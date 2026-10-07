@@ -1,0 +1,9 @@
+[package]
+name = "mycel-rules-guest"
+description = "Guest SDK for Mycel rules bundles: ABI exports, bump allocator, panic handler."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mycel-rules-abi = { path = "../../crates/mycel-rules-abi" }

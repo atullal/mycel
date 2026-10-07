@@ -1,0 +1,21 @@
+# Guest-side (wasm32-unknown-unknown) rules crates. A separate workspace so wasm builds never
+# touch the main workspace. Build with ./build.sh.
+[workspace]
+resolver = "3"
+members = ["mycel-rules-guest", "chat-rules", "counter-rules"]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+debug = false
+
+[profile.dev]
+panic = "abort"
