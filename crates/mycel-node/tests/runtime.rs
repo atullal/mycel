@@ -13,7 +13,7 @@ fn tmp(name: &str) -> PathBuf {
 
 async fn open(dir: &std::path::Path, name: &str, port: u16, keeper: bool) -> Arc<Runtime> {
     Runtime::open_with(RuntimeOptions {
-        data_dir: dir.clone(),
+        data_dir: dir.to_path_buf(),
         mode: NetworkMode::Local,
         name: Some(name.into()),
         keeper,
