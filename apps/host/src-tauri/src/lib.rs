@@ -82,39 +82,76 @@ fn forward_events(app: AppHandle, runtime: Rt) {
     });
 }
 
+/// Open the runtime and wire it to the app.
+fn start(app: &mut tauri::App) -> Result<(), String> {
+    let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("cannot find the app data folder: {e}"))?,
+    };
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
+    let mode = network_mode_from_env()?;
+    let name = std::env::var("MYCEL_NAME")
+        .ok()
+        .filter(|n| !n.trim().is_empty());
+
+    let runtime: Rt = tauri::async_runtime::block_on(Runtime::open(&data_dir, mode, name))
+        .map_err(|e| {
+            let hint = if e.to_string().contains("already open") {
+                "\n\nAnother copy of Mycel is already using this data folder. Quit it first, or give this copy its own folder with MYCEL_DATA_DIR."
+            } else {
+                ""
+            };
+            format!("cannot open Mycel data in {}: {e}{hint}", data_dir.display())
+        })?;
+
+    // Let the webview show downloaded attachments (convertFileSrc).
+    app.asset_protocol_scope()
+        .allow_directory(&data_dir, true)
+        .map_err(|e| e.to_string())?;
+
+    let handle = app.handle().clone();
+    set_window_title(&handle, &runtime.profile().name);
+    forward_events(handle, runtime.clone());
+    app.manage(runtime);
+
+    eprintln!(
+        "mycel-host: data dir {}, network {:?}",
+        data_dir.display(),
+        mode
+    );
+    Ok(())
+}
+
+/// Startup failed: hide the (unusable) window, show the reason, then quit.
+fn fail_to_start(app: &AppHandle, msg: String) {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+    eprintln!("mycel-host: {msg}");
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.hide();
+    }
+    let handle = app.clone();
+    app.dialog()
+        .message(msg)
+        .title("Mycel can't start")
+        .kind(MessageDialogKind::Error)
+        .show(move |_| handle.exit(1));
+}
+
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
-                Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-                _ => app.path().app_data_dir()?,
-            };
-            std::fs::create_dir_all(&data_dir)
-                .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
-            let mode = network_mode_from_env()?;
-            let name = std::env::var("MYCEL_NAME")
-                .ok()
-                .filter(|n| !n.trim().is_empty());
-
-            let runtime: Rt = tauri::async_runtime::block_on(Runtime::open(&data_dir, mode, name))
-                .map_err(|e| format!("cannot open Mycel runtime in {}: {e}", data_dir.display()))?;
-
-            // Let the webview show downloaded attachments (convertFileSrc).
-            app.asset_protocol_scope()
-                .allow_directory(&data_dir, true)?;
-
-            let handle = app.handle().clone();
-            set_window_title(&handle, &runtime.profile().name);
-            forward_events(handle, runtime.clone());
-            app.manage(runtime);
-
-            eprintln!(
-                "mycel-host: data dir {}, network {:?}",
-                data_dir.display(),
-                mode
-            );
+            match start(app) {
+                Ok(()) => {}
+                // Returning an error from setup makes Tauri panic (a native
+                // app then just "quits unexpectedly"). Say what went wrong.
+                Err(msg) => fail_to_start(app.handle(), msg),
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

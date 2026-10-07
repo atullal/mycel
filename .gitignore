@@ -4,3 +4,4 @@ node_modules/
 dist/
 apps/host/src-tauri/target/
 apps/host/src-tauri/gen/
+/dist-release/

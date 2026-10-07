@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into Mycel.app/Contents/Info.plist by `cargo tauri build`.
+     macOS 15+ asks the user before an app talks to devices on the local network;
+     these keys give that prompt a reason and declare the mDNS service Mycel uses
+     (iroh mDNS address lookup with service name "mycel" => _mycel._udp). -->
+<plist version="1.0">
+<dict>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Mycel finds people running Mycel on the same Wi-Fi or wired network and sends them your encrypted messages directly, with no internet or server.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_mycel._udp</string>
+  </array>
+</dict>
+</plist>

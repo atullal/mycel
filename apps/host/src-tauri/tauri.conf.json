@@ -34,6 +34,10 @@
     "active": true,
     "targets": "all",
     "category": "SocialNetworking",
+    "macOS": {
+      "signingIdentity": "-",
+      "minimumSystemVersion": "11.0"
+    },
     "shortDescription": "Peer-to-peer, end-to-end encrypted apps with no server",
     "icon": [
       "icons/32x32.png",
