@@ -295,9 +295,7 @@ async fn serve_sync(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
                 }
                 Some(ops) => {
                     if !accept_invite(inner, peer, space, ops) {
-                        send(&mut tx, &SyncMsg::Denied).await?;
-                        tx.finish()?;
-                        return Ok(());
+                        return deny(conn, tx).await;
                     }
                 }
             }
@@ -310,9 +308,7 @@ async fn serve_sync(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
             })
         })?;
         let Some(reply) = reply else {
-            send(&mut tx, &SyncMsg::Denied).await?;
-            tx.finish()?;
-            return Ok(());
+            return deny(conn, tx).await;
         };
         send(&mut tx, &reply).await?;
         let SyncMsg::DataAndWant { data, want } = recv(&mut rx).await? else {
@@ -327,6 +323,15 @@ async fn serve_sync(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
         conn.closed().await;
         return Ok(());
     }
+}
+
+/// Tell the client no, then wait for it to hang up: closing first would
+/// race the reply and the client would only see "connection lost".
+async fn deny(conn: Connection, mut tx: iroh::endpoint::SendStream) -> Result<()> {
+    send(&mut tx, &SyncMsg::Denied).await?;
+    tx.finish()?;
+    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+    Ok(())
 }
 
 /// A space pushed to us: accept only if policy allows and the ops prove that
@@ -360,7 +365,9 @@ fn accept_invite(inner: &Arc<Inner>, from: SignPk, space: SpaceId, ops: Vec<Sign
 }
 
 async fn serve_card(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
-    let (mut tx, _rx) = conn.accept_bi().await?;
+    // Server-initiated stream: a client-opened stream only exists once the
+    // client writes to it, and the client has nothing to say here.
+    let mut tx = conn.open_uni().await?;
     let card = ContactCard::new(&inner.keys, &inner.name.lock().unwrap().clone());
     send(&mut tx, &card).await?;
     tx.finish()?;
@@ -785,7 +792,7 @@ impl Node {
     /// Fetch a device's self-signed contact card (anyone may ask).
     pub async fn fetch_card(&self, peer: SignPk) -> Result<ContactCard> {
         let conn = connect(&self.inner, &peer, ALPN_CARD).await?;
-        let (_tx, mut rx) = conn.open_bi().await?;
+        let mut rx = conn.accept_uni().await?;
         let card: ContactCard = recv(&mut rx).await?;
         conn.close(0u32.into(), b"done");
         card.verify()?;
