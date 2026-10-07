@@ -14,4 +14,7 @@ wasmi = { version = "=2.0.0", default-features = false, features = ["std", "vali
 
 [dev-dependencies]
 mycel-rules-abi = { version = "0.1.0", path = "../mycel-rules-abi", features = ["chat"] }
+# Wire-format compatibility test: the guest's ChatOp must decode the kit's encoding.
+mycel-crypto = { version = "0.1.0", path = "../mycel-crypto" }
+mycel-kit-chat = { path = "../mycel-kit-chat" }
 wat = { version = "1.228.0", default-features = false }

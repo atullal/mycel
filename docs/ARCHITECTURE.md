@@ -140,7 +140,10 @@ Building blocks:
 - **Roles → capabilities:** `read(path)`, `write(path)`, `append(feed)`, `act(action)`, `admin`.
 - **Workflows:** a state machine with role-gated transitions and optional required signatures (e.g. legal sign-off).
 - **Proposals/branches:** propose changes on an Automerge branch; a role with merge rights accepts them (suggestion mode, edit review, alternate game timelines).
-- **Validators run as WASM** (`wasmtime`/`extism`). The space pins a hash of its **rules bundle**. Peers whose rules version differs from the pinned one go read-only until they upgrade. This guarantees every peer runs identical rules.
+- **Validators and reducers run as WASM** in [`wasmi`](https://github.com/wasmi-labs/wasmi) 2.0.0, a pure-Rust interpreter (pinned exactly; chosen over wasmtime/extism for small builds and determinism). Crate `mycel-rules` (host), `mycel-rules-abi` (shared `no_std` types), and the guest SDK under `rules/`. The space pins a hash of its **rules bundle** (`BLAKE3::derive_key("mycel/v0/rules-bundle", wasm)`). Peers whose rules version differs from the pinned one go read-only until they upgrade. This guarantees every peer runs identical rules.
+  - **Determinism:** bundles may import nothing; floats, SIMD, threads, memory64, multi-memory and start functions are rejected at load; each call runs on a fresh instance with a fixed fuel budget (20M) and a memory cap (16 MiB); every trap (out of fuel, OOM, stack overflow, panic) becomes the same `Reject(Trap)`.
+  - **ABI v1:** the guest exports `memory`, `mycel_abi_version() -> 1`, `mycel_alloc(len) -> ptr`, `mycel_validate(ptr, len) -> i64` and optionally `mycel_reduce(ptr, len) -> i64`. Input is a postcard `RuleInput { author, author_role, stream, payload, context }`; `validate` returns `0` = accept or `(1 << 32) | code` = reject. Exact spec and ingest guidance: [RULES_ABI.md](RULES_ABI.md).
+  - Example: `rules/chat-rules` validates the Chat kit's message feed (roles, size limits); author-only edit/delete stays in the deterministic chat reducer.
 
 ### L5 SDK + Kits
 - **Rust core** exposed to the UI through Tauri commands/events. The **TypeScript SDK** offers:
@@ -293,7 +296,7 @@ Everything else (sync, encryption, keepers, invites, presence, audit) comes from
 | L1 | Ed25519 (`ed25519-dalek`), OS keychain (`keyring`) | Agent device lists, personas, contacts |
 | L2 | `ed25519-dalek`, `hpke`, `blake3` (later: `keyhive_core`) | ✅ v0 built: membership DAG, deterministic resolution, epochs, lockboxes |
 | L3 | `automerge` 0.12, `chacha20poly1305` | ✅ v0 built: envelopes, validation, materialization. Next: Feed, Blob, Channel, indexer |
-| L4 | `wasmtime` / `extism` | Policy engine, reducer runtime, workflows, proposals |
+| L4 | `wasmi` 2.0.0 (pinned), `postcard` | ✅ v0 built: deterministic WASM rules runtime + guest SDK ([RULES_ABI.md](RULES_ABI.md)). Next: policy engine, workflows, proposals |
 | L5 | `@automerge/prosemirror` 0.2, React | TS SDK, kits |
 | L6 | `tauri` 2.12 | Host shell, app sandbox, manifests |
 | Keepers | the same core, headless | Mailbox, push bridge |
