@@ -1,0 +1,13 @@
+[package]
+name = "counter-rules"
+description = "Minimal Mycel rules bundle with an action reducer (exercises mycel_reduce)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+mycel-rules-guest = { path = "../mycel-rules-guest" }
+serde = { version = "1.0.229", default-features = false, features = ["derive"] }

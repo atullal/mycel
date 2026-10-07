@@ -1,0 +1,17 @@
+[package]
+name = "mycel-rules"
+version = "0.1.0"
+edition = "2024"
+description = "L4 rules runtime: deterministic, fuel-metered execution of wasm rules bundles."
+
+[dependencies]
+blake3 = "1.8.7"
+mycel-rules-abi = { version = "0.1.0", path = "../mycel-rules-abi" }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"
+# Pinned exactly: validation rules and the fuel cost model are part of consensus.
+wasmi = { version = "=2.0.0", default-features = false, features = ["std", "validate", "auto-dispatch"] }
+
+[dev-dependencies]
+mycel-rules-abi = { version = "0.1.0", path = "../mycel-rules-abi", features = ["chat"] }
+wat = { version = "1.228.0", default-features = false }

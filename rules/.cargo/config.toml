@@ -1,0 +1,6 @@
+[target.wasm32-unknown-unknown]
+# 128 KiB shadow stack instead of the default 1 MiB: the host zeroes the whole initial memory
+# on every call (fresh instance per call), so a small initial memory makes calls much cheaper.
+# The stack sits first in memory, so an overflow traps (deterministically) instead of
+# corrupting data.
+rustflags = ["-C", "link-arg=-zstack-size=131072"]
