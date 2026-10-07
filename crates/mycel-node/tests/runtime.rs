@@ -83,11 +83,17 @@ async fn messaging_end_to_end() {
         bob.messages(conv.id.clone(), None, None).unwrap().iter().any(|m| m.body == "hi bob 👋")
     })
     .await;
+    // Alice isn't Bob's contact: it arrives as a message request.
     let bconv = bob.conversation(conv.id.clone()).unwrap();
+    assert!(bconv.request);
+    assert_eq!(bconv.invited_by.as_deref(), Some(alice.profile().id.as_str()));
+    assert!(bob.contacts().is_empty(), "strangers are not auto-added");
+    assert!(bob.send_message(conv.id.clone(), "x".into(), None, vec![]).await.is_err());
+    let bconv = bob.accept_request(conv.id.clone()).unwrap();
+    assert!(!bconv.request);
     assert_eq!(bconv.title, "Alice", "bob learns alice's name via Profile");
     assert_eq!(bconv.unread, 1);
-    // alice was auto-added to bob's contacts
-    eventually("contact auto-added", || bob.contacts().iter().any(|c| c.name == "Alice")).await;
+    assert!(bob.contacts().iter().any(|c| c.name == "Alice"), "accepted → contact");
 
     // delivery → read
     eventually("delivered", || {
@@ -180,6 +186,7 @@ async fn keeper_delivers_while_sender_is_offline() {
     let conv = alice.create_conversation(Some("Team".into()), vec![b.id.clone()]).unwrap();
     alice.add_keeper(conv.id.clone(), k.id.clone()).unwrap();
     eventually("bob joined", || bob.conversations().len() == 1).await;
+    bob.accept_request(conv.id.clone()).unwrap();
     eventually("keeper joined", || keeper.node().space_ids().len() == 1).await;
     assert!(keeper.conversations().is_empty(), "keeper never shows conversations");
 
@@ -221,6 +228,8 @@ async fn group_admin_removes_member() {
     let c = alice.add_contact(carol.profile().contact_code).unwrap();
     let conv = alice.create_conversation(Some("Trio".into()), vec![b.id.clone(), c.id.clone()]).unwrap();
     eventually("all joined", || bob.conversations().len() == 1 && carol.conversations().len() == 1).await;
+    bob.accept_request(conv.id.clone()).unwrap();
+    carol.accept_request(conv.id.clone()).unwrap();
     assert!(bob.rename_conversation(conv.id.clone(), "mine".into()).is_err(), "not admin");
 
     // L4: Bob (not admin) bypasses the API and appends a forged Meta op.
@@ -259,4 +268,40 @@ async fn group_admin_removes_member() {
     for r in [alice, bob, carol] {
         r.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn declined_and_blocked_strangers_stay_out() {
+    let (dm, dv) = (tmp("mallory"), tmp("victim"));
+    let mallory = open(&dm, "Mallory", free_port(), false).await;
+    let victim = open(&dv, "Victim", free_port(), false).await;
+    connect_all(&[&mallory, &victim]);
+    // Mallory only needs the victim's public card (e.g. from the LAN).
+    let v = mallory.add_contact(victim.profile().contact_code).unwrap();
+    let c1 = mallory.create_conversation(None, vec![v.id.clone()]).unwrap();
+    mallory.send_message(c1.id.clone(), "click my file".into(), None, vec![]).await.unwrap();
+    eventually("request arrives", || victim.conversations().iter().any(|c| c.request)).await;
+    assert!(victim.contacts().is_empty());
+    victim.decline_request(c1.id.clone(), true).unwrap();
+    assert!(victim.conversations().is_empty(), "declined conversations are hidden");
+    // A new attempt from the blocked key is refused at the network layer.
+    let c2 = mallory.create_conversation(Some("again".into()), vec![v.id.clone()]).unwrap();
+    let _ = mallory.node().sync_with(
+        mycel_node::crypto::SignPk(<[u8; 32]>::try_from(hex_decode(&v.id)).unwrap()),
+        hash_of(&c2.id),
+        false,
+    ).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(victim.conversations().is_empty());
+    assert!(!victim.node().space_ids().contains(&hash_of(&c2.id)));
+    mallory.shutdown().await.unwrap();
+    victim.shutdown().await.unwrap();
+}
+
+fn hex_decode(s: &str) -> Vec<u8> {
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+}
+
+fn hash_of(s: &str) -> mycel_node::crypto::Hash32 {
+    mycel_node::crypto::Hash32(<[u8; 32]>::try_from(hex_decode(s)).unwrap())
 }

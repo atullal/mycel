@@ -246,7 +246,7 @@ async fn cards_ephemeral_and_blobs() {
     // blob: alice uploads, it's pushed to bob and keeper; a fresh fetch works
     let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
     let hash = alice.put_blob(space, payload.clone()).await.unwrap();
-    eventually("keeper stored blob", || keeper.blob_path(&hash).is_some()).await;
+    eventually("keeper stored blob", || keeper.blob_path(&space, &hash).is_some()).await;
     let path = bob.fetch_blob(space, hash).await.unwrap();
     assert_eq!(std::fs::read(path).unwrap(), payload);
 

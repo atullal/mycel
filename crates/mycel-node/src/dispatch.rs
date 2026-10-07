@@ -104,6 +104,14 @@ struct Title {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct Decline {
+    id: String,
+    #[serde(default)]
+    block: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Blob {
     blob: String,
 }
@@ -175,6 +183,11 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
             ok(rt.rename_conversation(t.id, t.title)?)
         }
         "fetch_attachment" => ok(rt.fetch_attachment(args::<Blob>(a)?.blob).await?),
+        "accept_request" => ok(rt.accept_request(args::<Id>(a)?.id)?),
+        "decline_request" => {
+            let d: Decline = args(a)?;
+            ok(rt.decline_request(d.id, d.block)?)
+        }
         "sync_now" => {
             rt.sync_now().await;
             ok(())

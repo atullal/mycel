@@ -44,7 +44,7 @@ impl Resolution {
             set.union_with(&self.anc[hi]);
         }
         let set = set.intersect(&self.valid);
-        replay(ops, &self.order, &self.anc, &set)
+        replay(ops, &self.order, &self.index, &self.anc, &set)
     }
 }
 
@@ -60,6 +60,7 @@ fn revocation_target(op: &SignedOp) -> Option<SignPk> {
             revocation: Some(_),
             ..
         } => Some(*member),
+        Action::Leave { .. } => Some(op.op.author),
         _ => None,
     }
 }
@@ -105,7 +106,7 @@ pub(crate) fn resolve(ops: &HashMap<OpId, SignedOp>) -> Resolution {
     let op_at = |i: usize| &ops[&order[i]];
 
     // 2. Seniority from ops that pass authorization ignoring concurrency.
-    let pre_valid = validate(ops, &order, &anc, &BitSet::new(n));
+    let pre_valid = validate(ops, &order, &index, &anc, &BitSet::new(n));
     let mut seniority: HashMap<SignPk, usize> = HashMap::new();
     for i in pre_valid.iter() {
         match &op_at(i).op.action {
@@ -148,11 +149,11 @@ pub(crate) fn resolve(ops: &HashMap<OpId, SignedOp>) -> Resolution {
             }
         }
         // 5. Authorization replay.
-        let valid = validate(ops, &order, &anc, &excluded);
+        let valid = validate(ops, &order, &index, &anc, &excluded);
         // 6. Winners that turned out unauthorized lose their candidacy; retry.
         let failed: Vec<usize> = winners.iter().copied().filter(|&w| !valid.get(w)).collect();
         if failed.is_empty() {
-            let state = replay(ops, &order, &anc, &valid);
+            let state = replay(ops, &order, &index, &anc, &valid);
             return Resolution {
                 winners: winners.iter().map(|&w| order[w]).collect(),
                 order,
@@ -171,6 +172,7 @@ pub(crate) fn resolve(ops: &HashMap<OpId, SignedOp>) -> Resolution {
 fn validate(
     ops: &HashMap<OpId, SignedOp>,
     order: &[OpId],
+    index: &HashMap<OpId, usize>,
     anc: &[BitSet],
     excluded: &BitSet,
 ) -> BitSet {
@@ -181,7 +183,7 @@ fn validate(
             continue;
         }
         let past = anc[i].intersect(&valid);
-        let st = replay(ops, order, anc, &past);
+        let st = replay(ops, order, index, anc, &past);
         if authorized(&ops[&order[i]], i, &st) {
             valid.set(i);
         }
@@ -244,7 +246,7 @@ fn authorized(op: &SignedOp, idx: usize, st: &MemberState) -> bool {
                 && fresh_epoch(st, rotation)
                 && recipients(rotation) == st.readers()
         }
-        Action::Leave => {
+        Action::Leave { .. } => {
             let mut after = st.clone();
             after.members.remove(&op.op.author);
             author_role.is_some() && after.admin_count() > 0
@@ -265,10 +267,10 @@ fn push_epoch(st: &mut MemberState, r: &Rotation, created_by: OpId) {
 fn replay(
     ops: &HashMap<OpId, SignedOp>,
     order: &[OpId],
+    index: &HashMap<OpId, usize>,
     anc: &[BitSet],
     set: &BitSet,
 ) -> MemberState {
-    let index: HashMap<&OpId, usize> = order.iter().enumerate().map(|(i, id)| (id, i)).collect();
     let index_of = |id: &OpId| index.get(id).copied();
     let mut st = MemberState::default();
     for i in set.iter() {
@@ -322,7 +324,7 @@ fn replay(
                 push_epoch(&mut st, rotation, id);
             }
             Action::Rotate { rotation } => push_epoch(&mut st, rotation, id),
-            Action::Leave => {
+            Action::Leave { .. } => {
                 st.members.remove(&op.author);
             }
         }

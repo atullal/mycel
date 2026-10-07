@@ -128,8 +128,9 @@ fn outsider_signed_envelope_is_invalid() {
     let sig = eve.sign(CTX_ENV_SIG, &[&encode(&header), &ct]);
     let env = Envelope { header, ciphertext: ct, sig };
     let id = env.id();
-    a.ingest_envelope(env).unwrap();
-    assert_eq!(a.status(&id), Status::Invalid("author not a writer at auth_heads"));
+    // Refused at the door: never stored, never relayed.
+    assert!(matches!(a.ingest_envelope(env), Err(SyncError::NotAllowed(_))));
+    assert!(!a.has_envelope(&id));
 }
 
 #[test]
@@ -322,4 +323,36 @@ fn many_messages_ingest_quickly() {
     assert_eq!(b.feed(&feed).last().unwrap().body, b"msg 1999");
     assert!(took.as_secs_f64() < 10.0, "ingest took {took:?}");
     eprintln!("ingested 2000 envelopes in {took:?}");
+}
+
+#[test]
+fn doc_equivocation_resolves_identically_everywhere() {
+    let (mut a, mut b, bk) = pair(Role::Writer);
+    let doc = StreamId::new_doc();
+    put(&mut a, doc, "base", "x");
+    sync(&mut a, &mut b);
+    // b equivocates: two different changes with the same (actor, seq)
+    let fork = |val: &str| -> Envelope {
+        let mut d = b.doc(&doc).unwrap().clone();
+        d.put(ROOT, "k", val.to_string()).unwrap();
+        d.commit();
+        let plain = d.get_last_local_change().unwrap().bytes().to_vec();
+        let epoch = b.graph.state().write_epoch().unwrap();
+        let (seq, prev) = b.my_chain_tip();
+        let header = Header { space: b.space_id(), stream: doc, author: bk.sign_pk(),
+            author_seq: seq, author_prev: prev, auth_heads: b.graph.heads(), epoch, nonce: random() };
+        let ct = b.ring.get(&epoch).unwrap().seal(&header.nonce, &content_aad(&header), &plain).unwrap();
+        let sig = bk.sign(CTX_ENV_SIG, &[&encode(&header), &ct]);
+        Envelope { header, ciphertext: ct, sig }
+    };
+    let e1 = fork("one");
+    let e2 = fork("two");
+    // a and c (another device of b's) receive them in opposite orders
+    let mut c = Replica::join(bk.clone(), a.op(&a.space_id()).unwrap().clone(), None).unwrap();
+    c.ingest_batch(a.all_ops(), a.envelope_ids().iter().map(|i| a.envelope(i).unwrap().clone()).collect());
+    a.ingest_envelope(e1.clone()).unwrap();
+    a.ingest_envelope(e2.clone()).unwrap();
+    c.ingest_envelope(e2).unwrap();
+    c.ingest_envelope(e1).unwrap();
+    assert_eq!(a.doc_json(&doc), c.doc_json(&doc), "same winner regardless of order");
 }

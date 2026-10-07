@@ -1,9 +1,11 @@
 //! The Mycel runtime: one device's identity, storage, network node and the
 //! app-facing API (docs/RUNTIME_API.md). The Tauri host and the CLI both wrap it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
+
+use parking_lot::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::BASE64URL_NOPAD;
@@ -84,6 +86,21 @@ pub struct Runtime {
     views: Mutex<HashMap<SpaceId, Arc<ChatView>>>,
     /// Names people announced (Profile ops), across all conversations.
     announced: Mutex<HashMap<SignPk, String>>,
+    /// Conversations from non-contacts awaiting accept/decline: space → inviter.
+    requests: Mutex<BTreeMap<SpaceId, SignPk>>,
+    /// Declined conversations we keep locally but never show.
+    hidden: Mutex<BTreeSet<SpaceId>>,
+    /// Keys whose invites we refuse at the network layer.
+    blocked: Arc<Mutex<BTreeSet<SignPk>>>,
+}
+
+fn load_set<T: serde::de::DeserializeOwned + Ord>(store: &DbStore, key: &str) -> Result<BTreeSet<T>> {
+    Ok(store
+        .kv_get(key)?
+        .and_then(|b| postcard::from_bytes::<Vec<T>>(&b).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .collect())
 }
 
 // ───────────────────────────── helpers ─────────────────────────────
@@ -142,17 +159,43 @@ fn guess_mime(name: &str) -> &'static str {
     }
 }
 
-fn sanitize_file_name(name: &str) -> String {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or("file");
-    let clean: String = base
+/// Make a peer-supplied file name safe to use as a single path component:
+/// basename only, no separators/drive prefixes/control chars, no leading dots
+/// (hidden files like `.zshenv`), bounded length. Security-critical: names
+/// come from other people's messages.
+pub fn sanitize_file_name(name: &str) -> String {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or("");
+    let mut clean: String = base
         .chars()
-        .map(|c| if c.is_control() || c == ':' { '_' } else { c })
+        .map(|c| {
+            if c.is_alphanumeric() || " .-_()[]+,@&'".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
-    if clean.is_empty() || clean == "." || clean == ".." {
-        "file".into()
-    } else {
-        clean
+    while clean.starts_with('.') || clean.starts_with(' ') {
+        clean.remove(0);
     }
+    let clean: String = clean.trim_end_matches([' ', '.']).chars().take(120).collect();
+    if clean.is_empty() { "file".into() } else { clean }
+}
+
+/// Mark a downloaded file as coming from the internet so macOS Gatekeeper
+/// still checks it before anything executes it.
+fn quarantine(path: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let value = format!("0081;{secs:x};Mycel;");
+        let _ = xattr::set(path, "com.apple.quarantine", value.as_bytes());
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = path;
 }
 
 fn role_of(r: Role) -> MemberRole {
@@ -241,7 +284,19 @@ impl Runtime {
         nopts.port = opts.port;
         // v0 policy: accept any conversation we're added to (the inviter needed
         // our contact card to add us). Blocking lists can come later.
-        nopts.invite_policy = Arc::new(|_, _| true);
+        // Invites from blocked keys are refused outright; invites from anyone
+        // else are accepted, and non-contacts land as message requests.
+        let blocked: Arc<Mutex<BTreeSet<SignPk>>> = Arc::new(Mutex::new(load_set(&store, "blocked")?));
+        let blocked_for_policy = blocked.clone();
+        nopts.invite_policy = Arc::new(move |from, _| !blocked_for_policy.lock().contains(from));
+        let requests: BTreeMap<SpaceId, SignPk> = store
+            .kv_get("requests")?
+            .and_then(|b| postcard::from_bytes::<Vec<(SpaceId, SignPk)>>(&b).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        let hidden: BTreeSet<SpaceId> = load_set(&store, "hidden")?;
+        nopts.accept_relay_invites = opts.keeper;
         let engine = mycel_rules::RulesEngine::load(CHAT_RULES_WASM)
             .map_err(|e| anyhow!("chat rules failed to load: {e:?}"))?;
         nopts.feed_validator = Some(Arc::new(WasmRules(engine)));
@@ -273,6 +328,9 @@ impl Runtime {
             keeper: opts.keeper,
             views: Mutex::default(),
             announced: Mutex::default(),
+            requests: Mutex::new(requests),
+            hidden: Mutex::new(hidden),
+            blocked,
         });
         // warm caches (also learns everyone's announced names)
         for s in rt.node.space_ids() {
@@ -317,7 +375,7 @@ impl Runtime {
     pub fn profile(&self) -> Profile {
         Profile {
             id: hex_id(&self.keys.sign_pk()),
-            name: self.name.lock().unwrap().clone(),
+            name: self.name.lock().clone(),
             contact_code: encode_contact_code(&self.node.card()),
         }
     }
@@ -327,7 +385,7 @@ impl Runtime {
         if name.is_empty() {
             bail!("name can't be empty");
         }
-        *self.name.lock().unwrap() = name.clone();
+        *self.name.lock() = name.clone();
         self.store.kv_put("name", name.clone().into_bytes());
         self.node.set_name(&name);
         // tell every conversation
@@ -340,7 +398,7 @@ impl Runtime {
     }
 
     fn save_contacts(&self) {
-        let list: Vec<StoredContact> = self.contacts.lock().unwrap().values().cloned().collect();
+        let list: Vec<StoredContact> = self.contacts.lock().values().cloned().collect();
         self.store.kv_put("contacts", postcard::to_allocvec(&list).unwrap());
     }
 
@@ -351,7 +409,6 @@ impl Runtime {
         keys.verify_binding()?;
         self.contacts
             .lock()
-            .unwrap()
             .insert(keys.sign_pk, StoredContact { keys, name });
         self.save_contacts();
         self.emit(Event::ContactsChanged);
@@ -371,7 +428,7 @@ impl Runtime {
 
     pub fn remove_contact(&self, id: PeerId) -> Result<()> {
         let pk = parse_pk(&id)?;
-        self.contacts.lock().unwrap().remove(&pk);
+        self.contacts.lock().remove(&pk);
         self.save_contacts();
         self.emit(Event::ContactsChanged);
         Ok(())
@@ -379,7 +436,7 @@ impl Runtime {
 
     fn contact(&self, pk: &SignPk) -> Option<Contact> {
         // Don't hold the contacts lock across name_of (it locks contacts too).
-        let known = self.contacts.lock().unwrap().contains_key(pk);
+        let known = self.contacts.lock().contains_key(pk);
         if !known {
             return None;
         }
@@ -393,14 +450,14 @@ impl Runtime {
     }
 
     pub fn contacts(&self) -> Vec<Contact> {
-        let pks: Vec<SignPk> = self.contacts.lock().unwrap().keys().copied().collect();
+        let pks: Vec<SignPk> = self.contacts.lock().keys().copied().collect();
         let mut out: Vec<Contact> = pks.iter().filter_map(|pk| self.contact(pk)).collect();
         out.sort_by_key(|c| c.name.to_lowercase());
         out
     }
 
     pub fn nearby(&self) -> Vec<NearbyPeer> {
-        let contacts = self.contacts.lock().unwrap().clone();
+        let contacts = self.contacts.lock().clone();
         let mut out: Vec<NearbyPeer> = self
             .node
             .peers()
@@ -434,13 +491,13 @@ impl Runtime {
     /// conversation, else the LAN name, else a short id.
     fn name_of(&self, pk: &SignPk) -> String {
         if *pk == self.keys.sign_pk() {
-            return self.name.lock().unwrap().clone();
+            return self.name.lock().clone();
         }
-        let contact_name = self.contacts.lock().unwrap().get(pk).map(|c| c.name.clone());
+        let contact_name = self.contacts.lock().get(pk).map(|c| c.name.clone());
         if let Some(n) = contact_name.filter(|n| !n.is_empty()) {
             return n;
         }
-        let announced = self.announced.lock().unwrap().get(pk).cloned();
+        let announced = self.announced.lock().get(pk).cloned();
         if let Some(n) = announced {
             return n;
         }
@@ -457,21 +514,20 @@ impl Runtime {
     }
 
     fn view(&self, space: &SpaceId) -> Result<Arc<ChatView>> {
-        if let Some(v) = self.views.lock().unwrap().get(space) {
+        if let Some(v) = self.views.lock().get(space) {
             return Ok(v.clone());
         }
         let items = self.node.with_space(space, |r| r.feed(&messages_feed()))?;
         let view = Arc::new(reduce(&items));
         self.announced
             .lock()
-            .unwrap()
             .extend(view.names.iter().map(|(k, v)| (*k, v.clone())));
-        self.views.lock().unwrap().insert(*space, view.clone());
+        self.views.lock().insert(*space, view.clone());
         Ok(view)
     }
 
     fn invalidate(&self, space: &SpaceId) {
-        self.views.lock().unwrap().remove(space);
+        self.views.lock().remove(space);
     }
 
     /// A local change: drop the cached view now, then sync + notify.
@@ -489,6 +545,9 @@ impl Runtime {
     }
 
     fn require_member(&self, space: &SpaceId) -> Result<Role> {
+        if self.requests.lock().contains_key(space) {
+            bail!("accept this message request before replying");
+        }
         match self.my_role(space) {
             Some(r) if r.can_write() => Ok(r),
             Some(_) => bail!("you can't post in this conversation"),
@@ -507,7 +566,6 @@ impl Runtime {
         let pk = parse_pk(id)?;
         self.contacts
             .lock()
-            .unwrap()
             .get(&pk)
             .map(|c| c.keys)
             .ok_or_else(|| anyhow!("{} is not in your contacts", pk.short()))
@@ -546,6 +604,8 @@ impl Runtime {
             .rev()
             .find(|m| !m.deleted)
             .map(|m| self.message_view(space, &view, m, &HashSet::new()));
+        // (take the lock once: two guards in one expression would deadlock)
+        let inviter = self.requests.lock().get(space).copied();
         Ok(ConversationSummary {
             id: space.to_string(),
             title,
@@ -555,6 +615,8 @@ impl Runtime {
             unread: view.unread_for(&me),
             active: my_role.is_some(),
             my_role: my_role.map(role_of),
+            request: inviter.is_some(),
+            invited_by: inviter.as_ref().map(hex_id),
         })
     }
 
@@ -587,7 +649,7 @@ impl Runtime {
                 .iter()
                 .map(|a| Attachment {
                     blob: a.blob.to_string(),
-                    name: a.name.clone(),
+                    name: sanitize_file_name(&a.name),
                     mime: a.mime.clone(),
                     size: a.size,
                     local_path: self
@@ -640,6 +702,7 @@ impl Runtime {
             .space_ids()
             .iter()
             .filter(|s| self.my_role(s) != Some(Role::Relay))
+            .filter(|s| !self.hidden.lock().contains(*s))
             .filter_map(|s| self.summary(s).ok())
             .collect();
         out.sort_by_key(|c| std::cmp::Reverse(c.last_message.as_ref().map_or(0, |m| m.sent_at)));
@@ -662,7 +725,7 @@ impl Runtime {
         let title = title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
         let direct = title.is_none() && keys.len() == 1;
         let (space, _) = self.node.create_space()?;
-        let name = self.name.lock().unwrap().clone();
+        let name = self.name.lock().clone();
         self.node.with_space(&space, |r| -> Result<()> {
             for k in &keys {
                 r.add_member(*k, Role::Writer)?;
@@ -749,8 +812,11 @@ impl Runtime {
         Ok(r)
     }
 
+    /// Where an attachment's decrypted copy lives. Always inside `files/`.
     fn file_path(&self, a: &AttachmentRef) -> Option<PathBuf> {
-        Some(self.data_dir.join("files").join(a.blob.to_string()).join(&a.name))
+        let root = self.data_dir.join("files");
+        let path = root.join(a.blob.to_string()).join(sanitize_file_name(&a.name));
+        path.starts_with(&root).then_some(path)
     }
 
     pub async fn fetch_attachment(&self, blob: String) -> Result<String> {
@@ -783,6 +849,7 @@ impl Runtime {
             tokio::fs::create_dir_all(d).await?;
         }
         tokio::fs::write(&out, plain).await?;
+        quarantine(&out);
         self.emit(Event::BlobReady { blob });
         self.emit(Event::ConversationUpdated { conversation: space.to_string() });
         Ok(out.to_string_lossy().into_owned())
@@ -904,6 +971,63 @@ impl Runtime {
         Ok(())
     }
 
+    fn save_requests(&self) {
+        let list: Vec<(SpaceId, SignPk)> = self.requests.lock().iter().map(|(a, b)| (*a, *b)).collect();
+        self.store.kv_put("requests", postcard::to_allocvec(&list).unwrap());
+    }
+
+    fn save_set<T: serde::Serialize + Copy>(&self, key: &str, set: &BTreeSet<T>) {
+        let list: Vec<T> = set.iter().copied().collect();
+        self.store.kv_put(key, postcard::to_allocvec(&list).unwrap());
+    }
+
+    /// Accept a message request: the inviter becomes a contact (with the name
+    /// they announced) and we introduce ourselves.
+    pub fn accept_request(&self, id: ConversationId) -> Result<ConversationSummary> {
+        let space = parse_space(&id)?;
+        let inviter = self.requests.lock().remove(&space).context("not a message request")?;
+        self.save_requests();
+        let keys = self.node.with_space(&space, |r| {
+            r.members().into_iter().find(|(k, _)| k.sign_pk == inviter).map(|(k, _)| k)
+        })?;
+        if let Some(keys) = keys
+            && !self.contacts.lock().contains_key(&inviter)
+        {
+            self.remember(keys, String::new())?;
+        }
+        if self.my_role(&space).is_some_and(Role::can_write) {
+            let name = self.name.lock().clone();
+            self.post(space, ChatOp::Profile { name })?;
+        }
+        self.emit(Event::ConversationUpdated { conversation: id.clone() });
+        self.summary(&space)
+    }
+
+    /// Decline a message request (leave it), optionally blocking the inviter.
+    pub fn decline_request(&self, id: ConversationId, block: bool) -> Result<()> {
+        let space = parse_space(&id)?;
+        let inviter = self.requests.lock().remove(&space).context("not a message request")?;
+        self.save_requests();
+        let _ = self.node.with_space(&space, |r| r.leave());
+        self.touch(space);
+        let hidden = {
+            let mut h = self.hidden.lock();
+            h.insert(space);
+            h.clone()
+        };
+        self.save_set("hidden", &hidden);
+        if block {
+            let blocked = {
+                let mut b = self.blocked.lock();
+                b.insert(inviter);
+                b.clone()
+            };
+            self.save_set("blocked", &blocked);
+        }
+        self.emit(Event::ConversationUpdated { conversation: id });
+        Ok(())
+    }
+
     pub fn rename_conversation(&self, id: ConversationId, title: String) -> Result<()> {
         let space = parse_space(&id)?;
         self.require_admin(&space)?;
@@ -937,19 +1061,17 @@ async fn bridge(rt: Weak<Runtime>, mut rx: broadcast::Receiver<NetEvent>) {
             NetEvent::SpaceAdded { space, from } => {
                 rt.invalidate(&space);
                 if !rt.keeper {
-                    // remember who added us, and introduce ourselves
-                    let inviter = rt.node.with_space(&space, |r| {
-                        r.members().into_iter().find(|(k, _)| k.sign_pk == from).map(|(k, _)| k)
-                    });
-                    let known = rt.contacts.lock().unwrap().contains_key(&from);
-                    if let Ok(Some(keys)) = inviter
-                        && !known
-                    {
-                        let _ = rt.remember(keys, String::new());
-                    }
-                    if rt.my_role(&space).is_some_and(Role::can_write) {
-                        let name = rt.name.lock().unwrap().clone();
-                        let _ = rt.post(space, ChatOp::Profile { name });
+                    let known = rt.contacts.lock().contains_key(&from);
+                    if known {
+                        // a contact added us: introduce ourselves right away
+                        if rt.my_role(&space).is_some_and(Role::can_write) {
+                            let name = rt.name.lock().clone();
+                            let _ = rt.post(space, ChatOp::Profile { name });
+                        }
+                    } else {
+                        // a stranger: message request; nothing is trusted or posted yet
+                        rt.requests.lock().insert(space, from);
+                        rt.save_requests();
                     }
                 }
                 rt.emit(Event::ConversationAdded { conversation: space.to_string() });
@@ -977,4 +1099,32 @@ fn _assert_send_sync() {
     fn is<T: Send + Sync>() {}
     is::<Runtime>();
     let _ = HashMap::<u8, u8>::new();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_file_name as s;
+
+    #[test]
+    fn hostile_attachment_names_are_neutralized() {
+        for evil in [
+            "../../../../Library/LaunchAgents/x.plist",
+            "/etc/passwd",
+            "..\\..\\x.bat",
+            "C:\\Windows\\x.exe",
+            "..",
+            ".",
+            ".zshenv",
+            "a/../../b",
+            "\0x\n",
+            "",
+        ] {
+            let n = s(evil);
+            assert!(!n.contains('/') && !n.contains('\\') && !n.starts_with('.'), "{evil:?} -> {n:?}");
+            assert!(!n.is_empty() && n != "..");
+        }
+        assert_eq!(s("Photo 1 (final).PNG"), "Photo 1 (final).PNG");
+        assert_eq!(s("résumé.pdf"), "résumé.pdf");
+        assert_eq!(s("../../x.plist"), "x.plist");
+    }
 }

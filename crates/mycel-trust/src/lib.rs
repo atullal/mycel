@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 
 use mycel_crypto::{
-    CryptoError, DeviceKeys, Hash32, Lockbox, MemberKeys, Sig, SignPk, SymKey, random,
+    CryptoError, DeviceKeys, Hash32, Lockbox, MemberKeys, Sig, SignPk, SymKey,
     random_u64, seal_lockbox,
 };
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,12 @@ pub type OpId = Hash32;
 pub type SpaceId = Hash32;
 
 const CTX_OP_SIG: &str = "mycel/v0/op";
+
+/// Resource limits (DoS hardening). Generous for real groups.
+pub const MAX_PARENTS: usize = 64;
+pub const MAX_MEMBERS: usize = 1024;
+pub const MAX_PENDING: usize = 4096;
+const STATE_CACHE_MAX: usize = 1024;
 const CTX_OP_ID: &str = "mycel/v0/op-id";
 const CTX_LOCKBOX: &str = "mycel/v0/lockbox";
 const CTX_KEYRING: &str = "mycel/v0/keyring";
@@ -42,9 +48,17 @@ pub enum TrustError {
 
 pub type Result<T> = std::result::Result<T, TrustError>;
 
-/// Random 128-bit epoch identifier.
+/// 128-bit epoch identifier, derived from the key commitment so two rotations
+/// can only share an id if they share the key (no epoch-id collisions).
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct EpochId(pub [u8; 16]);
+
+impl EpochId {
+    pub fn for_commitment(c: &Hash32) -> Self {
+        let h = Hash32::digest("mycel/v0/epoch-id", &c.0);
+        EpochId(h.0[..16].try_into().unwrap())
+    }
+}
 
 impl std::fmt::Debug for EpochId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -118,8 +132,10 @@ pub enum Action {
     },
     /// The author leaves voluntarily. No rotation (the leaver must not pick
     /// the next key): no epoch then matches the remaining readers, so the next
-    /// writer rotates automatically (TRUST.md §6).
-    Leave,
+    /// writer rotates automatically (TRUST.md §6). It is a revocation of the
+    /// author with `cutoff` = their own last envelope, so whoever holds the
+    /// device afterwards can't keep posting with backdated `auth_heads`.
+    Leave { cutoff: Option<Hash32> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +168,9 @@ impl SignedOp {
     pub fn verify_standalone(&self) -> Result<()> {
         let body = postcard::to_allocvec(&self.op).map_err(|_| TrustError::Encoding)?;
         self.op.author.verify(CTX_OP_SIG, &[&body], &self.sig)?;
+        if self.op.parents.len() > MAX_PARENTS {
+            return Err(TrustError::Malformed("too many parents"));
+        }
         let mut parents = self.op.parents.clone();
         parents.sort();
         parents.dedup();
@@ -159,6 +178,12 @@ impl SignedOp {
             return Err(TrustError::Malformed("duplicate parents"));
         }
         let check_rotation = |r: &Rotation| -> Result<()> {
+            if r.epoch != EpochId::for_commitment(&r.commitment) {
+                return Err(TrustError::Malformed("epoch id must derive from commitment"));
+            }
+            if r.lockboxes.len() > MAX_MEMBERS {
+                return Err(TrustError::Malformed("too many lockboxes"));
+            }
             let sorted = r.lockboxes.windows(2).all(|w| w[0].0 < w[1].0);
             if !sorted {
                 return Err(TrustError::Malformed("lockboxes must be sorted and unique"));
@@ -218,7 +243,7 @@ pub fn new_rotation<'a>(
     recipients: impl IntoIterator<Item = &'a MemberKeys>,
 ) -> Result<(Rotation, SymKey)> {
     let key = SymKey::generate();
-    let epoch = EpochId(random());
+    let epoch = EpochId::for_commitment(&key.commitment());
     let mut lockboxes = recipients
         .into_iter()
         .map(|m| {
@@ -442,8 +467,26 @@ impl SpaceGraph {
         if op.op.space != Some(self.space) {
             return Err(TrustError::WrongSpace);
         }
+        // DoS guard: only keys that some known op ever added may author ops.
+        // (An op that arrives before its author's Add is simply re-fetched on
+        // a later sync, so this doesn't affect convergence.)
+        if !self.ever_named(&op.op.author) {
+            return Err(TrustError::NotAuthorized("author was never added to this space"));
+        }
+        if self.pending.len() >= MAX_PENDING {
+            return Err(TrustError::Malformed("too many pending ops"));
+        }
         self.pending.insert(op.id(), op);
         Ok(())
+    }
+
+    /// Has any known op (valid or not) named `pk` as founder or added member?
+    pub fn ever_named(&self, pk: &SignPk) -> bool {
+        self.ops.values().chain(self.pending.values()).any(|o| match &o.op.action {
+            Action::Genesis { founder, .. } => founder.sign_pk == *pk,
+            Action::Add { member, .. } => member.sign_pk == *pk,
+            _ => false,
+        })
     }
 
     fn reresolve(&mut self) {
@@ -512,7 +555,11 @@ impl SpaceGraph {
             return s.clone();
         }
         let st = self.res.state_at(&self.ops, &key);
-        self.state_cache.lock().unwrap().insert(key, st.clone());
+        let mut cache = self.state_cache.lock().unwrap();
+        if cache.len() >= STATE_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(key, st.clone());
         st
     }
 
@@ -535,6 +582,7 @@ impl SpaceGraph {
                         revocation: Some(revocation),
                         ..
                     } if member == pk => Some((*id, revocation.cutoff)),
+                    Action::Leave { cutoff } if op.author == *pk => Some((*id, *cutoff)),
                     _ => None,
                 }
             })
@@ -580,6 +628,7 @@ impl SpaceGraph {
                     if let Some((_, lb)) = rotation.lockboxes.iter().find(|(pk, _)| *pk == my_pk)
                         && let Ok(bytes) = me.open_lockbox(&lockbox_info(&rotation.epoch, &my_pk), lb)
                         && let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice())
+                        && SymKey(arr).commitment() == rotation.commitment
                     {
                         try_insert(rotation.epoch, SymKey(arr));
                     }
@@ -740,11 +789,11 @@ impl SpaceGraph {
     }
 
     /// Any member: leave the space.
-    pub fn leave(&self, me: &DeviceKeys) -> Result<SignedOp> {
+    pub fn leave(&self, me: &DeviceKeys, cutoff: Option<Hash32>) -> Result<SignedOp> {
         if self.state().role(&me.sign_pk()).is_none() {
             return Err(TrustError::NotAuthorized("not a member"));
         }
-        Ok(self.author_op(me, Action::Leave))
+        Ok(self.author_op(me, Action::Leave { cutoff }))
     }
 
     /// Writer+: rotate to a fresh epoch for exactly the current readers.

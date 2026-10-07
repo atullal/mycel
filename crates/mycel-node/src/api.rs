@@ -74,6 +74,11 @@ pub struct ConversationSummary {
     /// False once we've been removed (history stays readable locally).
     pub active: bool,
     pub my_role: Option<MemberRole>,
+    /// A message request: someone who isn't a contact added you. Accept to
+    /// reply (and add them as a contact), or decline / block.
+    pub request: bool,
+    /// Who added you (for requests).
+    pub invited_by: Option<PeerId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

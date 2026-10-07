@@ -26,6 +26,8 @@ const CTX_CONTENT_AAD: &str = "mycel/v0/content";
 
 /// Envelopes carry small changes; large data goes through blobs.
 pub const MAX_ENVELOPE_CIPHERTEXT: usize = 1024 * 1024;
+/// Max membership heads an envelope may reference (DoS hardening).
+pub const MAX_AUTH_HEADS: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SyncError {
@@ -194,6 +196,8 @@ impl Ingested {
 struct DocState {
     doc: AutoCommit,
     applied: BTreeSet<EnvelopeId>,
+    /// (actor, seq) → (change hash, envelope) — to detect equivocation.
+    seqs: HashMap<(Vec<u8>, u64), (automerge::ChangeHash, EnvelopeId)>,
 }
 
 #[derive(Default)]
@@ -263,6 +267,9 @@ pub struct Replica {
     validator: Option<Arc<dyn FeedValidator>>,
     /// Valid envelopes whose decrypted content the rules rejected.
     rule_rejected: HashSet<EnvelopeId>,
+    /// Doc changes excluded because their author equivocated (two different
+    /// changes with the same actor+seq): the lowest envelope id wins, everywhere.
+    equivocated: HashSet<EnvelopeId>,
 }
 
 impl Replica {
@@ -322,6 +329,7 @@ impl Replica {
             store,
             validator: None,
             rule_rejected: HashSet::new(),
+            equivocated: HashSet::new(),
         }
     }
 
@@ -476,9 +484,17 @@ impl Replica {
         if env.ciphertext.len() > MAX_ENVELOPE_CIPHERTEXT {
             return Err(SyncError::TooLarge);
         }
+        if env.header.auth_heads.len() > MAX_AUTH_HEADS {
+            return Err(SyncError::NotAllowed("too many auth heads"));
+        }
         let id = env.id();
         if self.envelopes.contains_key(&id) {
             return Ok(None);
+        }
+        // DoS guard: never store envelopes from keys this space never added.
+        // (Re-fetched on a later sync if the Add simply hasn't arrived yet.)
+        if !self.graph.ever_named(&env.header.author) {
+            return Err(SyncError::NotAllowed("author was never added to this space"));
         }
         env.verify_sig()?;
         self.persist_envelope(&env);
@@ -557,7 +573,7 @@ impl Replica {
             (0, Some(_)) | (_, None) => return Status::Invalid("broken author chain"),
             (seq, Some(prev)) => match self.envelopes.get(prev) {
                 None => return Status::Pending("missing previous envelope"),
-                Some(p) if p.header.author != h.author || p.header.author_seq + 1 != seq => {
+                Some(p) if p.header.author != h.author || p.header.author_seq.checked_add(1) != Some(seq) => {
                     return Status::Invalid("broken author chain");
                 }
                 Some(_) => {}
@@ -691,11 +707,31 @@ impl Replica {
                 if change.actor_id().to_bytes() != env.header.author.0 {
                     return;
                 }
+                if self.equivocated.contains(id) {
+                    return;
+                }
                 let actor = ActorId::from(self.me.sign_pk().0.to_vec());
                 let state = self.docs.entry(stream).or_insert_with(|| DocState {
                     doc: AutoCommit::new().with_actor(actor),
                     applied: BTreeSet::new(),
+                    seqs: HashMap::new(),
                 });
+                let key = (change.actor_id().to_bytes().to_vec(), change.seq());
+                match state.seqs.get(&key) {
+                    Some((hash, _)) if *hash == change.hash() => {}
+                    Some((_, other)) => {
+                        // Equivocation: keep the lowest envelope id on every peer.
+                        let (winner, loser) = if id < other { (*id, *other) } else { (*other, *id) };
+                        self.equivocated.insert(loser);
+                        if winner == *id {
+                            self.rebuild_doc(stream);
+                        }
+                        return;
+                    }
+                    None => {
+                        state.seqs.insert(key, (change.hash(), *id));
+                    }
+                }
                 // Automerge queues changes whose deps haven't arrived yet.
                 let _ = state.doc.apply_changes([change]);
                 state.applied.insert(*id);
@@ -730,6 +766,19 @@ impl Replica {
                 feed.items.insert(*id, item);
                 feed.order = None;
             }
+        }
+    }
+
+    /// Re-derive one document from its valid envelopes in canonical order.
+    fn rebuild_doc(&mut self, stream: StreamId) {
+        self.docs.remove(&stream);
+        let ids: Vec<EnvelopeId> = self
+            .valid_by_stream
+            .get(&stream)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default();
+        for id in ids {
+            self.materialize(&id);
         }
     }
 
@@ -821,6 +870,7 @@ impl Replica {
         let state = self.docs.entry(doc).or_insert_with(|| DocState {
             doc: AutoCommit::new().with_actor(actor),
             applied: BTreeSet::new(),
+            seqs: HashMap::new(),
         });
         edit(&mut state.doc)?;
         state.doc.commit();
@@ -886,7 +936,8 @@ impl Replica {
     }
 
     pub fn leave(&mut self) -> Result<SignedOp> {
-        let op = self.graph.leave(&self.me)?;
+        let cutoff = self.latest_from(&self.me.sign_pk());
+        let op = self.graph.leave(&self.me, cutoff)?;
         self.ingest_op(op.clone())?;
         Ok(op)
     }
@@ -928,3 +979,4 @@ impl Replica {
 
 #[cfg(test)]
 mod tests;
+

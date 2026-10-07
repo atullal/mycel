@@ -21,7 +21,10 @@ pub mod wire;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+
+// parking_lot: no lock poisoning, so a panic can't wedge the whole node.
+use parking_lot::Mutex;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -34,7 +37,7 @@ use iroh::{
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use mycel_crypto::{DeviceKeys, Hash32, SignPk};
 use mycel_sync::{EnvelopeId, FeedValidator, Replica, Store};
-use mycel_trust::{SignedOp, SpaceId};
+use mycel_trust::{Role, SignedOp, SpaceId};
 use n0_future::StreamExt;
 use tokio::sync::{Notify, Semaphore, broadcast};
 
@@ -47,6 +50,10 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 const PERIODIC_SYNC: Duration = Duration::from_secs(15);
 const ONLINE_WINDOW: Duration = Duration::from_secs(45);
 const DEBOUNCE: Duration = Duration::from_millis(80);
+/// Per-space blob storage quota on each device.
+const MAX_SPACE_BLOBS: u64 = 2 * 1024 * 1024 * 1024;
+/// Max membership ops accepted in a pushed invite.
+const MAX_INVITE_OPS: usize = 4096;
 
 fn to_sign_pk(pk: &PublicKey) -> SignPk {
     SignPk(*pk.as_bytes())
@@ -78,6 +85,9 @@ pub struct NodeOptions {
     /// Where blobs live. `None` disables blob storage.
     pub blob_dir: Option<PathBuf>,
     pub invite_policy: InvitePolicy,
+    /// Accept invites that give us only the Relay role (keepers: yes;
+    /// personal devices: no — otherwise anyone could use our disk).
+    pub accept_relay_invites: bool,
     /// UDP port to bind (0 = random).
     pub port: u16,
     /// L4 rules applied to every feed entry in every space.
@@ -92,6 +102,7 @@ impl NodeOptions {
             store: None,
             blob_dir: None,
             invite_policy: Arc::new(|_, _| true),
+            accept_relay_invites: false,
             port: 0,
             feed_validator: None,
         }
@@ -150,6 +161,7 @@ struct Inner {
     store: Option<Arc<dyn Store>>,
     blob_dir: Option<PathBuf>,
     invite_policy: InvitePolicy,
+    accept_relay_invites: bool,
     feed_validator: Option<Arc<dyn FeedValidator>>,
     spaces: Mutex<HashMap<SpaceId, Replica>>,
     peers: Mutex<HashMap<SignPk, PeerState>>,
@@ -181,7 +193,7 @@ impl Inner {
     fn mark_ok(&self, pk: SignPk) {
         let was_online;
         {
-            let mut peers = self.peers.lock().unwrap();
+            let mut peers = self.peers.lock();
             let p = peers.entry(pk).or_default();
             was_online = p.online();
             p.last_ok = Some(Instant::now());
@@ -194,31 +206,44 @@ impl Inner {
     }
 
     fn mark_fail(&self, pk: SignPk) {
-        let mut peers = self.peers.lock().unwrap();
+        let mut peers = self.peers.lock();
         let p = peers.entry(pk).or_default();
         p.failures = p.failures.saturating_add(1);
         p.last_fail = Some(Instant::now());
     }
 
     fn with_space<R>(&self, space: &SpaceId, f: impl FnOnce(&mut Replica) -> R) -> Result<R> {
-        let mut spaces = self.spaces.lock().unwrap();
+        let mut spaces = self.spaces.lock();
         let r = spaces.get_mut(space).ok_or_else(|| anyhow!("unknown space"))?;
         Ok(f(r))
     }
 
     fn schedule(&self, space: SpaceId) {
-        self.dirty.lock().unwrap().insert(space);
+        self.dirty.lock().insert(space);
         self.wake.notify_one();
     }
 
-    fn blob_path(&self, hash: &Hash32) -> Option<PathBuf> {
-        self.blob_dir.as_ref().map(|d| d.join(hash.to_string()))
+    /// Blobs are stored per space: a member of one space can't fetch or fill
+    /// another space's blobs.
+    fn blob_path(&self, space: &SpaceId, hash: &Hash32) -> Option<PathBuf> {
+        self.blob_dir
+            .as_ref()
+            .map(|d| d.join(space.to_string()).join(hash.to_string()))
+    }
+
+    fn space_blob_bytes(&self, space: &SpaceId) -> u64 {
+        let Some(dir) = self.blob_dir.as_ref().map(|d| d.join(space.to_string())) else {
+            return 0;
+        };
+        std::fs::read_dir(dir)
+            .map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum())
+            .unwrap_or(0)
     }
 
     /// Apply received data; on change, notify the app and forward to other members.
     fn ingest(&self, space: &SpaceId, peer: SignPk, data: Data, sent: &[EnvelopeId]) -> SyncStats {
         let res = {
-            let mut spaces = self.spaces.lock().unwrap();
+            let mut spaces = self.spaces.lock();
             let Some(r) = spaces.get_mut(space) else {
                 return SyncStats::default();
             };
@@ -295,7 +320,7 @@ async fn serve_sync(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
         let SyncMsg::Hello { space, inv, invite } = msg else {
             bail!("expected Hello");
         };
-        let known = inner.spaces.lock().unwrap().contains_key(&space);
+        let known = inner.spaces.lock().contains_key(&space);
         if !known {
             match invite {
                 None => {
@@ -354,7 +379,7 @@ async fn deny(conn: Connection, mut tx: iroh::endpoint::SendStream) -> Result<()
 /// A space pushed to us: accept only if policy allows and the ops prove that
 /// both we and the pusher are members.
 fn accept_invite(inner: &Arc<Inner>, from: SignPk, space: SpaceId, ops: Vec<SignedOp>) -> bool {
-    if !(inner.invite_policy)(&from, &space) {
+    if ops.len() > MAX_INVITE_OPS || !(inner.invite_policy)(&from, &space) {
         return false;
     }
     let Some(genesis) = ops.iter().find(|o| o.id() == space).cloned() else {
@@ -364,7 +389,12 @@ fn accept_invite(inner: &Arc<Inner>, from: SignPk, space: SpaceId, ops: Vec<Sign
         return false;
     };
     r.ingest_batch(ops, vec![]);
-    if r.my_role().is_none() || !r.is_member(&from) {
+    match r.my_role() {
+        None => return false,
+        Some(Role::Relay) if !inner.accept_relay_invites => return false,
+        _ => {}
+    }
+    if !r.is_member(&from) {
         return false;
     }
     // Re-create with the store attached so everything is persisted.
@@ -377,7 +407,7 @@ fn accept_invite(inner: &Arc<Inner>, from: SignPk, space: SpaceId, ops: Vec<Sign
     };
     inner.prepare(&mut r);
     r.ingest_batch(all, vec![]);
-    inner.spaces.lock().unwrap().entry(space).or_insert(r);
+    inner.spaces.lock().entry(space).or_insert(r);
     inner.emit(NetEvent::SpaceAdded { space, from });
     true
 }
@@ -386,7 +416,7 @@ async fn serve_card(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
     // Server-initiated stream: a client-opened stream only exists once the
     // client writes to it, and the client has nothing to say here.
     let mut tx = conn.open_uni().await?;
-    let card = ContactCard::new(&inner.keys, &inner.name.lock().unwrap().clone());
+    let card = ContactCard::new(&inner.keys, &inner.name.lock().clone());
     send(&mut tx, &card).await?;
     tx.finish()?;
     conn.closed().await;
@@ -420,10 +450,9 @@ async fn serve_blob(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
     let allowed = inner
         .spaces
         .lock()
-        .unwrap()
         .get(&space)
         .is_some_and(|r| r.is_member(&peer));
-    let path = inner.blob_path(&hash);
+    let path = inner.blob_path(&space, &hash);
     match (req, allowed, path) {
         (_, false, _) | (_, _, None) => send(&mut tx, &BlobResp::Denied).await?,
         (BlobReq::Get { .. }, true, Some(path)) => match tokio::fs::read(&path).await {
@@ -436,6 +465,11 @@ async fn serve_blob(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
         (BlobReq::Put { len, .. }, true, Some(path)) => {
             if len > MAX_BLOB {
                 bail!("blob too large");
+            }
+            if inner.space_blob_bytes(&space) + len > MAX_SPACE_BLOBS {
+                send(&mut tx, &BlobResp::Denied).await?;
+                tx.finish()?;
+                return Ok(());
             }
             let mut bytes = vec![0u8; len as usize];
             rx.read_exact(&mut bytes).await?;
@@ -517,12 +551,12 @@ async fn sync_session(inner: &Arc<Inner>, peer: SignPk, space: SpaceId, trust_pe
 }
 
 async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
-    if !inner.inflight.lock().unwrap().insert((peer, space)) {
+    if !inner.inflight.lock().insert((peer, space)) {
         return;
     }
     let _slot = inner.sync_slots.acquire().await;
     let res = tokio::time::timeout(SESSION_TIMEOUT, sync_session(&inner, peer, space, false)).await;
-    inner.inflight.lock().unwrap().remove(&(peer, space));
+    inner.inflight.lock().remove(&(peer, space));
     match res {
         Ok(Ok(_)) => inner.mark_ok(peer),
         _ => inner.mark_fail(peer),
@@ -539,16 +573,16 @@ async fn scheduler(inner: Arc<Inner>) {
         }
         tokio::time::sleep(DEBOUNCE).await;
         let periodic = last_full.elapsed() >= PERIODIC_SYNC;
-        let explicit: HashSet<SpaceId> = std::mem::take(&mut *inner.dirty.lock().unwrap());
+        let explicit: HashSet<SpaceId> = std::mem::take(&mut *inner.dirty.lock());
         let mut dirty = explicit.clone();
         if periodic {
             last_full = Instant::now();
-            dirty.extend(inner.spaces.lock().unwrap().keys().copied());
+            dirty.extend(inner.spaces.lock().keys().copied());
         }
         let me = inner.keys.sign_pk();
         let targets: Vec<(SignPk, SpaceId)> = {
-            let spaces = inner.spaces.lock().unwrap();
-            let peers = inner.peers.lock().unwrap();
+            let spaces = inner.spaces.lock();
+            let peers = inner.peers.lock();
             dirty
                 .iter()
                 .filter_map(|s| spaces.get(s).map(|r| (s, r)))
@@ -586,7 +620,7 @@ async fn watch_mdns(inner: Arc<Inner>, mdns: MdnsAddressLookup) {
                     .user_data()
                     .and_then(|u| u.as_ref().strip_prefix("mycel:").map(str::to_string));
                 let newly = {
-                    let mut peers = inner.peers.lock().unwrap();
+                    let mut peers = inner.peers.lock();
                     let p = peers.entry(pk).or_default();
                     let newly = !p.nearby || p.name != name;
                     p.nearby = true;
@@ -599,7 +633,6 @@ async fn watch_mdns(inner: Arc<Inner>, mdns: MdnsAddressLookup) {
                     let shared: Vec<SpaceId> = inner
                         .spaces
                         .lock()
-                        .unwrap()
                         .iter()
                         .filter(|(_, r)| r.is_member(&pk))
                         .map(|(s, _)| *s)
@@ -611,7 +644,7 @@ async fn watch_mdns(inner: Arc<Inner>, mdns: MdnsAddressLookup) {
             }
             DiscoveryEvent::Expired { endpoint_id } => {
                 let pk = to_sign_pk(&endpoint_id);
-                if let Some(p) = inner.peers.lock().unwrap().get_mut(&pk) {
+                if let Some(p) = inner.peers.lock().get_mut(&pk) {
                     p.nearby = false;
                 }
                 inner.emit(NetEvent::PeersChanged);
@@ -679,6 +712,7 @@ impl Node {
             store: opts.store,
             blob_dir: opts.blob_dir,
             invite_policy: opts.invite_policy,
+            accept_relay_invites: opts.accept_relay_invites,
             feed_validator: opts.feed_validator,
             spaces: Mutex::default(),
             peers: Mutex::default(),
@@ -737,7 +771,7 @@ impl Node {
     }
 
     pub fn set_name(&self, name: &str) {
-        *self.inner.name.lock().unwrap() = name.to_string();
+        *self.inner.name.lock() = name.to_string();
         if self.inner.mode != NetMode::Local {
             self.router
                 .endpoint()
@@ -746,11 +780,11 @@ impl Node {
     }
 
     pub fn card(&self) -> ContactCard {
-        ContactCard::new(&self.inner.keys, &self.inner.name.lock().unwrap())
+        ContactCard::new(&self.inner.keys, &self.inner.name.lock())
     }
 
     pub fn peers(&self) -> HashMap<SignPk, PeerState> {
-        self.inner.peers.lock().unwrap().clone()
+        self.inner.peers.lock().clone()
     }
 
     // ───────────── spaces ─────────────
@@ -760,7 +794,7 @@ impl Node {
         let (mut r, genesis) = Replica::create(self.inner.keys.clone(), self.inner.store.clone())?;
         self.inner.prepare(&mut r);
         let id = r.space_id();
-        self.inner.spaces.lock().unwrap().insert(id, r);
+        self.inner.spaces.lock().insert(id, r);
         Ok((id, genesis))
     }
 
@@ -768,7 +802,7 @@ impl Node {
         let mut r = Replica::join(self.inner.keys.clone(), genesis, self.inner.store.clone())?;
         self.inner.prepare(&mut r);
         let id = r.space_id();
-        self.inner.spaces.lock().unwrap().entry(id).or_insert(r);
+        self.inner.spaces.lock().entry(id).or_insert(r);
         Ok(id)
     }
 
@@ -776,12 +810,12 @@ impl Node {
     pub fn insert_replica(&self, mut r: Replica) -> SpaceId {
         self.inner.prepare(&mut r);
         let id = r.space_id();
-        self.inner.spaces.lock().unwrap().insert(id, r);
+        self.inner.spaces.lock().insert(id, r);
         id
     }
 
     pub fn space_ids(&self) -> Vec<SpaceId> {
-        self.inner.spaces.lock().unwrap().keys().copied().collect()
+        self.inner.spaces.lock().keys().copied().collect()
     }
 
     /// Run `f` against a Space replica (sync lock: no awaiting inside).
@@ -877,8 +911,8 @@ impl Node {
         Ok(())
     }
 
-    pub fn blob_path(&self, hash: &Hash32) -> Option<PathBuf> {
-        self.inner.blob_path(hash).filter(|p| p.exists())
+    pub fn blob_path(&self, space: &SpaceId, hash: &Hash32) -> Option<PathBuf> {
+        self.inner.blob_path(space, hash).filter(|p| p.exists())
     }
 
     /// Store an (already encrypted) blob locally and push it to online
@@ -888,7 +922,7 @@ impl Node {
             bail!("file too large (max {} MiB)", MAX_BLOB / 1024 / 1024);
         }
         let hash = blob_hash(&bytes);
-        let path = self.inner.blob_path(&hash).context("blob storage disabled")?;
+        let path = self.inner.blob_path(&space, &hash).context("blob storage disabled")?;
         write_blob(&path, &bytes).await?;
         let me = self.id();
         let members: Vec<SignPk> = self.with_space(&space, |r| {
@@ -906,7 +940,7 @@ impl Node {
 
     /// Get a blob: local if present, otherwise from any member that has it.
     pub async fn fetch_blob(&self, space: SpaceId, hash: Hash32) -> Result<PathBuf> {
-        if let Some(p) = self.blob_path(&hash) {
+        if let Some(p) = self.blob_path(&space, &hash) {
             return Ok(p);
         }
         let me = self.id();
@@ -917,7 +951,7 @@ impl Node {
         members.sort_by_key(|pk| !peers.get(pk).is_some_and(|p| p.online()));
         for pk in members {
             if let Ok(bytes) = get_blob(&self.inner, pk, space, hash).await {
-                let path = self.inner.blob_path(&hash).context("blob storage disabled")?;
+                let path = self.inner.blob_path(&space, &hash).context("blob storage disabled")?;
                 write_blob(&path, &bytes).await?;
                 self.inner.emit(NetEvent::BlobStored { hash });
                 return Ok(path);

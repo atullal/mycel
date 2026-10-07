@@ -385,7 +385,7 @@ fn leave_forces_rotation_without_leaver() {
     let mut b = Peer::new();
     add(&mut g, &a, &b, Role::Writer);
     g.unlock(&b.keys, &mut b.ring);
-    let leave = g.leave(&b.keys).unwrap();
+    let leave = g.leave(&b.keys, None).unwrap();
     g.insert(leave.clone()).unwrap();
     assert!(g.is_valid(&leave.id()));
     assert!(g.state().role(&b.pk()).is_none());
@@ -396,7 +396,35 @@ fn leave_forces_rotation_without_leaver() {
     g.unlock(&b.keys, &mut b.ring);
     assert!(b.ring.get(&epoch).is_none(), "leaver can't read new epoch");
     // the last admin can't leave
-    let stuck = g.leave(&a.keys).unwrap();
+    let stuck = g.leave(&a.keys, None).unwrap();
     g.insert(stuck.clone()).unwrap();
     assert!(!g.is_valid(&stuck.id()));
+}
+
+#[test]
+fn epoch_ids_cannot_be_reused_with_a_different_key() {
+    let (mut g, a) = space();
+    let w = Peer::new();
+    add(&mut g, &a, &w, Role::Writer);
+    let (honest, _) = new_rotation([a.keys.public(), w.keys.public()].iter()).unwrap();
+    // Attacker copies the honest epoch id but uses its own key/commitment.
+    let (mut evil, _) = new_rotation([a.keys.public(), w.keys.public()].iter()).unwrap();
+    evil.epoch = honest.epoch;
+    let op = SignedOp::sign(&w.keys, Op {
+        space: Some(g.space_id()), parents: g.heads(), author: w.pk(), nonce: 5,
+        action: Action::Rotate { rotation: evil },
+    });
+    assert_eq!(g.insert(op), Err(TrustError::Malformed("epoch id must derive from commitment")));
+}
+
+#[test]
+fn ops_from_never_added_keys_are_dropped_at_the_door() {
+    let (mut g, _a) = space();
+    let outsider = Peer::new();
+    let junk = SignedOp::sign(&outsider.keys, Op {
+        space: Some(g.space_id()), parents: g.heads(), author: outsider.pk(), nonce: 1,
+        action: Action::Leave { cutoff: None },
+    });
+    assert!(matches!(g.insert(junk), Err(TrustError::NotAuthorized(_))));
+    assert_eq!(g.op_ids().len(), 1, "nothing stored");
 }
