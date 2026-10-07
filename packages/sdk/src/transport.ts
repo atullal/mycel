@@ -50,6 +50,8 @@ export interface Commands {
   add_keeper: [{ id: ConversationId; keeper: PeerId }, null];
   rename_conversation: [{ id: ConversationId; title: string }, null];
   fetch_attachment: [{ blob: string }, string];
+  accept_request: [{ id: ConversationId }, ConversationSummary];
+  decline_request: [{ id: ConversationId; block?: boolean | null }, null];
 }
 
 export type Command = keyof Commands;

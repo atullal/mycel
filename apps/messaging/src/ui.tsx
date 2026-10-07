@@ -129,6 +129,12 @@ export const Icon = {
       <path d="M8 3.5H5a1.5 1.5 0 0 0-1.5 1.5v10A1.5 1.5 0 0 0 5 16.5h3M12.5 13.5L16 10l-3.5-3.5M16 10H7.5" />
     </Svg>
   ),
+  Shield: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M10 2.5l6 2.3v4.6c0 3.8-2.5 6.6-6 8.1-3.5-1.5-6-4.3-6-8.1V4.8z" />
+      <path d="M7.5 10l1.8 1.8 3.4-3.6" />
+    </Svg>
+  ),
   Plus: (p: IconProps) => (
     <Svg {...p}>
       <path d="M10 4v12M4 10h12" />

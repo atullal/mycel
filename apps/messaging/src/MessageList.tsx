@@ -142,7 +142,8 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
                 onJump={jumpTo}
                 onReply={onReply}
                 onEdit={onEdit}
-                canAct={summary.active}
+                canAct={summary.active && !summary.request}
+                inert={summary.request}
                 flashing={flash === m.id}
                 editing={editingId === m.id}
                 me={me}
@@ -169,8 +170,11 @@ const MessageRow = memo(function MessageRow({
   flashing,
   editing,
   me,
+  inert,
 }: {
   me: string | undefined;
+  /** Message request: attachments and links stay closed until accepted. */
+  inert: boolean;
   m: MessageView;
   showAuthor: boolean;
   showAvatar: boolean;
@@ -234,13 +238,19 @@ const MessageRow = memo(function MessageRow({
                     <span className="mx-quote-text">{quoted ? previewText(quoted) : "Earlier message"}</span>
                   </button>
                 )}
-                {images.map((a) => (
-                  <ImageAttachment key={a.blob} a={a} />
-                ))}
-                {files.map((a) => (
-                  <FileAttachment key={a.blob} a={a} />
-                ))}
-                {m.body && <p className="mx-text">{linkify(m.body)}</p>}
+                {inert ? (
+                  m.attachments.map((a) => <InertAttachment key={a.blob} a={a} />)
+                ) : (
+                  <>
+                    {images.map((a) => (
+                      <ImageAttachment key={a.blob} a={a} />
+                    ))}
+                    {files.map((a) => (
+                      <FileAttachment key={a.blob} a={a} />
+                    ))}
+                  </>
+                )}
+                {m.body && <p className="mx-text">{inert ? m.body : linkify(m.body)}</p>}
               </>
             )}
             <span className="mx-meta">
@@ -389,6 +399,21 @@ function ImageAttachment({ a }: { a: Attachment }) {
         {state === "fetching" ? "Downloading" : "Download photo"}
       </button>
       {err && <span className="mx-file-err">{err}</span>}
+    </div>
+  );
+}
+
+/** An attachment in a message request: name and size only. Nothing is fetched, previewed or opened. */
+function InertAttachment({ a }: { a: Attachment }) {
+  return (
+    <div className="mx-file is-inert" title="Accept the request to download attachments">
+      <span className="mx-file-icon">
+        <Icon.File size={20} />
+      </span>
+      <span className="mx-file-text">
+        <span className="mx-file-name">{a.name}</span>
+        <span className="mx-file-size">{formatSize(a.size)}, opens after you accept</span>
+      </span>
     </div>
   );
 }

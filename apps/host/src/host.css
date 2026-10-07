@@ -97,6 +97,16 @@
 .rail-app.is-active .rail-count {
   background: var(--danger);
 }
+.rail-request-dot {
+  position: absolute;
+  top: -2px;
+  right: 2px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--nearby);
+  box-shadow: 0 0 0 2px var(--bg);
+}
 .rail-count.is-nearby {
   background: var(--nearby);
   color: #fff;

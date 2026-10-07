@@ -54,6 +54,13 @@ export interface ConversationSummary {
   /** False once we've been removed (history stays readable locally). */
   active: boolean;
   myRole: MemberRole | null;
+  /**
+   * A message request: someone who isn't a contact added you. Nothing is
+   * posted (no receipts, no replies) until you accept; decline to leave.
+   */
+  request: boolean;
+  /** Who added you (for requests). */
+  invitedBy: PeerId | null;
 }
 
 export interface Attachment {

@@ -66,7 +66,9 @@ export function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [panel]);
 
-  const unread = conversations.reduce((n, c) => n + (c.active ? c.unread : 0), 0);
+  // Message requests are not unread messages: they get a quieter dot instead.
+  const unread = conversations.reduce((n, c) => n + (c.active && !c.request ? c.unread : 0), 0);
+  const requests = conversations.filter((c) => c.request).length;
   const newNearby = nearby.filter((n) => !n.isContact).length;
   const online = status?.onlinePeers.length ?? 0;
   const toggle = (p: PanelId) => setPanel((cur) => (cur === p ? null : p));
@@ -96,6 +98,9 @@ export function App() {
                   <span className="rail-app-icon">
                     <G />
                     {a.id === "messaging" && unread > 0 && <span className="rail-count">{unread > 9 ? "9+" : unread}</span>}
+                    {a.id === "messaging" && unread === 0 && requests > 0 && (
+                      <span className="rail-request-dot" title={`${requests} message request${requests > 1 ? "s" : ""}`} />
+                    )}
                   </span>
                   <span className="rail-app-name">{a.name}</span>
                 </button>

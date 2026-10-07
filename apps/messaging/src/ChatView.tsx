@@ -3,7 +3,7 @@ import { useMessages, useMycel, useTyping } from "@mycel/sdk/react";
 import type { Contact, ConversationSummary, MessageView } from "@mycel/sdk";
 import { MessageList } from "./MessageList.tsx";
 import { Composer } from "./Composer.tsx";
-import { ConversationAvatar, Icon } from "./ui.tsx";
+import { ConversationAvatar, Icon, errorText } from "./ui.tsx";
 
 export function ChatView({
   summary,
@@ -26,10 +26,12 @@ export function ChatView({
   const [replyTo, setReplyTo] = useState<MessageView | null>(null);
   const [editing, setEditing] = useState<MessageView | null>(null);
 
-  // Mark read while the conversation is on screen (re-checked when the window regains focus or visibility).
+  // Mark read while the conversation is on screen (re-checked when the window
+  // regains focus or visibility). Never for a message request: a read receipt
+  // would tell a stranger you've seen it.
   const unread = summary.unread;
   useEffect(() => {
-    if (!unread || !summary.active) return;
+    if (!unread || !summary.active || summary.request) return;
     const tryMark = () => {
       if (document.visibilityState === "visible") {
         void mycel.chat.markRead(summary.id).catch(() => {});
@@ -42,13 +44,14 @@ export function ChatView({
       window.removeEventListener("focus", tryMark);
       document.removeEventListener("visibilitychange", tryMark);
     };
-  }, [mycel, summary.id, unread, summary.active, messages.length]);
+  }, [mycel, summary.id, unread, summary.active, summary.request, messages.length]);
 
   const others = summary.members.filter((m) => !m.isMe && m.role !== "keeper");
   const keepers = summary.members.filter((m) => m.role === "keeper");
 
   const subtitle = useMemo(() => {
     if (!summary.active) return "You're no longer a member. History stays on this device.";
+    if (summary.request) return summary.direct ? "Message request" : `Message request, ${others.length + 1} people`;
     if (summary.direct) {
       const other = others[0];
       const contact = other ? contactsById.get(other.id) : undefined;
@@ -74,7 +77,7 @@ export function ChatView({
     setEditing(m);
   }, []);
 
-  const canPost = summary.active && summary.myRole !== "readOnly";
+  const canPost = summary.active && !summary.request && summary.myRole !== "readOnly";
 
   return (
     <section className="mx-chat" aria-label={summary.title}>
@@ -132,7 +135,9 @@ export function ChatView({
         )}
       </div>
 
-      {canPost ? (
+      {summary.request ? (
+        <RequestBar summary={summary} onDeclined={onBack} />
+      ) : canPost ? (
         <Composer
           conversation={summary}
           messages={messages}
@@ -150,5 +155,88 @@ export function ChatView({
         </div>
       )}
     </section>
+  );
+}
+
+/**
+ * Shown instead of the composer while a conversation is a message request.
+ * Nothing is sent to the inviter (no receipts, no typing, no replies) until
+ * the request is accepted.
+ */
+function RequestBar({ summary, onDeclined }: { summary: ConversationSummary; onDeclined: () => void }) {
+  const mycel = useMycel();
+  const [busy, setBusy] = useState<"accept" | "decline" | "block" | null>(null);
+  const [confirmBlock, setConfirmBlock] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const inviter = summary.members.find((m) => m.id === summary.invitedBy);
+  const name = inviter?.name || "Someone";
+  const first = name.split(" ")[0];
+
+  const run = async (kind: "accept" | "decline" | "block") => {
+    setBusy(kind);
+    setError(null);
+    try {
+      if (kind === "accept") {
+        await mycel.chat.acceptRequest(summary.id);
+        setBusy(null);
+      } else {
+        await mycel.chat.declineRequest(summary.id, { block: kind === "block" });
+        onDeclined();
+      }
+    } catch (e) {
+      setError(errorText(e));
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="mx-request" role="region" aria-label="Message request">
+      <div className="mx-request-text">
+        <Icon.Shield size={20} />
+        <div>
+          <p className="mx-request-lead">
+            {summary.direct
+              ? `${name} isn't in your contacts.`
+              : `${name} added you to ${summary.title}. ${first} isn't in your contacts.`}{" "}
+            They can't see anything about you until you accept.
+          </p>
+          <p className="mx-request-note">
+            Accepting adds {first} to your contacts and lets you reply. Declining leaves quietly, and they aren't told
+            whether you read anything. Attachments and links stay closed until you accept.
+          </p>
+        </div>
+      </div>
+      {error && (
+        <p className="mx-request-error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="mx-request-actions">
+        {confirmBlock ? (
+          <>
+            <span className="mx-request-confirm">Block {first}? You won't get requests from them again.</span>
+            <button className="mx-btn mx-btn-quiet" onClick={() => setConfirmBlock(false)} disabled={!!busy}>
+              Cancel
+            </button>
+            <button className="mx-btn mx-btn-danger" onClick={() => void run("block")} disabled={!!busy} autoFocus>
+              {busy === "block" ? "Blocking…" : "Block and decline"}
+            </button>
+          </>
+        ) : (
+          <>
+            <button className="mx-btn mx-btn-text-danger" onClick={() => setConfirmBlock(true)} disabled={!!busy}>
+              Block
+            </button>
+            <button className="mx-btn mx-btn-quiet" onClick={() => void run("decline")} disabled={!!busy}>
+              {busy === "decline" ? "Declining…" : "Decline"}
+            </button>
+            <button className="mx-btn mx-btn-primary" onClick={() => void run("accept")} disabled={!!busy}>
+              {busy === "accept" ? "Accepting…" : "Accept"}
+            </button>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
