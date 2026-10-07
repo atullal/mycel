@@ -84,9 +84,11 @@ Pick either way:
 - **Contact codes.** On laptop A: **Profile** > *Your contact code* > copy it
   (or show the QR code). Send it to laptop B any way you like (AirDrop, a USB
   stick, read it out). On laptop B: **Contacts** > *Add by contact code* >
-  paste > Add. A contact code holds the person's keys and name but **no network
-  address**: in `lan` mode the two laptops still find each other's address via
-  mDNS, so contact codes don't help on a network that blocks mDNS.
+  paste > Add. A contact code holds the person's keys and name, plus the
+  laptop's current LAN addresses (the part after `@`). That means **contact
+  codes work even on networks that block mDNS**, as long as the two laptops
+  can reach each other's IP. If the address changes (a new network, a new
+  DHCP lease), mDNS or a fresh code fixes it.
 
 ## 4. Send messages and files
 
@@ -205,10 +207,18 @@ MYCEL_DATA_DIR=/tmp/mycel-b MYCEL_NAME="Laptop B" MYCEL_NET=lan "$APP" &
 - Wait 10 to 20 seconds; mDNS announcements are periodic. Quitting and
   reopening Mycel on both sides forces fresh announcements.
 - Still nothing? The network (or a firewall) is probably blocking mDNS
-  (UDP port 5353 multicast) or traffic between devices, and Mycel's `lan` mode
-  can't work there. Switch networks: a phone hotspot or a direct cable between
+  (UDP port 5353 multicast). **Exchange contact codes instead**: they carry
+  the laptop's IP addresses, so the laptops connect directly without
+  discovery. If even that fails, the network blocks traffic between devices
+  (client isolation). Switch networks: a phone hotspot or a direct cable between
   the two Macs is the most reliable. (Mycel's mDNS records aren't standard
   Bonjour services, so `dns-sd -B` won't list them; that's expected.)
+
+### Message requests
+If the other laptop starts a chat with you before you've added it as a
+contact, the chat shows up as a **request**. Click **Accept** to reply (the
+person is then added to your contacts), or **Decline** / **Block**. People
+who aren't your contacts can't see your name or profile until you accept.
 
 **"Mycel is damaged and can't be opened"** — this is Gatekeeper's quarantine on
 a downloaded unsigned app, not real damage. Run

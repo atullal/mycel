@@ -130,7 +130,7 @@ ciphertext = XChaCha20-Poly1305(key = epoch key, nonce, aad = "mycel/v0/content"
 
 ## 8. Transport rules
 
-- **ALPN** `mycel/sync/0`. Iroh authenticates the remote node ID, which equals the remote `sign_pk`.
+- **ALPN** `mycel/sync/1` (plus `mycel/card/0`, `mycel/eph/0`, `mycel/blob/0`). Iroh authenticates the remote node ID, which equals the remote `sign_pk`.
 - **Responders serve a space only to its current members**, including Relays. Requests from non-members are refused.
 - **Sync order:** membership ops first, then envelopes (set difference over IDs in v0; range-based reconciliation later).
 - **Everything received is validated by the receiver.** Nothing is trusted because of who sent it.
@@ -143,6 +143,32 @@ ciphertext = XChaCha20-Poly1305(key = epoch key, nonce, aad = "mycel/v0/content"
 | §3–§6 graph, resolution, epochs | `crates/mycel-trust` (`resolve.rs` = §5) | 13 tests: forged admin ops, pending ops, removal + rotation, concurrent revocation, mutual removal (seniority), delivery-order convergence, rotation recipient checks, bad key commitment, last admin, self-healing rotation |
 | §7 envelopes | `crates/mycel-sync` | 9 tests: replication, reader writes rejected, keeper can't read, outsider/tampered envelopes, forged actor, backdated writes after removal, 3-way convergence, demotion |
 | §8 transport | `crates/mycel-net` | end-to-end over real Iroh QUIC: 5 nodes (admin, writer, reader, keeper, outsider) |
+
+## 9b. Security review (2026-10-07) — fixed
+
+An independent adversarial review found these issues. All are fixed, each with a regression test:
+
+| # | Severity | Issue | Fix |
+|---|---|---|---|
+| 1 | Critical | Peer-chosen attachment names allowed path traversal on download | Strict basename sanitizer, paths confined to `files/`, macOS quarantine xattr on downloads, opener scope narrowed |
+| 2 | High | Any LAN outsider could push a conversation and impersonate a name | Invites from non-contacts become **message requests** (nothing is trusted or posted until Accept), Decline/Block, blocked keys refused at the network layer, Relay-role invites refused on personal devices |
+| 3 | High | Pre-authentication CPU/RAM exhaustion via junk ops and envelopes | Ops and envelopes from never-added keys are dropped before storage; caps on parents, auth_heads, pending ops, invite size and lockboxes; bounded state cache; index passed to replay |
+| 4 | High | Epoch-ID reuse with a different key could break convergence | `EpochId = H(commitment)`, checked structurally; unlock verifies each key against its own op's commitment |
+| 5 | Medium | Duplicate Automerge (actor, seq) could make docs diverge | Equivocation detected: the lowest envelope ID wins on every peer, and the doc is rebuilt canonically |
+| 6 | Medium | Overflow panic poisoned the global lock (crash loop) | `checked_add`; `parking_lot` mutexes (no poisoning) |
+| 7 | Low | Members who had left could keep posting with backdated heads | `Leave` carries a cutoff and is treated as a revocation |
+| 8 | Low | Blobs weren't scoped to a space, and had no quota | Per-space blob directories, 2 GiB per-space quota |
+| 9 | Low | Local HTTP API gaps | Per-run secret token (embedded in the page, `0600` file for the CLI) on every route; file serving limited to attachment folders; browser attachments must come from uploads |
+
+**Still open:**
+- `NeedInvite` vs `Denied` reveals whether a node holds a space whose 256-bit ID you already know.
+- mDNS and the card protocol reveal device names and public keys on the LAN, by design.
+
+**Spec drift fixed in this doc:**
+- The sync ALPN is `mycel/sync/1`.
+- The header field is `stream` (Doc or Feed), not `doc`.
+- Seniority is computed from ops that pass authorization ignoring concurrency.
+- Forks before a cutoff are tolerated but not yet surfaced in the UI.
 
 ## 10. Known v0 gaps (tracked)
 - **Post-quantum:** lockboxes are long-lived ciphertext stored on keepers, so they are exposed to harvest-now-decrypt-later attacks. Move to X-Wing (hybrid ML-KEM + X25519, already supported by `hpke` 0.14) once the IETF draft is final.
