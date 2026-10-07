@@ -11,5 +11,7 @@ pub use mycel_net as net;
 pub use mycel_sync as sync;
 pub use mycel_trust as trust;
 
+pub mod api;
+
 pub use mycel_net::{NetMode, Node};
 pub use mycel_trust::Role;
