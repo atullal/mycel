@@ -1,7 +1,7 @@
 # Mycel — architecture for peer-to-peer, authenticated, fully distributed apps
 
 > Working codename **Mycel** (after mycelium: an underground network with no center). Rename freely.
-> Status: design v0.2 — 2026-10-07. Phase 0 implemented (`crates/`); trust layer specified in [TRUST.md](TRUST.md).
+> Status: v0.3 — 2026-10-07. Phase 0 and phase 1 (platform v0 + Messaging) are implemented. See [§11 Implementation status](#11-implementation-status-2026-10-07). The trust layer is specified in [TRUST.md](TRUST.md).
 > Validation targets: **Messaging**, **Newsroom**, **Collaborative docs**, **Turn-based narrative RPG** (Disco Elysium–like).
 
 ---
@@ -338,3 +338,19 @@ Needs atomic multi-file snapshots and conflict surfacing for code, which plain A
 - **Trust layer:** our own minimal, secure layer (TRUST.md), migrating to Keyhive later.
 - **Name:** Mycel.
 - **Sync:** our own envelope protocol instead of samod (see L3).
+
+## 11. Implementation status (2026-10-07)
+
+| Layer | Built | Not yet |
+|---|---|---|
+| **L0 Network** | Iroh 1.3 QUIC dialed by key. Modes: `lan` (mDNS only, no internet), `internet` (n0 relays, DNS discovery, mDNS), `local` (tests). Live sync engine: push on change, epidemic forwarding, 15 s periodic sync, backoff. ALPNs: sync, card, ephemeral, blob. | DHT discovery; self-hosted relay config |
+| **L1 Identity** | Device keys (seed file `identity.key`, mode 0600), signed contact cards and codes, contacts, LAN names | Multi-device agents, personas, OS keychain, social recovery |
+| **L2 Trust** | Membership DAG, deterministic resolution (seniority, revocation wins, cutoffs), epochs + HPKE lockboxes, self-healing rotation, Leave | External crypto review; X-Wing (post-quantum) lockboxes; TreeKEM-style rotation |
+| **L3 Data** | Docs (Automerge), Feeds (causal, deterministic order), Blobs (encrypted, content-addressed, pushed/pulled), ephemeral Channels, redb storage with batched writes, restore on start, delivery tracking | Range-based set reconciliation, compaction |
+| **L4 Rules** | wasmi 2.0 deterministic engine (fuel, memory caps, no floats/imports). Chat rules (Rust → 14 KB WASM) run on every decrypted feed entry on every peer. | Rules pinned as a membership op; Doc path policies; action reducers in production |
+| **L5 SDK + Kits** | `@mycel/sdk` (types, Tauri/HTTP/mock transports, React hooks); Chat kit (Rust ops + deterministic reducer) | RichText, Workflow, Game kits |
+| **L6 Host** | Tauri 2 host shell (apps rail, profile/contacts/nearby/network panels); `mycel serve` web host; `mycel keeper` | App sandboxing via iframes + manifests |
+| **Keepers** | `mycel keeper`: accepts spaces, stores and serves ciphertext, never decrypts | Push wake-ups (APNs/FCM) for mobile |
+| **Apps** | **Messaging**: DMs, groups, replies, edits, deletes, reactions, read receipts, typing, files, members, keepers, leave | Docs, Newsroom, RPG |
+
+Tests: 73 Rust tests, including real-QUIC multi-node, real mDNS, runtime end-to-end with storage, and keeper offline delivery. Plus a UI end-to-end run driven in headless Chrome against real LAN devices. See [TESTING.md](TESTING.md).

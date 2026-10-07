@@ -25,17 +25,19 @@ impl Runtime {
     pub fn conversation(&self, id: ConversationId) -> Result<ConversationSummary>;
     pub fn create_conversation(&self, title: Option<String>, members: Vec<PeerId>) -> Result<ConversationSummary>;
     pub fn messages(&self, id: ConversationId, limit: Option<u32>, before: Option<MessageId>) -> Result<Vec<MessageView>>; // oldest → newest
-    pub fn send_message(&self, id: ConversationId, body: String, reply_to: Option<MessageId>, attachments: Vec<String> /* file paths */) -> Result<MessageView>;
+    pub async fn send_message(&self, id: ConversationId, body: String, reply_to: Option<MessageId>, attachments: Vec<String> /* file paths */) -> Result<MessageView>;
     pub fn edit_message(&self, id: ConversationId, message: MessageId, body: String) -> Result<()>;
     pub fn delete_message(&self, id: ConversationId, message: MessageId) -> Result<()>;
     pub fn toggle_reaction(&self, id: ConversationId, message: MessageId, emoji: String) -> Result<()>;
     pub fn mark_read(&self, id: ConversationId) -> Result<()>;
     pub fn set_typing(&self, id: ConversationId) -> Result<()>;
     pub fn add_members(&self, id: ConversationId, members: Vec<PeerId>) -> Result<()>;
-    pub fn remove_member(&self, id: ConversationId, member: PeerId) -> Result<()>;
+    pub fn remove_member(&self, id: ConversationId, member: PeerId) -> Result<()>;   // member == me → leave
+    pub fn leave_conversation(&self, id: ConversationId) -> Result<()>;
     pub fn add_keeper(&self, id: ConversationId, keeper: PeerId) -> Result<()>;   // keeper must be a contact
     pub fn rename_conversation(&self, id: ConversationId, title: String) -> Result<()>;
     pub async fn fetch_attachment(&self, blob: String) -> Result<String>;       // local file path
+    pub async fn sync_now(&self);                                               // pull-to-refresh
 }
 ```
 
@@ -79,3 +81,29 @@ Errors are rejected promises carrying a human-readable string.
 - **Message order:** messages arrive in causal order. `sentAt` is display-only (the author's clock).
 - **Attachments are lazy:** an attachment's `localPath` is `null` until fetched. Call `fetch_attachment`, then wait for `blobReady`.
 - **Offline-first:** everything works with no network at all. Peers on the same LAN find each other via mDNS with no internet.
+
+## Answers to contract questions (v0)
+- **Leaving:** call `remove_member(id, myId)`. Anyone can leave; the last admin can't. Leaving doesn't rotate keys itself; the next writer automatically rotates to a key the leaver doesn't have.
+- **Contact codes** are opaque strings: `mycel:` + base64url(signed contact card). Paste them as-is.
+- **Untitled groups** show the members' names. Renaming makes a conversation a group. `create_conversation` always creates a new conversation.
+- **Keepers** don't count toward `delivered` or `read`; they only make `sent` possible while everyone else is offline.
+- **`localPath`** is a filesystem path under the data dir: `files/<blob>/<name>`. Senders also get a decrypted copy there.
+- **`fetch_attachment`** resolves after the file is downloaded and decrypted, and also emits `blobReady`.
+- **Deleted messages** come back with an empty body and no attachments or reactions.
+- **Typing:** your own typing events are never echoed back to you.
+- **Pagination:** `list_messages` returns the newest `limit` messages (default 200) older than `before`.
+
+## HTTP transport (`mycel serve`)
+`mycel serve` exposes the same command table on `http://127.0.0.1:<port>`. It refuses to listen on anything but loopback.
+
+| Route | What |
+|---|---|
+| `POST /api/cmd/<command>` | JSON args → JSON result; errors are `400 {"error": "..."}`. Requires the header `X-Mycel: 1`. |
+| `GET /api/events` | Server-Sent Events, one JSON `Event` per message |
+| `POST /api/upload?name=<file>` | Raw body → `{"path": "..."}` to pass in `attachments`. Requires `X-Mycel: 1`. |
+| `GET /api/file?path=<path>` | Serves files under the data dir only (sandboxed, nosniff) |
+| `GET /api/boot.js` | Tells `@mycel/sdk` to use the HTTP transport |
+
+**Security:**
+- The `Host` header must be a loopback host, which blocks DNS rebinding.
+- API calls need the `X-Mycel` header. A cross-site page can't send it without a CORS preflight, and the server never approves preflights.
