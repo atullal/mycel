@@ -1,15 +1,23 @@
 {
   "name": "am",
   "version": "1.0.0",
+  "private": true,
   "description": "",
-  "main": "index.js",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "npm run dev -w @mycel/host",
+    "build": "npm run build -w @mycel/host",
+    "typecheck": "npm run typecheck --workspaces --if-present"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "type": "module",
+  "main": "index.js",
   "dependencies": {
     "@automerge/automerge": "^3.5.0",
     "@automerge/automerge-repo": "^2.6.0-alpha.3",

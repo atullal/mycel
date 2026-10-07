@@ -1,2 +1,5 @@
 /target
-/node_modules
+node_modules/
+dist/
+apps/host/src-tauri/target/
+apps/host/src-tauri/gen/
