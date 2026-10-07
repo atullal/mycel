@@ -846,6 +846,12 @@ impl Replica {
         Ok(op)
     }
 
+    pub fn leave(&mut self) -> Result<SignedOp> {
+        let op = self.graph.leave(&self.me)?;
+        self.ingest_op(op.clone())?;
+        Ok(op)
+    }
+
     pub fn set_role(&mut self, member: SignPk, role: Role) -> Result<SignedOp> {
         let cutoff = self.latest_from(&member);
         let (op, new_key) = self.graph.set_role(&self.me, member, role, cutoff)?;

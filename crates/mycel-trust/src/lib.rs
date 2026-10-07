@@ -116,6 +116,10 @@ pub enum Action {
     Rotate {
         rotation: Rotation,
     },
+    /// The author leaves voluntarily. No rotation (the leaver must not pick
+    /// the next key): no epoch then matches the remaining readers, so the next
+    /// writer rotates automatically (TRUST.md §6).
+    Leave,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -733,6 +737,14 @@ impl SpaceGraph {
             },
         );
         Ok((op, new_key))
+    }
+
+    /// Any member: leave the space.
+    pub fn leave(&self, me: &DeviceKeys) -> Result<SignedOp> {
+        if self.state().role(&me.sign_pk()).is_none() {
+            return Err(TrustError::NotAuthorized("not a member"));
+        }
+        Ok(self.author_op(me, Action::Leave))
     }
 
     /// Writer+: rotate to a fresh epoch for exactly the current readers.

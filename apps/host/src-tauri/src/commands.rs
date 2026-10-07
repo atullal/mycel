@@ -106,6 +106,7 @@ pub async fn send_message(
     attachments: Option<Vec<String>>,
 ) -> Res<MessageView> {
     rt.send_message(id, body, reply_to, attachments.unwrap_or_default())
+        .await
         .map_err(err)
 }
 

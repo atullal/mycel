@@ -528,7 +528,8 @@ async fn scheduler(inner: Arc<Inner>) {
         }
         tokio::time::sleep(DEBOUNCE).await;
         let periodic = last_full.elapsed() >= PERIODIC_SYNC;
-        let mut dirty: HashSet<SpaceId> = std::mem::take(&mut *inner.dirty.lock().unwrap());
+        let explicit: HashSet<SpaceId> = std::mem::take(&mut *inner.dirty.lock().unwrap());
+        let mut dirty = explicit.clone();
         if periodic {
             last_full = Instant::now();
             dirty.extend(inner.spaces.lock().unwrap().keys().copied());
@@ -540,8 +541,9 @@ async fn scheduler(inner: Arc<Inner>) {
             dirty
                 .iter()
                 .filter_map(|s| spaces.get(s).map(|r| (s, r)))
-                // no longer a member: nobody will talk to us about this space
-                .filter(|(_, r)| r.my_role().is_some())
+                // No longer a member: only push explicit local changes (e.g. our
+                // own Leave op); periodic syncs would just be refused.
+                .filter(|(s, r)| explicit.contains(*s) || r.my_role().is_some())
                 .flat_map(|(s, r)| {
                     r.members()
                         .into_iter()

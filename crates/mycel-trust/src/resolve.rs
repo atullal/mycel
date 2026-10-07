@@ -244,6 +244,11 @@ fn authorized(op: &SignedOp, idx: usize, st: &MemberState) -> bool {
                 && fresh_epoch(st, rotation)
                 && recipients(rotation) == st.readers()
         }
+        Action::Leave => {
+            let mut after = st.clone();
+            after.members.remove(&op.op.author);
+            author_role.is_some() && after.admin_count() > 0
+        }
     }
 }
 
@@ -317,6 +322,9 @@ fn replay(
                 push_epoch(&mut st, rotation, id);
             }
             Action::Rotate { rotation } => push_epoch(&mut st, rotation, id),
+            Action::Leave => {
+                st.members.remove(&op.author);
+            }
         }
     }
     st

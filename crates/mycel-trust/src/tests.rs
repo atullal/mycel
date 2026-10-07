@@ -378,3 +378,25 @@ fn insert_many_matches_sequential_inserts() {
     assert_eq!((added.len(), rejected), (5, 0));
     assert_eq!(b.state(), g.state());
 }
+
+#[test]
+fn leave_forces_rotation_without_leaver() {
+    let (mut g, mut a) = space();
+    let mut b = Peer::new();
+    add(&mut g, &a, &b, Role::Writer);
+    g.unlock(&b.keys, &mut b.ring);
+    let leave = g.leave(&b.keys).unwrap();
+    g.insert(leave.clone()).unwrap();
+    assert!(g.is_valid(&leave.id()));
+    assert!(g.state().role(&b.pk()).is_none());
+    assert_eq!(g.state().write_epoch(), None, "old epoch includes the leaver");
+    g.unlock(&a.keys, &mut a.ring);
+    let (rot, epoch, _) = g.rotate(&a.keys).unwrap();
+    g.insert(rot).unwrap();
+    g.unlock(&b.keys, &mut b.ring);
+    assert!(b.ring.get(&epoch).is_none(), "leaver can't read new epoch");
+    // the last admin can't leave
+    let stuck = g.leave(&a.keys).unwrap();
+    g.insert(stuck.clone()).unwrap();
+    assert!(!g.is_valid(&stuck.id()));
+}

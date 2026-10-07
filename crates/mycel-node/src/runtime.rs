@@ -815,12 +815,26 @@ impl Runtime {
         Ok(())
     }
 
+    /// Remove someone (admins), or leave (anyone, when `member` is yourself).
     pub fn remove_member(&self, id: ConversationId, member: PeerId) -> Result<()> {
         let space = parse_space(&id)?;
-        self.require_admin(&space)?;
         let pk = parse_pk(&member)?;
+        if pk == self.keys.sign_pk() {
+            return self.leave_conversation(id);
+        }
+        self.require_admin(&space)?;
         self.node.with_space(&space, |r| r.remove_member(pk))??;
         self.node.changed(space);
+        Ok(())
+    }
+
+    pub fn leave_conversation(&self, id: ConversationId) -> Result<()> {
+        let space = parse_space(&id)?;
+        self.node.with_space(&space, |r| r.leave())?
+            .map_err(|e| anyhow!("can't leave: {e} (the last admin must remove others or promote someone first)"))?;
+        // tell everyone before we stop syncing this space
+        let node_space = space;
+        self.node.changed(node_space);
         Ok(())
     }
 
