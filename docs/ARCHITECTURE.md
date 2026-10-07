@@ -312,6 +312,14 @@ Everything else (sync, encryption, keepers, invites, presence, audit) comes from
 
 ---
 
+## 8b. Future app: peer-to-peer version control (from user, 2026-10-07)
+Automerge-based version control for humans **and agents**:
+- Each agent is a member with Writer access to its own branch.
+- Humans review and merge proposals; every change is signed.
+- Repos sync between devices with no central host.
+
+Needs atomic multi-file snapshots and conflict surfacing for code, which plain Automerge merges don't give. Built on L4 Proposals plus the Workflow kit. Planned after the four target apps. Until then, this repo itself uses git.
+
 ## 9. Top risks
 1. **Keyhive maturity:** pre-1.0 and unaudited. Mitigation: the `Trust` trait; a minimal fallback built on `keyhive_crypto` primitives.
 2. **Encrypted sync through keepers:** keepers can't merge ciphertext, so storage grows until members compact it. Track Subduction/sedimentree.

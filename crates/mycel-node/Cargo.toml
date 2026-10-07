@@ -8,6 +8,8 @@ mycel-crypto = { version = "0.1.0", path = "../mycel-crypto" }
 mycel-net = { version = "0.1.0", path = "../mycel-net" }
 mycel-sync = { version = "0.1.0", path = "../mycel-sync" }
 mycel-trust = { version = "0.1.0", path = "../mycel-trust" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 [dev-dependencies]
 anyhow = "1.0.104"

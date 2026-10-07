@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 iroh = "1.3"
+iroh-mdns-address-lookup = "0.6.0"
 mycel-crypto = { version = "0.1.0", path = "../mycel-crypto" }
 mycel-sync = { version = "0.1.0", path = "../mycel-sync" }
 mycel-trust = { version = "0.1.0", path = "../mycel-trust" }
