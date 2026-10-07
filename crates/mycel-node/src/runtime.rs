@@ -80,6 +80,10 @@ pub struct Runtime {
     contacts: Mutex<BTreeMap<SignPk, StoredContact>>,
     mode: NetworkMode,
     keeper: bool,
+    /// Reduced chat views, invalidated whenever a space changes.
+    views: Mutex<HashMap<SpaceId, Arc<ChatView>>>,
+    /// Names people announced (Profile ops), across all conversations.
+    announced: Mutex<HashMap<SignPk, String>>,
 }
 
 // ───────────────────────────── helpers ─────────────────────────────
@@ -267,7 +271,13 @@ impl Runtime {
             contacts: Mutex::new(contacts),
             mode: opts.mode,
             keeper: opts.keeper,
+            views: Mutex::default(),
+            announced: Mutex::default(),
         });
+        // warm caches (also learns everyone's announced names)
+        for s in rt.node.space_ids() {
+            let _ = rt.view(&s);
+        }
         tokio::spawn(bridge(Arc::downgrade(&rt), rt.node.subscribe()));
         // catch up with everyone right away
         for s in rt.node.space_ids() {
@@ -430,12 +440,9 @@ impl Runtime {
         if let Some(n) = contact_name.filter(|n| !n.is_empty()) {
             return n;
         }
-        for space in self.node.space_ids() {
-            if let Ok(view) = self.view(&space)
-                && let Some(n) = view.names.get(pk)
-            {
-                return n.clone();
-            }
+        let announced = self.announced.lock().unwrap().get(pk).cloned();
+        if let Some(n) = announced {
+            return n;
         }
         if let Some(n) = self.node.peers().get(pk).and_then(|p| p.name.clone()) {
             return n;
@@ -449,16 +456,35 @@ impl Runtime {
         self.node.with_space(space, |r| r.my_role()).ok().flatten()
     }
 
-    fn view(&self, space: &SpaceId) -> Result<ChatView> {
+    fn view(&self, space: &SpaceId) -> Result<Arc<ChatView>> {
+        if let Some(v) = self.views.lock().unwrap().get(space) {
+            return Ok(v.clone());
+        }
         let items = self.node.with_space(space, |r| r.feed(&messages_feed()))?;
-        Ok(reduce(&items))
+        let view = Arc::new(reduce(&items));
+        self.announced
+            .lock()
+            .unwrap()
+            .extend(view.names.iter().map(|(k, v)| (*k, v.clone())));
+        self.views.lock().unwrap().insert(*space, view.clone());
+        Ok(view)
+    }
+
+    fn invalidate(&self, space: &SpaceId) {
+        self.views.lock().unwrap().remove(space);
+    }
+
+    /// A local change: drop the cached view now, then sync + notify.
+    fn touch(&self, space: SpaceId) {
+        self.invalidate(&space);
+        self.node.changed(space);
     }
 
     fn post(&self, space: SpaceId, op: ChatOp) -> Result<Hash32> {
         let (_, env) = self
             .node
             .with_space(&space, |r| r.append(messages_feed(), op.encode()))??;
-        self.node.changed(space);
+        self.touch(space);
         Ok(env.id())
     }
 
@@ -645,7 +671,7 @@ impl Runtime {
             r.append(messages_feed(), ChatOp::Profile { name }.encode())?;
             Ok(())
         })??;
-        self.node.changed(space);
+        self.touch(space);
         self.emit(Event::ConversationAdded { conversation: space.to_string() });
         self.summary(&space)
     }
@@ -842,7 +868,7 @@ impl Runtime {
             }
             Ok(())
         })??;
-        self.node.changed(space);
+        self.touch(space);
         Ok(())
     }
 
@@ -851,7 +877,7 @@ impl Runtime {
         self.require_admin(&space)?;
         let k = self.contact_keys(&keeper)?;
         self.node.with_space(&space, |r| r.add_member(k, Role::Relay))??;
-        self.node.changed(space);
+        self.touch(space);
         Ok(())
     }
 
@@ -864,7 +890,7 @@ impl Runtime {
         }
         self.require_admin(&space)?;
         self.node.with_space(&space, |r| r.remove_member(pk))??;
-        self.node.changed(space);
+        self.touch(space);
         Ok(())
     }
 
@@ -874,7 +900,7 @@ impl Runtime {
             .map_err(|e| anyhow!("can't leave: {e} (the last admin must remove others or promote someone first)"))?;
         // tell everyone before we stop syncing this space
         let node_space = space;
-        self.node.changed(node_space);
+        self.touch(node_space);
         Ok(())
     }
 
@@ -905,9 +931,11 @@ async fn bridge(rt: Weak<Runtime>, mut rx: broadcast::Receiver<NetEvent>) {
         let Some(rt) = rt.upgrade() else { return };
         match ev {
             NetEvent::SpaceChanged { space } => {
+                rt.invalidate(&space);
                 rt.emit(Event::ConversationUpdated { conversation: space.to_string() });
             }
             NetEvent::SpaceAdded { space, from } => {
+                rt.invalidate(&space);
                 if !rt.keeper {
                     // remember who added us, and introduce ourselves
                     let inviter = rt.node.with_space(&space, |r| {
