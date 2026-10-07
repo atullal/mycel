@@ -60,6 +60,8 @@ pub enum SyncMsg {
         invite: Option<Vec<SignedOp>>,
     },
     Denied,
+    /// You were removed: here is the proof (revocation + its causal past).
+    Removed { ops: Vec<SignedOp> },
     /// Server doesn't know the space; resend Hello with `invite`.
     NeedInvite,
     Accept { inv: Inventory, want: Inventory },

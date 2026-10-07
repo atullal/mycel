@@ -95,7 +95,7 @@ pub struct Reaction {
     pub by: Vec<PeerId>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Delivery {
     /// Written locally, not yet seen by any other member or keeper.

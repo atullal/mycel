@@ -308,7 +308,14 @@ async fn serve_sync(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
             })
         })?;
         let Some(reply) = reply else {
-            return deny(conn, tx).await;
+            let proof = inner.with_space(&space, |r| r.revocation_proof(&peer))?;
+            if proof.is_empty() {
+                return deny(conn, tx).await;
+            }
+            send(&mut tx, &SyncMsg::Removed { ops: proof }).await?;
+            tx.finish()?;
+            let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
+            return Ok(());
         };
         send(&mut tx, &reply).await?;
         let SyncMsg::DataAndWant { data, want } = recv(&mut rx).await? else {
@@ -471,6 +478,14 @@ async fn sync_session(inner: &Arc<Inner>, peer: SignPk, space: SpaceId, trust_pe
     let (their_inv, their_want) = match reply {
         SyncMsg::Accept { inv, want } => (inv, want),
         SyncMsg::Denied => bail!("peer denied sync (we are not a member)"),
+        SyncMsg::Removed { ops } => {
+            conn.close(0u32.into(), b"removed");
+            let res = inner.with_space(&space, |r| r.ingest_batch(ops, vec![]))?;
+            if res.changed() {
+                inner.emit(NetEvent::SpaceChanged { space });
+            }
+            bail!("peer denied sync (we were removed from this space)")
+        }
         other => bail!("unexpected reply: {other:?}"),
     };
     let out = inner.with_space(&space, |r| {
@@ -525,6 +540,8 @@ async fn scheduler(inner: Arc<Inner>) {
             dirty
                 .iter()
                 .filter_map(|s| spaces.get(s).map(|r| (s, r)))
+                // no longer a member: nobody will talk to us about this space
+                .filter(|(_, r)| r.my_role().is_some())
                 .flat_map(|(s, r)| {
                     r.members()
                         .into_iter()
@@ -892,7 +909,7 @@ impl Node {
         bail!("blob not available from any reachable member")
     }
 
-    pub async fn shutdown(self) -> Result<()> {
+    pub async fn shutdown(&self) -> Result<()> {
         for t in &self.tasks {
             t.abort();
         }

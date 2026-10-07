@@ -370,6 +370,22 @@ impl Replica {
         self.graph.op_ids().iter().filter_map(|i| self.graph.get(i).cloned()).collect()
     }
 
+    /// Winning revocations of `pk` plus every op in their causal past — what a
+    /// removed member needs to learn it was removed (nothing after that).
+    pub fn revocation_proof(&self, pk: &SignPk) -> Vec<SignedOp> {
+        let revs: Vec<OpId> = self.graph.revocations_of(pk).into_iter().map(|(id, _)| id).collect();
+        if revs.is_empty() {
+            return vec![];
+        }
+        self.graph
+            .resolution()
+            .order
+            .iter()
+            .filter(|id| self.graph.in_past(id, &revs))
+            .filter_map(|id| self.graph.get(id).cloned())
+            .collect()
+    }
+
     pub fn envelope_ids(&self) -> Vec<EnvelopeId> {
         self.envelopes.keys().copied().collect()
     }
