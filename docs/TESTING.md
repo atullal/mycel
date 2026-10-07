@@ -21,7 +21,7 @@ Setup: three `mycel serve --net lan` devices (Alice, Bob, Carol) plus one `mycel
 | Step | Result |
 |---|---|
 | Discovery | Alice saw Bob and Carol **by name over mDNS**, no codes exchanged ([screenshot](screenshots/02-alice-new-conv.png)) |
-| DM | Alice → Bob over the LAN. Bob got it with an unread badge, and Alice was auto-added to his contacts ([screenshot](screenshots/04-bob-inbox.png)) |
+| DM | Alice → Bob over the LAN. Bob got it with an unread badge. (This first run predates message requests; strangers are now held as requests, see below.) ([screenshot](screenshots/04-bob-inbox.png)) |
 | Reply + file | Bob replied with a file. Alice saw it, and her message went to **read** ✓✓ ([screenshot](screenshots/06-alice-sees-reply.png)) |
 | Download + reaction | Alice fetched the encrypted file from Bob peer-to-peer and decrypted it, then reacted 👍 ([screenshot](screenshots/07-alice-download-react.png)) |
 | Group | Alice created a group with Bob and Carol; Carol received it ([screenshot](screenshots/09-carol-inbox.png)) |
