@@ -9,6 +9,7 @@
 //! - [`Runtime`] — the app-facing API (docs/RUNTIME_API.md)
 
 pub mod api;
+pub mod dispatch;
 mod runtime;
 pub mod store;
 

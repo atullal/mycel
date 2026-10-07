@@ -248,6 +248,10 @@ impl Runtime {
         let _ = self.events.send(e);
     }
 
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
     pub fn node(&self) -> &Node {
         &self.node
     }

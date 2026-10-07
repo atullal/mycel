@@ -1,4 +1,5 @@
 import { createMockTransport } from "./mock.ts";
+import { createHttpTransport, isHttpRuntime } from "./http.ts";
 import { createTauriTransport, isTauri } from "./tauri.ts";
 import { toError, type ArgsOf, type Command, type FileHost, type ResultOf, type Transport } from "./transport.ts";
 import type {
@@ -185,7 +186,9 @@ export function createMycel(transport: Transport): Mycel {
 
 /** Tauri IPC inside the host; the in-memory mock everywhere else. */
 export function autoTransport(): Transport {
-  return isTauri() ? createTauriTransport() : createMockTransport();
+  if (isTauri()) return createTauriTransport();
+  if (isHttpRuntime()) return createHttpTransport();
+  return createMockTransport();
 }
 
 let defaultClient: Mycel | null = null;

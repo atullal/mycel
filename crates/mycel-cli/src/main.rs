@@ -1,0 +1,401 @@
+//! `mycel` — run a Mycel device from the terminal.
+//!
+//! - `mycel serve`  : a full device + the Mycel web UI on http://127.0.0.1:7777
+//! - `mycel keeper` : an always-on keeper (stores ciphertext, relays, never reads)
+//! - `mycel id`     : print this device's contact code
+//! - `mycel call`   : invoke one runtime command against a running `serve`
+
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, Result, bail};
+use axum::{
+    Json, Router,
+    body::Bytes,
+    extract::{Path as UrlPath, Query, State},
+    http::{HeaderMap, StatusCode, header},
+    response::{
+        IntoResponse, Response,
+        sse::{Event as SseEvent, KeepAlive, Sse},
+    },
+    routing::{get, post},
+};
+use clap::{Parser, Subcommand, ValueEnum};
+use mycel_node::api::NetworkMode;
+use mycel_node::{Runtime, RuntimeOptions, dispatch::dispatch};
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
+use tower_http::services::{ServeDir, ServeFile};
+
+#[derive(Parser)]
+#[command(name = "mycel", about = "Peer-to-peer, end-to-end encrypted, serverless.")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Net {
+    /// Local network only (mDNS). No internet needed.
+    Lan,
+    /// LAN + internet relays and discovery.
+    Internet,
+    /// Loopback only (tests).
+    Local,
+}
+
+impl From<Net> for NetworkMode {
+    fn from(n: Net) -> Self {
+        match n {
+            Net::Lan => NetworkMode::Lan,
+            Net::Internet => NetworkMode::Internet,
+            Net::Local => NetworkMode::Local,
+        }
+    }
+}
+
+#[derive(clap::Args)]
+struct DeviceArgs {
+    /// Data directory (identity, messages, files).
+    #[arg(long, default_value = "~/.mycel")]
+    data: String,
+    /// Display name (saved for next time).
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long, value_enum, default_value = "lan")]
+    net: Net,
+    /// UDP port for peer connections (0 = random).
+    #[arg(long, default_value_t = 0)]
+    port: u16,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Run a device and serve the web UI + API on localhost.
+    Serve {
+        #[command(flatten)]
+        dev: DeviceArgs,
+        /// Where to serve the UI/API. Loopback only.
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        http: SocketAddr,
+        /// Built UI to serve (apps/host/dist).
+        #[arg(long)]
+        ui: Option<PathBuf>,
+    },
+    /// Run an always-on keeper: stores and relays encrypted data, can't read it.
+    Keeper {
+        #[command(flatten)]
+        dev: DeviceArgs,
+    },
+    /// Print this device's contact code.
+    Id {
+        #[arg(long, default_value = "~/.mycel")]
+        data: String,
+    },
+    /// Call a runtime command on a running `mycel serve`.
+    Call {
+        command: String,
+        /// JSON arguments, e.g. '{"id": "..."}'
+        #[arg(default_value = "{}")]
+        args: String,
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        http: SocketAddr,
+    },
+}
+
+fn expand(p: &str) -> PathBuf {
+    match p.strip_prefix("~/") {
+        Some(rest) => PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rest),
+        None => PathBuf::from(p),
+    }
+}
+
+async fn open(dev: &DeviceArgs, keeper: bool) -> Result<Arc<Runtime>> {
+    Runtime::open_with(RuntimeOptions {
+        data_dir: expand(&dev.data),
+        mode: dev.net.into(),
+        name: dev.name.clone(),
+        keeper,
+        port: dev.port,
+    })
+    .await
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    match Cli::parse().cmd {
+        Cmd::Serve { dev, http, ui } => serve(dev, http, ui).await,
+        Cmd::Keeper { dev } => keeper(dev).await,
+        Cmd::Id { data } => {
+            let rt = Runtime::open_with(RuntimeOptions {
+                data_dir: expand(&data),
+                mode: NetworkMode::Local,
+                name: None,
+                keeper: false,
+                port: 0,
+            })
+            .await?;
+            let p = rt.profile();
+            println!("name: {}\nid:   {}\ncode: {}", p.name, p.id, p.contact_code);
+            rt.shutdown().await
+        }
+        Cmd::Call { command, args, http } => call(http, &command, &args).await,
+    }
+}
+
+async fn keeper(dev: DeviceArgs) -> Result<()> {
+    let rt = open(&dev, true).await?;
+    let p = rt.profile();
+    println!("Mycel keeper running ({:?}).", rt.network_status().mode);
+    println!("Add it to a conversation with this contact code:\n\n{}\n", p.contact_code);
+    let mut events = rt.subscribe();
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break,
+            ev = events.recv() => {
+                if let Ok(mycel_node::api::Event::ConversationAdded { conversation }) = ev {
+                    println!("now keeping space {}", &conversation[..12]);
+                }
+            }
+        }
+    }
+    rt.shutdown().await
+}
+
+// ─────────────────────────────── HTTP server ───────────────────────────────
+
+struct App {
+    rt: Arc<Runtime>,
+    http: SocketAddr,
+}
+
+type Shared = Arc<App>;
+
+/// Defence for a localhost API that a browser can reach:
+/// - Host must be loopback (blocks DNS rebinding);
+/// - API calls need `X-Mycel: 1` (a cross-site page can't send it without a
+///   CORS preflight, which we never approve).
+fn guard(app: &App, headers: &HeaderMap, need_marker: bool) -> Result<(), Response> {
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
+    let ok_host = host == app.http.to_string()
+        || host == format!("localhost:{}", app.http.port())
+        || host == format!("127.0.0.1:{}", app.http.port());
+    if !ok_host {
+        return Err((StatusCode::FORBIDDEN, "bad host").into_response());
+    }
+    if need_marker && headers.get("x-mycel").is_none_or(|v| v != "1") {
+        return Err((StatusCode::FORBIDDEN, "missing X-Mycel header").into_response());
+    }
+    Ok(())
+}
+
+async fn api_cmd(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    UrlPath(cmd): UrlPath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = guard(&app, &headers, true) {
+        return r;
+    }
+    let args: Value = if body.is_empty() {
+        Value::Null
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+        }
+    };
+    match dispatch(&app.rt, &cmd, args).await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+async fn api_events(State(app): State<Shared>, headers: HeaderMap) -> Response {
+    if let Err(r) = guard(&app, &headers, false) {
+        return r;
+    }
+    let stream = BroadcastStream::new(app.rt.subscribe()).filter_map(|ev| {
+        let ev = ev.ok()?;
+        let data = serde_json::to_string(&ev).ok()?;
+        Some(Ok::<_, std::convert::Infallible>(SseEvent::default().data(data)))
+    });
+    Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
+}
+
+#[derive(Deserialize)]
+struct UploadQ {
+    name: String,
+}
+
+/// Browser file picker → a file under the data dir the runtime can attach.
+async fn api_upload(
+    State(app): State<Shared>,
+    headers: HeaderMap,
+    Query(q): Query<UploadQ>,
+    body: Bytes,
+) -> Response {
+    if let Err(r) = guard(&app, &headers, true) {
+        return r;
+    }
+    let name: String = q
+        .name
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("file")
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let name = if name.is_empty() || name == "." || name == ".." { "file".into() } else { name };
+    let dir = app.rt.data_dir().join("uploads").join(format!("{:016x}", mycel_node::crypto::random_u64()));
+    let path = dir.join(name);
+    let res = async {
+        tokio::fs::create_dir_all(&dir).await?;
+        tokio::fs::write(&path, &body).await
+    }
+    .await;
+    match res {
+        Ok(()) => Json(json!({"path": path.to_string_lossy()})).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct FileQ {
+    path: String,
+}
+
+/// Serve a local file — only from inside the data dir.
+async fn api_file(State(app): State<Shared>, headers: HeaderMap, Query(q): Query<FileQ>) -> Response {
+    if let Err(r) = guard(&app, &headers, false) {
+        return r;
+    }
+    let root = match app.rt.data_dir().canonicalize() {
+        Ok(r) => r,
+        Err(_) => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let Ok(path) = Path::new(&q.path).canonicalize() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !path.starts_with(&root) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let mime = mime_for(&name);
+            (
+                [
+                    (header::CONTENT_TYPE, mime.to_string()),
+                    (header::CONTENT_DISPOSITION, format!("inline; filename=\"{}\"", name.replace('"', ""))),
+                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+                    (header::CONTENT_SECURITY_POLICY, "sandbox".to_string()),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+fn mime_for(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "pdf" => "application/pdf",
+        "txt" | "md" => "text/plain; charset=utf-8",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn health(State(app): State<Shared>) -> Json<Value> {
+    let p = app.rt.profile();
+    Json(json!({"ok": true, "id": p.id, "name": p.name, "transport": "http"}))
+}
+
+fn default_ui() -> Option<PathBuf> {
+    // repo checkout: <repo>/apps/host/dist next to the binary's workspace
+    let candidates = [
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/host/dist"),
+        PathBuf::from("apps/host/dist"),
+    ];
+    candidates.into_iter().find(|p| p.join("index.html").exists())
+}
+
+async fn serve(dev: DeviceArgs, http: SocketAddr, ui: Option<PathBuf>) -> Result<()> {
+    if !http.ip().is_loopback() {
+        bail!("refusing to serve the API on a non-loopback address ({http}): anyone on the network could use your account");
+    }
+    let rt = open(&dev, false).await?;
+    let app: Shared = Arc::new(App { rt: rt.clone(), http });
+    let mut router = Router::new()
+        .route("/api/health", get(health))
+        .route(
+            "/api/boot.js",
+            get(|| async {
+                ([(header::CONTENT_TYPE, "text/javascript")], "window.__MYCEL_HTTP__ = true;")
+            }),
+        )
+        .route("/api/cmd/{cmd}", post(api_cmd))
+        .route("/api/events", get(api_events))
+        .route("/api/upload", post(api_upload))
+        .route("/api/file", get(api_file))
+        .with_state(app);
+    let ui = ui.or_else(default_ui);
+    if let Some(dir) = &ui {
+        router = router.fallback_service(
+            ServeDir::new(dir).fallback(ServeFile::new(dir.join("index.html"))),
+        );
+    }
+    let listener = tokio::net::TcpListener::bind(http)
+        .await
+        .with_context(|| format!("can't listen on {http}"))?;
+    let p = rt.profile();
+    println!("Mycel device \"{}\" ({:?}) — id {}", p.name, rt.network_status().mode, &p.id[..16]);
+    match &ui {
+        Some(_) => println!("Open http://{http}"),
+        None => println!("API on http://{http}/api (no UI found: build apps/host first)"),
+    }
+    println!("Contact code:\n{}\n", p.contact_code);
+    axum::serve(listener, router)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
+    rt.shutdown().await
+}
+
+async fn call(http: SocketAddr, command: &str, args: &str) -> Result<()> {
+    // Minimal HTTP/1.1 client so the CLI doesn't need an HTTP client crate.
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let body: Value = serde_json::from_str(args).context("args must be JSON")?;
+    let body = body.to_string();
+    let mut s = tokio::net::TcpStream::connect(http)
+        .await
+        .with_context(|| format!("is `mycel serve` running on {http}?"))?;
+    let req = format!(
+        "POST /api/cmd/{command} HTTP/1.1\r\nHost: {http}\r\nX-Mycel: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    s.write_all(req.as_bytes()).await?;
+    let mut resp = String::new();
+    s.read_to_string(&mut resp).await?;
+    let (head, payload) = resp.split_once("\r\n\r\n").unwrap_or((&resp, ""));
+    let ok = head.starts_with("HTTP/1.1 200");
+    let pretty = serde_json::from_str::<Value>(payload)
+        .map(|v| serde_json::to_string_pretty(&v).unwrap())
+        .unwrap_or_else(|_| payload.to_string());
+    println!("{pretty}");
+    if !ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
