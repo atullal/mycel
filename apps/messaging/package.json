@@ -1,0 +1,24 @@
+{
+  "name": "@mycel/messaging",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Mycel Messaging: end-to-end encrypted direct and group chat, built only on @mycel/sdk.",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "dependencies": {
+    "@mycel/sdk": "0.1.0"
+  },
+  "peerDependencies": {
+    "react": ">=18"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "react": "^19.3.0",
+    "typescript": "~5.9.3"
+  }
+}
