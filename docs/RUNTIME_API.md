@@ -68,6 +68,8 @@ impl Runtime {
 | `add_keeper` | `{ id, keeper }` | `null` |
 | `rename_conversation` | `{ id, title }` | `null` |
 | `fetch_attachment` | `{ blob }` | `string` (path) |
+| `accept_request` | `{ id }` | `ConversationSummary` |
+| `decline_request` | `{ id, block? }` | `null` |
 
 Errors are rejected promises carrying a human-readable string.
 
@@ -81,6 +83,12 @@ Errors are rejected promises carrying a human-readable string.
 - **Message order:** messages arrive in causal order. `sentAt` is display-only (the author's clock).
 - **Attachments are lazy:** an attachment's `localPath` is `null` until fetched. Call `fetch_attachment`, then wait for `blobReady`.
 - **Offline-first:** everything works with no network at all. Peers on the same LAN find each other via mDNS with no internet.
+
+## Message requests
+When someone who isn't your contact adds you, the conversation arrives with `request: true` and `invitedBy` set.
+- Until you call `accept_request`, nothing is posted: no profile, no read receipts, no replies.
+- `accept_request` makes the inviter a contact.
+- `decline_request {block: true}` also refuses future invites from that key at the network layer.
 
 ## Answers to contract questions (v0)
 - **Leaving:** call `remove_member(id, myId)`. Anyone can leave; the last admin can't. Leaving doesn't rotate keys itself; the next writer automatically rotates to a key the leaver doesn't have.
@@ -106,4 +114,4 @@ Errors are rejected promises carrying a human-readable string.
 
 **Security:**
 - The `Host` header must be a loopback host, which blocks DNS rebinding.
-- API calls need the `X-Mycel` header. A cross-site page can't send it without a CORS preflight, and the server never approves preflights.
+- Every route requires the per-run token. It's embedded in the page `mycel serve` returns, so other origins can't read it. Fetch calls send it as the `X-Mycel` header; EventSource and `<img>` requests send it as `?t=`. The CLI reads it from `<data>/http-token`, which has mode `0600`.

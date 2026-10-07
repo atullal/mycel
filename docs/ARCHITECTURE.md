@@ -353,4 +353,4 @@ Needs atomic multi-file snapshots and conflict surfacing for code, which plain A
 | **Keepers** | `mycel keeper`: accepts spaces, stores and serves ciphertext, never decrypts | Push wake-ups (APNs/FCM) for mobile |
 | **Apps** | **Messaging**: DMs, groups, replies, edits, deletes, reactions, read receipts, typing, files, members, keepers, leave | Docs, Newsroom, RPG |
 
-Tests: 73 Rust tests, including real-QUIC multi-node, real mDNS, runtime end-to-end with storage, and keeper offline delivery. Plus a UI end-to-end run driven in headless Chrome against real LAN devices. See [TESTING.md](TESTING.md).
+Tests: 79 Rust tests, including real-QUIC multi-node, real mDNS, runtime end-to-end with storage, and keeper offline delivery. Plus a UI end-to-end run driven in headless Chrome against real LAN devices. See [TESTING.md](TESTING.md).

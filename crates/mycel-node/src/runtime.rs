@@ -951,6 +951,11 @@ impl Runtime {
 
     pub fn mark_read(&self, id: ConversationId) -> Result<()> {
         let space = parse_space(&id)?;
+        // No read receipts for message requests: the sender learns nothing
+        // until we accept.
+        if self.requests.lock().contains_key(&space) {
+            return Ok(());
+        }
         let me = self.keys.sign_pk();
         let view = self.view(&space)?;
         let Some((idx, last)) = view
