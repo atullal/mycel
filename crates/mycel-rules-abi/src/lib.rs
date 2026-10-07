@@ -93,7 +93,7 @@ pub struct RuleInput {
     #[serde(with = "serde_bytes")]
     pub payload: Vec<u8>,
     /// Host-supplied facts from the change's causal past that the rule needs
-    /// (app-defined encoding; e.g. the author of a message being edited).
+    /// (app-defined encoding; empty when unused). Must be derived only from the causal past.
     #[serde(with = "serde_bytes")]
     pub context: Vec<u8>,
 }

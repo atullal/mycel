@@ -1,5 +1,5 @@
 use super::*;
-use mycel_rules_abi::chat::{ChatOp, codes};
+use mycel_rules_abi::chat::{AttachmentRef, ChatOp, codes};
 use mycel_rules_abi::{encode, unpack_ptr_len};
 
 const CHAT_RULES: &[u8] = include_bytes!("../fixtures/chat_rules.wasm");
@@ -26,10 +26,34 @@ fn input(author: [u8; 32], role: RoleTag, op: &ChatOp, context: &[u8]) -> RuleIn
     }
 }
 
+fn op_input(role: RoleTag, op: &ChatOp) -> RuleInput {
+    input(ALICE, role, op, &[])
+}
+
 fn text(body: &str) -> ChatOp {
     ChatOp::Text {
         body: body.into(),
         reply_to: None,
+        attachments: vec![],
+    }
+}
+
+fn attachment(name: &str, mime: &str) -> AttachmentRef {
+    AttachmentRef {
+        blob: [1; 32],
+        key: [2; 32],
+        nonce: [3; 24],
+        name: name.into(),
+        mime: mime.into(),
+        size: 1234,
+    }
+}
+
+fn with_attachments(atts: Vec<AttachmentRef>) -> ChatOp {
+    ChatOp::Text {
+        body: "see attached".into(),
+        reply_to: None,
+        attachments: atts,
     }
 }
 
@@ -63,65 +87,79 @@ fn chat_accepts_valid_ops() {
     let e = chat();
     let target = [9u8; 32];
     let cases = [
-        input(ALICE, RoleTag::Writer, &text("hello"), &[]),
-        input(ALICE, RoleTag::Admin, &text("hello from admin"), &[]),
-        input(
-            ALICE,
+        (RoleTag::Writer, text("hello")),
+        (RoleTag::Admin, text("hello from admin")),
+        (
             RoleTag::Writer,
-            &ChatOp::Text {
+            ChatOp::Text {
                 body: "re".into(),
                 reply_to: Some(target),
+                attachments: vec![],
             },
-            &[],
         ),
-        input(ALICE, RoleTag::Writer, &text(&"x".repeat(16 * 1024)), &[]),
-        input(
-            ALICE,
+        (RoleTag::Writer, text(&"x".repeat(16 * 1024))),
+        (
             RoleTag::Writer,
-            &ChatOp::Edit {
+            with_attachments(vec![attachment(&"n".repeat(256), &"m".repeat(256)); 10]),
+        ),
+        (
+            RoleTag::Writer,
+            ChatOp::Edit {
                 target,
                 body: "fixed".into(),
             },
-            &ALICE,
         ),
-        input(ALICE, RoleTag::Writer, &ChatOp::Delete { target }, &ALICE),
-        input(
-            ALICE,
+        // Edit/Delete of someone else's message passes validation: the chat reducer ignores
+        // it (author-only edits are enforced over the causally ordered feed).
+        (RoleTag::Writer, ChatOp::Delete { target }),
+        (
             RoleTag::Writer,
-            &ChatOp::React {
+            ChatOp::React {
                 target,
                 emoji: "👍🏽".into(),
+                on: true,
             },
-            &[],
         ),
-        input(
-            ALICE,
-            RoleTag::Reader,
-            &ChatOp::Receipt { up_to: target },
-            &[],
-        ),
-        input(
-            ALICE,
+        (
             RoleTag::Writer,
-            &ChatOp::Receipt { up_to: target },
-            &[],
-        ),
-        input(
-            ALICE,
-            RoleTag::Writer,
-            &ChatOp::Attachment {
-                blob: [1; 32],
-                mime: "image/png".into(),
-                name: "cat.png".into(),
-                size: 1234,
-                caption: "a cat".into(),
+            ChatOp::React {
+                target,
+                emoji: "x".repeat(32),
+                on: false,
             },
-            &[],
+        ),
+        (RoleTag::Reader, ChatOp::Receipt { up_to: target }),
+        (RoleTag::Writer, ChatOp::Receipt { up_to: target }),
+        (
+            RoleTag::Writer,
+            ChatOp::Profile {
+                name: "n".repeat(64),
+            },
+        ),
+        (
+            RoleTag::Writer,
+            ChatOp::Profile {
+                name: String::new(),
+            },
+        ),
+        (
+            RoleTag::Admin,
+            ChatOp::Meta {
+                title: Some("Book club".into()),
+                direct: false,
+            },
+        ),
+        (
+            RoleTag::Admin,
+            ChatOp::Meta {
+                title: None,
+                direct: true,
+            },
         ),
     ];
-    for (i, c) in cases.iter().enumerate() {
-        let t = e.validate_traced(c);
-        assert_eq!(t.result, Verdict::Accept, "case {i}: {:?}", t.detail);
+    for (i, (role, op)) in cases.iter().enumerate() {
+        let t = e.validate_traced(&op_input(*role, op));
+        assert_eq!(t.result, Verdict::Accept, "case {i} {op:?}: {:?}", t.detail);
     }
 }
 
@@ -131,149 +169,125 @@ fn chat_rejects_invalid_ops() {
     let target = [9u8; 32];
     let cases = [
         // role checks
+        (RoleTag::Reader, text("hi"), codes::NOT_WRITER),
+        (RoleTag::Relay, text("hi"), codes::NOT_WRITER),
         (
-            input(ALICE, RoleTag::Reader, &text("hi"), &[]),
-            rule(codes::NOT_WRITER),
+            RoleTag::Reader,
+            ChatOp::Edit {
+                target,
+                body: "x".into(),
+            },
+            codes::NOT_WRITER,
         ),
         (
-            input(ALICE, RoleTag::Relay, &text("hi"), &[]),
-            rule(codes::NOT_WRITER),
+            RoleTag::Reader,
+            ChatOp::Delete { target },
+            codes::NOT_WRITER,
         ),
         (
-            input(
-                ALICE,
-                RoleTag::Reader,
-                &ChatOp::React {
-                    target,
-                    emoji: "x".into(),
-                },
-                &[],
-            ),
-            rule(codes::NOT_WRITER),
+            RoleTag::Reader,
+            ChatOp::React {
+                target,
+                emoji: "x".into(),
+                on: true,
+            },
+            codes::NOT_WRITER,
         ),
         (
-            input(
-                ALICE,
-                RoleTag::Relay,
-                &ChatOp::Receipt { up_to: target },
-                &[],
-            ),
-            rule(codes::NOT_READER),
+            RoleTag::Reader,
+            ChatOp::Profile { name: "me".into() },
+            codes::NOT_WRITER,
+        ),
+        (
+            RoleTag::Relay,
+            ChatOp::Receipt { up_to: target },
+            codes::NOT_READER,
+        ),
+        (
+            RoleTag::Writer,
+            ChatOp::Meta {
+                title: None,
+                direct: false,
+            },
+            codes::NOT_ADMIN,
+        ),
+        (
+            RoleTag::Reader,
+            ChatOp::Meta {
+                title: None,
+                direct: false,
+            },
+            codes::NOT_ADMIN,
         ),
         // size limits
         (
-            input(
-                ALICE,
-                RoleTag::Writer,
-                &text(&"x".repeat(16 * 1024 + 1)),
-                &[],
-            ),
-            rule(codes::BODY_TOO_LONG),
+            RoleTag::Writer,
+            text(&"x".repeat(16 * 1024 + 1)),
+            codes::BODY_TOO_LONG,
         ),
         (
-            input(
-                ALICE,
-                RoleTag::Writer,
-                &ChatOp::Edit {
-                    target,
-                    body: "x".repeat(16 * 1024 + 1),
-                },
-                &ALICE,
-            ),
-            rule(codes::BODY_TOO_LONG),
+            RoleTag::Writer,
+            ChatOp::Edit {
+                target,
+                body: "x".repeat(16 * 1024 + 1),
+            },
+            codes::BODY_TOO_LONG,
         ),
         (
-            input(
-                ALICE,
-                RoleTag::Writer,
-                &ChatOp::React {
-                    target,
-                    emoji: "x".repeat(33),
-                },
-                &[],
-            ),
-            rule(codes::BAD_EMOJI),
+            RoleTag::Writer,
+            ChatOp::React {
+                target,
+                emoji: "x".repeat(33),
+                on: true,
+            },
+            codes::BAD_EMOJI,
         ),
         (
-            input(
-                ALICE,
-                RoleTag::Writer,
-                &ChatOp::React {
-                    target,
-                    emoji: String::new(),
-                },
-                &[],
-            ),
-            rule(codes::BAD_EMOJI),
-        ),
-        // authorship of edits/deletes
-        (
-            input(
-                ALICE,
-                RoleTag::Writer,
-                &ChatOp::Edit {
-                    target,
-                    body: "mine now".into(),
-                },
-                &BOB,
-            ),
-            rule(codes::NOT_TARGET_AUTHOR),
+            RoleTag::Writer,
+            ChatOp::React {
+                target,
+                emoji: String::new(),
+                on: false,
+            },
+            codes::BAD_EMOJI,
         ),
         (
-            input(ALICE, RoleTag::Admin, &ChatOp::Delete { target }, &BOB),
-            rule(codes::NOT_TARGET_AUTHOR),
+            RoleTag::Writer,
+            ChatOp::Profile {
+                name: "n".repeat(65),
+            },
+            codes::NAME_TOO_LONG,
         ),
         (
-            input(ALICE, RoleTag::Writer, &ChatOp::Delete { target }, &[]),
-            rule(codes::MISSING_CONTEXT),
-        ),
-        (
-            input(
-                ALICE,
-                RoleTag::Writer,
-                &ChatOp::Delete { target },
-                &ALICE[..31],
-            ),
-            rule(codes::MISSING_CONTEXT),
-        ),
-        (
-            input(ALICE, RoleTag::Reader, &ChatOp::Delete { target }, &ALICE),
-            rule(codes::NOT_WRITER),
+            RoleTag::Admin,
+            ChatOp::Meta {
+                title: Some("t".repeat(257)),
+                direct: false,
+            },
+            codes::NAME_TOO_LONG,
         ),
         // attachments
         (
-            input(
-                ALICE,
-                RoleTag::Writer,
-                &ChatOp::Attachment {
-                    blob: [1; 32],
-                    mime: String::new(),
-                    name: "a".into(),
-                    size: 1,
-                    caption: String::new(),
-                },
-                &[],
-            ),
-            rule(codes::BAD_ATTACHMENT),
+            RoleTag::Writer,
+            with_attachments(vec![attachment("a", "b"); 11]),
+            codes::BAD_ATTACHMENT,
         ),
         (
-            input(
-                ALICE,
-                RoleTag::Writer,
-                &ChatOp::Attachment {
-                    blob: [1; 32],
-                    mime: "a/b".into(),
-                    name: "n".repeat(256),
-                    size: 1,
-                    caption: String::new(),
-                },
-                &[],
-            ),
-            rule(codes::BAD_ATTACHMENT),
+            RoleTag::Writer,
+            with_attachments(vec![attachment(&"n".repeat(257), "image/png")]),
+            codes::BAD_ATTACHMENT,
+        ),
+        (
+            RoleTag::Writer,
+            with_attachments(vec![
+                attachment("ok", "image/png"),
+                attachment("a.png", &"m".repeat(257)),
+            ]),
+            codes::BAD_ATTACHMENT,
         ),
     ];
-    for (i, (c, expected)) in cases.iter().enumerate() {
-        assert_eq!(e.validate(c), *expected, "case {i}");
+    for (i, (role, op, code)) in cases.iter().enumerate() {
+        assert_eq!(e.validate(&op_input(*role, op)), rule(*code), "case {i}");
     }
 }
 
@@ -290,12 +304,175 @@ fn chat_rejects_malformed_payloads_and_wrong_stream() {
     c.payload = good.clone();
     c.payload.push(0); // trailing byte
     assert_eq!(e.validate(&c), rule(codes::MALFORMED_PAYLOAD));
-    c.payload = vec![0, 2, 0xff, 0xfe, 0]; // invalid UTF-8 body
+    c.payload = vec![0, 2, 0xff, 0xfe, 0, 0]; // invalid UTF-8 body
+    assert_eq!(e.validate(&c), rule(codes::MALFORMED_PAYLOAD));
+    c.payload = vec![3, 0]; // React with a truncated target
     assert_eq!(e.validate(&c), rule(codes::MALFORMED_PAYLOAD));
 
     c.payload = good;
     c.stream.kind = StreamKind::Doc;
     assert_eq!(e.validate(&c), rule(codes::WRONG_STREAM));
+}
+
+/// `mycel_rules_abi::chat::ChatOp` (no_std, used by the wasm guest) must decode exactly the
+/// bytes `mycel_kit_chat::ChatOp` produces, for every variant.
+#[test]
+fn chat_wire_format_matches_mycel_kit_chat() {
+    use mycel_crypto::Hash32 as H;
+    use mycel_kit_chat as kit;
+
+    let kit_att = |name: &str, mime: &str| kit::AttachmentRef {
+        blob: H([1; 32]),
+        key: [2; 32],
+        nonce: [3; 24],
+        name: name.into(),
+        mime: mime.into(),
+        size: 1234,
+    };
+    // (kit op, the abi op it must decode to, role, expected verdict)
+    let cases: Vec<(kit::ChatOp, ChatOp, RoleTag, Verdict)> = vec![
+        (
+            kit::ChatOp::Text {
+                body: "hi ☕".into(),
+                reply_to: Some(H([4; 32])),
+                attachments: vec![kit_att("a.png", "image/png"), kit_att("b", "")],
+            },
+            ChatOp::Text {
+                body: "hi ☕".into(),
+                reply_to: Some([4; 32]),
+                attachments: vec![attachment("a.png", "image/png"), attachment("b", "")],
+            },
+            RoleTag::Writer,
+            Verdict::Accept,
+        ),
+        (
+            kit::ChatOp::Text {
+                body: "x".repeat(16 * 1024 + 1),
+                reply_to: None,
+                attachments: vec![],
+            },
+            ChatOp::Text {
+                body: "x".repeat(16 * 1024 + 1),
+                reply_to: None,
+                attachments: vec![],
+            },
+            RoleTag::Writer,
+            rule(codes::BODY_TOO_LONG),
+        ),
+        (
+            kit::ChatOp::Edit {
+                target: H([5; 32]),
+                body: "edited".into(),
+            },
+            ChatOp::Edit {
+                target: [5; 32],
+                body: "edited".into(),
+            },
+            RoleTag::Writer,
+            Verdict::Accept,
+        ),
+        (
+            kit::ChatOp::Delete { target: H([6; 32]) },
+            ChatOp::Delete { target: [6; 32] },
+            RoleTag::Reader,
+            rule(codes::NOT_WRITER),
+        ),
+        (
+            kit::ChatOp::React {
+                target: H([7; 32]),
+                emoji: "🎉".into(),
+                on: true,
+            },
+            ChatOp::React {
+                target: [7; 32],
+                emoji: "🎉".into(),
+                on: true,
+            },
+            RoleTag::Writer,
+            Verdict::Accept,
+        ),
+        (
+            kit::ChatOp::React {
+                target: H([7; 32]),
+                emoji: "🎉".into(),
+                on: false,
+            },
+            ChatOp::React {
+                target: [7; 32],
+                emoji: "🎉".into(),
+                on: false,
+            },
+            RoleTag::Admin,
+            Verdict::Accept,
+        ),
+        (
+            kit::ChatOp::Receipt { up_to: H([8; 32]) },
+            ChatOp::Receipt { up_to: [8; 32] },
+            RoleTag::Reader,
+            Verdict::Accept,
+        ),
+        (
+            kit::ChatOp::Profile {
+                name: "Alice".into(),
+            },
+            ChatOp::Profile {
+                name: "Alice".into(),
+            },
+            RoleTag::Writer,
+            Verdict::Accept,
+        ),
+        (
+            kit::ChatOp::Meta {
+                title: Some("Team".into()),
+                direct: false,
+            },
+            ChatOp::Meta {
+                title: Some("Team".into()),
+                direct: false,
+            },
+            RoleTag::Writer,
+            rule(codes::NOT_ADMIN),
+        ),
+        (
+            kit::ChatOp::Meta {
+                title: None,
+                direct: true,
+            },
+            ChatOp::Meta {
+                title: None,
+                direct: true,
+            },
+            RoleTag::Admin,
+            Verdict::Accept,
+        ),
+    ];
+    let e = chat();
+    for (i, (kit_op, abi_op, role, verdict)) in cases.iter().enumerate() {
+        let bytes = kit_op.encode();
+        assert_eq!(
+            mycel_rules_abi::decode_exact::<ChatOp>(&bytes).as_ref(),
+            Some(abi_op),
+            "case {i}: abi decode of kit bytes"
+        );
+        assert_eq!(encode(abi_op), bytes, "case {i}: abi encoding differs");
+        assert_eq!(
+            kit::ChatOp::decode(&encode(abi_op)).as_ref(),
+            Some(kit_op),
+            "case {i}: kit decode"
+        );
+        let c = RuleInput {
+            author: ALICE,
+            author_role: *role,
+            stream: FEED,
+            payload: bytes,
+            context: vec![],
+        };
+        assert_eq!(e.validate(&c), *verdict, "case {i}: verdict");
+    }
+    // Every kit variant is covered above (keeps this test honest when variants are added).
+    let covered: std::collections::BTreeSet<u8> =
+        cases.iter().map(|(k, ..)| k.encode()[0]).collect();
+    assert_eq!(covered, (0..7).collect());
 }
 
 #[test]
@@ -307,6 +484,17 @@ fn chat_fuel_is_well_within_budget() {
     assert!(t.fuel_used > 0);
     eprintln!("chat-rules fuel for a 16 KiB message: {}", t.fuel_used);
     // Max-size message uses well under 1/10 of the budget.
+    assert!(
+        t.fuel_used < Limits::V1.fuel / 10,
+        "fuel used: {}",
+        t.fuel_used
+    );
+    let atts = op_input(
+        RoleTag::Writer,
+        &with_attachments(vec![attachment(&"n".repeat(256), &"m".repeat(256)); 10]),
+    );
+    let t = e.validate_traced(&atts);
+    assert_eq!(t.result, Verdict::Accept);
     assert!(
         t.fuel_used < Limits::V1.fuel / 10,
         "fuel used: {}",
@@ -330,8 +518,16 @@ fn determinism_repeated_calls_and_fresh_engines() {
     let inputs = [
         input(ALICE, RoleTag::Writer, &text("hello"), &[]),
         input(ALICE, RoleTag::Reader, &text("hello"), &[]),
-        input(ALICE, RoleTag::Writer, &ChatOp::Delete { target }, &BOB),
-        input(BOB, RoleTag::Writer, &ChatOp::Delete { target }, &BOB),
+        input(ALICE, RoleTag::Writer, &ChatOp::Delete { target }, &[]),
+        input(
+            BOB,
+            RoleTag::Writer,
+            &ChatOp::Meta {
+                title: None,
+                direct: true,
+            },
+            &[],
+        ),
         input(ALICE, RoleTag::Writer, &text(&"y".repeat(20_000)), &[]),
     ];
     let reference: Vec<_> = {
