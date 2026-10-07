@@ -1,0 +1,194 @@
+/* Mycel host design tokens. Shared by the host shell and every app it mounts.
+ *
+ * Palette: the forest floor. Lichen-grey ground, spruce ink, moss for action,
+ * a pale lichen green for your own words, ochre for "nearby" (the LAN is warm,
+ * the internet is not required).
+ */
+
+:root {
+  color-scheme: light;
+
+  --bg: #e9ede8;          /* lichen ground: behind panes, the rail */
+  --surface: #f9faf7;     /* panes */
+  --surface-2: #eff2ed;   /* hover, inputs */
+  --surface-3: #e2e8e1;   /* pressed, selected */
+  --raised: #ffffff;      /* dialogs, popovers, other people's bubbles */
+  --ink: #18221d;
+  --ink-2: #4f5d55;
+  --ink-3: #85918a;
+  --line: #d3dcd4;
+  --line-soft: #e3e9e3;
+
+  --accent: #2d5e4b;      /* moss / spruce */
+  --accent-hover: #244e3e;
+  --accent-ink: #f2f7f2;
+  --accent-soft: #dbe8de;
+
+  --mine: #d6e6cc;        /* lichen */
+  --mine-ink: #15211a;
+  --mine-meta: #5b7360;
+  --theirs: #ffffff;
+  --theirs-ink: #18221d;
+
+  --nearby: #b07d1c;      /* ochre */
+  --nearby-soft: #f3e6c9;
+  --online: #3f8a5f;
+  --danger: #a23b2b;
+  --danger-soft: #f6dfda;
+  --read: #2f7a8a;
+
+  --tone-moss: #5f7d5a;
+  --tone-slate: #56708c;
+  --tone-ochre: #a47a2a;
+  --tone-plum: #81607d;
+  --tone-clay: #a2634a;
+  --tone-tide: #3f7f7b;
+
+  --shadow-pop: 0 1px 2px rgba(24, 34, 29, 0.06), 0 8px 28px -6px rgba(24, 34, 29, 0.18);
+  --shadow-sheet: 0 0 0 1px rgba(24, 34, 29, 0.05), 24px 0 60px -20px rgba(24, 34, 29, 0.25);
+
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", sans-serif;
+  --font-display: ui-serif, "New York", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  --r-sm: 6px;
+  --r-md: 10px;
+  --r-lg: 16px;
+  --r-bubble: 18px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #0f1412;
+    --surface: #151c19;
+    --surface-2: #1b2420;
+    --surface-3: #232e29;
+    --raised: #1d2622;
+    --ink: #e3ebe5;
+    --ink-2: #a3b1a8;
+    --ink-3: #6f7d75;
+    --line: #2a3530;
+    --line-soft: #212b26;
+    --accent: #8fc2a2;
+    --accent-hover: #a5d2b5;
+    --accent-ink: #0d1813;
+    --accent-soft: #23362c;
+    --mine: #2b4234;
+    --mine-ink: #e7f1e9;
+    --mine-meta: #9ab9a3;
+    --theirs: #1f2924;
+    --theirs-ink: #e3ebe5;
+    --nearby: #dcb05a;
+    --nearby-soft: #3a3020;
+    --online: #6cc48f;
+    --danger: #ec8a77;
+    --danger-soft: #3d221d;
+    --read: #7cc6d4;
+    --tone-moss: #6f8f69;
+    --tone-slate: #6b86a3;
+    --tone-ochre: #b58c3d;
+    --tone-plum: #977391;
+    --tone-clay: #b67760;
+    --tone-tide: #4f9590;
+    --shadow-pop: 0 1px 2px rgba(0, 0, 0, 0.3), 0 10px 30px -6px rgba(0, 0, 0, 0.55);
+    --shadow-sheet: 0 0 0 1px rgba(255, 255, 255, 0.04), 24px 0 60px -20px rgba(0, 0, 0, 0.6);
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0f1412;
+  --surface: #151c19;
+  --surface-2: #1b2420;
+  --surface-3: #232e29;
+  --raised: #1d2622;
+  --ink: #e3ebe5;
+  --ink-2: #a3b1a8;
+  --ink-3: #6f7d75;
+  --line: #2a3530;
+  --line-soft: #212b26;
+  --accent: #8fc2a2;
+  --accent-hover: #a5d2b5;
+  --accent-ink: #0d1813;
+  --accent-soft: #23362c;
+  --mine: #2b4234;
+  --mine-ink: #e7f1e9;
+  --mine-meta: #9ab9a3;
+  --theirs: #1f2924;
+  --theirs-ink: #e3ebe5;
+  --nearby: #dcb05a;
+  --nearby-soft: #3a3020;
+  --online: #6cc48f;
+  --danger: #ec8a77;
+  --danger-soft: #3d221d;
+  --read: #7cc6d4;
+  --tone-moss: #6f8f69;
+  --tone-slate: #6b86a3;
+  --tone-ochre: #b58c3d;
+  --tone-plum: #977391;
+  --tone-clay: #b67760;
+  --tone-tide: #4f9590;
+  --shadow-pop: 0 1px 2px rgba(0, 0, 0, 0.3), 0 10px 30px -6px rgba(0, 0, 0, 0.55);
+  --shadow-sheet: 0 0 0 1px rgba(255, 255, 255, 0.04), 24px 0 60px -20px rgba(0, 0, 0, 0.6);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: 14.5px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: default;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+::selection {
+  background: var(--accent-soft);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}

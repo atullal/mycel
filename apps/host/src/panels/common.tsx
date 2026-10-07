@@ -1,0 +1,59 @@
+// Small pieces shared by the host panels. The host deliberately does not import
+// UI from apps: apps and host only meet through @mycel/sdk.
+
+const TONES = ["moss", "slate", "ochre", "plum", "clay", "tide"] as const;
+
+export function toneFor(id: string) {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  return TONES[h % TONES.length]!;
+}
+
+export function initials(name: string) {
+  const parts = name.trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 0) return "?";
+  if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase();
+  return (parts[0]![0]! + parts[parts.length - 1]![0]!).toUpperCase();
+}
+
+export function Avatar({
+  id,
+  name,
+  size = 36,
+  status,
+}: {
+  id: string;
+  name: string;
+  size?: number;
+  status?: "online" | "nearby" | "offline";
+}) {
+  return (
+    <span
+      className={`h-avatar tone-${toneFor(id)}`}
+      style={{ width: size, height: size, fontSize: Math.round(size * 0.38) }}
+      aria-hidden="true"
+    >
+      {initials(name)}
+      {status && status !== "offline" && <span className={`h-presence is-${status}`} />}
+    </span>
+  );
+}
+
+export function statusOf(c: { nearby: boolean; online: boolean }): "nearby" | "online" | "offline" {
+  return c.nearby ? "nearby" : c.online ? "online" : "offline";
+}
+
+export const STATUS_LABEL = {
+  nearby: "On your network",
+  online: "Online",
+  offline: "Offline",
+} as const;
+
+export function errorText(e: unknown) {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** Short, readable form of a hex id: first and last 4 characters. */
+export function shortId(id: string) {
+  return id.length > 12 ? `${id.slice(0, 4)}…${id.slice(-4)}` : id;
+}

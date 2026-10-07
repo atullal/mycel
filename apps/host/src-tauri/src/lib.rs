@@ -1,0 +1,158 @@
+//! The Mycel Host: a Tauri shell around one `mycel_node::Runtime`.
+//!
+//! Every command in docs/RUNTIME_API.md is exposed as a `#[tauri::command]`
+//! that forwards to the runtime held in managed state; runtime events are
+//! forwarded to the webview as the `mycel://event` Tauri event. Apps never see
+//! Tauri directly: they go through `@mycel/sdk`.
+//!
+//! Environment:
+//! - `MYCEL_DATA_DIR`: where the runtime keeps keys and data (default: the
+//!   platform app-data dir). Give each instance its own to run several on one
+//!   machine.
+//! - `MYCEL_NET`: `lan` (default), `internet` or `local`.
+//! - `MYCEL_NAME`: display name to use when creating a new profile.
+
+mod commands;
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use mycel_node::Runtime;
+use mycel_node::api::{Event, NetworkMode};
+use tauri::{AppHandle, Emitter, Manager, RunEvent};
+use tokio::sync::broadcast::error::RecvError;
+
+/// Tauri event carrying one runtime `Event` to the webview.
+pub const EVENT: &str = "mycel://event";
+
+/// Runtime handle kept in Tauri managed state.
+pub type Rt = Arc<Runtime>;
+
+fn network_mode_from_env() -> Result<NetworkMode, String> {
+    match std::env::var("MYCEL_NET").ok().as_deref().map(str::trim) {
+        None | Some("") | Some("lan") => Ok(NetworkMode::Lan),
+        Some("internet") => Ok(NetworkMode::Internet),
+        Some("local") => Ok(NetworkMode::Local),
+        Some(other) => Err(format!(
+            "MYCEL_NET={other:?} is not a network mode; use lan, internet or local"
+        )),
+    }
+}
+
+/// Window title carries the profile name so several instances can be told apart.
+pub(crate) fn set_window_title(app: &AppHandle, name: &str) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_title(&format!("{name} — Mycel"));
+    }
+}
+
+/// Forward runtime events to the webview until the runtime shuts down.
+fn forward_events(app: AppHandle, runtime: Rt) {
+    // Subscribe before spawning so nothing emitted after startup is missed.
+    let mut rx = runtime.subscribe();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if let Err(e) = app.emit(EVENT, &event) {
+                        eprintln!("mycel-host: failed to emit event: {e}");
+                    }
+                }
+                Err(RecvError::Lagged(skipped)) => {
+                    // We dropped events: tell the UI to refresh everything it shows.
+                    eprintln!("mycel-host: event stream lagged by {skipped}; asking UI to refresh");
+                    let mut refresh = vec![
+                        Event::ContactsChanged,
+                        Event::NearbyChanged,
+                        Event::NetworkChanged,
+                    ];
+                    refresh.extend(
+                        runtime
+                            .conversations()
+                            .into_iter()
+                            .map(|c| Event::ConversationUpdated { conversation: c.id }),
+                    );
+                    for event in refresh {
+                        let _ = app.emit(EVENT, &event);
+                    }
+                }
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
+pub fn run() {
+    let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
+                Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+                _ => app.path().app_data_dir()?,
+            };
+            std::fs::create_dir_all(&data_dir)
+                .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
+            let mode = network_mode_from_env()?;
+            let name = std::env::var("MYCEL_NAME")
+                .ok()
+                .filter(|n| !n.trim().is_empty());
+
+            let runtime: Rt = tauri::async_runtime::block_on(Runtime::open(&data_dir, mode, name))
+                .map_err(|e| format!("cannot open Mycel runtime in {}: {e}", data_dir.display()))?;
+
+            // Let the webview show downloaded attachments (convertFileSrc).
+            app.asset_protocol_scope()
+                .allow_directory(&data_dir, true)?;
+
+            let handle = app.handle().clone();
+            set_window_title(&handle, &runtime.profile().name);
+            forward_events(handle, runtime.clone());
+            app.manage(runtime);
+
+            eprintln!(
+                "mycel-host: data dir {}, network {:?}",
+                data_dir.display(),
+                mode
+            );
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::get_profile,
+            commands::set_name,
+            commands::add_contact,
+            commands::add_nearby_contact,
+            commands::remove_contact,
+            commands::list_contacts,
+            commands::list_nearby,
+            commands::network_status,
+            commands::list_conversations,
+            commands::get_conversation,
+            commands::create_conversation,
+            commands::list_messages,
+            commands::send_message,
+            commands::edit_message,
+            commands::delete_message,
+            commands::toggle_reaction,
+            commands::mark_read,
+            commands::set_typing,
+            commands::add_members,
+            commands::remove_member,
+            commands::add_keeper,
+            commands::rename_conversation,
+            commands::fetch_attachment,
+        ])
+        .build(tauri::generate_context!())
+        .expect("failed to build the Mycel host");
+
+    app.run(|app, event| {
+        if let RunEvent::Exit = event
+            && let Some(runtime) = app.try_state::<Rt>()
+        {
+            let runtime = runtime.inner().clone();
+            if let Err(e) = tauri::async_runtime::block_on(runtime.shutdown()) {
+                eprintln!("mycel-host: runtime shutdown failed: {e}");
+            }
+        }
+    });
+}
