@@ -756,13 +756,31 @@ impl Node {
         self.router.endpoint().addr()
     }
 
+    /// Addresses other devices can reach us on (real interface IPs, not
+    /// wildcard binds; loopback excluded unless that's all there is).
     pub fn local_addresses(&self) -> Vec<String> {
-        self.router
-            .endpoint()
-            .bound_sockets()
-            .iter()
-            .map(|a| a.to_string())
-            .collect()
+        let mut addrs: Vec<std::net::SocketAddr> = self.addr().ip_addrs().copied().collect();
+        if addrs.iter().any(|a| !a.ip().is_loopback()) {
+            addrs.retain(|a| !a.ip().is_loopback());
+        }
+        addrs.sort();
+        addrs.dedup();
+        addrs.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// Remember direct addresses for a peer (from a contact code), so we can
+    /// reach it even on networks where mDNS is blocked.
+    pub fn add_peer_hints(&self, peer: SignPk, addrs: &[std::net::SocketAddr]) {
+        if addrs.is_empty() {
+            return;
+        }
+        if let Ok(id) = to_endpoint_id(&peer) {
+            let mut a = EndpointAddr::new(id);
+            for x in addrs {
+                a = a.with_ip_addr(*x);
+            }
+            self.inner.memory.add_endpoint_info(a);
+        }
     }
 
     /// Tell the node how to reach a peer directly (tests / manual pairing).

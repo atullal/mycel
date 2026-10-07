@@ -27,7 +27,7 @@ use mycel_node::{Runtime, RuntimeOptions, dispatch::dispatch};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 
 #[derive(Parser)]
 #[command(name = "mycel", about = "Peer-to-peer, end-to-end encrypted, serverless.")]
@@ -102,6 +102,9 @@ enum Cmd {
         args: String,
         #[arg(long, default_value = "127.0.0.1:7777")]
         http: SocketAddr,
+        /// Data dir of the running `serve` (to read its API token).
+        #[arg(long, default_value = "~/.mycel")]
+        data: String,
     },
 }
 
@@ -141,7 +144,7 @@ async fn main() -> Result<()> {
             println!("name: {}\nid:   {}\ncode: {}", p.name, p.id, p.contact_code);
             rt.shutdown().await
         }
-        Cmd::Call { command, args, http } => call(http, &command, &args).await,
+        Cmd::Call { command, args, http, data } => call(http, &expand(&data), &command, &args).await,
     }
 }
 
@@ -169,16 +172,21 @@ async fn keeper(dev: DeviceArgs) -> Result<()> {
 struct App {
     rt: Arc<Runtime>,
     http: SocketAddr,
+    /// Per-run secret, embedded in the served index.html (cross-origin pages
+    /// can't read it) and required on every API route.
+    token: String,
+    /// index.html with the token injected.
+    index: Option<String>,
 }
 
 type Shared = Arc<App>;
 
 /// Defence for a localhost API that a browser can reach:
 /// - Host must be loopback (blocks DNS rebinding);
-/// - API calls need `X-Mycel: 1` (a cross-site page can't send it without a
-///   CORS preflight, which we never approve).
+/// - every API route needs the per-run token, either as the `X-Mycel` header
+///   (fetch) or `?t=` (EventSource, <img>). Only our own page knows it.
 #[allow(clippy::result_large_err)] // the Err is the HTTP response itself
-fn guard(app: &App, headers: &HeaderMap, need_marker: bool) -> Result<(), Response> {
+fn guard(app: &App, headers: &HeaderMap, query_token: Option<&str>) -> Result<(), Response> {
     let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
     let ok_host = host == app.http.to_string()
         || host == format!("localhost:{}", app.http.port())
@@ -186,10 +194,21 @@ fn guard(app: &App, headers: &HeaderMap, need_marker: bool) -> Result<(), Respon
     if !ok_host {
         return Err((StatusCode::FORBIDDEN, "bad host").into_response());
     }
-    if need_marker && headers.get("x-mycel").is_none_or(|v| v != "1") {
-        return Err((StatusCode::FORBIDDEN, "missing X-Mycel header").into_response());
+    let header_token = headers.get("x-mycel").and_then(|v| v.to_str().ok());
+    let given = header_token.or(query_token).unwrap_or("");
+    if !constant_time_eq(given.as_bytes(), app.token.as_bytes()) {
+        return Err((StatusCode::FORBIDDEN, "missing or wrong token").into_response());
     }
     Ok(())
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+#[derive(Deserialize, Default)]
+struct TokenQ {
+    t: Option<String>,
 }
 
 async fn api_cmd(
@@ -198,7 +217,7 @@ async fn api_cmd(
     UrlPath(cmd): UrlPath<String>,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = guard(&app, &headers, true) {
+    if let Err(r) = guard(&app, &headers, None) {
         return r;
     }
     let args: Value = if body.is_empty() {
@@ -209,14 +228,30 @@ async fn api_cmd(
             Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
         }
     };
+    // Browser-supplied attachment paths must come from our own upload folder.
+    if cmd == "send_message"
+        && let Some(paths) = args.get("attachments").and_then(|a| a.as_array())
+    {
+        let uploads = app.rt.data_dir().join("uploads");
+        for p in paths {
+            let ok = p
+                .as_str()
+                .and_then(|p| Path::new(p).canonicalize().ok())
+                .zip(uploads.canonicalize().ok())
+                .is_some_and(|(p, root)| p.starts_with(root));
+            if !ok {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": "attachments must be uploaded first"}))).into_response();
+            }
+        }
+    }
     match dispatch(&app.rt, &cmd, args).await {
         Ok(v) => Json(v).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
     }
 }
 
-async fn api_events(State(app): State<Shared>, headers: HeaderMap) -> Response {
-    if let Err(r) = guard(&app, &headers, false) {
+async fn api_events(State(app): State<Shared>, headers: HeaderMap, Query(q): Query<TokenQ>) -> Response {
+    if let Err(r) = guard(&app, &headers, q.t.as_deref()) {
         return r;
     }
     let stream = BroadcastStream::new(app.rt.subscribe()).filter_map(|ev| {
@@ -239,7 +274,7 @@ async fn api_upload(
     Query(q): Query<UploadQ>,
     body: Bytes,
 ) -> Response {
-    if let Err(r) = guard(&app, &headers, true) {
+    if let Err(r) = guard(&app, &headers, None) {
         return r;
     }
     let name: String = q
@@ -267,21 +302,26 @@ async fn api_upload(
 #[derive(Deserialize)]
 struct FileQ {
     path: String,
+    t: Option<String>,
 }
 
 /// Serve a local file — only from inside the data dir.
 async fn api_file(State(app): State<Shared>, headers: HeaderMap, Query(q): Query<FileQ>) -> Response {
-    if let Err(r) = guard(&app, &headers, false) {
+    if let Err(r) = guard(&app, &headers, q.t.as_deref()) {
         return r;
     }
-    let root = match app.rt.data_dir().canonicalize() {
-        Ok(r) => r,
-        Err(_) => return StatusCode::NOT_FOUND.into_response(),
-    };
     let Ok(path) = Path::new(&q.path).canonicalize() else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !path.starts_with(&root) {
+    // Only attachments: never identity.key, the database, or anything else.
+    let allowed = ["files", "uploads"].iter().any(|d| {
+        app.rt
+            .data_dir()
+            .join(d)
+            .canonicalize()
+            .is_ok_and(|root| path.starts_with(root))
+    });
+    if !allowed {
         return StatusCode::FORBIDDEN.into_response();
     }
     match tokio::fs::read(&path).await {
@@ -303,6 +343,16 @@ async fn api_file(State(app): State<Shared>, headers: HeaderMap, Query(q): Query
     }
 }
 
+fn write_private(path: &Path, contents: &str) -> Result<()> {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 fn mime_for(name: &str) -> &'static str {
     match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
         "png" => "image/png",
@@ -317,9 +367,31 @@ fn mime_for(name: &str) -> &'static str {
     }
 }
 
-async fn health(State(app): State<Shared>) -> Json<Value> {
+async fn health(State(app): State<Shared>, headers: HeaderMap) -> Response {
+    if let Err(r) = guard(&app, &headers, None) {
+        return r;
+    }
     let p = app.rt.profile();
-    Json(json!({"ok": true, "id": p.id, "name": p.name, "transport": "http"}))
+    Json(json!({"ok": true, "id": p.id, "name": p.name, "transport": "http"})).into_response()
+}
+
+/// The UI's index.html with the session token injected (no-store: never cached).
+async fn serve_index(State(app): State<Shared>, headers: HeaderMap) -> Response {
+    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
+    if !(host == app.http.to_string() || host == format!("localhost:{}", app.http.port())) {
+        return (StatusCode::FORBIDDEN, "bad host").into_response();
+    }
+    match &app.index {
+        Some(html) => (
+            [
+                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            html.clone(),
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "UI not built: run `npm run build`").into_response(),
+    }
 }
 
 fn default_ui() -> Option<PathBuf> {
@@ -336,26 +408,33 @@ async fn serve(dev: DeviceArgs, http: SocketAddr, ui: Option<PathBuf>) -> Result
         bail!("refusing to serve the API on a non-loopback address ({http}): anyone on the network could use your account");
     }
     let rt = open(&dev, false).await?;
-    let app: Shared = Arc::new(App { rt: rt.clone(), http });
-    let mut router = Router::new()
+    let ui = ui.or_else(default_ui);
+    let token = mycel_node::crypto::Hash32(mycel_node::crypto::random()).to_string();
+    let index = ui.as_ref().and_then(|d| std::fs::read_to_string(d.join("index.html")).ok()).map(|html| {
+        let boot = format!(
+            "<script>window.__MYCEL_HTTP__=true;window.__MYCEL_TOKEN__=\"{token}\";</script>"
+        );
+        html.replace("<script src=\"/api/boot.js\"></script>", "").replacen("<head>", &format!("<head>{boot}"), 1)
+    });
+    let app: Shared = Arc::new(App { rt: rt.clone(), http, token, index });
+    let mut router: Router<Shared> = Router::new()
+        .route("/", get(serve_index))
+        .route("/index.html", get(serve_index))
         .route("/api/health", get(health))
-        .route(
-            "/api/boot.js",
-            get(|| async {
-                ([(header::CONTENT_TYPE, "text/javascript")], "window.__MYCEL_HTTP__ = true;")
-            }),
-        )
         .route("/api/cmd/{cmd}", post(api_cmd))
         .route("/api/events", get(api_events))
         .route("/api/upload", post(api_upload))
-        .route("/api/file", get(api_file))
-        .with_state(app);
-    let ui = ui.or_else(default_ui);
+        .route("/api/file", get(api_file));
     if let Some(dir) = &ui {
+        // static assets only; every HTML route goes through `serve_index` (token injection)
+        // static files; unknown paths (SPA routes) get the token-injected index
         router = router.fallback_service(
-            ServeDir::new(dir).fallback(ServeFile::new(dir.join("index.html"))),
+            ServeDir::new(dir).not_found_service(axum::handler::Handler::with_state(serve_index, app.clone())),
         );
     }
+    let router = router.with_state(app.clone());
+    // let `mycel call` (same user) authenticate: token file readable only by us
+    write_private(&rt.data_dir().join("http-token"), &format!("{} {}", http, app.token))?;
     let listener = tokio::net::TcpListener::bind(http)
         .await
         .with_context(|| format!("can't listen on {http}"))?;
@@ -374,7 +453,10 @@ async fn serve(dev: DeviceArgs, http: SocketAddr, ui: Option<PathBuf>) -> Result
     rt.shutdown().await
 }
 
-async fn call(http: SocketAddr, command: &str, args: &str) -> Result<()> {
+async fn call(http: SocketAddr, data: &Path, command: &str, args: &str) -> Result<()> {
+    let token_file = std::fs::read_to_string(data.join("http-token"))
+        .with_context(|| format!("no running `mycel serve` for {}", data.display()))?;
+    let token = token_file.split_whitespace().nth(1).unwrap_or("").to_string();
     // Minimal HTTP/1.1 client so the CLI doesn't need an HTTP client crate.
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let body: Value = serde_json::from_str(args).context("args must be JSON")?;
@@ -383,7 +465,7 @@ async fn call(http: SocketAddr, command: &str, args: &str) -> Result<()> {
         .await
         .with_context(|| format!("is `mycel serve` running on {http}?"))?;
     let req = format!(
-        "POST /api/cmd/{command} HTTP/1.1\r\nHost: {http}\r\nX-Mycel: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST /api/cmd/{command} HTTP/1.1\r\nHost: {http}\r\nX-Mycel: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     s.write_all(req.as_bytes()).await?;

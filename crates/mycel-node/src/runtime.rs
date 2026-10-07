@@ -92,6 +92,8 @@ pub struct Runtime {
     hidden: Mutex<BTreeSet<SpaceId>>,
     /// Keys whose invites we refuse at the network layer.
     blocked: Arc<Mutex<BTreeSet<SignPk>>>,
+    /// Direct-address hints from contact codes (for networks without mDNS).
+    hints: Mutex<BTreeMap<SignPk, Vec<String>>>,
 }
 
 fn load_set<T: serde::de::DeserializeOwned + Ord>(store: &DbStore, key: &str) -> Result<BTreeSet<T>> {
@@ -130,13 +132,47 @@ pub fn encode_contact_code(card: &ContactCard) -> String {
     format!("{CONTACT_PREFIX}{}", BASE64URL_NOPAD.encode(&postcard::to_allocvec(card).unwrap()))
 }
 
+/// Contact code plus optional `@ip:port,ip:port` address hints (unsigned,
+/// only used to find the device; its identity is still the signed card).
+pub fn encode_contact_code_with_hints(card: &ContactCard, hints: &[String]) -> String {
+    let base = encode_contact_code(card);
+    if hints.is_empty() { base } else { format!("{base}@{}", hints.join(",")) }
+}
+
 pub fn decode_contact_code(code: &str) -> Result<ContactCard> {
+    Ok(decode_contact_code_with_hints(code)?.0)
+}
+
+pub fn decode_contact_code_with_hints(code: &str) -> Result<(ContactCard, Vec<std::net::SocketAddr>)> {
     let code: String = code.split_whitespace().collect();
     let body = code.strip_prefix(CONTACT_PREFIX).unwrap_or(&code);
-    let bytes = BASE64URL_NOPAD.decode(body.as_bytes()).context("not a Mycel contact code")?;
+    let (card_part, hints) = body.split_once('@').unwrap_or((body, ""));
+    let bytes = BASE64URL_NOPAD.decode(card_part.as_bytes()).context("not a Mycel contact code")?;
     let card: ContactCard = postcard::from_bytes(&bytes).context("not a Mycel contact code")?;
     card.verify().context("contact code signature is invalid")?;
-    Ok(card)
+    let hints = hints
+        .split(',')
+        .filter_map(|h| h.parse().ok())
+        .take(8)
+        .collect();
+    Ok((card, hints))
+}
+
+/// A friendly default name: the computer's name.
+fn default_device_name() -> String {
+    #[cfg(target_os = "macos")]
+    if let Ok(out) = std::process::Command::new("scutil").args(["--get", "ComputerName"]).output()
+        && out.status.success()
+    {
+        let n = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !n.is_empty() {
+            return n.chars().take(64).collect();
+        }
+    }
+    std::env::var("HOSTNAME")
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "Mycel user".into())
 }
 
 fn guess_mime(name: &str) -> &'static str {
@@ -267,7 +303,7 @@ impl Runtime {
             }
             (None, Some(n)) => n,
             (None, None) => {
-                if opts.keeper { "Keeper".to_string() } else { "Anonymous".to_string() }
+                if opts.keeper { "Keeper".to_string() } else { default_device_name() }
             }
         };
         let contacts: BTreeMap<SignPk, StoredContact> = store
@@ -296,6 +332,12 @@ impl Runtime {
             .into_iter()
             .collect();
         let hidden: BTreeSet<SpaceId> = load_set(&store, "hidden")?;
+        let hints: BTreeMap<SignPk, Vec<String>> = store
+            .kv_get("hints")?
+            .and_then(|b| postcard::from_bytes::<Vec<(SignPk, Vec<String>)>>(&b).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         nopts.accept_relay_invites = opts.keeper;
         let engine = mycel_rules::RulesEngine::load(CHAT_RULES_WASM)
             .map_err(|e| anyhow!("chat rules failed to load: {e:?}"))?;
@@ -331,7 +373,12 @@ impl Runtime {
             requests: Mutex::new(requests),
             hidden: Mutex::new(hidden),
             blocked,
+            hints: Mutex::new(hints),
         });
+        for (pk, addrs) in rt.hints.lock().iter() {
+            let addrs: Vec<std::net::SocketAddr> = addrs.iter().filter_map(|a| a.parse().ok()).collect();
+            rt.node.add_peer_hints(*pk, &addrs);
+        }
         // warm caches (also learns everyone's announced names)
         for s in rt.node.space_ids() {
             let _ = rt.view(&s);
@@ -376,7 +423,7 @@ impl Runtime {
         Profile {
             id: hex_id(&self.keys.sign_pk()),
             name: self.name.lock().clone(),
-            contact_code: encode_contact_code(&self.node.card()),
+            contact_code: encode_contact_code_with_hints(&self.node.card(), &self.node.local_addresses()),
         }
     }
 
@@ -416,7 +463,14 @@ impl Runtime {
     }
 
     pub fn add_contact(&self, code: String) -> Result<Contact> {
-        let card = decode_contact_code(&code)?;
+        let (card, hints) = decode_contact_code_with_hints(&code)?;
+        if !hints.is_empty() {
+            self.node.add_peer_hints(card.keys.sign_pk, &hints);
+            let mut all = self.hints.lock();
+            all.insert(card.keys.sign_pk, hints.iter().map(|h| h.to_string()).collect());
+            let list: Vec<(SignPk, Vec<String>)> = all.iter().map(|(k, v)| (*k, v.clone())).collect();
+            self.store.kv_put("hints", postcard::to_allocvec(&list).unwrap());
+        }
         self.remember(card.keys, card.name)
     }
 

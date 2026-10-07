@@ -305,3 +305,21 @@ fn hex_decode(s: &str) -> Vec<u8> {
 fn hash_of(s: &str) -> mycel_node::crypto::Hash32 {
     mycel_node::crypto::Hash32(<[u8; 32]>::try_from(hex_decode(s)).unwrap())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn contact_code_address_hints_connect_without_discovery() {
+    // Local mode: no mDNS, and we deliberately don't call connect_all.
+    let alice = open(&tmp("ha"), "Alice", free_port(), false).await;
+    let bob = open(&tmp("hb"), "Bob", free_port(), false).await;
+    let code = bob.profile().contact_code;
+    assert!(code.contains('@'), "code carries address hints: {code}");
+    let b = alice.add_contact(code).unwrap();
+    let conv = alice.create_conversation(None, vec![b.id.clone()]).unwrap();
+    alice.send_message(conv.id.clone(), "found you by code".into(), None, vec![]).await.unwrap();
+    eventually("bob reached via hints only", || {
+        bob.conversations().iter().any(|c| c.id == conv.id)
+    })
+    .await;
+    alice.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
+}

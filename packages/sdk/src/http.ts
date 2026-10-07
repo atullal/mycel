@@ -9,13 +9,19 @@ export function isHttpRuntime(): boolean {
   return typeof window !== "undefined" && (window as unknown as { __MYCEL_HTTP__?: boolean }).__MYCEL_HTTP__ === true;
 }
 
-/** Every API call carries this header; the server rejects calls without it (CSRF guard). */
-const MARKER = { "X-Mycel": "1" };
+/**
+ * Per-run token injected into the page by `mycel serve` (cross-origin pages
+ * can't read it). Sent on every API call; the server rejects calls without it.
+ */
+function token(): string {
+  return (window as unknown as { __MYCEL_TOKEN__?: string }).__MYCEL_TOKEN__ ?? "";
+}
+const marker = () => ({ "X-Mycel": token() });
 
 async function upload(file: File, base: string): Promise<string> {
   const res = await fetch(`${base}/api/upload?name=${encodeURIComponent(file.name)}`, {
     method: "POST",
-    headers: { ...MARKER, "Content-Type": "application/octet-stream" },
+    headers: { ...marker(), "Content-Type": "application/octet-stream" },
     body: file,
   });
   const json = (await res.json()) as { path?: string; error?: string };
@@ -59,10 +65,10 @@ function httpFiles(base: string): FileHost {
       });
     },
     url(path) {
-      return `${base}/api/file?path=${encodeURIComponent(path)}`;
+      return `${base}/api/file?path=${encodeURIComponent(path)}&t=${encodeURIComponent(token())}`;
     },
     async open(path) {
-      window.open(`${base}/api/file?path=${encodeURIComponent(path)}`, "_blank", "noopener");
+      window.open(`${base}/api/file?path=${encodeURIComponent(path)}&t=${encodeURIComponent(token())}`, "_blank", "noopener");
     },
   };
 }
@@ -77,7 +83,7 @@ export function createHttpTransport(base = ""): Transport {
 
   const ensureListening = () => {
     if (source) return;
-    source = new EventSource(`${base}/api/events`);
+    source = new EventSource(`${base}/api/events?t=${encodeURIComponent(token())}`);
     source.onmessage = (msg) => {
       let event: MycelEvent;
       try {
@@ -103,7 +109,7 @@ export function createHttpTransport(base = ""): Transport {
       try {
         res = await fetch(`${base}/api/cmd/${cmd}`, {
           method: "POST",
-          headers: { ...MARKER, "Content-Type": "application/json" },
+          headers: { ...marker(), "Content-Type": "application/json" },
           body: JSON.stringify(args ?? {}),
         });
       } catch {
