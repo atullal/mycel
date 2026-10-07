@@ -1,3 +1,6 @@
 /target
-/node_modules
+node_modules/
 .claude/
+dist/
+apps/host/src-tauri/target/
+apps/host/src-tauri/gen/
