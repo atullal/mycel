@@ -3445,6 +3445,7 @@ dependencies = [
  "mycel-crypto",
  "mycel-kit-chat",
  "mycel-net",
+ "mycel-rules",
  "mycel-sync",
  "mycel-trust",
  "postcard",

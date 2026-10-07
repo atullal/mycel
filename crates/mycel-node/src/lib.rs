@@ -21,4 +21,4 @@ pub use mycel_trust as trust;
 
 pub use mycel_net::{NetMode, Node, NodeOptions};
 pub use mycel_trust::Role;
-pub use runtime::{Runtime, RuntimeOptions, decode_contact_code, encode_contact_code};
+pub use runtime::{Runtime, RuntimeOptions, chat_rules_hash, decode_contact_code, encode_contact_code};

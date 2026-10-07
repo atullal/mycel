@@ -19,6 +19,39 @@ use crate::api::*;
 use crate::store::DbStore;
 
 const ATTACHMENT_AAD: &[u8] = b"mycel/v0/attachment";
+
+/// L4: the chat rules, compiled Rust → WASM (rules/chat-rules), run by every
+/// peer on every decrypted chat entry. Pinned by hash.
+const CHAT_RULES_WASM: &[u8] = include_bytes!("../../mycel-rules/fixtures/chat_rules.wasm");
+
+struct WasmRules(mycel_rules::RulesEngine);
+
+impl mycel_sync::FeedValidator for WasmRules {
+    fn validate(&self, stream: &mycel_sync::StreamId, author: &SignPk, role: Role, body: &[u8]) -> bool {
+        use mycel_rules::{RoleTag, RuleInput, StreamKind, StreamTag, Verdict};
+        // Only the chat feed is governed by the chat rules.
+        if *stream != messages_feed() {
+            return true;
+        }
+        let input = RuleInput {
+            author: author.0,
+            author_role: match role {
+                Role::Relay => RoleTag::Relay,
+                Role::Reader => RoleTag::Reader,
+                Role::Writer => RoleTag::Writer,
+                Role::Admin => RoleTag::Admin,
+            },
+            stream: StreamTag { kind: StreamKind::Feed, id: stream.id },
+            payload: body.to_vec(),
+            context: vec![],
+        };
+        self.0.validate(&input) == Verdict::Accept
+    }
+}
+
+pub fn chat_rules_hash() -> String {
+    mycel_rules::RulesHash::of(CHAT_RULES_WASM).to_string()
+}
 const CONTACT_PREFIX: &str = "mycel:";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -205,6 +238,9 @@ impl Runtime {
         // v0 policy: accept any conversation we're added to (the inviter needed
         // our contact card to add us). Blocking lists can come later.
         nopts.invite_policy = Arc::new(|_, _| true);
+        let engine = mycel_rules::RulesEngine::load(CHAT_RULES_WASM)
+            .map_err(|e| anyhow!("chat rules failed to load: {e:?}"))?;
+        nopts.feed_validator = Some(Arc::new(WasmRules(engine)));
         let node = Node::spawn(keys.clone(), nopts).await?;
 
         for (space, (ops, envs)) in store.load_spaces()? {

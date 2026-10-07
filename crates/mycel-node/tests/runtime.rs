@@ -223,6 +223,22 @@ async fn group_admin_removes_member() {
     eventually("all joined", || bob.conversations().len() == 1 && carol.conversations().len() == 1).await;
     assert!(bob.rename_conversation(conv.id.clone(), "mine".into()).is_err(), "not admin");
 
+    // L4: Bob (not admin) bypasses the API and appends a forged Meta op.
+    // Every peer's WASM chat rules reject it; the title is unchanged.
+    let space = alice.node().space_ids()[0];
+    let forged = mycel_node::chat::ChatOp::Meta { title: Some("pwned".into()), direct: false };
+    bob.node()
+        .with_space(&space, |r| r.append(mycel_node::chat::messages_feed(), forged.encode()))
+        .unwrap()
+        .unwrap();
+    bob.node().changed(space);
+    eventually("alice's rules reject bob's forged op", || {
+        alice.node().with_space(&space, |r| r.rule_rejected()).unwrap() == 1
+    })
+    .await;
+    assert_eq!(alice.conversation(conv.id.clone()).unwrap().title, "Trio");
+    assert_eq!(bob.node().with_space(&space, |r| r.rule_rejected()).unwrap(), 1);
+
     alice.remove_member(conv.id.clone(), c.id.clone()).unwrap();
     eventually("carol learns she was removed", || {
         !carol.conversation(conv.id.clone()).unwrap().active

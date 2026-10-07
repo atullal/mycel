@@ -11,6 +11,7 @@ hex = "0.4.3"
 mycel-crypto = { version = "0.1.0", path = "../mycel-crypto" }
 mycel-kit-chat = { version = "0.0.1", path = "../mycel-kit-chat" }
 mycel-net = { version = "0.1.0", path = "../mycel-net" }
+mycel-rules = { version = "0.1.0", path = "../mycel-rules" }
 mycel-sync = { version = "0.1.0", path = "../mycel-sync" }
 mycel-trust = { version = "0.1.0", path = "../mycel-trust" }
 postcard = { version = "1.1.3", features = ["alloc"] }

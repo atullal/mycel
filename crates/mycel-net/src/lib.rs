@@ -33,7 +33,7 @@ use iroh::{
 };
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
 use mycel_crypto::{DeviceKeys, Hash32, SignPk};
-use mycel_sync::{EnvelopeId, Replica, Store};
+use mycel_sync::{EnvelopeId, FeedValidator, Replica, Store};
 use mycel_trust::{SignedOp, SpaceId};
 use n0_future::StreamExt;
 use tokio::sync::{Notify, Semaphore, broadcast};
@@ -80,6 +80,8 @@ pub struct NodeOptions {
     pub invite_policy: InvitePolicy,
     /// UDP port to bind (0 = random).
     pub port: u16,
+    /// L4 rules applied to every feed entry in every space.
+    pub feed_validator: Option<Arc<dyn FeedValidator>>,
 }
 
 impl NodeOptions {
@@ -91,6 +93,7 @@ impl NodeOptions {
             blob_dir: None,
             invite_policy: Arc::new(|_, _| true),
             port: 0,
+            feed_validator: None,
         }
     }
 }
@@ -147,6 +150,7 @@ struct Inner {
     store: Option<Arc<dyn Store>>,
     blob_dir: Option<PathBuf>,
     invite_policy: InvitePolicy,
+    feed_validator: Option<Arc<dyn FeedValidator>>,
     spaces: Mutex<HashMap<SpaceId, Replica>>,
     peers: Mutex<HashMap<SignPk, PeerState>>,
     events: broadcast::Sender<NetEvent>,
@@ -160,6 +164,12 @@ struct Inner {
 }
 
 impl Inner {
+    fn prepare(&self, r: &mut Replica) {
+        if self.feed_validator.is_some() {
+            r.set_feed_validator(self.feed_validator.clone());
+        }
+    }
+
     fn emit(&self, e: NetEvent) {
         let _ = self.events.send(e);
     }
@@ -365,6 +375,7 @@ fn accept_invite(inner: &Arc<Inner>, from: SignPk, space: SpaceId, ops: Vec<Sign
     let Ok(mut r) = Replica::join(inner.keys.clone(), genesis, inner.store.clone()) else {
         return false;
     };
+    inner.prepare(&mut r);
     r.ingest_batch(all, vec![]);
     inner.spaces.lock().unwrap().entry(space).or_insert(r);
     inner.emit(NetEvent::SpaceAdded { space, from });
@@ -668,6 +679,7 @@ impl Node {
             store: opts.store,
             blob_dir: opts.blob_dir,
             invite_policy: opts.invite_policy,
+            feed_validator: opts.feed_validator,
             spaces: Mutex::default(),
             peers: Mutex::default(),
             events,
@@ -745,21 +757,24 @@ impl Node {
 
     /// Found a new Space; returns its id and the genesis op.
     pub fn create_space(&self) -> Result<(SpaceId, SignedOp)> {
-        let (r, genesis) = Replica::create(self.inner.keys.clone(), self.inner.store.clone())?;
+        let (mut r, genesis) = Replica::create(self.inner.keys.clone(), self.inner.store.clone())?;
+        self.inner.prepare(&mut r);
         let id = r.space_id();
         self.inner.spaces.lock().unwrap().insert(id, r);
         Ok((id, genesis))
     }
 
     pub fn join_space(&self, genesis: SignedOp) -> Result<SpaceId> {
-        let r = Replica::join(self.inner.keys.clone(), genesis, self.inner.store.clone())?;
+        let mut r = Replica::join(self.inner.keys.clone(), genesis, self.inner.store.clone())?;
+        self.inner.prepare(&mut r);
         let id = r.space_id();
         self.inner.spaces.lock().unwrap().entry(id).or_insert(r);
         Ok(id)
     }
 
     /// Insert a restored replica (from storage at startup).
-    pub fn insert_replica(&self, r: Replica) -> SpaceId {
+    pub fn insert_replica(&self, mut r: Replica) -> SpaceId {
+        self.inner.prepare(&mut r);
         let id = r.space_id();
         self.inner.spaces.lock().unwrap().insert(id, r);
         id

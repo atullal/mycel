@@ -164,6 +164,13 @@ pub enum Status {
     Invalid(&'static str),
 }
 
+/// L4 rules hook: decides whether a decrypted feed entry is acceptable.
+/// Must be deterministic (same inputs → same answer on every peer); the
+/// inputs are all derived from the envelope and its causal past.
+pub trait FeedValidator: Send + Sync {
+    fn validate(&self, stream: &StreamId, author: &SignPk, author_role: Role, body: &[u8]) -> bool;
+}
+
 /// Durable storage for a replica's inputs. Everything else is derived.
 pub trait Store: Send + Sync {
     fn put_op(&self, space: &SpaceId, op: &SignedOp);
@@ -253,6 +260,9 @@ pub struct Replica {
     /// Which peers are known to hold which envelopes (from sync inventories).
     holders: HashMap<EnvelopeId, BTreeSet<SignPk>>,
     store: Option<Arc<dyn Store>>,
+    validator: Option<Arc<dyn FeedValidator>>,
+    /// Valid envelopes whose decrypted content the rules rejected.
+    rule_rejected: HashSet<EnvelopeId>,
 }
 
 impl Replica {
@@ -310,7 +320,30 @@ impl Replica {
             feeds: HashMap::new(),
             holders: HashMap::new(),
             store,
+            validator: None,
+            rule_rejected: HashSet::new(),
         }
+    }
+
+    /// Install (or replace) the L4 rules for feed entries; re-derives feeds.
+    pub fn set_feed_validator(&mut self, v: Option<Arc<dyn FeedValidator>>) {
+        self.validator = v;
+        self.rule_rejected.clear();
+        self.feeds.clear();
+        let ids: Vec<EnvelopeId> = self
+            .status
+            .iter()
+            .filter(|(_, s)| **s == Status::Valid)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            self.materialize(&id);
+        }
+    }
+
+    /// Entries that were cryptographically valid but rejected by the rules.
+    pub fn rule_rejected(&self) -> usize {
+        self.rule_rejected.len()
     }
 
     fn persist_op(&self, op: &SignedOp) {
@@ -679,6 +712,12 @@ impl Replica {
                     .state_at(&env.header.auth_heads)
                     .role(&env.header.author)
                     .unwrap_or(Role::Relay);
+                if let Some(v) = &self.validator
+                    && !v.validate(&stream, &env.header.author, role, &entry.body)
+                {
+                    self.rule_rejected.insert(*id);
+                    return;
+                }
                 let item = FeedItem {
                     id: *id,
                     author: env.header.author,
