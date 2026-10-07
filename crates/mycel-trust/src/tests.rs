@@ -359,3 +359,22 @@ fn concurrent_revocation_by_unauthorized_author_does_not_win() {
     assert!(g.is_valid(&a_add.id()), "admin's concurrent op survives");
     assert_eq!(g.state().role(&x.pk()), Some(Role::Reader));
 }
+
+#[test]
+fn insert_many_matches_sequential_inserts() {
+    let (mut g, a) = space();
+    let peers: Vec<Peer> = (0..5).map(|_| Peer::new()).collect();
+    for p in &peers {
+        add(&mut g, &a, p, Role::Writer);
+    }
+    let space = g.space_id();
+    let mut b = SpaceGraph::from_genesis(g.get(&space).unwrap().clone()).unwrap();
+    // reversed order: everything goes pending, then resolves once
+    let ops: Vec<SignedOp> = g.resolution().order.iter().rev()
+        .filter(|id| **id != space)
+        .map(|id| g.get(id).unwrap().clone())
+        .collect();
+    let (added, rejected) = b.insert_many(ops);
+    assert_eq!((added.len(), rejected), (5, 0));
+    assert_eq!(b.state(), g.state());
+}

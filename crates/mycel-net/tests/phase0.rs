@@ -1,24 +1,59 @@
-//! Phase 0 end-to-end: real Iroh QUIC endpoints on localhost.
+//! End-to-end tests: real Iroh QUIC endpoints on this machine.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use mycel_crypto::DeviceKeys;
-use mycel_net::{NetMode, Node};
-use mycel_sync::{Replica, Status, automerge::{ROOT, transaction::Transactable}};
+use mycel_net::{NetEvent, NetMode, Node, NodeOptions};
+use mycel_sync::{
+    Replica, Status, StreamId, StreamKind,
+    automerge::{ROOT, transaction::Transactable},
+};
 use mycel_trust::Role;
 use serde_json::json;
 
-async fn node() -> Node {
-    Node::spawn(Arc::new(DeviceKeys::generate()), NetMode::Local)
-        .await
-        .unwrap()
+async fn node_with(mode: NetMode, name: &str) -> Node {
+    let mut opts = NodeOptions::new(mode, name);
+    let dir = std::env::temp_dir().join(format!("mycel-test-blobs-{}", mycel_crypto::random_u64()));
+    opts.blob_dir = Some(dir);
+    Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap()
+}
+
+/// Local-mode nodes that all know each other's addresses.
+async fn mesh(n: usize) -> Vec<Node> {
+    let mut nodes = Vec::new();
+    for i in 0..n {
+        nodes.push(node_with(NetMode::Local, &format!("n{i}")).await);
+    }
+    for a in &nodes {
+        for b in &nodes {
+            if a.id() != b.id() {
+                a.add_peer_addr(b.addr());
+            }
+        }
+    }
+    nodes
+}
+
+async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+    for _ in 0..200 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for: {what}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn phase0_end_to_end() {
-    let (alice, bob, carol, keeper, eve) = (node().await, node().await, node().await, node().await, node().await);
+    let mut nodes = mesh(5).await;
+    let eve = nodes.pop().unwrap();
+    let keeper = nodes.pop().unwrap();
+    let carol = nodes.pop().unwrap();
+    let bob = nodes.pop().unwrap();
+    let alice = nodes.pop().unwrap();
 
-    // Alice founds a space and invites everyone (invite = genesis + alice's address).
     let (space, genesis) = alice.create_space().unwrap();
     alice
         .with_space(&space, |r| {
@@ -30,40 +65,34 @@ async fn phase0_end_to_end() {
         .unwrap();
     for n in [&bob, &carol, &keeper] {
         n.join_space(genesis.clone()).unwrap();
-        n.sync_with(alice.addr(), space, true).await.unwrap();
+        n.sync_with(alice.id(), space, true).await.unwrap();
         assert!(n.with_space(&space, |r| r.my_role().is_some()).unwrap());
     }
 
-    // Bob writes and pushes to the keeper only.
     let doc = Replica::new_doc_id();
     bob.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "headline", "Mayor resigns")))
         .unwrap()
         .unwrap();
-    bob.sync_with(keeper.addr(), space, false).await.unwrap();
-
-    // Keeper holds it, validates it, but can't read it.
+    bob.sync_with(keeper.id(), space, false).await.unwrap();
     keeper
         .with_space(&space, |r| {
             assert_eq!(r.opaque_count(), 1);
             assert_eq!(r.doc_json(&doc), serde_json::Value::Null);
         })
         .unwrap();
-
-    // Carol (reader) gets it via the keeper, never talking to Bob.
-    carol.sync_with(keeper.addr(), space, false).await.unwrap();
+    carol.sync_with(keeper.id(), space, false).await.unwrap();
     assert_eq!(
         carol.with_space(&space, |r| r.doc_json(&doc)).unwrap(),
         json!({"headline": "Mayor resigns"})
     );
 
-    // Carol tries to write: rejected locally and by everyone she syncs with.
     let (_, env) = carol
         .with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "headline", "FAKE")))
         .unwrap()
         .unwrap();
     let env_id = env.unwrap().id();
-    carol.sync_with(keeper.addr(), space, false).await.unwrap();
-    alice.sync_with(keeper.addr(), space, false).await.unwrap();
+    carol.sync_with(keeper.id(), space, false).await.unwrap();
+    alice.sync_with(keeper.id(), space, false).await.unwrap();
     alice
         .with_space(&space, |r| {
             assert!(matches!(r.status(&env_id), Status::Invalid(_)));
@@ -71,40 +100,19 @@ async fn phase0_end_to_end() {
         })
         .unwrap();
 
-    // Eve (not a member) is refused at the door.
     eve.join_space(genesis.clone()).unwrap();
-    let err = eve.sync_with(alice.addr(), space, true).await.unwrap_err();
+    let err = eve.sync_with(alice.id(), space, true).await.unwrap_err();
     assert!(err.to_string().contains("denied"), "{err}");
 
-    // Alice removes Bob and pushes to the keeper.
-    alice
-        .with_space(&space, |r| r.remove_member(bob.id()))
-        .unwrap()
-        .unwrap();
+    alice.with_space(&space, |r| r.remove_member(bob.id())).unwrap().unwrap();
     alice
         .with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "source", "confidential")))
         .unwrap()
         .unwrap();
-    alice.sync_with(keeper.addr(), space, false).await.unwrap();
-
-    // The keeper now refuses Bob.
-    let err = bob.sync_with(keeper.addr(), space, false).await.unwrap_err();
+    alice.sync_with(keeper.id(), space, false).await.unwrap();
+    let err = bob.sync_with(keeper.id(), space, false).await.unwrap_err();
     assert!(err.to_string().contains("denied"), "{err}");
-
-    // Even if Bob gets the data some other way (a stale peer), he can't read the new epoch.
-    let stale = alice.with_space(&space, |r| {
-        let ops: Vec<_> = r.op_ids().iter().map(|i| r.op(i).unwrap().clone()).collect();
-        let envs: Vec<_> = r.envelope_ids().iter().map(|i| r.envelope(i).unwrap().clone()).collect();
-        (ops, envs)
-    }).unwrap();
-    bob.with_space(&space, |r| {
-        for op in stale.0 { r.ingest_op(op).unwrap(); }
-        for e in stale.1 { r.ingest_envelope(e).unwrap(); }
-        assert_eq!(r.my_role(), None);
-        assert_eq!(r.doc_json(&doc), json!({"headline": "Mayor resigns"}), "no 'source' for bob");
-    }).unwrap();
-
-    carol.sync_with(keeper.addr(), space, false).await.unwrap();
+    carol.sync_with(keeper.id(), space, false).await.unwrap();
     assert_eq!(
         carol.with_space(&space, |r| r.doc_json(&doc)).unwrap(),
         json!({"headline": "Mayor resigns", "source": "confidential"})
@@ -113,4 +121,165 @@ async fn phase0_end_to_end() {
     for n in [alice, bob, carol, keeper, eve] {
         n.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invites_and_live_sync_without_manual_calls() {
+    let mut nodes = mesh(3).await;
+    let carol = nodes.pop().unwrap();
+    let bob = nodes.pop().unwrap();
+    let alice = nodes.pop().unwrap();
+    let mut bob_events = bob.subscribe();
+
+    let (space, _) = alice.create_space().unwrap();
+    alice
+        .with_space(&space, |r| {
+            r.add_member(bob.keys().public(), Role::Writer)?;
+            r.add_member(carol.keys().public(), Role::Writer)
+        })
+        .unwrap()
+        .unwrap();
+    let feed = StreamId::named(StreamKind::Feed, "messages");
+    alice
+        .with_space(&space, |r| r.append(feed, b"welcome".to_vec()))
+        .unwrap()
+        .unwrap();
+    alice.changed(space); // the scheduler pushes the space (invite) to bob & carol
+
+    eventually("bob accepts invite", || bob.space_ids().contains(&space)).await;
+    let added = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(NetEvent::SpaceAdded { space: s, from }) = bob_events.recv().await {
+                return (s, from);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(added, (space, alice.id()));
+    eventually("bob has welcome", || {
+        bob.with_space(&space, |r| r.feed_len(&feed)).unwrap() == 1
+    })
+    .await;
+
+    // Bob replies; carol gets it with no explicit sync calls.
+    bob.with_space(&space, |r| r.append(feed, b"hi from bob".to_vec())).unwrap().unwrap();
+    bob.changed(space);
+    eventually("carol sees bob", || {
+        carol.space_ids().contains(&space)
+            && carol.with_space(&space, |r| r.feed_len(&feed)).unwrap() == 2
+    })
+    .await;
+    // delivery tracking: bob learns that carol and alice hold his message
+    let bob_msg = bob.with_space(&space, |r| r.feed(&feed)[1].id).unwrap();
+    eventually("holders known", || {
+        bob.with_space(&space, |r| r.holders(&bob_msg).len()).unwrap() == 2
+    })
+    .await;
+
+    for n in [alice, bob, carol] {
+        n.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn invite_policy_can_refuse() {
+    let mut nodes = Vec::new();
+    for name in ["alice", "mallory-target"] {
+        let mut opts = NodeOptions::new(NetMode::Local, name);
+        if name != "alice" {
+            opts.invite_policy = Arc::new(|_, _| false);
+        }
+        nodes.push(Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap());
+    }
+    let target = nodes.pop().unwrap();
+    let alice = nodes.pop().unwrap();
+    alice.add_peer_addr(target.addr());
+    let (space, _) = alice.create_space().unwrap();
+    alice
+        .with_space(&space, |r| r.add_member(target.keys().public(), Role::Writer))
+        .unwrap()
+        .unwrap();
+    let err = alice.sync_with(target.id(), space, false).await.unwrap_err();
+    assert!(err.to_string().contains("denied"), "{err}");
+    assert!(target.space_ids().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cards_ephemeral_and_blobs() {
+    let mut nodes = mesh(3).await;
+    let keeper = nodes.pop().unwrap();
+    let bob = nodes.pop().unwrap();
+    let alice = nodes.pop().unwrap();
+
+    let card = alice.fetch_card(bob.id()).await.unwrap();
+    assert_eq!(card.name, "n1");
+    assert_eq!(card.keys, bob.keys().public());
+
+    let (space, genesis) = alice.create_space().unwrap();
+    alice
+        .with_space(&space, |r| {
+            r.add_member(card.keys, Role::Writer)?;
+            r.add_member(keeper.keys().public(), Role::Relay)
+        })
+        .unwrap()
+        .unwrap();
+    bob.join_space(genesis.clone()).unwrap();
+    keeper.join_space(genesis).unwrap();
+    bob.sync_with(alice.id(), space, true).await.unwrap();
+    keeper.sync_with(alice.id(), space, true).await.unwrap();
+
+    // typing indicator
+    let mut ev = bob.subscribe();
+    alice.send_ephemeral(space, b"typing".to_vec()).unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Ok(NetEvent::Ephemeral { from, data, .. }) = ev.recv().await {
+                return (from, data);
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(got, (alice.id(), b"typing".to_vec()));
+
+    // blob: alice uploads, it's pushed to bob and keeper; a fresh fetch works
+    let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let hash = alice.put_blob(space, payload.clone()).await.unwrap();
+    eventually("keeper stored blob", || keeper.blob_path(&hash).is_some()).await;
+    let path = bob.fetch_blob(space, hash).await.unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), payload);
+
+    for n in [alice, bob, keeper] {
+        n.shutdown().await.unwrap();
+    }
+}
+
+/// Real mDNS on this machine: no manual addresses, no relays, no internet.
+#[tokio::test(flavor = "multi_thread")]
+async fn lan_discovery_via_mdns() {
+    let alice = node_with(NetMode::Lan, "alice-lan").await;
+    let bob = node_with(NetMode::Lan, "bob-lan").await;
+    eventually("alice sees bob nearby", || {
+        alice.peers().get(&bob.id()).is_some_and(|p| p.nearby && p.name.as_deref() == Some("bob-lan"))
+    })
+    .await;
+    let card = alice.fetch_card(bob.id()).await.unwrap();
+    let (space, _) = alice.create_space().unwrap();
+    let feed = StreamId::new_feed();
+    alice
+        .with_space(&space, |r| {
+            r.add_member(card.keys, Role::Writer)?;
+            r.append(feed, b"over the LAN".to_vec())
+        })
+        .unwrap()
+        .unwrap();
+    alice.changed(space);
+    eventually("bob got message over LAN", || {
+        bob.space_ids().contains(&space)
+            && bob.with_space(&space, |r| r.feed_len(&feed)).unwrap() == 1
+    })
+    .await;
+    alice.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
 }

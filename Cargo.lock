@@ -1841,6 +1841,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mycel-kit-chat"
+version = "0.0.1"
+dependencies = [
+ "mycel-crypto",
+ "mycel-sync",
+ "mycel-trust",
+ "postcard",
+ "serde",
+]
+
+[[package]]
 name = "mycel-net"
 version = "0.1.0"
 dependencies = [
@@ -1850,6 +1861,7 @@ dependencies = [
  "mycel-crypto",
  "mycel-sync",
  "mycel-trust",
+ "n0-future",
  "postcard",
  "serde",
  "serde_json",

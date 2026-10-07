@@ -26,16 +26,16 @@ fn sync(a: &mut Replica, b: &mut Replica) {
     }
 }
 
-fn put(r: &mut Replica, doc: DocId, key: &str, val: &str) -> Envelope {
+fn put(r: &mut Replica, doc: StreamId, key: &str, val: &str) -> Envelope {
     let (k, v) = (key.to_string(), val.to_string());
     r.change(doc, move |d| d.put(ROOT, k, v)).unwrap().1.unwrap()
 }
 
 /// Founder + a member with `role`, both synced.
 fn pair(role: Role) -> (Replica, Replica, Arc<DeviceKeys>) {
-    let (mut a, genesis) = Replica::create(dev()).unwrap();
+    let (mut a, genesis) = Replica::create(dev(), None).unwrap();
     let bk = dev();
-    let mut b = Replica::join(bk.clone(), genesis).unwrap();
+    let mut b = Replica::join(bk.clone(), genesis, None).unwrap();
     a.add_member(bk.public(), role).unwrap();
     sync(&mut a, &mut b);
     (a, b, bk)
@@ -72,9 +72,9 @@ fn reader_writes_are_rejected_everywhere() {
 
 #[test]
 fn keeper_stores_and_validates_but_cannot_read() {
-    let (mut a, genesis) = Replica::create(dev()).unwrap();
+    let (mut a, genesis) = Replica::create(dev(), None).unwrap();
     let kk = dev();
-    let mut keeper = Replica::join(kk.clone(), genesis).unwrap();
+    let mut keeper = Replica::join(kk.clone(), genesis, None).unwrap();
     a.add_member(kk.public(), Role::Relay).unwrap();
     let doc = Replica::new_doc_id();
     let env = put(&mut a, doc, "secret", "the source is X");
@@ -96,7 +96,7 @@ fn outsider_and_tampered_envelopes() {
     // An outsider who learned the genesis op can replicate the graph but has no
     // role and no keys: it cannot even produce an envelope.
     let genesis = a.op(&a.space_id()).unwrap().clone();
-    let mut eve = Replica::join(dev(), genesis).unwrap();
+    let mut eve = Replica::join(dev(), genesis, None).unwrap();
     sync(&mut a, &mut eve);
     assert!(eve.change(doc, |d| d.put(ROOT, "k", "evil")).is_err());
 
@@ -116,7 +116,7 @@ fn outsider_signed_envelope_is_invalid() {
     let eve = dev();
     let header = Header {
         space: a.space_id(),
-        doc,
+        stream: doc,
         author: eve.sign_pk(),
         author_seq: 0,
         author_prev: None,
@@ -147,7 +147,7 @@ fn author_cannot_write_under_another_actor() {
     let epoch = b.graph.state().write_epoch().unwrap();
     let header = Header {
         space: b.space_id(),
-        doc,
+        stream: doc,
         author: bk.sign_pk(),
         author_seq: 0,
         author_prev: None,
@@ -188,10 +188,10 @@ fn removal_cuts_off_reads_and_backdated_writes() {
 
 #[test]
 fn concurrent_edits_converge() {
-    let (mut a, genesis) = Replica::create(dev()).unwrap();
+    let (mut a, genesis) = Replica::create(dev(), None).unwrap();
     let (bk, ck) = (dev(), dev());
-    let mut b = Replica::join(bk.clone(), genesis.clone()).unwrap();
-    let mut c = Replica::join(ck.clone(), genesis).unwrap();
+    let mut b = Replica::join(bk.clone(), genesis.clone(), None).unwrap();
+    let mut c = Replica::join(ck.clone(), genesis, None).unwrap();
     a.add_member(bk.public(), Role::Writer).unwrap();
     a.add_member(ck.public(), Role::Writer).unwrap();
     sync(&mut a, &mut b);
@@ -227,4 +227,99 @@ fn demoted_writer_becomes_read_only() {
     sync(&mut a, &mut b);
     assert_eq!(b.doc_json(&doc), json!({"k": "by writer", "k2": "admin"}), "still reads");
     assert_eq!(a.doc_json(&doc), b.doc_json(&doc));
+}
+
+#[test]
+fn feeds_order_causally_and_converge() {
+    let (mut a, mut b, _) = pair(Role::Writer);
+    let feed = StreamId::named(StreamKind::Feed, "messages");
+    a.append(feed, b"a1".to_vec()).unwrap();
+    a.append(feed, b"a2".to_vec()).unwrap();
+    sync(&mut a, &mut b);
+    // concurrent appends on both sides
+    b.append(feed, b"b1".to_vec()).unwrap();
+    a.append(feed, b"a3".to_vec()).unwrap();
+    sync(&mut a, &mut b);
+    let fa: Vec<Vec<u8>> = a.feed(&feed).into_iter().map(|i| i.body).collect();
+    let fb: Vec<Vec<u8>> = b.feed(&feed).into_iter().map(|i| i.body).collect();
+    assert_eq!(fa, fb, "same order everywhere");
+    assert_eq!(&fa[..2], &[b"a1".to_vec(), b"a2".to_vec()], "causal prefix");
+    assert_eq!(fa.len(), 4);
+    // b1 and a3 both depend on a2
+    let items = a.feed(&feed);
+    assert!(items[2].deps.contains(&items[1].id) && items[3].deps.contains(&items[1].id));
+    assert_eq!(items[0].author_role, Role::Admin);
+}
+
+#[test]
+fn reader_feed_appends_rejected() {
+    let (mut a, mut r, _) = pair(Role::Reader);
+    let feed = StreamId::new_feed();
+    a.append(feed, b"hello".to_vec()).unwrap();
+    sync(&mut a, &mut r);
+    let (_, env) = r.append(feed, b"spam".to_vec()).unwrap();
+    assert!(matches!(r.status(&env.id()), Status::Invalid(_)));
+    sync(&mut a, &mut r);
+    assert_eq!(a.feed_len(&feed), 1);
+    assert_eq!(r.feed_len(&feed), 1);
+}
+
+#[derive(Default)]
+struct MemStore {
+    ops: std::sync::Mutex<Vec<SignedOp>>,
+    envs: std::sync::Mutex<Vec<Envelope>>,
+}
+impl Store for MemStore {
+    fn put_op(&self, _: &SpaceId, op: &SignedOp) {
+        self.ops.lock().unwrap().push(op.clone());
+    }
+    fn put_envelope(&self, _: &SpaceId, env: &Envelope) {
+        self.envs.lock().unwrap().push(env.clone());
+    }
+}
+
+#[test]
+fn restore_from_store_reproduces_state() {
+    let store = Arc::new(MemStore::default());
+    let ak = dev();
+    let (mut a, genesis) = Replica::create(ak.clone(), Some(store.clone())).unwrap();
+    let bk = dev();
+    let mut b = Replica::join(bk.clone(), genesis.clone(), None).unwrap();
+    a.add_member(bk.public(), Role::Writer).unwrap();
+    sync(&mut a, &mut b);
+    let feed = StreamId::new_feed();
+    let doc = StreamId::new_doc();
+    b.append(feed, b"from b".to_vec()).unwrap();
+    put(&mut b, doc, "k", "v");
+    sync(&mut a, &mut b);
+    a.append(feed, b"from a".to_vec()).unwrap();
+
+    let ops: Vec<SignedOp> = store.ops.lock().unwrap().iter()
+        .filter(|o| o.id() != genesis.id()).cloned().collect();
+    let envs = store.envs.lock().unwrap().clone();
+    let mut restored = Replica::restore(ak, genesis, ops, envs, None).unwrap();
+    assert_eq!(restored.graph().state(), a.graph().state());
+    assert_eq!(restored.feed(&feed), a.feed(&feed));
+    assert_eq!(restored.doc_json(&doc), a.doc_json(&doc));
+    // and it can keep writing on the same author chain
+    let (_, env) = restored.append(feed, b"after restart".to_vec()).unwrap();
+    assert_eq!(restored.status(&env.id()), Status::Valid);
+}
+
+#[test]
+fn many_messages_ingest_quickly() {
+    let (mut a, mut b, _) = pair(Role::Writer);
+    let feed = StreamId::new_feed();
+    for i in 0..2000 {
+        a.append(feed, format!("msg {i}").into_bytes()).unwrap();
+    }
+    let envs: Vec<Envelope> = a.envelope_ids().iter().map(|i| a.envelope(i).unwrap().clone()).collect();
+    let t = std::time::Instant::now();
+    let res = b.ingest_batch(vec![], envs);
+    let took = t.elapsed();
+    assert_eq!(res.envelopes, 2000);
+    assert_eq!(b.feed_len(&feed), 2000);
+    assert_eq!(b.feed(&feed).last().unwrap().body, b"msg 1999");
+    assert!(took.as_secs_f64() < 10.0, "ingest took {took:?}");
+    eprintln!("ingested 2000 envelopes in {took:?}");
 }

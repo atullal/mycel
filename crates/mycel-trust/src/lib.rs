@@ -404,19 +404,47 @@ impl SpaceGraph {
         if self.contains(&id) {
             return Ok(Inserted::Duplicate);
         }
-        op.verify_standalone()?;
-        if op.op.space != Some(self.space) {
-            return Err(TrustError::WrongSpace);
-        }
-        self.pending.insert(id, op);
+        self.stage(op)?;
         let promoted = self.promote_pending();
         if promoted.contains(&id) {
-            self.res = resolve::resolve(&self.ops);
-            self.state_cache.lock().unwrap().clear();
+            self.reresolve();
             Ok(Inserted::New)
         } else {
             Ok(Inserted::Pending)
         }
+    }
+
+    /// Insert many ops, resolving the graph once. Bad ops are skipped and
+    /// reported; returns (ids that became part of the graph, rejected count).
+    pub fn insert_many(&mut self, ops: impl IntoIterator<Item = SignedOp>) -> (Vec<OpId>, usize) {
+        let mut rejected = 0;
+        for op in ops {
+            if self.contains(&op.id()) {
+                continue;
+            }
+            if self.stage(op).is_err() {
+                rejected += 1;
+            }
+        }
+        let promoted: Vec<OpId> = self.promote_pending().into_iter().collect();
+        if !promoted.is_empty() {
+            self.reresolve();
+        }
+        (promoted, rejected)
+    }
+
+    fn stage(&mut self, op: SignedOp) -> Result<()> {
+        op.verify_standalone()?;
+        if op.op.space != Some(self.space) {
+            return Err(TrustError::WrongSpace);
+        }
+        self.pending.insert(op.id(), op);
+        Ok(())
+    }
+
+    fn reresolve(&mut self) {
+        self.res = resolve::resolve(&self.ops);
+        self.state_cache.lock().unwrap().clear();
     }
 
     fn promote_pending(&mut self) -> HashSet<OpId> {
