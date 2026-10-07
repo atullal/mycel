@@ -32,6 +32,9 @@ struct Shared {
     closed: Mutex<bool>,
 }
 
+/// Everything stored for one space: its ops (incl. genesis) and envelopes.
+pub type StoredSpace = (Vec<SignedOp>, Vec<Envelope>);
+
 pub struct DbStore {
     db: Arc<Database>,
     shared: Arc<Shared>,
@@ -140,10 +143,10 @@ impl DbStore {
     }
 
     /// Every stored space: (genesis + other ops, envelopes).
-    pub fn load_spaces(&self) -> Result<HashMap<SpaceId, (Vec<SignedOp>, Vec<Envelope>)>> {
+    pub fn load_spaces(&self) -> Result<HashMap<SpaceId, StoredSpace>> {
         self.flush()?;
         let txn = self.db.begin_read()?;
-        let mut out: HashMap<SpaceId, (Vec<SignedOp>, Vec<Envelope>)> = HashMap::new();
+        let mut out: HashMap<SpaceId, StoredSpace> = HashMap::new();
         let space_of = |k: &[u8]| Hash32(k[..32].try_into().unwrap());
         for row in txn.open_table(OPS)?.iter()? {
             let (k, v) = row?;

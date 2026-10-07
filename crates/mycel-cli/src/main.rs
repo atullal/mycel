@@ -177,6 +177,7 @@ type Shared = Arc<App>;
 /// - Host must be loopback (blocks DNS rebinding);
 /// - API calls need `X-Mycel: 1` (a cross-site page can't send it without a
 ///   CORS preflight, which we never approve).
+#[allow(clippy::result_large_err)] // the Err is the HTTP response itself
 fn guard(app: &App, headers: &HeaderMap, need_marker: bool) -> Result<(), Response> {
     let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
     let ok_host = host == app.http.to_string()

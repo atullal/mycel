@@ -11,7 +11,7 @@ fn tmp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("mycel-rt-{name}-{}", mycel_node::crypto::random_u64()))
 }
 
-async fn open(dir: &PathBuf, name: &str, port: u16, keeper: bool) -> Arc<Runtime> {
+async fn open(dir: &std::path::Path, name: &str, port: u16, keeper: bool) -> Arc<Runtime> {
     Runtime::open_with(RuntimeOptions {
         data_dir: dir.clone(),
         mode: NetworkMode::Local,
