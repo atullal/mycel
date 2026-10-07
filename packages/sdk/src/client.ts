@@ -94,6 +94,13 @@ export interface Mycel {
     rename(id: ConversationId, title: string): Promise<void>;
     /** `fetch_attachment`: resolves to the local path; `blobReady` fires too. */
     fetchAttachment(blob: string): Promise<string>;
+    /** `accept_request`: the inviter becomes a contact and you introduce yourself. */
+    acceptRequest(id: ConversationId): Promise<ConversationSummary>;
+    /**
+     * `decline_request`: leave the conversation (it disappears from the list).
+     * `block: true` also refuses every future invite from that person.
+     */
+    declineRequest(id: ConversationId, opts?: { block?: boolean }): Promise<void>;
   };
 
   /** Host file services (native dialog in Tauri, `<input type=file>` in the mock). */
@@ -178,6 +185,9 @@ export function createMycel(transport: Transport): Mycel {
       addKeeper: (id, keeper) => call("add_keeper", { id, keeper }).then(done),
       rename: (id, title) => call("rename_conversation", { id, title }).then(done),
       fetchAttachment: (blob) => call("fetch_attachment", { blob }),
+      acceptRequest: (id) => call("accept_request", { id }),
+      declineRequest: (id, opts = {}) =>
+        call("decline_request", opts.block ? { id, block: true } : { id }).then(done),
     },
     files: transport.files ?? browserFiles,
     on: on as Mycel["on"],

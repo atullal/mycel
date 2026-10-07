@@ -165,6 +165,22 @@ pub async fn rename_conversation(rt: State<'_, Rt>, id: ConversationId, title: S
     rt.rename_conversation(id, title).map_err(err)
 }
 
+// ---------------------------------------------------------------- message requests
+
+#[tauri::command]
+pub async fn accept_request(rt: State<'_, Rt>, id: ConversationId) -> Res<ConversationSummary> {
+    rt.accept_request(id).map_err(err)
+}
+
+#[tauri::command]
+pub async fn decline_request(
+    rt: State<'_, Rt>,
+    id: ConversationId,
+    block: Option<bool>,
+) -> Res<()> {
+    rt.decline_request(id, block.unwrap_or(false)).map_err(err)
+}
+
 #[tauri::command]
 pub async fn fetch_attachment(rt: State<'_, Rt>, blob: String) -> Res<String> {
     rt.fetch_attachment(blob).await.map_err(err)

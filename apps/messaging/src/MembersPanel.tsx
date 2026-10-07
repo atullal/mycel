@@ -34,7 +34,8 @@ export function MembersPanel({
     );
   }
 
-  const isAdmin = c.active && c.myRole === "admin";
+  // Nothing can be changed (or posted) until a message request is accepted.
+  const isAdmin = c.active && !c.request && c.myRole === "admin";
   const memberIds = new Set(c.members.map((m) => m.id));
   const candidates = contacts.filter((x) => !memberIds.has(x.id));
   const people = c.members.filter((m) => m.role !== "keeper");
@@ -191,7 +192,7 @@ export function MembersPanel({
           </p>
         )}
 
-        {c.active && !c.direct && (
+        {c.active && !c.direct && !c.request && (
           <section className="mx-panel-section">
             {confirm === "leave" ? (
               <div className="mx-confirm">

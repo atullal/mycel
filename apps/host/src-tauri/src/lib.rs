@@ -82,6 +82,62 @@ fn forward_events(app: AppHandle, runtime: Rt) {
     });
 }
 
+/// Escape glob metacharacters so a literal path can be used inside a scope pattern.
+fn glob_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '?' | '*' | '[' | ']' => {
+                out.push('[');
+                out.push(c);
+                out.push(']');
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// The webview may only show and open decrypted attachments, which the runtime
+/// keeps under `<data dir>/files/`. Everything else in the data dir (keys, the
+/// store) stays out of reach of the asset protocol and the opener.
+///
+/// The static capability already allows `$APPDATA/files/**`; this adds the
+/// data dir actually in use (it differs when `MYCEL_DATA_DIR` is set).
+fn allow_attachment_files(app: &tauri::App, data_dir: &std::path::Path) -> Result<(), String> {
+    let files = data_dir.join("files");
+    std::fs::create_dir_all(&files)
+        .map_err(|e| format!("cannot create {}: {e}", files.display()))?;
+
+    // Show downloaded attachments (convertFileSrc).
+    app.asset_protocol_scope()
+        .allow_directory(&files, true)
+        .map_err(|e| e.to_string())?;
+
+    // Open them with the system app. Scope paths are glob patterns, so escape
+    // the directory; list both the given and the canonical form (on macOS
+    // /tmp is really /private/tmp, and the opener checks canonical paths).
+    let mut dirs = vec![files.clone()];
+    if let Ok(canonical) = std::fs::canonicalize(&files)
+        && canonical != files
+    {
+        dirs.push(canonical);
+    }
+    let allowed: Vec<serde_json::Value> = dirs
+        .iter()
+        .map(|d| {
+            let pattern = format!("{}/**", glob_escape(&d.to_string_lossy()));
+            serde_json::json!({ "path": pattern })
+        })
+        .collect();
+    app.add_capability(
+        tauri::ipc::CapabilityBuilder::new("attachment-files")
+            .window("main")
+            .permission_scoped("opener:allow-open-path", allowed, Vec::new()),
+    )
+    .map_err(|e| format!("cannot allow opening attachments: {e}"))
+}
+
 /// Open the runtime and wire it to the app.
 fn start(app: &mut tauri::App) -> Result<(), String> {
     let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
@@ -108,10 +164,7 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
             format!("cannot open Mycel data in {}: {e}{hint}", data_dir.display())
         })?;
 
-    // Let the webview show downloaded attachments (convertFileSrc).
-    app.asset_protocol_scope()
-        .allow_directory(&data_dir, true)
-        .map_err(|e| e.to_string())?;
+    allow_attachment_files(app, &data_dir)?;
 
     let handle = app.handle().clone();
     set_window_title(&handle, &runtime.profile().name);
@@ -178,6 +231,8 @@ pub fn run() {
             commands::add_keeper,
             commands::rename_conversation,
             commands::fetch_attachment,
+            commands::accept_request,
+            commands::decline_request,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build the Mycel host");

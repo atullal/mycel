@@ -137,6 +137,10 @@ interface Conv {
   active: boolean;
   /** Ever-increasing activity clock, for "newest activity first" ordering. */
   activity: number;
+  /** Set while this is a message request from a non-contact. */
+  invitedBy: PeerId | null;
+  /** Declined requests disappear from the list. */
+  hidden: boolean;
 }
 
 interface Blob_ {
@@ -246,6 +250,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
   const uploads = new Map<string, File>();
   const objectUrls = new Map<string, string>();
   const handlers = new Set<(e: MycelEvent) => void>();
+  const blocked = new Set<PeerId>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let clock = 0;
 
@@ -331,6 +336,8 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       unread: c.unread,
       active: c.active,
       myRole: myRole(c),
+      request: c.invitedBy != null,
+      invitedBy: c.invitedBy,
     };
   }
 
@@ -347,6 +354,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
   }
 
   function requireActive(c: Conv) {
+    if (c.invitedBy) throw "accept this message request before replying";
     if (!c.active) throw "You're no longer a member of this conversation";
   }
 
@@ -476,6 +484,8 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       unread: 0,
       active: true,
       activity: -activityAgo,
+      invitedBy: null,
+      hidden: false,
     };
     convs.set(id, c);
     return c;
@@ -555,6 +565,17 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     seedMsg(bc, meId, 9 * 24 * HOUR - 20 * MIN, "Yes please, I've been meaning to read it");
     seedMsg(bc, hana.id, 6 * 24 * HOUR, "We're moving the circle to the new group. See you there!");
     bc.active = false;
+
+    // A message request: Kofi (on the LAN, not a contact) started a chat.
+    const kofi = person("Kofi Mensah");
+    const rq = seedConv(hexFrom("conv:kofi"), null, [[kofi.id, "admin"], [meId, "admin"]], 0);
+    rq.invitedBy = kofi.id;
+    seedMsg(rq, kofi.id, 7 * MIN, "Hi Juno, it's Kofi from the bike co-op. We met at the repair night on Thursday.");
+    const quote = addBlob("brake-quote.pdf", "application/pdf", 48_213, false, () => new Blob(["(mock pdf)"], { type: "application/pdf" }));
+    seedMsg(rq, kofi.id, 6 * MIN, "Here's the quote for your brakes, and the shop's page: https://example.org/coop", {
+      attachments: [quote],
+    });
+    rq.unread = 2;
   }
 
   // --- ambient activity ------------------------------------------------------------
@@ -595,6 +616,8 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
         unread: 0,
         active: true,
         activity: ++clock,
+        invitedBy: null,
+        hidden: false,
       };
       convs.set(id, c);
       emit({ type: "conversationAdded", conversation: id });
@@ -689,7 +712,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       addresses: ["192.168.1.24:51820", "[fe80::1c2a:8ff:fe3d:91b2]:51820", "127.0.0.1:51820"],
     }),
     list_conversations: () =>
-      [...convs.values()].sort((a, b) => b.activity - a.activity).map(summary),
+      [...convs.values()].filter((c) => !c.hidden).sort((a, b) => b.activity - a.activity).map(summary),
     get_conversation: ({ id }) => summary(getConv(id)),
     create_conversation: ({ title, members }) => {
       const t = title?.trim() || null;
@@ -708,6 +731,8 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
         unread: 0,
         active: true,
         activity: ++clock,
+        invitedBy: null,
+        hidden: false,
       };
       convs.set(c.id, c);
       emit({ type: "conversationAdded", conversation: c.id });
@@ -800,6 +825,8 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     },
     mark_read: ({ id }) => {
       const c = getConv(id);
+      // A read receipt would tell a stranger you've seen their request.
+      if (c.invitedBy) throw "accept this message request before replying";
       if (c.unread !== 0) {
         c.unread = 0;
         emit({ type: "conversationUpdated", conversation: c.id });
@@ -807,7 +834,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       return null;
     },
     set_typing: ({ id }) => {
-      getConv(id);
+      if (getConv(id).invitedBy) throw "accept this message request before replying";
       return null;
     },
     add_members: ({ id, members }) => {
@@ -860,6 +887,41 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       return null;
     },
     fetch_attachment: ({ blob }) => fetchAttachment(blob),
+    accept_request: ({ id }) => {
+      const c = getConv(id);
+      const inviter = c.invitedBy;
+      if (!inviter) throw "not a message request";
+      c.invitedBy = null;
+      const p = people.get(inviter);
+      if (p && !p.contact) {
+        p.contact = true;
+        p.online = true;
+        emit({ type: "contactsChanged" });
+        emit({ type: "nearbyChanged" });
+        emit({ type: "networkChanged" });
+      }
+      touch(c);
+      // They see your introduction and say hello back.
+      if (opts.replies && p) {
+        later(1500, () => {
+          typingBurst(c, inviter, 2000);
+          later(2000, () => receive(c, inviter, "Thanks for accepting! No rush on the brakes."));
+        });
+      }
+      return summary(c);
+    },
+    decline_request: ({ id, block }) => {
+      const c = getConv(id);
+      const inviter = c.invitedBy;
+      if (!inviter) throw "not a message request";
+      c.invitedBy = null;
+      c.active = false;
+      c.hidden = true;
+      c.members = c.members.filter((m) => m.id !== meId);
+      if (block) blocked.add(inviter);
+      emit({ type: "conversationUpdated", conversation: c.id });
+      return null;
+    },
   };
 
   // --- file host ------------------------------------------------------------------------
