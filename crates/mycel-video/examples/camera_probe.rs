@@ -13,8 +13,11 @@ fn main() -> anyhow::Result<()> {
     use mycel_video::mac::{CameraPermission, camera, camera_permission};
 
     let cam = camera();
-    println!("camera: {}", cam.describe());
     let p = camera_permission();
+    if p == CameraPermission::Authorized {
+        let _ = cam.prepare(); // (looks up the name)
+    }
+    println!("camera: {}", cam.describe());
     println!("permission: {p:?}");
     if p != CameraPermission::Authorized {
         println!("not capturing (that would ask for permission)");

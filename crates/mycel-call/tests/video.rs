@@ -428,8 +428,11 @@ async fn tiny_video_over_bluetooth_measurement() {
 
 /// Decodes every remote video stream a device's app would show, one decoder
 /// per person: frames seen per person.
-fn watch_people(rx: broadcast::Receiver<UiFrame>) -> Arc<Mutex<std::collections::HashMap<[u8; 32], Vec<(u32, Instant)>>>> {
-    let seen: Arc<Mutex<std::collections::HashMap<[u8; 32], Vec<(u32, Instant)>>>> = Arc::default();
+/// Frames decoded per person: (test-pattern counter, when).
+type PerPerson = Arc<Mutex<std::collections::HashMap<[u8; 32], Vec<(u32, Instant)>>>>;
+
+fn watch_people(rx: broadcast::Receiver<UiFrame>) -> PerPerson {
+    let seen: PerPerson = Arc::default();
     let out = seen.clone();
     let mut rx = rx;
     std::thread::spawn(move || {

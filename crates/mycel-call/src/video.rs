@@ -28,8 +28,11 @@ pub struct VideoHub {
     /// Video streams that arrived before their leg was added (the engine
     /// accepts a connection's streams as soon as it has the leg; the
     /// other side's long-lived control stream can come first).
-    early: Mutex<HashMap<(CallId, SignPk), Vec<(u8, RecvStream)>>>,
+    early: Mutex<HashMap<(CallId, SignPk), Vec<EarlyStream>>>,
 }
+
+/// A video stream (its kind byte, and the rest) waiting for its leg.
+type EarlyStream = (u8, RecvStream);
 
 impl VideoHub {
     pub fn new(me: SignPk) -> VideoHub {

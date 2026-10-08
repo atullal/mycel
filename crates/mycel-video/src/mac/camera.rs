@@ -109,7 +109,23 @@ impl CaptureDelegate {
 }
 
 /// The default camera at 720p (or what it can do), NV12.
-pub struct Camera;
+#[derive(Default)]
+pub struct Camera {
+    /// Its name, once we've looked (looking asks AVFoundation, which can
+    /// take a while: never on the async runtime).
+    name: std::sync::OnceLock<String>,
+}
+
+impl Camera {
+    fn look_up_name(&self) -> &str {
+        self.name.get_or_init(|| {
+            // SAFETY: a class method taking a media type.
+            unsafe { AVCaptureDevice::defaultDeviceWithMediaType(media_video()) }
+                .map(|d| unsafe { d.localizedName() }.to_string())
+                .unwrap_or_else(|| "No camera".into())
+        })
+    }
+}
 
 struct Running {
     session: Retained<AVCaptureSession>,
@@ -131,17 +147,16 @@ impl Drop for Running {
 
 impl VideoSource for Camera {
     fn describe(&self) -> String {
-        // SAFETY: a class method taking a media type.
-        unsafe { AVCaptureDevice::defaultDeviceWithMediaType(media_video()) }
-            .map(|d| unsafe { d.localizedName() }.to_string())
-            .unwrap_or_else(|| "No camera".into())
+        self.name.get().cloned().unwrap_or_else(|| "Camera".into())
     }
 
     fn prepare(&self) -> Result<()> {
+        self.look_up_name();
         ensure_camera_permission()
     }
 
     fn start(&self, sink: PictureSink) -> Result<SourceHandle> {
+        self.look_up_name();
         ensure_camera_permission()?;
         // SAFETY: AVFoundation calls with valid arguments; the session is
         // configured before it starts running.
@@ -181,5 +196,5 @@ impl VideoSource for Camera {
 }
 
 pub fn camera() -> Arc<dyn VideoSource> {
-    Arc::new(Camera)
+    Arc::new(Camera::default())
 }

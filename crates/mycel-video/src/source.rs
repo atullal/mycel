@@ -35,7 +35,8 @@ impl SourceHandle {
 }
 
 pub trait VideoSource: Send + Sync + 'static {
-    /// Shown in call stats ("FaceTime HD Camera", "Test pattern").
+    /// Shown in call stats ("FaceTime HD Camera", "Test pattern"). Called
+    /// on the async runtime: must not block.
     fn describe(&self) -> String;
     /// Make sure we may use the camera, asking the user if the OS hasn't
     /// yet. Blocking (it may wait for the user); errors say what to do.
