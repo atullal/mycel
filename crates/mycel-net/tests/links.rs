@@ -63,6 +63,16 @@ async fn sync_over_links_and_fall_back_to_bluetooth() {
         .unwrap();
     bob.sync_with(alice.id(), space, false).await.unwrap();
     assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(), json!({"msg": "over peer wifi"}));
+    // Path choice needs an RTT sample on each path; a very short exchange
+    // under load can finish before the fast path has one, so sync again
+    // until it has settled.
+    for _ in 0..20 {
+        if bob.peers()[&alice.id()].via == Some(PathKind::PeerWifi) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        bob.sync_with(alice.id(), space, false).await.unwrap();
+    }
     assert_eq!(bob.peers()[&alice.id()].via, Some(PathKind::PeerWifi), "fastest link wins");
 
     wifi.cut();
