@@ -12,6 +12,7 @@ import type {
   Attachment,
   CallEndReason,
   CallInfo,
+  ParticipantState,
   Contact,
   ConversationSummary,
   Delivery,
@@ -584,12 +585,20 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
 
   // --- calls ---------------------------------------------------------------------
   //
-  // Simulated 1:1 voice calls: ringing, answering, a path that depends on how
-  // the person is reachable, a bitrate that follows it, a moving level meter.
+  // Simulated voice calls, 1:1 and group: ringing, answering, people joining
+  // and leaving, a path per person that depends on how they're reachable, a
+  // bitrate that follows it, moving level meters.
 
+  interface MockPart {
+    person: Person;
+    state: ParticipantState;
+    muted: boolean;
+    seed: number;
+  }
   interface MockCall {
     info: CallInfo;
     activeAt: number | null;
+    parts: MockPart[];
   }
   const calls = new Map<string, MockCall>();
 
@@ -603,6 +612,16 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     return path === "bluetooth" ? 12_000 : path === "relay" ? 24_000 : 32_000;
   }
 
+  function rttFor(path: CallInfo["path"]): number {
+    return path === "bluetooth" ? 48 : path === "relay" ? 70 : 4;
+  }
+
+  /** In it, or calling out: other calls get "busy". */
+  function engaged(c: MockCall): boolean {
+    const s = c.info.state;
+    return s === "active" || s === "connecting" || (s === "ringing" && c.info.direction === "outgoing");
+  }
+
   function snapshot(c: MockCall): CallInfo {
     const now = Date.now();
     const active = c.info.state === "active";
@@ -610,8 +629,36 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     const voice = (seed: number) => Math.max(0, 0.45 + 0.35 * Math.sin(t * 3.1 + seed) * Math.sin(t * 1.7 + seed * 2));
     c.info.durationMs = c.activeAt ? (c.info.state === "ended" ? c.info.durationMs : now - c.activeAt) : 0;
     c.info.level = active && !c.info.muted ? voice(0) : 0;
-    c.info.remoteLevel = active && !c.info.remoteMuted ? voice(1.3) : 0;
-    const rtt = c.info.path === "bluetooth" ? 48 : c.info.path === "relay" ? 70 : 4;
+    const rank = (s: ParticipantState) => (s === "joined" ? 0 : s === "connecting" ? 1 : s === "ringing" ? 2 : 3);
+    c.info.participants = c.parts
+      .map((p) => {
+        const path = p.state === "joined" || p.state === "ringing" ? pathFor(p.person) : null;
+        const level = active && p.state === "joined" && !p.muted ? voice(p.seed) : 0;
+        return {
+          id: p.person.id,
+          name: p.person.name,
+          state: p.state,
+          muted: p.muted,
+          level,
+          speaking: level > 0.55,
+          path,
+          bitrate: active && p.state === "joined" ? bitrateFor(path) : 0,
+          rttMs: active && p.state === "joined" ? rttFor(path) : 0,
+          lossPct: 0,
+        };
+      })
+      .sort((a, b) => rank(a.state) - rank(b.state) || a.name.localeCompare(b.name));
+    const joined = c.info.participants.filter((p) => p.state === "joined");
+    const inCall = active || (c.info.direction === "outgoing" && (c.info.state === "connecting" || c.info.state === "ringing"));
+    c.info.joinedCount = joined.length + (inCall ? 1 : 0);
+    const loudest = joined.filter((p) => p.speaking).sort((a, b) => b.level - a.level)[0];
+    c.info.activeSpeaker = loudest?.id ?? null;
+    c.info.remoteLevel = active ? Math.max(0, ...joined.map((p) => p.level)) : 0;
+    c.info.remoteMuted = !c.info.group && (c.parts[0]?.muted ?? false);
+    const main = c.info.group ? (joined[0] ?? null) : (c.info.participants[0] ?? null);
+    c.info.path = main ? pathFor(people.get(main.id)) : null;
+    c.info.bitrate = bitrateFor(c.info.path);
+    const rtt = rttFor(c.info.path);
     c.info.stats = {
       ...c.info.stats,
       rttMs: active ? rtt : 0,
@@ -631,7 +678,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
   function setCallState(c: MockCall, state: CallInfo["state"], end: CallEndReason | null = null) {
     if (c.info.state === "ended") return;
     c.info.state = state;
-    if (state === "active") {
+    if (state === "active" && !c.activeAt) {
       c.activeAt = Date.now();
       c.info.connectedAt = c.activeAt;
       tickCall(c);
@@ -644,6 +691,28 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     callUpdate(c);
   }
 
+  /** Someone else's state in a call changed. */
+  function setPart(c: MockCall, who: Person, state: ParticipantState) {
+    const p = c.parts.find((x) => x.person.id === who.id);
+    if (!p || c.info.state === "ended") return;
+    p.state = state;
+    const anyoneIn = c.parts.some((x) => x.state === "joined");
+    const stillRinging = c.parts.some((x) => x.state === "ringing" || x.state === "connecting");
+    const outgoing = c.info.direction === "outgoing";
+    if (c.info.state === "active" && !anyoneIn) {
+      setCallState(c, "ended", "remoteHungUp");
+    } else if (outgoing && c.info.state !== "active" && state === "joined") {
+      setCallState(c, "active");
+    } else if (outgoing && c.info.state !== "active" && !anyoneIn && !stillRinging) {
+      const any = (s: ParticipantState) => c.parts.some((x) => x.state === s);
+      setCallState(c, "ended", any("declined") ? "remoteDeclined" : any("busy") ? "busy" : any("missed") ? "noAnswer" : "unavailable");
+    } else if ((c.info.state === "joinable" || c.info.state === "ringing") && !outgoing && !anyoneIn) {
+      setCallState(c, "ended", "missed");
+    } else {
+      callUpdate(c);
+    }
+  }
+
   function tickCall(c: MockCall) {
     later(100, () => {
       if (c.info.state !== "active") return;
@@ -652,15 +721,28 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     });
   }
 
-  function newCall(conv: Conv, peer: Person, direction: CallInfo["direction"]): MockCall {
-    const path = pathFor(peer);
+  /** A call in `conv`; `from` is who started it (null: you). */
+  function newCall(conv: Conv, direction: CallInfo["direction"], from: Person | null): MockCall {
+    const others = otherMembers(conv)
+      .map((m) => people.get(m.id))
+      .filter((p): p is Person => !!p);
+    const group = others.length > 1;
+    const peer = from ?? others[0]!;
     const c: MockCall = {
       activeAt: null,
+      parts: others.map((p, i) => ({
+        person: p,
+        state: direction === "outgoing" ? "ringing" : p === from ? "joined" : "ringing",
+        muted: false,
+        seed: 1.3 + i * 0.9,
+      })),
       info: {
         id: randomHex(32),
         conversation: conv.id,
-        peer: peer.id,
-        peerName: peer.name,
+        group,
+        title: group ? conv.title : null,
+        peer: group && !from ? meId : peer.id,
+        peerName: group && !from ? "You" : peer.name,
         direction,
         state: direction === "outgoing" ? "connecting" : "ringing",
         endReason: null,
@@ -668,8 +750,11 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
         startedAt: Date.now(),
         connectedAt: null,
         durationMs: 0,
-        path,
-        bitrate: bitrateFor(path),
+        participants: [],
+        joinedCount: 0,
+        activeSpeaker: null,
+        path: null,
+        bitrate: 32_000,
         muted: false,
         remoteMuted: false,
         level: 0,
@@ -708,38 +793,64 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     const conv = getConv(conversation);
     if (conv.invitedBy) throw "accept this message request before calling";
     if (!conv.active) throw "you're no longer a member of this conversation";
-    const others = otherMembers(conv);
-    if (others.length !== 1) throw "calls work in one-to-one conversations for now";
-    const ringing = liveCalls().find((c) => c.info.direction === "incoming" && c.info.conversation === conversation && c.info.state === "ringing");
-    if (ringing) return acceptCall(ringing.info.id);
-    if (liveCalls().length > 0) throw "You're already in a call.";
-    const peer = people.get(others[0]!.id)!;
-    const c = newCall(conv, peer, "outgoing");
-    const reachable = peer.online || peer.nearby;
-    if (!reachable) {
+    if (otherMembers(conv).length === 0) throw "there's nobody else in this conversation to call";
+    const waiting = liveCalls().find(
+      (c) =>
+        c.info.direction === "incoming" &&
+        c.info.conversation === conversation &&
+        (c.info.state === "ringing" || c.info.state === "joinable"),
+    );
+    if (waiting) return acceptCall(waiting.info.id);
+    if (liveCalls().some(engaged)) throw "You're already in a call.";
+    const c = newCall(conv, "outgoing", null);
+    const reachable = c.parts.filter((p) => p.person.online || p.person.nearby);
+    if (reachable.length === 0) {
       later(1800, () => {
-        c.info.error = `${peer.name} can't be reached right now`;
+        c.info.error = c.info.group
+          ? "Nobody in the group can be reached right now"
+          : `${c.parts[0]!.person.name} can't be reached right now`;
+        for (const p of c.parts) p.state = "unavailable";
         setCallState(c, "ended", "unavailable");
       });
-    } else {
-      later(500, () => setCallState(c, "ringing"));
-      later(3200, () => setCallState(c, "active"));
-      // they occasionally mute for a moment
-      later(9000, () => {
-        c.info.remoteMuted = true;
-        later(2500, () => (c.info.remoteMuted = false));
-      });
+      return snapshot(c);
     }
+    later(500, () => {
+      for (const p of c.parts) if (!reachable.includes(p)) p.state = "unavailable";
+      setCallState(c, "ringing");
+    });
+    // the first two who can be reached answer; anyone else lets it ring out
+    reachable.forEach((p, i) => {
+      if (i < 2) later(3200 + i * 1800, () => setPart(c, p.person, "joined"));
+      else later(9000, () => setPart(c, p.person, "missed"));
+    });
+    // they occasionally mute for a moment
+    later(9000, () => {
+      const p = reachable[0]!;
+      p.muted = true;
+      later(2500, () => (p.muted = false));
+    });
     return snapshot(c);
   }
 
   function acceptCall(id: string): CallInfo {
     const c = getCall(id);
-    if (c.info.direction !== "incoming" || c.info.state !== "ringing") throw "This call isn't ringing any more.";
-    for (const other of liveCalls()) if (other !== c) setCallState(other, "ended", "hungUp");
+    if (c.info.direction !== "incoming" || !(c.info.state === "ringing" || c.info.state === "joinable")) {
+      throw "This call isn't ringing any more.";
+    }
+    for (const other of liveCalls()) if (other !== c && engaged(other)) setCallState(other, "ended", "hungUp");
     setCallState(c, "connecting");
     later(400, () => setCallState(c, "active"));
     return snapshot(c);
+  }
+
+  /** Decline (or let ring out): a group call stays joinable while it goes on. */
+  function declineCall(c: MockCall, missed = false) {
+    if (c.info.group && c.info.direction === "incoming" && c.info.state === "ringing") {
+      setCallState(c, "joinable");
+    } else {
+      const unanswered = c.info.state === "ringing" && c.info.direction === "incoming";
+      setCallState(c, "ended", missed ? "missed" : unanswered ? "declined" : "hungUp");
+    }
   }
 
   // --- ambient activity ------------------------------------------------------------
@@ -769,11 +880,29 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     // Ines calls you (once), unless you're already in a call
     later(40_000, () => {
       const conv = convs.get(hexFrom("conv:ines"));
-      if (!conv?.active || liveCalls().length > 0) return;
-      const c = newCall(conv, ines, "incoming");
+      if (!conv?.active || liveCalls().some(engaged)) return;
+      const c = newCall(conv, "incoming", ines);
       emit({ type: "callIncoming", call: snapshot(c) });
       later(30_000, () => {
-        if (c.info.state === "ringing") setCallState(c, "ended", "missed");
+        if (c.info.state === "ringing") declineCall(c, true);
+      });
+    });
+    // Tobias calls the climbing group and Ines picks up. Unanswered, it
+    // stays joinable while they talk; a few minutes later they hang up.
+    later(100_000, () => {
+      const g = convs.get(hexFrom("conv:climb"));
+      if (!g?.active || liveCalls().some(engaged)) return;
+      const c = newCall(g, "incoming", tobias);
+      emit({ type: "callIncoming", call: snapshot(c) });
+      later(2500, () => setPart(c, ines, "joined"));
+      later(30_000, () => {
+        setPart(c, hana, "missed");
+        if (c.info.state === "ringing") declineCall(c, true);
+      });
+      later(180_000, () => {
+        if (c.info.state === "active") return; // you're in it: they stay
+        setPart(c, ines, "left");
+        setPart(c, tobias, "left");
       });
     });
     later(75_000, () => {
@@ -1112,14 +1241,13 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     start_call: ({ conversation }) => startCall(conversation),
     accept_call: ({ call }) => acceptCall(call),
     decline_call: ({ call }) => {
-      const c = getCall(call);
-      setCallState(c, "ended", c.info.state === "ringing" && c.info.direction === "incoming" ? "declined" : "hungUp");
+      declineCall(getCall(call));
       return null;
     },
     end_call: ({ call }) => {
       const c = getCall(call);
-      const unanswered = c.info.direction === "incoming" && c.info.state === "ringing";
-      setCallState(c, "ended", unanswered ? "declined" : "hungUp");
+      if (c.info.direction === "incoming" && c.info.state === "ringing") declineCall(c);
+      else setCallState(c, "ended", c.info.state === "joinable" ? "declined" : "hungUp");
       return null;
     },
     set_muted: ({ call, muted }) => {

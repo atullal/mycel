@@ -173,7 +173,7 @@ export interface NetworkStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Calls (live voice, 1:1)
+// Calls (live voice, 1:1 and group)
 
 /** Hex call id, bound to the conversation and the caller. */
 export type CallId = string;
@@ -181,12 +181,13 @@ export type CallId = string;
 export type CallDirection = "outgoing" | "incoming";
 
 /**
- * - `connecting`: dialing their device (outgoing), or answered and setting up audio (incoming)
- * - `ringing`: their device is ringing (outgoing), or yours is (incoming)
+ * - `connecting`: dialing (outgoing), or answered / joining and setting up audio
+ * - `ringing`: their devices are ringing (outgoing), or yours is (incoming)
  * - `active`: talking
+ * - `joinable`: a group call you declined or missed is still going on; join with `calls.join`
  * - `ended`: over; see `endReason`
  */
-export type CallState = "connecting" | "ringing" | "active" | "ended";
+export type CallState = "connecting" | "ringing" | "active" | "joinable" | "ended";
 
 /**
  * - `hungUp`: you hung up (or cancelled before they answered)
@@ -198,6 +199,7 @@ export type CallState = "connecting" | "ringing" | "active" | "ended";
  * - `replaced`: you both called at the same moment and this one merged into the other (don't show it)
  * - `connectionLost`: every path died and none came back
  * - `micDenied`: Mycel isn't allowed to use the microphone
+ * - `full`: the group call already has the most people a call can have (8)
  * - `failed`: something else (`error` says what)
  */
 export type CallEndReason =
@@ -212,7 +214,42 @@ export type CallEndReason =
   | "replaced"
   | "connectionLost"
   | "micDenied"
+  | "full"
   | "failed";
+
+/**
+ * Where someone stands in a call: `ringing` (their device rings), `connecting`
+ * (in the call, our audio to them is being set up), `joined`, `declined`,
+ * `missed`, `busy` (in another call), `unavailable` (unreachable), `left`.
+ */
+export type ParticipantState =
+  | "ringing"
+  | "connecting"
+  | "joined"
+  | "declined"
+  | "missed"
+  | "busy"
+  | "unavailable"
+  | "left";
+
+/** Someone else in (or rung for) a call. */
+export interface Participant {
+  id: PeerId;
+  name: string;
+  state: ParticipantState;
+  muted: boolean;
+  /** Level of what they say, 0..1 (0 unless you're talking to them). */
+  level: number;
+  /** Talking right now. */
+  speaking: boolean;
+  /** The path to their device. */
+  path: PathKind | null;
+  /** Our Opus bitrate to them, bits/s. */
+  bitrate: number;
+  rttMs: number;
+  /** Of what we send them, the share they reported missing (0..100). */
+  lossPct: number;
+}
 
 /** Live numbers about a call (in-call bar, diagnostics). */
 export interface CallStats {
@@ -241,7 +278,11 @@ export interface CallStats {
 export interface CallInfo {
   id: CallId;
   conversation: ConversationId;
-  /** The other device. */
+  /** A group conversation's call: more than two people may be in it (up to 8). */
+  group: boolean;
+  /** The group's name (group calls). */
+  title: string | null;
+  /** 1:1: the other device. Group: who started the call (`peerName` "You" if it was you). */
   peer: PeerId;
   peerName: string;
   direction: CallDirection;
@@ -255,15 +296,22 @@ export interface CallInfo {
   connectedAt: number | null;
   /** Talking time so far. */
   durationMs: number;
-  /** The path carrying the call right now. */
+  /** Everyone else in, or rung for, the call (1:1: just the other person). Joined first. */
+  participants: Participant[];
+  /** People in the call right now, you included if you're in it. */
+  joinedCount: number;
+  /** Whoever is talking loudest right now. */
+  activeSpeaker: PeerId | null;
+  /** The path carrying the call (group: to the first person who joined; see `participants`). */
   path: PathKind | null;
   /** Our Opus send bitrate, bits/s (32k on fast paths, ~12k on Bluetooth). */
   bitrate: number;
   muted: boolean;
+  /** 1:1: the other person muted themselves. */
   remoteMuted: boolean;
   /** Microphone level 0..1 (0 while muted). */
   level: number;
-  /** Level of what we hear, 0..1. */
+  /** Level of everything we hear, mixed, 0..1. */
   remoteLevel: number;
   /** Echo cancellation is on (otherwise suggest headphones). */
   echoCancellation: boolean;

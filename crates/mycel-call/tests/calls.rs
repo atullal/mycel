@@ -3,156 +3,19 @@
 //! Bluetooth-like bandwidth limit, and with the peer-to-peer Wi-Fi link cut
 //! mid-call so the call continues over Bluetooth.
 
-use std::sync::Arc;
+mod common;
+
 use std::time::{Duration, Instant};
 
-use mycel_call::audio::{AudioIo, TestAudio, TestSource};
-use mycel_call::level::{estimate_frequency, goertzel};
-use mycel_call::proto::{self, Ctrl, call_id};
-use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallInfo, CallManager, CallPhase, EndReason};
-use mycel_crypto::{DeviceKeys, Hash32, SignPk};
-use mycel_net::iroh::endpoint::Connection;
-use mycel_net::link::{Link, MemNet, PathKind};
-use mycel_net::{ExtraProtocol, NetMode, Node, NodeOptions};
-use mycel_trust::Role;
-use parking_lot::Mutex;
-use tokio::sync::mpsc;
-
-struct Host {
-    node: Arc<Node>,
-    events: Arc<Mutex<Vec<CallEvent>>>,
-}
-
-impl CallHost for Host {
-    fn me(&self) -> SignPk {
-        self.node.id()
-    }
-
-    fn callee(&self, space: &Hash32) -> anyhow::Result<SignPk> {
-        let me = self.node.id();
-        let others: Vec<SignPk> = self.node.with_space(space, |r| {
-            r.members().into_iter().filter(|(k, role)| k.sign_pk != me && *role != Role::Relay).map(|(k, _)| k.sign_pk).collect()
-        })?;
-        match others.as_slice() {
-            [one] => Ok(*one),
-            _ => anyhow::bail!("not a direct conversation"),
-        }
-    }
-
-    fn may_call(&self, space: &Hash32, peer: &SignPk) -> bool {
-        self.node.with_space(space, |r| r.is_member(peer) && r.my_role().is_some()).unwrap_or(false)
-    }
-
-    fn name_of(&self, peer: &SignPk) -> String {
-        peer.short()
-    }
-
-    fn connect(&self, peer: SignPk) -> BoxFuture<anyhow::Result<Connection>> {
-        let node = self.node.clone();
-        Box::pin(async move { node.connect(peer, ALPN_CALL).await })
-    }
-
-    fn note_connection(&self, peer: &SignPk, conn: &Connection) {
-        self.node.note_connection(*peer, conn);
-    }
-
-    fn emit(&self, event: CallEvent) {
-        self.events.lock().push(event);
-    }
-}
-
-struct Device {
-    node: Arc<Node>,
-    calls: CallManager,
-    audio: Arc<TestAudio>,
-    events: Arc<Mutex<Vec<CallEvent>>>,
-}
-
-impl Device {
-    fn hex(&self) -> String {
-        self.node.id().0.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    fn status(&self) -> Vec<CallInfo> {
-        self.calls.status()
-    }
-
-    fn live(&self) -> Vec<CallInfo> {
-        self.status().into_iter().filter(|c| c.state != CallPhase::Ended).collect()
-    }
-
-    fn incoming(&self) -> Option<CallInfo> {
-        self.events.lock().iter().rev().find_map(|e| match e {
-            CallEvent::Incoming(c) => Some(c.clone()),
-            _ => None,
-        })
-    }
-
-    fn call(&self, id: &str) -> Option<CallInfo> {
-        self.status().into_iter().find(|c| c.id == id)
-    }
-
-    /// Frequency of what this device heard in the last `secs` seconds.
-    fn heard(&self, secs: f32) -> Option<f32> {
-        let rec = self.audio.recording();
-        let rec = rec.lock();
-        let n = (48_000.0 * secs) as usize;
-        let tail = &rec.samples[rec.samples.len().saturating_sub(n)..];
-        estimate_frequency(tail, 48_000)
-    }
-
-    fn heard_power(&self, secs: f32, hz: f32) -> f32 {
-        let rec = self.audio.recording();
-        let rec = rec.lock();
-        let n = (48_000.0 * secs) as usize;
-        goertzel(&rec.samples[rec.samples.len().saturating_sub(n)..], hz, 48_000)
-    }
-}
-
-async fn device(name: &str, source: TestSource, ip: bool, nets: &[&MemNet]) -> Device {
-    let keys = Arc::new(DeviceKeys::generate());
-    let mut opts = NodeOptions::new(NetMode::Local, name);
-    opts.ip = ip;
-    opts.links = nets.iter().map(|n| n.link(keys.sign_pk()) as Arc<dyn Link>).collect();
-    let (tx, rx) = mpsc::unbounded_channel();
-    opts.extra_protocols.push(ExtraProtocol { alpn: ALPN_CALL.to_vec(), incoming: tx });
-    let node = Arc::new(Node::spawn(keys, opts).await.unwrap());
-    let events: Arc<Mutex<Vec<CallEvent>>> = Arc::default();
-    let calls = CallManager::new(Arc::new(Host { node: node.clone(), events: events.clone() }));
-    let audio = Arc::new(TestAudio::new(source));
-    calls.set_audio(audio.clone() as Arc<dyn AudioIo>);
-    calls.serve(rx);
-    Device { node, calls, audio, events }
-}
-
-fn sine(hz: f32) -> TestSource {
-    TestSource::Sine { hz, amp: 0.5 }
-}
-
-/// A conversation with both devices in it.
-async fn shared_space(a: &Device, b: &Device) -> Hash32 {
-    let (space, genesis) = a.node.create_space().unwrap();
-    a.node.with_space(&space, |r| r.add_member(b.node.keys().public(), Role::Writer)).unwrap().unwrap();
-    b.node.join_space(genesis).unwrap();
-    b.node.sync_with(a.node.id(), space, true).await.unwrap();
-    space
-}
-
-async fn eventually<T>(what: &str, secs: u64, mut f: impl FnMut() -> Option<T>) -> T {
-    let end = Instant::now() + Duration::from_secs(secs);
-    loop {
-        if let Some(v) = f() {
-            return v;
-        }
-        if Instant::now() > end {
-            panic!("timed out waiting for: {what}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
+use common::*;
+use mycel_call::audio::{TestAudio, TestSource};
+use mycel_call::proto::{self, CallRef, Ctrl, call_id};
+use mycel_call::{ALPN_CALL, CallPhase, EndReason};
+use mycel_crypto::Hash32;
+use mycel_net::link::{MemNet, PathKind};
 
 /// Alice calls Bob and Bob answers; returns the call id once both are talking.
-async fn connect_call(alice: &Device, bob: &Device, space: Hash32) -> String {
+pub async fn connect_call(alice: &Device, bob: &Device, space: Hash32) -> String {
     let out = alice.calls.start(space).await.unwrap();
     assert_eq!(out.state, CallPhase::Connecting);
     let ring = eventually("bob's device rings", 15, || bob.incoming().filter(|r| r.id == out.id)).await;
@@ -232,7 +95,9 @@ async fn call_carries_audio_both_ways_and_hangs_up() {
     assert!(a.stats.frames_sent > 150 && b.stats.frames_received > 150);
     assert!(b.stats.frames_lost < 10, "lost {}", b.stats.frames_lost);
     assert!(a.duration_ms >= 3_000);
-    assert!(a.level > 0.0 && b.level > 0.0, "mic meters move");
+    assert!(b.level > 0.0, "bob's mic meter moves");
+    // alice's tone comes in 100 ms bursts: her meter moves during one
+    eventually("alice's mic meter moves", 3, || (alice.call(&id)?.level > 0.0).then_some(())).await;
     assert!(a.remote_level > 0.0, "alice hears bob's steady tone on her meter");
 
     // mute: Bob goes silent for Alice, and Alice sees it
@@ -303,7 +168,8 @@ async fn decline_timeout_busy_and_strangers() {
         let (mut tx, mut rx) = conn.open_bi().await.unwrap();
         let nonce = [7u8; 16];
         // a valid id for Carol, or Bob's id replayed by Carol: both refused
-        let ring = Ctrl::Ring { version: 0, space, nonce, call: call_id(&space, &bound_to, &nonce) };
+        let call = CallRef { space, initiator: bound_to, nonce, call: call_id(&space, &bound_to, &nonce) };
+        let ring = Ctrl::Ring { version: proto::VERSION, call, group: false };
         proto::send(&mut tx, &ring).await.unwrap();
         assert_eq!(proto::recv(&mut rx).await.unwrap(), Some(Ctrl::Denied));
         conn.close(0u32.into(), b"");

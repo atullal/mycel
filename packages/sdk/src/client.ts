@@ -111,18 +111,25 @@ export interface Mycel {
   };
 
   /**
-   * Live 1:1 voice calls. Audio is captured and played by the runtime (not
-   * the webview): Opus over the same encrypted multipath connection as
-   * everything else. Watch `callIncoming` / `callUpdated`, or `useCalls()`.
+   * Live voice calls, 1:1 and group (up to 8 people, each connected to each
+   * other). Audio is captured and played by the runtime (not the webview):
+   * Opus over the same encrypted multipath connections as everything else.
+   * Watch `callIncoming` / `callUpdated`, or `useCalls()`.
    */
   calls: {
-    /** `start_call`: ring the other person in a direct conversation (resolves while `connecting`). */
+    /**
+     * `start_call`: ring the other person, or everyone in a group (resolves
+     * while `connecting`). Joins the conversation's call instead if one is
+     * ringing you or going on without you.
+     */
     start(conversation: ConversationId): Promise<CallInfo>;
     /** `accept_call`: answer a ringing call (asks for the microphone the first time). */
     accept(call: CallId): Promise<CallInfo>;
-    /** `decline_call` */
+    /** `accept_call` on a `joinable` group call: join it. */
+    join(call: CallId): Promise<CallInfo>;
+    /** `decline_call` (a declined group call stays `joinable` while it goes on) */
     decline(call: CallId): Promise<void>;
-    /** `end_call`: hang up, or cancel a call that hasn't been answered. */
+    /** `end_call`: hang up (a group call goes on for the others), or cancel a call that hasn't been answered. */
     end(call: CallId): Promise<void>;
     /** `set_muted` */
     setMuted(call: CallId, muted: boolean): Promise<CallInfo>;
@@ -221,6 +228,7 @@ export function createMycel(transport: Transport): Mycel {
     calls: {
       start: (conversation) => call("start_call", { conversation }),
       accept: (id) => call("accept_call", { call: id }),
+      join: (id) => call("accept_call", { call: id }),
       decline: (id) => call("decline_call", { call: id }).then(done),
       end: (id) => call("end_call", { call: id }).then(done),
       setMuted: (id, muted) => call("set_muted", { call: id, muted }),
