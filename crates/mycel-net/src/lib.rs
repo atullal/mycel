@@ -17,9 +17,10 @@
 //! S → C  Data{data}
 //! ```
 
+pub mod link;
 pub mod wire;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -39,9 +40,10 @@ use mycel_crypto::{DeviceKeys, Hash32, SignPk};
 use mycel_sync::{EnvelopeId, FeedValidator, Replica, Store};
 use mycel_trust::{Role, SignedOp, SpaceId};
 use n0_future::StreamExt;
-use tokio::sync::{Notify, Semaphore, broadcast};
+use tokio::sync::{Notify, Semaphore, broadcast, mpsc};
 
 pub use iroh;
+pub use link::{Link, LinkEvent, LinkStatus, PathKind};
 pub use wire::ContactCard;
 use wire::*;
 
@@ -92,6 +94,10 @@ pub struct NodeOptions {
     pub port: u16,
     /// L4 rules applied to every feed entry in every space.
     pub feed_validator: Option<Arc<dyn FeedValidator>>,
+    /// Extra non-IP paths (peer-to-peer Wi-Fi, Bluetooth...). Not in `Local` mode.
+    pub links: Vec<Arc<dyn Link>>,
+    /// Use IP at all (tests turn it off to force traffic onto links).
+    pub ip: bool,
 }
 
 impl NodeOptions {
@@ -105,6 +111,8 @@ impl NodeOptions {
             accept_relay_invites: false,
             port: 0,
             feed_validator: None,
+            links: Vec::new(),
+            ip: true,
         }
     }
 }
@@ -135,11 +143,15 @@ pub struct PeerState {
     pub last_ok: Option<Instant>,
     pub failures: u32,
     pub last_fail: Option<Instant>,
+    /// Links (peer-to-peer Wi-Fi, Bluetooth) the peer is currently reachable on.
+    pub links: BTreeSet<PathKind>,
+    /// The path the last successful exchange actually used.
+    pub via: Option<PathKind>,
 }
 
 impl PeerState {
     pub fn online(&self) -> bool {
-        self.nearby || self.last_ok.is_some_and(|t| t.elapsed() < ONLINE_WINDOW)
+        self.nearby || !self.links.is_empty() || self.last_ok.is_some_and(|t| t.elapsed() < ONLINE_WINDOW)
     }
 
     /// Exponential backoff after failures: 2s, 4s, … capped at 60s.
@@ -167,6 +179,11 @@ struct Inner {
     peers: Mutex<HashMap<SignPk, PeerState>>,
     events: broadcast::Sender<NetEvent>,
     memory: MemoryLookup,
+    /// Addresses learned from links, kept apart from contact-code hints so a
+    /// lost link can drop exactly its own addresses.
+    link_lookup: MemoryLookup,
+    link_addrs: Mutex<HashMap<SignPk, HashSet<link::CustomAddr>>>,
+    links: Vec<Arc<dyn Link>>,
     endpoint: Endpoint,
     /// Spaces needing a push to all members; `None` key = everything (periodic).
     dirty: Mutex<HashSet<SpaceId>>,
@@ -202,6 +219,86 @@ impl Inner {
         }
         if !was_online {
             self.emit(NetEvent::PeersChanged);
+        }
+    }
+
+    /// Remember which path a finished exchange used (for the Network panel).
+    fn note_path(&self, pk: SignPk, conn: &Connection) {
+        let via = conn.paths().iter().find(|p| p.is_selected()).map(|p| PathKind::of(p.remote_addr()));
+        if via.is_none() {
+            return;
+        }
+        let changed = {
+            let mut peers = self.peers.lock();
+            let p = peers.entry(pk).or_default();
+            std::mem::replace(&mut p.via, via) != via
+        };
+        if changed {
+            self.emit(NetEvent::PeersChanged);
+        }
+    }
+
+    /// A link found or lost a peer: update the addresses Iroh may dial and
+    /// sync shared spaces with a newly reachable peer.
+    fn on_link_event(self: &Arc<Self>, kind: PathKind, ev: LinkEvent) {
+        let (peer, newly) = match ev {
+            LinkEvent::Found { peer, addr, name } => {
+                if peer == self.keys.sign_pk() {
+                    return;
+                }
+                self.link_addrs.lock().entry(peer).or_default().insert(addr);
+                let mut peers = self.peers.lock();
+                let p = peers.entry(peer).or_default();
+                let newly = p.links.insert(kind);
+                if p.name.is_none() {
+                    p.name = name;
+                }
+                p.failures = 0;
+                (peer, newly)
+            }
+            LinkEvent::Lost { peer, addr } => {
+                let mut map = self.link_addrs.lock();
+                if let Some(set) = map.get_mut(&peer) {
+                    set.remove(&addr);
+                    let still = set.iter().any(|a| PathKind::of_custom(a.id()) == kind);
+                    if set.is_empty() {
+                        map.remove(&peer);
+                    }
+                    if !still && let Some(p) = self.peers.lock().get_mut(&peer) {
+                        p.links.remove(&kind);
+                    }
+                }
+                (peer, false)
+            }
+        };
+        self.publish_link_addrs(peer);
+        self.emit(NetEvent::PeersChanged);
+        if newly {
+            let shared: Vec<SpaceId> = self
+                .spaces
+                .lock()
+                .iter()
+                .filter(|(_, r)| r.is_member(&peer))
+                .map(|(s, _)| *s)
+                .collect();
+            for s in shared {
+                tokio::spawn(sync_once(self.clone(), peer, s));
+            }
+        }
+    }
+
+    fn publish_link_addrs(&self, peer: SignPk) {
+        let Ok(id) = to_endpoint_id(&peer) else { return };
+        let addrs: Vec<iroh::TransportAddr> = self
+            .link_addrs
+            .lock()
+            .get(&peer)
+            .map(|s| s.iter().cloned().map(iroh::TransportAddr::Custom).collect())
+            .unwrap_or_default();
+        if addrs.is_empty() {
+            self.link_lookup.remove_endpoint_info(id);
+        } else {
+            self.link_lookup.set_endpoint_info(EndpointAddr::from_parts(id, addrs));
         }
     }
 
@@ -361,6 +458,7 @@ async fn serve_sync(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
         send(&mut tx, &SyncMsg::Data { data: out }).await?;
         tx.finish()?;
         inner.ingest(&space, peer, data, &sent);
+        inner.note_path(peer, &conn);
         inner.mark_ok(peer);
         conn.closed().await;
         return Ok(());
@@ -546,6 +644,7 @@ async fn sync_session(inner: &Arc<Inner>, peer: SignPk, space: SpaceId, trust_pe
     let SyncMsg::Data { data } = recv(&mut rx).await? else {
         bail!("expected Data");
     };
+    inner.note_path(peer, &conn);
     conn.close(0u32.into(), b"done");
     Ok(inner.ingest(&space, peer, data, &sent))
 }
@@ -689,12 +788,24 @@ impl Node {
                 .bind_addr(format!("0.0.0.0:{}", opts.port).as_str())?,
             NetMode::Internet => Endpoint::builder(presets::N0),
         };
-        let mut builder = builder.secret_key(secret).alpns(alpns);
+        let mut builder = builder
+            .secret_key(secret)
+            .alpns(alpns)
+            .path_selector(Arc::new(link::MycelPathSelector))
+            .transport_config(link::transport_config());
         if let Some(ud) = lan_user_data(&opts.name) {
             builder = builder.user_data_for_address_lookup(ud);
         }
+        if !opts.ip {
+            builder = builder.clear_ip_transports();
+        }
+        for l in &opts.links {
+            builder = builder.add_custom_transport(l.transport());
+        }
         let endpoint = builder.bind().await?;
         endpoint.address_lookup()?.add(memory.clone());
+        let link_lookup = MemoryLookup::new();
+        endpoint.address_lookup()?.add(link_lookup.clone());
         let mdns = if opts.mode != NetMode::Local {
             let mdns = MdnsAddressLookup::builder()
                 .service_name("mycel")
@@ -718,6 +829,9 @@ impl Node {
             peers: Mutex::default(),
             events,
             memory,
+            link_lookup,
+            link_addrs: Mutex::default(),
+            links: opts.links,
             endpoint: endpoint.clone(),
             dirty: Mutex::default(),
             wake: Notify::new(),
@@ -732,6 +846,20 @@ impl Node {
         let mut tasks = vec![tokio::spawn(scheduler(inner.clone()))];
         if let Some(mdns) = mdns {
             tasks.push(tokio::spawn(watch_mdns(inner.clone(), mdns)));
+        }
+        for l in &inner.links {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let kind = l.kind();
+            if let Err(e) = l.start(tx) {
+                eprintln!("[mycel] {} unavailable: {e:#}", kind.label());
+                continue;
+            }
+            let inner = inner.clone();
+            tasks.push(tokio::spawn(async move {
+                while let Some(ev) = rx.recv().await {
+                    inner.on_link_event(kind, ev);
+                }
+            }));
         }
         Ok(Node { inner, router, tasks })
     }
@@ -788,8 +916,16 @@ impl Node {
         self.inner.memory.add_endpoint_info(addr);
     }
 
+    /// Health of each link (peer-to-peer Wi-Fi, Bluetooth).
+    pub fn link_status(&self) -> Vec<LinkStatus> {
+        self.inner.links.iter().map(|l| l.status()).collect()
+    }
+
     pub fn set_name(&self, name: &str) {
         *self.inner.name.lock() = name.to_string();
+        for l in &self.inner.links {
+            l.set_name(name);
+        }
         if self.inner.mode != NetMode::Local {
             self.router
                 .endpoint()
@@ -981,6 +1117,9 @@ impl Node {
     pub async fn shutdown(&self) -> Result<()> {
         for t in &self.tasks {
             t.abort();
+        }
+        for l in &self.inner.links {
+            l.stop();
         }
         self.router.shutdown().await?;
         Ok(())
