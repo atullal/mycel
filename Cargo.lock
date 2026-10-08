@@ -3466,6 +3466,7 @@ dependencies = [
  "hex",
  "mycel-crypto",
  "mycel-kit-chat",
+ "mycel-link-awdl",
  "mycel-net",
  "mycel-rules",
  "mycel-sync",
