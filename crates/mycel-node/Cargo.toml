@@ -15,7 +15,7 @@ mycel-kit-chat = { version = "0.0.1", path = "../mycel-kit-chat" }
 mycel-link-awdl = { version = "0.1.0", path = "../mycel-link-awdl" }
 mycel-link-ble = { path = "../mycel-link-ble" }
 mycel-link-iface = { path = "../mycel-link-iface" }
-mycel-net = { version = "0.1.0", path = "../mycel-net" }
+mycel-net = { version = "0.1.0", path = "../mycel-net", features = ["dht"] }
 mycel-rules = { version = "0.1.0", path = "../mycel-rules" }
 mycel-sync = { version = "0.1.0", path = "../mycel-sync" }
 mycel-trust = { version = "0.1.0", path = "../mycel-trust" }

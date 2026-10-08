@@ -44,6 +44,7 @@
 //! themselves.
 
 pub mod core;
+pub mod directory;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -87,6 +88,10 @@ const QUEUE_CWND_DIV: usize = 8;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 /// The higher key dials only if the lower one hasn't after this long.
 const DIAL_DEFER: Duration = Duration::from_secs(2);
+/// Control message kinds (mesh frames for the router at the destination).
+const CTRL_REACH: u8 = 1;
+const RECORD_CACHE: Duration = Duration::from_secs(60);
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(12);
 
 /// How a device takes part in the mesh.
 #[derive(Clone, Debug)]
@@ -113,6 +118,9 @@ pub struct MeshOptions {
     /// Whether this device reaches the internet; `None`: it does while
     /// connected to its home relay.
     pub internet: Option<bool>,
+    /// Where reachability records are published and looked up (see
+    /// [`directory`]); the node sets the real one ([`Mesh::set_directory`]).
+    pub directory: Option<Arc<dyn directory::Directory>>,
 }
 
 impl Default for MeshOptions {
@@ -129,6 +137,7 @@ impl Default for MeshOptions {
             gateway_rate: c.gateway_rate,
             gateways: c.gateways,
             internet: None,
+            directory: None,
         }
     }
 }
@@ -216,6 +225,11 @@ struct Driver {
     dropped_too_big: std::sync::atomic::AtomicU64,
     /// Uplink cost override (tests, or a known slow link).
     uplink: Mutex<Option<u32>>,
+    directory: Mutex<Option<Arc<dyn directory::Directory>>>,
+    /// Records looked up: target -> (gateways with cost, when). Shared with
+    /// the address lookup.
+    records: Mutex<HashMap<SignPk, (Vec<(SignPk, u32)>, Instant)>>,
+    records_published: std::sync::atomic::AtomicU64,
 }
 
 impl std::fmt::Debug for Driver {
@@ -553,14 +567,98 @@ impl Driver {
 
     // ───────────── beyond the mesh ─────────────
 
-    fn on_control(self: &Arc<Self>, _from: SignPk, _payload: Bytes) {}
-
-    fn resolve(self: &Arc<Self>, peer: SignPk) {
-        // No directory: anyone we have no route to is dialed directly.
-        self.with_router(|r, now| r.on_resolved(peer, None, now));
+    fn directory(&self) -> Option<Arc<dyn directory::Directory>> {
+        self.directory.lock().clone()
     }
 
-    fn publish_reach(self: &Arc<Self>, _gateways: Vec<(SignPk, u32)>) {}
+    /// A control message for us: a record to publish, as a gateway.
+    fn on_control(self: &Arc<Self>, _from: SignPk, payload: Bytes) {
+        if payload.first() != Some(&CTRL_REACH) {
+            return;
+        }
+        let record = payload.slice(1..);
+        // signed by its owner; it must name us as one of its gateways
+        let Some(reach) = directory::open(&record, None) else { return };
+        if !reach.gateways.iter().any(|(g, _)| *g == self.me) {
+            return;
+        }
+        if !self.with_router(|r, now| r.internet() && r.admit_record(reach.node, now)) {
+            return;
+        }
+        let Some(dir) = self.directory() else { return };
+        let me = self.clone();
+        self.keep(tokio::spawn(async move {
+            if dir.put(record).await.is_ok() {
+                me.records_published.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+    }
+
+    /// Look `peer` up: behind gateways (a record), or not (dial it).
+    fn resolve(self: &Arc<Self>, peer: SignPk) {
+        let Some(dir) = self.directory() else {
+            self.with_router(|r, now| r.on_resolved(peer, None, now));
+            return;
+        };
+        let me = self.clone();
+        self.keep(tokio::spawn(async move {
+            let gws = me.lookup(&dir, peer).await;
+            me.with_router(|r, now| r.on_resolved(peer, gws, now));
+        }));
+    }
+
+    /// The gateways `peer`'s record names (cached a minute), or `None`.
+    async fn lookup(&self, dir: &Arc<dyn directory::Directory>, peer: SignPk) -> Option<Vec<(SignPk, u32)>> {
+        if let Some((g, at)) = self.records.lock().get(&peer)
+            && at.elapsed() < RECORD_CACHE
+        {
+            return (!g.is_empty()).then(|| g.clone());
+        }
+        let found = tokio::time::timeout(LOOKUP_TIMEOUT, dir.get(peer))
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| directory::open(&b, Some(&peer)))
+            .map(|r| r.gateways);
+        self.records.lock().insert(peer, (found.clone().unwrap_or_default(), Instant::now()));
+        found.filter(|g| !g.is_empty())
+    }
+
+    /// Without the internet: sign a record naming our gateways and hand it
+    /// to each of them to publish.
+    fn publish_reach(self: &Arc<Self>, gateways: Vec<(SignPk, u32)>) {
+        let Ok(record) = directory::seal(&self.keys, &gateways) else { return };
+        let mut payload = Vec::with_capacity(1 + record.len());
+        payload.push(CTRL_REACH);
+        payload.extend_from_slice(&record);
+        let payload = Bytes::from(payload);
+        self.with_router(|r, now| {
+            for (g, _) in &gateways {
+                r.send(*g, *g, payload.clone(), true, now);
+            }
+        });
+    }
+
+    /// Mesh addresses for `peer` beyond our own mesh: through our gateways
+    /// if we have no internet, through its gateways if it has a record.
+    async fn gateway_addrs(self: Arc<Self>, peer: SignPk) -> Vec<CustomAddr> {
+        let (local, internet, mine) = {
+            let r = self.router.lock();
+            let now = self.now();
+            let local = r.is_neighbour(&peer) || r.next_hop_local(&peer, now).is_some();
+            (local, r.internet(), r.gateways(now))
+        };
+        if local || peer == self.me {
+            return Vec::new(); // a link or a mesh route has it
+        }
+        if !internet {
+            return mine.iter().take(self.opts.routes.max(1)).map(|g| mesh_addr(&peer, g)).collect();
+        }
+        let Some(dir) = self.directory() else { return Vec::new() };
+        let Some(mut gws) = self.lookup(&dir, peer).await else { return Vec::new() };
+        gws.sort_by_key(|(g, c)| (*c, g.0));
+        gws.into_iter().filter(|(g, _)| *g != self.me).take(3).map(|(g, _)| mesh_addr(&peer, &g)).collect()
+    }
 
     fn stats(&self) -> MeshStats {
         let mut s = self.router.lock().stats();
@@ -655,6 +753,7 @@ impl Mesh {
     pub fn new(keys: Arc<DeviceKeys>, name: &str, opts: MeshOptions) -> Mesh {
         let (inbox, rx) = mpsc::channel(INBOX);
         let me = keys.sign_pk();
+        let directory = opts.directory.clone();
         let mut router = Router::new(me, opts.config());
         router.set_internet(opts.internet.unwrap_or(false));
         let d = Arc::new(Driver {
@@ -675,6 +774,9 @@ impl Mesh {
             dropped_queue: Default::default(),
             dropped_too_big: Default::default(),
             uplink: Mutex::default(),
+            directory: Mutex::new(directory),
+            records: Mutex::default(),
+            records_published: Default::default(),
         });
         Mesh { d }
     }
@@ -721,6 +823,33 @@ impl Mesh {
 
     pub fn stats(&self) -> MeshStats {
         self.d.stats()
+    }
+
+    /// Where records are published and looked up (the node sets the pkarr
+    /// relay and DHT directory once its endpoint exists).
+    pub fn set_directory(&self, dir: Arc<dyn directory::Directory>) {
+        *self.d.directory.lock() = Some(dir);
+    }
+
+    /// The address lookup to add to the endpoint: mesh addresses through
+    /// gateways for devices beyond our mesh.
+    pub fn address_lookup(&self) -> MeshLookup {
+        MeshLookup { d: self.d.clone() }
+    }
+
+    /// The gateways our record names (empty while we have the internet).
+    pub fn my_gateways(&self) -> Vec<SignPk> {
+        self.d.router.lock().my_gateways().to_vec()
+    }
+
+    /// Whether the mesh currently thinks we reach the internet.
+    pub fn has_internet(&self) -> bool {
+        self.d.router.lock().internet()
+    }
+
+    /// Records this device published for others, as a gateway.
+    pub fn records_published(&self) -> u64 {
+        self.d.records_published.load(Ordering::Relaxed)
     }
 
     /// Fix this device's announced internet cost (0.1 ms units) instead of
@@ -804,6 +933,45 @@ impl ProtocolHandler for MeshProtocol {
         self.d.add_conn(conn);
         closed.closed().await;
         Ok(())
+    }
+}
+
+/// An Iroh address lookup: for a device beyond our mesh, one mesh address
+/// per gateway (`mesh(dst, via G)`), each its own QUIC path.
+#[derive(Clone)]
+pub struct MeshLookup {
+    d: Arc<Driver>,
+}
+
+impl std::fmt::Debug for MeshLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MeshLookup")
+    }
+}
+
+impl iroh::address_lookup::AddressLookup for MeshLookup {
+    fn resolve(
+        &self,
+        endpoint_id: iroh::EndpointId,
+    ) -> Option<n0_future::boxed::BoxStream<Result<iroh::address_lookup::Item, iroh::address_lookup::Error>>> {
+        use n0_future::StreamExt;
+        let d = self.d.clone();
+        let peer = to_sign_pk(&endpoint_id);
+        let stream = n0_future::stream::once_future(async move {
+            let addrs = d.gateway_addrs(peer).await;
+            (!addrs.is_empty()).then(|| {
+                let data = iroh::endpoint_info::EndpointData::new(
+                    addrs.into_iter().map(iroh::TransportAddr::Custom).collect(),
+                );
+                Ok(iroh::address_lookup::Item::new(
+                    iroh::endpoint_info::EndpointInfo::from_parts(endpoint_id, data),
+                    "mycel-mesh",
+                    None,
+                ))
+            })
+        })
+        .filter_map(|x| x);
+        Some(Box::pin(stream))
     }
 }
 

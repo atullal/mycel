@@ -942,6 +942,16 @@ impl Node {
         endpoint.address_lookup()?.add(memory.clone());
         let link_lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(link_lookup.clone());
+        if let Some(m) = &mesh {
+            // devices beyond our mesh: through gateways (theirs or ours)
+            endpoint.address_lookup()?.add(m.address_lookup());
+            if opts.mode == NetMode::Internet && opts.mesh.as_ref().is_some_and(|o| o.directory.is_none()) {
+                match mesh::directory::PkarrDirectory::new(&endpoint, true) {
+                    Ok(d) => m.set_directory(Arc::new(Arc::new(d))),
+                    Err(e) => eprintln!("[mycel] no record directory: {e:#}"),
+                }
+            }
+        }
         let mdns = if opts.mode != NetMode::Local {
             let mdns = MdnsAddressLookup::builder()
                 .service_name("mycel")
