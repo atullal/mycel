@@ -142,6 +142,27 @@ fn allow_attachment_files(app: &tauri::App, data_dir: &std::path::Path) -> Resul
     .map_err(|e| format!("cannot allow opening attachments: {e}"))
 }
 
+/// Opened from Finder there's no terminal, so stderr (where the runtime and
+/// the peer-to-peer Wi-Fi / Bluetooth links log) goes nowhere. Send it to
+/// `<data dir>/mycel.log` instead (the previous run is kept as `mycel.log.1`).
+fn log_to_file(data_dir: &std::path::Path) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: isatty only inspects the descriptor.
+    if unsafe { libc::isatty(2) } == 1 {
+        return;
+    }
+    let path = data_dir.join("mycel.log");
+    let _ = std::fs::rename(&path, data_dir.join("mycel.log.1"));
+    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        // SAFETY: dup2 onto stderr; `file` stays open until dup2 has copied it.
+        unsafe { libc::dup2(file.as_raw_fd(), 2) };
+    }
+    if std::env::var_os("MYCEL_BLE_LOG").is_none() {
+        // SAFETY: called during startup, before other threads read the environment.
+        unsafe { std::env::set_var("MYCEL_BLE_LOG", "1") };
+    }
+}
+
 /// Open the runtime and wire it to the app.
 fn start(app: &mut tauri::App) -> Result<(), String> {
     let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
@@ -153,6 +174,7 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
     };
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
+    log_to_file(&data_dir);
     let mode = network_mode(&data_dir)?;
     let name = std::env::var("MYCEL_NAME")
         .ok()

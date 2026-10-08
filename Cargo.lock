@@ -3394,6 +3394,7 @@ dependencies = [
 name = "mycel-host"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "mycel-node",
  "serde",
  "serde_json",
