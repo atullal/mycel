@@ -1,20 +1,31 @@
 //! Blobs: immutable, content-addressed (BLAKE3), already-encrypted bytes of
 //! any size, stored per space and streamed between members over QUIC.
 //!
-//! Protocol (ALPN `mycel/blob/0`, one bi-stream per transfer):
+//! Protocol: one QUIC bi-stream of kind `Blob` per request, on the pooled
+//! connection to the member (low stream priority, so messages go first):
 //!
 //! ```text
-//! fetch:  C → S  GetFrom{space, hash, offset}     S → C  Range{total, offset'} ‖ bytes[offset'..total]
-//! push:   C → S  Offer{space, hash, len}          S → C  Stored (have it) | SendFrom{offset} | NoSpace | Busy | Denied
-//!         C → S  bytes[offset..len]               S → C  Stored
+//! range:  C → S  GetRange{space, hash, offset, len}  S → C  Range{total, offset} ‖ bytes[offset..offset+len)
+//! push:   C → S  Offer{space, hash, len}             S → C  Stored (have it) | SendFrom{offset} | NoSpace | Busy | Denied
+//!         C → S  bytes[offset..len]                  S → C  Stored
 //! ```
-//! (`Get` and `Put` are the original whole-blob requests; still served.)
+//! (`Get`, `Put` and `GetFrom` are older whole-blob / resume-from requests;
+//! still served.)
+//!
+//! Downloads come from every member that has the blob at once: the missing
+//! bytes are cut into pieces of up to 4 MiB, each fetched with `GetRange` on
+//! its own stream, two at a time per member. When there's nothing left to
+//! hand out, an idle member takes over the second half of the biggest piece
+//! still in flight; a member that fails gives its unfinished pieces back.
 //!
 //! Bytes go straight between the QUIC stream and disk in small buffers, so
-//! memory stays bounded whatever the size. Data lands in `<hash>.part` and is
-//! renamed into place only once the BLAKE3 hash of the whole blob matches; an
-//! interrupted transfer leaves the `.part` behind and the next attempt (from
-//! any member that has the blob) resumes from where it stopped.
+//! memory stays bounded whatever the size. Data lands in `<hash>.part`, with
+//! a `<hash>.ranges` file listing which bytes are there (pieces arrive out of
+//! order; no `.ranges` means the `.part` is a plain prefix, as pushes and
+//! older versions write it). The file is renamed into place only once the
+//! BLAKE3 hash of the whole blob matches; an interrupted transfer leaves both
+//! behind and the next attempt (from any members that have the blob) fetches
+//! only what's missing.
 //!
 //! There's no size limit and no quota. The only guard is free disk space: a
 //! transfer that would leave less than [`MIN_FREE_SPACE`] free is refused.
