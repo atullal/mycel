@@ -14,6 +14,10 @@ use mycel_net::iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use mycel_net::iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr, endpoint::presets};
 use mycel_net::link::{Link, MemNet, MycelPathSelector, PathKind};
 
+/// Both tests measure throughput: side by side they starve each other of
+/// CPU, so they run one at a time.
+static MEASURING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const ALPN: &[u8] = b"test/aggregate";
 const MB: u64 = 1_000_000;
 
@@ -145,6 +149,7 @@ const TOTAL: u64 = 40 * MB;
 /// Two 10 MB/s links carry about twice what one does, on one stream.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_links_add_up() {
+    let _measuring = MEASURING.lock().await;
     eprintln!("one 10 MB/s link:");
     let one = link(1, PathKind::PeerWifi, 10 * MB, 5);
     let p = pair(&[&one]).await;
@@ -175,6 +180,7 @@ async fn two_links_add_up() {
 /// so throughput is the fast link's own.
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_bluetooth_never_slows_the_fast_link() {
+    let _measuring = MEASURING.lock().await;
     eprintln!("fast link alone:");
     let fast = link(4, PathKind::PeerWifi, 10 * MB, 5);
     let p = pair(&[&fast]).await;

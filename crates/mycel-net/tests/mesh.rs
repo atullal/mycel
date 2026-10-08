@@ -18,6 +18,10 @@ use parking_lot::Mutex;
 use serde_json::json;
 use tokio::sync::mpsc;
 
+/// Tests that measure speed (fps, throughput, rates) run one at a time:
+/// side by side they starve each other of CPU and the numbers mean nothing.
+static MEASURING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const BULK: &[u8] = b"test/mesh-bulk";
 
 async fn eventually(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
@@ -178,6 +182,7 @@ async fn write_and_sync(a: &Node, c: &Node, space: mycel_trust::SpaceId, text: &
 /// aggregated like direct links) and survives losing one relay mid-transfer.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_routes_aggregate_and_fail_over() {
+    let _measuring = MEASURING.lock().await;
     const RATE: u64 = 400_000;
     let rated = |n| {
         let e = edge(n);
@@ -246,6 +251,7 @@ async fn two_routes_aggregate_and_fail_over() {
 /// adds little latency of its own.
 #[tokio::test(flavor = "multi_thread")]
 async fn five_device_line_latency_per_hop() {
+    let _measuring = MEASURING.lock().await;
     let edges: Vec<MemNet> = (0..4).map(edge).collect();
     let mut nodes = Vec::new();
     for i in 0..5 {
@@ -309,6 +315,7 @@ async fn route_heals_when_a_middle_device_leaves() {
 /// never back), and traffic doesn't loop.
 #[tokio::test(flavor = "multi_thread")]
 async fn ring_has_no_storms_or_loops() {
+    let _measuring = MEASURING.lock().await;
     const N: usize = 6;
     let e: Vec<MemNet> = (0..N as u64).map(edge).collect();
     let mut nodes = Vec::new();
@@ -353,6 +360,7 @@ async fn ring_has_no_storms_or_loops() {
 /// isn't routed through.
 #[tokio::test(flavor = "multi_thread")]
 async fn relay_budget_is_enforced() {
+    let _measuring = MEASURING.lock().await;
     const BUDGET: u64 = 100_000;
     let (ab, bc) = (edge(0), edge(1));
     let a = device("a", &[&ab], fast()).await;

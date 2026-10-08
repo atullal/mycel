@@ -20,6 +20,10 @@ use mycel_video::{CameraState, TestPattern, UiFrame, UiSource, VideoSource};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc};
 
+/// Tests that measure speed (fps, throughput, rates) run one at a time:
+/// side by side they starve each other of CPU and the numbers mean nothing.
+static MEASURING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Host {
     node: Arc<Node>,
     events: Arc<Mutex<Vec<CallEvent>>>,
@@ -220,6 +224,7 @@ fn bursts() -> TestSource {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn video_call_both_ways_over_ip() {
+    let _measuring = MEASURING.lock().await;
     let alice = device("alice", TestSource::Sine { hz: 660.0, amp: 0.5 }, true, &[]).await;
     let bob = device("bob", TestSource::Sine { hz: 440.0, amp: 0.5 }, true, &[]).await;
     alice.node.add_peer_addr(bob.node.addr());
@@ -313,6 +318,7 @@ async fn slow_link_call(n: u64, video: bool) -> (f64, f64, u64, CallInfo, CallIn
 /// less than 100 ms over the same link without video.
 #[tokio::test(flavor = "multi_thread")]
 async fn video_on_a_slow_link_leaves_audio_alone() {
+    let _measuring = MEASURING.lock().await;
     let (lat_off, rate_off, lost_off, _, b_off, _) = slow_link_call(11, false).await;
     let (lat_on, rate_on, lost_on, a, b, fps) = slow_link_call(12, true).await;
     eprintln!(
@@ -347,6 +353,7 @@ async fn video_on_a_slow_link_leaves_audio_alone() {
 /// sides and the audio carries on.
 #[tokio::test(flavor = "multi_thread")]
 async fn video_pauses_on_bluetooth() {
+    let _measuring = MEASURING.lock().await;
     let wifi = MemNet::new(12, PathKind::PeerWifi);
     let bt = MemNet::new(12, PathKind::Bluetooth);
     bt.set_rate_limit(Some(20_000));
@@ -390,6 +397,7 @@ async fn video_pauses_on_bluetooth() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn tiny_video_over_bluetooth_measurement() {
+    let _measuring = MEASURING.lock().await;
     // SAFETY: this test runs on its own (ignored by default), before any
     // other thread reads the environment.
     unsafe { std::env::set_var("MYCEL_VIDEO_BLUETOOTH_KBPS", "40") };
