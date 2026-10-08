@@ -159,6 +159,10 @@ struct State {
     ///
     /// We only select a path once the path is functional in Noq.
     selected_path: Option<transports::FourTuple>,
+    /// MYCEL PATCH: further paths the selector wants data sent on, next to
+    /// [`Self::selected_path`] (bandwidth aggregation). Marked
+    /// [`PathStatus::Available`] and never closed as redundant IP paths.
+    also_available: Vec<transports::FourTuple>,
     /// Time at which we should schedule the next holepunch attempt.
     scheduled_holepunch: Option<Instant>,
     /// When to next attempt opening paths in [`Self::pending_open_paths`].
@@ -201,6 +205,7 @@ impl RemoteStateActor {
                 paths: RemotePathState::new(metrics),
                 last_holepunch: None,
                 selected_path: Default::default(),
+                also_available: Vec::new(),
                 scheduled_holepunch: None,
                 scheduled_open_path: None,
                 pending_open_paths: VecDeque::new(),
@@ -327,6 +332,12 @@ impl RemoteStateActor {
                 }
                 _ = link_path_ping.tick() => {
                     self.ping_link_paths();
+                    // MYCEL PATCH: re-run path selection every second, so the
+                    // set of paths carrying data follows RTT, loss and stalls
+                    // (upstream selects only when a path opens or closes).
+                    if !self.connections.is_empty() {
+                        self.select_path();
+                    }
                 }
                 _ = &mut idle_timeout => {
                     if self.is_idle(&inbox) {
@@ -504,6 +515,7 @@ impl RemoteStateActor {
         if self.connections.is_empty() {
             trace!("last connection closed - clearing selected_path");
             self.state.selected_path = None;
+            self.state.also_available.clear(); // MYCEL PATCH
         }
     }
 
@@ -668,10 +680,14 @@ impl RemoteStateActor {
     #[instrument(skip_all)]
     fn select_path(&mut self) {
         let current_path = self.state.selected_path.as_ref();
-        let selected_addr = {
+        let (selected_addr, also) = {
             let ctx = PathSelectionContext::new(current_path, &self.connections);
-            self.state.path_selector.select(&ctx).selected().cloned()
+            let selection = self.state.path_selector.select(&ctx);
+            (selection.selected().cloned(), selection.also)
         };
+        // MYCEL PATCH: the selector's extra Available paths (empty for
+        // selectors that never call `PathSelection::also_use`).
+        self.state.also_available = also;
 
         if let Some(addr) = selected_addr
             && self.state.selected_path.as_ref() != Some(&addr)
@@ -728,6 +744,8 @@ impl RemoteStateActor {
                 if conn.side().is_client()
                     && path_fourtuple.is_ip()
                     && path_fourtuple != &selected
+                    // MYCEL PATCH: keep IP paths the selector aggregates
+                    && !self.state.also_available.contains(path_fourtuple)
                     && conn_state.paths.values().filter(|a| a.is_ip()).count() > 1
                 {
                     trace!(?path_fourtuple, %conn_id, %path_id, "closing direct path");
@@ -1146,7 +1164,8 @@ impl State {
     /// Returns [`PathStatus::Available`] if `addr` is the currently-selected path,
     /// or [`PathStatus::Backup`] otherwise.
     fn path_status_for_addr(&self, addr: &transports::FourTuple) -> PathStatus {
-        if Some(addr) == self.selected_path.as_ref() {
+        // MYCEL PATCH: `also_available` paths carry data too.
+        if Some(addr) == self.selected_path.as_ref() || self.also_available.contains(addr) {
             PathStatus::Available
         } else {
             PathStatus::Backup
@@ -1538,13 +1557,34 @@ pub trait PathSelector: Send + Sync + std::fmt::Debug + 'static {
 #[cfg_attr(not(feature = "unstable-custom-transports"), allow(unreachable_pub))]
 pub struct PathSelection {
     selection: Option<transports::FourTuple>,
+    /// MYCEL PATCH: extra paths to send on as well (see [`PathSelection::also_use`]).
+    also: Vec<transports::FourTuple>,
 }
 
 #[cfg_attr(not(feature = "unstable-custom-transports"), allow(unreachable_pub))]
 impl PathSelection {
     /// An empty selection.
     pub fn none() -> Self {
-        Self { selection: None }
+        Self {
+            selection: None,
+            also: Vec::new(),
+        }
+    }
+
+    /// MYCEL PATCH: also send data on this path, next to the selected one.
+    ///
+    /// noq schedules packets on every validated path whose local status is
+    /// [`PathStatus::Available`], each within its own congestion window, so
+    /// marking several paths Available aggregates their bandwidth. Paths
+    /// named here become Available (all others Backup) and IP paths named
+    /// here are not closed as redundant. The set is replaced on every
+    /// selection, including an otherwise empty one.
+    pub fn also_use(&mut self, path: &PathSelectionData<'_>) {
+        if self.selection.as_ref() != Some(path.network_path)
+            && !self.also.contains(path.network_path)
+        {
+            self.also.push(path.network_path.clone());
+        }
     }
 
     /// Sets the path as the selected path.

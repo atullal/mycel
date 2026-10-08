@@ -5,7 +5,7 @@ punching) and relay addresses. Custom-transport addresses (Mycel's
 peer-to-peer Wi-Fi and Bluetooth links) were used only if they were the
 first path, so losing that path killed the connection.
 
-Change (all in `src/socket/remote_map/remote_state.rs`, marked `MYCEL PATCH`):
+Changes (all in `src/socket/remote_map/remote_state.rs`, marked `MYCEL PATCH`):
 
 1. When a client connection is registered, every known custom-transport
    address for the remote is opened as a (backup) path.
@@ -19,8 +19,32 @@ Change (all in `src/socket/remote_map/remote_state.rs`, marked `MYCEL PATCH`):
    5 s path idle timeout closed it: a call that had been running for a
    while could then not fail over from peer-to-peer Wi-Fi to Bluetooth.
 
-Path *selection* is unchanged in Iroh; Mycel installs its own
-`PathSelector` (`mycel_net::link::MycelPathSelector`).
+4. **Several Available paths (bandwidth aggregation).** noq already
+   schedules packets on every validated path whose local status is
+   `PathStatus::Available` (`Connection::scheduling_info`): `poll_transmit`
+   walks the paths in path-id order and each one sends until its own
+   congestion window (and pacer) is full, so with two Available paths the
+   first fills its window and the overflow goes to the second. Upstream
+   Iroh marks only the selected path Available, so the others idled. The
+   patch:
+   - `PathSelection::also_use(&path)`: a selector may name extra paths to
+     send on. They are kept in `State::also_available` (replaced on every
+     selection; empty for selectors that never call it, so upstream
+     behaviour is unchanged for them).
+   - `path_status_for_addr` returns Available for the selected path *and*
+     the `also_available` ones; all others stay Backup.
+   - `apply_selected_path` does not close an `also_available` IP path as a
+     redundant IP path (the selector decides which IP paths are distinct
+     interfaces worth keeping; the rest are still closed as before).
+   - selection re-runs every second (on the link-ping tick), not only
+     when a path opens or closes, so the Available set follows RTT, loss
+     and rate.
+
+Path *selection* policy lives in Mycel: `mycel_net::link::MycelPathSelector`
+picks the selected path and which other paths join the aggregate.
+
+Covered by `crates/mycel-net/tests/aggregate.rs` (two rate-limited links
+≈ 1.9× one link on one stream; a cut link; a slow link never slows a fast one).
 
 Covered by `crates/mycel-net/tests/links.rs`
 (`live_connection_moves_to_another_link`) and, for 3,

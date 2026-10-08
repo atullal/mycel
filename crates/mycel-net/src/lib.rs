@@ -752,7 +752,7 @@ impl Node {
         let mut builder = builder
             .secret_key(secret)
             .alpns(alpns)
-            .path_selector(Arc::new(link::MycelPathSelector))
+            .path_selector(Arc::new(link::MycelPathSelector::default()))
             .transport_config(link::transport_config());
         if let Some(ud) = lan_user_data(&opts.name) {
             builder = builder.user_data_for_address_lookup(ud);

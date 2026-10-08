@@ -125,7 +125,7 @@ async fn live_connection_moves_to_another_link() {
             .secret_key(SecretKey::from_bytes(&k.seed()))
             .relay_mode(mycel_net::iroh::RelayMode::Disabled)
             .clear_ip_transports()
-            .path_selector(Arc::new(MycelPathSelector))
+            .path_selector(Arc::new(MycelPathSelector::default()))
             .transport_config(mycel_net::link::transport_config());
         for n in [&wifi, &bt] {
             b = b.add_custom_transport(n.link(k.sign_pk()).transport());
