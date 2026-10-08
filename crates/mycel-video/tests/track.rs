@@ -12,7 +12,7 @@ use mycel_net::{ExtraProtocol, NetMode, Node, NodeOptions};
 use mycel_video::pattern::read_counter;
 use mycel_video::platform::H264Decoder;
 use mycel_video::source::wall_us;
-use mycel_video::{CameraState, TestPattern, TrackOptions, UiFrame, UiSource, VideoTrack};
+use mycel_video::{CameraState, TestPattern, UiFrame, UiSource, VideoCall, VideoSource};
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc};
 
@@ -75,12 +75,25 @@ fn watch(mut rx: broadcast::Receiver<UiFrame>, source: UiSource) -> Arc<Mutex<Se
 }
 
 struct Pair {
-    a: VideoTrack,
-    b: VideoTrack,
+    a: Arc<VideoCall>,
+    b: Arc<VideoCall>,
     a_ui: broadcast::Sender<UiFrame>,
     b_ui: broadcast::Sender<UiFrame>,
     _conns: (Connection, Connection),
     _nodes: (Arc<Node>, Arc<Node>),
+}
+
+/// What the call engine does: hand the connection's video streams (by
+/// their kind byte) to the call's video.
+fn route(conn: Connection, video: Arc<VideoCall>, peer: [u8; 32]) {
+    tokio::spawn(async move {
+        while let Ok(mut rx) = conn.accept_uni().await {
+            let mut kind = [0u8; 1];
+            if rx.read_exact(&mut kind).await.is_ok() {
+                let _ = video.stream(&peer, kind[0], rx);
+            }
+        }
+    });
 }
 
 async fn pair(ip: bool, nets: &[&MemNet], path: Option<PathKind>) -> Pair {
@@ -102,26 +115,19 @@ async fn pair(ip: bool, nets: &[&MemNet], path: Option<PathKind>) -> Pair {
     .expect("connected");
     let cb = b.incoming.recv().await.unwrap();
     let (a_ui, b_ui) = (broadcast::channel(512).0, broadcast::channel(512).0);
-    let src = || Arc::new(TestPattern::default()) as Arc<dyn mycel_video::VideoSource>;
+    let src = || Arc::new(TestPattern::default()) as Arc<dyn VideoSource>;
     let rt = tokio::runtime::Handle::current();
-    let ta = VideoTrack::start(
-        ca.clone(),
-        src(),
-        a_ui.clone(),
-        TrackOptions { me: a.node.id().0, peer: b.node.id().0, path },
-        rt.clone(),
-    );
-    let tb = VideoTrack::start(
-        cb.clone(),
-        src(),
-        b_ui.clone(),
-        TrackOptions { me: b.node.id().0, peer: a.node.id().0, path },
-        rt,
-    );
-    Pair { a: ta, b: tb, a_ui, b_ui, _conns: (ca, cb), _nodes: (a.node, b.node) }
+    let (ka, kb) = (a.node.id().0, b.node.id().0);
+    let va = Arc::new(VideoCall::new(ka, src(), a_ui.clone(), rt.clone()));
+    let vb = Arc::new(VideoCall::new(kb, src(), b_ui.clone(), rt));
+    va.add_peer(kb, ca.clone(), path);
+    vb.add_peer(ka, cb.clone(), path);
+    route(ca.clone(), va.clone(), kb);
+    route(cb.clone(), vb.clone(), ka);
+    Pair { a: va, b: vb, a_ui, b_ui, _conns: (ca, cb), _nodes: (a.node, b.node) }
 }
 
-async fn camera(t: &VideoTrack, on: bool) {
+async fn camera(t: &VideoCall, on: bool) {
     // set_camera blocks (permission prompt); off the runtime
     tokio::task::block_in_place(|| t.set_camera(on)).unwrap();
 }

@@ -214,10 +214,25 @@ type-checked for Linux but haven't been run on Linux hardware yet):
    Call a laptop that is quit: after a few seconds *can't be reached right
    now*. Let it ring: *No answer* after 45 s on the caller, *Missed call* on
    the other.
+6. **Group calls** (with a third device, e.g. `mycel serve` on one laptop, or
+   a third Mac): in a group, the phone button rings everyone in it. Up to 8
+   people can be in one call. Each device connects to every other device
+   directly, so there is no host and the person who started the call can
+   leave without ending it.
+   - **While talking:** under the group's header, a tile for each person shows
+     a ring that grows when they talk, their path and bitrate (*Same network ·
+     32 kbps*, *Bluetooth · 12 kbps*), and a red mic if they're muted
+     ([screenshot](screenshots/17-group-call.png)).
+   - **Joining late:** decline, or let it ring out, and the group shows *Group
+     call · 2 in call* with **Join call**
+     ([screenshot](screenshots/18-group-call-join.png)). The phone button
+     joins too.
+   - **Leaving:** the red button in the bar leaves; the others carry on, and
+     the call ends when the last person leaves.
 
 For a log of which path each call uses, run Mycel from Terminal with
 `MYCEL_CALL_DEBUG=1 /Applications/Mycel.app/Contents/MacOS/mycel-host`
-(it prints every path with its RTT and packet counts once a second).
+(it prints each person's path and RTT once a second).
 
 ## 5d. Video calls
 

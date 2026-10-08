@@ -30,15 +30,15 @@ impl CallHost for Host {
         self.node.id()
     }
 
-    fn callee(&self, space: &Hash32) -> anyhow::Result<SignPk> {
+    fn members(&self, space: &Hash32) -> anyhow::Result<Vec<SignPk>> {
         let me = self.node.id();
         let others: Vec<SignPk> = self.node.with_space(space, |r| {
             r.members().into_iter().filter(|(k, role)| k.sign_pk != me && *role != Role::Relay).map(|(k, _)| k.sign_pk).collect()
         })?;
-        match others.as_slice() {
-            [one] => Ok(*one),
-            _ => anyhow::bail!("not a direct conversation"),
+        if others.is_empty() {
+            anyhow::bail!("nobody else here");
         }
+        Ok(others)
     }
 
     fn may_call(&self, space: &Hash32, peer: &SignPk) -> bool {
@@ -71,6 +71,10 @@ struct Device {
 }
 
 impl Device {
+    fn hex(&self) -> String {
+        self.node.id().0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
     fn call(&self, id: &str) -> Option<CallInfo> {
         self.calls.status().into_iter().find(|c| c.id == id)
     }
@@ -420,4 +424,99 @@ async fn tiny_video_over_bluetooth_measurement() {
         a.video.queue_ms,
     );
     alice.calls.end(&id).unwrap();
+}
+
+/// Decodes every remote video stream a device's app would show, one decoder
+/// per person: frames seen per person.
+fn watch_people(rx: broadcast::Receiver<UiFrame>) -> Arc<Mutex<std::collections::HashMap<[u8; 32], Vec<(u32, Instant)>>>> {
+    let seen: Arc<Mutex<std::collections::HashMap<[u8; 32], Vec<(u32, Instant)>>>> = Arc::default();
+    let out = seen.clone();
+    let mut rx = rx;
+    std::thread::spawn(move || {
+        let mut decs: std::collections::HashMap<[u8; 32], H264Decoder> = Default::default();
+        loop {
+            let f = match rx.blocking_recv() {
+                Ok(f) => f,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return,
+            };
+            if f.source != UiSource::Remote {
+                continue;
+            }
+            let dec = decs.entry(f.peer).or_default();
+            if let Ok(pic) = dec.decode(&f.frame)
+                && let Ok((w, h, luma)) = pic.luma()
+                && let Some(n) = read_counter(&luma, w, h, w)
+            {
+                out.lock().entry(f.peer).or_default().push((n, Instant::now()));
+            }
+        }
+    });
+    seen
+}
+
+/// A group video call of three: everyone sees both others, each as its own
+/// stream (a tile), each in order, and every participant's video shows.
+#[tokio::test(flavor = "multi_thread")]
+async fn group_video_call_of_three() {
+    let alice = device("alice", TestSource::Sine { hz: 440.0, amp: 0.5 }, true, &[]).await;
+    let bob = device("bob", TestSource::Sine { hz: 550.0, amp: 0.5 }, true, &[]).await;
+    let carol = device("carol", TestSource::Sine { hz: 660.0, amp: 0.5 }, true, &[]).await;
+    let all = [&alice, &bob, &carol];
+    for a in all {
+        for b in all {
+            if a.node.id() != b.node.id() {
+                a.node.add_peer_addr(b.node.addr());
+            }
+        }
+    }
+    let (space, genesis) = alice.node.create_space().unwrap();
+    for d in [&bob, &carol] {
+        alice.node.with_space(&space, |r| r.add_member(d.node.keys().public(), Role::Writer)).unwrap().unwrap();
+    }
+    for d in [&bob, &carol] {
+        d.node.join_space(genesis.clone()).unwrap();
+        d.node.sync_with(alice.node.id(), space, true).await.unwrap();
+    }
+    let seen: Vec<_> = all.iter().map(|d| watch_people(d.calls.video_frames())).collect();
+
+    let out = alice.calls.start(space).await.unwrap();
+    alice.calls.set_camera(&out.id, true).await.unwrap();
+    for d in [&bob, &carol] {
+        let ring = eventually("rings", 15, || d.incoming().filter(|r| r.id == out.id)).await;
+        d.calls.set_camera(&ring.id, true).await.unwrap();
+        d.calls.accept(&ring.id).await.unwrap();
+    }
+    eventually("all three in", 20, || {
+        all.iter().all(|d| d.call(&out.id).is_some_and(|c| c.state == CallPhase::Active && c.joined_count == 3)).then_some(())
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+
+    for (d, seen) in all.iter().zip(&seen) {
+        let info = d.call(&out.id).unwrap();
+        let cut = Instant::now() - Duration::from_secs(2);
+        for other in all.iter().filter(|o| o.node.id() != d.node.id()) {
+            let s = seen.lock();
+            let frames = s.get(&other.node.id().0).map(|v| v.as_slice()).unwrap_or(&[]);
+            let fps = frames.iter().filter(|f| f.1 >= cut).count() as f64 / 2.0;
+            assert!(frames.windows(2).all(|w| w[1].0 > w[0].0), "in order");
+            let p = info.participants.iter().find(|p| p.id == other.hex()).expect("participant");
+            eprintln!(
+                "{} sees {}: {fps:.1} fps decoded, {}x{} at {:.1} fps, sending them {}x{} {} kbit/s",
+                d.node.id().short(),
+                other.node.id().short(),
+                p.video.recv_width,
+                p.video.recv_height,
+                p.video.recv_fps,
+                p.video.send_width,
+                p.video.send_height,
+                p.video.sent_bitrate / 1000,
+            );
+            assert!(fps > 12.0, "{fps:.1} fps");
+            assert!(p.video.remote_camera && p.video.receiving && p.video.sending);
+        }
+        assert_eq!(info.video.camera, CameraState::On);
+    }
+    alice.calls.end(&out.id).unwrap();
 }

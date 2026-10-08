@@ -13,6 +13,7 @@ import type {
   Attachment,
   CallEndReason,
   CallInfo,
+  ParticipantState,
   Contact,
   ConversationSummary,
   Delivery,
@@ -585,17 +586,28 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
 
   // --- calls ---------------------------------------------------------------------
   //
-  // Simulated 1:1 voice calls: ringing, answering, a path that depends on how
-  // the person is reachable, a bitrate that follows it, a moving level meter.
+  // Simulated voice calls, 1:1 and group: ringing, answering, people joining
+  // and leaving, a path per person that depends on how they're reachable, a
+  // bitrate that follows it, moving level meters.
 
+  interface MockPart {
+    person: Person;
+    state: ParticipantState;
+    muted: boolean;
+    seed: number;
+    /** Their camera is on (they turn it on a moment after we do). */
+    camera: boolean;
+    /** Their fake camera, while we can see it. */
+    feed: { stop(): void } | null;
+  }
   interface MockCall {
     info: CallInfo;
     activeAt: number | null;
+    parts: MockPart[];
     /** Our camera is wanted on. */
     camera: boolean;
-    /** Running fake cameras: ours (self-view) and theirs. */
+    /** Our fake camera (self-view). */
     local: { stop(): void } | null;
-    remote: { stop(): void } | null;
   }
   const calls = new Map<string, MockCall>();
 
@@ -690,72 +702,63 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     };
   }
 
+  const slowPath = (path: CallInfo["path"]) => path === "bluetooth" || path === "ieee802154";
+
   /** Start or stop the fake cameras to match the call. */
   function syncVideo(c: MockCall) {
     const active = c.info.state === "active";
-    const slow = c.info.path === "bluetooth";
     const wantLocal = active && c.camera;
-    if (wantLocal && !c.local) c.local = fakeCamera("local", meId, "", 205); // (the self-view is mirrored: no text)
+    if (wantLocal && !c.local) c.local = fakeCamera("local", meId, "", 205); // (mirrored: no text)
     if (!wantLocal && c.local) {
       c.local.stop();
       c.local = null;
     }
-    // they turn their camera on a moment after we do, and leave it on
-    if (wantLocal && !c.info.video.remoteCamera) {
-      later(1500, () => {
-        if (c.info.state !== "active") return;
-        c.info.video.remoteCamera = true;
-        syncVideo(c);
-      });
-    }
-    const wantRemote = active && c.info.video.remoteCamera && !slow;
-    if (wantRemote && !c.remote) c.remote = fakeCamera("remote", c.info.peer, c.info.peerName, 145);
-    if (!wantRemote && c.remote) {
-      c.remote.stop();
-      c.remote = null;
-    }
-    const v = c.info.video;
-    v.camera = c.camera ? "on" : "off";
-    v.paused = c.camera && slow;
-    v.sending = c.camera && active && !slow;
-    v.remotePaused = v.remoteCamera && slow;
-    v.receiving = wantRemote;
-    v.sendWidth = v.sending ? 640 : 0;
-    v.sendHeight = v.sending ? 360 : 0;
-    v.sendFps = v.sending ? 15 : 0;
-    v.bitrate = v.sending ? 600_000 : 0;
-    v.sentBitrate = v.bitrate;
-    v.recvWidth = wantRemote ? 640 : 0;
-    v.recvHeight = wantRemote ? 360 : 0;
-    v.recvFps = wantRemote ? 15 : 0;
-    v.latencyMs = wantRemote ? 38 : 0;
+    c.parts.forEach((p, i) => {
+      const joined = active && p.state === "joined";
+      // they turn their camera on a moment after we do, and leave it on
+      if (joined && c.camera && !p.camera) {
+        later(1500 + i * 700, () => {
+          if (c.info.state !== "active") return;
+          p.camera = true;
+          syncVideo(c);
+        });
+      }
+      const want = joined && p.camera && !slowPath(pathFor(p.person));
+      if (want && !p.feed) p.feed = fakeCamera("remote", p.person.id, p.person.name, (145 + i * 70) % 360);
+      if (!want && p.feed) {
+        p.feed.stop();
+        p.feed = null;
+      }
+    });
   }
 
-  function emptyVideo(): CallInfo["video"] {
+  /** Video with one person, as the runtime reports it. */
+  function peerVideo(c: MockCall, p: MockPart): CallInfo["participants"][number]["video"] {
+    const joined = c.info.state === "active" && p.state === "joined";
+    const slow = slowPath(pathFor(p.person));
+    const sending = joined && c.camera && !slow;
+    const receiving = !!p.feed;
     return {
-      camera: "off",
-      error: null,
-      sending: false,
-      paused: false,
-      remoteCamera: false,
-      remotePaused: false,
-      receiving: false,
-      sendWidth: 0,
-      sendHeight: 0,
-      sendFps: 0,
-      bitrate: 0,
-      sentBitrate: 0,
+      sending,
+      paused: joined && c.camera && slow,
+      remoteCamera: joined && p.camera,
+      remotePaused: joined && p.camera && slow,
+      receiving,
+      sendWidth: sending ? 640 : 0,
+      sendHeight: sending ? 360 : 0,
+      sendFps: sending ? 15 : 0,
+      bitrate: sending ? 600_000 : 0,
+      sentBitrate: sending ? 600_000 : 0,
       queueMs: 0,
-      recvWidth: 0,
-      recvHeight: 0,
-      recvFps: 0,
-      latencyMs: 0,
+      recvWidth: receiving ? 640 : 0,
+      recvHeight: receiving ? 360 : 0,
+      recvFps: receiving ? 15 : 0,
+      latencyMs: receiving ? 38 : 0,
       framesSent: 0,
       framesReceived: 0,
       framesSkipped: 0,
       keyframesSent: 0,
       keyframeRequests: 0,
-      source: "Simulated camera",
       encoder: "H.264 (WebCodecs)",
     };
   }
@@ -770,6 +773,16 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     return path === "bluetooth" ? 12_000 : path === "relay" ? 24_000 : 32_000;
   }
 
+  function rttFor(path: CallInfo["path"]): number {
+    return path === "bluetooth" ? 48 : path === "relay" ? 70 : 4;
+  }
+
+  /** In it, or calling out: other calls get "busy". */
+  function engaged(c: MockCall): boolean {
+    const s = c.info.state;
+    return s === "active" || s === "connecting" || (s === "ringing" && c.info.direction === "outgoing");
+  }
+
   function snapshot(c: MockCall): CallInfo {
     const now = Date.now();
     const active = c.info.state === "active";
@@ -777,8 +790,37 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     const voice = (seed: number) => Math.max(0, 0.45 + 0.35 * Math.sin(t * 3.1 + seed) * Math.sin(t * 1.7 + seed * 2));
     c.info.durationMs = c.activeAt ? (c.info.state === "ended" ? c.info.durationMs : now - c.activeAt) : 0;
     c.info.level = active && !c.info.muted ? voice(0) : 0;
-    c.info.remoteLevel = active && !c.info.remoteMuted ? voice(1.3) : 0;
-    const rtt = c.info.path === "bluetooth" ? 48 : c.info.path === "relay" ? 70 : 4;
+    const rank = (s: ParticipantState) => (s === "joined" ? 0 : s === "connecting" ? 1 : s === "ringing" ? 2 : 3);
+    c.info.participants = c.parts
+      .map((p) => {
+        const path = p.state === "joined" || p.state === "ringing" ? pathFor(p.person) : null;
+        const level = active && p.state === "joined" && !p.muted ? voice(p.seed) : 0;
+        return {
+          id: p.person.id,
+          name: p.person.name,
+          state: p.state,
+          muted: p.muted,
+          level,
+          speaking: level > 0.55,
+          path,
+          bitrate: active && p.state === "joined" ? bitrateFor(path) : 0,
+          rttMs: active && p.state === "joined" ? rttFor(path) : 0,
+          lossPct: 0,
+          video: peerVideo(c, p),
+        };
+      })
+      .sort((a, b) => rank(a.state) - rank(b.state) || a.name.localeCompare(b.name));
+    const joined = c.info.participants.filter((p) => p.state === "joined");
+    const inCall = active || (c.info.direction === "outgoing" && (c.info.state === "connecting" || c.info.state === "ringing"));
+    c.info.joinedCount = joined.length + (inCall ? 1 : 0);
+    const loudest = joined.filter((p) => p.speaking).sort((a, b) => b.level - a.level)[0];
+    c.info.activeSpeaker = loudest?.id ?? null;
+    c.info.remoteLevel = active ? Math.max(0, ...joined.map((p) => p.level)) : 0;
+    c.info.remoteMuted = !c.info.group && (c.parts[0]?.muted ?? false);
+    const main = c.info.group ? (joined[0] ?? null) : (c.info.participants[0] ?? null);
+    c.info.path = main ? pathFor(people.get(main.id)) : null;
+    c.info.bitrate = bitrateFor(c.info.path);
+    const rtt = rttFor(c.info.path);
     c.info.stats = {
       ...c.info.stats,
       rttMs: active ? rtt : 0,
@@ -787,6 +829,14 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       latencyMs: active ? rtt / 2 + (c.info.path === "bluetooth" ? 80 : 40) + 55 : 0,
       framesSent: active ? Math.floor(c.info.durationMs / 20) : c.info.stats.framesSent,
       framesReceived: active ? Math.floor(c.info.durationMs / 20) : c.info.stats.framesReceived,
+    };
+    const first = c.parts.find((p) => p.person.id === joined[0]?.id) ?? (c.info.group ? null : c.parts[0]);
+    const pv = first ? peerVideo(c, first) : null;
+    c.info.video = {
+      ...(pv ?? peerVideo(c, { person: people.get(c.info.peer) ?? c.parts[0]!.person, state: "left", muted: false, seed: 0, camera: false, feed: null })),
+      camera: c.camera && c.info.state !== "ended" ? "on" : "off",
+      error: null,
+      source: "Simulated camera",
     };
     return structuredClone(c.info);
   }
@@ -799,7 +849,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     if (c.info.state === "ended") return;
     c.info.state = state;
     syncVideo(c);
-    if (state === "active") {
+    if (state === "active" && !c.activeAt) {
       c.activeAt = Date.now();
       c.info.connectedAt = c.activeAt;
       tickCall(c);
@@ -812,6 +862,29 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     callUpdate(c);
   }
 
+  /** Someone else's state in a call changed. */
+  function setPart(c: MockCall, who: Person, state: ParticipantState) {
+    const p = c.parts.find((x) => x.person.id === who.id);
+    if (!p || c.info.state === "ended") return;
+    p.state = state;
+    syncVideo(c);
+    const anyoneIn = c.parts.some((x) => x.state === "joined");
+    const stillRinging = c.parts.some((x) => x.state === "ringing" || x.state === "connecting");
+    const outgoing = c.info.direction === "outgoing";
+    if (c.info.state === "active" && !anyoneIn) {
+      setCallState(c, "ended", "remoteHungUp");
+    } else if (outgoing && c.info.state !== "active" && state === "joined") {
+      setCallState(c, "active");
+    } else if (outgoing && c.info.state !== "active" && !anyoneIn && !stillRinging) {
+      const any = (s: ParticipantState) => c.parts.some((x) => x.state === s);
+      setCallState(c, "ended", any("declined") ? "remoteDeclined" : any("busy") ? "busy" : any("missed") ? "noAnswer" : "unavailable");
+    } else if ((c.info.state === "joinable" || c.info.state === "ringing") && !outgoing && !anyoneIn) {
+      setCallState(c, "ended", "missed");
+    } else {
+      callUpdate(c);
+    }
+  }
+
   function tickCall(c: MockCall) {
     later(100, () => {
       if (c.info.state !== "active") return;
@@ -820,18 +893,32 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     });
   }
 
-  function newCall(conv: Conv, peer: Person, direction: CallInfo["direction"]): MockCall {
-    const path = pathFor(peer);
+  /** A call in `conv`; `from` is who started it (null: you). */
+  function newCall(conv: Conv, direction: CallInfo["direction"], from: Person | null): MockCall {
+    const others = otherMembers(conv)
+      .map((m) => people.get(m.id))
+      .filter((p): p is Person => !!p);
+    const group = others.length > 1;
+    const peer = from ?? others[0]!;
     const c: MockCall = {
       activeAt: null,
       camera: false,
       local: null,
-      remote: null,
+      parts: others.map((p, i) => ({
+        person: p,
+        state: direction === "outgoing" ? "ringing" : p === from ? "joined" : "ringing",
+        muted: false,
+        seed: 1.3 + i * 0.9,
+        camera: false,
+        feed: null,
+      })),
       info: {
         id: randomHex(32),
         conversation: conv.id,
-        peer: peer.id,
-        peerName: peer.name,
+        group,
+        title: group ? conv.title : null,
+        peer: group && !from ? meId : peer.id,
+        peerName: group && !from ? "You" : peer.name,
         direction,
         state: direction === "outgoing" ? "connecting" : "ringing",
         endReason: null,
@@ -839,8 +926,11 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
         startedAt: Date.now(),
         connectedAt: null,
         durationMs: 0,
-        path,
-        bitrate: bitrateFor(path),
+        participants: [],
+        joinedCount: 0,
+        activeSpeaker: null,
+        path: null,
+        bitrate: 32_000,
         muted: false,
         remoteMuted: false,
         level: 0,
@@ -861,7 +951,32 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
           heardToneHz: null,
           measuredRoundTripMs: null,
         },
-        video: emptyVideo(),
+        video: {
+          camera: "off",
+          error: null,
+          sending: false,
+          paused: false,
+          remoteCamera: false,
+          remotePaused: false,
+          receiving: false,
+          sendWidth: 0,
+          sendHeight: 0,
+          sendFps: 0,
+          bitrate: 0,
+          sentBitrate: 0,
+          queueMs: 0,
+          recvWidth: 0,
+          recvHeight: 0,
+          recvFps: 0,
+          latencyMs: 0,
+          framesSent: 0,
+          framesReceived: 0,
+          framesSkipped: 0,
+          keyframesSent: 0,
+          keyframeRequests: 0,
+          source: "Simulated camera",
+          encoder: "H.264 (WebCodecs)",
+        },
       },
     };
     calls.set(c.info.id, c);
@@ -880,41 +995,66 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     const conv = getConv(conversation);
     if (conv.invitedBy) throw "accept this message request before calling";
     if (!conv.active) throw "you're no longer a member of this conversation";
-    const others = otherMembers(conv);
-    if (others.length !== 1) throw "calls work in one-to-one conversations for now";
-    const ringing = liveCalls().find((c) => c.info.direction === "incoming" && c.info.conversation === conversation && c.info.state === "ringing");
-    if (ringing) return acceptCall(ringing.info.id, video);
-    if (liveCalls().length > 0) throw "You're already in a call.";
-    const peer = people.get(others[0]!.id)!;
-    const c = newCall(conv, peer, "outgoing");
+    if (otherMembers(conv).length === 0) throw "there's nobody else in this conversation to call";
+    const waiting = liveCalls().find(
+      (c) =>
+        c.info.direction === "incoming" &&
+        c.info.conversation === conversation &&
+        (c.info.state === "ringing" || c.info.state === "joinable"),
+    );
+    if (waiting) return acceptCall(waiting.info.id, video);
+    if (liveCalls().some(engaged)) throw "You're already in a call.";
+    const c = newCall(conv, "outgoing", null);
     c.camera = video;
-    syncVideo(c);
-    const reachable = peer.online || peer.nearby;
-    if (!reachable) {
+    const reachable = c.parts.filter((p) => p.person.online || p.person.nearby);
+    if (reachable.length === 0) {
       later(1800, () => {
-        c.info.error = `${peer.name} can't be reached right now`;
+        c.info.error = c.info.group
+          ? "Nobody in the group can be reached right now"
+          : `${c.parts[0]!.person.name} can't be reached right now`;
+        for (const p of c.parts) p.state = "unavailable";
         setCallState(c, "ended", "unavailable");
       });
-    } else {
-      later(500, () => setCallState(c, "ringing"));
-      later(3200, () => setCallState(c, "active"));
-      // they occasionally mute for a moment
-      later(9000, () => {
-        c.info.remoteMuted = true;
-        later(2500, () => (c.info.remoteMuted = false));
-      });
+      return snapshot(c);
     }
+    later(500, () => {
+      for (const p of c.parts) if (!reachable.includes(p)) p.state = "unavailable";
+      setCallState(c, "ringing");
+    });
+    // the first two who can be reached answer; anyone else lets it ring out
+    reachable.forEach((p, i) => {
+      if (i < 2) later(3200 + i * 1800, () => setPart(c, p.person, "joined"));
+      else later(9000, () => setPart(c, p.person, "missed"));
+    });
+    // they occasionally mute for a moment
+    later(9000, () => {
+      const p = reachable[0]!;
+      p.muted = true;
+      later(2500, () => (p.muted = false));
+    });
     return snapshot(c);
   }
 
   function acceptCall(id: string, video = false): CallInfo {
     const c = getCall(id);
     if (video) c.camera = true;
-    if (c.info.direction !== "incoming" || c.info.state !== "ringing") throw "This call isn't ringing any more.";
-    for (const other of liveCalls()) if (other !== c) setCallState(other, "ended", "hungUp");
+    if (c.info.direction !== "incoming" || !(c.info.state === "ringing" || c.info.state === "joinable")) {
+      throw "This call isn't ringing any more.";
+    }
+    for (const other of liveCalls()) if (other !== c && engaged(other)) setCallState(other, "ended", "hungUp");
     setCallState(c, "connecting");
     later(400, () => setCallState(c, "active"));
     return snapshot(c);
+  }
+
+  /** Decline (or let ring out): a group call stays joinable while it goes on. */
+  function declineCall(c: MockCall, missed = false) {
+    if (c.info.group && c.info.direction === "incoming" && c.info.state === "ringing") {
+      setCallState(c, "joinable");
+    } else {
+      const unanswered = c.info.state === "ringing" && c.info.direction === "incoming";
+      setCallState(c, "ended", missed ? "missed" : unanswered ? "declined" : "hungUp");
+    }
   }
 
   // --- ambient activity ------------------------------------------------------------
@@ -944,11 +1084,29 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     // Ines calls you (once), unless you're already in a call
     later(40_000, () => {
       const conv = convs.get(hexFrom("conv:ines"));
-      if (!conv?.active || liveCalls().length > 0) return;
-      const c = newCall(conv, ines, "incoming");
+      if (!conv?.active || liveCalls().some(engaged)) return;
+      const c = newCall(conv, "incoming", ines);
       emit({ type: "callIncoming", call: snapshot(c) });
       later(30_000, () => {
-        if (c.info.state === "ringing") setCallState(c, "ended", "missed");
+        if (c.info.state === "ringing") declineCall(c, true);
+      });
+    });
+    // Tobias calls the climbing group and Ines picks up. Unanswered, it
+    // stays joinable while they talk; a few minutes later they hang up.
+    later(100_000, () => {
+      const g = convs.get(hexFrom("conv:climb"));
+      if (!g?.active || liveCalls().some(engaged)) return;
+      const c = newCall(g, "incoming", tobias);
+      emit({ type: "callIncoming", call: snapshot(c) });
+      later(2500, () => setPart(c, ines, "joined"));
+      later(30_000, () => {
+        setPart(c, hana, "missed");
+        if (c.info.state === "ringing") declineCall(c, true);
+      });
+      later(180_000, () => {
+        if (c.info.state === "active") return; // you're in it: they stay
+        setPart(c, ines, "left");
+        setPart(c, tobias, "left");
       });
     });
     later(75_000, () => {
@@ -1296,14 +1454,13 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     },
     video_keyframe: () => null,
     decline_call: ({ call }) => {
-      const c = getCall(call);
-      setCallState(c, "ended", c.info.state === "ringing" && c.info.direction === "incoming" ? "declined" : "hungUp");
+      declineCall(getCall(call));
       return null;
     },
     end_call: ({ call }) => {
       const c = getCall(call);
-      const unanswered = c.info.direction === "incoming" && c.info.state === "ringing";
-      setCallState(c, "ended", unanswered ? "declined" : "hungUp");
+      if (c.info.direction === "incoming" && c.info.state === "ringing") declineCall(c);
+      else setCallState(c, "ended", c.info.state === "joinable" ? "declined" : "hungUp");
       return null;
     },
     set_muted: ({ call, muted }) => {
@@ -1406,7 +1563,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     dispose() {
       for (const c of calls.values()) {
         c.local?.stop();
-        c.remote?.stop();
+        for (const p of c.parts) p.feed?.stop();
       }
       videoHandlers.clear();
       for (const t of timers) clearTimeout(t);

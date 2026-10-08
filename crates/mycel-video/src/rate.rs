@@ -7,12 +7,10 @@
 //!   peer-to-peer Wi-Fi / Wi-Fi Direct (the radio hops channels); 360p via
 //!   a relay; none under 1 Mbit/s (Bluetooth, IEEE 802.15.4: "video paused:
 //!   slow connection", see [`BLUETOOTH`]).
-//! - Under that ceiling a **delay-based controller** sets the bitrate. Every
-//!   frame is its own QUIC stream, and the time from handing it to QUIC to
-//!   QUIC reporting it fully acknowledged is its delivery time. Compared
-//!   with the lowest delivery time seen lately (the "base": RTT, delayed
-//!   ACKs, an uncongested path), the excess is how long it waited in queues
-//!   (as LEDBAT measures it). Rising queueing means the path is full: back off (×0.75, and
+//! - Under that ceiling a **delay-based controller** sets the bitrate: the
+//!   path's smoothed RTT (QUIC's, which leaves out delayed-ACK time) above
+//!   the lowest RTT seen lately (the base, as LEDBAT measures it) is
+//!   queueing on the way, which audio feels as much as video does. Rising queueing means the path is full: back off (×0.75, and
 //!   to no more than what was acknowledged meanwhile) before audio, which
 //!   shares every queue on the way, suffers. Short queues: creep up (×1.12
 //!   every 500 ms).
@@ -134,8 +132,8 @@ const INCREASE_EVERY: Duration = Duration::from_millis(500);
 /// Until the path first shows queueing, ramp up faster (×1.4 every 400 ms:
 /// 150 kbit/s to 2.5 Mbit/s in ~3.5 s), like TCP's slow start...
 const SLOW_START_EVERY: Duration = Duration::from_millis(400);
-/// ...which ends at the first frame delayed this much (not the smoothed
-/// delay: an overshoot shouldn't last long enough to show in that).
+/// ...which ends at the second frame in a row delayed this much (not the
+/// smoothed delay: an overshoot shouldn't last long enough to show in that).
 const SLOW_START_EXIT: Duration = Duration::from_millis(40);
 /// Not sending for this long resets to the start rate.
 const IDLE_RESTART: Duration = Duration::from_secs(2);
@@ -187,6 +185,7 @@ pub struct RateController {
     congested: bool,
     /// Still ramping up fast: no sign of a full path yet.
     slow_start: bool,
+    late_in_a_row: u32,
     /// Last acknowledged frame: no acks, no evidence to raise the rate on.
     last_ack: Option<Instant>,
     last_send: Option<Instant>,
@@ -214,6 +213,7 @@ impl RateController {
             acked_rate: 0,
             congested: false,
             slow_start: true,
+            late_in_a_row: 0,
             last_ack: None,
             last_send: None,
         }
@@ -336,9 +336,9 @@ impl RateController {
         }
     }
 
-    /// The other side acknowledged a whole frame of `bytes`, `in_flight`
-    /// after we queued it.
-    pub fn on_acked(&mut self, now: Instant, in_flight: Duration, rtt: Duration, bytes: usize) {
+    /// The other side acknowledged a whole frame of `bytes` (what gets
+    /// through, and evidence the path is in use).
+    pub fn on_acked(&mut self, now: Instant, bytes: usize) {
         let (start, n) = &mut self.acked_window;
         let s = *start.get_or_insert(now);
         *n += bytes as u64;
@@ -348,28 +348,43 @@ impl RateController {
             *start = Some(now);
             *n = 0;
         }
-        let _ = rtt;
         self.last_ack = Some(now);
+    }
+
+    /// The path's smoothed RTT now (QUIC's, which already leaves out the
+    /// receiver's delayed-ACK time). Above the lowest RTT seen lately (the
+    /// base), the excess is queueing: video's and everything else's,
+    /// audio included.
+    pub fn on_rtt(&mut self, now: Instant, rtt: Duration) {
+        if rtt.is_zero() {
+            return;
+        }
         // the base: min over the last 5–10 s (so it follows a path change)
         let (cur, prev, since) = &mut self.base;
         if since.is_none_or(|t| now.duration_since(t) > BASE_PERIOD) {
             *prev = cur.take();
             *since = Some(now);
         }
-        *cur = Some(cur.map_or(in_flight, |c| c.min(in_flight)));
+        *cur = Some(cur.map_or(rtt, |c| c.min(rtt)));
         let base = match (*cur, *prev) {
             (Some(c), Some(p)) => c.min(p),
             (Some(c), None) => c,
-            _ => in_flight,
+            _ => rtt,
         };
-        let q = in_flight.saturating_sub(base);
+        let q = rtt.saturating_sub(base);
+        // (two in a row: one blip on a busy machine isn't a full path)
         if self.slow_start && q > SLOW_START_EXIT {
-            self.slow_start = false;
-            self.congested = true;
+            self.late_in_a_row += 1;
+            if self.late_in_a_row >= 2 {
+                self.slow_start = false;
+                self.congested = true;
+            }
+        } else {
+            self.late_in_a_row = 0;
         }
         self.delay = Some(match self.delay {
             None => q,
-            Some(d) => d.mul_f64(0.8) + q.mul_f64(0.2),
+            Some(d) => d.mul_f64(0.7) + q.mul_f64(0.3),
         });
     }
 
@@ -486,14 +501,16 @@ mod tests {
         for _ in 0..50 {
             now += Duration::from_millis(100);
             c.on_sent(now, (c.bitrate() / 8 / 10) as usize);
-            c.on_acked(now, RTT + Duration::from_millis(5), RTT, 1000);
+            c.on_acked(now, 1000);
+            c.on_rtt(now, RTT + Duration::from_millis(5));
             c.tick(now, RTT);
         }
         assert_eq!(c.bitrate(), 2_500_000, "full rate after 5 s");
         for _ in 0..300 {
             now += Duration::from_millis(100);
             c.on_sent(now, (c.bitrate() / 8 / 10) as usize);
-            c.on_acked(now, RTT + Duration::from_millis(5), RTT, 1000);
+            c.on_acked(now, 1000);
+            c.on_rtt(now, RTT + Duration::from_millis(5));
             c.tick(now, RTT);
         }
         assert_eq!(c.bitrate(), 2_500_000);
@@ -508,13 +525,15 @@ mod tests {
         // a clean path first (to learn its base delay), then queues build
         for _ in 0..30 {
             now += Duration::from_millis(100);
-            c.on_acked(now, RTT, RTT, 30_000);
+            c.on_acked(now, 30_000);
+            c.on_rtt(now, RTT);
             c.tick(now, RTT);
         }
         let start = c.bitrate();
         for _ in 0..20 {
             now += Duration::from_millis(100);
-            c.on_acked(now, RTT + Duration::from_millis(400), RTT, 1000);
+            c.on_acked(now, 1000);
+            c.on_rtt(now, RTT + Duration::from_millis(400));
             c.tick(now, RTT);
         }
         assert!(c.bitrate() < start / 3, "{} → {}", start, c.bitrate());
@@ -526,10 +545,12 @@ mod tests {
         let mut c = RateController::new(Some(PathKind::PeerWifi));
         let mut now = Instant::now();
         // squeeze to the bottom
-        c.on_acked(now, RTT, RTT, 1000);
+        c.on_acked(now, 1000);
+            c.on_rtt(now, RTT);
         for _ in 0..30 {
             now += Duration::from_millis(100);
-            c.on_acked(now, Duration::from_millis(600), RTT, 1000);
+            c.on_acked(now, 1000);
+            c.on_rtt(now, Duration::from_millis(600));
             c.tick(now, RTT);
         }
         let low = c.quality();
@@ -537,7 +558,8 @@ mod tests {
         for _ in 0..400 {
             now += Duration::from_millis(100);
             c.on_sent(now, (c.bitrate() / 80) as usize);
-            c.on_acked(now, RTT, RTT, 1000);
+            c.on_acked(now, 1000);
+            c.on_rtt(now, RTT);
             if c.tick(now, RTT).is_some() {
                 switches += 1;
             }
@@ -561,7 +583,8 @@ mod tests {
         for _ in 0..50 {
             now += Duration::from_millis(100);
             c.on_sent(now, 10_000);
-            c.on_acked(now, RTT, RTT, 10_000);
+            c.on_acked(now, 10_000);
+            c.on_rtt(now, RTT);
             c.tick(now, RTT);
         }
         assert!(c.bitrate() > start * 4);

@@ -1,17 +1,19 @@
 //! Media framing: one Opus frame per QUIC datagram.
 //!
 //! ```text
-//! 0      kind (0x01 = audio, v0)
+//! 0      track kind (0x01 = audio; any other kind is another track,
+//!        e.g. video, handed to the call's TrackSink)
 //! 1..5   sequence number, u32 LE (one per 20 ms frame, never reused)
 //! 5..9   capture timestamp, u32 LE, in 48 kHz samples
 //! 9      flags (bit 0: sender is muted)
 //! 10..   Opus packet
 //! ```
 //!
-//! The QUIC connection is already authenticated and encrypted end to end,
-//! and carries only this one call, so frames carry no call id or MAC. When a
-//! path can't carry datagrams the same frames go on a unidirectional stream,
-//! each prefixed with its length (u16 LE).
+//! Each QUIC connection is already authenticated and encrypted end to end,
+//! and carries one call between two devices, so frames carry no call id or
+//! MAC. When a path can't carry datagrams, the same frames go on a
+//! unidirectional stream that starts with the track kind byte, each frame
+//! prefixed with its length (u16 LE).
 
 use anyhow::{Result, bail};
 use bytes::{BufMut, Bytes, BytesMut};

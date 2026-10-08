@@ -14,7 +14,8 @@ pub fn wall_us() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros() as u64).unwrap_or(0)
 }
 
-/// One captured picture.
+/// One captured picture (cloning shares the pixels).
+#[derive(Clone)]
 pub struct Picture {
     pub width: u32,
     pub height: u32,

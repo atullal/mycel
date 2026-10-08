@@ -119,8 +119,12 @@ impl CallHost for RuntimeCallHost {
         self.me
     }
 
-    fn callee(&self, space: &SpaceId) -> Result<SignPk> {
-        self.rt.upgrade().context("shutting down")?.call_peer(space)
+    fn members(&self, space: &SpaceId) -> Result<Vec<SignPk>> {
+        self.rt.upgrade().context("shutting down")?.call_members(space)
+    }
+
+    fn title(&self, space: &SpaceId) -> Option<String> {
+        self.rt.upgrade()?.summary(space).ok().map(|s| s.title)
     }
 
     fn may_call(&self, space: &SpaceId, peer: &SignPk) -> bool {
@@ -1358,8 +1362,8 @@ impl Runtime {
         &self.calls
     }
 
-    /// The person a call in this conversation goes to.
-    fn call_peer(&self, space: &SpaceId) -> Result<SignPk> {
+    /// Whom a call in this conversation rings: everyone else in it.
+    fn call_members(&self, space: &SpaceId) -> Result<Vec<SignPk>> {
         if self.keeper {
             bail!("keepers don't make calls");
         }
@@ -1376,11 +1380,10 @@ impl Runtime {
             .filter(|(k, role)| k.sign_pk != me && *role != Role::Relay)
             .map(|(k, _)| k.sign_pk)
             .collect();
-        match people.as_slice() {
-            [one] => Ok(*one),
-            [] => bail!("there's nobody else in this conversation to call"),
-            _ => bail!("calls work in one-to-one conversations for now"),
+        if people.is_empty() {
+            bail!("there's nobody else in this conversation to call");
         }
+        Ok(people)
     }
 
     /// May `peer` ring us about `space`? Both must be current members (not
@@ -1402,14 +1405,17 @@ impl Runtime {
             .unwrap_or(false)
     }
 
-    /// Ring the other person in a direct conversation. Returns at once (the
+    /// Call a conversation: the other person, or everyone in a group (up to
+    /// 8 can be in the call at once). Joins the conversation's call instead
+    /// if one is ringing you or going on without you. Returns at once (the
     /// call is `connecting`); watch `callUpdated` for ringing / active /
-    /// ended (`unavailable` if their device can't be reached).
+    /// ended (`unavailable` if nobody can be reached).
     pub async fn start_call(&self, conversation: ConversationId) -> Result<CallInfo> {
         let space = parse_space(&conversation)?;
         self.calls.start(space).await
     }
 
+    /// Answer a ringing call, or join a `joinable` group call.
     pub async fn accept_call(&self, call: String) -> Result<CallInfo> {
         self.calls.accept(&call).await
     }
@@ -1418,7 +1424,8 @@ impl Runtime {
         self.calls.decline(&call)
     }
 
-    /// Hang up, or cancel an outgoing call that hasn't been answered.
+    /// Hang up (a group call goes on for the others), or cancel an outgoing
+    /// call that hasn't been answered.
     pub fn end_call(&self, call: String) -> Result<()> {
         self.calls.end(&call)
     }

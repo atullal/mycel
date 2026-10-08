@@ -32,10 +32,10 @@ use tokio::sync::{broadcast, mpsc};
 use crate::platform::H264Encoder;
 use crate::rate::{Admit, Quality, RateController};
 use crate::receiver::Reorder;
-use crate::source::{Picture, SourceHandle, VideoSource, wall_us};
+use crate::source::{Picture, wall_us};
 use crate::wire::{
-    CtrlDeframer, EncodedFrame, FRAME_HEADER_LEN, KIND_CTRL, KIND_FRAME, MAX_FRAME, STREAM_HEADER_LEN, UiFrame,
-    UiSource, VideoCtrl, ctrl_stream_header, stream_kind,
+    CtrlDeframer, EncodedFrame, FRAME_HEADER_LEN, KIND_CTRL, KIND_FRAME, MAX_FRAME, UiFrame, UiSource, VideoCtrl,
+    ctrl_stream_header,
 };
 
 /// Give up on a frame QUIC hasn't delivered after this long.
@@ -119,9 +119,10 @@ struct Outstanding {
 }
 
 impl Outstanding {
-    fn give_up(mut self, seq: u32) {
+    fn give_up(mut self, seq: u32, ctrl: &mpsc::UnboundedSender<VideoCtrl>) {
         if let Some(s) = self.stream.as_mut() {
             let _ = s.reset(reset_code(seq));
+            let _ = ctrl.send(VideoCtrl::Dropped { seq });
         }
     }
 }
@@ -213,8 +214,12 @@ struct Shared {
     send: Mutex<SendSide>,
     recv: Mutex<RecvSide>,
     reorder: Mutex<Reorder>,
-    camera: Mutex<(CameraState, Option<String>)>,
-    source_desc: Mutex<String>,
+    /// Our camera is on: send to this peer.
+    camera_on: AtomicBool,
+    /// This track also feeds the self-view (one track per call does).
+    self_view: AtomicBool,
+    /// The encoder couldn't start.
+    encoder_error: Mutex<Option<String>>,
     latest: Latest,
     ctrl_tx: mpsc::UnboundedSender<VideoCtrl>,
     stop: AtomicBool,
@@ -235,7 +240,7 @@ impl Shared {
     }
 
     fn sending_state(&self) -> VideoCtrl {
-        let camera = self.camera.lock().0 == CameraState::On;
+        let camera = self.camera_on.load(Ordering::SeqCst);
         VideoCtrl::State { camera, paused: self.ctl.lock().paused() }
     }
 
@@ -261,11 +266,11 @@ impl Shared {
     }
 }
 
-/// A call's video. Dropping it stops everything.
+/// Our video to one other device and theirs to us, on the connection to
+/// them. Pictures come from [`crate::VideoCall`] (one camera, a track per
+/// peer). Dropping it stops everything.
 pub struct VideoTrack {
     shared: Arc<Shared>,
-    source: Arc<dyn VideoSource>,
-    running: Mutex<Option<SourceHandle>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     encoder: Option<std::thread::JoinHandle<()>>,
     rt: tokio::runtime::Handle,
@@ -278,15 +283,42 @@ pub struct TrackOptions {
     pub path: Option<PathKind>,
 }
 
+/// One direction-pair of video with one peer, for stats and the UI.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerVideo {
+    /// Our video is going out to them.
+    pub sending: bool,
+    /// Our video to them is paused: the path can't carry it.
+    pub paused: bool,
+    /// They have their camera on.
+    pub remote_camera: bool,
+    /// Their video is paused on their side (slow connection).
+    pub remote_paused: bool,
+    /// Their frames are arriving.
+    pub receiving: bool,
+    pub send_width: u32,
+    pub send_height: u32,
+    pub send_fps: f32,
+    pub bitrate: u32,
+    pub sent_bitrate: u32,
+    pub queue_ms: u32,
+    pub recv_width: u32,
+    pub recv_height: u32,
+    pub recv_fps: f32,
+    pub latency_ms: u32,
+    pub frames_sent: u64,
+    pub frames_received: u64,
+    pub frames_skipped: u64,
+    pub keyframes_sent: u64,
+    pub keyframe_requests: u64,
+    pub encoder: String,
+}
+
 impl VideoTrack {
-    /// Start receiving on `conn` (and sending once the camera is on).
-    pub fn start(
-        conn: Connection,
-        source: Arc<dyn VideoSource>,
-        ui: broadcast::Sender<UiFrame>,
-        opts: TrackOptions,
-        rt: tokio::runtime::Handle,
-    ) -> VideoTrack {
+    /// Start video with one peer on `conn`: receive whatever streams are
+    /// handed to [`VideoTrack::accept_stream`], send once the camera is on.
+    pub fn start(conn: Connection, ui: broadcast::Sender<UiFrame>, opts: TrackOptions, rt: tokio::runtime::Handle) -> VideoTrack {
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             conn: conn.clone(),
@@ -300,8 +332,9 @@ impl VideoTrack {
             send: Mutex::default(),
             recv: Mutex::default(),
             reorder: Mutex::default(),
-            camera: Mutex::default(),
-            source_desc: Mutex::new(source.describe()),
+            camera_on: AtomicBool::new(false),
+            self_view: AtomicBool::new(false),
+            encoder_error: Mutex::new(None),
             latest: Latest::default(),
             ctrl_tx,
             stop: AtomicBool::new(false),
@@ -311,7 +344,6 @@ impl VideoTrack {
         let (frame_tx, frame_rx) = mpsc::unbounded_channel::<EncodedFrame>();
         let tasks = vec![
             rt.spawn(write_ctrl(shared.clone(), ctrl_rx)),
-            rt.spawn(accept(shared.clone())),
             rt.spawn(send_frames(shared.clone(), frame_rx)),
             rt.spawn(tick(shared.clone())),
         ];
@@ -321,62 +353,68 @@ impl VideoTrack {
             .spawn(move || encode_loop(enc_shared, frame_tx))
             .ok();
         let _ = shared.ctrl_tx.send(shared.sending_state());
-        VideoTrack { shared, source, running: Mutex::new(None), tasks, encoder, rt }
+        VideoTrack { shared, tasks, encoder, rt }
     }
 
-    /// Turn our camera on or off. Turning it on may ask for permission
-    /// (blocking until the user answers), so call it off the async runtime.
-    pub fn set_camera(&self, on: bool) -> Result<()> {
-        let sh = &self.shared;
-        if !on {
-            self.running.lock().take();
-            *sh.camera.lock() = (CameraState::Off, None);
-            sh.generation.fetch_add(1, Ordering::SeqCst);
-            sh.latest.pic.lock().take();
-            let _ = sh.ctrl_tx.send(sh.sending_state());
-            return Ok(());
-        }
-        if self.running.lock().is_some() {
-            return Ok(());
-        }
-        *sh.camera.lock() = (CameraState::Starting, None);
-        let result = self.source.prepare().and_then(|()| {
-            let target = Arc::downgrade(sh);
-            self.source.start(Arc::new(move |pic: Picture| {
-                if let Some(sh) = target.upgrade() {
-                    *sh.latest.pic.lock() = Some(pic);
-                    sh.latest.ready.notify_one();
-                }
-            }))
+    /// A video stream from this peer (its kind byte already read).
+    pub fn accept_stream(&self, kind: u8, rx: RecvStream) {
+        let sh = self.shared.clone();
+        self.rt.spawn(async move {
+            if let Err(e) = read_stream(&sh, kind, rx).await
+                && std::env::var_os("MYCEL_VIDEO_DEBUG").is_some()
+            {
+                eprintln!("[video] stream: {e:#}");
+            }
         });
-        match result {
-            Ok(handle) => {
-                *self.running.lock() = Some(handle);
-                *sh.camera.lock() = (CameraState::On, None);
-                sh.generation.fetch_add(1, Ordering::SeqCst);
-                sh.force_key.store(true, Ordering::SeqCst);
-                let _ = sh.ctrl_tx.send(sh.sending_state());
-                Ok(())
+    }
+
+    /// Standalone use (no call engine): accept this connection's streams
+    /// ourselves, routing video kinds to [`VideoTrack::accept_stream`].
+    pub fn serve(&self) {
+        let sh = self.shared.clone();
+        let conn = sh.conn.clone();
+        let rt = self.rt.clone();
+        self.rt.spawn(async move {
+            while let Ok(mut rx) = conn.accept_uni().await {
+                let sh = sh.clone();
+                rt.spawn(async move {
+                    let mut kind = [0u8; 1];
+                    if rx.read_exact(&mut kind).await.is_ok() && crate::wire::is_video_kind(kind[0]) {
+                        let _ = read_stream(&sh, kind[0], rx).await;
+                    }
+                });
             }
-            Err(e) => {
-                let msg = format!("{e:#}");
-                let denied = msg.contains("isn't allowed");
-                *sh.camera.lock() = (if denied { CameraState::Denied } else { CameraState::Failed }, Some(msg));
-                let _ = sh.ctrl_tx.send(sh.sending_state());
-                Err(e)
-            }
+        });
+    }
+
+    /// A picture from the camera (the newest wins; older unencoded ones drop).
+    pub fn push(&self, pic: Picture) {
+        if !self.shared.camera_on.load(Ordering::Relaxed) {
+            return;
         }
+        *self.shared.latest.pic.lock() = Some(pic);
+        self.shared.latest.ready.notify_one();
     }
 
-    /// Tests: reset every `every`-th delta frame's stream mid-way, as the
-    /// sender does with frames stuck too long (0 = off).
-    #[doc(hidden)]
-    pub fn drop_frames_for_test(&self, every: u32) {
-        self.shared.test_drop_every.store(every, Ordering::SeqCst);
+    /// Our camera turned on or off: start or stop sending, and tell them.
+    pub fn set_camera(&self, on: bool) {
+        let sh = &self.shared;
+        if sh.camera_on.swap(on, Ordering::SeqCst) == on {
+            return;
+        }
+        sh.generation.fetch_add(1, Ordering::SeqCst);
+        sh.latest.pic.lock().take();
+        if on {
+            sh.force_key.store(true, Ordering::SeqCst);
+        }
+        let _ = sh.ctrl_tx.send(sh.sending_state());
     }
 
-    pub fn camera_on(&self) -> bool {
-        self.running.lock().is_some()
+    /// Also show what we encode for this peer as our self-view.
+    pub fn set_self_view(&self, on: bool) {
+        if !self.shared.self_view.swap(on, Ordering::SeqCst) && on {
+            self.shared.force_key.store(true, Ordering::SeqCst);
+        }
     }
 
     /// Ask the other side for a keyframe (e.g. the app's decoder was reset).
@@ -389,28 +427,39 @@ impl VideoTrack {
         self.shared.force_key.store(true, Ordering::SeqCst);
     }
 
-    pub fn info(&self) -> VideoInfo {
+    /// Tests: reset every `every`-th delta frame's stream mid-way, as the
+    /// sender does with frames stuck too long (0 = off).
+    #[doc(hidden)]
+    pub fn drop_frames_for_test(&self, every: u32) {
+        self.shared.test_drop_every.store(every, Ordering::SeqCst);
+    }
+
+    /// The encoder couldn't start (why).
+    pub fn encoder_error(&self) -> Option<String> {
+        self.shared.encoder_error.lock().clone()
+    }
+
+    pub fn info(&self) -> PeerVideo {
         let sh = &self.shared;
         let now = Instant::now();
-        let (camera, error) = sh.camera.lock().clone();
+        let on = sh.camera_on.load(Ordering::SeqCst);
         let ctl = sh.ctl.lock();
         let s = sh.send.lock();
         let r = sh.recv.lock();
         let ro = sh.reorder.lock();
         let receiving = r.last.is_some_and(|t| now.duration_since(t) < RECV_IDLE);
-        VideoInfo {
-            camera,
-            error,
-            sending: camera == CameraState::On && !ctl.paused(),
-            paused: camera == CameraState::On && ctl.paused(),
+        let sending = on && !ctl.paused();
+        PeerVideo {
+            sending,
+            paused: on && ctl.paused(),
             remote_camera: r.remote_camera,
             remote_paused: r.remote_paused,
             receiving,
-            send_width: s.size.0,
-            send_height: s.size.1,
-            send_fps: s.window.fps(now),
-            bitrate: if camera == CameraState::On && !ctl.paused() { ctl.bitrate() } else { 0 },
-            sent_bitrate: if s.window.fps(now) > 0.0 { ctl.sent_rate() } else { 0 },
+            send_width: if sending { s.size.0 } else { 0 },
+            send_height: if sending { s.size.1 } else { 0 },
+            send_fps: if sending { s.window.fps(now) } else { 0.0 },
+            bitrate: if sending { ctl.bitrate() } else { 0 },
+            sent_bitrate: if sending && s.window.fps(now) > 0.0 { ctl.sent_rate() } else { 0 },
             queue_ms: ctl.queue_delay().map(|d| d.as_millis() as u32).unwrap_or(0),
             recv_width: r.size.0,
             recv_height: r.size.1,
@@ -421,7 +470,6 @@ impl VideoTrack {
             frames_skipped: s.skipped,
             keyframes_sent: s.keyframes,
             keyframe_requests: ro.stats.keyframe_requests,
-            source: sh.source_desc.lock().clone(),
             encoder: s.encoder.clone(),
         }
     }
@@ -430,7 +478,6 @@ impl VideoTrack {
 impl Drop for VideoTrack {
     fn drop(&mut self) {
         self.shared.stop.store(true, Ordering::SeqCst);
-        self.running.lock().take();
         self.shared.latest.ready.notify_all();
         for t in &self.tasks {
             t.abort();
@@ -438,7 +485,6 @@ impl Drop for VideoTrack {
         if let Some(t) = self.encoder.take() {
             let _ = t.join();
         }
-        let _ = &self.rt;
     }
 }
 
@@ -512,7 +558,7 @@ fn encode_loop(sh: Arc<Shared>, out: mpsc::UnboundedSender<EncodedFrame>) {
                     }
                     Err(e) => {
                         eprintln!("[video] {e:#}");
-                        *sh.camera.lock() = (CameraState::Failed, Some(format!("{e:#}")));
+                        *sh.encoder_error.lock() = Some(format!("{e:#}"));
                         std::thread::sleep(Duration::from_millis(500));
                         continue;
                     }
@@ -553,7 +599,9 @@ fn encode_loop(sh: Arc<Shared>, out: mpsc::UnboundedSender<EncodedFrame>) {
             frame.seq = seq;
             seq = seq.wrapping_add(1);
         }
-        let _ = sh.ui.send(UiFrame { source: UiSource::Local, peer: sh.me, frame: frame.clone() });
+        if sh.self_view.load(Ordering::Relaxed) {
+            let _ = sh.ui.send(UiFrame { source: UiSource::Local, peer: sh.me, frame: frame.clone() });
+        }
         if !send {
             continue;
         }
@@ -575,7 +623,7 @@ fn encode_loop(sh: Arc<Shared>, out: mpsc::UnboundedSender<EncodedFrame>) {
                 let older: Vec<u32> = o.range(..frame.seq).map(|(s, _)| *s).collect();
                 for s in older {
                     if let Some(f) = o.remove(&s) {
-                        f.give_up(s);
+                        f.give_up(s, &sh.ctrl_tx);
                     }
                 }
             }
@@ -599,14 +647,13 @@ async fn send_frames(sh: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<EncodedFra
         if std::env::var_os("MYCEL_VIDEO_DEBUG").is_some() {
             eprintln!("[video {:?}] send #{seq} key={key} {} B {}x{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100_000, wire.len(), f.width, f.height);
         }
-        let Ok((mut tx, rx_half)) = sh.conn.open_bi().await else { return };
-        // we never read their half of a frame stream
-        drop(rx_half);
+        let Ok(mut tx) = sh.conn.open_uni().await else { return };
         let _ = tx.set_priority(FRAME_PRIORITY);
         let every = sh.test_drop_every.load(Ordering::Relaxed);
         if every > 0 && !key && seq % every == 0 {
             let _ = tx.write_all(&wire[..wire.len() / 2]).await;
             let _ = tx.reset(reset_code(seq));
+            let _ = sh.ctrl_tx.send(VideoCtrl::Dropped { seq });
             sh.outstanding.lock().remove(&seq);
             continue;
         }
@@ -629,6 +676,7 @@ async fn send_frames(sh: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<EncodedFra
             // given up on mid-way (stuck, or a newer keyframe)?
             if !sh.outstanding.lock().contains_key(&seq) {
                 let _ = tx.reset(reset_code(seq));
+                let _ = sh.ctrl_tx.send(VideoCtrl::Dropped { seq });
                 ok = false;
                 break;
             }
@@ -656,16 +704,14 @@ async fn send_frames(sh: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<EncodedFra
             let r = stopped.await;
             let Some(f) = sh2.outstanding.lock().remove(&seq) else { return };
             if matches!(r, Ok(None)) {
-                let rtt = *sh2.rtt.lock();
-                sh2.ctl.lock().on_acked(Instant::now(), handed.elapsed(), rtt, f.bytes);
+                sh2.ctl.lock().on_acked(Instant::now(), f.bytes);
             }
         });
     }
 }
 
 async fn write_ctrl(sh: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<VideoCtrl>) {
-    let Ok((mut tx, rx_half)) = sh.conn.open_bi().await else { return };
-    drop(rx_half);
+    let Ok(mut tx) = sh.conn.open_uni().await else { return };
     let _ = tx.set_priority(CTRL_PRIORITY);
     if tx.write_all(&ctrl_stream_header()).await.is_err() {
         return;
@@ -698,6 +744,7 @@ async fn tick(sh: Arc<Shared>) {
             if path.is_some() {
                 ctl.set_path(path, now);
             }
+            ctl.on_rtt(now, rtt);
             (ctl.tick(now, rtt), ctl.paused())
         };
         if changed.is_some() {
@@ -723,7 +770,7 @@ async fn tick(sh: Arc<Shared>) {
             if !stale.is_empty() {
                 for s in stale {
                     if let Some(f) = o.remove(&s) {
-                        f.give_up(s);
+                        f.give_up(s, &sh.ctrl_tx);
                     }
                 }
                 sh.force_key.store(true, Ordering::SeqCst);
@@ -743,31 +790,8 @@ async fn tick(sh: Arc<Shared>) {
 
 // ─────────────────────────────── receive ───────────────────────────────
 
-async fn accept(sh: Arc<Shared>) {
-    while let Ok((tx, rx)) = sh.conn.accept_bi().await {
-        drop(tx); // we never answer on a video stream
-        let sh = sh.clone();
-        tokio::spawn(async move {
-            if let Err(e) = read_stream(&sh, rx).await
-                && std::env::var_os("MYCEL_VIDEO_DEBUG").is_some()
-            {
-                eprintln!("[video] stream: {e:#}");
-            }
-        });
-    }
-}
-
-async fn read_stream(sh: &Shared, mut rx: RecvStream) -> Result<()> {
-    let mut head = [0u8; STREAM_HEADER_LEN];
-    if let Err(e) = rx.read_exact(&mut head).await {
-        if let ReadExactError::ReadError(e) = &e
-            && let Some(seq) = reset_seq(e)
-        {
-            frame_lost(sh, seq);
-        }
-        return Err(e.into());
-    }
-    match stream_kind(&head)? {
+async fn read_stream(sh: &Shared, kind: u8, rx: RecvStream) -> Result<()> {
+    match kind {
         KIND_FRAME => read_frame(sh, rx).await,
         KIND_CTRL => read_ctrl(sh, rx).await,
         _ => Ok(()),
@@ -839,6 +863,7 @@ async fn read_ctrl(sh: &Shared, mut rx: RecvStream) -> Result<()> {
                         sh.force_key.store(true, Ordering::SeqCst);
                     }
                 }
+                VideoCtrl::Dropped { seq } => frame_lost(sh, seq),
                 VideoCtrl::State { camera, paused } => {
                     let mut r = sh.recv.lock();
                     r.remote_camera = camera;

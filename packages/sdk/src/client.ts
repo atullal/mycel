@@ -112,39 +112,44 @@ export interface Mycel {
   };
 
   /**
-   * Live 1:1 voice calls. Audio is captured and played by the runtime (not
-   * the webview): Opus over the same encrypted multipath connection as
-   * everything else. Watch `callIncoming` / `callUpdated`, or `useCalls()`.
+   * Live voice calls, 1:1 and group (up to 8 people, each connected to each
+   * other). Audio is captured and played by the runtime (not the webview):
+   * Opus over the same encrypted multipath connections as everything else.
+   * Watch `callIncoming` / `callUpdated`, or `useCalls()`.
    */
   calls: {
     /**
-     * `start_call`: ring the other person in a direct conversation (resolves
-     * while `connecting`). `video: true` starts with our camera on (asking
-     * for the camera the first time).
+     * `start_call`: ring the other person, or everyone in a group (resolves
+     * while `connecting`). Joins the conversation's call instead if one is
+     * ringing you or going on without you. `video: true` starts with our
+     * camera on (asking for the camera the first time).
      */
     start(conversation: ConversationId, opts?: { video?: boolean }): Promise<CallInfo>;
     /** `accept_call`: answer a ringing call (asks for the microphone the first time); `video` turns our camera on. */
     accept(call: CallId, opts?: { video?: boolean }): Promise<CallInfo>;
+    /** `accept_call` on a `joinable` group call: join it. */
+    join(call: CallId, opts?: { video?: boolean }): Promise<CallInfo>;
     /**
      * `set_camera`: turn our camera on or off, before or during a call. The
      * first time, this waits for the user to answer the system's camera
      * prompt; if they say no it rejects, and `video.error` says where to allow it.
      */
     setCamera(call: CallId, on: boolean): Promise<CallInfo>;
-    /** `video_keyframe`: our video decoder lost its place; get fresh keyframes. */
+    /** `video_keyframe`: our video decoders lost their place; get fresh keyframes. */
     requestKeyframe(call: CallId): Promise<void>;
     /**
-     * Encoded video frames as they arrive: the other side's video and our
-     * self-view. Decode them with `videoCanvas` (or `useVideoCanvas` in
-     * React). Returns an unsubscribe function. Without a video-capable
-     * backend nothing arrives (`videoSupported` is false).
+     * Encoded video frames as they arrive: everyone's video (one stream per
+     * person, `frame.peer` says whose) and our self-view. Decode them with
+     * `videoCanvas` (or `useVideoCanvas` in React). Returns an unsubscribe
+     * function. Without a video-capable backend nothing arrives
+     * (`videoSupported` is false).
      */
     onVideo(handler: (frame: VideoFrameData) => void): () => void;
     /** The backend delivers video frames. */
     readonly videoSupported: boolean;
-    /** `decline_call` */
+    /** `decline_call` (a declined group call stays `joinable` while it goes on) */
     decline(call: CallId): Promise<void>;
-    /** `end_call`: hang up, or cancel a call that hasn't been answered. */
+    /** `end_call`: hang up (a group call goes on for the others), or cancel a call that hasn't been answered. */
     end(call: CallId): Promise<void>;
     /** `set_muted` */
     setMuted(call: CallId, muted: boolean): Promise<CallInfo>;
@@ -246,6 +251,7 @@ export function createMycel(transport: Transport): Mycel {
     calls: {
       start: (conversation, opts) => call("start_call", { conversation, video: opts?.video ?? false }),
       accept: (id, opts) => call("accept_call", { call: id, video: opts?.video ?? false }),
+      join: (id, opts) => call("accept_call", { call: id, video: opts?.video ?? false }),
       setCamera: (id, on) => call("set_camera", { call: id, on }),
       requestKeyframe: (id) => call("video_keyframe", { call: id }).then(done),
       onVideo: (handler) => {

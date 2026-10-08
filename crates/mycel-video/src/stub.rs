@@ -10,6 +10,7 @@ use crate::wire::EncodedFrame;
 
 const UNSUPPORTED: &str = "Video isn't available on this device yet.";
 
+#[derive(Clone)]
 pub struct PixelBuffer;
 
 impl PixelBuffer {

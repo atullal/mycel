@@ -1,8 +1,9 @@
 //! Live video for Mycel calls.
 //!
-//! Video rides the call's own QUIC connection (so it uses every path the
+//! Video rides the call's own QUIC connections (so it uses every path the
 //! call does and moves with it), on streams of its own: see [`wire`] for
-//! the format, [`track`] for the engine, [`rate`] for how much is sent.
+//! the format, [`track`] for one peer's video, [`call`] for a call's (one
+//! camera, a track per peer), [`rate`] for how much is sent.
 //!
 //! # Choices, and why
 //!
@@ -53,6 +54,7 @@
 //! test-pattern counters on the canvas.
 //! [`platform::H264Decoder`] decodes in Rust for tests and headless runs.
 
+pub mod call;
 pub mod pattern;
 pub mod rate;
 pub mod receiver;
@@ -74,5 +76,6 @@ pub mod platform {
 }
 
 pub use source::{Picture, TestPattern, VideoSource, default_source};
-pub use track::{CameraState, TrackOptions, VideoInfo, VideoTrack};
+pub use call::VideoCall;
+pub use track::{CameraState, PeerVideo, TrackOptions, VideoInfo, VideoTrack};
 pub use wire::{EncodedFrame, UiFrame, UiSource};

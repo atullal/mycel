@@ -1,14 +1,12 @@
 //! What video looks like on the wire, and what the webview gets.
 //!
-//! Video shares the call's QUIC connection with audio but never its
-//! datagrams: every encoded frame goes on its own **bidirectional stream**
-//! (the call's audio uses datagrams, a unidirectional fallback stream and one
-//! control stream, so bidirectional streams opened after the call starts are
-//! video's alone). Each stream starts with a magic and a kind:
+//! Video shares the call's QUIC connections with audio but never its
+//! datagrams: every encoded frame goes on its own **unidirectional stream**
+//! whose first byte is its track kind, as the call engine expects of every
+//! track other than audio (it hands those streams to its `TrackSink`):
 //!
 //! ```text
-//! 0..4   b"MYV0"
-//! 4      kind: 1 = frame, 2 = control
+//! 0      kind: 0x10 = a video frame, 0x11 = the video control stream
 //! ```
 //!
 //! A frame stream then carries one frame and ends:
@@ -23,18 +21,17 @@
 //! ..     the frame: H.264 NAL units, each prefixed with its u32 BE length
 //! ```
 //!
-//! The control stream (one per direction, opened first) carries
-//! [`VideoCtrl`] messages, each a u16 LE length and postcard bytes.
+//! The control stream (one per direction) carries [`VideoCtrl`] messages,
+//! each a u16 LE length and postcard bytes.
 
 use anyhow::{Result, bail, ensure};
 use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
-pub const MAGIC: [u8; 4] = *b"MYV0";
-pub const KIND_FRAME: u8 = 1;
-pub const KIND_CTRL: u8 = 2;
-/// Magic + kind.
-pub const STREAM_HEADER_LEN: usize = 5;
+/// Track kinds (the first byte of a stream); audio is 0x01.
+pub const KIND_FRAME: u8 = 0x10;
+pub const KIND_CTRL: u8 = 0x11;
+pub const STREAM_HEADER_LEN: usize = 1;
 pub const FRAME_HEADER_LEN: usize = 19;
 /// No single frame may be larger (a 720p keyframe is ~50–150 KB).
 pub const MAX_FRAME: usize = 4 * 1024 * 1024;
@@ -61,7 +58,6 @@ impl EncodedFrame {
     pub fn encode(&self) -> Bytes {
         let cfg = self.config.as_deref().unwrap_or(&[]);
         let mut b = BytesMut::with_capacity(STREAM_HEADER_LEN + FRAME_HEADER_LEN + cfg.len() + self.data.len());
-        b.put_slice(&MAGIC);
         b.put_u8(KIND_FRAME);
         b.put_u32_le(self.seq);
         b.put_u64_le(self.capture_us);
@@ -92,17 +88,13 @@ impl EncodedFrame {
     }
 }
 
-/// What kind of video stream this is, from its first [`STREAM_HEADER_LEN`] bytes.
-pub fn stream_kind(head: &[u8]) -> Result<u8> {
-    ensure!(head.len() >= STREAM_HEADER_LEN && head[..4] == MAGIC, "not a video stream");
-    match head[4] {
-        k @ (KIND_FRAME | KIND_CTRL) => Ok(k),
-        k => bail!("unknown video stream kind {k}"),
-    }
+/// A stream of this track kind is video's.
+pub fn is_video_kind(kind: u8) -> bool {
+    matches!(kind, KIND_FRAME | KIND_CTRL)
 }
 
 pub fn ctrl_stream_header() -> [u8; STREAM_HEADER_LEN] {
-    [MAGIC[0], MAGIC[1], MAGIC[2], MAGIC[3], KIND_CTRL]
+    [KIND_CTRL]
 }
 
 /// Video control messages (one control stream per direction).
@@ -114,6 +106,10 @@ pub enum VideoCtrl {
     /// What I'm sending: camera on or off, and paused because the path
     /// can't carry video.
     State { camera: bool, paused: bool },
+    /// I gave up on frame `seq` (its stream was reset). Said here too,
+    /// because a reset can overtake a stream's first bytes, and then the
+    /// receiver can't tell which frame it was.
+    Dropped { seq: u32 },
 }
 
 impl VideoCtrl {
@@ -306,7 +302,7 @@ mod tests {
         for key in [true, false] {
             let f = frame(9, key);
             let wire = f.encode();
-            assert_eq!(stream_kind(&wire).unwrap(), KIND_FRAME);
+            assert_eq!(wire[0], KIND_FRAME);
             let back = EncodedFrame::decode(wire.slice(STREAM_HEADER_LEN..)).unwrap();
             assert_eq!(back, f);
         }
@@ -314,9 +310,7 @@ mod tests {
 
     #[test]
     fn rejects_garbage() {
-        assert!(stream_kind(b"MYV0").is_err());
-        assert!(stream_kind(b"XXXX\x01").is_err());
-        assert!(stream_kind(b"MYV0\x09").is_err());
+        assert!(is_video_kind(KIND_CTRL) && !is_video_kind(0x01), "audio is not video");
         assert!(EncodedFrame::decode(Bytes::from_static(&[0; 10])).is_err());
         let mut w = frame(1, true).encode().slice(STREAM_HEADER_LEN..).to_vec();
         w[17] = 0xff;
