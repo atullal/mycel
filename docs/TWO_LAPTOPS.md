@@ -176,6 +176,41 @@ For a log of which path each call uses, run Mycel from Terminal with
 `MYCEL_CALL_DEBUG=1 /Applications/Mycel.app/Contents/MacOS/mycel-host`
 (it prints every path with its RTT and packet counts once a second).
 
+## 5c. Mesh: reaching someone out of range, through another Mac (needs 3 Macs)
+
+With **two** Macs the mesh can't be shown: two devices in range of each
+other always use their direct path (it always wins), and out of range there's
+nobody in between. You need a third Mac in the middle. It doesn't have to be
+in your conversations: anyone running Mycel relays by default, and can't read
+what it relays.
+
+1. Install Mycel on all three: **A** (you), **B** (the middle), **C** (the
+   other person). A and C add each other as contacts and start a chat. B
+   doesn't need to know either of them.
+2. Turn **Wi-Fi off** on A and C (Bluetooth only), and keep B with Bluetooth on.
+3. Put A and C far enough apart that they can't see each other over
+   Bluetooth (another room, roughly 15–30 m with walls), with B between them in
+   range of both. On A, the Network panel's *Paths* should show **Mesh:
+   1 device out of range**, and *Talking to* shows C as
+   **via Mesh (via B, 2 hops)**.
+4. Send messages and a small photo; make a call. It goes A → B → C over
+   Bluetooth, so it's slow (a call drops to its lowest bitrate). With Wi-Fi on
+   (no network needed), the hops use peer-to-peer Wi-Fi instead and are much
+   faster; peer-to-peer Wi-Fi's range is larger, so it takes more distance to
+   need the mesh at all.
+5. Walk C back into A's range: *Talking to* switches to the direct path
+   within a few seconds.
+
+Easier to set up: put A and C on **different** networks with the internet
+off, and B on both (e.g. B on Ethernet with A and on Wi-Fi with C). The mesh
+hops over whatever links each pair has, including the same network.
+
+With a fourth Mac D, also in range of A and C, the conversation uses both B
+and D at once (two routes) and keeps going when either walks away.
+
+`MYCEL_MESH_RELAY=0` makes a Mac use the mesh without relaying for others;
+`MYCEL_MESH=0` turns it off.
+
 ## 6. Offline delivery
 
 1. Quit Mycel on laptop B (**Mycel > Quit Mycel**, or ⌘Q).
@@ -256,6 +291,8 @@ MYCEL_DATA_DIR=/tmp/mycel-b MYCEL_NAME="Laptop B" MYCEL_NET=lan "$APP" &
 - `MYCEL_LINKS`: `all` (default), `none`, or a list of `awdl,ble`.
 - `MYCEL_IP=0`: turn off ordinary Wi-Fi/Ethernet IP, leaving only peer-to-peer
   Wi-Fi and Bluetooth (to prove those paths work on their own).
+- `MYCEL_MESH=0`: no multi-hop mesh (§5c). `MYCEL_MESH_RELAY=0`: use the mesh,
+  but don't relay for others.
 
 ## Troubleshooting
 

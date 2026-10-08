@@ -12,6 +12,7 @@ export const PATH_LABEL: Record<PathKind, string> = {
   peerWifi: "Peer-to-peer Wi-Fi",
   bluetooth: "Bluetooth",
   relay: "Internet relay",
+  mesh: "Mesh",
 };
 
 /** How a path reads after "via". */
@@ -20,6 +21,7 @@ export const VIA_LABEL: Record<PathKind, string> = {
   peerWifi: "Peer-to-peer Wi-Fi",
   bluetooth: "Bluetooth",
   relay: "an internet relay",
+  mesh: "nearby devices (mesh)",
 };
 
 export function formatDuration(ms: number): string {

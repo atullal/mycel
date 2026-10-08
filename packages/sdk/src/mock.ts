@@ -895,16 +895,22 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       links: [
         { kind: "peerWifi", active: true, detail: null, peers: 1 },
         { kind: "bluetooth", active: true, detail: null, peers: 1 },
+        { kind: "mesh", active: true, detail: "2 nearby, relaying for others", peers: 1 },
       ],
       peers: [...people.values()]
         .filter((p) => p.contact && (p.online || p.nearby))
-        .map((p, i) => ({
-          id: p.id,
-          name: p.name,
-          online: true,
-          via: (p.nearby ? "network" : i % 2 ? "bluetooth" : "peerWifi") as PathKind,
-          available: (p.nearby ? ["network", "peerWifi", "bluetooth"] : ["bluetooth"]) as PathKind[],
-        })),
+        .map((p, i, all) => {
+          // the last one is out of range, reached through the first
+          const meshed = !p.nearby && all.length > 1 && i === all.length - 1;
+          return {
+            id: p.id,
+            name: p.name,
+            online: true,
+            via: (p.nearby ? "network" : meshed ? "mesh" : i % 2 ? "bluetooth" : "peerWifi") as PathKind,
+            available: (p.nearby ? ["network", "peerWifi", "bluetooth"] : meshed ? ["mesh"] : ["bluetooth"]) as PathKind[],
+            mesh: meshed ? { via: all[0].id, viaName: all[0].name, hops: 2 } : null,
+          };
+        }),
       onlinePeers: [...people.values()].filter((p) => p.contact && p.online).map((p) => p.id),
       nearbyPeers: [...people.values()].filter((p) => p.nearby).length,
       addresses: ["192.168.1.24:51820", "[fe80::1c2a:8ff:fe3d:91b2]:51820", "127.0.0.1:51820"],

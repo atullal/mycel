@@ -136,7 +136,7 @@ one-to-one: `start_call` works in direct conversations (groups: later).
 | `endReason` | `hungUp`, `remoteHungUp`, `declined`, `remoteDeclined`, `busy`, `unavailable` (their device can't be reached), `noAnswer` (45 s), `missed`, `replaced` (you both called at once; this half merged into the other: don't show it), `connectionLost`, `micDenied`, `failed` |
 | `error` | human-readable cause where it helps (`failed`, `unavailable`) |
 | `startedAt`, `connectedAt`, `durationMs` | ms since epoch / talking time |
-| `path` | the path carrying the call now: `network`, `peerWifi`, `bluetooth`, `relay` |
+| `path` | the path carrying the call now: `network`, `peerWifi`, `bluetooth`, `relay`, `mesh` (through other nearby devices) |
 | `bitrate` | our Opus bitrate (bits/s): 32k on fast paths, 24k via relay, 12k on Bluetooth, lower under loss |
 | `muted`, `remoteMuted` | |
 | `level`, `remoteLevel` | 0..1 meters (yours is 0 while muted) |

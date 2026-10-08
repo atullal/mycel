@@ -28,6 +28,7 @@
 mod blobs;
 mod pool;
 pub mod link;
+pub mod mesh;
 pub mod wire;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -57,6 +58,7 @@ use tokio::sync::{Notify, Semaphore, broadcast, mpsc};
 pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_free_space, free_space, human_size};
 pub use iroh;
 pub use link::{Link, LinkEvent, LinkStatus, PathKind};
+pub use mesh::{Mesh, MeshOptions, MeshRoute, MeshStats, Tap};
 pub use wire::ContactCard;
 use wire::*;
 
@@ -116,6 +118,8 @@ pub struct NodeOptions {
     /// More protocols on the same endpoint (e.g. live calls). Each gets the
     /// node's multipath connections, path selection and links for free.
     pub extra_protocols: Vec<ExtraProtocol>,
+    /// Multi-hop relaying through nearby devices (`mesh.rs`); `None` = off.
+    pub mesh: Option<MeshOptions>,
 }
 
 /// Another protocol served on the node's endpoint: incoming connections with
@@ -141,6 +145,7 @@ impl NodeOptions {
             links: Vec::new(),
             ip: true,
             extra_protocols: Vec::new(),
+            mesh: None,
         }
     }
 }
@@ -175,6 +180,8 @@ pub struct PeerState {
     pub links: BTreeSet<PathKind>,
     /// The path the last successful exchange actually used.
     pub via: Option<PathKind>,
+    /// When `via` is the mesh: which neighbour it leaves through, how many hops.
+    pub mesh: Option<MeshRoute>,
 }
 
 impl PeerState {
@@ -212,6 +219,7 @@ struct Inner {
     link_lookup: MemoryLookup,
     link_addrs: Mutex<HashMap<SignPk, HashSet<link::CustomAddr>>>,
     links: Vec<Arc<dyn Link>>,
+    mesh: Option<Mesh>,
     endpoint: Endpoint,
     /// Spaces needing a push to all members; `None` key = everything (periodic).
     dirty: Mutex<HashSet<SpaceId>>,
@@ -268,14 +276,20 @@ impl Inner {
 
     /// Remember which path a finished exchange used (for the Network panel).
     fn note_path(&self, pk: SignPk, conn: &Connection) {
-        let via = conn.paths().iter().find(|p| p.is_selected()).map(|p| PathKind::of(p.remote_addr()));
-        if via.is_none() {
+        let Some(addr) = conn.paths().iter().find(|p| p.is_selected()).map(|p| p.remote_addr().clone()) else {
             return;
-        }
+        };
+        let via = Some(PathKind::of(&addr));
+        let route = match (&addr, &self.mesh) {
+            (iroh::TransportAddr::Custom(c), Some(m)) if via == Some(PathKind::Mesh) => m.route_info(c),
+            _ => None,
+        };
         let changed = {
             let mut peers = self.peers.lock();
             let p = peers.entry(pk).or_default();
-            std::mem::replace(&mut p.via, via) != via
+            let changed = p.via != via || p.mesh != route;
+            (p.via, p.mesh) = (via, route);
+            changed
         };
         if changed {
             self.emit(NetEvent::PeersChanged);
@@ -316,6 +330,9 @@ impl Inner {
             }
         };
         self.publish_link_addrs(peer);
+        if kind != PathKind::Mesh {
+            self.update_direct(peer);
+        }
         self.emit(NetEvent::PeersChanged);
         if newly {
             let shared: Vec<SpaceId> = self
@@ -329,6 +346,18 @@ impl Inner {
                 tokio::spawn(sync_once(self.clone(), peer, s));
             }
         }
+    }
+
+    /// Tell the mesh whether `peer` has a direct path (a link or the LAN):
+    /// neighbours relay for us, and get no mesh addresses themselves.
+    fn update_direct(&self, peer: SignPk) {
+        let Some(mesh) = &self.mesh else { return };
+        let direct = self
+            .peers
+            .lock()
+            .get(&peer)
+            .is_some_and(|p| p.nearby || p.links.iter().any(|k| *k != PathKind::Mesh));
+        mesh.set_direct(peer, direct);
     }
 
     fn publish_link_addrs(&self, peer: SignPk) {
@@ -822,6 +851,7 @@ async fn watch_mdns(inner: Arc<Inner>, mdns: MdnsAddressLookup) {
                     p.failures = 0;
                     newly
                 };
+                inner.update_direct(pk);
                 if newly {
                     inner.emit(NetEvent::PeersChanged);
                     let shared: Vec<SpaceId> = inner
@@ -841,6 +871,7 @@ async fn watch_mdns(inner: Arc<Inner>, mdns: MdnsAddressLookup) {
                 if let Some(p) = inner.peers.lock().get_mut(&pk) {
                     p.nearby = false;
                 }
+                inner.update_direct(pk);
                 inner.emit(NetEvent::PeersChanged);
             }
             _ => {}
@@ -872,6 +903,12 @@ impl Node {
         let memory = MemoryLookup::new();
         let mut alpns: Vec<Vec<u8>> = vec![ALPN.to_vec()];
         alpns.extend(opts.extra_protocols.iter().map(|p| p.alpn.clone()));
+        let mesh = opts.mesh.clone().map(|o| Mesh::new(keys.clone(), &opts.name, o));
+        let mut links = opts.links;
+        if let Some(m) = &mesh {
+            alpns.push(mesh::ALPN.to_vec());
+            links.push(Arc::new(m.clone()));
+        }
         let builder = match opts.mode {
             NetMode::Local => Endpoint::builder(presets::Minimal)
                 .relay_mode(iroh::RelayMode::Disabled)
@@ -892,10 +929,13 @@ impl Node {
         if !opts.ip {
             builder = builder.clear_ip_transports();
         }
-        for l in &opts.links {
+        for l in &links {
             builder = builder.add_custom_transport(l.transport());
         }
         let endpoint = builder.bind().await?;
+        if let Some(m) = &mesh {
+            m.attach(endpoint.clone());
+        }
         endpoint.address_lookup()?.add(memory.clone());
         let link_lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(link_lookup.clone());
@@ -925,7 +965,8 @@ impl Node {
             memory,
             link_lookup,
             link_addrs: Mutex::default(),
-            links: opts.links,
+            links,
+            mesh: mesh.clone(),
             endpoint: endpoint.clone(),
             dirty: Mutex::default(),
             wake: Notify::new(),
@@ -938,6 +979,9 @@ impl Node {
         let mut router = Router::builder(endpoint).accept(ALPN, Handler { inner: inner.clone() });
         for p in opts.extra_protocols {
             router = router.accept(p.alpn, Forward(p.incoming));
+        }
+        if let Some(m) = &mesh {
+            router = router.accept(mesh::ALPN, m.protocol());
         }
         let router = router.spawn();
         let mut tasks = vec![tokio::spawn(scheduler(inner.clone()))];
@@ -1018,6 +1062,11 @@ impl Node {
     /// Tell the node how to reach a peer directly (tests / manual pairing).
     pub fn add_peer_addr(&self, addr: EndpointAddr) {
         self.inner.memory.add_endpoint_info(addr);
+    }
+
+    /// The mesh router, if this node relays.
+    pub fn mesh(&self) -> Option<&Mesh> {
+        self.inner.mesh.as_ref()
     }
 
     /// Health of each link (peer-to-peer Wi-Fi, Bluetooth).

@@ -159,6 +159,41 @@ aad_i    = "mycel/v0/stream-chunk" ‖ len(A): u32 LE ‖ A ‖ chunk_size: u32 
 - **Responders serve a space only to its current members**, including Relays. Requests from non-members are refused.
 - **Sync order:** membership ops first, then envelopes (set difference over IDs in v0; range-based reconciliation later).
 - **Everything received is validated by the receiver.** Nothing is trusted because of who sent it.
+- **ALPN** `mycel/mesh/0`: hop connections between nearby devices for multi-hop relaying (ARCHITECTURE.md §12). Accepted from anyone nearby: relaying needs no membership. What crosses a relay is the QUIC traffic of a connection between two *other* devices, so the rules above still apply end to end. See §8b.
+
+## 8b. Mesh relays: what they can and can't do
+
+A relay forwards QUIC packets of a connection between two other devices.
+
+**A relay cannot:**
+- read them: they're encrypted end to end (QUIC/TLS 1.3, keyed to the two devices);
+- change or inject packets: AEAD, so altered packets are dropped by the receiver's QUIC;
+- impersonate either end: the connection authenticates the remote device key;
+- forge routes *to someone else*: each announcement is signed by its origin's device key. One with a bad signature, or one more than 10 minutes from the receiver's clock, is rejected;
+- make a device join anything: relaying needs no membership, and a relay is given none.
+
+**A relay learns (metadata):**
+- *Who talks to whom.* Each mesh frame's header carries the source and destination device keys and the waypoint, in clear to each relay. Hops are themselves QUIC connections, so headers are hidden from radio eavesdroppers who aren't Mycel devices on the path.
+- *When, how often and how much.* Packet sizes and timing, which reveal activity patterns (a call is a steady 50 packets/s, a file is a burst).
+- *Who is around.* Every device within 8 hops receives every announcement: the device key and the display name (the same name already shown over Bluetooth, peer-to-peer Wi-Fi and the LAN).
+
+**A malicious relay can:**
+- *Drop or delay traffic* (denial of service). Mitigations:
+  - up to 3 routes per destination, through distinct neighbours, as separate QUIC paths, so traffic moves to the others when one goes dark (dead paths are noticed in about 3 s);
+  - direct paths are always preferred.
+- *Claim a low cost to attract traffic* (black hole): costs aren't signed (each hop adds its own). The same mitigations apply. Route attestations (per-hop signatures) would be a later hardening.
+- *Replay old announcements of a device that left*, within the 10-minute window, keeping a dead route alive. That costs only failed attempts.
+
+**Load and abuse:**
+- relaying for others is capped per neighbour (1 MiB/s) and in total (4 MiB/s);
+- announcements are capped at 100/s per neighbour;
+- frames have a TTL and are never sent back where they came from;
+- reassembly buffers are bounded;
+- `MYCEL_MESH_RELAY=0` relays nothing; `MYCEL_MESH=0` turns the mesh off.
+
+**Limits (known):**
+- No onion routing or padding: relays see endpoints, sizes and timing. Hiding who-talks-to-whom would need onion-style layered encryption and cover traffic, at a large bandwidth cost on Bluetooth.
+- Sybil devices nearby can each be a neighbour (each is rate-limited separately); the radio's range is the practical bound.
 
 ## 9. Implementation status (phase 0, 2026-10-07)
 
@@ -202,5 +237,5 @@ An independent adversarial review found these issues. All are fixed, each with a
 - Multi-device agents and device revocation (phase 1).
 - Rotation cost is O(n) lockboxes per rotation. Fine for groups up to a few hundred; switch to TreeKEM/BeeKEM-style rotation later.
 - Honest edits built on top of a removed member's concurrent edits are dropped on rebuild (Automerge needs dependencies). This needs a "re-author" recovery flow.
-- Keepers see metadata.
+- Keepers see metadata. So do mesh relays (who talks to whom, sizes, timing; §8b).
 - Needs a professional cryptographic review before production.

@@ -13,7 +13,7 @@ use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallInfo, CallManage
 use mycel_crypto::{DeviceKeys, Hash32, SignPk};
 use mycel_net::iroh::endpoint::Connection;
 use mycel_net::link::{Link, MemNet, PathKind};
-use mycel_net::{ExtraProtocol, NetMode, Node, NodeOptions};
+use mycel_net::{ExtraProtocol, MeshOptions, NetMode, Node, NodeOptions};
 use mycel_trust::Role;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -110,9 +110,14 @@ impl Device {
 }
 
 async fn device(name: &str, source: TestSource, ip: bool, nets: &[&MemNet]) -> Device {
+    device_with(name, source, ip, nets, None).await
+}
+
+async fn device_with(name: &str, source: TestSource, ip: bool, nets: &[&MemNet], mesh: Option<MeshOptions>) -> Device {
     let keys = Arc::new(DeviceKeys::generate());
     let mut opts = NodeOptions::new(NetMode::Local, name);
     opts.ip = ip;
+    opts.mesh = mesh;
     opts.links = nets.iter().map(|n| n.link(keys.sign_pk()) as Arc<dyn Link>).collect();
     let (tx, rx) = mpsc::unbounded_channel();
     opts.extra_protocols.push(ExtraProtocol { alpn: ALPN_CALL.to_vec(), incoming: tx });
@@ -424,5 +429,42 @@ async fn audio_falls_back_to_a_stream() {
     assert_eq!(a.stats.transport, "stream");
     assert!((bob.heard(1.0).unwrap() - 440.0).abs() < 8.0);
     assert!((alice.heard(1.0).unwrap() - 660.0).abs() < 8.0);
+    alice.calls.end(&id).unwrap();
+}
+
+/// No direct link at all: Alice and Carol are each in range of Bob only.
+/// Their call runs through Bob, who isn't in the conversation and only
+/// forwards ciphertext.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_through_a_mesh_relay() {
+    let ab = MemNet::new(5, PathKind::PeerWifi);
+    let bc = MemNet::new(6, PathKind::PeerWifi);
+    let mesh = || Some(MeshOptions { announce_every: Duration::from_millis(500), ..MeshOptions::default() });
+    let alice = device_with("alice", sine(440.0), false, &[&ab], mesh()).await;
+    let bob = device_with("bob", sine(550.0), false, &[&ab, &bc], mesh()).await;
+    let carol = device_with("carol", sine(660.0), false, &[&bc], mesh()).await;
+    for (from, to) in [(&alice, &carol), (&carol, &alice)] {
+        let id = to.node.id();
+        eventually("a mesh route", 20, || {
+            from.node.peers().get(&id).is_some_and(|p| p.links.contains(&PathKind::Mesh)).then_some(())
+        })
+        .await;
+    }
+    let space = shared_space(&alice, &carol).await;
+    let id = connect_call(&alice, &carol, space).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (a, c) = (alice.call(&id).unwrap(), carol.call(&id).unwrap());
+    assert_eq!(a.path, Some(PathKind::Mesh));
+    assert_eq!(c.path, Some(PathKind::Mesh));
+    assert!((carol.heard(1.0).unwrap() - 440.0).abs() < 8.0, "carol hears alice");
+    assert!((alice.heard(1.0).unwrap() - 660.0).abs() < 8.0, "alice hears carol");
+    eprintln!(
+        "through one relay: rtt {} ms, latency ≈{} ms, loss {:.1}%, bitrate {} bps",
+        c.stats.rtt_ms, c.stats.latency_ms, a.stats.loss_pct, a.bitrate
+    );
+    let relayed = bob.node.mesh().unwrap().stats();
+    assert!(relayed.frames_relayed > 100, "{relayed:?}");
+    assert!(bob.node.space_ids().is_empty(), "the relay isn't in the conversation");
+    assert!(bob.calls.status().is_empty(), "nor in the call");
     alice.calls.end(&id).unwrap();
 }

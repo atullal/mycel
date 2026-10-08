@@ -36,6 +36,8 @@ pub use noq_udp;
 /// Custom transport ids (Iroh `CustomAddr::id`). "myc" + a link number.
 pub const TRANSPORT_PEER_WIFI: u64 = 0x6d79_6301;
 pub const TRANSPORT_BLUETOOTH: u64 = 0x6d79_6302;
+/// Multi-hop mesh (`mesh.rs`): QUIC packets relayed by other devices.
+pub const TRANSPORT_MESH: u64 = 0x6d79_6303;
 /// In-memory links for tests ([`MemNet`]) pick their own ids.
 pub const TRANSPORT_TEST_BASE: u64 = 0x6d79_63f0;
 
@@ -51,12 +53,16 @@ pub enum PathKind {
     Bluetooth,
     /// Through an internet relay server (end-to-end encrypted).
     Relay,
+    /// Relayed hop by hop by other nearby devices, over whatever links they
+    /// have (end-to-end encrypted; see `mesh.rs`).
+    Mesh,
 }
 
 impl PathKind {
     pub fn of_custom(id: u64) -> PathKind {
         match id {
             TRANSPORT_BLUETOOTH => PathKind::Bluetooth,
+            TRANSPORT_MESH => PathKind::Mesh,
             // test links pretend to be peer Wi-Fi unless they use the BT id
             _ => PathKind::PeerWifi,
         }
@@ -80,11 +86,15 @@ impl PathKind {
 
     /// Lower is preferred. Fast local paths compete on RTT; the relay needs
     /// the internet and a third party; Bluetooth is the slowest, so it only
-    /// carries traffic when nothing else works.
+    /// carries traffic when nothing else works. The mesh shares the relay's
+    /// tier: both are someone else forwarding ciphertext, so measured RTT
+    /// decides between them (and comparable ones aggregate). A mesh path
+    /// never competes with a direct one: it only exists to devices with no
+    /// direct link (`mesh.rs`).
     fn tier(self) -> u8 {
         match self {
             PathKind::Network | PathKind::PeerWifi => 0,
-            PathKind::Relay => 1,
+            PathKind::Relay | PathKind::Mesh => 1,
             PathKind::Bluetooth => 2,
         }
     }
@@ -95,6 +105,7 @@ impl PathKind {
             PathKind::PeerWifi => "Peer-to-peer Wi-Fi",
             PathKind::Bluetooth => "Bluetooth",
             PathKind::Relay => "Internet relay",
+            PathKind::Mesh => "Mesh",
         }
     }
 }

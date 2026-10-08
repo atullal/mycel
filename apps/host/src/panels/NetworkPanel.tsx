@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useContacts, useMycel, useNearby, useNetwork, useProfile } from "@mycel/sdk/react";
-import type { LinkStatus, NetworkMode, NetworkStatus, PathKind } from "@mycel/sdk";
+import type { LinkStatus, NetworkMode, NetworkStatus, PathKind, PeerPaths } from "@mycel/sdk";
 import { initials, toneFor } from "./common.tsx";
 
 const MODE: Record<NetworkMode, { name: string; text: string }> = {
@@ -23,7 +23,18 @@ const PATH: Record<PathKind, { name: string; text: string }> = {
   peerWifi: { name: "Peer-to-peer Wi-Fi", text: "Device to device, like AirDrop. Needs Wi-Fi on, but no network." },
   bluetooth: { name: "Bluetooth", text: "Slow but works with Wi-Fi off. Fine for messages, slow for big files." },
   relay: { name: "Internet relay", text: "Through an encrypted relay when you're on different networks." },
+  mesh: {
+    name: "Mesh",
+    text: "Through other nearby Mycel devices, hop by hop, when someone is out of range. They can't read it.",
+  },
 };
+
+/** "via Peer-to-peer Wi-Fi", or "via Mesh (via Bob, 2 hops)". */
+function viaText(p: PeerPaths): string {
+  if (!p.via) return p.online ? "reachable" : "offline";
+  if (p.via === "mesh" && p.mesh) return `via Mesh (via ${p.mesh.viaName}, ${p.mesh.hops} hops)`;
+  return `via ${PATH[p.via].name}`;
+}
 
 /** One row per path: is it working, and how many devices it reaches. */
 function pathRows(status: NetworkStatus): { kind: PathKind; on: boolean; text: string }[] {
@@ -50,6 +61,12 @@ function pathRows(status: NetworkStatus): { kind: PathKind; on: boolean; text: s
       ? { kind: "relay", on: true, text: "On when the internet is available" }
       : { kind: "relay", on: false, text: "Off (local only)" },
   );
+  const mesh = link("mesh");
+  if (mesh) {
+    // "1 device" reached through others; else what the mesh is doing
+    const text = mesh.peers > 0 ? `${devices(mesh.peers)} out of range` : (mesh.detail ?? "On");
+    rows.push({ kind: "mesh", on: mesh.active, text });
+  }
   return rows;
 }
 
@@ -229,7 +246,7 @@ export function NetworkPanel() {
                 <span className="p-path-dot" aria-hidden="true" />
                 <span className="p-path-name">{p.name}</span>
                 <span className="p-path-state">
-                  {p.via ? `via ${PATH[p.via].name}` : p.online ? "reachable" : "offline"}
+                  {viaText(p)}
                   {p.available.length > 1 && ` · ${p.available.length} paths`}
                 </span>
               </li>

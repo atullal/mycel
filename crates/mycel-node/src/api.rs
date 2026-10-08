@@ -176,6 +176,19 @@ pub struct PeerPaths {
     pub via: Option<PathKind>,
     /// Paths currently available without the internet.
     pub available: Vec<PathKind>,
+    /// When `via` is the mesh: the nearby device it goes through, and hops.
+    pub mesh: Option<MeshVia>,
+}
+
+/// A mesh route: "Mesh (via Bob, 2 hops)".
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeshVia {
+    /// The neighbour it leaves through (never needs to be a contact).
+    pub via: PeerId,
+    pub via_name: String,
+    /// Hops to the peer (2 = one device in between).
+    pub hops: u8,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
