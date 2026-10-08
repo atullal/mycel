@@ -17,6 +17,7 @@ mod runtime;
 pub mod store;
 
 pub use mycel_call as call;
+pub use mycel_video as video;
 pub use mycel_crypto as crypto;
 pub use mycel_kit_chat as chat;
 pub use mycel_net as net;

@@ -20,6 +20,8 @@
 //! - [`audio`]: the [`audio::AudioIo`] trait and its backends (Apple voice
 //!   processing with echo cancellation, plain devices via cpal, test audio)
 //! - [`CallManager`]: places, answers and runs calls
+//! - video (`mycel_video`): the built-in [`engine::TrackSink`], a video
+//!   track on every person's connection
 
 pub mod api;
 pub mod audio;
@@ -35,6 +37,7 @@ mod manager;
 pub mod proto;
 pub mod resample;
 pub mod state;
+mod video;
 
 pub use api::{CallInfo, CallPhase, CallStats, Direction, EndReason, Participant, ParticipantState};
 pub use engine::TrackSink;

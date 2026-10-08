@@ -16,6 +16,7 @@ export function ChatView({
   inCall = false,
   callsBusy = false,
   onCall,
+  onVideoCall,
   call = null,
   meName = "You",
 }: {
@@ -31,6 +32,8 @@ export function ChatView({
   callsBusy?: boolean;
   /** Start a voice call: the other person, or the whole group. */
   onCall?: () => void;
+  /** Start (or join) a call with our camera on. */
+  onVideoCall?: () => void;
   /** This conversation's call: one you're in, or a group call you may join. */
   call?: CallInfo | null;
   /** Your name, for your own tile in a group call. */
@@ -184,6 +187,17 @@ export function ChatView({
             aria-label={summary.direct ? `Voice call ${summary.title}` : `Call everyone in ${summary.title}`}
           >
             <Icon.Phone />
+          </button>
+        )}
+        {onVideoCall && summary.active && !summary.request && others.length > 0 && (
+          <button
+            className={`mx-icon-btn mx-call-btn${inCall ? " is-on" : ""}`}
+            onClick={onVideoCall}
+            disabled={callsBusy && !joinable}
+            title={inCall ? "In a call" : joinable ? "Join the group call with video" : callsBusy ? "You're already in a call" : "Video call"}
+            aria-label={summary.direct ? `Video call ${summary.title}` : `Video call everyone in ${summary.title}`}
+          >
+            <Icon.Video />
           </button>
         )}
         <span className="mx-e2e" title="End-to-end encrypted. Only the people in this conversation can read it.">

@@ -157,6 +157,18 @@ export const Icon = {
       <path d="M4.5 9.5a5.5 5.5 0 0 0 11 0M10 15v2.5" />
     </Svg>
   ),
+  /** A video camera: video call / camera on. */
+  Video: (p: IconProps) => (
+    <Svg {...p}>
+      <rect x="2.5" y="5" width="10.5" height="10" rx="2" />
+      <path d="M13 8.6l4.5-2.6v8l-4.5-2.6z" />
+    </Svg>
+  ),
+  VideoOff: (p: IconProps) => (
+    <Svg {...p}>
+      <path d="M13 11.5V7a2 2 0 0 0-2-2H8.5M4.4 5.2A2 2 0 0 0 2.5 7v6a2 2 0 0 0 2 2H11a2 2 0 0 0 1.7-.9M13 8.6l4.5-2.6v8l-2-1.2M3 3l14 14" />
+    </Svg>
+  ),
   MicOff: (p: IconProps) => (
     <Svg {...p}>
       <path d="M12.5 8.2V5a2.5 2.5 0 0 0-4.8-1M7.5 7.5V9a2.5 2.5 0 0 0 4 2" />

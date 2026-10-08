@@ -28,6 +28,8 @@ use crate::api::{CallInfo, CallPhase, CallStats, Direction, EndReason, Participa
 use crate::audio::{AudioIo, default_audio};
 use crate::bitrate::{BitrateController, Observation};
 use crate::engine::{LegMedia, Media, TrackSink, tier};
+use crate::video::VideoHub;
+use mycel_video::{UiFrame, VideoSource};
 use crate::proto::{self, CallId, CallRef, Ctrl, MAX_PARTICIPANTS, VERSION};
 use crate::state::{CALLEE_RING_SLACK, LiveCall, RING_TIMEOUT, RingDecision, SETUP_TIMEOUT, on_ring};
 
@@ -275,6 +277,8 @@ struct Mgr {
     host: Arc<dyn CallHost>,
     audio: RwLock<Arc<dyn AudioIo>>,
     sink: RwLock<Option<Arc<dyn TrackSink>>>,
+    /// Video in calls (the default track sink).
+    video: Arc<VideoHub>,
     calls: Mutex<HashMap<CallId, Arc<Call>>>,
     /// Our call in (initiator, space) lost a glare: answer theirs at once.
     expecting: Mutex<HashMap<(SignPk, Hash32), Instant>>,
@@ -302,11 +306,13 @@ pub struct CallManager {
 
 impl CallManager {
     pub fn new(host: Arc<dyn CallHost>) -> CallManager {
+        let video = Arc::new(VideoHub::new(host.me()));
         CallManager {
             inner: Arc::new(Mgr {
                 host,
                 audio: RwLock::new(default_audio()),
-                sink: RwLock::new(None),
+                sink: RwLock::new(Some(video.clone() as Arc<dyn TrackSink>)),
+                video,
                 calls: Mutex::default(),
                 expecting: Mutex::default(),
                 ring_timeout: Mutex::new(RING_TIMEOUT),
@@ -326,7 +332,43 @@ impl CallManager {
         self.inner.audio.read().clone()
     }
 
-    /// Where tracks other than audio (video) go; set before calls start.
+    /// Swap the video source (tests, headless runs).
+    pub fn set_video_source(&self, source: Arc<dyn VideoSource>) {
+        self.inner.video.set_source(source);
+    }
+
+    /// Encoded video frames to show: every call's remote video (one stream
+    /// per person) and our self-view (see `mycel_video::UiFrame`).
+    pub fn video_frames(&self) -> tokio::sync::broadcast::Receiver<UiFrame> {
+        self.inner.video.frames()
+    }
+
+    /// Turn our camera on or off in a call (before it's answered too). The
+    /// first time, this may wait for the user to answer the system's
+    /// camera prompt. If the camera can't start the call goes on without
+    /// it: `video.camera` and `video.error` say why.
+    pub async fn set_camera(&self, id: &str, on: bool) -> Result<CallInfo> {
+        let call = self.find(id)?;
+        if call.core.lock().phase == CallPhase::Ended {
+            bail!("This call already ended.");
+        }
+        let (hub, cid) = (self.inner.video.clone(), call.id());
+        let r = tokio::task::spawn_blocking(move || hub.set_camera(&cid, on)).await.context("camera failed to start")?;
+        let i = info(&self.inner, &call);
+        self.inner.host.emit(CallEvent::Updated(i.clone()));
+        r.map(|()| i)
+    }
+
+    /// The app's video decoders lost their place (or just started): get
+    /// fresh keyframes from everyone, and for the self-view.
+    pub fn video_keyframe(&self, id: &str) -> Result<()> {
+        let call = self.find(id)?;
+        self.inner.video.keyframes(&call.id());
+        Ok(())
+    }
+
+    /// Where tracks other than audio (video) go; set before calls start
+    /// (replaces the built-in video).
     pub fn set_track_sink(&self, sink: Arc<dyn TrackSink>) {
         *self.inner.sink.write() = Some(sink);
     }
@@ -1455,8 +1497,15 @@ async fn finish(mgr: &Arc<Mgr>, call: &Arc<Call>) {
         }
         (core.media.take(), conns)
     };
-    if let Some(m) = media {
-        let _ = tokio::task::spawn_blocking(move || drop(m)).await;
+    let video = mgr.video.end(&call.id());
+    if media.is_some() || video.is_some() {
+        let _ = tokio::task::spawn_blocking(move || {
+            drop(media);
+            if let Some(stop) = video {
+                stop();
+            }
+        })
+        .await;
     }
     mgr.host.emit(CallEvent::Updated(info(mgr, call)));
     for conn in conns {
@@ -1573,6 +1622,7 @@ fn info(mgr: &Mgr, c: &Call) -> CallInfo {
             bitrate: r.bitrate,
             rtt_ms: r.rtt_ms,
             loss_pct: r.loss_pct,
+            video: mgr.video.peer(&c.id(), &r.id),
         })
         .collect();
     let rank = |s: ParticipantState| match s {
@@ -1642,5 +1692,6 @@ fn info(mgr: &Mgr, c: &Call) -> CallInfo {
         remote_level,
         echo_cancellation: audio.echo_cancellation(),
         stats,
+        video: mgr.video.info(&c.id(), phase != CallPhase::Ended),
     }
 }

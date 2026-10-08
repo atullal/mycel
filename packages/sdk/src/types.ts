@@ -262,6 +262,38 @@ export interface Participant {
   rttMs: number;
   /** Of what we send them, the share they reported missing (0..100). */
   lossPct: number;
+  /** Video with them, both ways (their camera; our video to them, at the quality their path allows). */
+  video: PeerVideo;
+}
+
+/** Video with one person in a call. */
+export interface PeerVideo {
+  /** Our video is going out to them. */
+  sending: boolean;
+  /** Our video to them is paused: the path to them is too slow. */
+  paused: boolean;
+  /** Their camera is on. */
+  remoteCamera: boolean;
+  /** Their video is paused on their side (slow connection). */
+  remotePaused: boolean;
+  /** Their frames are arriving right now. */
+  receiving: boolean;
+  sendWidth: number;
+  sendHeight: number;
+  sendFps: number;
+  bitrate: number;
+  sentBitrate: number;
+  queueMs: number;
+  recvWidth: number;
+  recvHeight: number;
+  recvFps: number;
+  latencyMs: number;
+  framesSent: number;
+  framesReceived: number;
+  framesSkipped: number;
+  keyframesSent: number;
+  keyframeRequests: number;
+  encoder: string;
 }
 
 /** Live numbers about a call (in-call bar, diagnostics). */
@@ -329,6 +361,55 @@ export interface CallInfo {
   /** Echo cancellation is on (otherwise suggest headphones). */
   echoCancellation: boolean;
   stats: CallStats;
+  /** Video both ways (camera off and nothing received in a voice call). */
+  video: VideoInfo;
+}
+
+/**
+ * Our camera in a call:
+ * - `off`, `starting`, `on`
+ * - `denied`: Mycel isn't allowed to use the camera (`error` says where to allow it)
+ * - `failed`: it couldn't start (`error` says why); the call goes on without video
+ */
+export type CameraState = "off" | "starting" | "on" | "denied" | "failed";
+
+/** Live video state and numbers for a call. */
+export interface VideoInfo {
+  camera: CameraState;
+  error: string | null;
+  /** Our video is going out. */
+  sending: boolean;
+  /** Our video is paused: the path is too slow (Bluetooth). Show "Video paused: slow connection". */
+  paused: boolean;
+  /** The other side has its camera on. */
+  remoteCamera: boolean;
+  /** The other side's video is paused (slow connection). */
+  remotePaused: boolean;
+  /** Their frames are arriving right now. */
+  receiving: boolean;
+  sendWidth: number;
+  sendHeight: number;
+  sendFps: number;
+  /** Target video bitrate (bits/s). */
+  bitrate: number;
+  /** What we actually sent over the last second (bits/s). */
+  sentBitrate: number;
+  /** How long our frames wait in queues beyond the base delay. */
+  queueMs: number;
+  recvWidth: number;
+  recvHeight: number;
+  recvFps: number;
+  /** Their capture to arrival here (clocks of two devices: approximate). */
+  latencyMs: number;
+  framesSent: number;
+  framesReceived: number;
+  framesSkipped: number;
+  keyframesSent: number;
+  keyframeRequests: number;
+  /** What captures our video ("FaceTime HD Camera", "Test pattern ..."). */
+  source: string;
+  /** Which encoder ("H.264 low-latency", "H.264 hardware", ...). */
+  encoder: string;
 }
 
 /**

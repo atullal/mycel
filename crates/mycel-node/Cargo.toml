@@ -9,6 +9,7 @@ chacha20poly1305 = "0.11.0"
 data-encoding = "2.11.1"
 hex = "0.4.3"
 mycel-call = { version = "0.0.1", path = "../mycel-call" }
+mycel-video = { version = "0.0.1", path = "../mycel-video" }
 mycel-crypto = { version = "0.1.0", path = "../mycel-crypto" }
 mycel-kit-chat = { version = "0.0.1", path = "../mycel-kit-chat" }
 mycel-link-awdl = { version = "0.1.0", path = "../mycel-link-awdl" }

@@ -241,13 +241,53 @@ fn percent_decode(s: &str) -> String {
 // ---------------------------------------------------------------- calls
 
 #[tauri::command]
-pub async fn start_call(rt: State<'_, Rt>, conversation: ConversationId) -> Res<CallInfo> {
-    rt.start_call(conversation).await.map_err(err)
+pub async fn start_call(rt: State<'_, Rt>, conversation: ConversationId, video: Option<bool>) -> Res<CallInfo> {
+    rt.start_call_with(conversation, video.unwrap_or(false)).await.map_err(err)
 }
 
 #[tauri::command]
-pub async fn accept_call(rt: State<'_, Rt>, call: String) -> Res<CallInfo> {
-    rt.accept_call(call).await.map_err(err)
+pub async fn accept_call(rt: State<'_, Rt>, call: String, video: Option<bool>) -> Res<CallInfo> {
+    rt.accept_call_with(call, video.unwrap_or(false)).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn set_camera(rt: State<'_, Rt>, call: String, on: bool) -> Res<CallInfo> {
+    rt.set_camera(call, on).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn video_keyframe(rt: State<'_, Rt>, call: String) -> Res<()> {
+    rt.video_keyframe(call).map_err(err)
+}
+
+/// Bumped by every `video_subscribe`: older subscriptions stop.
+static VIDEO_SUBSCRIPTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Stream encoded video frames (remote video and self-view) to the webview
+/// as raw bytes (layout: `mycel_video::UiFrame`); it decodes them with
+/// WebCodecs. One subscription at a time: a new one (a reload) replaces it.
+#[tauri::command]
+pub async fn video_subscribe(rt: State<'_, Rt>, channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Res<()> {
+    use std::sync::atomic::Ordering;
+    let me = VIDEO_SUBSCRIPTION.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut frames = rt.video_frames();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            let f = match frames.recv().await {
+                Ok(f) => f,
+                // the webview fell behind: skip ahead (it asks for a keyframe)
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return,
+            };
+            if VIDEO_SUBSCRIPTION.load(Ordering::SeqCst) != me {
+                return;
+            }
+            if channel.send(tauri::ipc::InvokeResponseBody::Raw(f.encode())).is_err() {
+                return;
+            }
+        }
+    });
+    Ok(())
 }
 
 #[tauri::command]

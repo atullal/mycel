@@ -58,8 +58,10 @@ export interface Commands {
   fetch_attachment: [{ blob: string }, string];
   accept_request: [{ id: ConversationId }, ConversationSummary];
   decline_request: [{ id: ConversationId; block?: boolean | null }, null];
-  start_call: [{ conversation: ConversationId }, CallInfo];
-  accept_call: [{ call: CallId }, CallInfo];
+  start_call: [{ conversation: ConversationId; video?: boolean }, CallInfo];
+  accept_call: [{ call: CallId; video?: boolean }, CallInfo];
+  set_camera: [{ call: CallId; on: boolean }, CallInfo];
+  video_keyframe: [{ call: CallId }, null];
   decline_call: [{ call: CallId }, null];
   end_call: [{ call: CallId }, null];
   set_muted: [{ call: CallId; muted: boolean }, CallInfo];
@@ -107,6 +109,12 @@ export interface Transport {
   listen(handler: (event: MycelEvent) => void): () => void;
   /** Native file access, if the transport provides it. */
   readonly files?: FileHost;
+  /**
+   * Encoded video frames (remote video and self-view), one ArrayBuffer per
+   * frame in the layout of `video.ts`. Absent if the backend has no video.
+   * Returns an unsubscribe function.
+   */
+  video?(handler: (frame: ArrayBuffer) => void): () => void;
 }
 
 /** Normalise whatever a transport rejected with into an Error with a readable message. */

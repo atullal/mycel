@@ -125,6 +125,41 @@ export function createHttpTransport(base = ""): Transport {
       }
       return json as ResultOf<C>;
     },
+    video(handler) {
+      // GET /api/video: one long response of [u32 LE length][frame]...
+      const abort = new AbortController();
+      void (async () => {
+        let res: Response;
+        try {
+          res = await fetch(`${base}/api/video?t=${encodeURIComponent(token())}`, { signal: abort.signal });
+        } catch {
+          return;
+        }
+        const reader = res.body?.getReader();
+        if (!reader) return;
+        let buf = new Uint8Array(0);
+        for (;;) {
+          let chunk: ReadableStreamReadResult<Uint8Array>;
+          try {
+            chunk = await reader.read();
+          } catch {
+            return;
+          }
+          if (chunk.done) return;
+          const joined = new Uint8Array(buf.length + chunk.value.length);
+          joined.set(buf);
+          joined.set(chunk.value, buf.length);
+          buf = joined;
+          while (buf.length >= 4) {
+            const len = new DataView(buf.buffer, buf.byteOffset, 4).getUint32(0, true);
+            if (buf.length < 4 + len) break;
+            handler(buf.slice(4, 4 + len).buffer);
+            buf = buf.slice(4 + len);
+          }
+        }
+      })();
+      return () => abort.abort();
+    },
     listen(handler) {
       handlers.add(handler);
       ensureListening();

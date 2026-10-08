@@ -45,6 +45,12 @@ impl Runtime {
     pub fn end_call(&self, call: String) -> Result<()>;
     pub fn set_muted(&self, call: String, muted: bool) -> Result<CallInfo>;
     pub fn call_status(&self) -> Vec<CallInfo>;
+    // video in calls
+    pub async fn start_call_with(&self, conversation: ConversationId, video: bool) -> Result<CallInfo>;
+    pub async fn accept_call_with(&self, call: String, video: bool) -> Result<CallInfo>;
+    pub async fn set_camera(&self, call: String, on: bool) -> Result<CallInfo>;
+    pub fn video_keyframe(&self, call: String) -> Result<()>;
+    pub fn video_frames(&self) -> broadcast::Receiver<mycel_video::UiFrame>;
     pub async fn sync_now(&self);                                               // pull-to-refresh
 }
 ```
@@ -79,8 +85,11 @@ impl Runtime {
 | `accept_request` | `{ id }` | `ConversationSummary` |
 | `decline_request` | `{ id, block? }` | `null` |
 | `stage_file` | raw bytes as the body; `x-mycel-name` header = URI-encoded file name | `string` (path to pass in `attachments`) |
-| `start_call` | `{ conversation }` | `CallInfo` |
-| `accept_call` | `{ call }` | `CallInfo` |
+| `start_call` | `{ conversation, video? }` | `CallInfo` |
+| `accept_call` | `{ call, video? }` | `CallInfo` |
+| `set_camera` | `{ call, on }` | `CallInfo` |
+| `video_keyframe` | `{ call }` | `null` |
+| `video_subscribe` | `{ channel }` (Tauri only) | `null`; frames arrive on the channel |
 | `decline_call` | `{ call }` | `null` |
 | `end_call` | `{ call }` | `null` |
 | `set_muted` | `{ call, muted }` | `CallInfo` |
@@ -116,7 +125,7 @@ Errors are rejected promises carrying a human-readable string. It includes the c
   - Files staged under the data dir's `uploads/` (HTTP uploads, `stage_file`) are deleted once the message is sent; the attachment then lives in `files/`.
 - **Offline-first:** everything works with no network at all. Peers on the same LAN find each other via mDNS with no internet.
 
-## Calls (live voice, 1:1 and group)
+## Calls (live voice and video, 1:1 and group)
 Audio is captured and played by the runtime (Rust), never by the webview, so
 the same commands work in the Tauri host and over `mycel serve`.
 
@@ -149,6 +158,7 @@ rings every other member, and up to 8 people can be in the call at once.
 | `level`, `remoteLevel` | 0..1 meters: yours (0 while muted), and everything you hear mixed |
 | `echoCancellation` | false → suggest headphones |
 | `stats` | `rttMs`, `lossPct` (of what we send, as the other side reports), `jitterMs`, `bufferMs`, `latencyMs` (estimate), `framesSent/Received/Lost/Late`, `transport` (`datagram` / `stream`), `audioDevice`, and with test audio `heardToneHz`, `measuredRoundTripMs` |
+| `video` | see **Video** below; in a voice call `camera: "off"` and nothing received |
 
 Semantics:
 - **Ringing needs only the devices online.** The caller dials each other
@@ -185,6 +195,58 @@ Semantics:
   Settings > Privacy & Security > Microphone, then call again."*
 - `call_status` lists live calls plus ones that ended in the last 10 s.
 
+### Video
+Video rides the same call (the same QUIC connection, so every path and the
+same moves between them). Our camera is captured and encoded by the runtime
+(H.264 in hardware through VideoToolbox); **the webview only decodes**, with
+WebCodecs `VideoDecoder`, which needs Safari 16.4 or later (on macOS 11+,
+update Safari). `@mycel/sdk` does it for you: `useVideoCanvas(ref, { call,
+source, peer })` in React, or `videoCanvas(canvas)` + `mycel.calls.onVideo`.
+
+- **Starting:** `start_call { video: true }` / `accept_call { video: true }`,
+  or `set_camera { call, on }` at any time (also before the call is
+  answered). The first time, macOS asks for the camera
+  (NSCameraUsageDescription); if denied, `set_camera` fails, the call goes on
+  without video, and `video.camera` is `denied` with `video.error`:
+  *"Mycel isn't allowed to use the camera. Allow it in System Settings >
+  Privacy & Security > Camera, then turn the camera on again."*
+- **Group calls:** every person gets their own video stream (`frame.peer`
+  says whose; show one tile each), encoded at the quality the path to that
+  person allows; `participants[].video` has each one's numbers both ways.
+- **What's sent** follows the path: up to 720p30 on cable, a Wi-Fi network or
+  UWB; 480p30 on peer-to-peer Wi-Fi / Wi-Fi Direct; 360p via a relay; and
+  nothing under 1 Mbit/s (Bluetooth, Thread/802.15.4) or over the multi-hop mesh: `video.paused` on our
+  side and `video.remotePaused` on theirs ("Video paused: slow connection"),
+  resuming by itself when a faster path returns. Under that ceiling a
+  delay-based controller keeps video's queueing to tens of ms, so audio
+  keeps priority: video starts at 320×180 and ramps up within ~4 s.
+- **`video` fields:** `camera` (`off`, `starting`, `on`, `denied`, `failed`),
+  `error`, `sending`, `paused`, `remoteCamera`, `remotePaused`, `receiving`,
+  `sendWidth/Height`, `sendFps`, `bitrate` (target), `sentBitrate`,
+  `queueMs`, `recvWidth/Height`, `recvFps`, `latencyMs` (their capture to
+  arrival here; two clocks, so approximate), `framesSent/Received/Skipped`,
+  `keyframesSent`, `keyframeRequests`, `source` (camera name), `encoder`.
+
+**Frames** (Tauri: `video_subscribe` with a `Channel`, raw bytes per
+message; HTTP: `GET /api/video`, each frame a u32 LE length then the
+frame). One frame, little-endian:
+
+| Bytes | |
+|---|---|
+| 0 | layout version (1) |
+| 1 | source: 0 = the other device, 1 = our self-view (show it mirrored) |
+| 2 | flags: bit 0 keyframe |
+| 4..36 | peer: whose video (32-byte device key) |
+| 36..40 | sequence number |
+| 40..48 | capture time, µs since the epoch |
+| 48..52 | width, height (u16 each) |
+| 52..54 | avcC length, then the H.264 `avcC` record (keyframes only: configure the decoder with it as `description`, codec `avc1.PPCCLL` from its bytes 1–3), then the frame (AVCC: 4-byte big-endian NAL lengths) |
+
+Frames arrive in order, starting at a keyframe. If the webview's decoder
+loses its place (an error, or it joined mid-stream), call `video_keyframe`.
+`MYCEL_VIDEO=test` replaces the camera with a moving test pattern (headless
+runs); `MYCEL_VIDEO_DEBUG=1` logs frames and the rate controller.
+
 `MYCEL_AUDIO` picks the audio backend (hosts and `mycel serve`): unset =
 Apple voice processing with echo cancellation on macOS (falls back to plain
 devices), `device` = plain default devices, `test[:<hz>]` = a sine tone in
@@ -216,6 +278,7 @@ When someone who isn't your contact adds you, the conversation arrives with `req
 |---|---|
 | `POST /api/cmd/<command>` | JSON args → JSON result; errors are `400 {"error": "..."}`. Requires the header `X-Mycel: 1`. |
 | `GET /api/events` | Server-Sent Events, one JSON `Event` per message |
+| `GET /api/video` | Video frames (see **Video**): one long binary response, each frame a u32 LE length then the frame |
 | `POST /api/upload?name=<file>` | Raw body, streamed to disk with no size limit → `{"path": "..."}` to pass in `attachments`. Requires `X-Mycel: 1`. |
 | `GET /api/file?path=<path>` | Serves attachment files under the data dir only (sandboxed, nosniff). Streamed, with `Range` support |
 | `GET /api/boot.js` | Tells `@mycel/sdk` to use the HTTP transport |

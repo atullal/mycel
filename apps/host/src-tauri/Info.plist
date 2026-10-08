@@ -19,6 +19,8 @@
   <string>Mycel reads files you choose to attach from your Downloads folder so it can encrypt and send them.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Mycel uses the microphone only during voice calls you place or answer. Your voice goes end-to-end encrypted, directly to the person you're talking to.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Mycel uses the camera only during video calls, when you turn it on. Your video goes end-to-end encrypted, directly to the person you're talking to.</string>
   <key>NSBluetoothAlwaysUsageDescription</key>
   <string>Mycel uses Bluetooth to reach nearby devices running Mycel when there is no Wi-Fi, and sends them your end-to-end encrypted messages directly.</string>
   <key>NSBonjourServices</key>

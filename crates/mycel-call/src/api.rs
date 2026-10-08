@@ -130,6 +130,8 @@ pub struct Participant {
     pub rtt_ms: u32,
     /// Of what we send them, the share they reported missing (0..100).
     pub loss_pct: f32,
+    /// Video with them, both ways (their camera, our video to them).
+    pub video: mycel_video::PeerVideo,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -177,4 +179,6 @@ pub struct CallInfo {
     /// Echo cancellation is on (otherwise headphones avoid echo).
     pub echo_cancellation: bool,
     pub stats: CallStats,
+    /// Video both ways (camera off and nothing received when it's a voice call).
+    pub video: mycel_video::VideoInfo,
 }

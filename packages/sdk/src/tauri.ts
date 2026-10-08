@@ -1,4 +1,4 @@
-import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { Channel, convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
@@ -97,6 +97,19 @@ export function createTauriTransport(): Transport {
           unlisten = null;
           void pending.then((fn) => fn());
         }
+      };
+    },
+    video(handler) {
+      // Raw bytes over a Tauri channel (`video_subscribe`); a new
+      // subscription replaces the previous one in the host.
+      const channel = new Channel<ArrayBuffer>();
+      let live = true;
+      channel.onmessage = (buf) => {
+        if (live) handler(buf);
+      };
+      void invoke("video_subscribe", { channel }).catch((e) => console.error("[mycel] video", e));
+      return () => {
+        live = false;
       };
     },
   };

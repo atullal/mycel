@@ -234,6 +234,32 @@ For a log of which path each call uses, run Mycel from Terminal with
 `MYCEL_CALL_DEBUG=1 /Applications/Mycel.app/Contents/MacOS/mycel-host`
 (it prints each person's path and RTT once a second).
 
+## 5d. Video calls
+
+1. In your one-to-one conversation click the **camera** button in the header
+   (next to the phone). The first time, macOS asks *"Mycel would like to
+   access the camera"* → **OK**. The other laptop's incoming-call card says
+   *Video call*: **Accept with video** (camera icon), **Accept** (voice only,
+   you can turn the camera on later) or **Decline**.
+2. Their picture fills the top of the conversation, yours sits in the corner
+   (mirrored, like a mirror). The camera button in the call bar turns your
+   camera on and off at any time; the other side sees *"…'s camera is off"*.
+   The small label at the bottom left shows what you receive
+   (e.g. *720p · 30 fps · 40 ms*).
+3. Video starts small (320×180) and sharpens within a few seconds, up to
+   720p on the same network or a cable and 480p over peer-to-peer Wi-Fi.
+4. **Walk it across paths** as in 5b: on *Peer-to-peer Wi-Fi* it drops to
+   480p; turn Wi-Fi off and the call moves to *Bluetooth*: video pauses on
+   both sides (*"Video paused: slow connection"*) while the voice carries
+   on; turn Wi-Fi back on and the video comes back by itself.
+5. If the camera was denied: the call goes on with voice and the bar says
+   where to allow it (System Settings > Privacy & Security > Camera > turn
+   **Mycel** on), then click the camera button again.
+
+Video needs both laptops on this build (Safari 16.4 or later too, on
+macOS 11). `MYCEL_VIDEO_DEBUG=1` (with the Terminal command above) logs the
+video bitrate, resolution and each keyframe.
+
 ## 5c. Mesh: reaching someone out of range, through another Mac (needs 3 Macs)
 
 With **two** Macs the mesh can't be shown: two devices in range of each

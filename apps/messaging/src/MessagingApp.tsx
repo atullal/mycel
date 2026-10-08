@@ -5,7 +5,7 @@ import { ConversationList } from "./ConversationList.tsx";
 import { ChatView } from "./ChatView.tsx";
 import { NewConversationDialog } from "./NewConversation.tsx";
 import { MembersPanel } from "./MembersPanel.tsx";
-import { CallBar, IncomingCall, isLive, visibleCalls } from "./Calls.tsx";
+import { CallBar, IncomingCall, VideoStage, hasVideo, isLive, visibleCalls } from "./Calls.tsx";
 import { errorText } from "./ui.tsx";
 import "./messaging.css";
 
@@ -54,10 +54,10 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
   const liveCall = calls.find((c) => isLive(c) && c !== ringing) ?? null;
   const [callError, setCallError] = useState<string | null>(null);
   const startCall = useCallback(
-    async (conversation: string) => {
+    async (conversation: string, video = false) => {
       setCallError(null);
       try {
-        await mycel.calls.start(conversation);
+        await mycel.calls.start(conversation, { video });
       } catch (e) {
         setCallError(errorText(e));
       }
@@ -96,6 +96,7 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
       />
       <main className="mx-main">
         <CallBar call={barCall} onOpen={select} error={callError} onDismissError={() => setCallError(null)} />
+        {liveCall && hasVideo(liveCall) && <VideoStage key={liveCall.id} call={liveCall} />}
         {current ? (
           <ChatView
             key={current.id}
@@ -108,6 +109,7 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
             inCall={liveCall?.conversation === current.id}
             callsBusy={liveCall != null}
             onCall={() => void startCall(current.id)}
+            onVideoCall={() => void startCall(current.id, true)}
             call={currentCall}
             meName={profile?.name}
           />

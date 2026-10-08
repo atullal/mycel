@@ -1440,6 +1440,43 @@ impl Runtime {
         self.calls.set_muted(&call, muted)
     }
 
+    /// Turn our camera on or off in a call (before it's answered too). The
+    /// first time, this waits for the user to answer the camera prompt.
+    pub async fn set_camera(&self, call: String, on: bool) -> Result<CallInfo> {
+        self.calls.set_camera(&call, on).await
+    }
+
+    /// The app's video decoder needs a fresh start: keyframes, please.
+    pub fn video_keyframe(&self, call: String) -> Result<()> {
+        self.calls.video_keyframe(&call)
+    }
+
+    /// Encoded video frames for the app to decode and show: every call's
+    /// remote video and our self-view (binary layout: `mycel_video::UiFrame`).
+    pub fn video_frames(&self) -> tokio::sync::broadcast::Receiver<mycel_video::UiFrame> {
+        self.calls.video_frames()
+    }
+
+    /// Start a call, with our camera on from the start if `video`.
+    pub async fn start_call_with(&self, conversation: ConversationId, video: bool) -> Result<CallInfo> {
+        let info = self.start_call(conversation).await?;
+        if !video {
+            return Ok(info);
+        }
+        // a denied camera doesn't stop the call: `video.error` says why
+        Ok(self.set_camera(info.id.clone(), true).await.unwrap_or_else(|_| {
+            self.call_status().into_iter().find(|c| c.id == info.id).unwrap_or(info)
+        }))
+    }
+
+    /// Answer a call, with our camera on if `video`.
+    pub async fn accept_call_with(&self, call: String, video: bool) -> Result<CallInfo> {
+        if video {
+            let _ = self.set_camera(call.clone(), true).await;
+        }
+        self.accept_call(call).await
+    }
+
     /// Live calls, plus ones that ended in the last few seconds.
     pub fn call_status(&self) -> Vec<CallInfo> {
         self.calls.status()
