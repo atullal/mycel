@@ -240,6 +240,12 @@ pub fn run() {
             commands::accept_request,
             commands::decline_request,
             commands::stage_file,
+            commands::start_call,
+            commands::accept_call,
+            commands::decline_call,
+            commands::end_call,
+            commands::set_muted,
+            commands::call_status,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build the Mycel host");

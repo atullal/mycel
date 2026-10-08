@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useContacts, useConversations, useProfile } from "@mycel/sdk/react";
+import { useCalls, useContacts, useConversations, useMycel, useProfile } from "@mycel/sdk/react";
 import type { Contact } from "@mycel/sdk";
 import { ConversationList } from "./ConversationList.tsx";
 import { ChatView } from "./ChatView.tsx";
 import { NewConversationDialog } from "./NewConversation.tsx";
 import { MembersPanel } from "./MembersPanel.tsx";
+import { CallBar, IncomingCall, isLive, visibleCalls } from "./Calls.tsx";
+import { errorText } from "./ui.tsx";
 import "./messaging.css";
 
 export interface MessagingAppProps {
@@ -43,6 +45,25 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
 
   const contactsById = useMemo(() => new Map<string, Contact>(contacts.map((c) => [c.id, c])), [contacts]);
 
+  // Voice calls: one incoming ring at a time, one call in progress.
+  const mycel = useMycel();
+  const calls = visibleCalls(useCalls());
+  const ringing = calls.find((c) => c.direction === "incoming" && c.state === "ringing") ?? null;
+  const barCall = calls.find((c) => isLive(c) && c !== ringing) ?? calls.find((c) => !isLive(c)) ?? null;
+  const liveCall = calls.find((c) => isLive(c) && c !== ringing) ?? null;
+  const [callError, setCallError] = useState<string | null>(null);
+  const startCall = useCallback(
+    async (conversation: string) => {
+      setCallError(null);
+      try {
+        await mycel.calls.start(conversation);
+      } catch (e) {
+        setCallError(errorText(e));
+      }
+    },
+    [mycel],
+  );
+
   // Once the first list arrives, drop a remembered selection that no longer
   // exists. (Only then: a just-created conversation can be selected before the
   // list has refreshed to include it.)
@@ -70,6 +91,7 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
         onCompose={() => setComposing(true)}
       />
       <main className="mx-main">
+        <CallBar call={barCall} onOpen={select} error={callError} onDismissError={() => setCallError(null)} />
         {current ? (
           <ChatView
             key={current.id}
@@ -79,6 +101,9 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
             membersOpen={membersOpen}
             onToggleMembers={() => setMembersOpen((o) => !o)}
             onBack={() => select(null)}
+            inCall={liveCall?.conversation === current.id}
+            callsBusy={liveCall != null}
+            onCall={() => void startCall(current.id)}
           />
         ) : (
           <NoSelection
@@ -99,6 +124,7 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
           onLeft={() => setMembersOpen(false)}
         />
       )}
+      {ringing && <IncomingCall key={ringing.id} call={ringing} onAnswered={select} />}
       {composing && (
         <NewConversationDialog
           onClose={() => setComposing(false)}

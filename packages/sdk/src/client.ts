@@ -3,6 +3,8 @@ import { createHttpTransport, isHttpRuntime } from "./http.ts";
 import { createTauriTransport, isTauri } from "./tauri.ts";
 import { toError, type ArgsOf, type Command, type FileHost, type ResultOf, type Transport } from "./transport.ts";
 import type {
+  CallId,
+  CallInfo,
   Contact,
   ConversationId,
   ConversationSummary,
@@ -108,6 +110,26 @@ export interface Mycel {
     declineRequest(id: ConversationId, opts?: { block?: boolean }): Promise<void>;
   };
 
+  /**
+   * Live 1:1 voice calls. Audio is captured and played by the runtime (not
+   * the webview): Opus over the same encrypted multipath connection as
+   * everything else. Watch `callIncoming` / `callUpdated`, or `useCalls()`.
+   */
+  calls: {
+    /** `start_call`: ring the other person in a direct conversation (resolves while `connecting`). */
+    start(conversation: ConversationId): Promise<CallInfo>;
+    /** `accept_call`: answer a ringing call (asks for the microphone the first time). */
+    accept(call: CallId): Promise<CallInfo>;
+    /** `decline_call` */
+    decline(call: CallId): Promise<void>;
+    /** `end_call`: hang up, or cancel a call that hasn't been answered. */
+    end(call: CallId): Promise<void>;
+    /** `set_muted` */
+    setMuted(call: CallId, muted: boolean): Promise<CallInfo>;
+    /** `call_status`: live calls, plus ones that ended in the last few seconds. */
+    status(): Promise<CallInfo[]>;
+  };
+
   /** Host file services (native dialog in Tauri, `<input type=file>` in the mock). */
   files: FileHost;
 
@@ -195,6 +217,14 @@ export function createMycel(transport: Transport): Mycel {
       acceptRequest: (id) => call("accept_request", { id }),
       declineRequest: (id, opts = {}) =>
         call("decline_request", opts.block ? { id, block: true } : { id }).then(done),
+    },
+    calls: {
+      start: (conversation) => call("start_call", { conversation }),
+      accept: (id) => call("accept_call", { call: id }),
+      decline: (id) => call("decline_call", { call: id }).then(done),
+      end: (id) => call("end_call", { call: id }).then(done),
+      setMuted: (id, muted) => call("set_muted", { call: id, muted }),
+      status: () => call("call_status", none),
     },
     files: transport.files ?? browserFiles,
     on: on as Mycel["on"],

@@ -14,6 +14,8 @@ import {
 } from "react";
 import { getMycel, type Mycel } from "../src/client.ts";
 import type {
+  CallId,
+  CallInfo,
   Contact,
   ConversationId,
   ConversationSummary,
@@ -298,4 +300,52 @@ export function useTyping(id: ConversationId | null | undefined): PeerId[] {
   }, [client, id]);
 
   return useMemo(() => [...typing.keys()], [typing]);
+}
+
+/** How long an ended call stays in `useCalls()` (for a "Call ended" moment). */
+const ENDED_MS = 4000;
+
+/**
+ * Calls on this device: loads `call_status`, then follows `callIncoming` and
+ * `callUpdated` (about 10 updates a second while a call is active). Ended
+ * calls drop out a few seconds after they end. Newest first.
+ */
+export function useCalls(): CallInfo[] {
+  const client = useMycel();
+  const [calls, setCalls] = useState<Map<CallId, CallInfo>>(new Map());
+
+  useEffect(() => {
+    let alive = true;
+    const timers = new Map<CallId, ReturnType<typeof setTimeout>>();
+    const put = (c: CallInfo) => {
+      if (!alive) return;
+      setCalls((m) => new Map(m).set(c.id, c));
+      if (c.state === "ended" && !timers.has(c.id)) {
+        timers.set(
+          c.id,
+          setTimeout(() => {
+            setCalls((m) => {
+              const next = new Map(m);
+              next.delete(c.id);
+              return next;
+            });
+          }, ENDED_MS),
+        );
+      }
+    };
+    client.calls.status().then(
+      (list) => list.forEach(put),
+      () => {},
+    );
+    const offIncoming = client.on("callIncoming", (e) => put(e.call));
+    const offUpdated = client.on("callUpdated", (e) => put(e.call));
+    return () => {
+      alive = false;
+      offIncoming();
+      offUpdated();
+      for (const t of timers.values()) clearTimeout(t);
+    };
+  }, [client]);
+
+  return useMemo(() => [...calls.values()].sort((a, b) => b.startedAt - a.startedAt), [calls]);
 }

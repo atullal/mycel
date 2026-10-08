@@ -530,3 +530,100 @@ async fn legacy_attachments_folders_and_read_errors() {
     }
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Live voice call between two runtimes (test audio in place of devices):
+/// refused while the conversation is still a message request, then rings,
+/// answers, carries audio, mutes and hangs up through the JSON command table.
+#[tokio::test(flavor = "multi_thread")]
+async fn voice_call_between_runtimes() {
+    use mycel_node::api::{CallEndReason, CallPhase};
+    use mycel_node::call::audio::{AudioIo, TestAudio, TestSource};
+    use mycel_node::call::level::estimate_frequency;
+    use mycel_node::dispatch::dispatch;
+    use serde_json::json;
+
+    let (da, db) = (tmp("call-alice"), tmp("call-bob"));
+    let alice = open(&da, "Alice", free_port(), false).await;
+    let bob = open(&db, "Bob", free_port(), false).await;
+    connect_all(&[&alice, &bob]);
+    let bob_audio = Arc::new(TestAudio::new(TestSource::Sine { hz: 330.0, amp: 0.5 }));
+    alice.calls().set_audio(Arc::new(TestAudio::new(TestSource::Sine { hz: 440.0, amp: 0.5 })));
+    bob.calls().set_audio(bob_audio.clone() as Arc<dyn AudioIo>);
+    let mut bob_events = bob.subscribe();
+
+    // Alice has Bob's code, Bob doesn't have hers: on Bob's side this is a
+    // message request, so her call is refused and nothing rings.
+    let bob_contact = alice.add_contact(bob.profile().contact_code).unwrap();
+    let conv = alice.create_conversation(None, vec![bob_contact.id.clone()]).unwrap();
+    eventually("bob gets the request", || bob.conversations().iter().any(|c| c.id == conv.id && c.request)).await;
+    assert!(bob.start_call(conv.id.clone()).await.is_err(), "can't call from an unaccepted request");
+    let c = alice.start_call(conv.id.clone()).await.unwrap();
+    eventually("refused", || {
+        alice.call_status().iter().any(|x| x.id == c.id && x.end_reason == Some(CallEndReason::Failed))
+    })
+    .await;
+    assert!(bob.call_status().is_empty(), "nothing rang on bob's side");
+
+    // Bob accepts the request: now it rings.
+    bob.accept_request(conv.id.clone()).unwrap();
+    let out = dispatch(&alice, "start_call", json!({ "conversation": conv.id })).await.unwrap();
+    assert_eq!(out["state"], "connecting");
+    assert_eq!(out["direction"], "outgoing");
+    assert_eq!(out["peerName"], "Bob");
+    let id = out["id"].as_str().unwrap().to_string();
+    let incoming = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(Event::CallIncoming { call }) = bob_events.recv().await {
+                return call;
+            }
+        }
+    })
+    .await
+    .expect("callIncoming event");
+    assert_eq!(incoming.id, id);
+    assert_eq!(incoming.conversation, conv.id);
+    assert_eq!(incoming.peer_name, "Alice");
+    let json_event = serde_json::to_value(Event::CallIncoming { call: incoming.clone() }).unwrap();
+    assert_eq!(json_event["type"], "callIncoming");
+    assert_eq!(json_event["call"]["state"], "ringing");
+
+    let accepted = dispatch(&bob, "accept_call", json!({ "call": id })).await.unwrap();
+    assert!(accepted["state"] == "connecting" || accepted["state"] == "active");
+    eventually("both active", || {
+        let a = alice.call_status();
+        let b = bob.call_status();
+        a.first().is_some_and(|c| c.state == CallPhase::Active) && b.first().is_some_and(|c| c.state == CallPhase::Active)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    {
+        let rec = bob_audio.recording();
+        let rec = rec.lock();
+        let f = estimate_frequency(&rec.samples[rec.samples.len() - 48_000..], 48_000).unwrap();
+        assert!((f - 440.0).abs() < 8.0, "bob hears alice's 440 Hz, got {f}");
+    }
+    let st = dispatch(&bob, "call_status", json!({})).await.unwrap();
+    assert_eq!(st[0]["state"], "active");
+    assert_eq!(st[0]["path"], "network");
+    assert!(st[0]["durationMs"].as_u64().unwrap() >= 1_500);
+    assert!(st[0]["stats"]["framesReceived"].as_u64().unwrap() > 50);
+    // the Network panel learns the call's path too
+    let net = alice.network_status();
+    assert!(net.peers.iter().any(|p| p.id == bob_contact.id && p.online));
+
+    let muted = dispatch(&bob, "set_muted", json!({ "call": id, "muted": true })).await.unwrap();
+    assert_eq!(muted["muted"], true);
+    eventually("alice sees bob muted", || alice.call_status().first().is_some_and(|c| c.remote_muted)).await;
+
+    dispatch(&alice, "end_call", json!({ "call": id })).await.unwrap();
+    eventually("bob sees the hang-up", || {
+        bob.call_status().first().is_some_and(|c| c.end_reason == Some(CallEndReason::RemoteHungUp))
+    })
+    .await;
+    assert!(dispatch(&bob, "accept_call", json!({ "call": id })).await.is_err(), "can't answer an ended call");
+
+    for rt in [alice, bob] {
+        rt.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(rt.data_dir());
+    }
+}

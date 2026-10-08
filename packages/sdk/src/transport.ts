@@ -1,4 +1,6 @@
 import type {
+  CallId,
+  CallInfo,
   Contact,
   ConversationId,
   ConversationSummary,
@@ -56,6 +58,12 @@ export interface Commands {
   fetch_attachment: [{ blob: string }, string];
   accept_request: [{ id: ConversationId }, ConversationSummary];
   decline_request: [{ id: ConversationId; block?: boolean | null }, null];
+  start_call: [{ conversation: ConversationId }, CallInfo];
+  accept_call: [{ call: CallId }, CallInfo];
+  decline_call: [{ call: CallId }, null];
+  end_call: [{ call: CallId }, null];
+  set_muted: [{ call: CallId; muted: boolean }, CallInfo];
+  call_status: [Record<string, never>, CallInfo[]];
 }
 
 export type Command = keyof Commands;

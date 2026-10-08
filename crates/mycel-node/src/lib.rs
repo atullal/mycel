@@ -6,6 +6,7 @@
 //! - [`sync`]   — signed encrypted envelopes, Docs and Feeds
 //! - [`net`]    — Iroh transport, live sync, LAN discovery, blobs
 //! - [`chat`]   — the chat kit
+//! - [`call`]   — live voice calls
 //! - [`Runtime`] — the app-facing API (docs/RUNTIME_API.md)
 
 pub mod api;
@@ -15,6 +16,7 @@ mod files;
 mod runtime;
 pub mod store;
 
+pub use mycel_call as call;
 pub use mycel_crypto as crypto;
 pub use mycel_kit_chat as chat;
 pub use mycel_net as net;
