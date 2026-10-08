@@ -41,7 +41,7 @@ function pathRows(status: NetworkStatus): { kind: PathKind; on: boolean; text: s
     const l = link(kind);
     rows.push(
       l
-        ? { kind, on: l.active, text: l.active ? devices(l.peers) : (l.detail ?? "Not available") }
+        ? { kind, on: l.active, text: l.active ? (l.peers === 0 && l.detail ? l.detail : devices(l.peers)) : (l.detail ?? "Not available") }
         : { kind, on: false, text: "Not available on this device" },
     );
   }
