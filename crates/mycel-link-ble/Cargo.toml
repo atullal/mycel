@@ -1,0 +1,28 @@
+[package]
+name = "mycel-link-ble"
+description = "Bluetooth LE link for Mycel: Iroh QUIC packets over L2CAP channels, with discovery"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1.0.104"
+bytes = "1.12"
+mycel-crypto = { version = "0.1.0", path = "../mycel-crypto" }
+mycel-net = { version = "0.1.0", path = "../mycel-net" }
+parking_lot = "0.12.5"
+tokio = { version = "1.53.2", features = ["sync"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6.2"
+dispatch2 = "0.3.1"
+objc2 = "0.6.5"
+objc2-core-bluetooth = "0.3.2"
+objc2-core-foundation = { version = "0.3.2", features = ["CFRunLoop", "CFDate", "CFString", "block2"] }
+objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSBundle", "NSData", "NSDate", "NSDictionary", "NSError", "NSObject", "NSRunLoop", "NSStream", "NSString", "NSUUID", "NSValue"] }
+
+[dev-dependencies]
+mycel-sync = { version = "0.1.0", path = "../mycel-sync" }
+mycel-trust = { version = "0.1.0", path = "../mycel-trust" }
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = ["full"] }
