@@ -23,13 +23,18 @@ const PATH: Record<PathKind, { name: string; text: string }> = {
   peerWifi: { name: "Peer-to-peer Wi-Fi", text: "Device to device, like AirDrop. Needs Wi-Fi on, but no network." },
   bluetooth: { name: "Bluetooth", text: "Slow but works with Wi-Fi off. Fine for messages, slow for big files." },
   relay: { name: "Internet relay", text: "Through an encrypted relay when you're on different networks." },
+  wifiDirect: { name: "Wi-Fi Direct", text: "Device to device over Wi-Fi Direct or Wi-Fi Aware. No network needed." },
+  uwb: { name: "UWB", text: "Ultra-wideband radio: short range, a few Mbit/s." },
+  ieee802154: { name: "Thread / 802.15.4", text: "Low-power radio (Thread, 6LoWPAN): very slow, fine for messages." },
+  ethernet: { name: "Cable", text: "A direct cable: Ethernet, Thunderbolt or USB." },
+  other: { name: "Other link", text: "Another network interface on this device." },
 };
 
 /** One row per path: is it working, and how many devices it reaches. */
-function pathRows(status: NetworkStatus): { kind: PathKind; on: boolean; text: string }[] {
+function pathRows(status: NetworkStatus): { kind: PathKind; label?: string | null; on: boolean; text: string }[] {
   const reach = (kind: PathKind) => status.peers.filter((p) => p.available.includes(kind)).length;
   const devices = (n: number) => (n === 1 ? "1 device" : `${n} devices`);
-  const rows: { kind: PathKind; on: boolean; text: string }[] = [
+  const rows: { kind: PathKind; label?: string | null; on: boolean; text: string }[] = [
     {
       kind: "network",
       on: status.addresses.length > 0,
@@ -44,6 +49,16 @@ function pathRows(status: NetworkStatus): { kind: PathKind; on: boolean; text: s
         ? { kind, on: l.active, text: l.active ? (l.peers === 0 && l.detail ? l.detail : devices(l.peers)) : (l.detail ?? "Not available") }
         : { kind, on: false, text: "Not available on this device" },
     );
+  }
+  // Any other radio or interface this device has (UWB, Wi-Fi Direct, a cable, ...)
+  for (const l of status.links) {
+    if (l.kind === "peerWifi" || l.kind === "bluetooth") continue;
+    rows.push({
+      kind: l.kind,
+      label: l.label,
+      on: l.active,
+      text: l.active ? (l.peers === 0 && l.detail ? l.detail : devices(l.peers)) : (l.detail ?? "Not available"),
+    });
   }
   rows.push(
     status.mode === "internet"
@@ -211,9 +226,12 @@ export function NetworkPanel() {
         <h4>Paths</h4>
         <ul className="p-paths">
           {pathRows(status).map((r) => (
-            <li key={r.kind} className={r.on ? "is-on" : ""} title={PATH[r.kind].text}>
+            <li key={`${r.kind}:${r.label ?? ""}`} className={r.on ? "is-on" : ""} title={PATH[r.kind].text}>
               <span className="p-path-dot" aria-hidden="true" />
-              <span className="p-path-name">{PATH[r.kind].name}</span>
+              <span className="p-path-name">
+                {PATH[r.kind].name}
+                {r.label && <span className="p-path-label"> {r.label}</span>}
+              </span>
               <span className="p-path-state">{r.text}</span>
             </li>
           ))}

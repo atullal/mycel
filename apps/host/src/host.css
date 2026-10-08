@@ -824,6 +824,12 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.p-path-label {
+  font-weight: 400;
+  color: var(--ink-3);
+  font-family: var(--mono, ui-monospace, monospace);
+  font-size: 0.85em;
+}
 .p-path-state {
   color: var(--ink-2);
   text-align: right;
