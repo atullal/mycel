@@ -271,9 +271,10 @@ export type MycelEvent =
   /**
    * An attachment transfer moved forward (at most every 250 ms, plus a final
    * event with `done === total`). `id` is the path passed to `send_message`
-   * for uploads, and the blob id for downloads.
+   * for uploads, and the blob id for downloads. `rate` is bytes per second
+   * over the last few seconds.
    */
-  | { type: "transferProgress"; direction: TransferDirection; id: string; done: number; total: number }
+  | { type: "transferProgress"; direction: TransferDirection; id: string; done: number; total: number; rate: number }
   /** Someone is calling: show Accept / Decline. */
   | { type: "callIncoming"; call: CallInfo }
   /** A call changed (state, path, bitrate, mute); ~10x a second while active, for duration and meters. */

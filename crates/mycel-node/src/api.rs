@@ -206,9 +206,10 @@ pub enum Event {
     BlobReady { blob: String },
     /// An attachment transfer moved forward (at most every 250 ms, plus a
     /// final event with `done == total`). `id` is the path passed to
-    /// `send_message` for uploads, and the blob id for downloads.
+    /// `send_message` for uploads, and the blob id for downloads. `rate` is
+    /// bytes per second over the last few seconds.
     #[serde(rename_all = "camelCase")]
-    TransferProgress { direction: TransferDirection, id: String, done: u64, total: u64 },
+    TransferProgress { direction: TransferDirection, id: String, done: u64, total: u64, rate: u64 },
     /// Someone is calling: show Accept / Decline.
     #[serde(rename_all = "camelCase")]
     CallIncoming { call: CallInfo },

@@ -25,6 +25,8 @@ use crate::store::DbStore;
 const ATTACHMENT_AAD: &[u8] = b"mycel/v0/attachment";
 /// Transfer progress events are throttled to one per this interval.
 const PROGRESS_EVERY: Duration = Duration::from_millis(250);
+/// Transfer speed is averaged over this long.
+const RATE_WINDOW: Duration = Duration::from_secs(3);
 
 /// L4: the chat rules, compiled Rust → WASM (rules/chat-rules), run by every
 /// peer on every decrypted chat entry. Pinned by hash.
@@ -992,20 +994,30 @@ impl Runtime {
         Ok(self.message_view(&space, &view, m, &HashSet::new()))
     }
 
-    /// A throttled progress reporter emitting `TransferProgress` events.
+    /// A throttled progress reporter emitting `TransferProgress` events,
+    /// with the speed over the last [`RATE_WINDOW`].
     fn progress(&self, direction: TransferDirection, id: String) -> mycel_net::Progress {
         let events = self.events.clone();
-        let last: Mutex<Option<Instant>> = Mutex::new(None);
+        let samples: Mutex<std::collections::VecDeque<(Instant, u64)>> = Mutex::new(Default::default());
         Arc::new(move |done, total| {
             let now = Instant::now();
-            {
-                let mut l = last.lock();
-                if done < total && l.is_some_and(|t| now.duration_since(t) < PROGRESS_EVERY) {
+            let rate = {
+                let mut s = samples.lock();
+                if done < total && s.back().is_some_and(|&(t, _)| now.duration_since(t) < PROGRESS_EVERY) {
                     return;
                 }
-                *l = Some(now);
-            }
-            let _ = events.send(Event::TransferProgress { direction, id: id.clone(), done, total });
+                if s.back().is_some_and(|&(_, d)| done < d) {
+                    s.clear(); // restarted from scratch
+                }
+                s.push_back((now, done));
+                while s.len() > 2 && s.front().is_some_and(|&(t, _)| now.duration_since(t) > RATE_WINDOW) {
+                    s.pop_front();
+                }
+                let (t0, d0) = s[0];
+                let secs = now.duration_since(t0).as_secs_f64();
+                if secs > 0.0 { ((done - d0) as f64 / secs) as u64 } else { 0 }
+            };
+            let _ = events.send(Event::TransferProgress { direction, id: id.clone(), done, total, rate });
         })
     }
 
