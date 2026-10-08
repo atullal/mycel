@@ -6,7 +6,12 @@
 //! - a stream thread ("R") runs a CFRunLoop for the L2CAP channels'
 //!   `NSInputStream`/`NSOutputStream`s (they deliver events only on a run
 //!   loop that is actually running, which a GCD worker thread is not) and the
-//!   2 s housekeeping timer.
+//!   1 s housekeeping timer (state machine tick, keepalive pings, silence).
+//!
+//! Scanning reports every advertisement (`AllowDuplicates`), throttled here
+//! to one report per peripheral per [`REPORT_EVERY`]: without duplicates
+//! macOS reports a peripheral once and then goes quiet about it for as long
+//! as it pleases, which left two Macs in range unlinked for many minutes.
 //!
 //! Neither ever blocks on Iroh, and Iroh never blocks on them: packets to
 //! send go into a bounded per-channel [`OutQueue`] and a block is posted to R
@@ -42,12 +47,12 @@ use objc2_foundation::{
 use parking_lot::Mutex;
 
 use crate::core::{ChanId, Cmd, Input, Pid};
-use crate::hub::{ChannelRx, Hub, PING_EVERY, PacketSink, Radio, short};
+use crate::hub::{ChannelRx, Hub, PING_EVERY, PacketSink, Radio, SILENT_AFTER, short};
 use crate::wire::{GattInfo, OutQueue, encode_hello, encode_ping};
 use crate::{Backend, INFO_CHAR_UUID, OUT_QUEUE_BYTES, SERVICE_UUID, debug, info};
 
-/// Housekeeping tick (timeouts, retries, rescans).
-const TICK_SECS: f64 = 2.0;
+/// Housekeeping tick (timeouts, retries, rescans, pings).
+const TICK_SECS: f64 = 1.0;
 /// Bytes read from an input stream at a time.
 const READ_CHUNK: usize = 8192;
 
@@ -189,12 +194,15 @@ struct CbState {
     peripherals: HashMap<Pid, Retained<CBPeripheral>>,
     /// Must stay referenced or CoreBluetooth closes the channel.
     channels: HashMap<ChanId, Retained<CBL2CAPChannel>>,
-    /// macOS repeats discoveries even with duplicates off; pass each
-    /// peripheral on at most once per [`REPORT_EVERY`].
+    /// Scanning reports every advertisement; pass each peripheral on at
+    /// most once per [`REPORT_EVERY`].
     reported: HashMap<Pid, std::time::Instant>,
 }
 
-const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+const REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+/// Log a sighting (with RSSI) at level 1 when a peripheral wasn't reported
+/// for this long.
+const SAW_LOG_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
 struct RunLoopRef(CFRetained<CFRunLoop>);
 // CFRunLoopPerformBlock / WakeUp / Stop are thread-safe.
@@ -263,7 +271,9 @@ impl Driver {
             if let Cmd::CloseChannel(chan) = c {
                 self.hub.remove_sink(chan);
                 self.on_streams(move |_| {
-                    close_streams(chan);
+                    if close_streams(chan) {
+                        info(format_args!("L2CAP channel {chan} closed by us"));
+                    }
                 });
             }
             self.on_queue(move |d| d.exec_cb(c));
@@ -275,43 +285,55 @@ impl Driver {
         if self.stopped.load(Ordering::SeqCst) {
             return;
         }
-        let mut cb = self.cb.lock();
-        let cb = &mut cb.0;
-        let Some(central) = cb.central.clone() else { return };
-        let periph = |pid: &Pid| cb.peripherals.get(pid).cloned();
-        match cmd {
-            Cmd::Connect(pid) => {
-                if let Some(p) = periph(&pid) {
-                    unsafe { central.connectPeripheral_options(&p, None) };
+        // What the radio would have reported, had we had a handle to use.
+        let mut follow_up = None;
+        {
+            let mut cb = self.cb.lock();
+            let cb = &mut cb.0;
+            let Some(central) = cb.central.clone() else { return };
+            let periph = |pid: &Pid| cb.peripherals.get(pid).cloned();
+            match cmd {
+                Cmd::Connect(pid) => match periph(&pid) {
+                    Some(p) => unsafe { central.connectPeripheral_options(&p, None) },
+                    None => {
+                        info(format_args!("no handle for {pid}; can't dial it"));
+                        follow_up = Some(Input::ConnectFailed(pid));
+                    }
+                },
+                Cmd::Disconnect(pid) => {
+                    if let Some(p) = periph(&pid) {
+                        debug(format_args!("cancelling the connection to {pid}"));
+                        unsafe { central.cancelPeripheralConnection(&p) };
+                    }
                 }
-            }
-            Cmd::Disconnect(pid) => {
-                if let Some(p) = periph(&pid) {
-                    unsafe { central.cancelPeripheralConnection(&p) };
+                Cmd::Forget(pid) => {
+                    // The next advertisement brings a fresh handle, reported at once.
+                    cb.peripherals.remove(&pid);
+                    cb.reported.remove(&pid);
                 }
-            }
-            Cmd::Forget(pid) => {
-                cb.peripherals.remove(&pid);
-            }
-            Cmd::ReadInfo(pid) => {
-                if let Some(p) = periph(&pid) {
-                    let services = NSArray::from_retained_slice(&[uuid(SERVICE_UUID)]);
-                    unsafe { p.discoverServices(Some(&services)) };
+                Cmd::ReadInfo(pid) => match periph(&pid) {
+                    Some(p) => {
+                        let services = NSArray::from_retained_slice(&[uuid(SERVICE_UUID)]);
+                        unsafe { p.discoverServices(Some(&services)) };
+                    }
+                    None => follow_up = Some(Input::InfoFailed(pid)),
+                },
+                Cmd::OpenChannel(pid, psm) => match periph(&pid) {
+                    Some(p) => unsafe { p.openL2CAPChannel(psm) },
+                    None => follow_up = Some(Input::OpenFailed(pid)),
+                },
+                Cmd::CloseChannel(chan) => {
+                    cb.channels.remove(&chan);
                 }
-            }
-            Cmd::OpenChannel(pid, psm) => {
-                if let Some(p) = periph(&pid) {
-                    unsafe { p.openL2CAPChannel(psm) };
+                Cmd::Rescan => {
+                    unsafe { central.stopScan() };
+                    scan(&central);
                 }
+                _ => {}
             }
-            Cmd::CloseChannel(chan) => {
-                cb.channels.remove(&chan);
-            }
-            Cmd::Rescan => {
-                unsafe { central.stopScan() };
-                scan(&central);
-            }
-            _ => {}
+        }
+        if let Some(i) = follow_up {
+            self.input(i);
         }
     }
 
@@ -415,9 +437,11 @@ impl Driver {
             return;
         };
         let chan = self.next_chan.fetch_add(1, Ordering::Relaxed);
+        let peer = unsafe { channel.peer() }.map(|p| unsafe { p.identifier() }.UUIDString().to_string());
         info(format_args!(
-            "L2CAP channel {chan} open ({}, psm {})",
-            if pid.is_some() { "dialed" } else { "accepted" },
+            "L2CAP channel {chan} open ({} {}, psm {})",
+            if pid.is_some() { "dialed to" } else { "accepted from" },
+            peer.unwrap_or_else(|| "?".into()),
             unsafe { channel.PSM() }
         ));
         self.cb.lock().0.channels.insert(chan, channel.retain());
@@ -458,9 +482,12 @@ fn advertises_mycel(adv: &NSDictionary<NSString, AnyObject>) -> bool {
 fn scan(central: &CBCentralManager) {
     let services = NSArray::from_retained_slice(&[uuid(SERVICE_UUID)]);
     let services = (!scan_all()).then_some(services);
-    let no = NSNumber::new_bool(false);
+    // Every advertisement, so a peer in range keeps being reported (the
+    // `discovered` callback throttles). Without duplicates macOS may report
+    // a peripheral once and never again.
+    let yes = NSNumber::new_bool(true);
     let key: &NSString = unsafe { CBCentralManagerScanOptionAllowDuplicatesKey };
-    let opts = NSDictionary::<NSString, AnyObject>::from_slices(&[key], &[&*no as &AnyObject]);
+    let opts = NSDictionary::<NSString, AnyObject>::from_slices(&[key], &[&*yes as &AnyObject]);
     unsafe { central.scanForPeripheralsWithServices_options(services.as_deref(), Some(&opts)) };
     debug(format_args!("scanning"));
 }
@@ -520,24 +547,34 @@ define_class!(
         ) {
             let Some(d) = self.driver() else { return };
             let pid = pid_of(peripheral);
-            {
+            let quiet_before = {
                 let mut cb = d.cb.lock();
                 let now = std::time::Instant::now();
-                if cb.0.reported.get(&pid).is_some_and(|t| now.duration_since(*t) < REPORT_EVERY) {
+                let last = cb.0.reported.get(&pid).copied();
+                if last.is_some_and(|t| now.duration_since(t) < REPORT_EVERY) {
                     return;
                 }
                 cb.0.reported.insert(pid.clone(), now);
-                cb.0.reported.retain(|_, t| now.duration_since(*t) < REPORT_EVERY * 30);
-            }
+                if cb.0.reported.len() > 64 {
+                    cb.0.reported.retain(|_, t| now.duration_since(*t) < SAW_LOG_AFTER);
+                }
+                last.is_none_or(|t| now.duration_since(t) >= SAW_LOG_AFTER)
+            };
             let name = adv
                 .objectForKey(unsafe { CBAdvertisementDataLocalNameKey })
                 .and_then(|o| o.downcast::<NSString>().ok())
                 .map(|s| s.to_string());
             if scan_all() && !advertises_mycel(adv) {
-                info(format_args!("saw non-Mycel device {pid} name={name:?} rssi={}", rssi.intValue()));
+                if quiet_before {
+                    info(format_args!("saw non-Mycel device {pid} name={name:?} rssi={}", rssi.intValue()));
+                }
                 return;
             }
-            info(format_args!("saw {pid} name={name:?} rssi={}", rssi.intValue()));
+            if quiet_before {
+                info(format_args!("advertisement from {pid} name={name:?} rssi={}", rssi.intValue()));
+            } else {
+                debug(format_args!("advertisement from {pid} rssi={}", rssi.intValue()));
+            }
             {
                 let mut cb = d.cb.lock();
                 let delegate = cb.0.delegate.clone();
@@ -568,7 +605,11 @@ define_class!(
         #[unsafe(method(centralManager:didDisconnectPeripheral:error:))]
         fn disconnected(&self, _central: &CBCentralManager, peripheral: &CBPeripheral, error: Option<&NSError>) {
             let Some(d) = self.driver() else { return };
-            debug(format_args!("disconnected from {}: {:?}", pid_of(peripheral), error.map(err_text)));
+            info(format_args!(
+                "BLE connection to {} ended: {}",
+                pid_of(peripheral),
+                error.map(err_text).unwrap_or_else(|| "cancelled by us".into())
+            ));
             d.input(Input::Disconnected(pid_of(peripheral)));
         }
     }
@@ -804,7 +845,8 @@ fn stream_tick(d: &Arc<Driver>) {
         let silent = m.iter().filter(|(_, io)| io.rx.silent(now)).map(|(c, _)| *c).collect();
         let mut ping = Vec::new();
         for (c, io) in m.iter_mut() {
-            if now.duration_since(io.last_ping) >= PING_EVERY {
+            // (minus a little: the 1 s tick may fire slightly early)
+            if now.duration_since(io.last_ping) + std::time::Duration::from_millis(250) >= PING_EVERY {
                 io.last_ping = now;
                 if io.q.lock().push(encode_ping()) {
                     ping.push(*c);
@@ -814,7 +856,7 @@ fn stream_tick(d: &Arc<Driver>) {
         (silent, ping)
     });
     for c in silent {
-        channel_died(d, c, "silent");
+        channel_died(d, c, &format!("silent: nothing received for {} s (dead link)", SILENT_AFTER.as_secs()));
     }
     for c in ping {
         pump(d, c);
@@ -945,10 +987,10 @@ define_class!(
                 pump(&d, chan);
             }
             if event.contains(NSStreamEvent::ErrorOccurred) {
-                let why = stream.streamError().map(|e| err_text(&e)).unwrap_or_else(|| "stream error".into());
-                channel_died(&d, chan, &why);
+                let why = stream.streamError().map(|e| err_text(&e)).unwrap_or_else(|| "unknown".into());
+                channel_died(&d, chan, &format!("stream error: {why}"));
             } else if event.contains(NSStreamEvent::EndEncountered) {
-                channel_died(&d, chan, "ended");
+                channel_died(&d, chan, "closed by the peer (stream ended)");
             }
         }
     }

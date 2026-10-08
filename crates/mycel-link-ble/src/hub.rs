@@ -18,10 +18,12 @@ use crate::wire::{BadStream, Deframer, Frame};
 
 /// Inbound packets waiting for Iroh. Full = dropped (QUIC recovers).
 pub const INBOUND_QUEUE: usize = 512;
-/// Send a ping on an otherwise quiet channel this often...
-pub const PING_EVERY: Duration = Duration::from_secs(8);
-/// ...and give up on a channel that has said nothing for this long.
-pub const SILENT_AFTER: Duration = Duration::from_secs(30);
+/// Send a ping on every channel this often...
+pub const PING_EVERY: Duration = Duration::from_secs(2);
+/// ...and give up on a channel that has said nothing for this long (a dead
+/// link is noticed in seconds even when the OS doesn't report it). Older
+/// builds ping every 8 s, so this stays above that.
+pub const SILENT_AFTER: Duration = Duration::from_secs(10);
 
 /// Where a channel's outgoing frames go (the platform's write side).
 pub trait PacketSink: Send + Sync {
@@ -126,6 +128,11 @@ impl Hub {
         self.core.lock().peers()
     }
 
+    /// Devices in range we aren't linked to yet.
+    pub fn connecting(&self) -> usize {
+        self.core.lock().connecting(Instant::now())
+    }
+
     /// Feed the state machine. Routing and node events are handled here;
     /// the returned commands are for the radio.
     pub fn input(&self, i: Input) -> Vec<Cmd> {
@@ -147,7 +154,7 @@ impl Hub {
                     self.routes.lock().by_key.remove(&key);
                 }
                 Cmd::Found { key, name } => {
-                    crate::info(format_args!("linked to {} ({name})", short(&key)));
+                    crate::info(format_args!("linked to {} \"{name}\"", short(&key)));
                     self.emit(LinkEvent::Found {
                         peer: key,
                         addr: addr_of(&key),
@@ -155,7 +162,7 @@ impl Hub {
                     });
                 }
                 Cmd::Lost { key } => {
-                    crate::info(format_args!("lost {}", short(&key)));
+                    crate::info(format_args!("lost {} (no channel left)", short(&key)));
                     self.emit(LinkEvent::Lost { peer: key, addr: addr_of(&key) });
                 }
                 other => {
@@ -215,7 +222,11 @@ impl Default for ChannelRx {
 impl ChannelRx {
     /// Nothing arrived for [`SILENT_AFTER`]: the channel is dead.
     pub fn silent(&self, now: Instant) -> bool {
-        now.duration_since(self.last_rx) >= SILENT_AFTER
+        self.quiet_for(now) >= SILENT_AFTER
+    }
+
+    pub fn quiet_for(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_rx)
     }
 
     /// Bytes read from the channel. Returns radio commands to run, or an
