@@ -118,4 +118,6 @@ pub struct CallInfo {
     /// Echo cancellation is on (otherwise headphones avoid echo).
     pub echo_cancellation: bool,
     pub stats: CallStats,
+    /// Video both ways (camera off and nothing received when it's a voice call).
+    pub video: mycel_video::VideoInfo,
 }

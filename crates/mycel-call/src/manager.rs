@@ -23,6 +23,7 @@ use crate::bitrate::{BitrateController, Observation};
 use crate::engine::Media;
 use crate::proto::{self, CallId, Ctrl, VERSION, call_id};
 use crate::state::{CallState, Effect, Input, LiveCall, RING_TIMEOUT, RingDecision, on_ring};
+use mycel_video::{UiFrame, VideoSource, VideoTrack};
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
@@ -100,6 +101,10 @@ struct Call {
     remote_loss: Mutex<f32>,
     bitrate: AtomicU32,
     error: Mutex<Option<String>>,
+    /// Video, from when the call goes active.
+    video: Mutex<Option<VideoTrack>>,
+    /// Our camera should be on (asked for before or during the call).
+    camera: AtomicBool,
 }
 
 struct Mgr {
@@ -111,6 +116,9 @@ struct Mgr {
     ring_timeout: Mutex<Duration>,
     force_stream: AtomicBool,
     pending: AtomicUsize,
+    video_source: RwLock<Arc<dyn VideoSource>>,
+    /// Encoded frames for the app to show (remote video and self-view).
+    video_frames: tokio::sync::broadcast::Sender<UiFrame>,
 }
 
 /// Live 1:1 calls over the node's endpoint.
@@ -130,6 +138,8 @@ impl CallManager {
                 ring_timeout: Mutex::new(RING_TIMEOUT),
                 force_stream: AtomicBool::new(false),
                 pending: AtomicUsize::new(0),
+                video_source: RwLock::new(mycel_video::default_source()),
+                video_frames: tokio::sync::broadcast::channel(256).0,
             }),
         }
     }
@@ -145,6 +155,63 @@ impl CallManager {
 
     pub fn set_ring_timeout(&self, d: Duration) {
         *self.inner.ring_timeout.lock() = d;
+    }
+
+    /// Swap the video source (tests, headless runs).
+    pub fn set_video_source(&self, source: Arc<dyn VideoSource>) {
+        *self.inner.video_source.write() = source;
+    }
+
+    /// Encoded video frames to show: every call's remote video and our
+    /// self-view (see `mycel_video::UiFrame`).
+    pub fn video_frames(&self) -> tokio::sync::broadcast::Receiver<UiFrame> {
+        self.inner.video_frames.subscribe()
+    }
+
+    /// Turn our camera on or off in a call (before it's answered too). The
+    /// first time, this may wait for the user to answer the system's
+    /// camera prompt. If the camera can't start the call goes on without
+    /// it: `video.camera` and `video.error` say why.
+    pub async fn set_camera(&self, id: &str, on: bool) -> Result<CallInfo> {
+        let call = self.find(id)?;
+        if !call.state.lock().is_live() {
+            bail!("This call already ended.");
+        }
+        call.camera.store(on, Ordering::Relaxed);
+        let track_live = call.video.lock().is_some();
+        if track_live {
+            let c = call.clone();
+            let r = tokio::task::spawn_blocking(move || match c.video.lock().as_ref() {
+                Some(v) => v.set_camera(on),
+                None => Ok(()),
+            })
+            .await
+            .context("camera failed to start")?;
+            if r.is_err() {
+                call.camera.store(false, Ordering::Relaxed);
+            }
+        } else if on {
+            // not talking yet: ask for permission now, start with the call
+            let src = self.inner.video_source.read().clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || src.prepare()).await.context("camera check failed")? {
+                call.camera.store(false, Ordering::Relaxed);
+                return Err(e);
+            }
+        }
+        let i = info(&self.inner, &call);
+        self.inner.host.emit(CallEvent::Updated(i.clone()));
+        Ok(i)
+    }
+
+    /// The app's video decoder lost its place (or just started): get fresh
+    /// keyframes for the remote video and the self-view.
+    pub fn video_keyframe(&self, id: &str) -> Result<()> {
+        let call = self.find(id)?;
+        if let Some(v) = call.video.lock().as_ref() {
+            v.request_keyframe();
+            v.force_keyframe();
+        }
+        Ok(())
     }
 
     /// Send audio on a stream even where datagrams work (tests the fallback).
@@ -227,6 +294,8 @@ impl CallManager {
             remote_loss: Mutex::new(0.0),
             bitrate: AtomicU32::new(0),
             error: Mutex::new(None),
+            video: Mutex::new(None),
+            camera: AtomicBool::new(false),
         });
         mgr.calls.lock().insert(id, call.clone());
         let first = info(mgr, &call);
@@ -358,6 +427,10 @@ fn info(mgr: &Mgr, c: &Call) -> CallInfo {
         remote_level,
         echo_cancellation: audio.echo_cancellation(),
         stats,
+        video: c.video.lock().as_ref().map(|v| v.info()).unwrap_or_else(|| mycel_video::VideoInfo {
+            source: mgr.video_source.read().describe(),
+            ..Default::default()
+        }),
     }
 }
 
@@ -496,6 +569,8 @@ async fn handle_incoming(mgr: &Arc<Mgr>, conn: Connection) -> Result<()> {
         remote_loss: Mutex::new(0.0),
         bitrate: AtomicU32::new(0),
         error: Mutex::new(None),
+        video: Mutex::new(None),
+        camera: AtomicBool::new(false),
     });
     mgr.calls.lock().insert(id, call.clone());
     proto::send(&mut tx, &Ctrl::Ringing).await?;
@@ -677,6 +752,25 @@ async fn start_media(mgr: &Arc<Mgr>, call: &Arc<Call>, conn: &Connection) -> Res
         .await
         .context("audio failed to start")??;
     *call.media.lock() = Some(media);
+    // video: always receive; send once the camera is on
+    let track = VideoTrack::start(
+        conn.clone(),
+        mgr.video_source.read().clone(),
+        mgr.video_frames.clone(),
+        mycel_video::TrackOptions { me: mgr.host.me().0, peer: call.peer.0, path },
+        tokio::runtime::Handle::current(),
+    );
+    *call.video.lock() = Some(track);
+    if call.camera.load(Ordering::Relaxed) {
+        let c = call.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Some(v) = c.video.lock().as_ref()
+                && v.set_camera(true).is_err()
+            {
+                c.camera.store(false, Ordering::Relaxed);
+            }
+        });
+    }
     *call.connected_at.lock() = Some(wall_ms());
     *call.path.lock() = path;
     call.bitrate.store(bitrate, Ordering::Relaxed);
@@ -760,8 +854,9 @@ async fn on_tick(
 /// forget it after a while.
 async fn finish(mgr: &Arc<Mgr>, call: &Arc<Call>, conn: Option<&Connection>) {
     let media = call.media.lock().take();
-    if let Some(m) = media {
-        let _ = tokio::task::spawn_blocking(move || drop(m)).await;
+    let video = call.video.lock().take();
+    if media.is_some() || video.is_some() {
+        let _ = tokio::task::spawn_blocking(move || drop((video, media))).await;
     }
     mgr.host.emit(CallEvent::Updated(info(mgr, call)));
     if let Some(conn) = conn {
