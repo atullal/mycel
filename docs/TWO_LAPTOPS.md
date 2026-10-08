@@ -147,6 +147,49 @@ doesn't connect between your laptops, run Mycel from Terminal
 (`MYCEL_AWDL_DEBUG=1 MYCEL_BLE_LOG=2 /Applications/Mycel.app/Contents/MacOS/mycel-host`)
 and keep the log.
 
+## 5c. Other radios, cables and Linux machines
+
+Mycel uses every network interface a computer has, not only Wi-Fi and
+Bluetooth: each becomes its own path, shown in the Network panel's *Paths*
+list by what it is ("Cable bridge0", "Wi-Fi Direct p2p-wlan0-0", "UWB
+lowpan0", "Thread / 802.15.4 wpan0"). Path choice is by what each path
+measures, so a faster radio wins and slower ones stay as backups.
+
+- **A cable between two Macs** (Thunderbolt or USB-C): plug it in; the
+  Thunderbolt bridge gets a link-local address and becomes a *Cable* path,
+  even with no network at all.
+- **To see what Mycel makes of your interfaces**:
+  `cargo run -p mycel-link-iface --example ifaces` (add `-- --no-ip` for
+  what it does with `MYCEL_IP=0`). It only reads the interface list.
+- **Say what an interface is** when its name doesn't:
+  `MYCEL_IFACE_MEDIUM=wpan0=uwb,mesh0=other`. Use only some interfaces:
+  `MYCEL_IFACES=lowpan0,p2p-wlan0-0`. Log what the interface link does:
+  `MYCEL_IFACE_LOG=1`.
+- **UWB**: Macs have no UWB radio. On Linux a UWB (IEEE 802.15.4z) radio
+  carries data only if its driver exposes it through the kernel's
+  ieee802154 stack with a 6LoWPAN interface (`ip link add link wpan0 name
+  lowpan0 type lowpan`); most UWB chips today only do ranging.
+
+**On Linux** (the app is built and used the same way; these links were
+type-checked for Linux but haven't been run on Linux hardware yet):
+
+- *Bluetooth* uses BlueZ and talks to Macs over Bluetooth too. `bluetoothd`
+  must be running and your user allowed to advertise: add yourself to the
+  `bluetooth` group (`sudo usermod -aG bluetooth $USER`, then log in again)
+  on distributions whose BlueZ D-Bus policy uses it. No pairing is needed.
+  Building needs `libdbus-1-dev` (or build with the `vendored-dbus` feature
+  of `mycel-link-ble`).
+- *Wi-Fi Direct* is off by default; turn it on with `MYCEL_WIFI_DIRECT=1`
+  (or `MYCEL_LINKS=all,wifidirect`). It needs wpa_supplicant running with
+  D-Bus (`-u`), a Wi-Fi driver with P2P support, and permission to use
+  wpa_supplicant's D-Bus API (root, or the `netdev` group on Debian/Ubuntu).
+  Mycel devices find each other and form a group with no prompt; the group's
+  `p2p-*` interface then shows up as a path. NetworkManager may also try to
+  manage that interface.
+- *Interfaces* need no special permission: the link binds to each
+  interface's IPv6 link-local address (no `CAP_NET_RAW`). Interfaces with IPv6
+  disabled can't be used.
+
 ## 5b. Voice calls (over every path)
 
 1. Open your one-to-one conversation and click the **phone** button in its
@@ -268,9 +311,10 @@ MYCEL_DATA_DIR=/tmp/mycel-b MYCEL_NAME="Laptop B" MYCEL_NET=lan "$APP" &
 - `MYCEL_NAME`: display name; if set, it replaces the saved name on every launch.
 - `MYCEL_NET`: `internet` (every path, the default), `lan` (local paths only,
   never the internet) or `local` (this Mac only). Overrides the Network panel.
-- `MYCEL_LINKS`: `all` (default), `none`, or a list of `awdl,ble`.
+- `MYCEL_LINKS`: `all` (default), `none`, or a list of `awdl,ble,iface` (`iface`: every other network interface; on Linux add `wifidirect` to form Wi-Fi Direct groups). `MYCEL_IFACE_LOG=1` logs the interface link, `MYCEL_PATH_DEBUG=1` every path's RTT / throughput estimate and cost.
 - `MYCEL_IP=0`: turn off ordinary Wi-Fi/Ethernet IP, leaving only peer-to-peer
-  Wi-Fi and Bluetooth (to prove those paths work on their own).
+  Wi-Fi, Bluetooth and other radios or cables (to prove those paths work on
+  their own; the interface link still leaves your Wi-Fi/Ethernet network alone).
 
 ## Troubleshooting
 

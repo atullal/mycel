@@ -912,6 +912,7 @@ impl Shared {
         };
         LinkStatus {
             kind: PathKind::PeerWifi,
+            label: None,
             active: detail.is_none(),
             detail,
             peers,

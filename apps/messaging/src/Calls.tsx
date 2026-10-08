@@ -13,6 +13,11 @@ export const PATH_LABEL: Record<PathKind, string> = {
   peerWifi: "Peer-to-peer Wi-Fi",
   bluetooth: "Bluetooth",
   relay: "Internet relay",
+  wifiDirect: "Wi-Fi Direct",
+  uwb: "UWB",
+  ieee802154: "Thread / 802.15.4",
+  ethernet: "Cable",
+  other: "Other link",
 };
 
 /** How a path reads after "via". */
@@ -21,6 +26,11 @@ export const VIA_LABEL: Record<PathKind, string> = {
   peerWifi: "Peer-to-peer Wi-Fi",
   bluetooth: "Bluetooth",
   relay: "an internet relay",
+  wifiDirect: "Wi-Fi Direct",
+  uwb: "UWB",
+  ieee802154: "Thread / 802.15.4",
+  ethernet: "a cable",
+  other: "another link",
 };
 
 export function formatDuration(ms: number): string {

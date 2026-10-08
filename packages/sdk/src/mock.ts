@@ -1024,6 +1024,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       links: [
         { kind: "peerWifi", active: true, detail: null, peers: 1 },
         { kind: "bluetooth", active: true, detail: null, peers: 1 },
+        { kind: "ethernet", label: "bridge0", active: true, detail: null, peers: 0 },
       ],
       peers: [...people.values()]
         .filter((p) => p.contact && (p.online || p.nearby))
