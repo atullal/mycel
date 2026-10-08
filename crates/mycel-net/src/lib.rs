@@ -66,7 +66,9 @@ pub const POOL_IDLE: Duration = Duration::from_secs(60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 const PERIODIC_SYNC: Duration = Duration::from_secs(15);
 const ONLINE_WINDOW: Duration = Duration::from_secs(45);
-const DEBOUNCE: Duration = Duration::from_millis(80);
+/// Changes are pushed this long after they happen (coalescing a burst). Short:
+/// a sync is one stream on a pooled connection, no handshake.
+const DEBOUNCE: Duration = Duration::from_millis(5);
 /// Max membership ops accepted in a pushed invite.
 const MAX_INVITE_OPS: usize = 4096;
 
@@ -214,7 +216,8 @@ struct Inner {
     /// Spaces needing a push to all members; `None` key = everything (periodic).
     dirty: Mutex<HashSet<SpaceId>>,
     wake: Notify,
-    inflight: Mutex<HashSet<(SignPk, SpaceId)>>,
+    /// Syncs running now; `true` = something changed meanwhile, run again.
+    inflight: Mutex<HashMap<(SignPk, SpaceId), bool>>,
     sync_slots: Semaphore,
     /// Outgoing connections, one per peer, reused for every exchange.
     pool: Pool,
@@ -725,15 +728,32 @@ async fn sync_exchange(
 }
 
 async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
-    if !inner.inflight.lock().insert((peer, space)) {
-        return;
+    {
+        let mut inflight = inner.inflight.lock();
+        if let Some(again) = inflight.get_mut(&(peer, space)) {
+            // One is running: it may have missed this change, so it runs once more.
+            *again = true;
+            return;
+        }
+        inflight.insert((peer, space), false);
     }
     let _slot = inner.sync_slots.acquire().await;
-    let res = tokio::time::timeout(SESSION_TIMEOUT, sync_session(&inner, peer, space, false)).await;
-    inner.inflight.lock().remove(&(peer, space));
-    match res {
-        Ok(Ok(_)) => inner.mark_ok(peer),
-        _ => inner.mark_fail(peer),
+    loop {
+        let res = tokio::time::timeout(SESSION_TIMEOUT, sync_session(&inner, peer, space, false)).await;
+        let ok = matches!(res, Ok(Ok(_)));
+        if ok {
+            inner.mark_ok(peer);
+        } else {
+            inner.mark_fail(peer);
+        }
+        let mut inflight = inner.inflight.lock();
+        match inflight.get_mut(&(peer, space)) {
+            Some(again) if *again && ok => *again = false,
+            _ => {
+                inflight.remove(&(peer, space));
+                return;
+            }
+        }
     }
 }
 

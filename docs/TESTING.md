@@ -2,14 +2,14 @@
 
 ## Automated (run `cargo test --workspace --exclude mycel-host`)
 
-All 159 tests pass and clippy is clean (2026-10-07).
+All 163 tests pass and clippy is clean (2026-10-08).
 
 | Crate | Tests | What they prove |
 |---|---|---|
 | `mycel-crypto` | 14 | Domain separation, framing, kex binding, lockbox info binding, AEAD tamper detection; **streaming attachment AEAD**: chunk-boundary sizes (0, 1, exactly one chunk, many), tamper, wrong key/nonce/AAD, truncation, extension, reorder/duplicate, chunk-size change, legacy one-shot detection, incremental digest == one-shot |
 | `mycel-trust` | 17 | Forged admin ops, pending ops, removal + rotation, concurrent revocation, mutual removal (seniority), delivery-order convergence, rotation recipient checks, bad key commitment, last admin, self-healing rotation, batch insert, leave, **epoch-ID reuse rejected**, **ops from never-added keys dropped** |
 | `mycel-sync` | 14 | Replication, reader writes rejected, keeper can't read, outsider/tampered envelopes, forged actor, backdated writes after removal, 3-way convergence, demotion, feed causal order, restore from storage, 2,000-message ingest, **doc equivocation resolves identically everywhere** |
-| `mycel-net` | 9 | **Links**: two devices with no IP at all sync over in-memory links, prefer peer-to-peer Wi-Fi, fall back to Bluetooth; **a live QUIC connection moves to another link mid-transfer** (failover ≈5 s); Real QUIC between 5 nodes; invites + live sync with no manual calls; refusing invites; contact cards, typing, encrypted blobs; **real mDNS discovery on this machine**; **40 MiB blob streamed to disk, interrupted download resumed from its `.part`, corrupt partial copy detected and refetched from another member while the sender is offline, push policy (small → everyone, big → keepers only)**; free-space guard |
+| `mycel-net` | 13 | **Bandwidth aggregation** (`aggregate.rs`, no IP, rate-limited in-memory links): one stream over two 10 MB/s links ≈ 1.9× one link; one link cut a quarter of the way in, the transfer still completes; a fast link + 20 KB/s Bluetooth, and a fast link + a slow 300 KB/s / 60 ms one, never drop below the fast link alone. **Connection reuse** (`pool.rs`): 20 syncs + a card + a typing message = 1 dial / 1 accepted connection; a peer restarted on the same port is redialed; an idle connection is closed and redialed on use. **Multi-source download** (`multisource.rs`): three members hold a 24 MiB blob, each on its own 4 MB/s link; the fourth downloads from all three at ≈2.6× one source, one source is shut down a third of the way in, the rest comes from the other two, hash-checked and byte-exact. **Links**: two devices with no IP at all sync over in-memory links, prefer peer-to-peer Wi-Fi, fall back to Bluetooth; **a live QUIC connection moves to another link mid-transfer** (failover ≈5 s); Real QUIC between 5 nodes; invites + live sync with no manual calls; refusing invites; contact cards, typing, encrypted blobs; **real mDNS discovery on this machine**; **40 MiB blob streamed to disk, interrupted (multi-source, out-of-order) download resumed from its `.part` + `.ranges`, corrupt partial copy detected and refetched from another member while the sender is offline, push policy (small → everyone, big → keepers only)**; free-space guard |
 | `mycel-call` | 35 | **Live calls.** Unit: Opus round trip keeps a 440 Hz tone, 12 kbps fits ~1.5 KB/s, PLC and FEC; frame codec and stream fallback framing under arbitrary splits; **jitter buffer**: prebuffering, reorder, loss → FEC from the next frame, late and duplicate frames dropped, target grows with jitter but never past 120 ms, underrun → conceal → rebuffer → resume, bursts trimmed; **bitrate controller** (path ceilings, loss/RTT step-down, slow recovery, FEC loss %); resampler pitch/length across rates; call id binds space + caller + nonce; **state machine**: answer and hang-up from either side, decline, ring timeout on both sides, setup timeout, busy, **both call at once → one call**. Integration (two real nodes, real QUIC, test audio): audio both ways with measured latency, mute, hang-up by either side; decline / no answer / missed / busy / **forged rings from a non-member refused**; simultaneous calls merge; **no IP: call starts on peer-to-peer Wi-Fi, the link is cut, the same call continues over a 20 KB/s Bluetooth-like link at 12 kbps**; datagram → stream fallback |
 | `mycel-node` | 11 | Full messaging API on real storage: DMs, delivery → read, replies, reactions, edits, deletes, attachments, **restart persistence**, **keeper delivery while the sender is offline**, group admin removal, **L4 rules rejecting a forged op**, **message requests + declined/blocked strangers stay out**, **contact-code address hints connect without discovery**, **hostile attachment names neutralized**; **voice call refused while the conversation is a message request, then rings, answers, carries audio, mutes and hangs up through the JSON command table**; **120 MiB attachment (past the old 50 MiB cap) byte-exact between two nodes with upload/download progress**, **legacy one-shot attachments still open**, **folders sent as .zip via a `file://` URL**, `file://` decoding, **unreadable files explain why** (missing, permission denied → macOS privacy hint) |
 | `mycel-link-awdl` | 9 | Control datagrams, TXT records, interface filtering; plus 2 ignored Bonjour loopback tests (`-- --ignored`) |
@@ -131,3 +131,36 @@ For two laptops, see [TWO_LAPTOPS.md](TWO_LAPTOPS.md).
 On one Mac the AWDL traffic loops locally, so the real radio test needs two Macs (see TWO_LAPTOPS.md §7). Bluetooth: advertising, L2CAP publishing and scanning were verified on this Mac (121 nearby BLE devices seen); a Mac can't connect to itself, so the Bluetooth path's first real crossing is the two-laptop test.
 
 **Network panel** shows the mode switch, each path's state and which path each person is reached by ([screenshot](screenshots/14-network-paths.png)).
+
+## Multipath aggregation, connection reuse, multi-source downloads (2026-10-08)
+
+**Aggregation** (`crates/mycel-net/tests/aggregate.rs`, two endpoints with no IP, joined only by rate-limited in-memory links with 5 ms latency; one QUIC stream, debug build; `cargo test -p mycel-net --test aggregate -- --nocapture --test-threads=1`):
+
+| Links | Throughput | Bytes per path |
+|---|---|---|
+| one 10 MB/s link | 8.3–8.5 MB/s | all on it |
+| two 10 MB/s links | 16.0–16.5 MB/s (**1.91–1.97×**) | ≈ 20–26 MB on each |
+| two links, one cut at 25 % | 40 MB in ≈ 11 s | the live one takes over after ≈ 5 s |
+| 10 MB/s + 20 KB/s Bluetooth | 7.9–8.3 MB/s (fast link alone: 8.0–8.3) | Bluetooth 0.0 MB (backup) |
+| 10 MB/s + slow "peer Wi-Fi" (300 KB/s, 60 ms) | 7.7–8.2 MB/s | slow link 0.2–0.3 MB |
+
+The single-link figure is under 10 MB/s because the in-memory "radio" drops packets once its 250 ms queue is full, and Cubic keeps filling it. In the cut case, the bytes that were in flight on the dead path are resent only when that path's 5 s idle timeout closes it (noq requeues them when it discards the path). Until then the stream is held up at that hole, so a cut costs about 5 s, then everything continues on the live path.
+
+**Connection reuse** (`tests/pool.rs`, two nodes on loopback): first sync with the handshake 24–37 ms, then **2.0–4.0 ms per sync** on the pooled connection. 20 syncs + a card + a typing message = **1 dial, 1 accepted connection**. After the peer restarts on the same port, the next sync redials it (26–30 ms).
+
+**Multi-source** (`tests/multisource.rs`, each source on its own 4 MB/s link to the downloader): one source 3.6–3.7 MB/s; three sources **9.4–9.7 MB/s (2.6×)**. One source shut down a third of the way in; the 24 MiB finished in about 3.0 s from the other two, hash-checked and byte-exact. Each source served 8–13 MB.
+
+**Real devices on this Mac** (two `mycel serve --net local` processes, driven over the HTTP API by a script; "before" = commit `5cb1454`, debug builds):
+
+| | Before | After |
+|---|---|---|
+| 10 consecutive messages, send → visible on the other device | 92–104 ms each (median 94) | **11–20 ms** (first 20, median 12) |
+| first message after 65 s quiet | n/a | 24 ms (the 15 s periodic sync keeps the pooled connection warm) |
+| 1 GiB attachment: fetch + decrypt | 141.7 s (8 MB/s) | 111.9–131.6 s (8–10 MB/s); release build 100.6 s (11 MB/s) |
+| sha256 / peak RSS (alice / bob) | match / 43 / 36 MB | match / 47–52 / 36–39 MB |
+
+Message latency was mostly the scheduler's 80 ms debounce, which made sense while every sync paid a handshake. On a pooled connection a sync is one stream, so changes are now pushed after 5 ms, and a change made while a sync to that peer is running triggers one more sync (before, it waited for the next 15 s periodic sync).
+
+**The 1 GiB transfer is capped by the platform, not by Mycel**: a bare QUIC stream between two plain *upstream* Iroh 1.3.0 endpoints (no Mycel code, no patch) on this Mac does 9–10 MB/s over 127.0.0.1 and over the Mac's own interface address. That's with no loss, a 1.4–2.6 ms RTT and a 300 MB congestion window, and it's the same with noq-udp's `fast-apple-datapath`. Mycel's own figures match it. With only loopback here, aggregation can't show a real gain, so the aggregation numbers above come from the in-memory links. This doesn't explain the 21 s/GiB measured on 2026-10-07 (LAN mode); it's worth chasing upstream (noq's macOS UDP path).
+
+Re-run: `head -c 1073741824 /dev/urandom > /tmp/big.bin; python3 scripts/net-bench.py target/debug/mycel /tmp/bench after /tmp/big.bin [--cold]`. It starts both devices (`--net local`, ports 7811/7812), exchanges contact codes, creates a DM, then times messages and the attachment.

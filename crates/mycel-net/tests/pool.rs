@@ -12,6 +12,7 @@ use mycel_sync::{
     automerge::{ROOT, transaction::Transactable},
 };
 use mycel_trust::Role;
+use serde_json::json;
 
 async fn node(keys: Arc<DeviceKeys>, name: &str, port: u16) -> Node {
     let mut opts = NodeOptions::new(NetMode::Local, name);
@@ -41,9 +42,10 @@ async fn syncs_reuse_one_connection_and_redial_after_restart() {
     for i in 0..N {
         alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "n", i as i64))).unwrap().unwrap();
         let t = Instant::now();
-        let stats = bob.sync_with(alice.id(), space, false).await.unwrap();
+        bob.sync_with(alice.id(), space, false).await.unwrap();
         later += t.elapsed();
-        assert!(stats.ops + stats.envelopes > 0 || i == 0, "sync {i} carried the change");
+        // (bob's own background push may have fetched it a moment earlier)
+        assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(), json!({"n": i}), "sync {i} carried the change");
     }
     eprintln!("first sync (with handshake) {first:?}, then {:?} per sync on the pooled connection", later / N as u32);
     // Card and ephemeral messages ride the same connection.
