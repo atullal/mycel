@@ -136,9 +136,14 @@ impl TrackSink for VideoHub {
                 }
             }
         };
-        v.add_peer(peer.0, conn.clone(), selected_path(conn).0);
-        for (kind, rx) in self.early.lock().remove(&(*call, *peer)).unwrap_or_default() {
-            let _ = v.stream(&peer.0, kind, rx);
+        {
+            // (under the early lock, so a stream can't slip in between
+            // adding the track and draining what arrived before it)
+            let mut early = self.early.lock();
+            v.add_peer(peer.0, conn.clone(), selected_path(conn).0);
+            for (kind, rx) in early.remove(&(*call, *peer)).unwrap_or_default() {
+                let _ = v.stream(&peer.0, kind, rx);
+            }
         }
         if fresh && self.wanted.lock().contains(call) {
             // (starting the camera may block a moment; a failure shows in
@@ -155,19 +160,25 @@ impl TrackSink for VideoHub {
         }
     }
 
-    fn datagram(&self, _call: &CallId, _peer: &SignPk, _kind: u8, _data: Bytes) {}
+    fn datagram(&self, call: &CallId, peer: &SignPk, kind: u8, data: Bytes) {
+        if mycel_video::wire::is_video_kind(kind)
+            && let Some(v) = self.call(call)
+        {
+            v.datagram(&peer.0, &data);
+        }
+    }
 
     fn stream(&self, call: &CallId, peer: &SignPk, kind: u8, stream: RecvStream) {
         if !mycel_video::wire::is_video_kind(kind) {
             return;
         }
+        let mut early = self.early.lock();
         let left = match self.call(call) {
             Some(v) => v.stream(&peer.0, kind, stream),
             None => Some(stream),
         };
         if let Some(rx) = left {
             // hold it for the leg (a few at most: the control stream, a frame or two)
-            let mut early = self.early.lock();
             let q = early.entry((*call, *peer)).or_default();
             if q.len() < 32 {
                 q.push((kind, rx));

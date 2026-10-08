@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, ensure};
 use bytes::Bytes;
 use mycel_net::PathKind;
-use mycel_net::iroh::endpoint::{Connection, ReadError, ReadExactError, RecvStream, SendStream};
+use mycel_net::iroh::endpoint::{Connection, ReadError, ReadExactError, RecvStream, SendDatagramError, SendStream};
 use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
@@ -368,11 +368,24 @@ impl VideoTrack {
         });
     }
 
+    /// A video datagram from this peer (kind byte included).
+    pub fn accept_datagram(&self, d: &[u8]) {
+        let _ = read_ctrl_datagram(&self.shared, d);
+    }
+
     /// Standalone use (no call engine): accept this connection's streams
-    /// ourselves, routing video kinds to [`VideoTrack::accept_stream`].
+    /// and datagrams ourselves, routing video kinds to this track.
     pub fn serve(&self) {
         let sh = self.shared.clone();
         let conn = sh.conn.clone();
+        {
+            let (sh, conn) = (sh.clone(), conn.clone());
+            self.rt.spawn(async move {
+                while let Ok(d) = conn.read_datagram().await {
+                    let _ = read_ctrl_datagram(&sh, &d);
+                }
+            });
+        }
         let rt = self.rt.clone();
         self.rt.spawn(async move {
             while let Ok(mut rx) = conn.accept_uni().await {
@@ -710,14 +723,36 @@ async fn send_frames(sh: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<EncodedFra
     }
 }
 
+/// Control messages go as datagrams (kind byte, then the message): they're
+/// small and repeated where it matters (state every second, keyframe
+/// requests until answered), and unlike a stream they can't get stuck
+/// behind video data QUIC is still recovering after a path change. A path
+/// that can't carry datagrams gets them on a control stream instead.
 async fn write_ctrl(sh: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<VideoCtrl>) {
-    let Ok(mut tx) = sh.conn.open_uni().await else { return };
-    let _ = tx.set_priority(CTRL_PRIORITY);
-    if tx.write_all(&ctrl_stream_header()).await.is_err() {
-        return;
-    }
+    let mut stream: Option<SendStream> = None;
     while let Some(m) = rx.recv().await {
-        if tx.write_all(&m.encode()).await.is_err() {
+        let body = m.encode();
+        if stream.is_none() {
+            let mut d = Vec::with_capacity(1 + body.len());
+            d.push(KIND_CTRL);
+            d.extend_from_slice(&body);
+            match sh.conn.send_datagram(Bytes::from(d)) {
+                Ok(()) => continue,
+                Err(SendDatagramError::ConnectionLost(_)) => return,
+                Err(_) => {}
+            }
+        }
+        if stream.is_none() {
+            let Ok(mut tx) = sh.conn.open_uni().await else { return };
+            let _ = tx.set_priority(CTRL_PRIORITY);
+            if tx.write_all(&ctrl_stream_header()).await.is_err() {
+                return;
+            }
+            stream = Some(tx);
+        }
+        if let Some(tx) = stream.as_mut()
+            && tx.write_all(&body).await.is_err()
+        {
             return;
         }
     }
@@ -729,8 +764,10 @@ async fn tick(sh: Arc<Shared>) {
     let mut ticker = tokio::time::interval(TICK);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut was_paused = sh.ctl.lock().paused();
+    let mut ticks: u64 = 0;
     loop {
         ticker.tick().await;
+        ticks += 1;
         let now = Instant::now();
         let (path, rtt) = match sh.conn.paths().iter().find(|p| p.is_selected()) {
             Some(p) => (Some(PathKind::of(p.remote_addr())), p.rtt()),
@@ -761,6 +798,10 @@ async fn tick(sh: Arc<Shared>) {
         if paused != was_paused {
             was_paused = paused;
             sh.force_key.store(true, Ordering::SeqCst);
+            let _ = sh.ctrl_tx.send(sh.sending_state());
+        } else if ticks.is_multiple_of(20) {
+            // and once a second anyway (a few bytes): whatever the other
+            // side missed (a replaced connection, a late track) heals itself
             let _ = sh.ctrl_tx.send(sh.sending_state());
         }
         // frames stuck too long: give up on them and start over from a keyframe
@@ -855,21 +896,36 @@ async fn read_ctrl(sh: &Shared, mut rx: RecvStream) -> Result<()> {
         };
         de.push(&buf[..n]);
         while let Some(m) = de.next_msg()? {
-            match m {
-                VideoCtrl::KeyframeRequest { missing } => {
-                    // a keyframe after the missing frame is already on its way
-                    let covered = sh.send.lock().last_key.is_some_and(|k| k >= missing);
-                    if !covered {
-                        sh.force_key.store(true, Ordering::SeqCst);
-                    }
-                }
-                VideoCtrl::Dropped { seq } => frame_lost(sh, seq),
-                VideoCtrl::State { camera, paused } => {
-                    let mut r = sh.recv.lock();
-                    r.remote_camera = camera;
-                    r.remote_paused = paused;
-                }
+            on_ctrl(sh, m);
+        }
+    }
+}
+
+/// A control datagram (kind byte, then one message).
+fn read_ctrl_datagram(sh: &Shared, d: &[u8]) -> Result<()> {
+    ensure!(d.first() == Some(&KIND_CTRL), "not a video control datagram");
+    let mut de = CtrlDeframer::default();
+    de.push(&d[1..]);
+    while let Some(m) = de.next_msg()? {
+        on_ctrl(sh, m);
+    }
+    Ok(())
+}
+
+fn on_ctrl(sh: &Shared, m: VideoCtrl) {
+    match m {
+        VideoCtrl::KeyframeRequest { missing } => {
+            // a keyframe after the missing frame is already on its way
+            let covered = sh.send.lock().last_key.is_some_and(|k| k >= missing);
+            if !covered {
+                sh.force_key.store(true, Ordering::SeqCst);
             }
+        }
+        VideoCtrl::Dropped { seq } => frame_lost(sh, seq),
+        VideoCtrl::State { camera, paused } => {
+            let mut r = sh.recv.lock();
+            r.remote_camera = camera;
+            r.remote_paused = paused;
         }
     }
 }

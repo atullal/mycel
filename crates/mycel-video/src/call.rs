@@ -75,6 +75,13 @@ impl VideoCall {
         }
     }
 
+    /// A video datagram from `peer` (kind byte included).
+    pub fn datagram(&self, peer: &[u8; 32], d: &[u8]) {
+        if let Some(t) = self.tracks.lock().get(peer) {
+            t.accept_datagram(d);
+        }
+    }
+
     /// Ask for permission now if it's never been asked (blocking: the
     /// system prompt waits for the user). Errors say what to do.
     pub fn prepare(&self) -> Result<()> {

@@ -21,8 +21,9 @@
 //! ..     the frame: H.264 NAL units, each prefixed with its u32 BE length
 //! ```
 //!
-//! The control stream (one per direction) carries [`VideoCtrl`] messages,
-//! each a u16 LE length and postcard bytes.
+//! Control messages ([`VideoCtrl`]: each a u16 LE length and postcard
+//! bytes) go in datagrams starting with kind 0x11, or, on a path without
+//! datagrams, on one control stream (kind 0x11) per direction.
 
 use anyhow::{Result, bail, ensure};
 use bytes::{BufMut, Bytes, BytesMut};

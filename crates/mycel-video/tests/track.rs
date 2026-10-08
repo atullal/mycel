@@ -83,9 +83,17 @@ struct Pair {
     _nodes: (Arc<Node>, Arc<Node>),
 }
 
-/// What the call engine does: hand the connection's video streams (by
-/// their kind byte) to the call's video.
+/// What the call engine does: hand the connection's video streams and
+/// datagrams (by their kind byte) to the call's video.
 fn route(conn: Connection, video: Arc<VideoCall>, peer: [u8; 32]) {
+    {
+        let (conn, video) = (conn.clone(), video.clone());
+        tokio::spawn(async move {
+            while let Ok(d) = conn.read_datagram().await {
+                video.datagram(&peer, &d);
+            }
+        });
+    }
     tokio::spawn(async move {
         while let Ok(mut rx) = conn.accept_uni().await {
             let mut kind = [0u8; 1];
