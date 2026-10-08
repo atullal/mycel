@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useContacts, useMycel, useNearby, useNetwork, useProfile } from "@mycel/sdk/react";
-import type { LinkStatus, NetworkMode, NetworkStatus, PathKind } from "@mycel/sdk";
+import type { LinkStatus, NetworkMode, NetworkStatus, PathKind, PeerPaths } from "@mycel/sdk";
 import { initials, toneFor } from "./common.tsx";
 
 const MODE: Record<NetworkMode, { name: string; text: string }> = {
@@ -28,7 +28,18 @@ const PATH: Record<PathKind, { name: string; text: string }> = {
   ieee802154: { name: "Thread / 802.15.4", text: "Low-power radio (Thread, 6LoWPAN): very slow, fine for messages." },
   ethernet: { name: "Cable", text: "A direct cable: Ethernet, Thunderbolt or USB." },
   other: { name: "Other link", text: "Another network interface on this device." },
+  mesh: {
+    name: "Mesh",
+    text: "Through other nearby Mycel devices, hop by hop, when someone is out of range. They can't read it.",
+  },
 };
+
+/** "via Peer-to-peer Wi-Fi", or "via Mesh (via Bob, 2 hops)". */
+function viaText(p: PeerPaths): string {
+  if (!p.via) return p.online ? "reachable" : "offline";
+  if (p.via === "mesh" && p.mesh) return `via Mesh (via ${p.mesh.viaName}, ${p.mesh.hops} hops)`;
+  return `via ${PATH[p.via].name}`;
+}
 
 /** One row per path: is it working, and how many devices it reaches. */
 function pathRows(status: NetworkStatus): { kind: PathKind; label?: string | null; on: boolean; text: string }[] {
@@ -52,7 +63,7 @@ function pathRows(status: NetworkStatus): { kind: PathKind; label?: string | nul
   }
   // Any other radio or interface this device has (UWB, Wi-Fi Direct, a cable, ...)
   for (const l of status.links) {
-    if (l.kind === "peerWifi" || l.kind === "bluetooth") continue;
+    if (l.kind === "peerWifi" || l.kind === "bluetooth" || l.kind === "mesh") continue;
     rows.push({
       kind: l.kind,
       label: l.label,
@@ -65,6 +76,12 @@ function pathRows(status: NetworkStatus): { kind: PathKind; label?: string | nul
       ? { kind: "relay", on: true, text: "On when the internet is available" }
       : { kind: "relay", on: false, text: "Off (local only)" },
   );
+  const mesh = link("mesh");
+  if (mesh) {
+    // "1 device" reached through others; else what the mesh is doing
+    const text = mesh.peers > 0 ? `${devices(mesh.peers)} out of range` : (mesh.detail ?? "On");
+    rows.push({ kind: "mesh", on: mesh.active, text });
+  }
   return rows;
 }
 
@@ -247,7 +264,7 @@ export function NetworkPanel() {
                 <span className="p-path-dot" aria-hidden="true" />
                 <span className="p-path-name">{p.name}</span>
                 <span className="p-path-state">
-                  {p.via ? `via ${PATH[p.via].name}` : p.online ? "reachable" : "offline"}
+                  {viaText(p)}
                   {p.available.length > 1 && ` · ${p.available.length} paths`}
                 </span>
               </li>

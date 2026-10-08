@@ -117,6 +117,7 @@ export type NetworkMode = "local" | "lan" | "internet";
  * - `peerWifi`: Apple peer-to-peer Wi-Fi (like AirDrop), no shared network needed
  * - `bluetooth`: Bluetooth LE, slow, no Wi-Fi needed
  * - `relay`: through an encrypted internet relay
+ * - `mesh`: relayed hop by hop by other nearby Mycel devices (they can't read it)
  */
 /**
  * The medium a path travels over. Path selection ranks paths by what they
@@ -135,7 +136,8 @@ export type PathKind =
   | "uwb"
   | "ieee802154"
   | "ethernet"
-  | "other";
+  | "other"
+  | "mesh";
 
 /** A link: peer-to-peer Wi-Fi, Bluetooth, or one kind of network interface. */
 export interface LinkStatus {
@@ -157,6 +159,17 @@ export interface PeerPaths {
   via: PathKind | null;
   /** Paths available without the internet. */
   available: PathKind[];
+  /** When `via` is `mesh`: the nearby device it goes through, and how many hops. */
+  mesh: MeshVia | null;
+}
+
+/** A mesh route: "Mesh (via Bob, 2 hops)". */
+export interface MeshVia {
+  /** The neighbour it leaves through (needn't be a contact). */
+  via: PeerId;
+  viaName: string;
+  /** Hops to the peer (2 = one device in between). */
+  hops: number;
 }
 
 export interface NetworkStatus {

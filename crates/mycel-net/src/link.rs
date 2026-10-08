@@ -40,6 +40,8 @@ pub const TRANSPORT_BLUETOOTH: u64 = 0x6d79_6302;
 /// Any network interface (`mycel-link-iface`): the address carries the
 /// medium, see [`PathKind::of_custom_addr`].
 pub const TRANSPORT_IFACE: u64 = 0x6d79_6320;
+/// Multi-hop mesh (`mesh.rs`): QUIC packets relayed by other devices.
+pub const TRANSPORT_MESH: u64 = 0x6d79_6303;
 /// In-memory links for tests ([`MemNet`]) pick their own ids.
 pub const TRANSPORT_TEST_BASE: u64 = 0x6d79_63f0;
 
@@ -69,11 +71,14 @@ pub enum PathKind {
     /// Any other network interface (802.11s or ad-hoc Wi-Fi mesh, ...); the
     /// link's status names it.
     Other,
+    /// Relayed hop by hop by other nearby Mycel devices, over whatever links
+    /// they have (end-to-end encrypted; see `mesh.rs`).
+    Mesh,
 }
 
 impl PathKind {
     /// Every kind, in a stable order (wire codes are indexes into this).
-    pub const ALL: [PathKind; 9] = [
+    pub const ALL: [PathKind; 10] = [
         PathKind::Network,
         PathKind::PeerWifi,
         PathKind::Bluetooth,
@@ -83,6 +88,7 @@ impl PathKind {
         PathKind::Ieee802154,
         PathKind::Ethernet,
         PathKind::Other,
+        PathKind::Mesh,
     ];
 
     /// One-byte code carried in link addresses.
@@ -99,6 +105,7 @@ impl PathKind {
         match id {
             TRANSPORT_BLUETOOTH => PathKind::Bluetooth,
             TRANSPORT_IFACE => PathKind::Other,
+            TRANSPORT_MESH => PathKind::Mesh,
             // test links pretend to be peer Wi-Fi unless they use the BT id
             _ => PathKind::PeerWifi,
         }
@@ -152,6 +159,10 @@ impl PathKind {
             PathKind::Bluetooth => 30.0 * KB,
             // 250 kbit/s, 6LoWPAN headers and mesh-under hops
             PathKind::Ieee802154 => 15.0 * KB,
+            // at least two hops over links we don't know: below the relay
+            // until measured. (A mesh path never competes with a direct one:
+            // devices with a direct path get no mesh addresses.)
+            PathKind::Mesh => 500.0 * KB,
         }
     }
 
@@ -166,6 +177,7 @@ impl PathKind {
             PathKind::Ieee802154 => "Thread / 802.15.4",
             PathKind::Ethernet => "Cable",
             PathKind::Other => "Other link",
+            PathKind::Mesh => "Mesh",
         }
     }
 }

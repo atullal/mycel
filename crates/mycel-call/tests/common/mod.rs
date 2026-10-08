@@ -11,7 +11,7 @@ use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallInfo, CallManage
 use mycel_crypto::{DeviceKeys, Hash32, SignPk};
 use mycel_net::iroh::endpoint::Connection;
 use mycel_net::link::{Link, MemNet};
-use mycel_net::{ExtraProtocol, NetMode, Node, NodeOptions};
+use mycel_net::{ExtraProtocol, MeshOptions, NetMode, Node, NodeOptions};
 use mycel_trust::Role;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -108,9 +108,15 @@ impl Device {
 }
 
 pub async fn device(name: &str, source: TestSource, ip: bool, nets: &[&MemNet]) -> Device {
+    device_with(name, source, ip, nets, None).await
+}
+
+#[allow(dead_code)] // not every test binary uses the mesh
+pub async fn device_with(name: &str, source: TestSource, ip: bool, nets: &[&MemNet], mesh: Option<MeshOptions>) -> Device {
     let keys = Arc::new(DeviceKeys::generate());
     let mut opts = NodeOptions::new(NetMode::Local, name);
     opts.ip = ip;
+    opts.mesh = mesh;
     opts.links = nets.iter().map(|n| n.link(keys.sign_pk()) as Arc<dyn Link>).collect();
     let (tx, rx) = mpsc::unbounded_channel();
     opts.extra_protocols.push(ExtraProtocol { alpn: ALPN_CALL.to_vec(), incoming: tx });

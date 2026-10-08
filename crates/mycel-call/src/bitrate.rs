@@ -17,7 +17,8 @@ pub const FLOOR: u32 = 8_000;
 pub fn ceiling(kind: PathKind) -> u32 {
     match kind {
         PathKind::Network | PathKind::PeerWifi => 32_000,
-        PathKind::Relay => 24_000,
+        // mesh hops may be Bluetooth: start lower; loss and RTT steer it from there
+        PathKind::Relay | PathKind::Mesh => 24_000,
         PathKind::Bluetooth => 12_000,
         // any other medium, by what it typically carries
         other if other.prior_rate() >= 1_000_000.0 => 32_000,
