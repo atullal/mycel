@@ -1,0 +1,477 @@
+//! A fake radio for tests: runs the real state machine, framing, routing and
+//! Iroh transport of several in-process links, with the CoreBluetooth calls
+//! replaced by an in-memory "air". Proves everything above the radio.
+
+use std::collections::HashMap;
+use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Weak};
+use std::time::Duration;
+
+use bytes::Bytes;
+use mycel_crypto::SignPk;
+use parking_lot::Mutex;
+
+use crate::core::{ChanId, Cmd, Input};
+use crate::hub::{ChannelRx, Hub, PacketSink, Radio};
+use crate::wire::{GattInfo, OutQueue, encode_hello};
+use crate::{Backend, BleLink, OUT_QUEUE_BYTES};
+
+enum Job {
+    Input(usize, Input),
+    Cmd(usize, Cmd),
+    Bytes { to: usize, chan: ChanId, data: Bytes },
+}
+
+struct End {
+    node: usize,
+    chan: ChanId,
+}
+
+/// One L2CAP channel between two nodes.
+struct Pair {
+    dialer: End,
+    acceptor: End,
+}
+
+#[derive(Default)]
+struct AirInner {
+    keys: Vec<(SignPk, String)>,
+    hubs: HashMap<usize, Weak<Hub>>,
+    rx: HashMap<(usize, ChanId), ChannelRx>,
+    pairs: Vec<Pair>,
+    next_chan: ChanId,
+    cut: bool,
+}
+
+pub struct Air {
+    inner: Mutex<AirInner>,
+    tx: std_mpsc::Sender<Job>,
+    /// `Some(bytes/s)`: channels are rate-limited like a real radio, with the
+    /// same bounded drop-when-full queue the macOS backend uses.
+    rate: Option<usize>,
+    slow: Mutex<Vec<Arc<SlowSink>>>,
+}
+
+/// A rate-limited channel end: frames queue (bounded, dropped when full) and
+/// a radio thread moves `rate` bytes/s, in arbitrary chunks, to the peer.
+struct SlowSink {
+    tx: std_mpsc::Sender<Job>,
+    to: usize,
+    chan: ChanId,
+    q: Mutex<OutQueue>,
+}
+
+impl PacketSink for SlowSink {
+    fn send(&self, frame: Bytes) -> bool {
+        self.q.lock().push(frame)
+    }
+}
+
+fn pid(n: usize) -> String {
+    format!("p{n}")
+}
+
+fn idx(pid: &str) -> usize {
+    pid[1..].parse().unwrap()
+}
+
+struct FakeBackend {
+    air: Arc<Air>,
+    me: usize,
+}
+
+impl Backend for FakeBackend {
+    fn start(&self, hub: Arc<Hub>) -> anyhow::Result<()> {
+        hub.set_radio(Radio::On);
+        let others: Vec<usize> = {
+            let mut a = self.air.inner.lock();
+            a.hubs.insert(self.me, Arc::downgrade(&hub));
+            a.hubs.keys().copied().filter(|n| *n != self.me).collect()
+        };
+        for o in others {
+            self.air.job(Job::Input(self.me, Input::Discovered(pid(o))));
+            self.air.job(Job::Input(o, Input::Discovered(pid(self.me))));
+        }
+        Ok(())
+    }
+}
+
+struct FakeSink {
+    tx: std_mpsc::Sender<Job>,
+    to: usize,
+    chan: ChanId,
+}
+
+impl PacketSink for FakeSink {
+    fn send(&self, frame: Bytes) -> bool {
+        self.tx.send(Job::Bytes { to: self.to, chan: self.chan, data: frame }).is_ok()
+    }
+}
+
+impl Air {
+    pub fn new() -> Arc<Air> {
+        Self::with_rate(None)
+    }
+
+    pub fn with_rate(rate: Option<usize>) -> Arc<Air> {
+        let (tx, rx) = std_mpsc::channel();
+        let air = Arc::new(Air { inner: Mutex::default(), tx, rate, slow: Mutex::default() });
+        if let Some(rate) = rate {
+            let weak = Arc::downgrade(&air);
+            std::thread::spawn(move || {
+                const SLICE: Duration = Duration::from_millis(5);
+                loop {
+                    std::thread::sleep(SLICE);
+                    let Some(air) = weak.upgrade() else { return };
+                    let sinks = air.slow.lock().clone();
+                    for s in sinks {
+                        let mut budget = rate * SLICE.as_millis() as usize / 1000;
+                        let mut q = s.q.lock();
+                        while budget > 0 {
+                            let Some(chunk) = q.peek() else { break };
+                            let n = chunk.len().min(budget);
+                            let data = Bytes::copy_from_slice(&chunk[..n]);
+                            q.advance(n);
+                            budget -= n;
+                            let _ = s.tx.send(Job::Bytes { to: s.to, chan: s.chan, data });
+                        }
+                    }
+                }
+            });
+        }
+        let weak = Arc::downgrade(&air);
+        std::thread::spawn(move || {
+            while let Ok(job) = rx.recv() {
+                let Some(air) = weak.upgrade() else { return };
+                air.run(job);
+            }
+        });
+        let weak = Arc::downgrade(&air);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(200));
+                let Some(air) = weak.upgrade() else { return };
+                let nodes: Vec<usize> = air.inner.lock().hubs.keys().copied().collect();
+                for n in nodes {
+                    air.job(Job::Input(n, Input::Tick));
+                }
+            }
+        });
+        air
+    }
+
+    pub fn link(self: &Arc<Self>, me: SignPk, name: &str) -> Arc<BleLink> {
+        let n = {
+            let mut a = self.inner.lock();
+            a.keys.push((me, name.to_string()));
+            a.keys.len() - 1
+        };
+        BleLink::new(me, name, Box::new(FakeBackend { air: self.clone(), me: n }))
+    }
+
+    /// Radio silence: every channel drops, nothing connects.
+    pub fn cut(&self) {
+        let pairs = {
+            let mut a = self.inner.lock();
+            a.cut = true;
+            std::mem::take(&mut a.pairs)
+        };
+        for p in pairs {
+            self.close_end(&p.dialer);
+            self.close_end(&p.acceptor);
+        }
+    }
+
+    /// Back in range: everyone sees everyone again.
+    pub fn restore(&self) {
+        let nodes: Vec<usize> = {
+            let mut a = self.inner.lock();
+            a.cut = false;
+            a.hubs.keys().copied().collect()
+        };
+        for &n in &nodes {
+            for &o in &nodes {
+                if n != o {
+                    self.job(Job::Input(n, Input::Discovered(pid(o))));
+                }
+            }
+        }
+    }
+
+    pub fn channels(&self) -> usize {
+        self.inner.lock().pairs.len()
+    }
+
+    fn job(&self, j: Job) {
+        let _ = self.tx.send(j);
+    }
+
+    fn hub(&self, n: usize) -> Option<Arc<Hub>> {
+        self.inner.lock().hubs.get(&n).and_then(|w| w.upgrade())
+    }
+
+    fn input(&self, n: usize, i: Input) {
+        let Some(hub) = self.hub(n) else { return };
+        for c in hub.input(i) {
+            self.job(Job::Cmd(n, c));
+        }
+    }
+
+    fn close_end(&self, e: &End) {
+        self.inner.lock().rx.remove(&(e.node, e.chan));
+        if let Some(h) = self.hub(e.node) {
+            h.remove_sink(e.chan);
+        }
+        self.job(Job::Input(e.node, Input::ChannelClosed(e.chan)));
+    }
+
+    fn close_where(&self, f: impl Fn(&Pair) -> bool) {
+        let gone: Vec<Pair> = {
+            let mut a = self.inner.lock();
+            let (gone, keep) = std::mem::take(&mut a.pairs).into_iter().partition(|p| f(p));
+            a.pairs = keep;
+            gone
+        };
+        for p in gone {
+            self.close_end(&p.dialer);
+            self.close_end(&p.acceptor);
+        }
+    }
+
+    fn run(&self, job: Job) {
+        match job {
+            Job::Input(n, i) => self.input(n, i),
+            Job::Bytes { to, chan, data } => {
+                let Some(hub) = self.hub(to) else { return };
+                let mut a = self.inner.lock();
+                let Some(rx) = a.rx.get_mut(&(to, chan)) else { return };
+                let res = rx.on_bytes(&hub, chan, &data);
+                drop(a);
+                match res {
+                    Ok(cmds) => cmds.into_iter().for_each(|c| self.job(Job::Cmd(to, c))),
+                    Err(e) => panic!("bad stream: {e:?}"),
+                }
+            }
+            Job::Cmd(n, cmd) => self.exec(n, cmd),
+        }
+    }
+
+    fn exec(&self, n: usize, cmd: Cmd) {
+        let cut = self.inner.lock().cut;
+        match cmd {
+            Cmd::Connect(p) if cut => self.job(Job::Input(n, Input::ConnectFailed(p))),
+            Cmd::Connect(p) => self.job(Job::Input(n, Input::Connected(p))),
+            Cmd::ReadInfo(p) => {
+                let (key, name) = self.inner.lock().keys[idx(&p)].clone();
+                self.job(Job::Input(n, Input::Info(p, GattInfo { psm: 0x80, key, name })));
+            }
+            Cmd::OpenChannel(p, _) => {
+                let o = idx(&p);
+                let (Some(hn), Some(ho)) = (self.hub(n), self.hub(o)) else { return };
+                let (cn, co, kn, ko) = {
+                    let mut a = self.inner.lock();
+                    let cn = a.next_chan;
+                    let co = a.next_chan + 1;
+                    a.next_chan += 2;
+                    a.rx.insert((n, cn), ChannelRx::default());
+                    a.rx.insert((o, co), ChannelRx::default());
+                    a.pairs.push(Pair { dialer: End { node: n, chan: cn }, acceptor: End { node: o, chan: co } });
+                    (cn, co, a.keys[n].clone(), a.keys[o].clone())
+                };
+                self.job(Job::Input(n, Input::ChannelOpened { chan: cn, pid: Some(p) }));
+                self.job(Job::Input(o, Input::ChannelOpened { chan: co, pid: None }));
+                for (hub, chan, to, to_chan, me) in [(&hn, cn, o, co, kn), (&ho, co, n, cn, ko)] {
+                    let hello = encode_hello(&me.0, &me.1);
+                    if self.rate.is_some() {
+                        let mut q = OutQueue::new(OUT_QUEUE_BYTES);
+                        q.push(hello);
+                        let sink = Arc::new(SlowSink { tx: self.tx.clone(), to, chan: to_chan, q: Mutex::new(q) });
+                        self.slow.lock().push(sink.clone());
+                        hub.add_sink(chan, sink);
+                    } else {
+                        hub.add_sink(chan, Arc::new(FakeSink { tx: self.tx.clone(), to, chan: to_chan }));
+                        self.job(Job::Bytes { to, chan: to_chan, data: hello });
+                    }
+                }
+            }
+            Cmd::CloseChannel(c) => {
+                self.close_where(|p| (p.dialer.node == n && p.dialer.chan == c) || (p.acceptor.node == n && p.acceptor.chan == c))
+            }
+            Cmd::Disconnect(p) => {
+                let o = idx(&p);
+                // the L2CAP channels dialed over this connection die with it
+                self.close_where(|pair| pair.dialer.node == n && pair.acceptor.node == o);
+                self.job(Job::Input(n, Input::Disconnected(p)));
+            }
+            Cmd::Rescan if !cut => {
+                let nodes: Vec<usize> = self.inner.lock().hubs.keys().copied().collect();
+                for o in nodes.into_iter().filter(|o| *o != n) {
+                    self.job(Job::Input(n, Input::Discovered(pid(o))));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mycel_crypto::DeviceKeys;
+    use mycel_net::link::{Link, PathKind};
+    use mycel_net::{NetMode, Node, NodeOptions};
+    use mycel_sync::{
+        Replica,
+        automerge::{ROOT, transaction::Transactable},
+    };
+    use mycel_trust::Role;
+    use serde_json::json;
+
+    async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    async fn node(air: &Arc<Air>, name: &str) -> (Node, Arc<BleLink>) {
+        let keys = Arc::new(DeviceKeys::generate());
+        let link = air.link(keys.sign_pk(), name);
+        let mut opts = NodeOptions::new(NetMode::Local, name);
+        opts.ip = false;
+        opts.links = vec![link.clone() as Arc<dyn Link>];
+        (Node::spawn(keys, opts).await.unwrap(), link)
+    }
+
+    /// Real QUIC between two nodes over the BLE link stack (framing, state
+    /// machine, routing, transport) with a fake radio; one channel per pair;
+    /// Lost when the radio goes quiet and relinked when it comes back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn nodes_sync_over_the_ble_stack() {
+        let air = Air::new();
+        let (alice, alice_link) = node(&air, "alice").await;
+        let (bob, _bob_link) = node(&air, "bob").await;
+
+        eventually("linked both ways", || {
+            alice.peers().get(&bob.id()).is_some_and(|p| p.links.contains(&PathKind::Bluetooth))
+                && bob.peers().get(&alice.id()).is_some_and(|p| p.links.contains(&PathKind::Bluetooth))
+        })
+        .await;
+        assert_eq!(air.channels(), 1, "tie-break: exactly one channel for the pair");
+        assert_eq!(alice.peers()[&bob.id()].name.as_deref(), Some("bob"));
+        let st = alice_link.status();
+        assert!(st.active && st.peers == 1 && st.detail.is_none(), "{st:?}");
+
+        let (space, genesis) = alice.create_space().unwrap();
+        alice.with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer)).unwrap().unwrap();
+        bob.join_space(genesis).unwrap();
+        bob.sync_with(alice.id(), space, true).await.unwrap();
+        let doc = Replica::new_doc_id();
+        alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "msg", "hi over bluetooth"))).unwrap().unwrap();
+        bob.sync_with(alice.id(), space, false).await.unwrap();
+        assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(), json!({"msg": "hi over bluetooth"}));
+        assert_eq!(bob.peers()[&alice.id()].via, Some(PathKind::Bluetooth));
+        bob.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "reply", "hello back"))).unwrap().unwrap();
+        alice.sync_with(bob.id(), space, false).await.unwrap();
+        assert_eq!(
+            alice.with_space(&space, |r| r.doc_json(&doc)).unwrap(),
+            json!({"msg": "hi over bluetooth", "reply": "hello back"})
+        );
+
+        air.cut();
+        eventually("lost", || alice.peers().get(&bob.id()).is_some_and(|p| p.links.is_empty())).await;
+        assert_eq!(alice_link.status().peers, 0);
+
+        air.restore();
+        eventually("relinked", || {
+            alice.peers().get(&bob.id()).is_some_and(|p| p.links.contains(&PathKind::Bluetooth))
+                && bob.peers().get(&alice.id()).is_some_and(|p| p.links.contains(&PathKind::Bluetooth))
+        })
+        .await;
+        alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "msg", "back in range"))).unwrap().unwrap();
+        bob.sync_with(alice.id(), space, false).await.unwrap();
+        assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap()["msg"], json!("back in range"));
+        assert_eq!(air.channels(), 1);
+        alice.shutdown().await.unwrap();
+        bob.shutdown().await.unwrap();
+    }
+
+    /// QUIC over a radio as slow as BLE L2CAP, with the real bounded queue:
+    /// a 128 KiB message arrives intact; reports goodput vs. the raw rate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bulk_sync_over_a_slow_radio() {
+        const RATE: usize = 40 * 1024; // bytes/s, a typical Mac-to-Mac L2CAP rate
+        let air = Air::with_rate(Some(RATE));
+        let (alice, _a) = node(&air, "alice").await;
+        let (bob, _b) = node(&air, "bob").await;
+        eventually("linked", || {
+            alice.peers().get(&bob.id()).is_some_and(|p| !p.links.is_empty())
+                && bob.peers().get(&alice.id()).is_some_and(|p| !p.links.is_empty())
+        })
+        .await;
+        let (space, genesis) = alice.create_space().unwrap();
+        alice.with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer)).unwrap().unwrap();
+        bob.join_space(genesis).unwrap();
+        bob.sync_with(alice.id(), space, true).await.unwrap();
+
+        let doc = Replica::new_doc_id();
+        let mut x = 0x2545_f491u32;
+        let big: String = (0..128 * 1024)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                (b'a' + (x % 26) as u8) as char
+            })
+            .collect();
+        alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "big", big.as_str()))).unwrap().unwrap();
+        let t = std::time::Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), bob.sync_with(alice.id(), space, false))
+            .await
+            .expect("finished")
+            .unwrap();
+        let el = t.elapsed();
+        assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap()["big"], json!(big));
+        let goodput = big.len() as f64 / el.as_secs_f64();
+        eprintln!(
+            "128 KiB over a {} KiB/s radio: {:.2?} = {:.1} KiB/s goodput ({:.0}% of raw)",
+            RATE / 1024,
+            el,
+            goodput / 1024.0,
+            100.0 * goodput / RATE as f64
+        );
+        assert!(goodput > RATE as f64 * 0.3, "QUIC keeps a slow radio reasonably busy");
+        alice.shutdown().await.unwrap();
+        bob.shutdown().await.unwrap();
+    }
+
+    /// Three devices that all discover each other at once end up with one
+    /// channel per pair.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_channel_per_pair() {
+        let air = Air::new();
+        let mut links = Vec::new();
+        for n in 0..3 {
+            let l = air.link(DeviceKeys::generate().sign_pk(), &format!("n{n}"));
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            l.start(tx).unwrap();
+            links.push((l, rx));
+        }
+        eventually("all linked", || links.iter().all(|(l, _)| l.status().peers == 2)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(air.channels(), 3);
+        for (l, rx) in &mut links {
+            let mut found = 0;
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    mycel_net::LinkEvent::Found { .. } => found += 1,
+                    mycel_net::LinkEvent::Lost { .. } => panic!("no flapping"),
+                }
+            }
+            assert_eq!(found, 2, "each peer found once ({:?})", l.hub);
+        }
+    }
+}

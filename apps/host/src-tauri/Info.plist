@@ -17,6 +17,8 @@
   <string>Mycel reads files you choose to attach from your Documents folder so it can encrypt and send them.</string>
   <key>NSDownloadsFolderUsageDescription</key>
   <string>Mycel reads files you choose to attach from your Downloads folder so it can encrypt and send them.</string>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>Mycel uses Bluetooth to reach nearby devices running Mycel when there is no Wi-Fi, and sends them your end-to-end encrypted messages directly.</string>
   <key>NSBonjourServices</key>
   <array>
     <string>_mycel._udp</string>

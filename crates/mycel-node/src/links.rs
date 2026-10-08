@@ -19,5 +19,8 @@ pub fn device_links(me: SignPk, name: &str) -> Vec<Arc<dyn Link>> {
     if on("awdl") {
         links.push(mycel_link_awdl::link(me, name));
     }
+    if on("ble") {
+        links.push(mycel_link_ble::link(me, name));
+    }
     links
 }
