@@ -45,6 +45,7 @@
 
 pub mod core;
 pub mod directory;
+pub mod dtn;
 pub mod wire;
 
 use std::collections::HashMap;
@@ -60,7 +61,7 @@ use iroh::endpoint::Connection;
 use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr};
-use mycel_crypto::{DeviceKeys, SignPk};
+use mycel_crypto::{DeviceKeys, Hash32, SignPk};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -121,6 +122,9 @@ pub struct MeshOptions {
     /// Where reachability records are published and looked up (see
     /// [`directory`]); the node sets the real one ([`Mesh::set_directory`]).
     pub directory: Option<Arc<dyn directory::Directory>>,
+    /// Store-and-forward ([`dtn`]): carry bundles for others and send ours
+    /// through carriers when no live path exists; `None` = off.
+    pub store_and_forward: Option<dtn::DtnConfig>,
 }
 
 impl Default for MeshOptions {
@@ -138,6 +142,7 @@ impl Default for MeshOptions {
             gateways: c.gateways,
             internet: None,
             directory: None,
+            store_and_forward: Some(dtn::DtnConfig::default()),
         }
     }
 }
@@ -230,6 +235,10 @@ struct Driver {
     /// the address lookup.
     records: Mutex<HashMap<SignPk, (Vec<(SignPk, u32)>, Instant)>>,
     records_published: std::sync::atomic::AtomicU64,
+    carrier: Option<Mutex<dtn::Carrier>>,
+    /// Where bundles for us go (the node ingests them).
+    bundle_sink: Mutex<Option<mpsc::UnboundedSender<(SignPk, Bytes)>>>,
+    last_summary: Mutex<HashMap<SignPk, Instant>>,
 }
 
 impl std::fmt::Debug for Driver {
@@ -409,10 +418,18 @@ impl Driver {
             h.dgram_cap = conn.datagram_send_buffer_space();
             h.failures = 0;
         }
+        let direct = self.hops.lock().get(&peer).is_some_and(|h| h.direct);
         self.with_router(|r, now| {
             r.hop_up(peer, now);
             r.tick(now);
         });
+        if let Some(c) = &self.carrier
+            && direct
+        {
+            c.lock().encounter(peer, self.now());
+        }
+        self.last_summary.lock().remove(&peer); // tell it what we hold, soon
+        self.keep(tokio::spawn(self.clone().serve_streams(peer, conn.clone())));
         let me = self.clone();
         let task = tokio::spawn(async move {
             while let Ok(d) = conn.read_datagram().await {
@@ -660,6 +677,173 @@ impl Driver {
         gws.into_iter().filter(|(g, _)| *g != self.me).take(3).map(|(g, _)| mesh_addr(&peer, &g)).collect()
     }
 
+    // ───────────── store and forward ─────────────
+
+    /// Streams a neighbour opens on the hop connection: summaries and
+    /// bundles (datagrams carry routing and packets).
+    async fn serve_streams(self: Arc<Self>, peer: SignPk, conn: Connection) {
+        loop {
+            tokio::select! {
+                bi = conn.accept_bi() => {
+                    let Ok((tx, rx)) = bi else { break };
+                    let me = self.clone();
+                    tokio::spawn(async move { let _ = me.on_bundle_stream(peer, tx, rx).await; });
+                }
+                uni = conn.accept_uni() => {
+                    let Ok(rx) = uni else { break };
+                    let me = self.clone();
+                    tokio::spawn(async move { let _ = me.on_summary_stream(peer, rx).await; });
+                }
+            }
+        }
+    }
+
+    async fn on_summary_stream(self: Arc<Self>, from: SignPk, mut rx: iroh::endpoint::RecvStream) -> Result<()> {
+        let bytes = rx.read_to_end(MAX_SUMMARY).await?;
+        let Some((&K_SUMMARY, body)) = bytes.split_first() else { return Ok(()) };
+        let w: WireSummary = postcard::from_bytes(body)?;
+        let s = dtn::Summary {
+            ids: w.ids,
+            receipts: w.receipts.into_iter().map(|(id, dst, sig)| dtn::Receipt { id, dst, sig }).collect(),
+            preds: w.preds,
+        };
+        let now = self.now();
+        if let Some(c) = &self.carrier {
+            c.lock().on_summary(from, s, now, verify_receipt);
+        }
+        Ok(())
+    }
+
+    async fn on_bundle_stream(
+        self: Arc<Self>,
+        from: SignPk,
+        mut tx: iroh::endpoint::SendStream,
+        mut rx: iroh::endpoint::RecvStream,
+    ) -> Result<()> {
+        let Some(c) = &self.carrier else { return Ok(()) };
+        let max = c.lock().config().max_bundle + 1024;
+        let bytes = rx.read_to_end(max).await?;
+        let Some((&K_BUNDLE, body)) = bytes.split_first() else { return Ok(()) };
+        let w: WireBundle = postcard::from_bytes(body)?;
+        let b = dtn::Bundle {
+            id: bundle_id(&w.src, &w.dst, &w.payload),
+            src: w.src,
+            dst: w.dst,
+            created: w.created,
+            lifetime: w.lifetime,
+            payload: Bytes::from(w.payload),
+            sig: w.sig,
+        };
+        let now = self.now();
+        let got = c.lock().accept(from, b, w.copies, now, verify_bundle);
+        let ok = !matches!(got, dtn::Accepted::Refused(_));
+        tx.write_all(&[ok as u8]).await?;
+        tx.finish()?;
+        if let dtn::Accepted::ForMe(b) = got {
+            let sig = self.keys.sign(RECEIPT_CTX, &[&b.id.0]);
+            c.lock().add_receipt(dtn::Receipt { id: b.id, dst: self.me, sig });
+            if let Some(sink) = self.bundle_sink.lock().as_ref() {
+                let _ = sink.send((b.src, b.payload));
+            }
+        }
+        Ok(())
+    }
+
+    /// Summaries to neighbours, then hand on what can move now.
+    fn dtn_tick(self: &Arc<Self>) {
+        let Some(c) = &self.carrier else { return };
+        let now = self.now();
+        let internet = self.router.lock().internet();
+        let neighbours: Vec<SignPk> = self.router.lock().neighbours().into_iter().map(|(k, _)| k).collect();
+        c.lock().set_internet(internet);
+        // summaries: on a new neighbour at once, then every few seconds
+        let due: Vec<SignPk> = {
+            let mut last = self.last_summary.lock();
+            last.retain(|k, _| neighbours.contains(k));
+            neighbours
+                .iter()
+                .filter(|k| last.get(*k).is_none_or(|t| t.elapsed() >= SUMMARY_EVERY))
+                .copied()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .inspect(|k| {
+                    last.insert(*k, Instant::now());
+                })
+                .collect()
+        };
+        if !due.is_empty() {
+            let s = c.lock().summary(now);
+            let wire = WireSummary {
+                ids: s.ids,
+                receipts: s.receipts.into_iter().map(|r| (r.id, r.dst, r.sig)).collect(),
+                preds: s.preds,
+            };
+            if let Ok(body) = postcard::to_allocvec(&wire) {
+                let mut msg = vec![K_SUMMARY];
+                msg.extend_from_slice(&body);
+                let msg = Bytes::from(msg);
+                for k in due {
+                    let Some(conn) = self.conn(&k) else { continue };
+                    let msg = msg.clone();
+                    self.keep(tokio::spawn(async move {
+                        if let Ok(mut tx) = conn.open_uni().await {
+                            let _ = tx.write_all(&msg).await;
+                            let _ = tx.finish();
+                        }
+                    }));
+                }
+            }
+        }
+        // what can move now: live/partial routes, gradient, spray
+        let plan = {
+            let mut carrier = c.lock();
+            carrier.tick(now);
+            let router = &self.router;
+            let mut outs = Vec::new();
+            let plan = carrier.plan(
+                now,
+                |dst| {
+                    let mut r = router.lock();
+                    let t = r.toward(dst, now);
+                    r.drain(&mut outs);
+                    t
+                },
+                &neighbours,
+            );
+            drop(carrier);
+            if !outs.is_empty() {
+                self.exec(outs);
+            }
+            plan
+        };
+        for t in plan {
+            let Some(b) = c.lock().bundle(&t.id).cloned() else { continue };
+            let Some(conn) = self.conn(&t.to) else {
+                c.lock().transferred(t.to, t.id, t.copies, false, now);
+                continue;
+            };
+            let me = self.clone();
+            self.keep(tokio::spawn(async move {
+                let ok = send_bundle(&conn, &b, t.copies).await.unwrap_or(false);
+                if let Some(c) = &me.carrier {
+                    c.lock().transferred(t.to, t.id, t.copies, ok, me.now());
+                }
+            }));
+        }
+    }
+
+    /// Carry `payload` to `dst` whenever it can get there.
+    fn send_bundle(&self, dst: SignPk, payload: Bytes, lifetime: Duration) -> Option<Hash32> {
+        let c = self.carrier.as_ref()?;
+        let id = bundle_id(&self.me, &dst, &payload);
+        let created = wall_ms();
+        let lifetime = lifetime.as_millis() as u64;
+        let sig = self.keys.sign(BUNDLE_CTX, &[&id.0, &created.to_be_bytes(), &lifetime.to_be_bytes()]);
+        let b = dtn::Bundle { id, src: self.me, dst, created, lifetime, payload, sig };
+        c.lock().originate(b, self.now()).ok()?;
+        Some(id)
+    }
+
     fn stats(&self) -> MeshStats {
         let mut s = self.router.lock().stats();
         s.dropped_queue += self.dropped_queue.load(Ordering::Relaxed);
@@ -702,6 +886,7 @@ impl Driver {
 async fn run(d: Arc<Driver>) {
     let tick = Duration::from_millis(20);
     let mut next_slow = Instant::now();
+    let mut next_dtn = Instant::now();
     loop {
         tokio::time::sleep(tick).await;
         if d.stopped.load(Ordering::Relaxed) {
@@ -730,6 +915,10 @@ async fn run(d: Arc<Driver>) {
             d.dial_missing();
             d.measure();
         }
+        if Instant::now() >= next_dtn {
+            next_dtn = Instant::now() + DTN_EVERY;
+            d.dtn_tick();
+        }
     }
 }
 
@@ -754,6 +943,7 @@ impl Mesh {
         let (inbox, rx) = mpsc::channel(INBOX);
         let me = keys.sign_pk();
         let directory = opts.directory.clone();
+        let carrier = opts.store_and_forward.clone().map(|c| Mutex::new(dtn::Carrier::new(me, c)));
         let mut router = Router::new(me, opts.config());
         router.set_internet(opts.internet.unwrap_or(false));
         let d = Arc::new(Driver {
@@ -777,6 +967,9 @@ impl Mesh {
             directory: Mutex::new(directory),
             records: Mutex::default(),
             records_published: Default::default(),
+            carrier,
+            bundle_sink: Mutex::default(),
+            last_summary: Mutex::default(),
         });
         Mesh { d }
     }
@@ -823,6 +1016,27 @@ impl Mesh {
 
     pub fn stats(&self) -> MeshStats {
         self.d.stats()
+    }
+
+    /// Carry `payload` to `dst` through others when it can't go live:
+    /// along any live part of the way, toward the internet, to its
+    /// gateways' mailboxes. `None` if store-and-forward is off.
+    pub fn send_bundle(&self, dst: SignPk, payload: Bytes, lifetime: Duration) -> Option<Hash32> {
+        self.d.send_bundle(dst, payload, lifetime)
+    }
+
+    /// Where bundles for us go: `(source, payload)`.
+    pub fn set_bundle_sink(&self, tx: mpsc::UnboundedSender<(SignPk, Bytes)>) {
+        *self.d.bundle_sink.lock() = Some(tx);
+    }
+
+    pub fn dtn_stats(&self) -> dtn::DtnStats {
+        self.d.carrier.as_ref().map(|c| c.lock().stats()).unwrap_or_default()
+    }
+
+    /// Whether this device holds bundle `id` (for others or its own).
+    pub fn holds_bundle(&self, id: &Hash32) -> bool {
+        self.d.carrier.as_ref().is_some_and(|c| c.lock().holds(id))
     }
 
     /// Where records are published and looked up (the node sets the pkarr
@@ -934,6 +1148,71 @@ impl ProtocolHandler for MeshProtocol {
         closed.closed().await;
         Ok(())
     }
+}
+
+// ───────────────────────────── store and forward ─────────────────────────────
+
+const BUNDLE_CTX: &str = "mycel/v0/dtn-bundle";
+const RECEIPT_CTX: &str = "mycel/v0/dtn-receipt";
+const K_SUMMARY: u8 = 1;
+const K_BUNDLE: u8 = 2;
+const MAX_SUMMARY: usize = 256 * 1024;
+const SUMMARY_EVERY: Duration = Duration::from_secs(5);
+const DTN_EVERY: Duration = Duration::from_secs(1);
+
+#[derive(Serialize, Deserialize)]
+struct WireBundle {
+    src: SignPk,
+    dst: SignPk,
+    created: u64,
+    lifetime: u64,
+    payload: Vec<u8>,
+    sig: mycel_crypto::Sig,
+    copies: u8,
+}
+
+#[derive(Serialize, Deserialize)]
+struct WireSummary {
+    ids: Vec<Hash32>,
+    receipts: Vec<(Hash32, SignPk, mycel_crypto::Sig)>,
+    preds: Vec<(SignPk, f32)>,
+}
+
+/// A bundle's id: the same data for the same destination is the same bundle.
+pub fn bundle_id(src: &SignPk, dst: &SignPk, payload: &[u8]) -> Hash32 {
+    let mut h = mycel_crypto::Digest::new(BUNDLE_CTX);
+    h.update(&src.0).update(&dst.0).update(payload);
+    h.finalize()
+}
+
+fn verify_bundle(b: &dtn::Bundle) -> bool {
+    b.id == bundle_id(&b.src, &b.dst, &b.payload)
+        && b.src.verify(BUNDLE_CTX, &[&b.id.0, &b.created.to_be_bytes(), &b.lifetime.to_be_bytes()], &b.sig).is_ok()
+        && b.created.saturating_add(b.lifetime) > wall_ms()
+}
+
+fn verify_receipt(r: &dtn::Receipt) -> bool {
+    r.dst.verify(RECEIPT_CTX, &[&r.id.0], &r.sig).is_ok()
+}
+
+/// Hand a bundle over a hop connection; `true` once the neighbour took it.
+async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8) -> Result<bool> {
+    let wire = WireBundle {
+        src: b.src,
+        dst: b.dst,
+        created: b.created,
+        lifetime: b.lifetime,
+        payload: b.payload.to_vec(),
+        sig: b.sig,
+        copies,
+    };
+    let mut msg = vec![K_BUNDLE];
+    msg.extend_from_slice(&postcard::to_allocvec(&wire)?);
+    let (mut tx, mut rx) = conn.open_bi().await?;
+    tx.write_all(&msg).await?;
+    tx.finish()?;
+    let ack = tokio::time::timeout(Duration::from_secs(30), rx.read_to_end(1)).await??;
+    Ok(ack.first() == Some(&1))
 }
 
 /// An Iroh address lookup: for a device beyond our mesh, one mesh address

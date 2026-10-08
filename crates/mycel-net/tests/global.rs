@@ -221,3 +221,64 @@ async fn two_gateways_are_two_paths_and_fail_over() {
     );
     drop(g2);
 }
+
+/// A device with given keys (to name it in a space before it exists).
+async fn device_with_keys(keys: Arc<DeviceKeys>, name: &str, radios: &[&MemNet], dir: &MemDirectory) -> Node {
+    let mut opts = NodeOptions::new(NetMode::Local, name);
+    opts.ip = false;
+    opts.links = radios.iter().map(|n| n.link(keys.sign_pk()) as Arc<dyn Link>).collect();
+    opts.mesh = Some(MeshOptions {
+        announce_every: Duration::from_millis(500),
+        internet: Some(false),
+        directory: Some(Arc::new(dir.clone())),
+        ..MeshOptions::default()
+    });
+    Node::spawn(keys, opts).await.unwrap()
+}
+
+/// No path ever exists between A and C. A mule walks from A's partition
+/// to C's and the message goes with it: A's failed sync becomes a signed,
+/// still-encrypted bundle; the mule carries it (it isn't a member and
+/// can't read it); C applies it when the mule arrives, minutes later in
+/// real life, seconds here. A short-lived bundle expires at the mule.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_data_mule_carries_a_message_across_partitions() {
+    let dir = MemDirectory::new();
+    let (here, there) = (ble(7), ble(8));
+    let a = device("a", &[&here], false, &dir).await;
+    let mule = device("mule", &[&here, &there], false, &dir).await;
+    let c_keys = Arc::new(DeviceKeys::generate());
+    let c_id = c_keys.sign_pk();
+
+    let (space, genesis) = a.create_space().unwrap();
+    a.with_space(&space, |r| r.add_member(c_keys.public(), Role::Writer)).unwrap().unwrap();
+    let doc = Replica::new_doc_id();
+    a.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "msg", "carried by hand"))).unwrap().unwrap();
+    // A's live sync to C fails (no path): it becomes a bundle
+    a.changed(space);
+    eventually("A makes a bundle for C", 30, || a.mesh().unwrap().dtn_stats().originated >= 1).await;
+    // and a short-lived one, to see carriers drop expired bundles
+    let short = a.mesh().unwrap().send_bundle(c_id, bytes::Bytes::from_static(b"stale soon"), Duration::from_secs(3)).unwrap();
+    eventually("the mule takes copies", 20, || {
+        let s = mule.mesh().unwrap().dtn_stats();
+        s.accepted >= 2
+    })
+    .await;
+    assert!(mule.space_ids().is_empty(), "the mule is in no space");
+
+    // the mule walks: out of A's range, into C's
+    here.cut();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    assert!(!mule.mesh().unwrap().holds_bundle(&short), "the short-lived bundle expired at the carrier");
+    assert!(mule.mesh().unwrap().dtn_stats().expired >= 1);
+    let c = device_with_keys(c_keys, "c", &[&there], &dir).await;
+    c.join_space(genesis).unwrap();
+    let t = Instant::now();
+    eventually("C has A's message", 30, || {
+        c.with_space(&space, |r| r.doc_json(&doc)).ok() == Some(json!({ "msg": "carried by hand" }))
+    })
+    .await;
+    eprintln!("mule: delivered {:?} after meeting C; mule stats {:?}", t.elapsed(), mule.mesh().unwrap().dtn_stats());
+    // C's receipt clears the mule's copy
+    eventually("the mule drops its delivered copy", 10, || mule.mesh().unwrap().dtn_stats().handed_on >= 1).await;
+}

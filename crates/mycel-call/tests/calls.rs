@@ -330,3 +330,58 @@ async fn call_through_a_mesh_relay() {
     assert!(bob.calls.status().is_empty(), "nor in the call");
     alice.calls.end(&id).unwrap();
 }
+
+/// Bluetooth-only in the US (two hops from its gateway), Bluetooth-only in
+/// Europe: a live call across both gateways and the internet, end to end.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_across_two_gateways_and_the_internet() {
+    use mycel_net::mesh::directory::{self, Directory, MemDirectory};
+    let dir = MemDirectory::new();
+    let radio = |n: u64| {
+        let m = MemNet::new(n, PathKind::Bluetooth);
+        m.set_rate_limit(Some(100_000));
+        m.set_latency(Duration::from_millis(10));
+        m
+    };
+    let (e1, e2, e3) = (radio(9), radio(10), radio(11));
+    let mesh = |internet: bool| {
+        Some(MeshOptions {
+            announce_every: Duration::from_millis(500),
+            internet: Some(internet),
+            directory: Some(std::sync::Arc::new(dir.clone())),
+            ..MeshOptions::default()
+        })
+    };
+    let us = device_with("us", sine(440.0), false, &[&e1], mesh(false)).await;
+    let _relay = device_with("relay", sine(330.0), false, &[&e1, &e2], mesh(false)).await;
+    let g_us = device_with("us-gateway", sine(330.0), true, &[&e2], mesh(true)).await;
+    let g_eu = device_with("eu-gateway", sine(330.0), true, &[&e3], mesh(true)).await;
+    let eu = device_with("eu", sine(660.0), false, &[&e3], mesh(false)).await;
+    g_us.node.add_peer_addr(g_eu.node.addr());
+    g_eu.node.add_peer_addr(g_us.node.addr());
+    for who in [&us, &eu] {
+        let id = who.node.id();
+        let mut ok = false;
+        for _ in 0..200 {
+            if dir.get(id).await.and_then(|b| directory::open(&b, Some(&id))).is_some() {
+                ok = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(ok, "a record for {id:?}");
+    }
+    let space = shared_space(&us, &eu).await;
+    let id = connect_call(&us, &eu, space).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let (a, b) = (us.call(&id).unwrap(), eu.call(&id).unwrap());
+    assert_eq!(a.path, Some(PathKind::Mesh));
+    assert_eq!(b.path, Some(PathKind::Mesh));
+    assert!((eu.heard(1.0).unwrap() - 440.0).abs() < 8.0, "Europe hears the US");
+    assert!((us.heard(1.0).unwrap() - 660.0).abs() < 8.0, "the US hears Europe");
+    eprintln!(
+        "US<->EU call: rtt {} ms, latency ~{} ms, loss {:.1}%, bitrate {} bps (3 BLE hops at 10 ms + 2 gateways)",
+        b.stats.rtt_ms, b.stats.latency_ms, a.stats.loss_pct, a.bitrate
+    );
+    us.calls.end(&id).unwrap();
+}

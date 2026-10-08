@@ -71,6 +71,10 @@ const ONLINE_WINDOW: Duration = Duration::from_secs(45);
 /// Changes are pushed this long after they happen (coalescing a burst). Short:
 /// a sync is one stream on a pooled connection, no handshake.
 const DEBOUNCE: Duration = Duration::from_millis(5);
+/// Store-and-forward bundles: the largest payload, and how long it is worth
+/// delivering.
+const MAX_BUNDLE_PAYLOAD: usize = 200 * 1024;
+const BUNDLE_LIFETIME: Duration = Duration::from_secs(3 * 24 * 3600);
 /// Max membership ops accepted in a pushed invite.
 const MAX_INVITE_OPS: usize = 4096;
 
@@ -233,6 +237,8 @@ struct Inner {
     accepted: AtomicU64,
     /// Blob bytes served to fetching members.
     blob_served: AtomicU64,
+    /// The last store-and-forward bundle sent per (member, space).
+    bundled: Mutex<HashMap<(SignPk, SpaceId), Hash32>>,
 }
 
 /// How many QUIC connections (handshakes) a node has made.
@@ -389,6 +395,55 @@ impl Inner {
         let mut spaces = self.spaces.lock();
         let r = spaces.get_mut(space).ok_or_else(|| anyhow!("unknown space"))?;
         Ok(f(r))
+    }
+
+    /// `peer` (a member of `space`) can't be reached live: send what it may
+    /// lack through store-and-forward carriers (no plaintext leaves us:
+    /// envelopes are already signed and encrypted).
+    fn offer_bundle(&self, peer: SignPk, space: SpaceId) {
+        let Some(mesh) = &self.mesh else { return };
+        let data = self
+            .with_space(&space, |r| {
+                if !r.is_member(&peer) {
+                    return None;
+                }
+                let envelopes: Vec<_> = r
+                    .envelope_ids()
+                    .iter()
+                    .filter(|id| !r.holders(id).contains(&peer))
+                    .filter_map(|id| r.envelope(id).cloned())
+                    .collect();
+                (!envelopes.is_empty()).then(|| Data { ops: r.all_ops(), envelopes })
+            })
+            .ok()
+            .flatten();
+        let Some(mut data) = data else { return };
+        let payload = loop {
+            let Ok(p) = postcard::to_allocvec(&DtnPayload { space, data }) else { return };
+            if p.len() <= MAX_BUNDLE_PAYLOAD {
+                break p;
+            }
+            let Ok(DtnPayload { data: mut d, .. }) = postcard::from_bytes::<DtnPayload>(&p) else { return };
+            if d.envelopes.pop().is_none() {
+                return;
+            }
+            data = d;
+        };
+        let id = mesh::bundle_id(&self.keys.sign_pk(), &peer, &payload);
+        if self.bundled.lock().insert((peer, space), id) == Some(id) {
+            return; // already on its way
+        }
+        mesh.send_bundle(peer, payload.into(), BUNDLE_LIFETIME);
+    }
+
+    /// A bundle for us arrived through carriers: apply it like a sync from
+    /// its (authenticated) source, if that source is a member.
+    fn on_bundle(&self, src: SignPk, payload: &[u8]) {
+        let Ok(DtnPayload { space, data }) = postcard::from_bytes::<DtnPayload>(payload) else { return };
+        if !self.with_space(&space, |r| r.is_member(&src)).unwrap_or(false) {
+            return;
+        }
+        self.ingest(&space, src, data, &[]);
     }
 
     fn schedule(&self, space: SpaceId) {
@@ -777,6 +832,7 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
             inner.mark_ok(peer);
         } else {
             inner.mark_fail(peer);
+            inner.offer_bundle(peer, space);
         }
         let mut inflight = inner.inflight.lock();
         match inflight.get_mut(&(peer, space)) {
@@ -988,6 +1044,7 @@ impl Node {
             pool,
             accepted: AtomicU64::new(0),
             blob_served: AtomicU64::new(0),
+            bundled: Mutex::default(),
         });
         let mut router = Router::builder(endpoint).accept(ALPN, Handler { inner: inner.clone() });
         for p in opts.extra_protocols {
@@ -1007,6 +1064,16 @@ impl Node {
         }));
         if let Some(mdns) = mdns {
             tasks.push(tokio::spawn(watch_mdns(inner.clone(), mdns)));
+        }
+        if let Some(m) = &inner.mesh {
+            let (tx, mut rx) = mpsc::unbounded_channel::<(SignPk, bytes::Bytes)>();
+            m.set_bundle_sink(tx);
+            let inner = inner.clone();
+            tasks.push(tokio::spawn(async move {
+                while let Some((src, payload)) = rx.recv().await {
+                    inner.on_bundle(src, &payload);
+                }
+            }));
         }
         for l in &inner.links {
             let (tx, mut rx) = mpsc::unbounded_channel();

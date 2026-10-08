@@ -87,6 +87,14 @@ pub struct Data {
     pub envelopes: Vec<Envelope>,
 }
 
+/// A store-and-forward bundle's payload: what a member may lack of a space
+/// (all signed and encrypted; carriers can't read it).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DtnPayload {
+    pub space: SpaceId,
+    pub data: Data,
+}
+
 /// Sync protocol (strictly alternating, see crate docs).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum SyncMsg {
