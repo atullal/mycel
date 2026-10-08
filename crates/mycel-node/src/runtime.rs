@@ -380,13 +380,13 @@ impl Runtime {
         nopts.store = Some(store.clone());
         nopts.blob_dir = Some(dir.join("blobs"));
         nopts.port = opts.port;
+        if opts.mode != NetworkMode::Local {
+            nopts.links = crate::links::device_links(keys.sign_pk(), &name);
+        }
         // MYCEL_IP=0: no Wi-Fi/Ethernet IP at all, links only (to test or
         // demonstrate peer-to-peer Wi-Fi and Bluetooth).
         if std::env::var("MYCEL_IP").is_ok_and(|v| v.trim() == "0") {
             nopts.ip = false;
-        }
-        if opts.mode != NetworkMode::Local {
-            nopts.links = crate::links::device_links(keys.sign_pk(), &name, nopts.ip);
         }
         // v0 policy: accept any conversation we're added to (the inviter needed
         // our contact card to add us). Blocking lists can come later.

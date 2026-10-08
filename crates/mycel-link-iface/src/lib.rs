@@ -23,9 +23,10 @@
 //! become paths like any other.
 //!
 //! Interfaces that Iroh's own IP transport already reaches peers through (a
-//! routable address on an ordinary NIC) are left to it while IP is on, so a
-//! Wi-Fi radio isn't driven twice; with IP off (or only link-local addresses,
-//! as on a cable between two Macs) they are this link's too.
+//! routable address on an ordinary NIC) are left to it, so a Wi-Fi radio
+//! isn't driven twice; with only link-local addresses (a cable between two
+//! Macs) they are this link's. [`Rules::ip_covers_routable`] = false hands it
+//! every NIC (tests, or a node with no IP transport that wants them).
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;

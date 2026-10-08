@@ -11,7 +11,8 @@
 //!
 //! `MYCEL_LINKS` picks them: unset or `all` = the defaults (all but
 //! `wifidirect`), `none` = IP only, or a comma list of the names above
-//! (`uwb`, `thread`, `802154` and `p2p` are other names for `iface`).
+//! (`uwb`, `thread`, `802154` and `p2p` are other names for `iface`;
+//! `all,wifidirect` = the defaults plus Wi-Fi Direct).
 //! `MYCEL_WIFI_DIRECT=1` adds `wifidirect` to the defaults.
 
 use std::sync::Arc;
@@ -36,7 +37,6 @@ fn wanted(spec: &str, wifi_direct: bool) -> Vec<&'static str> {
     if spec == "none" {
         return Vec::new();
     }
-    let all = spec.is_empty() || spec == "all";
     let named: Vec<&str> = spec
         .split(',')
         .map(|w| match w.trim() {
@@ -45,6 +45,7 @@ fn wanted(spec: &str, wifi_direct: bool) -> Vec<&'static str> {
             other => other,
         })
         .collect();
+    let all = spec.is_empty() || named.contains(&"all");
     PLATFORM
         .iter()
         .copied()
@@ -55,9 +56,13 @@ fn wanted(spec: &str, wifi_direct: bool) -> Vec<&'static str> {
         .collect()
 }
 
-/// The links for node `me` advertising `name`; `ip`: Iroh's IP transport is
-/// on too (then the interface link leaves ordinary NICs to it).
-pub fn device_links(me: SignPk, name: &str, ip: bool) -> Vec<Arc<dyn Link>> {
+/// The links for node `me` advertising `name`.
+///
+/// The interface link always leaves ordinary NICs with a routable address
+/// to Iroh's IP transport, also under `MYCEL_IP=0`: that switch means "no
+/// Wi-Fi / Ethernet networking, prove the other paths work".
+pub fn device_links(me: SignPk, name: &str) -> Vec<Arc<dyn Link>> {
+    let ip = true;
     let spec = std::env::var("MYCEL_LINKS").unwrap_or_default();
     let wifi_direct = std::env::var("MYCEL_WIFI_DIRECT").is_ok_and(|v| v.trim() == "1");
     let on = wanted(&spec, wifi_direct);
@@ -86,6 +91,7 @@ mod tests {
         assert_eq!(wanted("", false), defaults);
         assert_eq!(wanted("all", false), defaults);
         assert_eq!(wanted("none", true), Vec::<&str>::new());
+        assert_eq!(wanted("all,ble", false), defaults, "all means all");
         if cfg!(target_os = "macos") {
             assert_eq!(wanted("awdl, BLE", false), vec!["awdl", "ble"]);
             assert_eq!(wanted("uwb", false), vec!["iface"]);
@@ -94,6 +100,7 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert_eq!(wanted("", true), vec!["ble", "iface", "wifidirect"]);
             assert_eq!(wanted("wifi-direct", false), vec!["wifidirect"]);
+            assert_eq!(wanted("all,wifidirect", false), vec!["ble", "iface", "wifidirect"]);
             assert_eq!(wanted("awdl", false), Vec::<&str>::new(), "not on Linux");
         }
     }
