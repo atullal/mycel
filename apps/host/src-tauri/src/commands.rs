@@ -2,8 +2,9 @@
 //!
 //! Command names are snake_case; Tauri maps the webview's camelCase argument
 //! names (`replyTo`) onto these snake_case parameters (`reply_to`). Every
-//! error becomes its human-readable string, which the SDK surfaces as an
-//! `Error` message.
+//! error becomes its human-readable string with the full cause chain (e.g.
+//! "can't read /x: Operation not permitted (os error 1)"), which the SDK
+//! surfaces as an `Error` message.
 //!
 //! All commands are `async` so they run on the async runtime instead of the
 //! main (UI) thread.
@@ -18,8 +19,10 @@ use crate::{Rt, set_window_title};
 
 type Res<T> = Result<T, String>;
 
+/// `{:#}` prints an anyhow error with its causes; `to_string()` would drop
+/// them and hide the real OS error.
 fn err(e: impl std::fmt::Display) -> String {
-    e.to_string()
+    format!("{e:#}")
 }
 
 // ---------------------------------------------------------------- identity & contacts
@@ -184,4 +187,42 @@ pub async fn decline_request(
 #[tauri::command]
 pub async fn fetch_attachment(rt: State<'_, Rt>, blob: String) -> Res<String> {
     rt.fetch_attachment(blob).await.map_err(err)
+}
+
+/// Save raw bytes (a pasted image, a dropped file without a path) as an
+/// attachable file. The body is the file's bytes; the `x-mycel-name` header
+/// carries its URI-encoded name. Returns the path to pass in `attachments`.
+#[tauri::command]
+pub async fn stage_file(rt: State<'_, Rt>, request: tauri::ipc::Request<'_>) -> Res<String> {
+    let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
+        return Err("stage_file expects the file's bytes as the request body".into());
+    };
+    let name = request
+        .headers()
+        .get("x-mycel-name")
+        .and_then(|v| v.to_str().ok())
+        .map(percent_decode)
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "pasted".into());
+    rt.stage_upload(&name, data).await.map_err(err)
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

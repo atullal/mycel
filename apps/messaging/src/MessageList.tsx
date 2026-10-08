@@ -1,5 +1,5 @@
 import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { useMycel } from "@mycel/sdk/react";
+import { useMycel, useTransfer } from "@mycel/sdk/react";
 import type { Attachment, ConversationSummary, MessageView } from "@mycel/sdk";
 import {
   Avatar,
@@ -377,11 +377,25 @@ function useAttachment(a: Attachment) {
   };
   const url = a.localPath ? mycel.files.url(a.localPath) : null;
   const open = () => a.localPath && void mycel.files.open(a.localPath).catch((e) => setErr(errorText(e)));
-  return { state, err, fetch, url, open };
+  const transfer = useTransfer(a.blob);
+  const pct =
+    state === "fetching" && transfer && transfer.total > 0
+      ? Math.min(100, Math.floor((transfer.done / transfer.total) * 100))
+      : null;
+  return { state, err, fetch, url, open, pct };
+}
+
+/** Thin download progress bar under an attachment. */
+function ProgressBar({ pct }: { pct: number }) {
+  return (
+    <span className="mx-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
+      <span style={{ width: `${pct}%` }} />
+    </span>
+  );
 }
 
 function ImageAttachment({ a }: { a: Attachment }) {
-  const { state, err, fetch, url, open } = useAttachment(a);
+  const { state, err, fetch, url, open, pct } = useAttachment(a);
   if (url) {
     return (
       <button className="mx-image" onClick={open} title={`Open ${a.name}`}>
@@ -396,8 +410,9 @@ function ImageAttachment({ a }: { a: Attachment }) {
       <span className="mx-file-size">{formatSize(a.size)}</span>
       <button className="mx-btn mx-btn-small" onClick={fetch} disabled={state === "fetching"}>
         {state === "fetching" ? <span className="mx-spinner" aria-label="Downloading" /> : <Icon.Download size={15} />}
-        {state === "fetching" ? "Downloading" : "Download photo"}
+        {state === "fetching" ? (pct != null ? `Downloading ${pct}%` : "Downloading") : "Download photo"}
       </button>
+      {pct != null && <ProgressBar pct={pct} />}
       {err && <span className="mx-file-err">{err}</span>}
     </div>
   );
@@ -419,7 +434,7 @@ function InertAttachment({ a }: { a: Attachment }) {
 }
 
 function FileAttachment({ a }: { a: Attachment }) {
-  const { state, err, fetch, url, open } = useAttachment(a);
+  const { state, err, fetch, url, open, pct } = useAttachment(a);
   return (
     <div className="mx-file">
       <span className="mx-file-icon">
@@ -427,7 +442,10 @@ function FileAttachment({ a }: { a: Attachment }) {
       </span>
       <span className="mx-file-text">
         <span className="mx-file-name">{a.name}</span>
-        <span className="mx-file-size">{err ?? formatSize(a.size)}</span>
+        <span className={`mx-file-size${err ? " is-error" : ""}`}>
+          {err ?? (pct != null ? `${pct}% of ${formatSize(a.size)}` : formatSize(a.size))}
+        </span>
+        {pct != null && <ProgressBar pct={pct} />}
       </span>
       {url ? (
         <button className="mx-icon-btn mx-file-btn" onClick={open} aria-label={`Open ${a.name}`} title="Open">

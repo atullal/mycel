@@ -154,6 +154,15 @@ pub struct NetworkStatus {
     pub addresses: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TransferDirection {
+    /// Encrypting an attachment we're sending.
+    Upload,
+    /// Downloading an attachment someone sent.
+    Download,
+}
+
 /// Pushed to UIs (Tauri event `mycel://event`).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -171,4 +180,9 @@ pub enum Event {
     NetworkChanged,
     #[serde(rename_all = "camelCase")]
     BlobReady { blob: String },
+    /// An attachment transfer moved forward (at most every 250 ms, plus a
+    /// final event with `done == total`). `id` is the path passed to
+    /// `send_message` for uploads, and the blob id for downloads.
+    #[serde(rename_all = "camelCase")]
+    TransferProgress { direction: TransferDirection, id: String, done: u64, total: u64 },
 }

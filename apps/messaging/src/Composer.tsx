@@ -1,7 +1,24 @@
-import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from "react";
-import { useMycel } from "@mycel/sdk/react";
+import {
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ClipboardEvent,
+  type KeyboardEvent,
+  type Ref,
+} from "react";
+import { useMycel, useTransfer } from "@mycel/sdk/react";
 import type { ConversationSummary, MessageView } from "@mycel/sdk";
-import { Icon, errorText, fileNameFromPath, previewText } from "./ui.tsx";
+import { Icon, errorText, fileNameFromPath, formatSize, previewText } from "./ui.tsx";
+
+/** Lets the conversation view hand the composer dropped files. */
+export interface ComposerHandle {
+  /** Local paths (native drag-and-drop). */
+  attachPaths(paths: string[]): void;
+  /** Browser `File`s (HTML drag-and-drop): staged with the runtime first. */
+  attachFiles(files: File[]): void;
+}
 
 const TYPING_EVERY_MS = 2500;
 const MAX_ROWS_PX = 180;
@@ -14,7 +31,9 @@ export function Composer({
   onCancelReply,
   onCancelEdit,
   onStartEdit,
+  ref,
 }: {
+  ref?: Ref<ComposerHandle>;
   conversation: ConversationSummary;
   messages: MessageView[];
   replyTo: MessageView | null;
@@ -27,6 +46,7 @@ export function Composer({
   const [text, setText] = useState("");
   const [files, setFiles] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
+  const [staging, setStaging] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const draftBeforeEdit = useRef("");
   const lastTyping = useRef(0);
@@ -140,17 +160,50 @@ export function Composer({
     }
   };
 
+  const attachPaths = (picked: string[]) => {
+    if (picked.length) setFiles((f) => [...f, ...picked.filter((p) => !f.includes(p))]);
+  };
+
   const attach = async () => {
     try {
-      const picked = await mycel.files.pick();
-      if (picked.length) setFiles((f) => [...f, ...picked.filter((p) => !f.includes(p))]);
+      attachPaths(await mycel.files.pick());
     } catch (e) {
       setError(errorText(e));
     }
     input.current?.focus();
   };
 
-  const canSend = editing ? !!text.trim() : !!text.trim() || files.length > 0;
+  // Pasted images and HTML-dropped files have no path: copy them to the runtime first.
+  const attachFiles = async (list: File[]) => {
+    if (!list.length) return;
+    if (!mycel.files.stage) {
+      setError("Use the paperclip to attach files here.");
+      return;
+    }
+    setError(null);
+    setStaging((n) => n + 1);
+    try {
+      attachPaths(await mycel.files.stage(list));
+    } catch (e) {
+      setError(errorText(e));
+    } finally {
+      setStaging((n) => n - 1);
+      input.current?.focus();
+    }
+  };
+
+  useImperativeHandle(ref, () => ({ attachPaths, attachFiles }));
+
+  const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    if (editing) return;
+    const list = Array.from(e.clipboardData.files);
+    if (list.length) {
+      e.preventDefault();
+      void attachFiles(list);
+    }
+  };
+
+  const canSend = (editing ? !!text.trim() : !!text.trim() || files.length > 0) && staging === 0;
   const placeholder = editing
     ? "Edit message"
     : conversation.direct
@@ -182,14 +235,22 @@ export function Composer({
       {files.length > 0 && !editing && (
         <ul className="mx-pending" aria-label="Attachments">
           {files.map((f) => (
-            <li key={f}>
-              <Icon.File size={15} />
-              <span>{fileNameFromPath(f)}</span>
-              <button onClick={() => setFiles((all) => all.filter((x) => x !== f))} aria-label={`Remove ${fileNameFromPath(f)}`}>
-                <Icon.X size={13} />
-              </button>
-            </li>
+            <PendingFile key={f} path={f} sending={busy} onRemove={() => setFiles((all) => all.filter((x) => x !== f))} />
           ))}
+          {staging > 0 && (
+            <li className="is-staging">
+              <span className="mx-spinner" aria-hidden="true" />
+              <span>Adding…</span>
+            </li>
+          )}
+        </ul>
+      )}
+      {staging > 0 && (files.length === 0 || editing) && (
+        <ul className="mx-pending" aria-label="Attachments">
+          <li className="is-staging">
+            <span className="mx-spinner" aria-hidden="true" />
+            <span>Adding…</span>
+          </li>
         </ul>
       )}
 
@@ -212,6 +273,7 @@ export function Composer({
           placeholder={placeholder}
           onChange={(e) => onChange(e.target.value)}
           onKeyDown={onKeyDown}
+          onPaste={onPaste}
           aria-label={placeholder}
         />
         <button
@@ -225,8 +287,32 @@ export function Composer({
         </button>
       </div>
       <p className="mx-hint">
-        <kbd>Enter</kbd> to send, <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line, <kbd>↑</kbd> to edit your last message
+        <kbd>Enter</kbd> to send, <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line, <kbd>↑</kbd> to edit your last message.
+        Drop or paste files to attach.
       </p>
     </div>
+  );
+}
+
+/** A file waiting to be sent; shows encryption progress while sending. */
+function PendingFile({ path, sending, onRemove }: { path: string; sending: boolean; onRemove: () => void }) {
+  const progress = useTransfer(path);
+  const name = fileNameFromPath(path);
+  const pct = sending && progress && progress.total > 0 ? Math.min(100, Math.round((progress.done / progress.total) * 100)) : null;
+  return (
+    <li className={pct != null ? "is-sending" : undefined} title={pct != null ? `Encrypting ${name}: ${pct}% of ${formatSize(progress!.total)}` : name}>
+      <Icon.File size={15} />
+      <span>{name}</span>
+      {pct != null ? (
+        <>
+          <span className="mx-pending-pct">{pct}%</span>
+          <span className="mx-pending-bar" style={{ width: `${pct}%` }} aria-hidden="true" />
+        </>
+      ) : (
+        <button onClick={onRemove} disabled={sending} aria-label={`Remove ${name}`}>
+          <Icon.X size={13} />
+        </button>
+      )}
+    </li>
   );
 }

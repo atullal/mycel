@@ -66,7 +66,21 @@ export interface FileHost {
   url(path: string): string;
   /** Open a local file with the system's default application. */
   open(path: string): Promise<void>;
+  /**
+   * Turn browser `File`s (pasted images, HTML drag-and-drop) into paths that
+   * can be passed in `attachments`. Streams them to the runtime, any size.
+   */
+  stage?(files: File[]): Promise<string[]>;
+  /**
+   * Native drag-and-drop of files onto the window, with real paths (the
+   * Tauri host; there HTML5 drop events carry no files). Returns an
+   * unsubscribe function.
+   */
+  onDragDrop?(handler: (event: FileDragEvent) => void): () => void;
 }
+
+/** A native drag of files over the window. */
+export type FileDragEvent = { type: "over" } | { type: "leave" } | { type: "drop"; paths: string[] };
 
 /**
  * How the SDK talks to a Mycel runtime. In the host this is Tauri IPC; in a

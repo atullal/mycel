@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 
@@ -21,6 +22,8 @@ use crate::api::*;
 use crate::store::DbStore;
 
 const ATTACHMENT_AAD: &[u8] = b"mycel/v0/attachment";
+/// Transfer progress events are throttled to one per this interval.
+const PROGRESS_EVERY: Duration = Duration::from_millis(250);
 
 /// L4: the chat rules, compiled Rust → WASM (rules/chat-rules), run by every
 /// peer on every decrypted chat entry. Pinned by hash.
@@ -826,10 +829,19 @@ impl Runtime {
         }
         let reply_to = reply_to.map(|r| parse_hash(&r)).transpose()?;
         let mut refs = Vec::new();
-        for path in attachments {
-            refs.push(self.upload(space, Path::new(&path)).await?);
+        for path in &attachments {
+            refs.push(self.upload(space, path).await?);
         }
         let msg_id = self.post(space, ChatOp::Text { body, reply_to, attachments: refs })?;
+        // Files the HTTP UI staged under uploads/ are now in files/; drop the staging copies.
+        let uploads = self.data_dir.join("uploads").canonicalize().ok();
+        for raw in &attachments {
+            if let (Some(root), Ok(p)) = (&uploads, crate::files::local_path(raw).canonicalize())
+                && let Some(dir) = p.parent().filter(|d| d.starts_with(root) && d != root)
+            {
+                let _ = tokio::fs::remove_dir_all(dir).await;
+            }
+        }
         let view = self.view(&space)?;
         let m = view
             .messages
@@ -839,31 +851,108 @@ impl Runtime {
         Ok(self.message_view(&space, &view, m, &HashSet::new()))
     }
 
-    async fn upload(&self, space: SpaceId, path: &Path) -> Result<AttachmentRef> {
-        let plain = tokio::fs::read(path)
+    /// A throttled progress reporter emitting `TransferProgress` events.
+    fn progress(&self, direction: TransferDirection, id: String) -> mycel_net::Progress {
+        let events = self.events.clone();
+        let last: Mutex<Option<Instant>> = Mutex::new(None);
+        Arc::new(move |done, total| {
+            let now = Instant::now();
+            {
+                let mut l = last.lock();
+                if done < total && l.is_some_and(|t| now.duration_since(t) < PROGRESS_EVERY) {
+                    return;
+                }
+                *l = Some(now);
+            }
+            let _ = events.send(Event::TransferProgress { direction, id: id.clone(), done, total });
+        })
+    }
+
+    /// A fresh path under `uploads/` for a file the UI hands us as bytes
+    /// (browser uploads, pasted images). Its folder is created.
+    pub fn new_upload_path(&self, name: &str) -> Result<PathBuf> {
+        let dir = self.data_dir.join("uploads").join(format!("{:016x}", mycel_crypto::random_u64()));
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir.join(sanitize_file_name(name)))
+    }
+
+    /// Save bytes (e.g. a pasted image) as an attachable file; returns its path.
+    pub async fn stage_upload(&self, name: &str, data: &[u8]) -> Result<String> {
+        let path = self.new_upload_path(name)?;
+        tokio::fs::write(&path, data).await?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
+    /// Encrypt one attachment into the blob store (streaming, any size) and
+    /// keep a plaintext copy in `files/<blob>/`. Folders and macOS packages
+    /// (`.app`, `.pages`, `.key`, `.rtfd`, …) are sent as a `.zip`.
+    async fn upload(&self, space: SpaceId, raw: &str) -> Result<AttachmentRef> {
+        let path = crate::files::local_path(raw);
+        let meta = tokio::fs::metadata(&path)
             .await
-            .with_context(|| format!("can't read {}", path.display()))?;
+            .map_err(|e| crate::files::read_error(&path, e))?;
+        if meta.is_dir() {
+            let base = sanitize_file_name(&path.file_name().unwrap_or_default().to_string_lossy());
+            let name = format!("{base}.zip");
+            let dir = self.data_dir.join("uploads").join(format!(".zip-{:016x}", mycel_crypto::random_u64()));
+            let out = dir.join(&name);
+            let (src, dst) = (path.clone(), out.clone());
+            let zipped = tokio::task::spawn_blocking(move || crate::files::zip_dir(&src, &dst))
+                .await?
+                .with_context(|| format!("couldn't zip the folder {}", path.display()));
+            let res = match zipped {
+                Ok(()) => self.encrypt_attachment(space, &out, name, raw).await,
+                Err(e) => Err(e),
+            };
+            let _ = tokio::fs::remove_dir_all(&dir).await;
+            return res;
+        }
+        if !meta.is_file() {
+            bail!("{} isn't a regular file", path.display());
+        }
         let name = sanitize_file_name(&path.file_name().unwrap_or_default().to_string_lossy());
+        self.encrypt_attachment(space, &path, name, raw).await
+    }
+
+    async fn encrypt_attachment(&self, space: SpaceId, src: &Path, name: String, id: &str) -> Result<AttachmentRef> {
+        let size = tokio::fs::metadata(src)
+            .await
+            .map_err(|e| crate::files::read_error(src, e))?
+            .len();
+        // room for the sealed blob plus our plaintext copy
+        mycel_net::ensure_free_space(&self.data_dir, mycel_crypto::sealed_len(size) + size)?;
+        let staged = self.node.blob_staging_path().context("blob storage disabled")?;
+        let files = self.data_dir.join("files");
+        let incoming = files.join(format!(".incoming-{:016x}", mycel_crypto::random_u64()));
         let key = SymKey::generate();
         let nonce: [u8; 24] = random();
-        let ct = key.seal(&nonce, ATTACHMENT_AAD, &plain)?;
-        let blob = self.node.put_blob(space, ct).await?;
-        let r = AttachmentRef {
-            blob,
-            key: key.0,
-            nonce,
-            mime: guess_mime(&name).into(),
-            name,
-            size: plain.len() as u64,
+        let progress = self.progress(TransferDirection::Upload, id.to_string());
+        let job = {
+            let (src, copy, staged, key, progress) =
+                (src.to_path_buf(), incoming.join(&name), staged.clone(), key.clone(), progress.clone());
+            tokio::task::spawn_blocking(move || {
+                crate::files::seal_file(&src, &copy, &staged, &key, &nonce, ATTACHMENT_AAD, |done| progress(done, size))
+            })
         };
-        // keep a decrypted copy for ourselves
-        if let Some(p) = self.file_path(&r) {
-            if let Some(d) = p.parent() {
-                tokio::fs::create_dir_all(d).await?;
+        let res = match job.await {
+            Ok(Ok((blob, len))) => self.node.add_blob(space, &staged, blob).await.map(|()| (blob, len)),
+            Ok(Err(e)) => Err(e),
+            Err(e) => Err(e.into()),
+        };
+        let (blob, len) = match res {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&staged).await;
+                let _ = tokio::fs::remove_dir_all(&incoming).await;
+                return Err(e);
             }
-            tokio::fs::write(&p, &plain).await?;
+        };
+        progress(len, len);
+        // our decrypted copy: files/<blob>/<name>
+        if tokio::fs::rename(&incoming, files.join(blob.to_string())).await.is_err() {
+            let _ = tokio::fs::remove_dir_all(&incoming).await;
         }
-        Ok(r)
+        Ok(AttachmentRef { blob, key: key.0, nonce, mime: guess_mime(&name).into(), name, size: len })
     }
 
     /// Where an attachment's decrypted copy lives. Always inside `files/`.
@@ -894,16 +983,30 @@ impl Runtime {
         if out.exists() {
             return Ok(out.to_string_lossy().into_owned());
         }
-        let blob_path = self.node.fetch_blob(space, hash).await?;
-        let ct = tokio::fs::read(&blob_path).await?;
-        let plain = SymKey(a.key)
-            .open(&a.nonce, ATTACHMENT_AAD, &ct)
-            .context("attachment failed to decrypt")?;
-        if let Some(d) = out.parent() {
-            tokio::fs::create_dir_all(d).await?;
+        let progress = self.progress(TransferDirection::Download, blob.clone());
+        let blob_path = self.node.fetch_blob_with_progress(space, hash, progress.clone()).await?;
+        let sealed = tokio::fs::metadata(&blob_path).await?.len();
+        mycel_net::ensure_free_space(&self.data_dir, sealed)?;
+        let dir = out.parent().context("no file path")?.to_path_buf();
+        tokio::fs::create_dir_all(&dir).await?;
+        // Decrypt next to the final name, then rename: a half-written file
+        // never shows up as the attachment.
+        let tmp = dir.join(format!(".{:016x}.part", mycel_crypto::random_u64()));
+        let job = {
+            let (blob_path, tmp, key, nonce) = (blob_path.clone(), tmp.clone(), SymKey(a.key), a.nonce);
+            tokio::task::spawn_blocking(move || crate::files::open_file(&blob_path, &tmp, &key, &nonce, ATTACHMENT_AAD))
+        };
+        let res = match job.await {
+            Ok(r) => r,
+            Err(e) => Err(e.into()),
+        };
+        if let Err(e) = res {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
         }
-        tokio::fs::write(&out, plain).await?;
+        tokio::fs::rename(&tmp, &out).await?;
         quarantine(&out);
+        progress(sealed, sealed);
         self.emit(Event::BlobReady { blob });
         self.emit(Event::ConversationUpdated { conversation: space.to_string() });
         Ok(out.to_string_lossy().into_owned())

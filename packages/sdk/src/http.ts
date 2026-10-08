@@ -19,7 +19,7 @@ function token(): string {
 const marker = () => ({ "X-Mycel": token() });
 
 async function upload(file: File, base: string): Promise<string> {
-  const res = await fetch(`${base}/api/upload?name=${encodeURIComponent(file.name)}`, {
+  const res = await fetch(`${base}/api/upload?name=${encodeURIComponent(file.name || "pasted")}`, {
     method: "POST",
     headers: { ...marker(), "Content-Type": "application/octet-stream" },
     body: file,
@@ -69,6 +69,9 @@ function httpFiles(base: string): FileHost {
     },
     async open(path) {
       window.open(`${base}/api/file?path=${encodeURIComponent(path)}&t=${encodeURIComponent(token())}`, "_blank", "noopener");
+    },
+    stage(files) {
+      return Promise.all(files.map((f) => upload(f, base)));
     },
   };
 }

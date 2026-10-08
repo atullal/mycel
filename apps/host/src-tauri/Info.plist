@@ -3,11 +3,20 @@
 <!-- Merged into Mycel.app/Contents/Info.plist by `cargo tauri build`.
      macOS 15+ asks the user before an app talks to devices on the local network;
      these keys give that prompt a reason and declare the mDNS service Mycel uses
-     (iroh mDNS address lookup with service name "mycel" => _mycel._udp). -->
+     (iroh mDNS address lookup with service name "mycel" => _mycel._udp).
+     The folder usage descriptions let macOS ask before Mycel reads a file you
+     attach from Desktop, Documents or Downloads (without them the read just
+     fails with "Operation not permitted"). -->
 <plist version="1.0">
 <dict>
   <key>NSLocalNetworkUsageDescription</key>
   <string>Mycel finds people running Mycel on the same Wi-Fi or wired network and sends them your encrypted messages directly, with no internet or server.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Mycel reads files you choose to attach from your Desktop so it can encrypt and send them.</string>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Mycel reads files you choose to attach from your Documents folder so it can encrypt and send them.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Mycel reads files you choose to attach from your Downloads folder so it can encrypt and send them.</string>
   <key>NSBonjourServices</key>
   <array>
     <string>_mycel._udp</string>

@@ -5,10 +5,17 @@
 //! - HPKE RFC 9180 lockboxes: DHKEM(X25519, HKDF-SHA256) + HKDF-SHA256 + ChaCha20-Poly1305
 //! - XChaCha20-Poly1305 content encryption
 //! - BLAKE3 for ids and key commitments
+//! - Chunked streaming XChaCha20-Poly1305 (STREAM) for attachments of any size
 //!
 //! Every signature / hash / HPKE `info` is domain-separated with a context string.
 
 use std::fmt;
+
+pub mod stream;
+pub use stream::{
+    STREAM_CHUNK, STREAM_HEADER_LEN, STREAM_MAGIC, StreamOpener, StreamSealer, is_stream, open_stream,
+    seal_stream, sealed_len,
+};
 
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
@@ -35,6 +42,8 @@ pub enum CryptoError {
     Encrypt,
     #[error("os randomness unavailable")]
     Rng,
+    #[error("i/o error: {0}")]
+    Io(String),
 }
 
 pub type Result<T> = std::result::Result<T, CryptoError>;
@@ -74,6 +83,25 @@ impl Hash32 {
         let mut h = blake3::Hasher::new_derive_key(ctx);
         h.update(bytes);
         Hash32(*h.finalize().as_bytes())
+    }
+}
+
+/// Incremental [`Hash32::digest`]: same result for the same bytes, fed in pieces.
+#[derive(Clone)]
+pub struct Digest(blake3::Hasher);
+
+impl Digest {
+    pub fn new(ctx: &str) -> Self {
+        Digest(blake3::Hasher::new_derive_key(ctx))
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) -> &mut Self {
+        self.0.update(bytes);
+        self
+    }
+
+    pub fn finalize(&self) -> Hash32 {
+        Hash32(*self.0.finalize().as_bytes())
     }
 }
 

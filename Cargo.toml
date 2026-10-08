@@ -14,6 +14,20 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 debug = false
 
+# Attachments stream through these: unoptimized they run at a few MB/s, which
+# makes debug builds and tests with large files crawl.
+[profile.dev.package.blake3]
+opt-level = 3
+[profile.dev.package.chacha20]
+opt-level = 3
+[profile.dev.package.poly1305]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+# (the AEAD's generic code is instantiated here)
+[profile.dev.package.mycel-crypto]
+opt-level = 3
+
 [profile.release]
 codegen-units = 1
 lto = true

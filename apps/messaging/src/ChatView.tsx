@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { useMessages, useMycel, useTyping } from "@mycel/sdk/react";
 import type { Contact, ConversationSummary, MessageView } from "@mycel/sdk";
 import { MessageList } from "./MessageList.tsx";
-import { Composer } from "./Composer.tsx";
+import { Composer, type ComposerHandle } from "./Composer.tsx";
 import { ConversationAvatar, Icon, errorText } from "./ui.tsx";
 
 export function ChatView({
@@ -79,8 +79,66 @@ export function ChatView({
 
   const canPost = summary.active && !summary.request && summary.myRole !== "readOnly";
 
+  // Drag files onto the conversation to attach them. The native host reports
+  // real paths; in a browser, HTML drop events carry File objects.
+  const composer = useRef<ComposerHandle>(null);
+  const [dragging, setDragging] = useState(false);
+  const dragDepth = useRef(0);
+  const canDrop = canPost && !editing;
+  useEffect(() => {
+    if (!canDrop || !mycel.files.onDragDrop) return;
+    const off = mycel.files.onDragDrop((e) => {
+      if (e.type === "over") setDragging(true);
+      else {
+        setDragging(false);
+        if (e.type === "drop") composer.current?.attachPaths(e.paths);
+      }
+    });
+    return () => {
+      off();
+      setDragging(false);
+    };
+  }, [mycel, canDrop]);
+  const hasFiles = (e: DragEvent) => Array.from(e.dataTransfer.types).includes("Files");
+  const html5Drop = canDrop && !!mycel.files.stage && !mycel.files.onDragDrop;
+  const dropHandlers = html5Drop
+    ? {
+        onDragEnter: (e: DragEvent) => {
+          if (!hasFiles(e)) return;
+          e.preventDefault();
+          dragDepth.current += 1;
+          setDragging(true);
+        },
+        onDragOver: (e: DragEvent) => {
+          if (!hasFiles(e)) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "copy";
+        },
+        onDragLeave: () => {
+          dragDepth.current = Math.max(0, dragDepth.current - 1);
+          if (dragDepth.current === 0) setDragging(false);
+        },
+        onDrop: (e: DragEvent) => {
+          if (!hasFiles(e)) return;
+          e.preventDefault();
+          dragDepth.current = 0;
+          setDragging(false);
+          composer.current?.attachFiles(Array.from(e.dataTransfer.files));
+        },
+      }
+    : {};
+
   return (
-    <section className="mx-chat" aria-label={summary.title}>
+    <section className={`mx-chat${dragging ? " is-dropping" : ""}`} aria-label={summary.title} {...dropHandlers}>
+      {dragging && (
+        <div className="mx-dropzone" aria-hidden="true">
+          <div className="mx-dropzone-card">
+            <Icon.Clip />
+            <span>Drop to attach</span>
+            <small>Any size. Folders are sent as .zip</small>
+          </div>
+        </div>
+      )}
       <header className="mx-chat-head">
         <button className="mx-icon-btn mx-back" onClick={onBack} aria-label="Back to conversations">
           <Icon.Back />
@@ -139,6 +197,7 @@ export function ChatView({
         <RequestBar summary={summary} onDeclined={onBack} />
       ) : canPost ? (
         <Composer
+          ref={composer}
           conversation={summary}
           messages={messages}
           replyTo={replyTo}

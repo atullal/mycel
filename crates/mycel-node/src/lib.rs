@@ -10,6 +10,7 @@
 
 pub mod api;
 pub mod dispatch;
+mod files;
 mod runtime;
 pub mod store;
 

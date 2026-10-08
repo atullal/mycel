@@ -323,3 +323,205 @@ async fn contact_code_address_hints_connect_without_discovery() {
     alice.shutdown().await.unwrap();
     bob.shutdown().await.unwrap();
 }
+
+// ───────────────────────────── attachments ─────────────────────────────
+
+/// Alice and Bob in an accepted DM.
+async fn dm_pair(tag: &str) -> (Arc<Runtime>, Arc<Runtime>, String) {
+    let alice = open(&tmp(&format!("{tag}-a")), "Alice", free_port(), false).await;
+    let bob = open(&tmp(&format!("{tag}-b")), "Bob", free_port(), false).await;
+    connect_all(&[&alice, &bob]);
+    let b = alice.add_contact(bob.profile().contact_code).unwrap();
+    let conv = alice.create_conversation(None, vec![b.id]).unwrap();
+    eventually("bob joined", || bob.conversations().len() == 1).await;
+    bob.accept_request(conv.id.clone()).unwrap();
+    (alice, bob, conv.id)
+}
+
+/// Write `len` pseudo-random bytes to `path` a megabyte at a time.
+fn write_pseudo_random(path: &std::path::Path, len: usize) {
+    use std::io::Write;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
+    let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut left = len;
+    while left > 0 {
+        for c in buf.chunks_mut(8) {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            c.copy_from_slice(&x.to_le_bytes()[..c.len()]);
+        }
+        let n = left.min(buf.len());
+        f.write_all(&buf[..n]).unwrap();
+        left -= n;
+    }
+}
+
+/// Compare two files a chunk at a time (they may be big).
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::io::Read;
+    let (mut fa, mut fb) = (std::fs::File::open(a).unwrap(), std::fs::File::open(b).unwrap());
+    if fa.metadata().unwrap().len() != fb.metadata().unwrap().len() {
+        return false;
+    }
+    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = fa.read(&mut ba).unwrap();
+        if n == 0 {
+            return true;
+        }
+        fb.read_exact(&mut bb[..n]).unwrap();
+        if ba[..n] != bb[..n] {
+            return false;
+        }
+    }
+}
+
+async fn wait_for_message(rt: &Runtime, conv: &str, body: &str) -> mycel_node::api::MessageView {
+    let mut found = None;
+    eventually(&format!("message {body:?} arrives"), || {
+        found = rt.messages(conv.into(), None, None).unwrap().into_iter().find(|m| m.body == body);
+        found.is_some()
+    })
+    .await;
+    found.unwrap()
+}
+
+fn progress_events(rx: &mut tokio::sync::broadcast::Receiver<Event>, id: &str) -> Vec<(u64, u64)> {
+    let mut out = vec![];
+    while let Ok(ev) = rx.try_recv() {
+        if let Event::TransferProgress { id: i, done, total, .. } = ev
+            && i == id
+        {
+            out.push((done, total));
+        }
+    }
+    out
+}
+
+/// Way past the old 50 MiB cap: streamed, chunk-encrypted, fetched on demand
+/// (too big for an eager push), byte-exact, with progress both ways.
+#[tokio::test(flavor = "multi_thread")]
+async fn large_attachment_streams_between_nodes() {
+    let (alice, bob, conv) = dm_pair("big").await;
+    let file = tmp("big").with_extension("mov");
+    let len = 120 * 1024 * 1024;
+    write_pseudo_random(&file, len);
+    let path = file.to_string_lossy().into_owned();
+
+    let mut a_events = alice.subscribe();
+    let t = std::time::Instant::now();
+    let sent = alice.send_message(conv.clone(), "video".into(), None, vec![path.clone()]).await.unwrap();
+    let encrypt_time = t.elapsed();
+    let att = &sent.attachments[0];
+    assert_eq!(att.size, len as u64);
+    assert_eq!(att.mime, "video/quicktime");
+    assert_eq!(att.name, file.file_name().unwrap().to_str().unwrap());
+    assert!(same_file(&file, std::path::Path::new(att.local_path.as_ref().unwrap())), "sender keeps a plaintext copy");
+    let up = progress_events(&mut a_events, &path);
+    assert_eq!(up.last(), Some(&(len as u64, len as u64)), "upload progress ends at 100%");
+
+    wait_for_message(&bob, &conv, "video").await;
+    let space = bob.node().space_ids()[0];
+    let hash = hash_of(&att.blob);
+    assert!(bob.node().blob_path(&space, &hash).is_none(), "not pushed eagerly");
+
+    let mut b_events = bob.subscribe();
+    let t = std::time::Instant::now();
+    let got = bob.fetch_attachment(att.blob.clone()).await.unwrap();
+    let fetch_time = t.elapsed();
+    assert!(same_file(&file, std::path::Path::new(&got)), "byte-exact after the round trip");
+    let down = progress_events(&mut b_events, &att.blob);
+    assert!(down.len() >= 2, "download progress events: {down:?}");
+    let (done, total) = *down.last().unwrap();
+    assert_eq!(done, total);
+    assert!(total > len as u64, "progress counts sealed bytes");
+    eprintln!(
+        "120 MiB: encrypt+store {encrypt_time:?}, fetch+decrypt {fetch_time:?}, {} download progress events",
+        down.len()
+    );
+    let view = bob.messages(conv.clone(), None, None).unwrap();
+    assert_eq!(view.last().unwrap().attachments[0].local_path.as_deref(), Some(got.as_str()));
+
+    alice.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
+    let _ = std::fs::remove_file(&file);
+}
+
+/// Attachments sent before streaming (one-shot sealed) still open; folders
+/// and packages go as .zip; file:// URLs work; unreadable files say why.
+#[tokio::test(flavor = "multi_thread")]
+async fn legacy_attachments_folders_and_read_errors() {
+    use mycel_node::chat::{AttachmentRef, ChatOp, messages_feed};
+    use mycel_node::crypto::SymKey;
+    let (alice, bob, conv) = dm_pair("legacy").await;
+    let space = alice.node().space_ids()[0];
+
+    // the one-shot format older builds sent
+    let plain: Vec<u8> = (0..300_000u32).map(|i| (i * 13 % 251) as u8).collect();
+    let (key, nonce) = (SymKey::generate(), mycel_node::crypto::random());
+    let ct = key.seal(&nonce, b"mycel/v0/attachment", &plain).unwrap();
+    let blob = alice.node().put_blob(space, ct).await.unwrap();
+    let a = AttachmentRef {
+        blob,
+        key: key.0,
+        nonce,
+        name: "old.pdf".into(),
+        mime: "application/pdf".into(),
+        size: plain.len() as u64,
+    };
+    let op = ChatOp::Text { body: "legacy".into(), reply_to: None, attachments: vec![a] };
+    alice.node().with_space(&space, |r| r.append(messages_feed(), op.encode())).unwrap().unwrap();
+    alice.node().changed(space);
+    let m = wait_for_message(&bob, &conv, "legacy").await;
+    let got = bob.fetch_attachment(m.attachments[0].blob.clone()).await.unwrap();
+    assert_eq!(std::fs::read(got).unwrap(), plain);
+
+    // a folder (like a macOS package), passed as a file:// URL with a space in its name
+    let root = tmp("pkg");
+    let pkg = root.join("My Report.pages");
+    std::fs::create_dir_all(pkg.join("Data")).unwrap();
+    std::fs::write(pkg.join("Index.xml"), b"<doc/>").unwrap();
+    std::fs::write(pkg.join("Data").join("img.bin"), vec![7u8; 100_000]).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("Index.xml", pkg.join("link.xml")).unwrap();
+    let url = format!("file://{}", pkg.to_string_lossy().replace(' ', "%20"));
+    let sent = alice.send_message(conv.clone(), "pkg".into(), None, vec![url]).await.unwrap();
+    assert_eq!(sent.attachments[0].name, "My Report.pages.zip");
+    assert_eq!(sent.attachments[0].mime, "application/zip");
+    let m = wait_for_message(&bob, &conv, "pkg").await;
+    let got = bob.fetch_attachment(m.attachments[0].blob.clone()).await.unwrap();
+    let mut z = zip::ZipArchive::new(std::fs::File::open(got).unwrap()).unwrap();
+    let names: Vec<String> = z.file_names().map(str::to_string).collect();
+    assert!(names.contains(&"My Report.pages/Index.xml".to_string()), "{names:?}");
+    assert!(names.contains(&"My Report.pages/Data/img.bin".to_string()), "{names:?}");
+    let mut img = vec![];
+    std::io::Read::read_to_end(&mut z.by_name("My Report.pages/Data/img.bin").unwrap(), &mut img).unwrap();
+    assert_eq!(img, vec![7u8; 100_000]);
+
+    // errors carry the reason
+    let missing = root.join("nope.txt").to_string_lossy().into_owned();
+    let e = alice.send_message(conv.clone(), "x".into(), None, vec![missing]).await.unwrap_err();
+    assert!(format!("{e:#}").contains("can't find"), "{e:#}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = root.join("locked.txt");
+        std::fs::write(&locked, b"secret").unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&locked).is_err() {
+            // (not running as root)
+            let e = alice
+                .send_message(conv.clone(), "x".into(), None, vec![locked.to_string_lossy().into()])
+                .await
+                .unwrap_err();
+            let msg = format!("{e:#}");
+            assert!(msg.contains("locked.txt") && msg.contains("denied"), "{msg}");
+            #[cfg(target_os = "macos")]
+            assert!(msg.contains("Privacy & Security"), "{msg}");
+        }
+    }
+    alice.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
+}

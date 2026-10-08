@@ -13,7 +13,6 @@ pub const ALPN_EPH: &[u8] = b"mycel/eph/0";
 pub const ALPN_BLOB: &[u8] = b"mycel/blob/0";
 
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
-pub const MAX_BLOB: u64 = 50 * 1024 * 1024;
 
 pub async fn send<T: Serialize>(s: &mut SendStream, msg: &T) -> Result<()> {
     let bytes = postcard::to_allocvec(msg)?;
@@ -112,11 +111,19 @@ pub fn eph_aad(space: &SpaceId, sender: &[u8; 32]) -> Vec<u8> {
     [b"mycel/v0/ephemeral".as_slice(), &space.0, sender].concat()
 }
 
+/// Blob requests (see `blobs.rs`). New variants are only ever appended, so
+/// older peers' requests keep decoding.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum BlobReq {
+    /// Whole blob (original protocol). Answered with `Found{len}` + bytes.
     Get { space: SpaceId, hash: Hash32 },
-    /// Followed by `len` raw bytes.
+    /// Followed by `len` raw bytes, no handshake (original protocol).
     Put { space: SpaceId, hash: Hash32, len: u64 },
+    /// Bytes from `offset` on (resume). Answered with `Range` + bytes.
+    GetFrom { space: SpaceId, hash: Hash32, offset: u64 },
+    /// Offer to push `len` bytes. Answered with `Stored` (already have it),
+    /// `SendFrom`, `NoSpace`, `Busy` or `Denied`.
+    Offer { space: SpaceId, hash: Hash32, len: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -126,8 +133,19 @@ pub enum BlobResp {
     NotFound,
     Denied,
     Stored,
+    /// Followed by bytes `[offset, total)`. `offset` may be lower than asked.
+    Range { total: u64, offset: u64 },
+    /// Send bytes `[offset, len)` (we already hold the first `offset`).
+    SendFrom { offset: u64 },
+    /// Accepting it would leave too little free disk space.
+    NoSpace,
+    /// Another transfer of this blob is in progress.
+    Busy,
 }
 
+pub const BLOB_HASH_CTX: &str = "mycel/v0/blob";
+
+/// A blob's id: domain-separated BLAKE3 of its (encrypted) bytes.
 pub fn blob_hash(bytes: &[u8]) -> Hash32 {
-    Hash32::digest("mycel/v0/blob", bytes)
+    Hash32::digest(BLOB_HASH_CTX, bytes)
 }

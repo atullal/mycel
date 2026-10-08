@@ -913,6 +913,29 @@
 .mx-file-btn {
   color: var(--accent);
 }
+.mx-file-size.is-error {
+  color: var(--danger);
+}
+
+/* attachment download progress */
+.mx-progress {
+  display: block;
+  height: 3px;
+  margin-top: 5px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--ink) 10%, transparent);
+  overflow: hidden;
+}
+.mx-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.25s linear;
+}
+.mx-image.is-pending .mx-progress {
+  grid-column: 1 / -1;
+}
 
 /* hover actions */
 .mx-actions {
@@ -1212,6 +1235,55 @@
 }
 .mx-pending button:hover {
   background: var(--surface);
+}
+.mx-pending li.is-sending,
+.mx-pending li.is-staging {
+  position: relative;
+  overflow: hidden;
+  padding-right: 10px;
+}
+.mx-pending-pct {
+  font-variant-numeric: tabular-nums;
+  color: var(--accent) !important;
+  font-size: 12px;
+}
+.mx-pending-bar {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--accent);
+  transition: width 0.25s linear;
+}
+
+/* drag files onto a conversation */
+.mx-chat {
+  position: relative;
+}
+.mx-dropzone {
+  position: absolute;
+  inset: 8px;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  border: 2px dashed var(--accent);
+  border-radius: var(--r-md);
+  background: color-mix(in srgb, var(--surface) 82%, transparent);
+  pointer-events: none;
+}
+.mx-dropzone-card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  color: var(--accent);
+  font-weight: 600;
+  font-size: 15px;
+}
+.mx-dropzone-card small {
+  color: var(--ink-3);
+  font-weight: 400;
+  font-size: 12.5px;
 }
 
 .mx-composer-error {

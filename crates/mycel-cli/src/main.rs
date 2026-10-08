@@ -12,8 +12,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    body::Bytes,
-    extract::{Path as UrlPath, Query, State},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Path as UrlPath, Query, Request, State},
     http::{HeaderMap, StatusCode, header},
     response::{
         IntoResponse, Response,
@@ -27,7 +27,8 @@ use mycel_node::{Runtime, RuntimeOptions, dispatch::dispatch};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_stream::{StreamExt, wrappers::BroadcastStream};
-use tower_http::services::ServeDir;
+use tokio::io::AsyncWriteExt;
+use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Parser)]
 #[command(name = "mycel", about = "Peer-to-peer, end-to-end encrypted, serverless.")]
@@ -225,7 +226,7 @@ async fn api_cmd(
     } else {
         match serde_json::from_slice(&body) {
             Ok(v) => v,
-            Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{e:#}")}))).into_response(),
         }
     };
     // Browser-supplied attachment paths must come from our own upload folder.
@@ -246,7 +247,8 @@ async fn api_cmd(
     }
     match dispatch(&app.rt, &cmd, args).await {
         Ok(v) => Json(v).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))).into_response(),
+        // `{:#}`: the whole cause chain ("can't read x: Operation not permitted"), not just the outer message
+        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"error": format!("{e:#}")}))).into_response(),
     }
 }
 
@@ -267,35 +269,44 @@ struct UploadQ {
     name: String,
 }
 
-/// Browser file picker → a file under the data dir the runtime can attach.
-async fn api_upload(
-    State(app): State<Shared>,
-    headers: HeaderMap,
-    Query(q): Query<UploadQ>,
-    body: Bytes,
-) -> Response {
+/// Browser file picker / drop / paste → a file under the data dir the
+/// runtime can attach. Streams the body to disk: no size limit, bounded memory.
+async fn api_upload(State(app): State<Shared>, headers: HeaderMap, Query(q): Query<UploadQ>, body: Body) -> Response {
     if let Err(r) = guard(&app, &headers, None) {
         return r;
     }
-    let name: String = q
-        .name
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or("file")
-        .chars()
-        .filter(|c| !c.is_control())
-        .collect();
-    let name = if name.is_empty() || name == "." || name == ".." { "file".into() } else { name };
-    let dir = app.rt.data_dir().join("uploads").join(format!("{:016x}", mycel_node::crypto::random_u64()));
-    let path = dir.join(name);
-    let res = async {
-        tokio::fs::create_dir_all(&dir).await?;
-        tokio::fs::write(&path, &body).await
+    let fail = |status: StatusCode, e: anyhow::Error| (status, Json(json!({"error": format!("{e:#}")}))).into_response();
+    let path = match app.rt.new_upload_path(&q.name) {
+        Ok(p) => p,
+        Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let expected = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(len) = expected
+        && let Err(e) = mycel_node::net::ensure_free_space(app.rt.data_dir(), len)
+    {
+        return fail(StatusCode::INSUFFICIENT_STORAGE, e);
+    }
+    let res: Result<()> = async {
+        let mut f = tokio::fs::File::create(&path).await?;
+        let mut stream = body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            f.write_all(&chunk.context("upload interrupted")?).await?;
+        }
+        f.flush().await?;
+        Ok(())
     }
     .await;
     match res {
         Ok(()) => Json(json!({"path": path.to_string_lossy()})).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
+        Err(e) => {
+            if let Some(dir) = path.parent() {
+                let _ = tokio::fs::remove_dir_all(dir).await;
+            }
+            fail(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
     }
 }
 
@@ -305,9 +316,10 @@ struct FileQ {
     t: Option<String>,
 }
 
-/// Serve a local file — only from inside the data dir.
-async fn api_file(State(app): State<Shared>, headers: HeaderMap, Query(q): Query<FileQ>) -> Response {
-    if let Err(r) = guard(&app, &headers, q.t.as_deref()) {
+/// Serve a local file — only from inside the data dir. Streamed, with
+/// Range support (video seeking, multi-GB files).
+async fn api_file(State(app): State<Shared>, Query(q): Query<FileQ>, req: Request) -> Response {
+    if let Err(r) = guard(&app, req.headers(), q.t.as_deref()) {
         return r;
     }
     let Ok(path) = Path::new(&q.path).canonicalize() else {
@@ -321,24 +333,26 @@ async fn api_file(State(app): State<Shared>, headers: HeaderMap, Query(q): Query
             .canonicalize()
             .is_ok_and(|root| path.starts_with(root))
     });
-    if !allowed {
+    if !allowed || !path.is_file() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-            let mime = mime_for(&name);
-            (
-                [
-                    (header::CONTENT_TYPE, mime.to_string()),
-                    (header::CONTENT_DISPOSITION, format!("inline; filename=\"{}\"", name.replace('"', ""))),
-                    (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
-                    (header::CONTENT_SECURITY_POLICY, "sandbox".to_string()),
-                ],
-                bytes,
-            )
-                .into_response()
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    match ServeFile::new(&path).try_call(req).await {
+        Ok(resp) if resp.status().is_success() => {
+            let mut resp = resp.map(Body::new);
+            let h = resp.headers_mut();
+            // our own conservative type, not a guess from the extension
+            h.insert(header::CONTENT_TYPE, header::HeaderValue::from_static(mime_for(&name)));
+            if let Ok(v) = header::HeaderValue::from_str(&format!("inline; filename=\"{}\"", name.replace(['"', '\\'], "")))
+                .or_else(|_| header::HeaderValue::from_str("inline"))
+            {
+                h.insert(header::CONTENT_DISPOSITION, v);
+            }
+            h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+            h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static("sandbox"));
+            resp
         }
+        Ok(resp) => resp.status().into_response(),
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -423,7 +437,8 @@ async fn serve(dev: DeviceArgs, http: SocketAddr, ui: Option<PathBuf>) -> Result
         .route("/api/health", get(health))
         .route("/api/cmd/{cmd}", post(api_cmd))
         .route("/api/events", get(api_events))
-        .route("/api/upload", post(api_upload))
+        // uploads stream to disk: no body size limit
+        .route("/api/upload", post(api_upload).layer(DefaultBodyLimit::disable()))
         .route("/api/file", get(api_file));
     if let Some(dir) = &ui {
         // static assets only; every HTML route goes through `serve_index` (token injection)
