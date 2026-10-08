@@ -10,7 +10,7 @@
 //! main (UI) thread.
 
 use mycel_node::api::{
-    Contact, ConversationId, ConversationSummary, MessageId, MessageView, NearbyPeer,
+    CallInfo, Contact, ConversationId, ConversationSummary, MessageId, MessageView, NearbyPeer,
     NetworkMode, NetworkStatus, PeerId, Profile,
 };
 use tauri::{AppHandle, State};
@@ -236,4 +236,36 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+// ---------------------------------------------------------------- calls
+
+#[tauri::command]
+pub async fn start_call(rt: State<'_, Rt>, conversation: ConversationId) -> Res<CallInfo> {
+    rt.start_call(conversation).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn accept_call(rt: State<'_, Rt>, call: String) -> Res<CallInfo> {
+    rt.accept_call(call).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn decline_call(rt: State<'_, Rt>, call: String) -> Res<()> {
+    rt.decline_call(call).map_err(err)
+}
+
+#[tauri::command]
+pub async fn end_call(rt: State<'_, Rt>, call: String) -> Res<()> {
+    rt.end_call(call).map_err(err)
+}
+
+#[tauri::command]
+pub async fn set_muted(rt: State<'_, Rt>, call: String, muted: bool) -> Res<CallInfo> {
+    rt.set_muted(call, muted).map_err(err)
+}
+
+#[tauri::command]
+pub async fn call_status(rt: State<'_, Rt>) -> Res<Vec<CallInfo>> {
+    Ok(rt.call_status())
 }

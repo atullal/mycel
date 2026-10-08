@@ -153,6 +153,104 @@ export interface NetworkStatus {
   peers: PeerPaths[];
 }
 
+// ---------------------------------------------------------------------------
+// Calls (live voice, 1:1)
+
+/** Hex call id, bound to the conversation and the caller. */
+export type CallId = string;
+
+export type CallDirection = "outgoing" | "incoming";
+
+/**
+ * - `connecting`: dialing their device (outgoing), or answered and setting up audio (incoming)
+ * - `ringing`: their device is ringing (outgoing), or yours is (incoming)
+ * - `active`: talking
+ * - `ended`: over; see `endReason`
+ */
+export type CallState = "connecting" | "ringing" | "active" | "ended";
+
+/**
+ * - `hungUp`: you hung up (or cancelled before they answered)
+ * - `remoteHungUp`: they hung up
+ * - `declined`: you declined; `remoteDeclined`: they did
+ * - `busy`: they're in another call
+ * - `unavailable`: their device couldn't be reached (offline, or no path to it)
+ * - `noAnswer`: nobody answered; `missed`: an incoming call you didn't answer
+ * - `replaced`: you both called at the same moment and this one merged into the other (don't show it)
+ * - `connectionLost`: every path died and none came back
+ * - `micDenied`: Mycel isn't allowed to use the microphone
+ * - `failed`: something else (`error` says what)
+ */
+export type CallEndReason =
+  | "hungUp"
+  | "remoteHungUp"
+  | "declined"
+  | "remoteDeclined"
+  | "busy"
+  | "unavailable"
+  | "noAnswer"
+  | "missed"
+  | "replaced"
+  | "connectionLost"
+  | "micDenied"
+  | "failed";
+
+/** Live numbers about a call (in-call bar, diagnostics). */
+export interface CallStats {
+  rttMs: number;
+  /** Of what we send, the share the other side reported missing (0..100). */
+  lossPct: number;
+  jitterMs: number;
+  /** Audio held in our jitter buffer. */
+  bufferMs: number;
+  /** Estimated mouth-to-ear delay of what we hear. */
+  latencyMs: number;
+  framesSent: number;
+  framesReceived: number;
+  framesLost: number;
+  framesLate: number;
+  /** `datagram` normally; `stream` when a path can't carry datagrams. */
+  transport: string;
+  /** What captures and plays audio ("Voice processing (echo cancellation)", ...). */
+  audioDevice: string;
+  /** Test audio only: frequency of what we hear (Hz). */
+  heardToneHz: number | null;
+  /** Test audio only: measured round trip of our tone bursts, echoed back. */
+  measuredRoundTripMs: number | null;
+}
+
+export interface CallInfo {
+  id: CallId;
+  conversation: ConversationId;
+  /** The other device. */
+  peer: PeerId;
+  peerName: string;
+  direction: CallDirection;
+  state: CallState;
+  endReason: CallEndReason | null;
+  /** Human-readable cause, e.g. for `failed` or `unavailable`. */
+  error: string | null;
+  /** When the call was placed or arrived (ms since epoch). */
+  startedAt: number;
+  /** When it became active (ms since epoch). */
+  connectedAt: number | null;
+  /** Talking time so far. */
+  durationMs: number;
+  /** The path carrying the call right now. */
+  path: PathKind | null;
+  /** Our Opus send bitrate, bits/s (32k on fast paths, ~12k on Bluetooth). */
+  bitrate: number;
+  muted: boolean;
+  remoteMuted: boolean;
+  /** Microphone level 0..1 (0 while muted). */
+  level: number;
+  /** Level of what we hear, 0..1. */
+  remoteLevel: number;
+  /** Echo cancellation is on (otherwise suggest headphones). */
+  echoCancellation: boolean;
+  stats: CallStats;
+}
+
 /**
  * - `upload`: encrypting an attachment we're sending.
  * - `download`: downloading an attachment someone sent.
@@ -175,7 +273,11 @@ export type MycelEvent =
    * event with `done === total`). `id` is the path passed to `send_message`
    * for uploads, and the blob id for downloads.
    */
-  | { type: "transferProgress"; direction: TransferDirection; id: string; done: number; total: number };
+  | { type: "transferProgress"; direction: TransferDirection; id: string; done: number; total: number }
+  /** Someone is calling: show Accept / Decline. */
+  | { type: "callIncoming"; call: CallInfo }
+  /** A call changed (state, path, bitrate, mute); ~10x a second while active, for duration and meters. */
+  | { type: "callUpdated"; call: CallInfo };
 
 /** Alias matching the Rust name. */
 export type Event = MycelEvent;
@@ -195,4 +297,6 @@ export const EVENT_TYPES: readonly EventType[] = [
   "networkChanged",
   "blobReady",
   "transferProgress",
+  "callIncoming",
+  "callUpdated",
 ] as const;

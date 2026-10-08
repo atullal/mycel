@@ -1,0 +1,428 @@
+//! Live calls between two real nodes (real QUIC), with test audio in place of
+//! microphones and speakers: over loopback IP, over in-memory links with a
+//! Bluetooth-like bandwidth limit, and with the peer-to-peer Wi-Fi link cut
+//! mid-call so the call continues over Bluetooth.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use mycel_call::audio::{AudioIo, TestAudio, TestSource};
+use mycel_call::level::{estimate_frequency, goertzel};
+use mycel_call::proto::{self, Ctrl, call_id};
+use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallInfo, CallManager, CallPhase, EndReason};
+use mycel_crypto::{DeviceKeys, Hash32, SignPk};
+use mycel_net::iroh::endpoint::Connection;
+use mycel_net::link::{Link, MemNet, PathKind};
+use mycel_net::{ExtraProtocol, NetMode, Node, NodeOptions};
+use mycel_trust::Role;
+use parking_lot::Mutex;
+use tokio::sync::mpsc;
+
+struct Host {
+    node: Arc<Node>,
+    events: Arc<Mutex<Vec<CallEvent>>>,
+}
+
+impl CallHost for Host {
+    fn me(&self) -> SignPk {
+        self.node.id()
+    }
+
+    fn callee(&self, space: &Hash32) -> anyhow::Result<SignPk> {
+        let me = self.node.id();
+        let others: Vec<SignPk> = self.node.with_space(space, |r| {
+            r.members().into_iter().filter(|(k, role)| k.sign_pk != me && *role != Role::Relay).map(|(k, _)| k.sign_pk).collect()
+        })?;
+        match others.as_slice() {
+            [one] => Ok(*one),
+            _ => anyhow::bail!("not a direct conversation"),
+        }
+    }
+
+    fn may_call(&self, space: &Hash32, peer: &SignPk) -> bool {
+        self.node.with_space(space, |r| r.is_member(peer) && r.my_role().is_some()).unwrap_or(false)
+    }
+
+    fn name_of(&self, peer: &SignPk) -> String {
+        peer.short()
+    }
+
+    fn connect(&self, peer: SignPk) -> BoxFuture<anyhow::Result<Connection>> {
+        let node = self.node.clone();
+        Box::pin(async move { node.connect(peer, ALPN_CALL).await })
+    }
+
+    fn note_connection(&self, peer: &SignPk, conn: &Connection) {
+        self.node.note_connection(*peer, conn);
+    }
+
+    fn emit(&self, event: CallEvent) {
+        self.events.lock().push(event);
+    }
+}
+
+struct Device {
+    node: Arc<Node>,
+    calls: CallManager,
+    audio: Arc<TestAudio>,
+    events: Arc<Mutex<Vec<CallEvent>>>,
+}
+
+impl Device {
+    fn hex(&self) -> String {
+        self.node.id().0.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn status(&self) -> Vec<CallInfo> {
+        self.calls.status()
+    }
+
+    fn live(&self) -> Vec<CallInfo> {
+        self.status().into_iter().filter(|c| c.state != CallPhase::Ended).collect()
+    }
+
+    fn incoming(&self) -> Option<CallInfo> {
+        self.events.lock().iter().rev().find_map(|e| match e {
+            CallEvent::Incoming(c) => Some(c.clone()),
+            _ => None,
+        })
+    }
+
+    fn call(&self, id: &str) -> Option<CallInfo> {
+        self.status().into_iter().find(|c| c.id == id)
+    }
+
+    /// Frequency of what this device heard in the last `secs` seconds.
+    fn heard(&self, secs: f32) -> Option<f32> {
+        let rec = self.audio.recording();
+        let rec = rec.lock();
+        let n = (48_000.0 * secs) as usize;
+        let tail = &rec.samples[rec.samples.len().saturating_sub(n)..];
+        estimate_frequency(tail, 48_000)
+    }
+
+    fn heard_power(&self, secs: f32, hz: f32) -> f32 {
+        let rec = self.audio.recording();
+        let rec = rec.lock();
+        let n = (48_000.0 * secs) as usize;
+        goertzel(&rec.samples[rec.samples.len().saturating_sub(n)..], hz, 48_000)
+    }
+}
+
+async fn device(name: &str, source: TestSource, ip: bool, nets: &[&MemNet]) -> Device {
+    let keys = Arc::new(DeviceKeys::generate());
+    let mut opts = NodeOptions::new(NetMode::Local, name);
+    opts.ip = ip;
+    opts.links = nets.iter().map(|n| n.link(keys.sign_pk()) as Arc<dyn Link>).collect();
+    let (tx, rx) = mpsc::unbounded_channel();
+    opts.extra_protocols.push(ExtraProtocol { alpn: ALPN_CALL.to_vec(), incoming: tx });
+    let node = Arc::new(Node::spawn(keys, opts).await.unwrap());
+    let events: Arc<Mutex<Vec<CallEvent>>> = Arc::default();
+    let calls = CallManager::new(Arc::new(Host { node: node.clone(), events: events.clone() }));
+    let audio = Arc::new(TestAudio::new(source));
+    calls.set_audio(audio.clone() as Arc<dyn AudioIo>);
+    calls.serve(rx);
+    Device { node, calls, audio, events }
+}
+
+fn sine(hz: f32) -> TestSource {
+    TestSource::Sine { hz, amp: 0.5 }
+}
+
+/// A conversation with both devices in it.
+async fn shared_space(a: &Device, b: &Device) -> Hash32 {
+    let (space, genesis) = a.node.create_space().unwrap();
+    a.node.with_space(&space, |r| r.add_member(b.node.keys().public(), Role::Writer)).unwrap().unwrap();
+    b.node.join_space(genesis).unwrap();
+    b.node.sync_with(a.node.id(), space, true).await.unwrap();
+    space
+}
+
+async fn eventually<T>(what: &str, secs: u64, mut f: impl FnMut() -> Option<T>) -> T {
+    let end = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        if Instant::now() > end {
+            panic!("timed out waiting for: {what}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Alice calls Bob and Bob answers; returns the call id once both are talking.
+async fn connect_call(alice: &Device, bob: &Device, space: Hash32) -> String {
+    let out = alice.calls.start(space).await.unwrap();
+    assert_eq!(out.state, CallPhase::Connecting);
+    let ring = eventually("bob's device rings", 15, || bob.incoming().filter(|r| r.id == out.id)).await;
+    assert_eq!(ring.conversation, space.to_string());
+    assert_eq!(ring.peer, alice.hex());
+    eventually("alice hears it ringing", 5, || {
+        (alice.call(&out.id)?.state == CallPhase::Ringing).then_some(())
+    })
+    .await;
+    bob.calls.accept(&ring.id).await.unwrap();
+    eventually("both active", 10, || {
+        let a = alice.call(&out.id)?;
+        let b = bob.call(&out.id)?;
+        (a.state == CallPhase::Active && b.state == CallPhase::Active).then_some(())
+    })
+    .await;
+    out.id
+}
+
+/// Mean delay from each tone burst Alice "says" to its onset in what Bob hears.
+fn burst_latency(alice: &Device, bob: &Device, period: f64) -> Option<f64> {
+    let src = alice.audio.source_start()?;
+    let rec = bob.audio.recording();
+    let rec = rec.lock();
+    let start = rec.start?;
+    let offset = start.saturating_duration_since(src).as_secs_f64();
+    let delays: Vec<f64> = TestAudio::onsets(&rec.samples)
+        .into_iter()
+        .map(|t| {
+            let t = t + offset;
+            t - (t / period).floor() * period
+        })
+        .collect();
+    if delays.len() < 3 {
+        return None;
+    }
+    let tail = &delays[1..];
+    Some(tail.iter().sum::<f64>() / tail.len() as f64)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn call_carries_audio_both_ways_and_hangs_up() {
+    let alice = device("alice", TestSource::Bursts { hz: 1000.0, on_ms: 100, period_ms: 500 }, true, &[]).await;
+    let bob = device("bob", sine(440.0), true, &[]).await;
+    alice.node.add_peer_addr(bob.node.addr());
+    bob.node.add_peer_addr(alice.node.addr());
+    let space = shared_space(&alice, &bob).await;
+
+    let t = Instant::now();
+    let id = connect_call(&alice, &bob, space).await;
+    eprintln!("ring → answer → active in {:?}", t.elapsed());
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    // Alice hears Bob's 440 Hz; Bob hears Alice's 1 kHz bursts.
+    let f = alice.heard(1.0).expect("alice hears something");
+    assert!((f - 440.0).abs() < 8.0, "alice heard {f} Hz");
+    assert!(bob.heard_power(2.0, 1000.0) > 50.0 * bob.heard_power(2.0, 440.0), "bob hears 1 kHz, not his own tone");
+    let latency = burst_latency(&alice, &bob, 0.5).expect("bursts detected");
+    let a = alice.call(&id).unwrap();
+    let b = bob.call(&id).unwrap();
+    eprintln!(
+        "mouth-to-ear latency {:.0} ms (estimate {} ms); bitrate {} bps; path {:?}; rtt {} ms; jitter buffer {} ms; sent {} received {} lost {}",
+        latency * 1000.0,
+        b.stats.latency_ms,
+        a.bitrate,
+        a.path,
+        a.stats.rtt_ms,
+        b.stats.buffer_ms,
+        a.stats.frames_sent,
+        b.stats.frames_received,
+        b.stats.frames_lost,
+    );
+    assert!(latency < 0.200, "latency {latency:.3} s");
+    assert_eq!(a.path, Some(PathKind::Network));
+    assert_eq!(a.bitrate, 32_000, "fast path: full bitrate");
+    assert_eq!(a.stats.transport, "datagram");
+    assert!(a.stats.frames_sent > 150 && b.stats.frames_received > 150);
+    assert!(b.stats.frames_lost < 10, "lost {}", b.stats.frames_lost);
+    assert!(a.duration_ms >= 3_000);
+    assert!(a.level > 0.0 && b.level > 0.0, "mic meters move");
+    assert!(a.remote_level > 0.0, "alice hears bob's steady tone on her meter");
+
+    // mute: Bob goes silent for Alice, and Alice sees it
+    bob.calls.set_muted(&id, true).unwrap();
+    eventually("alice sees bob muted", 5, || alice.call(&id)?.remote_muted.then_some(())).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(alice.heard(0.3).is_none(), "muted mic sends silence");
+    bob.calls.set_muted(&id, false).unwrap();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(alice.heard(0.3).is_some());
+
+    // Bob hangs up
+    bob.calls.end(&id).unwrap();
+    let a = eventually("alice sees the hang-up", 5, || {
+        alice.call(&id).filter(|c| c.state == CallPhase::Ended)
+    })
+    .await;
+    assert_eq!(a.end_reason, Some(EndReason::RemoteHungUp));
+    assert_eq!(bob.call(&id).unwrap().end_reason, Some(EndReason::HungUp));
+    assert!(alice.live().is_empty() && bob.live().is_empty());
+
+    // and a second call, hung up by the caller this time
+    let id2 = connect_call(&alice, &bob, space).await;
+    assert_ne!(id, id2, "every call gets a fresh id");
+    alice.calls.end(&id2).unwrap();
+    let b = eventually("bob sees the hang-up", 5, || bob.call(&id2).filter(|c| c.state == CallPhase::Ended)).await;
+    assert_eq!(b.end_reason, Some(EndReason::RemoteHungUp));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn decline_timeout_busy_and_strangers() {
+    let alice = device("alice", sine(440.0), true, &[]).await;
+    let bob = device("bob", sine(660.0), true, &[]).await;
+    let carol = device("carol", sine(550.0), true, &[]).await;
+    for a in [&alice, &bob, &carol] {
+        for b in [&alice, &bob, &carol] {
+            if a.node.id() != b.node.id() {
+                a.node.add_peer_addr(b.node.addr());
+            }
+        }
+    }
+    let space = shared_space(&alice, &bob).await;
+
+    // Bob declines
+    let out = alice.calls.start(space).await.unwrap();
+    let ring = eventually("bob rings", 10, || bob.incoming()).await;
+    bob.calls.decline(&ring.id).unwrap();
+    let a = eventually("declined", 5, || alice.call(&out.id).filter(|c| c.state == CallPhase::Ended)).await;
+    assert_eq!(a.end_reason, Some(EndReason::RemoteDeclined));
+    assert_eq!(bob.call(&ring.id).unwrap().end_reason, Some(EndReason::Declined));
+
+    // nobody answers
+    alice.calls.set_ring_timeout(Duration::from_secs(2));
+    bob.calls.set_ring_timeout(Duration::from_secs(2));
+    let out = alice.calls.start(space).await.unwrap();
+    let a = eventually("no answer", 10, || alice.call(&out.id).filter(|c| c.state == CallPhase::Ended)).await;
+    assert_eq!(a.end_reason, Some(EndReason::NoAnswer));
+    let b = eventually("missed", 10, || bob.call(&out.id).filter(|c| c.state == CallPhase::Ended)).await;
+    assert_eq!(b.end_reason, Some(EndReason::Missed));
+    alice.calls.set_ring_timeout(Duration::from_secs(45));
+    bob.calls.set_ring_timeout(Duration::from_secs(45));
+
+    // Carol isn't in Alice and Bob's conversation: she can't place a call
+    // there, and if she rings Alice about it directly, Alice's device refuses.
+    assert!(carol.calls.start(space).await.is_err());
+    for bound_to in [carol.node.id(), bob.node.id()] {
+        let conn = carol.node.connect(alice.node.id(), ALPN_CALL).await.unwrap();
+        let (mut tx, mut rx) = conn.open_bi().await.unwrap();
+        let nonce = [7u8; 16];
+        // a valid id for Carol, or Bob's id replayed by Carol: both refused
+        let ring = Ctrl::Ring { version: 0, space, nonce, call: call_id(&space, &bound_to, &nonce) };
+        proto::send(&mut tx, &ring).await.unwrap();
+        assert_eq!(proto::recv(&mut rx).await.unwrap(), Some(Ctrl::Denied));
+        conn.close(0u32.into(), b"");
+    }
+    assert!(alice.live().is_empty() && alice.incoming().is_none_or(|c| c.peer != carol.hex()), "nothing rang for carol");
+
+    // Busy: Alice is talking to Bob; Carol (in her own conversation with Alice) calls
+    let space2 = shared_space(&carol, &alice).await;
+    let id = connect_call(&alice, &bob, space).await;
+    let busy = carol.calls.start(space2).await.unwrap();
+    let c = eventually("busy", 10, || carol.call(&busy.id).filter(|c| c.state == CallPhase::Ended)).await;
+    assert_eq!(c.end_reason, Some(EndReason::Busy));
+    assert_eq!(alice.call(&id).unwrap().state, CallPhase::Active, "the first call goes on");
+    alice.calls.end(&id).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn both_call_at_once_become_one_call() {
+    let alice = device("alice", sine(440.0), true, &[]).await;
+    let bob = device("bob", sine(660.0), true, &[]).await;
+    alice.node.add_peer_addr(bob.node.addr());
+    bob.node.add_peer_addr(alice.node.addr());
+    let space = shared_space(&alice, &bob).await;
+
+    let (a, b) = tokio::join!(alice.calls.start(space), bob.calls.start(space));
+    let (a, b) = (a.unwrap(), b.unwrap());
+    assert_ne!(a.id, b.id);
+    let winner = eventually("one active call on both sides", 15, || {
+        let al = alice.live();
+        let bl = bob.live();
+        match (al.as_slice(), bl.as_slice()) {
+            ([x], [y]) if x.id == y.id && x.state == CallPhase::Active && y.state == CallPhase::Active => {
+                Some(x.id.clone())
+            }
+            _ => None,
+        }
+    })
+    .await;
+    assert!(winner == a.id || winner == b.id);
+    // the losing call ended as replaced, without ringing anyone
+    let loser = if winner == a.id { &b.id } else { &a.id };
+    let lost = alice.call(loser).or_else(|| bob.call(loser)).unwrap();
+    assert_eq!(lost.end_reason, Some(EndReason::Replaced));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!((alice.heard(1.0).unwrap() - 660.0).abs() < 8.0);
+    assert!((bob.heard(1.0).unwrap() - 440.0).abs() < 8.0);
+    alice.calls.end(&winner).unwrap();
+}
+
+/// No IP at all: the call starts on peer-to-peer Wi-Fi, then that link is
+/// cut and the same call continues over a slow Bluetooth-like link, at a
+/// lower bitrate.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_moves_from_peer_wifi_to_bluetooth() {
+    let wifi = MemNet::new(3, PathKind::PeerWifi);
+    let bt = MemNet::new(3, PathKind::Bluetooth);
+    // Bluetooth LE: ~20 KB/s, 20 ms each way
+    bt.set_rate_limit(Some(20_000));
+    bt.set_latency(Duration::from_millis(20));
+    let alice = device("alice", sine(440.0), false, &[&wifi, &bt]).await;
+    let bob = device("bob", sine(660.0), false, &[&wifi, &bt]).await;
+    eventually("links up", 15, || {
+        alice.node.peers().get(&bob.node.id()).is_some_and(|p| p.links.len() == 2).then_some(())
+    })
+    .await;
+    let space = shared_space(&alice, &bob).await;
+
+    let id = connect_call(&alice, &bob, space).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let a = alice.call(&id).unwrap();
+    assert_eq!(a.path, Some(PathKind::PeerWifi), "starts on the fast link");
+    assert_eq!(a.bitrate, 32_000);
+    assert!((bob.heard(1.0).unwrap() - 440.0).abs() < 8.0);
+
+    let cut = Instant::now();
+    wifi.cut();
+    let (a, gap) = eventually("call moves to bluetooth", 30, || {
+        let a = alice.call(&id)?;
+        (a.path == Some(PathKind::Bluetooth) && a.bitrate <= 12_000).then(|| (a, cut.elapsed()))
+    })
+    .await;
+    eprintln!("alice's side moved to Bluetooth after {gap:?}, bitrate {} bps", a.bitrate);
+    let b = eventually("bob's side moves to bluetooth too", 30, || {
+        let b = bob.call(&id)?;
+        (b.path == Some(PathKind::Bluetooth)).then_some(b)
+    })
+    .await;
+    eprintln!("bob's side moved after {:?}, bitrate {} bps", cut.elapsed(), b.bitrate);
+    let received = bob.call(&id).unwrap().stats.frames_received;
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let b = bob.call(&id).unwrap();
+    let a = alice.call(&id).unwrap();
+    assert_eq!(a.state, CallPhase::Active, "same call, still going");
+    assert_eq!(b.path, Some(PathKind::Bluetooth));
+    let per_sec = (b.stats.frames_received - received) as f64 / 4.0;
+    eprintln!(
+        "over Bluetooth: {per_sec:.0} frames/s, rtt {} ms, buffer {} ms, latency ≈{} ms, loss {:.1}%",
+        b.stats.rtt_ms, b.stats.buffer_ms, b.stats.latency_ms, a.stats.loss_pct
+    );
+    assert!(per_sec > 40.0, "audio keeps flowing over Bluetooth ({per_sec}/s)");
+    assert!((bob.heard(1.0).unwrap() - 440.0).abs() < 8.0, "bob still hears alice");
+    assert!((alice.heard(1.0).unwrap() - 660.0).abs() < 8.0, "alice still hears bob");
+    alice.calls.end(&id).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn audio_falls_back_to_a_stream() {
+    let alice = device("alice", sine(440.0), true, &[]).await;
+    let bob = device("bob", sine(660.0), true, &[]).await;
+    alice.node.add_peer_addr(bob.node.addr());
+    bob.node.add_peer_addr(alice.node.addr());
+    alice.calls.force_stream(true);
+    bob.calls.force_stream(true);
+    let space = shared_space(&alice, &bob).await;
+    let id = connect_call(&alice, &bob, space).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let a = alice.call(&id).unwrap();
+    assert_eq!(a.stats.transport, "stream");
+    assert!((bob.heard(1.0).unwrap() - 440.0).abs() < 8.0);
+    assert!((alice.heard(1.0).unwrap() - 660.0).abs() < 8.0);
+    alice.calls.end(&id).unwrap();
+}

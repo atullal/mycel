@@ -147,6 +147,35 @@ doesn't connect between your laptops, run Mycel from Terminal
 (`MYCEL_AWDL_DEBUG=1 MYCEL_BLE_LOG=2 /Applications/Mycel.app/Contents/MacOS/mycel-host`)
 and keep the log.
 
+## 5b. Voice calls (over every path)
+
+1. Open your one-to-one conversation and click the **phone** button in its
+   header. The other laptop shows an incoming-call card: **Accept** (green) or
+   **Decline** (red). The first time, macOS asks *"Mycel would like to access
+   the microphone"* → **OK** (on both laptops; if you missed it: System
+   Settings > Privacy & Security > Microphone > turn **Mycel** on, then call
+   again).
+2. While talking, the bar at the top shows the time, the path in use
+   (*via your network*, *via Peer-to-peer Wi-Fi*, *via Bluetooth*), the
+   bitrate, a level meter for each of you, **mute** and **hang up**. Click the
+   name in the bar to jump back to the conversation.
+3. **Walk the call across paths**, as in step 5: leave the Wi-Fi network
+   (→ *Peer-to-peer Wi-Fi*, 32 kbps), then turn Wi-Fi off (→ *Bluetooth*, the
+   bitrate drops to 12 kbps so it fits the slow link), then turn it back on.
+   The call keeps going; when a path dies there are about 5 seconds of silence
+   while it's detected, then audio resumes on the next path.
+4. Echo: Mycel uses Apple's voice processing (the echo cancellation FaceTime
+   uses), so speakers are fine. If the bar says *Use headphones to avoid
+   echo*, voice processing couldn't start on that Mac; use headphones.
+5. Try calling at the same moment from both laptops: you end up in one call.
+   Call a laptop that is quit: after a few seconds *can't be reached right
+   now*. Let it ring: *No answer* after 45 s on the caller, *Missed call* on
+   the other.
+
+For a log of which path each call uses, run Mycel from Terminal with
+`MYCEL_CALL_DEBUG=1 /Applications/Mycel.app/Contents/MacOS/mycel-host`
+(it prints every path with its RTT and packet counts once a second).
+
 ## 6. Offline delivery
 
 1. Quit Mycel on laptop B (**Mycel > Quit Mycel**, or ⌘Q).

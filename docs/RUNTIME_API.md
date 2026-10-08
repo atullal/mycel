@@ -37,6 +37,14 @@ impl Runtime {
     pub fn add_keeper(&self, id: ConversationId, keeper: PeerId) -> Result<()>;   // keeper must be a contact
     pub fn rename_conversation(&self, id: ConversationId, title: String) -> Result<()>;
     pub async fn fetch_attachment(&self, blob: String) -> Result<String>;       // local file path
+
+    // calls (live 1:1 voice)
+    pub async fn start_call(&self, conversation: ConversationId) -> Result<CallInfo>;
+    pub async fn accept_call(&self, call: String) -> Result<CallInfo>;
+    pub fn decline_call(&self, call: String) -> Result<()>;
+    pub fn end_call(&self, call: String) -> Result<()>;
+    pub fn set_muted(&self, call: String, muted: bool) -> Result<CallInfo>;
+    pub fn call_status(&self) -> Vec<CallInfo>;
     pub async fn sync_now(&self);                                               // pull-to-refresh
 }
 ```
@@ -71,12 +79,18 @@ impl Runtime {
 | `accept_request` | `{ id }` | `ConversationSummary` |
 | `decline_request` | `{ id, block? }` | `null` |
 | `stage_file` | raw bytes as the body; `x-mycel-name` header = URI-encoded file name | `string` (path to pass in `attachments`) |
+| `start_call` | `{ conversation }` | `CallInfo` |
+| `accept_call` | `{ call }` | `CallInfo` |
+| `decline_call` | `{ call }` | `null` |
+| `end_call` | `{ call }` | `null` |
+| `set_muted` | `{ call, muted }` | `CallInfo` |
+| `call_status` | — | `CallInfo[]` |
 
 `stage_file` is host-only (Tauri). It is for pasted images and other files without a path. The SDK calls it through `files.stage()`.
 
 Errors are rejected promises carrying a human-readable string. It includes the cause, e.g. `macOS didn't let Mycel read /Users/me/Desktop/x.mov. Allow Mycel in System Settings > Privacy & Security > Files and Folders …: Operation not permitted (os error 1)`.
 
-**Event:** the Tauri event `mycel://event` carries one `Event` (tagged by `type`): `conversationUpdated`, `conversationAdded`, `typing`, `contactsChanged`, `nearbyChanged`, `networkChanged`, `blobReady`, `transferProgress`.
+**Event:** the Tauri event `mycel://event` carries one `Event` (tagged by `type`): `conversationUpdated`, `conversationAdded`, `typing`, `contactsChanged`, `nearbyChanged`, `networkChanged`, `blobReady`, `transferProgress`, `callIncoming`, `callUpdated`.
 
 `transferProgress { direction: "upload" | "download", id, done, total }`:
 - Emitted at most every 250 ms, plus a final event with `done == total`.
@@ -101,6 +115,58 @@ Errors are rejected promises carrying a human-readable string. It includes the c
   - A folder or macOS package (`.app`, `.pages`, `.key`, `.rtfd`, …) is sent as `<name>.zip`.
   - Files staged under the data dir's `uploads/` (HTTP uploads, `stage_file`) are deleted once the message is sent; the attachment then lives in `files/`.
 - **Offline-first:** everything works with no network at all. Peers on the same LAN find each other via mDNS with no internet.
+
+## Calls (live 1:1 voice)
+Audio is captured and played by the runtime (Rust), never by the webview, so
+the same commands work in the Tauri host and over `mycel serve`. Calls are
+one-to-one: `start_call` works in direct conversations (groups: later).
+
+| Event | When |
+|---|---|
+| `callIncoming { call }` | Someone is calling (`state: "ringing"`, `direction: "incoming"`): show Accept / Decline |
+| `callUpdated { call }` | Any change: state, path, bitrate, mute; about 10×/s while `active` (duration, level meters) |
+
+`CallInfo`:
+
+| Field | |
+|---|---|
+| `id` | hex call id (bound to the conversation and the caller, see below) |
+| `conversation`, `peer`, `peerName`, `direction` | `direction`: `outgoing` / `incoming` |
+| `state` | `connecting` (dialing their device / answered, starting audio), `ringing`, `active`, `ended` |
+| `endReason` | `hungUp`, `remoteHungUp`, `declined`, `remoteDeclined`, `busy`, `unavailable` (their device can't be reached), `noAnswer` (45 s), `missed`, `replaced` (you both called at once; this half merged into the other: don't show it), `connectionLost`, `micDenied`, `failed` |
+| `error` | human-readable cause where it helps (`failed`, `unavailable`) |
+| `startedAt`, `connectedAt`, `durationMs` | ms since epoch / talking time |
+| `path` | the path carrying the call now: `network`, `peerWifi`, `bluetooth`, `relay` |
+| `bitrate` | our Opus bitrate (bits/s): 32k on fast paths, 24k via relay, 12k on Bluetooth, lower under loss |
+| `muted`, `remoteMuted` | |
+| `level`, `remoteLevel` | 0..1 meters (yours is 0 while muted) |
+| `echoCancellation` | false → suggest headphones |
+| `stats` | `rttMs`, `lossPct` (of what we send, as the other side reports), `jitterMs`, `bufferMs`, `latencyMs` (estimate), `framesSent/Received/Lost/Late`, `transport` (`datagram` / `stream`), `audioDevice`, and with test audio `heardToneHz`, `measuredRoundTripMs` |
+
+Semantics:
+- **Ringing needs only both devices online.** The caller dials the other
+  device's key directly (ALPN `mycel/call/0` on the node's endpoint, so every
+  path: network, peer-to-peer Wi-Fi, relay, Bluetooth). If it can't be reached
+  within a few seconds the call ends `unavailable`.
+- **Only members may call.** The callee rings only if both are current
+  (non-keeper) members of the conversation, it isn't a message request you
+  haven't accepted (or one you declined), and the caller isn't blocked.
+  Otherwise the caller's call ends `failed`.
+- **One call at a time.** A second caller gets `busy`. Answering a ringing
+  call hangs up the one in progress. If both call each other at once, both
+  end up in one call (the other half ends `replaced`).
+- **Microphone permission** is asked on `start_call` / `accept_call` the first
+  time (macOS shows NSMicrophoneUsageDescription). If it's denied, the command
+  fails with *"Mycel isn't allowed to use the microphone. Allow it in System
+  Settings > Privacy & Security > Microphone, then call again."*
+- `call_status` lists live calls plus ones that ended in the last 10 s.
+
+`MYCEL_AUDIO` picks the audio backend (hosts and `mycel serve`): unset =
+Apple voice processing with echo cancellation on macOS (falls back to plain
+devices), `device` = plain default devices, `test[:<hz>]` = a sine tone in
+and nothing played (headless testing), `test:bursts[:<hz>]` = tone bursts
+that measure the round trip, `test:echo` = send back whatever arrives.
+`MYCEL_CALL_DEBUG=1` logs each call's paths once a second.
 
 ## Message requests
 When someone who isn't your contact adds you, the conversation arrives with `request: true` and `invitedBy` set.

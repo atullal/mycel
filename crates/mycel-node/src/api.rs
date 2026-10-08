@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use mycel_call::{CallInfo, CallPhase, CallStats, Direction as CallDirection, EndReason as CallEndReason};
 pub use mycel_net::{LinkStatus, PathKind};
 
 /// Hex-encoded 32-byte Ed25519 public key (device id = Iroh endpoint id).
@@ -187,7 +188,7 @@ pub enum TransferDirection {
 }
 
 /// Pushed to UIs (Tauri event `mycel://event`).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum Event {
     /// Anything about a conversation changed (messages, members, receipts).
@@ -208,4 +209,11 @@ pub enum Event {
     /// `send_message` for uploads, and the blob id for downloads.
     #[serde(rename_all = "camelCase")]
     TransferProgress { direction: TransferDirection, id: String, done: u64, total: u64 },
+    /// Someone is calling: show Accept / Decline.
+    #[serde(rename_all = "camelCase")]
+    CallIncoming { call: CallInfo },
+    /// A call changed: state, path, bitrate, mute; about 10 times a second
+    /// while active (for the duration and level meters).
+    #[serde(rename_all = "camelCase")]
+    CallUpdated { call: CallInfo },
 }

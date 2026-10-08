@@ -122,6 +122,25 @@ struct Blob {
     blob: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Conversation {
+    conversation: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CallArg {
+    call: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Mute {
+    call: String,
+    muted: bool,
+}
+
 fn args<T: DeserializeOwned>(v: Value) -> Result<T> {
     let v = if v.is_null() { json!({}) } else { v };
     serde_json::from_value(v).map_err(|e| anyhow!("bad arguments: {e}"))
@@ -195,6 +214,15 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
             let d: Decline = args(a)?;
             ok(rt.decline_request(d.id, d.block)?)
         }
+        "start_call" => ok(rt.start_call(args::<Conversation>(a)?.conversation).await?),
+        "accept_call" => ok(rt.accept_call(args::<CallArg>(a)?.call).await?),
+        "decline_call" => ok(rt.decline_call(args::<CallArg>(a)?.call)?),
+        "end_call" => ok(rt.end_call(args::<CallArg>(a)?.call)?),
+        "set_muted" => {
+            let m: Mute = args(a)?;
+            ok(rt.set_muted(m.call, m.muted)?)
+        }
+        "call_status" => ok(rt.call_status()),
         "sync_now" => {
             rt.sync_now().await;
             ok(())

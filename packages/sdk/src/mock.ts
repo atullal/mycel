@@ -10,6 +10,8 @@
 import type { ArgsOf, Command, FileHost, ResultOf, Transport } from "./transport.ts";
 import type {
   Attachment,
+  CallEndReason,
+  CallInfo,
   Contact,
   ConversationSummary,
   Delivery,
@@ -580,6 +582,166 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     rq.unread = 2;
   }
 
+  // --- calls ---------------------------------------------------------------------
+  //
+  // Simulated 1:1 voice calls: ringing, answering, a path that depends on how
+  // the person is reachable, a bitrate that follows it, a moving level meter.
+
+  interface MockCall {
+    info: CallInfo;
+    activeAt: number | null;
+  }
+  const calls = new Map<string, MockCall>();
+
+  function pathFor(p: Person | undefined): CallInfo["path"] {
+    if (!p) return null;
+    if (p.nearby) return "network";
+    return p.name === "Tobias Wren" ? "bluetooth" : "peerWifi";
+  }
+
+  function bitrateFor(path: CallInfo["path"]): number {
+    return path === "bluetooth" ? 12_000 : path === "relay" ? 24_000 : 32_000;
+  }
+
+  function snapshot(c: MockCall): CallInfo {
+    const now = Date.now();
+    const active = c.info.state === "active";
+    const t = now / 1000;
+    const voice = (seed: number) => Math.max(0, 0.45 + 0.35 * Math.sin(t * 3.1 + seed) * Math.sin(t * 1.7 + seed * 2));
+    c.info.durationMs = c.activeAt ? (c.info.state === "ended" ? c.info.durationMs : now - c.activeAt) : 0;
+    c.info.level = active && !c.info.muted ? voice(0) : 0;
+    c.info.remoteLevel = active && !c.info.remoteMuted ? voice(1.3) : 0;
+    const rtt = c.info.path === "bluetooth" ? 48 : c.info.path === "relay" ? 70 : 4;
+    c.info.stats = {
+      ...c.info.stats,
+      rttMs: active ? rtt : 0,
+      jitterMs: active ? 2 : 0,
+      bufferMs: active ? (c.info.path === "bluetooth" ? 80 : 40) : 0,
+      latencyMs: active ? rtt / 2 + (c.info.path === "bluetooth" ? 80 : 40) + 55 : 0,
+      framesSent: active ? Math.floor(c.info.durationMs / 20) : c.info.stats.framesSent,
+      framesReceived: active ? Math.floor(c.info.durationMs / 20) : c.info.stats.framesReceived,
+    };
+    return structuredClone(c.info);
+  }
+
+  function callUpdate(c: MockCall) {
+    emit({ type: "callUpdated", call: snapshot(c) });
+  }
+
+  function setCallState(c: MockCall, state: CallInfo["state"], end: CallEndReason | null = null) {
+    if (c.info.state === "ended") return;
+    c.info.state = state;
+    if (state === "active") {
+      c.activeAt = Date.now();
+      c.info.connectedAt = c.activeAt;
+      tickCall(c);
+    }
+    if (state === "ended") {
+      c.info.endReason = end;
+      if (c.activeAt) c.info.durationMs = Date.now() - c.activeAt;
+      later(10_000, () => calls.delete(c.info.id));
+    }
+    callUpdate(c);
+  }
+
+  function tickCall(c: MockCall) {
+    later(100, () => {
+      if (c.info.state !== "active") return;
+      callUpdate(c);
+      tickCall(c);
+    });
+  }
+
+  function newCall(conv: Conv, peer: Person, direction: CallInfo["direction"]): MockCall {
+    const path = pathFor(peer);
+    const c: MockCall = {
+      activeAt: null,
+      info: {
+        id: randomHex(32),
+        conversation: conv.id,
+        peer: peer.id,
+        peerName: peer.name,
+        direction,
+        state: direction === "outgoing" ? "connecting" : "ringing",
+        endReason: null,
+        error: null,
+        startedAt: Date.now(),
+        connectedAt: null,
+        durationMs: 0,
+        path,
+        bitrate: bitrateFor(path),
+        muted: false,
+        remoteMuted: false,
+        level: 0,
+        remoteLevel: 0,
+        echoCancellation: true,
+        stats: {
+          rttMs: 0,
+          lossPct: 0,
+          jitterMs: 0,
+          bufferMs: 0,
+          latencyMs: 0,
+          framesSent: 0,
+          framesReceived: 0,
+          framesLost: 0,
+          framesLate: 0,
+          transport: "datagram",
+          audioDevice: "Voice processing (echo cancellation)",
+          heardToneHz: null,
+          measuredRoundTripMs: null,
+        },
+      },
+    };
+    calls.set(c.info.id, c);
+    return c;
+  }
+
+  const liveCalls = () => [...calls.values()].filter((c) => c.info.state !== "ended");
+
+  function getCall(id: string): MockCall {
+    const c = calls.get(id);
+    if (!c) throw "no such call";
+    return c;
+  }
+
+  function startCall(conversation: string): CallInfo {
+    const conv = getConv(conversation);
+    if (conv.invitedBy) throw "accept this message request before calling";
+    if (!conv.active) throw "you're no longer a member of this conversation";
+    const others = otherMembers(conv);
+    if (others.length !== 1) throw "calls work in one-to-one conversations for now";
+    const ringing = liveCalls().find((c) => c.info.direction === "incoming" && c.info.conversation === conversation && c.info.state === "ringing");
+    if (ringing) return acceptCall(ringing.info.id);
+    if (liveCalls().length > 0) throw "You're already in a call.";
+    const peer = people.get(others[0]!.id)!;
+    const c = newCall(conv, peer, "outgoing");
+    const reachable = peer.online || peer.nearby;
+    if (!reachable) {
+      later(1800, () => {
+        c.info.error = `${peer.name} can't be reached right now`;
+        setCallState(c, "ended", "unavailable");
+      });
+    } else {
+      later(500, () => setCallState(c, "ringing"));
+      later(3200, () => setCallState(c, "active"));
+      // they occasionally mute for a moment
+      later(9000, () => {
+        c.info.remoteMuted = true;
+        later(2500, () => (c.info.remoteMuted = false));
+      });
+    }
+    return snapshot(c);
+  }
+
+  function acceptCall(id: string): CallInfo {
+    const c = getCall(id);
+    if (c.info.direction !== "incoming" || c.info.state !== "ringing") throw "This call isn't ringing any more.";
+    for (const other of liveCalls()) if (other !== c) setCallState(other, "ended", "hungUp");
+    setCallState(c, "connecting");
+    later(400, () => setCallState(c, "active"));
+    return snapshot(c);
+  }
+
   // --- ambient activity ------------------------------------------------------------
 
   if (opts.ambient) {
@@ -602,6 +764,16 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       later(3000, () => {
         receive(g, hana.id, "12:30 works. I'll bring snacks for the drive");
         advance(g, "read");
+      });
+    });
+    // Ines calls you (once), unless you're already in a call
+    later(40_000, () => {
+      const conv = convs.get(hexFrom("conv:ines"));
+      if (!conv?.active || liveCalls().length > 0) return;
+      const c = newCall(conv, ines, "incoming");
+      emit({ type: "callIncoming", call: snapshot(c) });
+      later(30_000, () => {
+        if (c.info.state === "ringing") setCallState(c, "ended", "missed");
       });
     });
     later(75_000, () => {
@@ -936,6 +1108,26 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       }
       return summary(c);
     },
+    start_call: ({ conversation }) => startCall(conversation),
+    accept_call: ({ call }) => acceptCall(call),
+    decline_call: ({ call }) => {
+      const c = getCall(call);
+      setCallState(c, "ended", c.info.state === "ringing" && c.info.direction === "incoming" ? "declined" : "hungUp");
+      return null;
+    },
+    end_call: ({ call }) => {
+      const c = getCall(call);
+      const unanswered = c.info.direction === "incoming" && c.info.state === "ringing";
+      setCallState(c, "ended", unanswered ? "declined" : "hungUp");
+      return null;
+    },
+    set_muted: ({ call, muted }) => {
+      const c = getCall(call);
+      c.info.muted = muted;
+      callUpdate(c);
+      return snapshot(c);
+    },
+    call_status: () => [...calls.values()].map(snapshot).sort((a, b) => b.startedAt - a.startedAt),
     decline_request: ({ id, block }) => {
       const c = getConv(id);
       const inviter = c.invitedBy;

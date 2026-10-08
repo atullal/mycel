@@ -12,7 +12,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::BASE64URL_NOPAD;
 use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, SignPk, SymKey, random};
 use mycel_kit_chat::{AttachmentRef, ChatOp, ChatSignal, ChatView, messages_feed, reduce};
-use mycel_net::{ContactCard, NetEvent, NetMode, Node, NodeOptions, PathKind};
+use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallManager};
+use mycel_net::{ContactCard, ExtraProtocol, NetEvent, NetMode, Node, NodeOptions, PathKind};
 use mycel_sync::Replica;
 use mycel_trust::{Role, SpaceId};
 use serde::{Deserialize, Serialize};
@@ -101,6 +102,58 @@ pub struct Runtime {
     blocked: Arc<Mutex<BTreeSet<SignPk>>>,
     /// Direct-address hints from contact codes (for networks without mDNS).
     hints: Mutex<BTreeMap<SignPk, Vec<String>>>,
+    /// Live voice calls (not on keepers).
+    calls: CallManager,
+}
+
+/// What calls need from the runtime: membership, names, dialing, events.
+struct RuntimeCallHost {
+    me: SignPk,
+    rt: Weak<Runtime>,
+}
+
+impl CallHost for RuntimeCallHost {
+    fn me(&self) -> SignPk {
+        self.me
+    }
+
+    fn callee(&self, space: &SpaceId) -> Result<SignPk> {
+        self.rt.upgrade().context("shutting down")?.call_peer(space)
+    }
+
+    fn may_call(&self, space: &SpaceId, peer: &SignPk) -> bool {
+        self.rt.upgrade().is_some_and(|rt| rt.may_call(space, peer))
+    }
+
+    fn name_of(&self, peer: &SignPk) -> String {
+        self.rt.upgrade().map(|rt| rt.name_of(peer)).unwrap_or_else(|| peer.short())
+    }
+
+    fn connect(&self, peer: SignPk) -> BoxFuture<Result<mycel_net::iroh::endpoint::Connection>> {
+        let rt = self.rt.clone();
+        Box::pin(async move {
+            let rt = rt.upgrade().context("shutting down")?;
+            rt.node
+                .connect(peer, ALPN_CALL)
+                .await
+                .map_err(|e| anyhow!("{} can't be reached right now ({e:#})", rt.name_of(&peer)))
+        })
+    }
+
+    fn note_connection(&self, peer: &SignPk, conn: &mycel_net::iroh::endpoint::Connection) {
+        if let Some(rt) = self.rt.upgrade() {
+            rt.node.note_connection(*peer, conn);
+        }
+    }
+
+    fn emit(&self, event: CallEvent) {
+        if let Some(rt) = self.rt.upgrade() {
+            rt.emit(match event {
+                CallEvent::Incoming(call) => Event::CallIncoming { call },
+                CallEvent::Updated(call) => Event::CallUpdated { call },
+            });
+        }
+    }
 }
 
 fn load_set<T: serde::de::DeserializeOwned + Ord>(store: &DbStore, key: &str) -> Result<BTreeSet<T>> {
@@ -365,6 +418,12 @@ impl Runtime {
             .into_iter()
             .collect();
         nopts.accept_relay_invites = opts.keeper;
+        // Live calls share the endpoint (and so every path). Keepers relay
+        // ciphertext only: no calls.
+        let (call_tx, call_rx) = tokio::sync::mpsc::unbounded_channel();
+        if !opts.keeper {
+            nopts.extra_protocols.push(ExtraProtocol { alpn: ALPN_CALL.to_vec(), incoming: call_tx });
+        }
         let engine = mycel_rules::RulesEngine::load(CHAT_RULES_WASM)
             .map_err(|e| anyhow!("chat rules failed to load: {e:?}"))?;
         nopts.feed_validator = Some(Arc::new(WasmRules(engine)));
@@ -385,7 +444,8 @@ impl Runtime {
         }
 
         let (events, _) = broadcast::channel(1024);
-        let rt = Arc::new(Runtime {
+        let me = keys.sign_pk();
+        let rt = Arc::new_cyclic(|weak| Runtime {
             data_dir: dir,
             keys,
             node,
@@ -403,7 +463,11 @@ impl Runtime {
             hidden: Mutex::new(hidden),
             blocked,
             hints: Mutex::new(hints),
+            calls: CallManager::new(Arc::new(RuntimeCallHost { me, rt: weak.clone() })),
         });
+        if !rt.keeper {
+            rt.calls.serve(call_rx);
+        }
         for (pk, addrs) in rt.hints.lock().iter() {
             let addrs: Vec<std::net::SocketAddr> = addrs.iter().filter_map(|a| a.parse().ok()).collect();
             rt.node.add_peer_hints(*pk, &addrs);
@@ -441,6 +505,7 @@ impl Runtime {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        self.calls.shutdown().await;
         self.node.shutdown().await?;
         self.store.close()?;
         Ok(())
@@ -1272,6 +1337,87 @@ impl Runtime {
         let title = Some(title.trim().to_string()).filter(|t| !t.is_empty());
         self.post(space, ChatOp::Meta { title, direct: false })?;
         Ok(())
+    }
+
+    // ───────────── calls ─────────────
+
+    /// The live-call engine (tests swap its audio with `calls().set_audio`).
+    pub fn calls(&self) -> &CallManager {
+        &self.calls
+    }
+
+    /// The person a call in this conversation goes to.
+    fn call_peer(&self, space: &SpaceId) -> Result<SignPk> {
+        if self.keeper {
+            bail!("keepers don't make calls");
+        }
+        if self.requests.lock().contains_key(space) {
+            bail!("accept this message request before calling");
+        }
+        let me = self.keys.sign_pk();
+        let (members, my_role) = self.node.with_space(space, |r| (r.members(), r.my_role()))?;
+        if my_role.is_none_or(|r| r == Role::Relay) {
+            bail!("you're no longer a member of this conversation");
+        }
+        let people: Vec<SignPk> = members
+            .into_iter()
+            .filter(|(k, role)| k.sign_pk != me && *role != Role::Relay)
+            .map(|(k, _)| k.sign_pk)
+            .collect();
+        match people.as_slice() {
+            [one] => Ok(*one),
+            [] => bail!("there's nobody else in this conversation to call"),
+            _ => bail!("calls work in one-to-one conversations for now"),
+        }
+    }
+
+    /// May `peer` ring us about `space`? Both must be current members (not
+    /// keepers); it must not be a message request we haven't accepted or a
+    /// conversation we declined; and they must not be blocked.
+    fn may_call(&self, space: &SpaceId, peer: &SignPk) -> bool {
+        if self.keeper
+            || self.requests.lock().contains_key(space)
+            || self.hidden.lock().contains(space)
+            || self.blocked.lock().contains(peer)
+        {
+            return false;
+        }
+        self.node
+            .with_space(space, |r| {
+                r.my_role().is_some_and(|m| m != Role::Relay)
+                    && r.members().iter().any(|(k, role)| k.sign_pk == *peer && *role != Role::Relay)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Ring the other person in a direct conversation. Returns at once (the
+    /// call is `connecting`); watch `callUpdated` for ringing / active /
+    /// ended (`unavailable` if their device can't be reached).
+    pub async fn start_call(&self, conversation: ConversationId) -> Result<CallInfo> {
+        let space = parse_space(&conversation)?;
+        self.calls.start(space).await
+    }
+
+    pub async fn accept_call(&self, call: String) -> Result<CallInfo> {
+        self.calls.accept(&call).await
+    }
+
+    pub fn decline_call(&self, call: String) -> Result<()> {
+        self.calls.decline(&call)
+    }
+
+    /// Hang up, or cancel an outgoing call that hasn't been answered.
+    pub fn end_call(&self, call: String) -> Result<()> {
+        self.calls.end(&call)
+    }
+
+    pub fn set_muted(&self, call: String, muted: bool) -> Result<CallInfo> {
+        self.calls.set_muted(&call, muted)
+    }
+
+    /// Live calls, plus ones that ended in the last few seconds.
+    pub fn call_status(&self) -> Vec<CallInfo> {
+        self.calls.status()
     }
 
     /// Sync every conversation with every member now (pull-to-refresh).

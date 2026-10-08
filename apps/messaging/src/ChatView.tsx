@@ -12,6 +12,9 @@ export function ChatView({
   membersOpen,
   onToggleMembers,
   onBack,
+  inCall = false,
+  callsBusy = false,
+  onCall,
 }: {
   summary: ConversationSummary;
   me: string | undefined;
@@ -19,6 +22,12 @@ export function ChatView({
   membersOpen: boolean;
   onToggleMembers: () => void;
   onBack: () => void;
+  /** A call with this conversation is in progress. */
+  inCall?: boolean;
+  /** Some call is in progress (one at a time). */
+  callsBusy?: boolean;
+  /** Start a voice call (direct conversations). */
+  onCall?: () => void;
 }) {
   const mycel = useMycel();
   const { messages, loading, hasMore, loadOlder, error } = useMessages(summary.id);
@@ -148,6 +157,17 @@ export function ChatView({
           <h2>{summary.title}</h2>
           <p>{subtitle}</p>
         </div>
+        {summary.direct && onCall && summary.active && !summary.request && (
+          <button
+            className={`mx-icon-btn mx-call-btn${inCall ? " is-on" : ""}`}
+            onClick={onCall}
+            disabled={callsBusy}
+            title={inCall ? "In a call" : callsBusy ? "You're already in a call" : "Voice call"}
+            aria-label={`Voice call ${summary.title}`}
+          >
+            <Icon.Phone />
+          </button>
+        )}
         <span className="mx-e2e" title="End-to-end encrypted. Only the people in this conversation can read it.">
           <Icon.Lock size={15} />
           <span>Encrypted</span>

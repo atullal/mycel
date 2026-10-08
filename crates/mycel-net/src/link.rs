@@ -13,7 +13,7 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -217,6 +217,20 @@ struct MemNetInner {
     started: Vec<(SignPk, mpsc::UnboundedSender<LinkEvent>)>,
 }
 
+/// Optional radio limits for a [`MemNet`] (default: none, instant delivery).
+#[derive(Default)]
+struct Shape {
+    /// Bytes per second the "radio" carries; `None` = unlimited.
+    rate: Option<u64>,
+    /// One-way delay added to every packet.
+    latency: Duration,
+    /// When the radio finishes sending what is already queued.
+    busy_until: Option<Instant>,
+}
+
+/// More queued than this and packets are dropped (a congested radio).
+const MEM_MAX_QUEUE: Duration = Duration::from_millis(250);
+
 /// An in-memory "radio" shared by test nodes: every [`MemLink`] on the same
 /// `MemNet` can reach every other, until [`MemNet::cut`] silences it. Lets
 /// tests prove failover between links without real radios.
@@ -226,13 +240,42 @@ pub struct MemNet {
     kind: PathKind,
     down: Arc<AtomicBool>,
     inner: Arc<Mutex<MemNetInner>>,
+    shape: Arc<Mutex<Shape>>,
 }
 
 impl MemNet {
     /// `n` (0..16) picks the transport id; `kind` is what it reports as.
     pub fn new(n: u64, kind: PathKind) -> MemNet {
         let id = if kind == PathKind::Bluetooth { TRANSPORT_BLUETOOTH } else { TRANSPORT_TEST_BASE + n };
-        MemNet { id, kind, down: Arc::default(), inner: Arc::default() }
+        MemNet { id, kind, down: Arc::default(), inner: Arc::default(), shape: Arc::default() }
+    }
+
+    /// Limit the link to `bytes_per_sec` (e.g. ~20 KB/s for Bluetooth LE),
+    /// with a short send queue; `None` removes the limit.
+    pub fn set_rate_limit(&self, bytes_per_sec: Option<u64>) {
+        let mut s = self.shape.lock();
+        s.rate = bytes_per_sec.filter(|r| *r > 0);
+        s.busy_until = None;
+    }
+
+    /// Add a fixed one-way delay to every packet.
+    pub fn set_latency(&self, latency: Duration) {
+        self.shape.lock().latency = latency;
+    }
+
+    /// When a packet of `len` bytes sent now arrives: `Some(delay)`, or
+    /// `None` if the send queue is full and it is dropped.
+    fn schedule(&self, len: usize) -> Option<Duration> {
+        let mut s = self.shape.lock();
+        let Some(rate) = s.rate else { return Some(s.latency) };
+        let now = Instant::now();
+        let start = s.busy_until.filter(|b| *b > now).unwrap_or(now);
+        if start - now > MEM_MAX_QUEUE {
+            return None;
+        }
+        let done = start + Duration::from_secs_f64(len as f64 / rate as f64);
+        s.busy_until = Some(done);
+        Some(done - now + s.latency)
     }
 
     /// Drop every packet from now on (radio out of range).
@@ -421,8 +464,28 @@ impl CustomSender for MemSender {
         };
         let seg = transmit.segment_size.unwrap_or(transmit.contents.len()).max(1);
         for chunk in transmit.contents.chunks(seg) {
+            let packet = Packet { data: Bytes::copy_from_slice(chunk), from: self.from.clone() };
             // a full queue drops the packet, like a congested radio
-            let _ = tx.try_send(Packet { data: Bytes::copy_from_slice(chunk), from: self.from.clone() });
+            match self.net.schedule(chunk.len()) {
+                None => {}
+                Some(d) if d.is_zero() => {
+                    let _ = tx.try_send(packet);
+                }
+                Some(d) => match tokio::runtime::Handle::try_current() {
+                    Ok(rt) => {
+                        let (tx, down) = (tx.clone(), self.net.down.clone());
+                        rt.spawn(async move {
+                            tokio::time::sleep(d).await;
+                            if !down.load(Ordering::SeqCst) {
+                                let _ = tx.try_send(packet);
+                            }
+                        });
+                    }
+                    Err(_) => {
+                        let _ = tx.try_send(packet);
+                    }
+                },
+            }
         }
         Poll::Ready(Ok(()))
     }
