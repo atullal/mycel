@@ -191,6 +191,8 @@ struct CbState {
     pm: Option<Retained<CBPeripheralManager>>,
     service: Option<Retained<CBMutableService>>,
     psm: Option<u16>,
+    /// A publish request is out; its callback sets `psm`.
+    publishing: bool,
     peripherals: HashMap<Pid, Retained<CBPeripheral>>,
     /// Must stay referenced or CoreBluetooth closes the channel.
     channels: HashMap<ChanId, Retained<CBL2CAPChannel>>,
@@ -328,6 +330,25 @@ impl Driver {
                 Cmd::Rescan => {
                     unsafe { central.stopScan() };
                     scan(&central);
+                    // macOS can stop advertising (or drop the published
+                    // channel) without telling us, after which nobody can
+                    // find this device until the app restarts.
+                    if let Some(pm) = cb.pm.clone()
+                        && unsafe { pm.state() } == CBManagerState::PoweredOn
+                    {
+                        match (cb.psm, &cb.service) {
+                            (None, _) if !cb.publishing => {
+                                info(format_args!("no L2CAP channel published; publishing again"));
+                                cb.publishing = true;
+                                unsafe { pm.publishL2CAPChannelWithEncryption(false) };
+                            }
+                            (Some(_), Some(_)) if !unsafe { pm.isAdvertising() } => {
+                                info(format_args!("advertising had stopped; advertising again"));
+                                advertise(&pm);
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -680,18 +701,21 @@ define_class!(
             let Some(d) = self.driver() else { return };
             let state = unsafe { pm.state() };
             info(format_args!("peripheral state: {:?}", radio_of(state)));
+            let mut cb = d.cb.lock();
             if state == CBManagerState::PoweredOn {
+                cb.0.publishing = true;
                 unsafe { pm.publishL2CAPChannelWithEncryption(false) };
             } else {
-                let mut cb = d.cb.lock();
                 cb.0.psm = None;
                 cb.0.service = None;
+                cb.0.publishing = false;
             }
         }
 
         #[unsafe(method(peripheralManager:didPublishL2CAPChannel:error:))]
         fn published(&self, _pm: &CBPeripheralManager, psm: u16, error: Option<&NSError>) {
             let Some(d) = self.driver() else { return };
+            d.cb.lock().0.publishing = false;
             if let Some(e) = error {
                 d.hub.set_problem(Some(format!("Couldn't open a Bluetooth channel: {}", err_text(e))));
                 return;
@@ -699,6 +723,16 @@ define_class!(
             info(format_args!("L2CAP channel published, psm {psm}"));
             d.cb.lock().0.psm = Some(psm);
             d.publish_service();
+        }
+
+        #[unsafe(method(peripheralManager:didUnpublishL2CAPChannel:error:))]
+        fn unpublished(&self, _pm: &CBPeripheralManager, psm: u16, _error: Option<&NSError>) {
+            let Some(d) = self.driver() else { return };
+            info(format_args!("L2CAP channel psm {psm} unpublished"));
+            let mut cb = d.cb.lock();
+            if cb.0.psm == Some(psm) {
+                cb.0.psm = None; // the next rescan publishes a new one
+            }
         }
 
         #[unsafe(method(peripheralManager:didAddService:error:))]

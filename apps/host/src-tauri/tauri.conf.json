@@ -36,6 +36,7 @@
     "category": "SocialNetworking",
     "macOS": {
       "signingIdentity": "-",
+      "entitlements": "Entitlements.plist",
       "minimumSystemVersion": "11.0"
     },
     "shortDescription": "Peer-to-peer, end-to-end encrypted apps with no server",
