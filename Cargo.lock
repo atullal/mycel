@@ -3592,6 +3592,7 @@ dependencies = [
  "chacha20poly1305",
  "data-encoding",
  "hex",
+ "mycel-call",
  "mycel-crypto",
  "mycel-kit-chat",
  "mycel-link-awdl",

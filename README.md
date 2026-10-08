@@ -15,6 +15,7 @@ crates/
   mycel-trust     Spaces: signed membership DAG, deterministic resolution, epochs
   mycel-sync      signed + encrypted envelopes → Automerge Docs and causal Feeds
   mycel-net       Iroh QUIC, live sync, mDNS, invites, cards, typing, blobs
+  mycel-call      live voice calls: Opus over QUIC datagrams on every path
   mycel-rules     L4: deterministic WASM rules engine (wasmi)
   mycel-kit-chat  chat data model + deterministic reducer
   mycel-node      the Runtime (storage, identity, contacts, messaging API)
@@ -31,7 +32,7 @@ npm install && npm run build                  # UI
 cargo build -p mycel-cli                      # CLI
 ./target/debug/mycel serve --name Alice       # then open http://127.0.0.1:7777
 ./target/debug/mycel keeper --data ~/.mycel-keeper   # optional always-on keeper
-cargo test --workspace --exclude mycel-host   # 93 Rust tests
+cargo test --workspace --exclude mycel-host   # 159 Rust tests
 ```
 
 Native app: `cd apps/host && cargo tauri build` (see [docs/TWO_LAPTOPS.md](docs/TWO_LAPTOPS.md)).

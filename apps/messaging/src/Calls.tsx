@@ -14,6 +14,14 @@ export const PATH_LABEL: Record<PathKind, string> = {
   relay: "Internet relay",
 };
 
+/** How a path reads after "via". */
+export const VIA_LABEL: Record<PathKind, string> = {
+  network: "your network",
+  peerWifi: "Peer-to-peer Wi-Fi",
+  bluetooth: "Bluetooth",
+  relay: "an internet relay",
+};
+
 export function formatDuration(ms: number): string {
   const s = Math.floor(ms / 1000);
   const h = Math.floor(s / 3600);
@@ -111,7 +119,7 @@ export function IncomingCall({ call, onAnswered }: { call: CallInfo; onAnswered:
         <strong>{call.peerName}</strong>
         <span>
           Voice call
-          {call.path ? ` · via ${PATH_LABEL[call.path]}` : ""}
+          {call.path ? ` · via ${VIA_LABEL[call.path]}` : ""}
         </span>
         {error && (
           <span className="mx-incoming-error" role="alert">
@@ -185,7 +193,7 @@ export function CallBar({
       </button>
       {live && (
         <span className="mx-callbar-path">
-          {call.path ? `via ${PATH_LABEL[call.path]}` : "Finding a path…"}
+          {call.path ? `via ${VIA_LABEL[call.path]}` : "Finding a path…"}
           {active && call.bitrate > 0 && <span className="mx-callbar-rate"> · {Math.round(call.bitrate / 1000)} kbps</span>}
           {active && call.remoteMuted && <span className="mx-callbar-rate"> · {call.peerName.split(" ")[0]} is muted</span>}
         </span>
@@ -197,7 +205,9 @@ export function CallBar({
       )}
       {active && (
         <span className="mx-callbar-meters">
+          <span className="mx-meter-label">You</span>
           <LevelMeter level={call.level} label="Your microphone" muted={call.muted} />
+          <span className="mx-meter-label">{call.peerName.split(" ")[0]}</span>
           <LevelMeter level={call.remoteLevel} label={`${call.peerName}'s voice`} muted={call.remoteMuted} />
         </span>
       )}

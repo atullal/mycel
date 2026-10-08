@@ -3,7 +3,7 @@
 //! to Rust, so there is no C toolchain and it builds for every target).
 
 use anyhow::{Result, bail};
-use unsafe_libopus as op;
+use unsafe_libopus as unsafe_ffi;
 use unsafe_libopus::varargs::{VarArg, VarArgs};
 
 /// Every call runs at this rate internally; devices are resampled to it.
@@ -22,7 +22,7 @@ fn check(code: i32, what: &str) -> Result<i32> {
 }
 
 pub struct Encoder {
-    st: *mut op::OpusEncoder,
+    st: *mut unsafe_ffi::OpusEncoder,
     bitrate: u32,
     loss: u8,
 }
@@ -35,15 +35,15 @@ impl Encoder {
     pub fn new(bitrate: u32) -> Result<Encoder> {
         let mut err = 0;
         // SAFETY: valid arguments; the returned pointer is checked below.
-        let st = unsafe { op::opus_encoder_create(SAMPLE_RATE as i32, 1, op::OPUS_APPLICATION_VOIP, &mut err) };
-        if st.is_null() || err != op::OPUS_OK {
+        let st = unsafe { unsafe_ffi::opus_encoder_create(SAMPLE_RATE as i32, 1, unsafe_ffi::OPUS_APPLICATION_VOIP, &mut err) };
+        if st.is_null() || err != unsafe_ffi::OPUS_OK {
             bail!("opus encoder could not start ({err})");
         }
         let mut e = Encoder { st, bitrate: 0, loss: 0 };
-        e.ctl(op::OPUS_SET_SIGNAL_REQUEST, op::OPUS_SIGNAL_VOICE)?;
-        e.ctl(op::OPUS_SET_COMPLEXITY_REQUEST, 7)?;
-        e.ctl(op::OPUS_SET_INBAND_FEC_REQUEST, 1)?;
-        e.ctl(op::OPUS_SET_VBR_REQUEST, 1)?;
+        e.ctl(unsafe_ffi::OPUS_SET_SIGNAL_REQUEST, unsafe_ffi::OPUS_SIGNAL_VOICE)?;
+        e.ctl(unsafe_ffi::OPUS_SET_COMPLEXITY_REQUEST, 7)?;
+        e.ctl(unsafe_ffi::OPUS_SET_INBAND_FEC_REQUEST, 1)?;
+        e.ctl(unsafe_ffi::OPUS_SET_VBR_REQUEST, 1)?;
         e.set_bitrate(bitrate)?;
         e.set_expected_loss(5)?;
         Ok(e)
@@ -51,7 +51,7 @@ impl Encoder {
 
     fn ctl(&mut self, request: i32, value: i32) -> Result<()> {
         // SAFETY: `st` is a live encoder; SET requests take one i32.
-        let r = unsafe { op::opus_encoder_ctl_impl(self.st, request, VarArgs::new(vec![VarArg::I32(value)])) };
+        let r = unsafe { unsafe_ffi::opus_encoder_ctl_impl(self.st, request, VarArgs::new(vec![VarArg::I32(value)])) };
         check(r, "setting").map(|_| ())
     }
 
@@ -62,7 +62,7 @@ impl Encoder {
     pub fn set_bitrate(&mut self, bps: u32) -> Result<()> {
         let bps = bps.clamp(6_000, 64_000);
         if bps != self.bitrate {
-            self.ctl(op::OPUS_SET_BITRATE_REQUEST, bps as i32)?;
+            self.ctl(unsafe_ffi::OPUS_SET_BITRATE_REQUEST, bps as i32)?;
             self.bitrate = bps;
         }
         Ok(())
@@ -72,7 +72,7 @@ impl Encoder {
     pub fn set_expected_loss(&mut self, pct: u8) -> Result<()> {
         let pct = pct.min(40);
         if pct != self.loss {
-            self.ctl(op::OPUS_SET_PACKET_LOSS_PERC_REQUEST, pct as i32)?;
+            self.ctl(unsafe_ffi::OPUS_SET_PACKET_LOSS_PERC_REQUEST, pct as i32)?;
             self.loss = pct;
         }
         Ok(())
@@ -85,7 +85,7 @@ impl Encoder {
         }
         // SAFETY: pointers and lengths come from live slices.
         let n = unsafe {
-            op::opus_encode_float(self.st, pcm.as_ptr(), FRAME_SAMPLES as i32, out.as_mut_ptr(), out.len() as i32)
+            unsafe_ffi::opus_encode_float(self.st, pcm.as_ptr(), FRAME_SAMPLES as i32, out.as_mut_ptr(), out.len() as i32)
         };
         Ok(check(n, "encode")? as usize)
     }
@@ -94,12 +94,12 @@ impl Encoder {
 impl Drop for Encoder {
     fn drop(&mut self) {
         // SAFETY: created by opus_encoder_create, destroyed once.
-        unsafe { op::opus_encoder_destroy(self.st) }
+        unsafe { unsafe_ffi::opus_encoder_destroy(self.st) }
     }
 }
 
 pub struct Decoder {
-    st: *mut op::OpusDecoder,
+    st: *mut unsafe_ffi::OpusDecoder,
 }
 
 unsafe impl Send for Decoder {}
@@ -108,8 +108,8 @@ impl Decoder {
     pub fn new() -> Result<Decoder> {
         let mut err = 0;
         // SAFETY: valid arguments; checked below.
-        let st = unsafe { op::opus_decoder_create(SAMPLE_RATE as i32, 1, &mut err) };
-        if st.is_null() || err != op::OPUS_OK {
+        let st = unsafe { unsafe_ffi::opus_decoder_create(SAMPLE_RATE as i32, 1, &mut err) };
+        if st.is_null() || err != unsafe_ffi::OPUS_OK {
             bail!("opus decoder could not start ({err})");
         }
         Ok(Decoder { st })
@@ -124,7 +124,7 @@ impl Decoder {
             _ => (std::ptr::null(), 0),
         };
         // SAFETY: `out` holds at least one frame; `ptr` is null or a live slice.
-        let n = unsafe { op::opus_decode_float(self.st, ptr, len, out.as_mut_ptr(), FRAME_SAMPLES as i32, fec as i32) };
+        let n = unsafe { unsafe_ffi::opus_decode_float(self.st, ptr, len, out.as_mut_ptr(), FRAME_SAMPLES as i32, fec as i32) };
         Ok(check(n, "decode")? as usize)
     }
 
@@ -151,7 +151,7 @@ impl Decoder {
 impl Drop for Decoder {
     fn drop(&mut self) {
         // SAFETY: created by opus_decoder_create, destroyed once.
-        unsafe { op::opus_decoder_destroy(self.st) }
+        unsafe { unsafe_ffi::opus_decoder_destroy(self.st) }
     }
 }
 

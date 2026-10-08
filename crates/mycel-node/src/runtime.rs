@@ -1356,7 +1356,7 @@ impl Runtime {
         }
         let me = self.keys.sign_pk();
         let (members, my_role) = self.node.with_space(space, |r| (r.members(), r.my_role()))?;
-        if !my_role.is_some_and(|r| r != Role::Relay) {
+        if my_role.is_none_or(|r| r == Role::Relay) {
             bail!("you're no longer a member of this conversation");
         }
         let people: Vec<SignPk> = members

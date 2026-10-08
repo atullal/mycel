@@ -353,7 +353,7 @@ mod tests {
         let space = Hash32([1; 32]);
         let (me, carol, dave) = (SignPk([2; 32]), SignPk([3; 32]), SignPk([4; 32]));
         let with_carol = LiveCall { id: Hash32([5; 32]), peer: carol, space, dir: Direction::Incoming };
-        assert_eq!(on_ring(&me, &dave, &space, &[with_carol.clone()], false), RingDecision::Busy);
+        assert_eq!(on_ring(&me, &dave, &space, std::slice::from_ref(&with_carol), false), RingDecision::Busy);
         // Carol calling again in the same conversation while we're in an incoming call with her: busy too
         assert_eq!(on_ring(&me, &carol, &space, &[with_carol], false), RingDecision::Busy);
         assert_eq!(on_ring(&me, &dave, &space, &[], false), RingDecision::Ring);

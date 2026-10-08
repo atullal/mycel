@@ -90,8 +90,17 @@ Every resource is addressable:
   - `iroh-blobs`: blob transfer
   - `iroh-gossip`: Channels and change announcements
   - `mycel/trust/1`: membership and key-agreement messages
+  - `mycel/call/0`: live voice calls (below)
 - **Peer authentication comes free:** the remote node ID *is* a Device key. L2 maps Device → Agent → roles.
 - **Paths (multipath QUIC):** one connection keeps several paths open and moves between them without reconnecting. IP paths (same network, or direct over the internet), the internet relay, and **links**: non-IP paths as Iroh custom transports (`mycel_net::link::Link`). Links today: **peer-to-peer Wi-Fi** (Apple AWDL via Network.framework + Bonjour `_mycel-p2p._udp`, `crates/mycel-link-awdl`) and **Bluetooth LE** (CoreBluetooth L2CAP channels, `crates/mycel-link-ble`). `MycelPathSelector` uses the fastest local path (network or peer-to-peer Wi-Fi, by RTT), else the relay, else Bluetooth; dead paths are noticed within ~5 s. Iroh 1.3 is vendored with a small patch so custom-transport addresses are opened as backup paths (`vendor/iroh/MYCEL_PATCH.md`).
+
+- **Live calls** (`crates/mycel-call`): a call is one QUIC connection on ALPN `mycel/call/0`, dialed straight to the other device's key on the node's own endpoint (`NodeOptions::extra_protocols`), so it rides every path above and moves between them mid-call like any other connection.
+  - *Signalling*: one control stream (`Ring`, `Ringing`, `Accept`/`Decline`/`Busy`/`Glare`/`Denied`, `Started`, `Mute`, `Report`, `HangUp`). The call id is `BLAKE3::derive_key("mycel/v0/call-id", space ‖ caller key ‖ nonce)`; the callee recomputes it with the QUIC-authenticated caller key and rings only if both are members of that space. Simultaneous calls resolve to the call of the lower device key.
+  - *Media*: Opus (libopus 1.3.1 in Rust via `unsafe-libopus`), 48 kHz mono, 20 ms frames, in-band FEC, one frame per QUIC datagram (10-byte header: kind, sequence, timestamp, flags); a unidirectional stream if a path has no datagrams. QUIC already encrypts end to end.
+  - *Receive*: adaptive jitter buffer (40–120 ms from RFC 3550 jitter, grows after underruns, trims bursts), pulled by the playback clock; Opus PLC for a missing frame, FEC from the next frame when it's there.
+  - *Bitrate*: the path sets a ceiling (32 kbps network / peer-to-peer Wi-Fi, 24 kbps relay, 12 kbps Bluetooth, ~1.5 KB/s of audio); reported loss > 3 % or RTT > 500 ms steps down, 5 clean seconds step back up.
+  - *Audio I/O* behind the `AudioIo` trait: Apple's voice-processing I/O unit on macOS (echo cancellation, noise suppression, AGC), plain devices via `cpal` with resampling, or software test sources/sinks.
+  - *Group calls (later)*: a mesh of these 1:1 connections sharing one call id; nothing in the wire format assumes two people per space.
 
 ### L1 Identity
 - **Device keys** are generated on device and stored in the Keychain / Secure Enclave / Android Keystore. They never leave the device.
@@ -344,7 +353,7 @@ Needs atomic multi-file snapshots and conflict surfacing for code, which plain A
 
 | Layer | Built | Not yet |
 |---|---|---|
-| **L0 Network** | Iroh 1.3 QUIC dialed by key, multipath. Modes: `internet` (default: every path incl. n0 relays and DNS discovery), `lan` ("Local only": same network via mDNS, peer-to-peer Wi-Fi, Bluetooth; never the internet), `local` (tests). Links: peer-to-peer Wi-Fi (AWDL) and Bluetooth LE as custom transports with live failover. Live sync engine: push on change, epidemic forwarding, 15 s periodic sync, backoff. ALPNs: sync, card, ephemeral, blob. | DHT discovery; self-hosted relay config |
+| **L0 Network** | Iroh 1.3 QUIC dialed by key, multipath. Modes: `internet` (default: every path incl. n0 relays and DNS discovery), `lan` ("Local only": same network via mDNS, peer-to-peer Wi-Fi, Bluetooth; never the internet), `local` (tests). Links: peer-to-peer Wi-Fi (AWDL) and Bluetooth LE as custom transports with live failover. Live sync engine: push on change, epidemic forwarding, 15 s periodic sync, backoff. ALPNs: sync, card, ephemeral, blob, call. Link paths are pinged every second so long-lived connections (calls) keep their backup paths. | DHT discovery; self-hosted relay config |
 | **L1 Identity** | Device keys (seed file `identity.key`, mode 0600), signed contact cards and codes, contacts, LAN names | Multi-device agents, personas, OS keychain, social recovery |
 | **L2 Trust** | Membership DAG, deterministic resolution (seniority, revocation wins, cutoffs), epochs + HPKE lockboxes, self-healing rotation, Leave | External crypto review; X-Wing (post-quantum) lockboxes; TreeKEM-style rotation |
 | **L3 Data** | Docs (Automerge), Feeds (causal, deterministic order), Blobs (encrypted, content-addressed, any size: streaming STREAM-construction AEAD, streamed to disk, resumable, hash-checked; small ones pushed, big ones pulled on demand), ephemeral Channels, redb storage with batched writes, restore on start, delivery tracking | Range-based set reconciliation, compaction; multi-source parallel blob download |
@@ -352,6 +361,7 @@ Needs atomic multi-file snapshots and conflict surfacing for code, which plain A
 | **L5 SDK + Kits** | `@mycel/sdk` (types, Tauri/HTTP/mock transports, React hooks); Chat kit (Rust ops + deterministic reducer) | RichText, Workflow, Game kits |
 | **L6 Host** | Tauri 2 host shell (apps rail, profile/contacts/nearby/network panels); `mycel serve` web host; `mycel keeper` | App sandboxing via iframes + manifests |
 | **Keepers** | `mycel keeper`: accepts spaces, stores and serves ciphertext, never decrypts | Push wake-ups (APNs/FCM) for mobile |
-| **Apps** | **Messaging**: DMs, groups, replies, edits, deletes, reactions, read receipts, typing, files, members, keepers, leave | Docs, Newsroom, RPG |
+| **Calls** | Live 1:1 voice over every path (`mycel-call`): direct dial by key, membership-checked signalling, Opus + FEC in QUIC datagrams, adaptive jitter buffer, path-aware adaptive bitrate, Apple voice processing (echo cancellation), mute, glare, busy | Group calls; video |
+| **Apps** | **Messaging**: DMs, groups, replies, edits, deletes, reactions, read receipts, typing, files, members, keepers, leave, **voice calls** | Docs, Newsroom, RPG |
 
-Tests: 123 Rust tests, including real-QUIC multi-node, real mDNS, runtime end-to-end with storage, and keeper offline delivery. Plus a UI end-to-end run driven in headless Chrome against real LAN devices. See [TESTING.md](TESTING.md).
+Tests: 159 Rust tests, including real-QUIC multi-node, real mDNS, runtime end-to-end with storage, and keeper offline delivery. Plus a UI end-to-end run driven in headless Chrome against real LAN devices. See [TESTING.md](TESTING.md).

@@ -23,30 +23,29 @@ pub fn estimate_frequency(samples: &[f32], rate: u32) -> Option<f32> {
     // hysteresis: ignore tiny wiggles around zero
     let hyst = peak * 0.05;
     let mut armed = false;
-    let mut first: Option<f32> = None;
-    let mut last = 0f32;
-    let mut count = 0usize;
+    let mut crossings: Vec<f32> = Vec::new();
     for i in 1..samples.len() {
         let (a, b) = (samples[i - 1], samples[i]);
         if b < -hyst {
             armed = true;
         }
         if armed && a <= 0.0 && b > 0.0 {
-            let t = (i - 1) as f32 + a / (a - b);
-            if first.is_none() {
-                first = Some(t);
-            } else {
-                count += 1;
-            }
-            last = t;
+            crossings.push((i - 1) as f32 + a / (a - b));
             armed = false;
         }
     }
-    let first = first?;
-    if count < 2 || last <= first {
+    // Periods between consecutive crossings; long ones are gaps (tone
+    // bursts, silence), not the tone.
+    let longest = rate as f32 / 20.0;
+    let mut periods: Vec<f32> = crossings.windows(2).map(|w| w[1] - w[0]).filter(|p| *p < longest).collect();
+    if periods.len() < 2 {
         return None;
     }
-    Some(count as f32 * rate as f32 / (last - first))
+    periods.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let median = periods[periods.len() / 2];
+    let near: Vec<f32> = periods.into_iter().filter(|p| (p - median).abs() < median * 0.2).collect();
+    let mean = near.iter().sum::<f32>() / near.len() as f32;
+    Some(rate as f32 / mean)
 }
 
 /// Power of `freq` in `samples` (Goertzel), normalized by length.
@@ -78,6 +77,12 @@ mod tests {
         assert!(goertzel(&tone, 523.25, rate) > 100.0 * goertzel(&tone, 800.0, rate));
         assert!(meter(&tone) > 0.7 && meter(&tone) < 0.9);
         assert_eq!(meter(&[0.0; 100]), 0.0);
+        // tone bursts with silence between them: still the tone's pitch
+        let bursts: Vec<f32> = (0..rate)
+            .map(|i| if (i / 4800) % 5 == 0 { 0.5 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / rate as f32).sin() } else { 0.0 })
+            .collect();
+        let f = estimate_frequency(&bursts, rate).unwrap();
+        assert!((f - 1000.0).abs() < 2.0, "{f}");
         assert_eq!(estimate_frequency(&[0.0; 1000], rate), None);
     }
 }

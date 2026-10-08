@@ -1686,8 +1686,7 @@
 .mx-callbar {
   display: flex;
   align-items: center;
-  gap: 10px 14px;
-  flex-wrap: wrap;
+  gap: 14px;
   min-height: 48px;
   padding: 6px 12px 6px 16px;
   border-bottom: 1px solid var(--line-soft);
@@ -1711,6 +1710,8 @@
   line-height: 1.4;
 }
 .mx-callbar-who {
+  flex: 0 0 auto;
+  max-width: 40%;
   display: inline-flex;
   align-items: baseline;
   gap: 8px;
@@ -1743,25 +1744,41 @@
   color: var(--accent);
   font-weight: 600;
 }
+.mx-callbar-path,
+.mx-callbar-hint {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .mx-callbar-path {
+  flex: 0 1 auto;
   font-size: 12.5px;
   color: var(--ink-2);
-  white-space: nowrap;
 }
 .mx-callbar-rate {
   color: var(--ink-3);
 }
 .mx-callbar-hint {
+  flex: 0 100 auto;
   font-size: 12px;
   color: var(--nearby);
-  white-space: nowrap;
 }
 .mx-callbar-meters {
   display: inline-flex;
+  align-items: center;
   gap: 10px;
+  flex: none;
   margin-left: auto;
 }
+.mx-meter-label {
+  font-size: 11px;
+  color: var(--ink-3);
+  align-self: center;
+  margin-right: -4px;
+}
 .mx-callbar-actions {
+  flex: none;
   display: inline-flex;
   align-items: center;
   gap: 6px;

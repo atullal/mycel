@@ -265,6 +265,18 @@ unsafe extern "C-unwind" fn on_input(
     st
 }
 
+#[cfg(test)]
+mod tests {
+    /// Prints whether this process may use the microphone. Only reads the
+    /// status, never prompts:
+    /// `cargo test -p mycel-call mic_status -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn mic_status() {
+        eprintln!("microphone permission: {:?}", super::mic_permission());
+    }
+}
+
 /// The speaker needs `frames` samples.
 unsafe extern "C-unwind" fn on_render(
     refcon: NonNull<c_void>,

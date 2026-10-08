@@ -690,7 +690,7 @@ async fn on_tick(
     last_report: &mut (u64, u64),
 ) -> Option<Input> {
     let shared = call.media.lock().as_ref().map(|m| m.shared().clone())?;
-    if ticks % 10 == 0 {
+    if ticks.is_multiple_of(10) {
         let now = Instant::now();
         let (path, rtt) = selected_path(conn);
         if std::env::var_os("MYCEL_CALL_DEBUG").is_some() {
@@ -733,7 +733,7 @@ async fn on_tick(
         let js = shared.jitter_stats();
         let (played, lost) = (js.played - last_report.0.min(js.played), js.lost - last_report.1.min(js.lost));
         *last_report = (js.played, js.lost);
-        let loss_ppm = if played + lost > 0 { (lost * 1_000_000 / (played + lost)) as u32 } else { 0 };
+        let loss_ppm = (lost * 1_000_000).checked_div(played + lost).unwrap_or(0) as u32;
         let _ = proto::send(
             tx,
             &Ctrl::Report { loss_ppm, jitter_ms: js.jitter_ms as u16, bitrate: ctl.bitrate() },
