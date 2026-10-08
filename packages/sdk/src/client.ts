@@ -12,6 +12,7 @@ import type {
   MessageView,
   MycelEvent,
   NearbyPeer,
+  NetworkMode,
   NetworkStatus,
   PeerId,
   Profile,
@@ -61,6 +62,10 @@ export interface Mycel {
   network: {
     /** `network_status` */
     status(): Promise<NetworkStatus>;
+    /** `set_network_mode`: takes effect after a restart. */
+    setMode(mode: NetworkMode): Promise<NetworkStatus>;
+    /** `restart_app` (native host only; check `transport.kind === "tauri"`). */
+    restart(): Promise<null>;
   };
 
   chat: {
@@ -158,6 +163,8 @@ export function createMycel(transport: Transport): Mycel {
     },
     network: {
       status: () => call("network_status", none),
+      setMode: (mode) => call("set_network_mode", { mode }),
+      restart: () => call("restart_app", none),
     },
     chat: {
       list: () => call("list_conversations", none),

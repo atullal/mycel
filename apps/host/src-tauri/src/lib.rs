@@ -9,7 +9,10 @@
 //! - `MYCEL_DATA_DIR`: where the runtime keeps keys and data (default: the
 //!   platform app-data dir). Give each instance its own to run several on one
 //!   machine.
-//! - `MYCEL_NET`: `lan` (default), `internet` or `local`.
+//! - `MYCEL_NET`: `internet` (default: every path, including relays), `lan`
+//!   (local paths only: same network, peer-to-peer Wi-Fi, Bluetooth) or
+//!   `local`. Without it, the mode chosen in the Network panel is used.
+//! - `MYCEL_LINKS`: which non-IP links to run (`all`, `none`, `awdl`, `ble`).
 //! - `MYCEL_NAME`: display name to use when creating a new profile.
 
 mod commands;
@@ -28,9 +31,10 @@ pub const EVENT: &str = "mycel://event";
 /// Runtime handle kept in Tauri managed state.
 pub type Rt = Arc<Runtime>;
 
-fn network_mode_from_env() -> Result<NetworkMode, String> {
+fn network_mode(data_dir: &std::path::Path) -> Result<NetworkMode, String> {
     match std::env::var("MYCEL_NET").ok().as_deref().map(str::trim) {
-        None | Some("") | Some("lan") => Ok(NetworkMode::Lan),
+        None | Some("") => Ok(Runtime::saved_network_mode(data_dir).unwrap_or(NetworkMode::Internet)),
+        Some("lan") => Ok(NetworkMode::Lan),
         Some("internet") => Ok(NetworkMode::Internet),
         Some("local") => Ok(NetworkMode::Local),
         Some(other) => Err(format!(
@@ -149,7 +153,7 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
     };
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
-    let mode = network_mode_from_env()?;
+    let mode = network_mode(&data_dir)?;
     let name = std::env::var("MYCEL_NAME")
         .ok()
         .filter(|n| !n.trim().is_empty());
@@ -216,6 +220,8 @@ pub fn run() {
             commands::list_contacts,
             commands::list_nearby,
             commands::network_status,
+            commands::set_network_mode,
+            commands::restart_app,
             commands::list_conversations,
             commands::get_conversation,
             commands::create_conversation,

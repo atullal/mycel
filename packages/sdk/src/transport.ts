@@ -6,6 +6,7 @@ import type {
   MessageView,
   MycelEvent,
   NearbyPeer,
+  NetworkMode,
   NetworkStatus,
   PeerId,
   Profile,
@@ -24,6 +25,9 @@ export interface Commands {
   list_contacts: [Record<string, never>, Contact[]];
   list_nearby: [Record<string, never>, NearbyPeer[]];
   network_status: [Record<string, never>, NetworkStatus];
+  set_network_mode: [{ mode: NetworkMode }, NetworkStatus];
+  /** Native host only: relaunch the app. */
+  restart_app: [Record<string, never>, null];
   list_conversations: [Record<string, never>, ConversationSummary[]];
   get_conversation: [{ id: ConversationId }, ConversationSummary];
   create_conversation: [{ title?: string | null; members: PeerId[] }, ConversationSummary];

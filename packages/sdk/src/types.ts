@@ -106,17 +106,51 @@ export interface MessageView {
 
 /**
  * - `local`: loopback only (tests).
- * - `lan`: local network via mDNS, no internet needed.
- * - `internet`: LAN + internet relays and DNS discovery.
+ * - `lan`: local paths only (same network, peer-to-peer Wi-Fi, Bluetooth); never the internet.
+ * - `internet`: every path: the local ones plus internet relays and discovery.
  */
 export type NetworkMode = "local" | "lan" | "internet";
 
+/**
+ * A path between two devices:
+ * - `network`: same Wi-Fi/Ethernet/cable network (or direct over the internet)
+ * - `peerWifi`: Apple peer-to-peer Wi-Fi (like AirDrop), no shared network needed
+ * - `bluetooth`: Bluetooth LE, slow, no Wi-Fi needed
+ * - `relay`: through an encrypted internet relay
+ */
+export type PathKind = "network" | "peerWifi" | "bluetooth" | "relay";
+
+/** A non-IP link (peer-to-peer Wi-Fi, Bluetooth). */
+export interface LinkStatus {
+  kind: PathKind;
+  active: boolean;
+  /** Why it isn't working, in actionable words. */
+  detail: string | null;
+  /** Devices reachable over it right now. */
+  peers: number;
+}
+
+export interface PeerPaths {
+  id: PeerId;
+  name: string;
+  online: boolean;
+  /** The path the last exchange used. */
+  via: PathKind | null;
+  /** Paths available without the internet. */
+  available: PathKind[];
+}
+
 export interface NetworkStatus {
   mode: NetworkMode;
+  /** The mode the next launch uses (differs from `mode` until a restart). */
+  nextMode: NetworkMode;
   onlinePeers: PeerId[];
+  /** Peers reachable without the internet. */
   nearbyPeers: number;
   /** Local addresses we're listening on (diagnostics). */
   addresses: string[];
+  links: LinkStatus[];
+  peers: PeerPaths[];
 }
 
 /** Pushed to UIs (Tauri event `mycel://event`), tagged by `type`. */

@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use mycel_net::{LinkStatus, PathKind};
+
 /// Hex-encoded 32-byte Ed25519 public key (device id = Iroh endpoint id).
 pub type PeerId = String;
 /// Hex-encoded Space id.
@@ -148,10 +150,31 @@ pub enum NetworkMode {
 #[serde(rename_all = "camelCase")]
 pub struct NetworkStatus {
     pub mode: NetworkMode,
+    /// The mode the next launch will use (differs from `mode` until restart).
+    pub next_mode: NetworkMode,
     pub online_peers: Vec<PeerId>,
+    /// Peers reachable without the internet (same network, peer-to-peer
+    /// Wi-Fi or Bluetooth).
     pub nearby_peers: u32,
     /// Local addresses we're listening on (diagnostics).
     pub addresses: Vec<String>,
+    /// Peer-to-peer Wi-Fi and Bluetooth: working or why not.
+    pub links: Vec<LinkStatus>,
+    /// How each reachable peer can be reached, and which path is in use.
+    pub peers: Vec<PeerPaths>,
+}
+
+/// Paths to one peer.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerPaths {
+    pub id: PeerId,
+    pub name: String,
+    pub online: bool,
+    /// The path the last exchange used.
+    pub via: Option<PathKind>,
+    /// Paths currently available without the internet.
+    pub available: Vec<PathKind>,
 }
 
 /// Pushed to UIs (Tauri event `mycel://event`).

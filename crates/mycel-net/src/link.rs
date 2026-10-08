@@ -24,7 +24,7 @@ use iroh::endpoint::transports::{
 };
 use mycel_crypto::SignPk;
 use parking_lot::Mutex;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 pub use iroh::endpoint::transports;
@@ -39,7 +39,7 @@ pub const TRANSPORT_BLUETOOTH: u64 = 0x6d79_6302;
 pub const TRANSPORT_TEST_BASE: u64 = 0x6d79_63f0;
 
 /// What kind of path a packet travels on, for path selection and the UI.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PathKind {
     /// Same Wi-Fi / Ethernet / cable network, or the open internet (direct IP).
@@ -99,7 +99,7 @@ impl PathKind {
 }
 
 /// A link's health, shown in the Network panel.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LinkStatus {
     pub kind: PathKind,

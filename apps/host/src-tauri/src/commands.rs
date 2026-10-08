@@ -10,7 +10,7 @@
 
 use mycel_node::api::{
     Contact, ConversationId, ConversationSummary, MessageId, MessageView, NearbyPeer,
-    NetworkStatus, PeerId, Profile,
+    NetworkMode, NetworkStatus, PeerId, Profile,
 };
 use tauri::{AppHandle, State};
 
@@ -64,6 +64,17 @@ pub async fn list_nearby(rt: State<'_, Rt>) -> Res<Vec<NearbyPeer>> {
 #[tauri::command]
 pub async fn network_status(rt: State<'_, Rt>) -> Res<NetworkStatus> {
     Ok(rt.network_status())
+}
+
+#[tauri::command]
+pub async fn set_network_mode(rt: State<'_, Rt>, mode: NetworkMode) -> Res<NetworkStatus> {
+    rt.set_network_mode(mode).map_err(err)
+}
+
+/// Relaunch the app (the network mode is fixed while running).
+#[tauri::command]
+pub fn restart_app(app: tauri::AppHandle) {
+    app.restart();
 }
 
 // ---------------------------------------------------------------- messaging

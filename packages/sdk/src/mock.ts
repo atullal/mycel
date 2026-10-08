@@ -19,6 +19,7 @@ import type {
   NearbyPeer,
   NetworkMode,
   NetworkStatus,
+  PathKind,
   PeerId,
   Profile,
   Reaction,
@@ -251,6 +252,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
   const objectUrls = new Map<string, string>();
   const handlers = new Set<(e: MycelEvent) => void>();
   const blocked = new Set<PeerId>();
+  let nextMode: NetworkMode = opts.mode;
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let clock = 0;
 
@@ -705,8 +707,28 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       [...people.values()].filter((p) => p.contact).sort((a, b) => a.name.localeCompare(b.name)).map(contactView),
     list_nearby: (): NearbyPeer[] =>
       [...people.values()].filter((p) => p.nearby).map((p) => ({ id: p.id, name: p.name, isContact: p.contact })),
+    restart_app: () => null,
+    set_network_mode: ({ mode }): NetworkStatus => {
+      nextMode = mode;
+      emit({ type: "networkChanged" });
+      return handlersByCmd.network_status({} as Record<string, never>) as NetworkStatus;
+    },
     network_status: (): NetworkStatus => ({
       mode: opts.mode,
+      nextMode,
+      links: [
+        { kind: "peerWifi", active: true, detail: null, peers: 1 },
+        { kind: "bluetooth", active: true, detail: null, peers: 1 },
+      ],
+      peers: [...people.values()]
+        .filter((p) => p.contact && (p.online || p.nearby))
+        .map((p, i) => ({
+          id: p.id,
+          name: p.name,
+          online: true,
+          via: (p.nearby ? "network" : i % 2 ? "bluetooth" : "peerWifi") as PathKind,
+          available: (p.nearby ? ["network", "peerWifi", "bluetooth"] : ["bluetooth"]) as PathKind[],
+        })),
       onlinePeers: [...people.values()].filter((p) => p.contact && p.online).map((p) => p.id),
       nearbyPeers: [...people.values()].filter((p) => p.nearby).length,
       addresses: ["192.168.1.24:51820", "[fe80::1c2a:8ff:fe3d:91b2]:51820", "127.0.0.1:51820"],

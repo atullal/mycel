@@ -775,6 +775,59 @@
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
+.p-mode-help {
+  margin-top: 8px;
+}
+.p-restart {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  font-size: 13px;
+  color: var(--ink);
+}
+.p-paths {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.p-paths li {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--line-soft);
+  font-size: 13px;
+}
+.p-paths li:last-child {
+  border-bottom: 0;
+}
+.p-path-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--ink-3);
+  opacity: 0.5;
+}
+.p-paths li.is-on .p-path-dot {
+  background: var(--online);
+  opacity: 1;
+}
+.p-path-name {
+  font-weight: 600;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.p-path-state {
+  color: var(--ink-2);
+  text-align: right;
+}
 .p-addrs {
   list-style: none;
   margin: 0;

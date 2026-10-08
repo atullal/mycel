@@ -1,22 +1,57 @@
-import { useMemo } from "react";
-import { useContacts, useNearby, useNetwork, useProfile } from "@mycel/sdk/react";
-import type { NetworkMode } from "@mycel/sdk";
+import { useMemo, useState } from "react";
+import { useContacts, useMycel, useNearby, useNetwork, useProfile } from "@mycel/sdk/react";
+import type { LinkStatus, NetworkMode, NetworkStatus, PathKind } from "@mycel/sdk";
 import { initials, toneFor } from "./common.tsx";
 
 const MODE: Record<NetworkMode, { name: string; text: string }> = {
   lan: {
-    name: "Local network",
-    text: "Finds people on the same Wi-Fi or wired network and talks to them directly. No internet needed.",
+    name: "Local only",
+    text: "Same network, peer-to-peer Wi-Fi and Bluetooth. Never uses the internet.",
   },
   internet: {
-    name: "Local network and internet",
-    text: "Talks directly on your local network, and through encrypted relays when people are elsewhere.",
+    name: "All paths",
+    text: "Everything local, plus encrypted internet relays for people who are elsewhere.",
   },
   local: {
     name: "This device only",
     text: "Not connecting to anyone. Used for testing.",
   },
 };
+
+const PATH: Record<PathKind, { name: string; text: string }> = {
+  network: { name: "Same network", text: "Wi-Fi, Ethernet or a cable between the devices." },
+  peerWifi: { name: "Peer-to-peer Wi-Fi", text: "Device to device, like AirDrop. Needs Wi-Fi on, but no network." },
+  bluetooth: { name: "Bluetooth", text: "Slow but works with Wi-Fi off. Fine for messages, slow for big files." },
+  relay: { name: "Internet relay", text: "Through an encrypted relay when you're on different networks." },
+};
+
+/** One row per path: is it working, and how many devices it reaches. */
+function pathRows(status: NetworkStatus): { kind: PathKind; on: boolean; text: string }[] {
+  const reach = (kind: PathKind) => status.peers.filter((p) => p.available.includes(kind)).length;
+  const devices = (n: number) => (n === 1 ? "1 device" : `${n} devices`);
+  const rows: { kind: PathKind; on: boolean; text: string }[] = [
+    {
+      kind: "network",
+      on: status.addresses.length > 0,
+      text: status.addresses.length ? devices(reach("network")) : "Not connected to a network",
+    },
+  ];
+  const link = (kind: PathKind): LinkStatus | undefined => status.links.find((l) => l.kind === kind);
+  for (const kind of ["peerWifi", "bluetooth"] as PathKind[]) {
+    const l = link(kind);
+    rows.push(
+      l
+        ? { kind, on: l.active, text: l.active ? devices(l.peers) : (l.detail ?? "Not available") }
+        : { kind, on: false, text: "Not available on this device" },
+    );
+  }
+  rows.push(
+    status.mode === "internet"
+      ? { kind: "relay", on: true, text: "On when the internet is available" }
+      : { kind: "relay", on: false, text: "Off (local only)" },
+  );
+  return rows;
+}
 
 type NodeState = "online" | "nearby" | "offline";
 
@@ -85,6 +120,52 @@ function Hyphae({ me, nodes }: { me: { id: string; name: string }; nodes: Node[]
   );
 }
 
+function ModeSwitch({ status }: { status: NetworkStatus }) {
+  const mycel = useMycel();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  if (status.mode === "local") return null;
+  const pick = async (mode: NetworkMode) => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await mycel.network.setMode(mode);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const pending = status.nextMode !== status.mode;
+  const native = mycel.transport.kind === "tauri";
+  return (
+    <section className="p-card">
+      <h4>Connections</h4>
+      <div className="p-seg" role="radiogroup" aria-label="Network mode">
+        {(["internet", "lan"] as const).map((m) => (
+          <button key={m} role="radio" aria-checked={status.nextMode === m} className={status.nextMode === m ? "is-on" : ""} disabled={busy} onClick={() => void pick(m)}>
+            {MODE[m].name}
+          </button>
+        ))}
+      </div>
+      <p className="p-help p-mode-help">{MODE[status.nextMode].text}</p>
+      {pending && (
+        <div className="p-restart">
+          <span>Restart Mycel to switch to “{MODE[status.nextMode].name}”.</span>
+          {native ? (
+            <button className="h-btn h-btn-primary h-btn-small" onClick={() => void mycel.network.restart()}>
+              Restart now
+            </button>
+          ) : (
+            <span className="p-help">Restart <code>mycel serve</code>.</span>
+          )}
+        </div>
+      )}
+      {err && <p className="p-error">{err}</p>}
+    </section>
+  );
+}
+
 export function NetworkPanel() {
   const { status, error } = useNetwork();
   const { contacts } = useContacts();
@@ -103,7 +184,6 @@ export function NetworkPanel() {
   }, [status, contacts, nearby]);
 
   if (!status) return error ? <p className="p-error">{error.message}</p> : null;
-  const mode = MODE[status.mode];
 
   return (
     <div className="p-network">
@@ -125,10 +205,38 @@ export function NetworkPanel() {
         </div>
       </dl>
 
+      <ModeSwitch status={status} />
+
       <section className="p-card">
-        <h4>{mode.name}</h4>
-        <p className="p-help">{mode.text}</p>
+        <h4>Paths</h4>
+        <ul className="p-paths">
+          {pathRows(status).map((r) => (
+            <li key={r.kind} className={r.on ? "is-on" : ""} title={PATH[r.kind].text}>
+              <span className="p-path-dot" aria-hidden="true" />
+              <span className="p-path-name">{PATH[r.kind].name}</span>
+              <span className="p-path-state">{r.text}</span>
+            </li>
+          ))}
+        </ul>
       </section>
+
+      {status.peers.length > 0 && (
+        <section className="p-card">
+          <h4>Talking to</h4>
+          <ul className="p-paths">
+            {status.peers.map((p) => (
+              <li key={p.id} className={p.online ? "is-on" : ""}>
+                <span className="p-path-dot" aria-hidden="true" />
+                <span className="p-path-name">{p.name}</span>
+                <span className="p-path-state">
+                  {p.via ? `via ${PATH[p.via].name}` : p.online ? "reachable" : "offline"}
+                  {p.available.length > 1 && ` · ${p.available.length} paths`}
+                </span>
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       <section className="p-card">
         <h4>Listening on</h4>

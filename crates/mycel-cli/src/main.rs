@@ -38,9 +38,10 @@ struct Cli {
 
 #[derive(Clone, Copy, ValueEnum)]
 enum Net {
-    /// Local network only (mDNS). No internet needed.
+    /// Local paths only: same network (mDNS), peer-to-peer Wi-Fi, Bluetooth.
+    /// Never contacts the internet.
     Lan,
-    /// LAN + internet relays and discovery.
+    /// Every path: local ones plus internet relays and discovery.
     Internet,
     /// Loopback only (tests).
     Local,
@@ -64,8 +65,9 @@ struct DeviceArgs {
     /// Display name (saved for next time).
     #[arg(long)]
     name: Option<String>,
-    #[arg(long, value_enum, default_value = "lan")]
-    net: Net,
+    /// Network mode [default: the mode saved from the UI, else internet]
+    #[arg(long, value_enum)]
+    net: Option<Net>,
     /// UDP port for peer connections (0 = random).
     #[arg(long, default_value_t = 0)]
     port: u16,
@@ -116,9 +118,14 @@ fn expand(p: &str) -> PathBuf {
 }
 
 async fn open(dev: &DeviceArgs, keeper: bool) -> Result<Arc<Runtime>> {
+    let data_dir = expand(&dev.data);
+    let mode = match dev.net {
+        Some(n) => n.into(),
+        None => Runtime::saved_network_mode(&data_dir).unwrap_or(NetworkMode::Internet),
+    };
     Runtime::open_with(RuntimeOptions {
-        data_dir: expand(&dev.data),
-        mode: dev.net.into(),
+        data_dir,
+        mode,
         name: dev.name.clone(),
         keeper,
         port: dev.port,

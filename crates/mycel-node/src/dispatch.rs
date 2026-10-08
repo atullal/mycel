@@ -112,6 +112,12 @@ struct Decline {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct Mode {
+    mode: crate::api::NetworkMode,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Blob {
     blob: String,
 }
@@ -136,6 +142,7 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
         "list_contacts" => ok(rt.contacts()),
         "list_nearby" => ok(rt.nearby()),
         "network_status" => ok(rt.network_status()),
+        "set_network_mode" => ok(rt.set_network_mode(args::<Mode>(a)?.mode)?),
         "list_conversations" => ok(rt.conversations()),
         "get_conversation" => ok(rt.conversation(args::<Id>(a)?.id)?),
         "create_conversation" => {

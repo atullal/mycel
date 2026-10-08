@@ -11,7 +11,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::BASE64URL_NOPAD;
 use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, SignPk, SymKey, random};
 use mycel_kit_chat::{AttachmentRef, ChatOp, ChatSignal, ChatView, messages_feed, reduce};
-use mycel_net::{ContactCard, NetEvent, NetMode, Node, NodeOptions};
+use mycel_net::{ContactCard, NetEvent, NetMode, Node, NodeOptions, PathKind};
 use mycel_sync::Replica;
 use mycel_trust::{Role, SpaceId};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,8 @@ pub struct Runtime {
     name: Mutex<String>,
     contacts: Mutex<BTreeMap<SignPk, StoredContact>>,
     mode: NetworkMode,
+    /// The mode the next launch will use (`set_network_mode`).
+    next_mode: Mutex<NetworkMode>,
     keeper: bool,
     /// Reduced chat views, invalidated whenever a space changes.
     views: Mutex<HashMap<SpaceId, Arc<ChatView>>>,
@@ -88,6 +90,8 @@ pub struct Runtime {
     announced: Mutex<HashMap<SignPk, String>>,
     /// Conversations from non-contacts awaiting accept/decline: space → inviter.
     requests: Mutex<BTreeMap<SpaceId, SignPk>>,
+    /// Just-accepted invites not yet classified (see `invite_policy`).
+    arriving: Arc<Mutex<HashSet<SpaceId>>>,
     /// Declined conversations we keep locally but never show.
     hidden: Mutex<BTreeSet<SpaceId>>,
     /// Keys whose invites we refuse at the network layer.
@@ -318,13 +322,27 @@ impl Runtime {
         nopts.store = Some(store.clone());
         nopts.blob_dir = Some(dir.join("blobs"));
         nopts.port = opts.port;
+        if opts.mode != NetworkMode::Local {
+            nopts.links = crate::links::device_links(keys.sign_pk(), &name);
+        }
         // v0 policy: accept any conversation we're added to (the inviter needed
         // our contact card to add us). Blocking lists can come later.
         // Invites from blocked keys are refused outright; invites from anyone
         // else are accepted, and non-contacts land as message requests.
         let blocked: Arc<Mutex<BTreeSet<SignPk>>> = Arc::new(Mutex::new(load_set(&store, "blocked")?));
         let blocked_for_policy = blocked.clone();
-        nopts.invite_policy = Arc::new(move |from, _| !blocked_for_policy.lock().contains(from));
+        // Spaces accepted by the network layer but not yet sorted into
+        // contact conversation vs message request (the event bridge does that):
+        // hidden until then, so a request never shows up as a normal chat.
+        let arriving: Arc<Mutex<HashSet<SpaceId>>> = Arc::default();
+        let arriving_for_policy = arriving.clone();
+        nopts.invite_policy = Arc::new(move |from, space| {
+            let ok = !blocked_for_policy.lock().contains(from);
+            if ok {
+                arriving_for_policy.lock().insert(*space);
+            }
+            ok
+        });
         let requests: BTreeMap<SpaceId, SignPk> = store
             .kv_get("requests")?
             .and_then(|b| postcard::from_bytes::<Vec<(SpaceId, SignPk)>>(&b).ok())
@@ -343,6 +361,7 @@ impl Runtime {
             .map_err(|e| anyhow!("chat rules failed to load: {e:?}"))?;
         nopts.feed_validator = Some(Arc::new(WasmRules(engine)));
         let node = Node::spawn(keys.clone(), nopts).await?;
+        let next_mode = Self::saved_network_mode(&dir).unwrap_or(opts.mode);
 
         for (space, (ops, envs)) in store.load_spaces()? {
             let Some(genesis) = ops.iter().find(|o| o.id() == space).cloned() else {
@@ -367,10 +386,12 @@ impl Runtime {
             name: Mutex::new(name),
             contacts: Mutex::new(contacts),
             mode: opts.mode,
+            next_mode: Mutex::new(next_mode),
             keeper: opts.keeper,
             views: Mutex::default(),
             announced: Mutex::default(),
             requests: Mutex::new(requests),
+            arriving,
             hidden: Mutex::new(hidden),
             blocked,
             hints: Mutex::new(hints),
@@ -529,16 +550,63 @@ impl Runtime {
 
     pub fn network_status(&self) -> NetworkStatus {
         let peers = self.node.peers();
+        let me = self.keys.sign_pk();
+        let mut paths: Vec<PeerPaths> = peers
+            .iter()
+            .filter(|(pk, p)| **pk != me && (p.online() || p.via.is_some()))
+            .map(|(pk, p)| {
+                let mut available: Vec<PathKind> = p.links.iter().copied().collect();
+                if p.nearby {
+                    available.insert(0, PathKind::Network);
+                }
+                PeerPaths {
+                    id: hex_id(pk),
+                    name: self.name_of(pk),
+                    online: p.online(),
+                    via: p.via,
+                    available,
+                }
+            })
+            .collect();
+        paths.sort_by(|a, b| b.online.cmp(&a.online).then_with(|| a.name.cmp(&b.name)));
         NetworkStatus {
             mode: self.mode,
+            next_mode: *self.next_mode.lock(),
             online_peers: peers
                 .iter()
                 .filter(|(_, p)| p.online())
                 .map(|(pk, _)| hex_id(pk))
                 .collect(),
-            nearby_peers: peers.values().filter(|p| p.nearby).count() as u32,
+            nearby_peers: peers.values().filter(|p| p.nearby || !p.links.is_empty()).count() as u32,
             addresses: self.node.local_addresses(),
+            links: self.node.link_status(),
+            peers: paths,
         }
+    }
+
+    /// The network mode saved by `set_network_mode`, if any. Hosts read it
+    /// before opening the runtime (the mode is fixed while running).
+    pub fn saved_network_mode(data_dir: &Path) -> Option<NetworkMode> {
+        let s = std::fs::read_to_string(data_dir.join("network-mode")).ok()?;
+        match s.trim() {
+            "lan" => Some(NetworkMode::Lan),
+            "internet" => Some(NetworkMode::Internet),
+            _ => None,
+        }
+    }
+
+    /// Choose the network mode for the next launch (`lan` = local paths only,
+    /// `internet` = also relays). Takes effect after a restart.
+    pub fn set_network_mode(&self, mode: NetworkMode) -> Result<NetworkStatus> {
+        let word = match mode {
+            NetworkMode::Lan => "lan",
+            NetworkMode::Internet => "internet",
+            NetworkMode::Local => bail!("local mode is for tests"),
+        };
+        std::fs::write(self.data_dir.join("network-mode"), word)?;
+        *self.next_mode.lock() = mode;
+        self.emit(Event::NetworkChanged);
+        Ok(self.network_status())
     }
 
     /// Best display name: contact name, else the name they announced in any
@@ -626,6 +694,9 @@ impl Runtime {
     }
 
     fn summary(&self, space: &SpaceId) -> Result<ConversationSummary> {
+        if self.arriving.lock().contains(space) {
+            bail!("unknown conversation");
+        }
         let me = self.keys.sign_pk();
         let view = self.view(space)?;
         let (members, my_role) = self.node.with_space(space, |r| (r.members(), r.my_role()))?;
@@ -953,7 +1024,7 @@ impl Runtime {
         let space = parse_space(&id)?;
         // No read receipts for message requests: the sender learns nothing
         // until we accept.
-        if self.requests.lock().contains_key(&space) {
+        if self.requests.lock().contains_key(&space) || self.arriving.lock().contains(&space) {
             return Ok(());
         }
         let me = self.keys.sign_pk();
@@ -1133,6 +1204,7 @@ async fn bridge(rt: Weak<Runtime>, mut rx: broadcast::Receiver<NetEvent>) {
                         rt.save_requests();
                     }
                 }
+                rt.arriving.lock().remove(&space);
                 rt.emit(Event::ConversationAdded { conversation: space.to_string() });
             }
             NetEvent::Ephemeral { space, from, data } => {
