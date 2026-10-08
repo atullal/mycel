@@ -3416,6 +3416,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "mycel-link-awdl"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "block2",
+ "bytes",
+ "hex",
+ "libc",
+ "mycel-crypto",
+ "mycel-net",
+ "mycel-sync",
+ "mycel-trust",
+ "parking_lot",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mycel-net"
 version = "0.1.0"
 dependencies = [
