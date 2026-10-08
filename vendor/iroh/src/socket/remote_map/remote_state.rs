@@ -65,7 +65,7 @@ const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
 /// Even if we have some non-relay route that works.
 const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 
-/// MYCEL PATCH: how often every custom-transport (link) path is pinged.
+/// MYCEL PATCH: how often every path is pinged (and selection re-run).
 const LINK_PATH_PING_INTERVAL: Duration = Duration::from_secs(1);
 
 /// The time after which an idle [`RemoteStateActor`] stops.
@@ -774,23 +774,23 @@ impl RemoteStateActor {
         }
     }
 
-    /// MYCEL PATCH: keep link (custom-transport) paths alive.
+    /// MYCEL PATCH: keep every path alive and measurable.
     ///
     /// noq re-arms a path's keepalive only when a packet *arrives* on it and
     /// may acknowledge on any path, so on a quiet backup path one side can
     /// stop sending on it entirely; the other side's path idle timer then
     /// closes it, and a long-lived connection (a call) can no longer fail
-    /// over to it. Pinging every link path each second keeps both sides'
-    /// idle timers fresh, at ~50 bytes/s per path.
+    /// over to it. Pinging every path each second keeps both sides' idle
+    /// timers fresh, at ~50 bytes/s per path, and means a live path always
+    /// *receives* something every second: the path selector treats one that
+    /// has received nothing for a few seconds as dead.
     fn ping_link_paths(&self) {
         for conn_state in self.connections.values() {
             let Some(conn) = conn_state.handle.upgrade() else {
                 continue;
             };
-            for (path_id, tuple) in conn_state.paths.iter() {
-                if matches!(tuple.remote(), transports::Addr::Custom(_))
-                    && let Some(path) = conn.path(*path_id)
-                {
+            for path_id in conn_state.paths.keys() {
+                if let Some(path) = conn.path(*path_id) {
                     path.ping().ok();
                 }
             }

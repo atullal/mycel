@@ -12,12 +12,19 @@ Changes (all in `src/socket/remote_map/remote_state.rs`, marked `MYCEL PATCH`):
 2. Custom addresses learned later (address lookup results, or addresses
    passed to `connect`) are queued and opened on all live connections.
 
-3. Every custom-transport path on every connection is pinged once a
-   second (`ping_link_paths`). noq re-arms a path's keepalive only when a
-   packet arrives on it and may acknowledge on any path, so on a quiet
-   backup path one side could stop sending on it and the other side's
-   5 s path idle timeout closed it: a call that had been running for a
-   while could then not fail over from peer-to-peer Wi-Fi to Bluetooth.
+3. Every path on every connection is pinged once a second
+   (`ping_link_paths`; first only custom-transport paths, now all). noq
+   re-arms a path's keepalive only when a packet arrives on it and may
+   acknowledge on any path, so on a quiet backup path one side could stop
+   sending on it and the other side's 5 s path idle timeout closed it: a
+   call that had been running for a while could then not fail over from
+   peer-to-peer Wi-Fi to Bluetooth. Pinging every path also means a live
+   path always *receives* something each second, which the selector uses
+   to spot a dead path (nothing received for 3 s) before its idle timeout.
+   That matters with several connections to one peer (Mycel's pooled
+   connection plus a call): Iroh selects one path across all of them and
+   re-opens it on every client connection, so a dead path that one
+   connection still lists would otherwise be re-opened on the others.
 
 4. **Several Available paths (bandwidth aggregation).** noq already
    schedules packets on every validated path whose local status is

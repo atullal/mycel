@@ -25,7 +25,7 @@
 //! sender, a keeper or any member that already downloaded them. Receivers
 //! enforce it too: only a keeper accepts an unsolicited push above the limit.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
@@ -35,10 +35,11 @@ use iroh::endpoint::{Connection, RecvStream, SendStream};
 use mycel_crypto::{Digest, Hash32, SignPk};
 use mycel_trust::{Role, SpaceId};
 use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::wire::*;
-use crate::{Inner, NetEvent, Node, connect, to_sign_pk};
+use crate::{Inner, NetEvent, Node, on_conn, open_bi, pooled};
 
 /// Blobs up to this size are pushed to every member as soon as they're posted.
 pub const EAGER_PUSH_MAX: u64 = 16 * 1024 * 1024;
@@ -261,17 +262,114 @@ async fn part_len(part: &Path) -> u64 {
     tokio::fs::metadata(part).await.map(|m| m.len()).unwrap_or(0)
 }
 
+// ───────────────────────────── partial downloads ─────────────────────────────
+
+/// Byte ranges of a blob we already hold in its `.part` file: sorted,
+/// disjoint, half-open `[start, end)`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct Ranges(Vec<(u64, u64)>);
+
+impl Ranges {
+    fn insert(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
+        }
+        let (mut s, mut e) = (start, end);
+        let mut out = Vec::with_capacity(self.0.len() + 1);
+        for &(a, b) in &self.0 {
+            if b < s || a > e {
+                out.push((a, b));
+            } else {
+                s = s.min(a);
+                e = e.max(b);
+            }
+        }
+        out.push((s, e));
+        out.sort_unstable();
+        self.0 = out;
+    }
+
+    fn covered(&self) -> u64 {
+        self.0.iter().map(|(a, b)| b - a).sum()
+    }
+
+    /// How many bytes from 0 on are contiguous.
+    fn prefix(&self) -> u64 {
+        match self.0.first() {
+            Some(&(0, e)) => e,
+            _ => 0,
+        }
+    }
+
+    /// The gaps in `[0, total)`.
+    fn missing(&self, total: u64) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        for &(a, b) in &self.0 {
+            if a > at {
+                out.push((at, a.min(total)));
+            }
+            at = at.max(b);
+        }
+        if at < total {
+            out.push((at, total));
+        }
+        out.retain(|(a, b)| a < b);
+        out
+    }
+}
+
+/// The `.ranges` file next to a `.part`: which bytes of it are filled in.
+/// No such file means the `.part` is a plain prefix (how pushes and older
+/// versions write it).
+fn ranges_path(part: &Path) -> PathBuf {
+    part.with_extension("ranges")
+}
+
+#[derive(Serialize, Deserialize)]
+struct RangesFile {
+    total: u64,
+    done: Ranges,
+}
+
+/// What a `.part` file holds, for a blob of `total` bytes (`None`: unknown yet).
+async fn load_done(part: &Path, total: Option<u64>) -> Ranges {
+    if let Ok(bytes) = tokio::fs::read(ranges_path(part)).await {
+        return match postcard::from_bytes::<RangesFile>(&bytes) {
+            Ok(f) if total.is_none_or(|t| t == f.total) => f.done,
+            _ => Ranges::default(), // stale or damaged: start over
+        };
+    }
+    let mut r = Ranges::default();
+    let len = part_len(part).await;
+    r.insert(0, total.map_or(len, |t| len.min(t)));
+    r
+}
+
+async fn save_done(part: &Path, total: u64, done: &Ranges) -> Result<()> {
+    let bytes = postcard::to_allocvec(&RangesFile { total, done: done.clone() })?;
+    let tmp = part.with_extension(format!("ranges.{:x}", mycel_crypto::random_u64()));
+    tokio::fs::write(&tmp, bytes).await?;
+    tokio::fs::rename(&tmp, ranges_path(part)).await?;
+    Ok(())
+}
+
+async fn drop_partial(part: &Path) {
+    let _ = tokio::fs::remove_file(part).await;
+    let _ = tokio::fs::remove_file(ranges_path(part)).await;
+}
+
 // ─────────────────────────────── server side ───────────────────────────────
 
-pub(crate) async fn serve(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
-    let peer = to_sign_pk(&conn.remote_id());
-    let (mut tx, mut rx) = conn.accept_bi().await?;
+/// One blob request, on its own stream of a pooled connection.
+pub(crate) async fn serve(inner: &Arc<Inner>, peer: SignPk, mut tx: SendStream, mut rx: RecvStream) -> Result<()> {
     let req: BlobReq = recv(&mut rx).await?;
     let (space, hash) = match &req {
         BlobReq::Get { space, hash }
         | BlobReq::Put { space, hash, .. }
         | BlobReq::GetFrom { space, hash, .. }
-        | BlobReq::Offer { space, hash, .. } => (*space, *hash),
+        | BlobReq::Offer { space, hash, .. }
+        | BlobReq::GetRange { space, hash, .. } => (*space, *hash),
     };
     let (allowed, keeper) = inner
         .spaces
@@ -288,21 +386,36 @@ pub(crate) async fn serve(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
         (BlobReq::Put { len, .. } | BlobReq::Offer { len, .. }, Some(_)) if !push_ok(len) => {
             send(&mut tx, &BlobResp::Denied).await
         }
-        (BlobReq::Get { .. }, Some(path)) => serve_get(&mut tx, &path, None).await,
-        (BlobReq::GetFrom { offset, .. }, Some(path)) => serve_get(&mut tx, &path, Some(offset)).await,
+        (BlobReq::Get { .. }, Some(path)) => serve_get(inner, &mut tx, &path, None).await,
+        (BlobReq::GetFrom { offset, .. }, Some(path)) => serve_get(inner, &mut tx, &path, Some(offset)).await,
+        (BlobReq::GetRange { offset, len, .. }, Some(path)) => serve_range(inner, &mut tx, &path, offset, len).await,
         (BlobReq::Put { len, .. }, Some(path)) => serve_put(inner, &mut tx, &mut rx, &path, hash, len, false).await,
         (BlobReq::Offer { len, .. }, Some(path)) => serve_put(inner, &mut tx, &mut rx, &path, hash, len, true).await,
     };
-    let _ = tx.finish();
-    // Let the client read everything before the connection goes away.
-    conn.closed().await;
+    tx.finish().ok();
     res
 }
 
-async fn serve_get(tx: &mut SendStream, path: &Path, offset: Option<u64>) -> Result<()> {
-    let len = match tokio::fs::metadata(path).await {
-        Ok(m) if m.is_file() => m.len(),
-        _ => return send(tx, &BlobResp::NotFound).await,
+async fn blob_len(path: &Path) -> Option<u64> {
+    match tokio::fs::metadata(path).await {
+        Ok(m) if m.is_file() => Some(m.len()),
+        _ => None,
+    }
+}
+
+/// Counts bytes served into [`Node::blob_bytes_served`].
+fn count_served(inner: &Arc<Inner>, from: u64) -> Progress {
+    let inner = inner.clone();
+    let last = std::sync::atomic::AtomicU64::new(from);
+    Arc::new(move |done, _| {
+        let prev = last.swap(done, std::sync::atomic::Ordering::Relaxed);
+        inner.blob_served.fetch_add(done.saturating_sub(prev), std::sync::atomic::Ordering::Relaxed);
+    })
+}
+
+async fn serve_get(inner: &Arc<Inner>, tx: &mut SendStream, path: &Path, offset: Option<u64>) -> Result<()> {
+    let Some(len) = blob_len(path).await else {
+        return send(tx, &BlobResp::NotFound).await;
     };
     let start = match offset {
         None => {
@@ -315,7 +428,17 @@ async fn serve_get(tx: &mut SendStream, path: &Path, offset: Option<u64>) -> Res
             o
         }
     };
-    send_from(tx, path, start, len, &no_progress()).await
+    send_from(tx, path, start, len, &count_served(inner, start)).await
+}
+
+async fn serve_range(inner: &Arc<Inner>, tx: &mut SendStream, path: &Path, offset: u64, len: u64) -> Result<()> {
+    let Some(total) = blob_len(path).await else {
+        return send(tx, &BlobResp::NotFound).await;
+    };
+    let start = offset.min(total);
+    send(tx, &BlobResp::Range { total, offset: start }).await?;
+    let end = start.saturating_add(len).min(total);
+    send_from(tx, path, start, end, &count_served(inner, start)).await
 }
 
 async fn serve_put(
@@ -334,8 +457,11 @@ async fn serve_put(
         return send(tx, &if handshake { BlobResp::Busy } else { BlobResp::Denied }).await;
     };
     let part = part_path(path);
-    // Legacy `Put` streams from 0 without asking; `Offer` can resume.
-    let mut offset = if handshake { part_len(&part).await } else { 0 };
+    // Legacy `Put` streams from 0 without asking; `Offer` resumes after the
+    // contiguous prefix we hold (a multi-source download may have left
+    // other ranges too: a push writes sequentially, so they are dropped).
+    let mut offset = if handshake { load_done(&part, Some(len)).await.prefix() } else { 0 };
+    let _ = tokio::fs::remove_file(ranges_path(&part)).await;
     if offset > len {
         offset = 0;
     }
@@ -362,57 +488,324 @@ async fn serve_put(
 /// Push a stored blob to one member (resuming a partial copy they have).
 async fn push(inner: &Arc<Inner>, pk: SignPk, space: SpaceId, hash: Hash32, path: &Path) -> Result<()> {
     let len = tokio::fs::metadata(path).await?.len();
-    let conn = connect(inner, &pk, ALPN_BLOB).await?;
-    let (mut tx, mut rx) = conn.open_bi().await?;
-    send(&mut tx, &BlobReq::Offer { space, hash, len }).await?;
-    let res = match recv::<BlobResp>(&mut rx).await? {
-        BlobResp::Stored => Ok(()),
-        BlobResp::SendFrom { offset } if offset <= len => {
-            send_from(&mut tx, path, offset, len, &no_progress()).await?;
-            tx.finish()?;
-            match recv::<BlobResp>(&mut rx).await? {
-                BlobResp::Stored => Ok(()),
-                other => Err(anyhow!("push failed: {other:?}")),
+    on_conn!(inner, &pk, |conn| async {
+        let (mut tx, mut rx) = open_bi(&conn, StreamKind::Blob).await?;
+        send(&mut tx, &BlobReq::Offer { space, hash, len }).await?;
+        match recv::<BlobResp>(&mut rx).await? {
+            BlobResp::Stored => Ok(()),
+            BlobResp::SendFrom { offset } if offset <= len => {
+                send_from(&mut tx, path, offset, len, &no_progress()).await?;
+                tx.finish()?;
+                match recv::<BlobResp>(&mut rx).await? {
+                    BlobResp::Stored => Ok(()),
+                    other => Err(anyhow!("push failed: {other:?}")),
+                }
             }
+            other => Err(anyhow!("push refused: {other:?}")),
         }
-        other => Err(anyhow!("push refused: {other:?}")),
-    };
-    conn.close(0u32.into(), b"done");
-    res
+    })
 }
 
-/// Fetch a blob from one member into `path`, resuming from `<path>.part`.
-async fn fetch_from(
-    inner: &Arc<Inner>,
-    pk: SignPk,
+/// Ranges are fetched in pieces of at most this size ...
+const PIECE: u64 = 4 * 1024 * 1024;
+/// ... with this many requests in flight per source (each its own QUIC
+/// stream on the pooled connection), so there's no gap between pieces.
+const STREAMS_PER_SOURCE: usize = 2;
+/// An idle source takes over the second half of a piece still in flight
+/// elsewhere when at least this much of it is left (end game).
+const STEAL_MIN: u64 = 512 * 1024;
+/// The `.ranges` file is rewritten after this many new bytes.
+const SAVE_EVERY: u64 = 4 * 1024 * 1024;
+
+/// Shared state of one multi-source download.
+struct Download {
     space: SpaceId,
     hash: Hash32,
-    path: &Path,
-    progress: &Progress,
-) -> Result<()> {
-    let part = part_path(path);
-    let have = part_len(&part).await;
-    let conn = connect(inner, &pk, ALPN_BLOB).await?;
-    let (mut tx, mut rx) = conn.open_bi().await?;
-    send(&mut tx, &BlobReq::GetFrom { space, hash, offset: have }).await?;
-    tx.finish()?;
-    let res = async {
-        let (total, offset) = match recv::<BlobResp>(&mut rx).await? {
-            BlobResp::Range { total, offset } if offset <= have.min(total) => (total, offset),
-            other => bail!("not available: {other:?}"),
+    total: u64,
+    part: PathBuf,
+    progress: Progress,
+    st: Mutex<DlState>,
+    /// A piece finished or came back.
+    changed: tokio::sync::Notify,
+}
+
+struct DlState {
+    done: Ranges,
+    /// Not yet handed to any source.
+    pending: std::collections::VecDeque<(u64, u64)>,
+    /// In flight: worker id → (next byte, end). A stealer may lower `end`.
+    active: HashMap<u64, (u64, u64)>,
+    next_id: u64,
+    unsaved: u64,
+}
+
+/// What a source should do next.
+enum Take {
+    /// Fetch `[start, end)` as piece `id`.
+    Piece { id: u64, start: u64, end: u64 },
+    /// Nothing to hand out, but pieces are in flight elsewhere and may come
+    /// back (their source fails): wait.
+    Wait,
+    Done,
+}
+
+impl Download {
+    /// Hand out the next piece (or half of the biggest one in flight).
+    fn take(&self) -> Take {
+        let mut st = self.st.lock();
+        let range = match st.pending.pop_front() {
+            Some((a, b)) if b - a > PIECE => {
+                st.pending.push_front((a + PIECE, b));
+                (a, a + PIECE)
+            }
+            Some(r) => r,
+            None => {
+                let Some((&victim, &(cur, end))) = st.active.iter().max_by_key(|(_, (c, e))| e.saturating_sub(*c))
+                else {
+                    return Take::Done;
+                };
+                if end.saturating_sub(cur) < 2 * STEAL_MIN {
+                    return Take::Wait;
+                }
+                let mid = cur + (end - cur) / 2;
+                st.active.insert(victim, (cur, mid));
+                (mid, end)
+            }
         };
-        let dir = path.parent().context("bad blob path")?;
-        tokio::fs::create_dir_all(dir).await?;
-        ensure_free_space(dir, total - offset)?;
-        let mut digest = blob_digest();
-        if offset > 0 {
-            hash_prefix(&part, offset, &mut digest).await?;
-        }
-        receive_into(&mut rx, &part, offset, total, &mut digest, progress).await?;
-        commit(inner, &part, path, hash, &digest).await
+        let id = st.next_id;
+        st.next_id += 1;
+        st.active.insert(id, range);
+        Take::Piece { id, start: range.0, end: range.1 }
     }
-    .await;
-    conn.close(0u32.into(), b"done");
+
+    /// `[start, start+n)` is on disk. Returns where this worker should stop
+    /// now, and a snapshot to save if it's time.
+    fn mark(&self, id: u64, start: u64, n: u64) -> (u64, Option<Ranges>) {
+        let (done, end, save) = {
+            let mut st = self.st.lock();
+            let end = st.active.get(&id).map_or(start, |r| r.1);
+            let upto = (start + n).min(end.max(start));
+            st.done.insert(start, upto);
+            if let Some(r) = st.active.get_mut(&id) {
+                r.0 = upto;
+            }
+            st.unsaved += upto - start;
+            let save = (st.unsaved >= SAVE_EVERY).then(|| {
+                st.unsaved = 0;
+                st.done.clone()
+            });
+            (st.done.covered(), end, save)
+        };
+        (self.progress)(done, self.total);
+        (end, save)
+    }
+
+    /// The worker stopped; whatever it didn't fetch goes back in the queue.
+    fn release(&self, id: u64) {
+        {
+            let mut st = self.st.lock();
+            if let Some((cur, end)) = st.active.remove(&id)
+                && cur < end
+            {
+                st.pending.push_front((cur, end));
+            }
+        }
+        self.changed.notify_waiters();
+    }
+
+    fn snapshot(&self) -> Ranges {
+        self.st.lock().done.clone()
+    }
+
+    fn finished(&self) -> bool {
+        self.st.lock().done.covered() >= self.total
+    }
+}
+
+/// Fetch `[start, end)` of the blob from one source into the `.part` file.
+async fn fetch_range(conn: &Connection, dl: &Download, id: u64, start: u64, end: u64) -> Result<()> {
+    let (mut tx, mut rx) = open_bi(conn, StreamKind::Blob).await?;
+    let (space, hash) = (dl.space, dl.hash);
+    send(&mut tx, &BlobReq::GetRange { space, hash, offset: start, len: end - start }).await?;
+    tx.finish()?;
+    match recv::<BlobResp>(&mut rx).await? {
+        BlobResp::Range { total, offset } if total == dl.total && offset == start => {}
+        other => bail!("not available: {other:?}"),
+    }
+    let mut f = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&dl.part)
+        .await
+        .with_context(|| format!("can't write {}", dl.part.display()))?;
+    f.seek(SeekFrom::Start(start)).await?;
+    let mut buf = vec![0u8; IO_CHUNK];
+    let (mut at, mut end) = (start, end);
+    while at < end {
+        let want = (buf.len() as u64).min(end - at) as usize;
+        let mut n = 0;
+        let mut ended = false;
+        while n < want && !ended {
+            match rx.read(&mut buf[n..want]).await {
+                Ok(Some(k)) => n += k,
+                Ok(None) | Err(_) => ended = true,
+            }
+        }
+        f.write_all(&buf[..n]).await?;
+        let (new_end, save) = dl.mark(id, at, n as u64);
+        at += n as u64;
+        end = new_end;
+        if let Some(done) = save {
+            f.flush().await?;
+            save_done(&dl.part, dl.total, &done).await?;
+        }
+        if ended && at < end {
+            bail!("transfer interrupted");
+        }
+    }
+    // the rest of this piece went to a faster source
+    rx.stop(0u32.into()).ok();
+    f.flush().await?;
+    Ok(())
+}
+
+/// One source: probe it, then keep fetching pieces until none are left.
+async fn source_worker(inner: Arc<Inner>, pk: SignPk, dl: Arc<Download>) -> Result<()> {
+    let mut failures = 0;
+    loop {
+        // Connect first: a source that is slow to reach holds no piece.
+        let conn = pooled(&inner, &pk).await?;
+        let changed = dl.changed.notified();
+        let (id, start, end) = match dl.take() {
+            Take::Piece { id, start, end } => (id, start, end),
+            Take::Done => return Ok(()),
+            Take::Wait => {
+                let _ = tokio::time::timeout(std::time::Duration::from_millis(500), changed).await;
+                continue;
+            }
+        };
+        let res = fetch_range(&conn, &dl, id, start, end).await;
+        dl.release(id);
+        drop(conn);
+        match res {
+            Ok(()) => failures = 0,
+            // once more (a dead pooled connection is redialed), then give up on it
+            Err(_) if failures == 0 => failures += 1,
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Ask a member whether it has the blob; `Some(total)` if it does.
+async fn probe(inner: &Arc<Inner>, pk: SignPk, space: SpaceId, hash: Hash32) -> Result<u64> {
+    on_conn!(inner, &pk, |conn| async {
+        let (mut tx, mut rx) = open_bi(&conn, StreamKind::Blob).await?;
+        send(&mut tx, &BlobReq::GetRange { space, hash, offset: 0, len: 0 }).await?;
+        tx.finish()?;
+        match recv::<BlobResp>(&mut rx).await? {
+            BlobResp::Range { total, .. } => Ok(total),
+            other => Err(anyhow!("not available: {other:?}")),
+        }
+    })
+}
+
+enum Step {
+    Probed(SignPk, Result<u64>),
+    Worker(Result<()>),
+}
+
+/// Download a blob from every member that has it at once: disjoint ranges
+/// from each (several streams per source), a failed source's ranges go to
+/// the others, and the whole file is checked against its hash at the end.
+async fn download(inner: &Arc<Inner>, sources: Vec<SignPk>, space: SpaceId, hash: Hash32, path: &Path, progress: &Progress) -> Result<()> {
+    let part = part_path(path);
+    let dir = path.parent().context("bad blob path")?;
+    tokio::fs::create_dir_all(dir).await?;
+    let mut tasks = tokio::task::JoinSet::new();
+    for pk in sources {
+        let inner = inner.clone();
+        tasks.spawn(async move { Step::Probed(pk, probe(&inner, pk, space, hash).await) });
+    }
+    let mut dl: Option<Arc<Download>> = None;
+    let mut workers = 0usize;
+    let mut last_err: Option<anyhow::Error> = None;
+    let start_workers = |dl: &Arc<Download>, pk: SignPk, tasks: &mut tokio::task::JoinSet<Step>| {
+        for _ in 0..STREAMS_PER_SOURCE {
+            let (inner, dl) = (inner.clone(), dl.clone());
+            tasks.spawn(async move { Step::Worker(source_worker(inner, pk, dl).await) });
+        }
+    };
+    while let Some(step) = tasks.join_next().await {
+        // Done: don't wait for slow probes or sources still dialing.
+        if dl.as_ref().is_some_and(|d| d.finished()) {
+            break;
+        }
+        match step.map_err(|e| anyhow!("download task failed: {e}"))? {
+            Step::Probed(pk, Ok(total)) => {
+                if dl.is_none() {
+                    let done = load_done(&part, Some(total)).await;
+                    ensure_free_space(dir, total - done.covered().min(total))?;
+                    // From now on the `.part` may have holes: say what it holds.
+                    save_done(&part, total, &done).await?;
+                    progress(done.covered(), total);
+                    let pending = done.missing(total).into();
+                    dl = Some(Arc::new(Download {
+                        space,
+                        hash,
+                        total,
+                        part: part.clone(),
+                        progress: progress.clone(),
+                        st: Mutex::new(DlState { done, pending, active: HashMap::new(), next_id: 0, unsaved: 0 }),
+                        changed: tokio::sync::Notify::new(),
+                    }));
+                }
+                let d = dl.as_ref().expect("set above");
+                if total == d.total {
+                    start_workers(d, pk, &mut tasks);
+                    workers += STREAMS_PER_SOURCE;
+                } // else: it disagrees on the size; not used
+            }
+            Step::Probed(_, Err(e)) => last_err = Some(e),
+            Step::Worker(res) => {
+                workers -= 1;
+                if let Err(e) = res {
+                    last_err = Some(e);
+                }
+                // (Pieces handed back by a failed source go to whoever is left.)
+                if workers == 0 && tasks.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    let Some(dl) = dl else {
+        return Err(last_err.unwrap_or_else(|| anyhow!("nobody else in the conversation has this file")));
+    };
+    let done = dl.snapshot();
+    if done.covered() < dl.total {
+        save_done(&part, dl.total, &done).await.ok();
+        let e = last_err.unwrap_or_else(|| anyhow!("no source left"));
+        return Err(e.context(format!(
+            "download stopped at {} of {}",
+            human_size(done.covered()),
+            human_size(dl.total)
+        )));
+    }
+    // Pieces arrived out of order: hash the finished file once.
+    {
+        let f = tokio::fs::OpenOptions::new().write(true).create(true).truncate(false).open(&part).await?;
+        f.set_len(dl.total).await?;
+        f.sync_all().await?;
+    }
+    let mut digest = blob_digest();
+    hash_prefix(&part, dl.total, &mut digest).await?;
+    let res = commit(inner, &part, path, hash, &digest).await;
+    if res.is_err() {
+        drop_partial(&part).await;
+    } else {
+        let _ = tokio::fs::remove_file(ranges_path(&part)).await;
+    }
     res
 }
 
@@ -420,6 +813,11 @@ impl Node {
     /// Local path of a blob we hold completely.
     pub fn blob_path(&self, space: &SpaceId, hash: &Hash32) -> Option<PathBuf> {
         self.inner.blob_path(space, hash).filter(|p| p.is_file())
+    }
+
+    /// Blob bytes this node has sent to members that fetched them.
+    pub fn blob_bytes_served(&self) -> u64 {
+        self.inner.blob_served.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A fresh path to build a blob in before [`Node::add_blob`] (same filesystem
@@ -463,13 +861,14 @@ impl Node {
         Ok(())
     }
 
-    /// Get a blob: local if present, otherwise from any member that has it.
+    /// Get a blob: local if present, otherwise from the members that have it.
     pub async fn fetch_blob(&self, space: SpaceId, hash: Hash32) -> Result<PathBuf> {
         self.fetch_blob_with_progress(space, hash, no_progress()).await
     }
 
     /// [`Node::fetch_blob`], reporting `(bytes, total)` as it downloads.
-    /// Resumes a partial download, from whichever member has the blob.
+    /// Downloads from every member that has the blob at once, and resumes a
+    /// partial download (from whichever members have it now).
     pub async fn fetch_blob_with_progress(&self, space: SpaceId, hash: Hash32, progress: Progress) -> Result<PathBuf> {
         let path = self.inner.blob_path(&space, &hash).context("blob storage disabled")?;
         if path.is_file() {
@@ -485,25 +884,13 @@ impl Node {
         })?;
         let peers = self.peers();
         members.sort_by_key(|pk| !peers.get(pk).is_some_and(|p| p.online()));
-        let mut last_err = None;
-        for pk in members {
-            // A resumed prefix that turns out to be bad is dropped; retry once from scratch.
-            for _ in 0..2 {
-                match fetch_from(&self.inner, pk, space, hash, &path, &progress).await {
-                    Ok(()) => return Ok(path),
-                    Err(e) => {
-                        let retry = e.is::<HashMismatch>();
-                        last_err = Some(e);
-                        if !retry {
-                            break;
-                        }
-                    }
-                }
-            }
+        // A bad copy is only caught by the final hash (it's dropped then):
+        // try once more from scratch.
+        let mut res = download(&self.inner, members.clone(), space, hash, &path, &progress).await;
+        if res.as_ref().is_err_and(|e| e.is::<HashMismatch>()) {
+            res = download(&self.inner, members, space, hash, &path, &progress).await;
         }
-        Err(match last_err {
-            Some(e) => e.context("couldn't download the file from anyone in the conversation"),
-            None => anyhow!("nobody else in the conversation has this file"),
-        })
+        res.map(|()| path)
+            .map_err(|e| e.context("couldn't download the file from anyone in the conversation"))
     }
 }

@@ -189,6 +189,10 @@ const AGG_LOSS_OK: f64 = 0.10;
 const AGG_LOSS_MIN_PACKETS: u64 = 200;
 /// The base RTT may drift up this much per second (routes change).
 const BASE_RTT_DRIFT: f64 = 0.01;
+/// Every path is pinged each second from both ends (Iroh patch), so a path
+/// that has received nothing for this long is dead (radio gone, network
+/// left) even before its idle timeout closes it.
+const STALE: Duration = Duration::from_secs(3);
 
 /// What the selector remembers about a path between selections.
 #[derive(Debug)]
@@ -211,6 +215,9 @@ struct PathHealth {
     aggregated: bool,
     slow_until: Option<Instant>,
     slow_pause: Duration,
+    /// Datagrams received so far, and when that last went up.
+    received: u64,
+    heard: Instant,
     seen: Instant,
 }
 
@@ -228,8 +235,14 @@ impl PathHealth {
             aggregated: false,
             slow_until: None,
             slow_pause: AGG_SLOW_PAUSE,
+            received: c.received,
+            heard: now,
             seen: now,
         }
+    }
+
+    fn stale(&self, now: Instant) -> bool {
+        now.duration_since(self.heard) > STALE
     }
 
     fn update(&mut self, now: Instant, c: &Candidate<'_>) {
@@ -238,6 +251,9 @@ impl PathHealth {
         // Counters are sums over connections; one closing makes them drop.
         if c.sent < self.sent || c.lost < self.lost || c.delivered < self.delivered {
             (self.sent, self.lost, self.delivered, self.at) = (c.sent, c.lost, c.delivered, now);
+        }
+        if c.received != self.received {
+            (self.received, self.heard) = (c.received, now);
         }
         let drifted = self.base_rtt.mul_f64(1.0 + BASE_RTT_DRIFT * dt);
         self.base_rtt = drifted.min(c.rtt);
@@ -282,6 +298,10 @@ impl PathHealth {
 /// - a second IP path out of the same local interface or to the same remote
 ///   address (IPv4 and IPv6 over one Wi-Fi are one radio). Distinct
 ///   interfaces (Ethernet, Thunderbolt bridge, Wi-Fi) each count.
+///
+/// A path that has received nothing for 3 s (every path is pinged each
+/// second) is dead: it is not *selected* while another path lives, so Iroh
+/// doesn't keep reopening it on other connections to the peer.
 #[derive(Debug, Default)]
 pub struct MycelPathSelector {
     health: Mutex<HashMap<FourTuple, PathHealth>>,
@@ -320,6 +340,7 @@ struct Candidate<'a> {
     lost: u64,
     /// Bytes sent and not lost.
     delivered: u64,
+    received: u64,
 }
 
 impl PathSelector for MycelPathSelector {
@@ -335,28 +356,19 @@ impl PathSelector for MycelPathSelector {
                     c.sent += s.udp_tx.datagrams;
                     c.lost += s.lost_packets;
                     c.delivered += delivered;
+                    c.received += s.udp_rx.datagrams;
                 }
                 None => cands.push(Candidate {
                     rtt: s.rtt,
                     sent: s.udp_tx.datagrams,
                     lost: s.lost_packets,
                     delivered,
+                    received: s.udp_rx.datagrams,
                     data: p,
                 }),
             }
         }
         let mut selection = PathSelection::none();
-        let current = cands.iter().find(|c| Some(c.data.network_path()) == ctx.current());
-        let Some(best) = cands.iter().min_by_key(|c| Self::key(c.data.network_path(), c.rtt)) else {
-            return selection;
-        };
-        let (tier, rtt) = Self::key(best.data.network_path(), best.rtt);
-        let primary = match current.map(|c| (c, Self::key(c.data.network_path(), c.rtt))) {
-            Some((c, (ct, crtt))) if ct == tier && rtt + (RTT_SWITCH_MIN.as_nanos() as i128) > crtt => c,
-            _ => best,
-        };
-        selection.set(&primary.data);
-
         let now = Instant::now();
         let mut health = self.health.lock();
         health.retain(|_, h| now.duration_since(h.seen) < Duration::from_secs(120));
@@ -368,6 +380,20 @@ impl PathSelector for MycelPathSelector {
                 }
             }
         }
+        // Dead paths (nothing received lately) are skipped while any path lives.
+        let alive = |c: &&Candidate<'_>| health.get(c.data.network_path()).is_none_or(|h| !h.stale(now));
+        let live: Vec<&Candidate<'_>> = cands.iter().filter(alive).collect();
+        let pool: Vec<&Candidate<'_>> = if live.is_empty() { cands.iter().collect() } else { live };
+        let current = pool.iter().copied().find(|c| Some(c.data.network_path()) == ctx.current());
+        let Some(best) = pool.iter().copied().min_by_key(|c| Self::key(c.data.network_path(), c.rtt)) else {
+            return selection;
+        };
+        let (tier, rtt) = Self::key(best.data.network_path(), best.rtt);
+        let primary = match current.map(|c| (c, Self::key(c.data.network_path(), c.rtt))) {
+            Some((c, (ct, crtt))) if ct == tier && rtt + (RTT_SWITCH_MIN.as_nanos() as i128) > crtt => c,
+            _ => best,
+        };
+        selection.set(&primary.data);
         let primary_path = primary.data.network_path();
         let (p_base, p_rate) = health.get(primary_path).map_or((primary.rtt, 0.0), |h| (h.base_rtt, h.rate));
 
@@ -399,6 +425,8 @@ impl PathSelector for MycelPathSelector {
             } else if h.aggregated && p_rate >= AGG_BUSY {
                 h.slow_pause = AGG_SLOW_PAUSE;
             }
+            // (A stale path keeps its status: demoting it before its idle
+            // timeout closes it only delays resending what is in flight on it.)
             let ok = aggregate
                 && PathKind::of_addr(&path.remote()) != PathKind::Bluetooth
                 && h.base_rtt <= limit

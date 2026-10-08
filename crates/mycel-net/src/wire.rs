@@ -7,10 +7,49 @@ use mycel_sync::{Envelope, EnvelopeId};
 use mycel_trust::{EpochId, OpId, SignedOp, SpaceId};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub const ALPN_SYNC: &[u8] = b"mycel/sync/1";
-pub const ALPN_CARD: &[u8] = b"mycel/card/0";
-pub const ALPN_EPH: &[u8] = b"mycel/eph/0";
-pub const ALPN_BLOB: &[u8] = b"mycel/blob/0";
+/// Mycel's protocol. One QUIC connection per pair of devices carries every
+/// exchange (sync sessions, contact cards, ephemeral messages, blob
+/// transfers) as its own QUIC stream, so there is no handshake per exchange
+/// and QUIC stream priorities put chat ahead of file bytes. (Replaces the
+/// per-exchange-connection ALPNs `mycel/sync/1`, `mycel/card/0`,
+/// `mycel/eph/0`, `mycel/blob/0`.)
+pub const ALPN: &[u8] = b"mycel/2";
+
+/// The first byte of every stream on [`ALPN`]: what the stream carries. (A
+/// label, like HTTP/3's stream types; QUIC does the multiplexing.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StreamKind {
+    /// Bi-stream: one sync session (see crate docs).
+    Sync = 1,
+    /// Bi-stream: the client sends nothing more, the server sends its card.
+    Card = 2,
+    /// Uni-stream: one ephemeral message.
+    Ephemeral = 3,
+    /// Bi-stream: one blob request (see `blobs.rs`).
+    Blob = 4,
+}
+
+impl StreamKind {
+    pub fn from_byte(b: u8) -> Option<Self> {
+        Some(match b {
+            1 => StreamKind::Sync,
+            2 => StreamKind::Card,
+            3 => StreamKind::Ephemeral,
+            4 => StreamKind::Blob,
+            _ => return None,
+        })
+    }
+
+    /// noq stream priority (higher is sent first within a connection):
+    /// messages, cards and presence ahead of bulk file bytes.
+    pub fn priority(self) -> i32 {
+        match self {
+            StreamKind::Blob => -1,
+            _ => 1,
+        }
+    }
+}
 
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
@@ -124,6 +163,11 @@ pub enum BlobReq {
     /// Offer to push `len` bytes. Answered with `Stored` (already have it),
     /// `SendFrom`, `NoSpace`, `Busy` or `Denied`.
     Offer { space: SpaceId, hash: Hash32, len: u64 },
+    /// Exactly bytes `[offset, offset + len)` (clamped to the blob), for
+    /// downloading disjoint ranges from several members at once. `len` 0
+    /// just asks whether they have it and how big it is. Answered with
+    /// `Range{total, offset}` + those bytes, `NotFound` or `Denied`.
+    GetRange { space: SpaceId, hash: Hash32, offset: u64, len: u64 },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
