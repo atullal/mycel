@@ -18,6 +18,7 @@ export const PATH_LABEL: Record<PathKind, string> = {
   ieee802154: "Thread / 802.15.4",
   ethernet: "Cable",
   other: "Other link",
+  mesh: "Mesh",
 };
 
 /** How a path reads after "via". */
@@ -31,6 +32,7 @@ export const VIA_LABEL: Record<PathKind, string> = {
   ieee802154: "Thread / 802.15.4",
   ethernet: "a cable",
   other: "another link",
+  mesh: "nearby devices (mesh)",
 };
 
 export function formatDuration(ms: number): string {

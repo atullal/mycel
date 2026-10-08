@@ -152,7 +152,7 @@ rings every other member, and up to 8 people can be in the call at once.
 | `participants` | everyone else in, or rung for, the call (1:1: the other person), joined first: `{ id, name, state, muted, level, speaking, path, bitrate, rttMs, lossPct }`. `state`: `ringing`, `connecting`, `joined`, `declined`, `missed`, `busy`, `unavailable`, `left`. `path` and `bitrate` are per person |
 | `joinedCount` | people in the call now, you included if you're in it |
 | `activeSpeaker` | the loudest person talking right now (a participant `id`), or `null` |
-| `path` | the path carrying the call now: `network`, `peerWifi`, `bluetooth`, `relay` (group: to the first person who joined; see `participants`) |
+| `path` | the path carrying the call now: `network`, `peerWifi`, `bluetooth`, `relay`, `mesh` (through other nearby devices), or another medium (group: to the first person who joined; see `participants`) |
 | `bitrate` | our Opus bitrate (bits/s): 32k on fast paths, 24k via relay, 12k on Bluetooth, lower under loss (group: see `participants`) |
 | `muted`, `remoteMuted` | `remoteMuted`: 1:1 only (group: each participant's `muted`) |
 | `level`, `remoteLevel` | 0..1 meters: yours (0 while muted), and everything you hear mixed |
@@ -210,9 +210,12 @@ source, peer })` in React, or `videoCanvas(canvas)` + `mycel.calls.onVideo`.
   without video, and `video.camera` is `denied` with `video.error`:
   *"Mycel isn't allowed to use the camera. Allow it in System Settings >
   Privacy & Security > Camera, then turn the camera on again."*
+- **Group calls:** every person gets their own video stream (`frame.peer`
+  says whose; show one tile each), encoded at the quality the path to that
+  person allows; `participants[].video` has each one's numbers both ways.
 - **What's sent** follows the path: up to 720p30 on cable, a Wi-Fi network or
   UWB; 480p30 on peer-to-peer Wi-Fi / Wi-Fi Direct; 360p via a relay; and
-  nothing under 1 Mbit/s (Bluetooth, Thread/802.15.4): `video.paused` on our
+  nothing under 1 Mbit/s (Bluetooth, Thread/802.15.4) or over the multi-hop mesh: `video.paused` on our
   side and `video.remotePaused` on theirs ("Video paused: slow connection"),
   resuming by itself when a faster path returns. Under that ceiling a
   delay-based controller keeps video's queueing to tens of ms, so audio

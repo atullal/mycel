@@ -14,11 +14,23 @@
 //! (`uwb`, `thread`, `802154` and `p2p` are other names for `iface`;
 //! `all,wifidirect` = the defaults plus Wi-Fi Direct).
 //! `MYCEL_WIFI_DIRECT=1` adds `wifidirect` to the defaults.
+//!
+//! The mesh relays over all of them (and the LAN): see [`mesh_options`].
 
 use std::sync::Arc;
 
 use mycel_crypto::SignPk;
-use mycel_net::Link;
+use mycel_net::{Link, MeshOptions};
+
+/// Multi-hop relaying through nearby devices, on unless `MYCEL_MESH=0`.
+/// `MYCEL_MESH_RELAY=0` still uses the mesh but relays nothing for others.
+pub fn mesh_options() -> Option<MeshOptions> {
+    let off = |var: &str| std::env::var(var).is_ok_and(|v| v.trim() == "0");
+    if off("MYCEL_MESH") {
+        return None;
+    }
+    Some(MeshOptions { relay: !off("MYCEL_MESH_RELAY"), ..MeshOptions::default() })
+}
 
 /// Links this platform has, in the order they start.
 const PLATFORM: &[&str] = if cfg!(target_os = "macos") {

@@ -5,8 +5,8 @@
 //!   (the prior the path selector uses too): video takes at most a quarter
 //!   of it, up to 720p30 on cable, a Wi-Fi network or UWB; 480p30 on
 //!   peer-to-peer Wi-Fi / Wi-Fi Direct (the radio hops channels); 360p via
-//!   a relay; none under 1 Mbit/s (Bluetooth, IEEE 802.15.4: "video paused:
-//!   slow connection", see [`BLUETOOTH`]).
+//!   a relay; none under 1 Mbit/s (Bluetooth, IEEE 802.15.4) or over the
+//!   multi-hop mesh ("video paused: slow connection", see [`BLUETOOTH`]).
 //! - Under that ceiling a **delay-based controller** sets the bitrate: the
 //!   path's smoothed RTT (QUIC's, which leaves out delayed-ACK time) above
 //!   the lowest RTT seen lately (the base, as LEDBAT measures it) is
@@ -89,6 +89,12 @@ pub fn budget(path: Option<PathKind>) -> Option<PathBudget> {
     };
     if kind == PathKind::Bluetooth {
         return bluetooth_override().or(BLUETOOTH);
+    }
+    // Multi-hop through other people's devices: every hop's links carry
+    // other traffic too and add delay, and a hop may well be Bluetooth.
+    // Paused, like Bluetooth.
+    if kind == PathKind::Mesh {
+        return None;
     }
     // Any medium by what it typically carries (the same prior the path
     // selector starts from): video may take a quarter of it, and a medium
@@ -473,6 +479,7 @@ mod tests {
         assert_eq!(best(PathKind::Relay), Some((360, 500_000)));
         assert_eq!(best(PathKind::Bluetooth), None, "paused");
         assert_eq!(best(PathKind::Ieee802154), None, "paused");
+        assert_eq!(best(PathKind::Mesh), None, "paused: multi-hop");
         for k in PathKind::ALL {
             if let Some(b) = budget(Some(k)) {
                 assert!(b.start <= b.max && b.max >= MIN_BPS, "{k:?}");

@@ -386,6 +386,7 @@ impl Runtime {
         nopts.port = opts.port;
         if opts.mode != NetworkMode::Local {
             nopts.links = crate::links::device_links(keys.sign_pk(), &name);
+            nopts.mesh = crate::links::mesh_options();
         }
         // MYCEL_IP=0: no Wi-Fi/Ethernet IP at all, links only (to test or
         // demonstrate peer-to-peer Wi-Fi and Bluetooth).
@@ -644,6 +645,11 @@ impl Runtime {
                     online: p.online(),
                     via: p.via,
                     available,
+                    mesh: p.mesh.as_ref().map(|m| MeshVia {
+                        via: hex_id(&m.via),
+                        via_name: m.via_name.clone().unwrap_or_else(|| self.name_of(&m.via)),
+                        hops: m.hops,
+                    }),
                 }
             })
             .collect();
