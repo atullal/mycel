@@ -10,7 +10,7 @@
 <plist version="1.0">
 <dict>
   <key>NSLocalNetworkUsageDescription</key>
-  <string>Mycel finds people running Mycel on the same Wi-Fi or wired network and sends them your encrypted messages directly, with no internet or server.</string>
+  <string>Mycel finds people running Mycel nearby — on the same Wi-Fi or wired network, or directly over peer-to-peer Wi-Fi when there is no network — and sends them your encrypted messages directly, with no internet or server.</string>
   <key>NSDesktopFolderUsageDescription</key>
   <string>Mycel reads files you choose to attach from your Desktop so it can encrypt and send them.</string>
   <key>NSDocumentsFolderUsageDescription</key>
@@ -20,6 +20,7 @@
   <key>NSBonjourServices</key>
   <array>
     <string>_mycel._udp</string>
+    <string>_mycel-p2p._udp</string>
   </array>
 </dict>
 </plist>

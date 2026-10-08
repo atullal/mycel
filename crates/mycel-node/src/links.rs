@@ -16,6 +16,8 @@ pub fn device_links(me: SignPk, name: &str) -> Vec<Arc<dyn Link>> {
     if want == "none" {
         return links;
     }
-    let _ = (&me, name, &on, &mut links);
+    if on("awdl") {
+        links.push(mycel_link_awdl::link(me, name));
+    }
     links
 }
