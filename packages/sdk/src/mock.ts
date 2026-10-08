@@ -832,7 +832,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       const total = Math.max(b.size, 1);
       for (let i = 1; i <= 4; i++) {
         await new Promise((r) => later(250 + Math.random() * 150, () => r(null)));
-        emit({ type: "transferProgress", direction: "download", id: blob, done: Math.round((total * i) / 4), total });
+        emit({ type: "transferProgress", direction: "download", id: blob, done: Math.round((total * i) / 4), total, rate: Math.round(total / 1.2) });
       }
       b.local = true;
       emit({ type: "blobReady", blob });

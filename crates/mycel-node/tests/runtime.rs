@@ -391,9 +391,14 @@ async fn wait_for_message(rt: &Runtime, conv: &str, body: &str) -> mycel_node::a
 fn progress_events(rx: &mut tokio::sync::broadcast::Receiver<Event>, id: &str) -> Vec<(u64, u64)> {
     let mut out = vec![];
     while let Ok(ev) = rx.try_recv() {
-        if let Event::TransferProgress { id: i, done, total, .. } = ev
+        if let Event::TransferProgress { id: i, done, total, rate, .. } = ev
             && i == id
         {
+            // a speed once some time has passed, never a silly one
+            assert!(rate < 100 * 1024 * 1024 * 1024, "rate {rate}");
+            if done == total && total > 64 * 1024 * 1024 {
+                assert!(rate > 0, "a big transfer reports its speed");
+            }
             out.push((done, total));
         }
     }

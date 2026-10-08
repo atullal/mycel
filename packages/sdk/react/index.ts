@@ -236,16 +236,17 @@ export function useMessages(id: ConversationId | null | undefined, pageSize = PA
 /**
  * Live progress of one attachment transfer: `id` is the path passed to
  * `send_message` (uploads) or the blob id (downloads). `null` until the first
- * `transferProgress` event for it; reset when `id` changes.
+ * `transferProgress` event for it; reset when `id` changes. `rate` is bytes
+ * per second over the last few seconds.
  */
-export function useTransfer(id: string | null | undefined): { done: number; total: number } | null {
+export function useTransfer(id: string | null | undefined): { done: number; total: number; rate: number } | null {
   const client = useMycel();
-  const [state, setState] = useState<{ done: number; total: number } | null>(null);
+  const [state, setState] = useState<{ done: number; total: number; rate: number } | null>(null);
   useEffect(() => {
     setState(null);
     if (!id) return;
     return client.on("transferProgress", (e) => {
-      if (e.id === id) setState({ done: e.done, total: e.total });
+      if (e.id === id) setState({ done: e.done, total: e.total, rate: e.rate });
     });
   }, [client, id]);
   return state;

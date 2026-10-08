@@ -311,6 +311,11 @@ export function formatSize(bytes: number): string {
   return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
 }
 
+/** "38 MB/s"; empty while there's no speed to show yet. */
+export function formatRate(bytesPerSec: number | undefined): string {
+  return bytesPerSec && bytesPerSec > 0 ? `${formatSize(bytesPerSec)}/s` : "";
+}
+
 export function fileNameFromPath(path: string): string {
   const parts = path.split(/[\\/]/);
   const last = parts[parts.length - 1] || path;

@@ -8,6 +8,7 @@ import {
   errorText,
   formatClock,
   formatDay,
+  formatRate,
   formatSize,
   previewText,
   sameDay,
@@ -382,7 +383,8 @@ function useAttachment(a: Attachment) {
     state === "fetching" && transfer && transfer.total > 0
       ? Math.min(100, Math.floor((transfer.done / transfer.total) * 100))
       : null;
-  return { state, err, fetch, url, open, pct };
+  const rate = pct != null ? formatRate(transfer?.rate) : "";
+  return { state, err, fetch, url, open, pct, rate };
 }
 
 /** Thin download progress bar under an attachment. */
@@ -395,7 +397,7 @@ function ProgressBar({ pct }: { pct: number }) {
 }
 
 function ImageAttachment({ a }: { a: Attachment }) {
-  const { state, err, fetch, url, open, pct } = useAttachment(a);
+  const { state, err, fetch, url, open, pct, rate } = useAttachment(a);
   if (url) {
     return (
       <button className="mx-image" onClick={open} title={`Open ${a.name}`}>
@@ -410,7 +412,7 @@ function ImageAttachment({ a }: { a: Attachment }) {
       <span className="mx-file-size">{formatSize(a.size)}</span>
       <button className="mx-btn mx-btn-small" onClick={fetch} disabled={state === "fetching"}>
         {state === "fetching" ? <span className="mx-spinner" aria-label="Downloading" /> : <Icon.Download size={15} />}
-        {state === "fetching" ? (pct != null ? `Downloading ${pct}%` : "Downloading") : "Download photo"}
+        {state === "fetching" ? (pct != null ? `Downloading ${pct}%${rate ? ` · ${rate}` : ""}` : "Downloading") : "Download photo"}
       </button>
       {pct != null && <ProgressBar pct={pct} />}
       {err && <span className="mx-file-err">{err}</span>}
@@ -434,7 +436,7 @@ function InertAttachment({ a }: { a: Attachment }) {
 }
 
 function FileAttachment({ a }: { a: Attachment }) {
-  const { state, err, fetch, url, open, pct } = useAttachment(a);
+  const { state, err, fetch, url, open, pct, rate } = useAttachment(a);
   return (
     <div className="mx-file">
       <span className="mx-file-icon">
@@ -443,7 +445,7 @@ function FileAttachment({ a }: { a: Attachment }) {
       <span className="mx-file-text">
         <span className="mx-file-name">{a.name}</span>
         <span className={`mx-file-size${err ? " is-error" : ""}`}>
-          {err ?? (pct != null ? `${pct}% of ${formatSize(a.size)}` : formatSize(a.size))}
+          {err ?? (pct != null ? `${pct}% of ${formatSize(a.size)}${rate ? ` · ${rate}` : ""}` : formatSize(a.size))}
         </span>
         {pct != null && <ProgressBar pct={pct} />}
       </span>

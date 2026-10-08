@@ -92,7 +92,7 @@ Errors are rejected promises carrying a human-readable string. It includes the c
 
 **Event:** the Tauri event `mycel://event` carries one `Event` (tagged by `type`): `conversationUpdated`, `conversationAdded`, `typing`, `contactsChanged`, `nearbyChanged`, `networkChanged`, `blobReady`, `transferProgress`, `callIncoming`, `callUpdated`.
 
-`transferProgress { direction: "upload" | "download", id, done, total }`:
+`transferProgress { direction: "upload" | "download", id, done, total, rate }` (`rate` = bytes per second over the last 3 s):
 - Emitted at most every 250 ms, plus a final event with `done == total`.
 - For uploads, `id` is the exact string passed in `send_message`'s `attachments`, and the bytes count plaintext encrypted.
 - For downloads, `id` is the blob id, and the bytes count sealed bytes received.

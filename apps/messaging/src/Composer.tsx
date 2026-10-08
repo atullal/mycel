@@ -10,7 +10,7 @@ import {
 } from "react";
 import { useMycel, useTransfer } from "@mycel/sdk/react";
 import type { ConversationSummary, MessageView } from "@mycel/sdk";
-import { Icon, errorText, fileNameFromPath, formatSize, previewText } from "./ui.tsx";
+import { Icon, errorText, fileNameFromPath, formatRate, formatSize, previewText } from "./ui.tsx";
 
 /** Lets the conversation view hand the composer dropped files. */
 export interface ComposerHandle {
@@ -292,13 +292,19 @@ function PendingFile({ path, sending, onRemove }: { path: string; sending: boole
   const progress = useTransfer(path);
   const name = fileNameFromPath(path);
   const pct = sending && progress && progress.total > 0 ? Math.min(100, Math.round((progress.done / progress.total) * 100)) : null;
+  const rate = pct != null ? formatRate(progress?.rate) : "";
   return (
-    <li className={pct != null ? "is-sending" : undefined} title={pct != null ? `Encrypting ${name}: ${pct}% of ${formatSize(progress!.total)}` : name}>
+    <li
+      className={pct != null ? "is-sending" : undefined}
+      title={pct != null ? `Encrypting ${name}: ${pct}% of ${formatSize(progress!.total)}${rate ? ` at ${rate}` : ""}` : name}
+    >
       <Icon.File size={15} />
       <span>{name}</span>
       {pct != null ? (
         <>
-          <span className="mx-pending-pct">{pct}%</span>
+          <span className="mx-pending-pct">
+            {pct}%{rate ? ` · ${rate}` : ""}
+          </span>
           <span className="mx-pending-bar" style={{ width: `${pct}%` }} aria-hidden="true" />
         </>
       ) : (
