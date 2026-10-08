@@ -187,8 +187,11 @@ pub struct MeshVia {
     /// The neighbour it leaves through (never needs to be a contact).
     pub via: PeerId,
     pub via_name: String,
-    /// Hops to the peer (2 = one device in between).
+    /// Hops to the peer (2 = one device in between; 0 = unknown, beyond a
+    /// gateway).
     pub hops: u8,
+    /// Through a gateway and the internet (`via` is the gateway).
+    pub gateway: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

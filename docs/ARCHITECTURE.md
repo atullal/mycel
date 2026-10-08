@@ -386,18 +386,19 @@ Tests: 210 Rust tests, including real-QUIC multi-node, multi-hop mesh (lines, ri
 
 ## 12. Mesh: how it stays decentralized without a direct link (2026-10-08)
 
-Alice and Carol are out of each other's radio range, and Bob is in range of both. Alice's packets for Carol go Alice → Bob → Carol. Bob needn't be a contact or a member of anything they share, and he can't read what he carries. There's no server, no coordinator and no special node: every Mycel device is a router, so the network is the devices themselves. Implementation: `crates/mycel-net/src/mesh.rs`.
+Alice and Carol are out of each other's radio range, and Bob is in range of both. Alice's packets for Carol go Alice → Bob → Carol. Bob needn't be a contact or a member of anything they share, and he can't read what he carries. There's no server, no coordinator and no special node: every Mycel device is a router, so the network is the devices themselves. Implementation: `crates/mycel-net/src/mesh/` (the routing core `core.rs` is a pure state machine; `mod.rs` drives it over QUIC).
 
 **What a relay carries.** It forwards the QUIC packets of Alice's connection *to Carol*: encrypted and authenticated end to end with keys only Alice and Carol hold (QUIC/TLS, dialed by Carol's key). A relay can drop or delay them, but it can't read, alter or forge them. CRDT sync, calls and files run unchanged on top.
 
-**Hops are link-agnostic.** A hop is a QUIC connection (ALPN `mycel/mesh/0`) between two *neighbours*: devices with a direct path, found by any link (Bluetooth, peer-to-peer Wi-Fi, a future UWB, Wi-Fi Direct or 802.15.4 link) or on the LAN. Mesh frames are QUIC datagrams on it: unreliable and unordered, like IP, because the end-to-end connection already does loss recovery and congestion control. The mesh code never looks at a link type, so any link added later carries and relays mesh traffic with no mesh changes. A hop connection is itself multipath, so a relay uses its best link to the next device and moves between links mid-hop.
+**Hops are link-agnostic.** A hop is a QUIC connection (ALPN `mycel/mesh/1`) between two *neighbours*: devices with a direct path, found by any link (Bluetooth, peer-to-peer Wi-Fi, a future UWB, Wi-Fi Direct or 802.15.4 link) or on the LAN. Mesh frames are QUIC datagrams on it: unreliable and unordered, like IP, because the end-to-end connection already does loss recovery and congestion control. The mesh code never looks at a link type, so any link added later carries and relays mesh traffic with no mesh changes. A hop connection is itself multipath, so a relay uses its best link to the next device and moves between links mid-hop.
 
 **Several routes at once (multiplexed hops).** A mesh address names a destination *and a waypoint*: the neighbour the packet leaves through, which also routes the replies (`mesh(Carol, via Bob)`). Each route is a distinct address, so Iroh opens one QUIC path per route, each with its own RTT, congestion window and failover. `MycelPathSelector` aggregates comparable routes exactly as it does direct links. A device keeps up to 3 routes per destination, through distinct neighbours, chosen from the routing table (cheapest first, sticky so they don't flap, none costlier than 4× the best + 30 ms). With A–B–C and A–D–C, one transfer uses both relays; when B leaves mid-transfer it finishes over D.
 
 **Routing** is distance-vector with originator messages, after B.A.T.M.A.N.:
 - Every device floods a small *announcement* every 2 s: device key, sequence number (milliseconds since the epoch), name, and a signature over all three with the device key.
 - Each device passes each announcement on once, 10–50 ms later (enough to hear the cheapest copy, and it desynchronizes neighbours), with its hop cost added. It never sends it back to the neighbour its best copy came from (split horizon).
-- To reach Carol, a device uses the neighbour that delivered Carol's cheapest fresh announcement. Routes expire 7 s after Carol goes quiet, and immediately when a hop connection drops.
+- To reach Carol, a device uses the neighbour that delivered Carol's cheapest fresh *feasible* announcement (Babel's feasibility condition: strictly closer than anything it advertised itself, so no loop forms even while routes change). When a hop drops, the routes it carried are retracted at once (a triggered update with cost ∞) and a seqno request travels toward the origin for a fresh announcement. Routes also expire 7 s after Carol goes quiet (far ones 4× later).
+- Fisheye: each period's announcement travels 2 hops, every 4th one the full 8. Flood reduction: an announcement is never sent to a neighbour that already sent it to us, and in a dense neighbourhood (≥ 8 neighbours) a device skips a rebroadcast that 3 others already made.
 - Costs are measured, not assumed: a hop costs its connection's smoothed RTT plus 2 ms, so among equally fast routes the shorter one wins. No medium is ranked by type, so new hardware ranks itself.
 
 **No loops, no storms:**
@@ -414,7 +415,7 @@ In a six-device ring each device sends about 13 announcements a second (2 of its
 
 **MTU.** End-to-end packets on the mesh are capped at QUIC's 1200-byte minimum. A frame that doesn't fit a hop's datagram is split in two and reassembled at the destination; relays can split again. Larger inner packets were tried: when a hop fell back to its base MTU after loss, every large packet was lost until the end-to-end path re-learnt its MTU, and throughput collapsed. Each hop also drops from the tail beyond 1/8 of its congestion window queued (at least 16 KiB), so a slow hop doesn't build seconds of delay and the end-to-end connection sees congestion early. A quarter window and a full window were measured too: throughput across two routes was more variable.
 
-**Store-and-forward.** Members of a conversation already store and forward for each other: CRDT sync is epidemic, and keepers hold ciphertext for offline members. The mesh adds no store-and-forward for strangers yet. The next step, as in BitChat, would be relays holding a bounded number of already-encrypted sync envelopes for an offline destination.
+**Store-and-forward.** Members of a conversation store and forward for each other through CRDT sync and keepers. Strangers carry bundles too (§13): already-encrypted envelopes, moved along live segments, toward connectivity, held in mailboxes at gateways.
 
 **Measured** (in-memory links, `cargo test -p mycel-net --test mesh -- --nocapture`):
 
@@ -434,3 +435,62 @@ In a six-device ring each device sends about 13 announcements a second (2 of its
 - the route flood suits local meshes of tens of devices, not thousands;
 - route choice is by RTT; throughput is left to the multipath scheduler's per-path measurements;
 - only the first hop of each route is chosen by the sender, so two routes can share relays further on.
+
+## 13. Global routing: from a Bluetooth-only phone in the US to one in Europe (2026-10-08)
+
+The question: two phones that only have Bluetooth, one in Boston, one in Berlin. No route table spans the planet, and Bluetooth hops can't cross an ocean (about 100,000 hops of 50 m). The answer is a hierarchy, each layer doing what it scales to. The survey and design record are in [ROUTING.md](ROUTING.md).
+
+```
+ Boston                                                          Berlin
+ phone ─BLE─ phone ─BLE─ phone ─BLE─ laptop        laptop ─BLE─ phone
+ (no internet)                       (gateway)     (gateway)    (no internet)
+   │  local mesh: signed distance       │  ════ internet ════  │  local mesh
+   │  vector, a few hops                │  (QUIC, relays,      │
+   │                                    │   hole punching)     │
+   └── record in the global directory: "Boston phone ── via ─▶ Boston laptop"
+       (pkarr signed by the phone's own key; Mainline DHT + n0 DNS relay)
+```
+
+1. **Local mesh** (§12). Inside radio range, devices route by signed announcements, as distance vector. Announcements are scoped: every period to 2 hops, every 4th period to 8.
+2. **Gateways.** A device with the internet that relays for others is a gateway. Its signed announcements carry a gateway flag and its uplink cost (measured internet RTT).
+3. **Default route.** A device without the internet sends anything it has no route for to the gateway with the lowest *total* cost (mesh cost + uplink). A fibre gateway four hops away beats a congested one next door.
+4. **Records.** A device without the internet picks its best 2 gateways (through distinct first hops where it can) and signs a pkarr record with its own key: `mycel-gw:<gateway>:<mesh cost>,…|exp:<unix>`. It sends the record to those gateways as mesh control messages.
+   - **Publishing:** each gateway checks the signature and that the record names it, then publishes it to the Mainline DHT and the n0 pkarr relay. Limits: one per origin per 10 s, at most 1024 origins.
+   - **Lifetime:** records are valid 30 min and refreshed every 10 min, and at once (at most every 5 s) when the gateway set changes.
+5. **Lookup.** Anyone with the internet resolves a key as usual. If the record names gateways, the device is behind them.
+   - **Addresses:** the sender's Iroh gets one mesh address per gateway, `mesh(dst, via G)`, each its own QUIC path, aggregated and failed over like any other.
+   - **Internet hops:** packets reach G over an internet hop (a QUIC connection opened on demand, hung up after 60 s idle), and G routes them into its mesh.
+   - **Replies:** the reply's waypoint is G, so replies come back the same way.
+   - **No open proxy:** gateways never relay internet → internet.
+6. **Boston to Berlin.** The Boston phone dials the Berlin phone's key.
+   - **Out of Boston:** having no internet, it addresses the packet via its own gateway. The packet climbs 3 BLE hops to the Boston laptop.
+   - **Across the internet:** the Boston laptop resolves the Berlin phone's record and dials the Berlin laptop.
+   - **Into Berlin:** the Berlin laptop routes the packet down its mesh.
+   - **Encryption:** it is one QUIC connection, encrypted end to end; nothing in between can read it.
+   - **Measured** (in-process): first sync 0.58 s, including lookups, dials and the handshake. A test-tone call had 84 ms RTT with 3 BLE hops at 10 ms each way, and 0 % loss.
+7. **When there's no live path: store-and-forward** ([`mesh/dtn.rs`](../crates/mycel-net/src/mesh/dtn.rs)).
+   - **Bundles:** a failed sync to a member becomes a *bundle*: the envelopes the member may lack, still signed and encrypted, signed by the source. It goes:
+     1. along any part of the route that is live now, hop by hop with custody;
+     2. then toward neighbours with better delivery predictability (PRoPHET) for the destination or for *the internet*, so a Bluetooth phone's message climbs toward connectivity;
+     3. Spray-and-Wait only when nobody knows anything.
+   - **Mailboxes:** a bundle that reaches one of the destination's gateways waits there until the destination appears on that gateway's mesh.
+   - **Receipts:** the destination signs a receipt; receipts spread and every carrier drops its copy.
+   - **Limits:** a 64 MiB store, 256 KiB bundles, 4 MiB per source, lifetimes up to 7 days (3 days for sync bundles).
+
+**Route freshness under churn** (measured in the virtual-time simulator, `mesh/core/tests.rs`, 500 ms announcement period, 5 ms per hop):
+
+| | |
+|---|---|
+| Dead route stops being used (retraction, triggered) | 25 ms on an 8-device line (timeout alone: 1.75–7 s) |
+| A ring that loses a link heals (seqno request to the origin) | 0.6 s, 0 loops at any instant |
+| Routes across a new link: 2 hops / up to 8 hops | 0.4 s / 1.4 s |
+| 60 link flaps in a 30-device random mesh with traffic | 0 frame loops, 0 route loops (Babel's feasibility condition) |
+| Announcement messages per device, fisheye + flood reduction vs flat | 25 devices −55 %, 50 −68 %, 100 −75 % |
+| Two gateways (250 KB/s each) for one Bluetooth-only device | 2.0× one path; one gateway lost mid-transfer: the other carries on, longest pause 0.8–2.6 s |
+| Gradient (PRoPHET toward the internet) vs Spray-and-Wait, 4 clusters in a chain | first copy reaches the internet in 35 min mean vs mostly not within 24 h (40 traces) |
+
+**Limits:**
+- Failover between gateway paths pauses for 0.8–2.6 s. Data in flight on the dead path leaves a hole that flow control waits on until that path's loss detection gives up. A mesh "unreachable" signal that abandons the path early would cut this.
+- Records name at most 3 gateways. A device that moves keeps working once its new record propagates: at once on the n0 relay, in seconds to a minute on the DHT. Meanwhile the old gateways drop packets for it.
+- The DHT path (`dht` feature) is built and on in the app, but tests never touch the public DHT. It is exercised only by real use.
+- Relays and gateways see who talks to whom, sizes and timing ([TRUST.md](TRUST.md) §8b–8c).

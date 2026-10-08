@@ -192,3 +192,23 @@ Message latency was mostly the scheduler's 80 ms debounce, which made sense whil
 **The 1 GiB transfer is capped by the platform, not by Mycel**: a bare QUIC stream between two plain *upstream* Iroh 1.3.0 endpoints (no Mycel code, no patch) on this Mac does 9–10 MB/s over 127.0.0.1 and over the Mac's own interface address. That's with no loss, a 1.4–2.6 ms RTT and a 300 MB congestion window, and it's the same with noq-udp's `fast-apple-datapath`. Mycel's own figures match it. With only loopback here, aggregation can't show a real gain, so the aggregation numbers above come from the in-memory links. This doesn't explain the 21 s/GiB measured on 2026-10-07 (LAN mode); it's worth chasing upstream (noq's macOS UDP path).
 
 Re-run: `head -c 1073741824 /dev/urandom > /tmp/big.bin; python3 scripts/net-bench.py target/debug/mycel /tmp/bench after /tmp/big.bin [--cold]`. It starts both devices (`--net local`, ports 7811/7812), exchanges contact codes, creates a DM, then times messages and the attachment.
+
+## Global routing and store-and-forward (2026-10-08)
+
+| Test | Where | Result |
+|---|---|---|
+| Learn routes across a new link: 2 hops / up to 8 hops | `mesh::core::tests::convergence_time_to_learn_new_routes` | 0.4 s / 1.4 s (500 ms period, 5 ms hops) |
+| A dead route stops being used | `convergence_dead_route_stops_being_used` | 25 ms (retraction) |
+| A ring heals around a cut | `convergence_heals_around_a_ring_without_loops` | 0.6 s, 0 loops |
+| 60 link flaps, 30-device mesh, traffic | `churn_never_loops` | 0 frame loops, 0 route loops |
+| Announcement overhead, fisheye + flood reduction | `overhead_per_device_against_mesh_size` | −55 % (25), −68 % (50), −75 % (100 devices) |
+| Gateway by total cost (far fast uplink beats near slow one) | `gateway_choice_by_total_cost` | ok |
+| BLE-only US (3 hops from its gateway) ↔ BLE-only EU, live sync | `tests/global.rs` | first sync 0.58 s; relays and gateways hold no space |
+| Test-tone call along that route | `mycel-call` `call_across_two_gateways_and_the_internet` | RTT 84 ms, ~137 ms mouth-to-ear, 0 % loss |
+| Two gateways for one device | `two_gateways_are_two_paths_and_fail_over` | 2.0× one path; one lost: longest pause 0.8–2.6 s |
+| Partial route → custody → delivery; mailbox; receipts; budgets | `mesh::dtn::tests` | ok |
+| Gradient vs Spray-and-Wait, 4 clusters in a chain, 40 traces | `gradient_beats_spray_and_wait` | 35 min mean vs mostly undelivered in 24 h |
+| Data mule across partitions (real QUIC) | `a_data_mule_carries_a_message_across_partitions` | delivered 1 s after meeting; short-lived bundle expired at the mule |
+
+Run them with output: `cargo test -p mycel-net mesh -- --nocapture`, `cargo test -p mycel-net --test global -- --nocapture`.
+

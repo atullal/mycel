@@ -36,7 +36,7 @@ async fn eventually(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
 
 /// A Bluetooth "radio" between devices: ~100 KB/s, 10 ms each way.
 fn ble(n: u64) -> MemNet {
-    let m = MemNet::new(n, PathKind::Bluetooth);
+    let m = MemNet::radio(n, PathKind::Bluetooth);
     m.set_rate_limit(Some(100_000));
     m.set_latency(Duration::from_millis(10));
     m
@@ -210,9 +210,39 @@ async fn two_gateways_are_two_paths_and_fail_over() {
     let half = t.elapsed();
     eprintln!("bytes per gateway path at half-way ({half:?}): {per:?}");
     assert!(per.iter().filter(|b| **b as f64 > total as f64 * 0.1).count() >= 2, "both gateways carry data: {per:?}");
+    // which path goes through gateway 2 (it survives)
+    let via_g2 = |c: &Connection| -> u64 {
+        c.paths()
+            .iter()
+            .filter(|p| match p.remote_addr() {
+                mycel_net::iroh::TransportAddr::Custom(a) => {
+                    mycel_net::mesh::parse_mesh_addr(a).is_some_and(|(_, w)| w == g2.id())
+                }
+                _ => false,
+            })
+            .map(|p| p.stats().udp_tx.bytes)
+            .sum()
+    };
     e1.cut(); // gateway 1 out of range
+    let cut_at = Instant::now();
+    // the longest stretch with no new bytes on the surviving path
+    let (mut last, mut last_change, mut longest) = (via_g2(&conn), Instant::now(), Duration::ZERO);
+    let reader = tokio::spawn(async move { tokio::time::timeout(Duration::from_secs(90), rx.read_to_end(8)).await });
+    while !reader.is_finished() && cut_at.elapsed() < Duration::from_secs(90) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let now = via_g2(&conn);
+        if now != last {
+            longest = longest.max(last_change.elapsed());
+            last = now;
+            last_change = Instant::now();
+        }
+    }
+    eprintln!("failover: longest pause on the surviving gateway path after the cut: {longest:?} (no routing convergence needed)");
+    // bounded by the path idle timeout (5 s): data in flight on the dead
+    // path leaves a hole that flow control waits on until loss detection
+    assert!(longest < Duration::from_secs(5), "{longest:?}");
     writer.await.unwrap();
-    let got = tokio::time::timeout(Duration::from_secs(90), rx.read_to_end(8)).await.expect("finished").unwrap();
+    let got = reader.await.unwrap().expect("finished").unwrap();
     assert_eq!(u64::from_le_bytes(got.try_into().unwrap()), total);
     let secs = t.elapsed().as_secs_f64();
     eprintln!(

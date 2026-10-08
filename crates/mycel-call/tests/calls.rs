@@ -338,7 +338,7 @@ async fn call_across_two_gateways_and_the_internet() {
     use mycel_net::mesh::directory::{self, Directory, MemDirectory};
     let dir = MemDirectory::new();
     let radio = |n: u64| {
-        let m = MemNet::new(n, PathKind::Bluetooth);
+        let m = MemNet::radio(n, PathKind::Bluetooth);
         m.set_rate_limit(Some(100_000));
         m.set_latency(Duration::from_millis(10));
         m

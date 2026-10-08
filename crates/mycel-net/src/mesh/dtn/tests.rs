@@ -256,7 +256,7 @@ fn gradient_beats_spray_and_wait() {
             (x % m as u64) as usize
         };
         // warm-up: an hour of contacts so predictabilities form
-        let mut contacts = |w: &mut World, rnd: &mut dyn FnMut(usize) -> usize| {
+        let contacts = |w: &mut World, rnd: &mut dyn FnMut(usize) -> usize| {
             w.apart();
             for c in 0..CLUSTERS {
                 for _ in 0..PER / 2 {

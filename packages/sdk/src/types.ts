@@ -168,8 +168,10 @@ export interface MeshVia {
   /** The neighbour it leaves through (needn't be a contact). */
   via: PeerId;
   viaName: string;
-  /** Hops to the peer (2 = one device in between). */
+  /** Hops to the peer (2 = one device in between; 0 = unknown, beyond a gateway). */
   hops: number;
+  /** Through a gateway and the internet: `via` is the gateway. */
+  gateway: boolean;
 }
 
 export interface NetworkStatus {

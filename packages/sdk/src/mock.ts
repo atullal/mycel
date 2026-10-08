@@ -1242,7 +1242,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
             online: true,
             via: (p.nearby ? "network" : meshed ? "mesh" : i % 2 ? "bluetooth" : "peerWifi") as PathKind,
             available: (p.nearby ? ["network", "peerWifi", "bluetooth"] : meshed ? ["mesh"] : ["bluetooth"]) as PathKind[],
-            mesh: meshed ? { via: all[0].id, viaName: all[0].name, hops: 2 } : null,
+            mesh: meshed ? { via: all[0].id, viaName: all[0].name, hops: 2, gateway: false } : null,
           };
         }),
       onlinePeers: [...people.values()].filter((p) => p.contact && p.online).map((p) => p.id),

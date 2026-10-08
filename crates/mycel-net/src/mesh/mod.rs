@@ -180,6 +180,21 @@ pub struct MeshRoute {
     pub gateway: bool,
 }
 
+/// A hop's cost in 0.1 ms units: its RTT plus the time to move 64 KiB at
+/// the rate its congestion window allows (cwnd per RTT), so a slow radio
+/// with a low RTT doesn't look better than a fast one with a higher RTT.
+fn hop_cost(conn: &Connection) -> Option<u32> {
+    let paths = conn.paths();
+    let path = paths.iter().find(|p| p.is_selected())?;
+    let rtt = path.rtt();
+    if rtt.is_zero() {
+        return None;
+    }
+    let cwnd = conn.congestion_state(path.id()).map_or(0, |c| c.window()).max(1200) as f64;
+    let secs = rtt.as_secs_f64() * (1.0 + 65_536.0 / cwnd);
+    Some((secs * 10_000.0).clamp(1.0, (u32::MAX / 2) as f64) as u32)
+}
+
 fn wall_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
@@ -187,6 +202,9 @@ fn wall_ms() -> u64 {
 fn to_sign_pk(id: &iroh::EndpointId) -> SignPk {
     SignPk(*id.as_bytes())
 }
+
+/// A record looked up: (gateways with cost, when).
+type Looked = (Vec<(SignPk, u32)>, Instant);
 
 /// The I/O side of one neighbour.
 struct Hop {
@@ -233,7 +251,7 @@ struct Driver {
     directory: Mutex<Option<Arc<dyn directory::Directory>>>,
     /// Records looked up: target -> (gateways with cost, when). Shared with
     /// the address lookup.
-    records: Mutex<HashMap<SignPk, (Vec<(SignPk, u32)>, Instant)>>,
+    records: Mutex<HashMap<SignPk, Looked>>,
     records_published: std::sync::atomic::AtomicU64,
     carrier: Option<Mutex<dtn::Carrier>>,
     /// Where bundles for us go (the node ingests them).
@@ -535,13 +553,7 @@ impl Driver {
     fn measure(self: &Arc<Self>) {
         let costs: Vec<(SignPk, u32)> = {
             let hops = self.hops.lock();
-            hops.iter()
-                .filter_map(|(pk, h)| {
-                    let conn = h.live()?;
-                    let rtt = conn.paths().iter().find(|p| p.is_selected()).map(|p| p.rtt())?;
-                    (!rtt.is_zero()).then(|| (*pk, (rtt.as_micros() / 100).clamp(1, u32::MAX as u128 / 2) as u32))
-                })
-                .collect()
+            hops.iter().filter_map(|(pk, h)| Some((*pk, hop_cost(h.live()?)?))).collect()
         };
         self.with_router(|r, _| {
             for (pk, c) in costs {
@@ -851,7 +863,7 @@ impl Driver {
         s
     }
 
-    /// Our internet cost as a gateway (0.1 ms units): set, or the mean RTT
+    /// Our internet cost as a gateway (0.1 ms units): set, or the mean cost
     /// of our internet hops, or a guess until there are any.
     fn uplink_cost(&self) -> u32 {
         if let Some(u) = *self.uplink.lock() {
@@ -859,13 +871,7 @@ impl Driver {
         }
         let rtts: Vec<u32> = {
             let hops = self.hops.lock();
-            hops.values()
-                .filter(|h| !h.direct)
-                .filter_map(|h| h.live())
-                .filter_map(|c| c.paths().iter().find(|p| p.is_selected()).map(|p| p.rtt()))
-                .filter(|r| !r.is_zero())
-                .map(|r| (r.as_micros() / 100).min(u32::MAX as u128) as u32)
-                .collect()
+            hops.values().filter(|h| !h.direct).filter_map(|h| hop_cost(h.live()?)).collect()
         };
         if rtts.is_empty() { core::DEFAULT_INTERNET_COST / 2 } else { rtts.iter().sum::<u32>() / rtts.len() as u32 }
     }
@@ -1100,15 +1106,22 @@ impl Link for Mesh {
         let r = self.d.router.lock();
         let neighbours = r.neighbours().iter().filter(|(_, direct)| *direct).count();
         let relay = r.config().relay;
+        let gateway = r.my_gateways().first().map(|g| r.origin_name(g).map_or_else(|| g.short(), |n| n.to_string()));
+        let mut detail = match (neighbours, relay) {
+            (0, _) => "No Mycel devices nearby to relay through".to_string(),
+            (n, true) => format!("{n} nearby, relaying for others"),
+            (n, false) => format!("{n} nearby, not relaying for others"),
+        };
+        if let Some(g) = gateway {
+            detail.push_str(&format!("; internet via {g}"));
+        } else if r.internet() && neighbours > 0 && relay {
+            detail.push_str("; a gateway for them");
+        }
         LinkStatus {
             kind: PathKind::Mesh,
             label: None,
             active: self.d.endpoint.get().is_some() && !self.d.stopped.load(Ordering::Relaxed),
-            detail: Some(match (neighbours, relay) {
-                (0, _) => "No Mycel devices nearby to relay through".into(),
-                (n, true) => format!("{n} nearby, relaying for others"),
-                (n, false) => format!("{n} nearby, not relaying for others"),
-            }),
+            detail: Some(detail),
             peers: r.reachable().len(),
         }
     }

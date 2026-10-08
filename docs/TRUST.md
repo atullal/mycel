@@ -195,6 +195,34 @@ A relay forwards QUIC packets of a connection between two other devices.
 - No onion routing or padding: relays see endpoints, sizes and timing. Hiding who-talks-to-whom would need onion-style layered encryption and cover traffic, at a large bandwidth cost on Bluetooth.
 - Sybil devices nearby can each be a neighbour (each is rate-limited separately); the radio's range is the practical bound.
 
+## 8c. Gateways, records and carriers (global routing, store-and-forward)
+
+**Records.** A gateway record ("D is reached via G1, G2") is a pkarr packet signed by D's own key.
+- **Forging:** nobody else can publish one for D. A gateway publishes only records that name it, that it can verify, at most one per origin per 10 s, at most 1024 origins.
+- **Expiry:** records expire after 30 minutes, and the newest by timestamp wins.
+
+**Attacks and mitigations:**
+- **Black-hole gateway.** A gateway, or a relay on the way to it, accepts traffic and drops it.
+  - *Mitigations:*
+    - a device publishes 2 gateways through distinct first hops where it can, each a separate QUIC path, so traffic continues on the other;
+    - a sender keeps every gateway the record names as its own path;
+    - store-and-forward bundles wait for a receipt and are carried by several copies.
+  - *Remaining:* a device with a single gateway in range depends on it.
+- **Sybil gateways.** Many fake devices near D announce themselves as gateways with a low uplink cost to be chosen.
+  - *Mitigations:* each must be a real radio neighbour, rate-limited separately. The uplink cost is signed by the gateway (it can lie, but only about itself). The traffic stays end-to-end encrypted.
+  - *Remaining:* choosing gateways by *measured* end-to-end quality (QUIC's per-path RTT and loss) instead of announced cost would blunt lying further. The multipath selector already does this per connection.
+- **Eclipse.** All of D's neighbours are hostile: they can drop everything and publish nothing for D.
+  - *Mitigations:* none at the routing layer. It's the radio-range equivalent of being on a hostile Wi-Fi. Detection: D sees no receipts and no live connections. Content is still never readable or forgeable.
+- **Directory.** Publishing many records for many keys would require many keys; each record costs a signature, and gateways cap what they publish. The n0 relay and the DHT apply their own limits. Lookups can't be forged (signatures), only withheld; the DHT and the relay are independent.
+- **Open proxy.** A gateway never relays internet → internet, so nobody can bounce traffic through it.
+- **Budgets.** Traffic crossing between the mesh and the internet has its own cap (2 MiB/s per gateway) on top of the per-neighbour and total relay caps.
+
+**Store-and-forward carriers** hold bundles: already-signed, already-encrypted envelopes for a destination key.
+- **They learn:** the destination key, the source key, sizes, and when bundles were created and moved.
+- **They can't:** read, alter (the source signs the bundle and the envelopes inside are signed), or fake delivery (receipts are signed by the destination).
+- **Abuse limits:** a 64 MiB store, 256 KiB bundles, 4 MiB per source, lifetimes up to 7 days, and per-neighbour rate limits. A bundle is never sent back to the device that gave it.
+- **Receipts** are tiny and public: they reveal that D received *something* from S. That is the same metadata the bundle already showed carriers.
+
 ## 9. Implementation status (phase 0, 2026-10-07)
 
 | Spec section | Code | Tests |

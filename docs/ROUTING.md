@@ -175,8 +175,7 @@ plus *triggered* updates when something breaks.
   gateway never relays internet → internet: it is not an open proxy.
 - **Records.** A device *without* the internet picks up to 2 (configurable
   1–3) gateways by total cost, through distinct first hops where it can.
-  It signs a pkarr record with its own key: `mycel-gw=<gateway>:<cost>,…`,
-  with an expiry. It sends the record to those gateways as mesh control
+  It signs a pkarr record with its own key: `mycel-gw:<gateway>:<cost>,…|exp:<unix>`. It sends the record to those gateways as mesh control
   messages. Each gateway checks the signature and that it is named in the
   record, then publishes it: to the Mainline DHT (`dht` feature) and to the
   n0 pkarr relay, as Iroh does for normal records. A gateway accepts at
@@ -303,4 +302,14 @@ where it works:
   - receipts;
   - a data mule across partitions.
 
-See `docs/TESTING.md` for the measured numbers.
+### Measured
+
+- **Learning and losing routes** (virtual-time simulator, 500 ms period, 5 ms per hop):
+  - routes across a new link: 0.4 s at 2 hops, 1.4 s up to 8 hops;
+  - a dead route is unused 25 ms after the link drops (retraction);
+  - a cut ring heals in 0.6 s (seqno request).
+- **Loops:** zero frame loops and zero route loops, checked at every step through 60 link flaps in a 30-device mesh with traffic.
+- **Overhead per device** with fisheye and flood reduction: −55 % at 25 devices, −68 % at 50, −75 % at 100 (`overhead_per_device_large_meshes`, ignored by default, runs 200 and 400).
+- **Gateways** (QUIC, in-process): a Bluetooth-only device three BLE hops from its gateway syncs with one behind another gateway; the first sync took 0.58 s. A test-tone call along that route had 84 ms RTT and 0 % loss.
+- **Two gateways:** 2.0× one path's throughput. When one is lost, the longest pause on the other is 0.8–2.6 s: data in flight leaves a hole in the stream until the dead path's loss detection gives up.
+- **Store-and-forward:** gradient routing gets the first copy to the internet in 35 min (mean of 40 traces, 4 clusters in a chain). Spray-and-Wait mostly never gets there within 24 h. A real data mule delivered 1 s after meeting the destination.
