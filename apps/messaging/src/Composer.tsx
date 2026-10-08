@@ -232,25 +232,18 @@ export function Composer({
         </div>
       )}
 
-      {files.length > 0 && !editing && (
+      {((files.length > 0 && !editing) || staging > 0) && (
         <ul className="mx-pending" aria-label="Attachments">
-          {files.map((f) => (
-            <PendingFile key={f} path={f} sending={busy} onRemove={() => setFiles((all) => all.filter((x) => x !== f))} />
-          ))}
+          {!editing &&
+            files.map((f) => (
+              <PendingFile key={f} path={f} sending={busy} onRemove={() => setFiles((all) => all.filter((x) => x !== f))} />
+            ))}
           {staging > 0 && (
             <li className="is-staging">
               <span className="mx-spinner" aria-hidden="true" />
               <span>Adding…</span>
             </li>
           )}
-        </ul>
-      )}
-      {staging > 0 && (files.length === 0 || editing) && (
-        <ul className="mx-pending" aria-label="Attachments">
-          <li className="is-staging">
-            <span className="mx-spinner" aria-hidden="true" />
-            <span>Adding…</span>
-          </li>
         </ul>
       )}
 

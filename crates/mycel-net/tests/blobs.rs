@@ -76,10 +76,10 @@ fn part(dir: &Path, space: &SpaceId, hash: &Hash32) -> PathBuf {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn big_blobs_stream_resume_and_follow_push_policy() {
-    let (alice, _) = node("alice").await;
+    let (alice, alice_dir) = node("alice").await;
     let (bob, bob_dir) = node("bob").await;
     let (carol, carol_dir) = node("carol").await;
-    let (keeper, _) = node("keeper").await;
+    let (keeper, keeper_dir) = node("keeper").await;
     let all = [&alice, &bob, &carol, &keeper];
     for a in all {
         for b in all {
@@ -154,6 +154,9 @@ async fn big_blobs_stream_resume_and_follow_push_policy() {
 
     for n in [&*fetch, &carol, &keeper] {
         n.shutdown().await.unwrap();
+    }
+    for d in [alice_dir, bob_dir, carol_dir, keeper_dir] {
+        let _ = std::fs::remove_dir_all(d);
     }
 }
 

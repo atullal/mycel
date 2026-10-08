@@ -21,7 +21,9 @@
 //!
 //! Push policy: blobs up to [`EAGER_PUSH_MAX`] are pushed to every member when
 //! posted; bigger ones are pushed only to keepers (whose job is to hold data
-//! while the sender is offline) and members fetch them on demand.
+//! while the sender is offline) and members fetch them on demand, from the
+//! sender, a keeper or any member that already downloaded them. Receivers
+//! enforce it too: only a keeper accepts an unsolicited push above the limit.
 
 use std::collections::HashSet;
 use std::io::SeekFrom;
@@ -271,10 +273,21 @@ pub(crate) async fn serve(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
         | BlobReq::GetFrom { space, hash, .. }
         | BlobReq::Offer { space, hash, .. } => (*space, *hash),
     };
-    let allowed = inner.spaces.lock().get(&space).is_some_and(|r| r.is_member(&peer));
+    let (allowed, keeper) = inner
+        .spaces
+        .lock()
+        .get(&space)
+        .map_or((false, false), |r| (r.is_member(&peer), r.my_role() == Some(Role::Relay)));
     let path = inner.blob_path(&space, &hash).filter(|_| allowed);
+    // Unsolicited pushes follow the push policy: keepers take any size, other
+    // devices only small blobs (big ones they fetch when their user asks), so
+    // a member can't fill someone's disk with files they never opened.
+    let push_ok = |len: u64| keeper || len <= EAGER_PUSH_MAX;
     let res = match (req, path) {
         (_, None) => send(&mut tx, &BlobResp::Denied).await,
+        (BlobReq::Put { len, .. } | BlobReq::Offer { len, .. }, Some(_)) if !push_ok(len) => {
+            send(&mut tx, &BlobResp::Denied).await
+        }
         (BlobReq::Get { .. }, Some(path)) => serve_get(&mut tx, &path, None).await,
         (BlobReq::GetFrom { offset, .. }, Some(path)) => serve_get(&mut tx, &path, Some(offset)).await,
         (BlobReq::Put { len, .. }, Some(path)) => serve_put(inner, &mut tx, &mut rx, &path, hash, len, false).await,

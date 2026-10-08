@@ -328,8 +328,8 @@ async fn contact_code_address_hints_connect_without_discovery() {
 
 /// Alice and Bob in an accepted DM.
 async fn dm_pair(tag: &str) -> (Arc<Runtime>, Arc<Runtime>, String) {
-    let alice = open(&tmp(&format!("{tag}-a")), "Alice", free_port(), false).await;
-    let bob = open(&tmp(&format!("{tag}-b")), "Bob", free_port(), false).await;
+    let alice = open(&tmp(tag), "Alice", free_port(), false).await;
+    let bob = open(&tmp(tag), "Bob", free_port(), false).await;
     connect_all(&[&alice, &bob]);
     let b = alice.add_contact(bob.profile().contact_code).unwrap();
     let conv = alice.create_conversation(None, vec![b.id]).unwrap();
@@ -444,8 +444,10 @@ async fn large_attachment_streams_between_nodes() {
     let view = bob.messages(conv.clone(), None, None).unwrap();
     assert_eq!(view.last().unwrap().attachments[0].local_path.as_deref(), Some(got.as_str()));
 
-    alice.shutdown().await.unwrap();
-    bob.shutdown().await.unwrap();
+    for rt in [alice, bob] {
+        rt.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(rt.data_dir()); // ~0.5 GB of test data
+    }
     let _ = std::fs::remove_file(&file);
 }
 
@@ -522,6 +524,9 @@ async fn legacy_attachments_folders_and_read_errors() {
             assert!(msg.contains("Privacy & Security"), "{msg}");
         }
     }
-    alice.shutdown().await.unwrap();
-    bob.shutdown().await.unwrap();
+    for rt in [alice, bob] {
+        rt.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(rt.data_dir());
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }
