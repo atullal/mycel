@@ -29,7 +29,7 @@
 //!   reported again, and a peer is only forgotten after [`FORGET_AFTER`]
 //!   without a single advertisement.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use mycel_crypto::SignPk;
@@ -180,10 +180,10 @@ struct Chan {
 
 pub struct Core {
     me: SignPk,
-    periphs: HashMap<Pid, Periph>,
-    chans: HashMap<ChanId, Chan>,
+    periphs: BTreeMap<Pid, Periph>,
+    chans: BTreeMap<ChanId, Chan>,
     /// The one channel carrying packets for each reachable node.
-    active: HashMap<SignPk, ChanId>,
+    active: BTreeMap<SignPk, ChanId>,
     last_scan: Instant,
     rng: u64,
     /// Upper bound of the random delay added to dials (tests set it to 0).
@@ -214,9 +214,9 @@ impl Core {
         h.write(&me.0);
         Core {
             me,
-            periphs: HashMap::new(),
-            chans: HashMap::new(),
-            active: HashMap::new(),
+            periphs: BTreeMap::new(),
+            chans: BTreeMap::new(),
+            active: BTreeMap::new(),
             last_scan: now,
             rng: h.finish() | 1,
             jitter_max: JITTER,
@@ -238,10 +238,15 @@ impl Core {
         self.active.contains_key(key)
     }
 
-    /// Devices in range (advertising recently) that we aren't linked to yet.
+    /// Devices in range (advertising recently) that we aren't linked to yet,
+    /// counted by node. A peripheral whose key we haven't read yet may well be
+    /// a node we're already linked to (linked over a channel it dialed, or
+    /// under a rotated address), so those only count beyond the number of
+    /// linked nodes: better to under-report briefly than to claim to be
+    /// connecting to a device that is linked.
     pub fn connecting(&self, now: Instant) -> usize {
-        let mut keys = HashSet::new();
-        let mut unknown = 0;
+        let mut keys = BTreeSet::new();
+        let mut unknown = 0usize;
         for p in self.periphs.values() {
             if p.phase == Phase::Myself || now.saturating_duration_since(p.seen) >= RECENT {
                 continue;
@@ -254,7 +259,7 @@ impl Core {
                 None => unknown += 1,
             }
         }
-        keys.len() + unknown
+        keys.len() + unknown.saturating_sub(self.active.len())
     }
 
     fn jitter(&mut self) -> Duration {
@@ -286,7 +291,18 @@ impl Core {
                 }
             }
             Input::InfoFailed(pid) => {
-                if matches!(self.phase(&pid), Some(Phase::Reading(_))) {
+                let Some(p) = self.periphs.get_mut(&pid) else { return out };
+                if !matches!(p.phase, Phase::Reading(_)) {
+                    return out;
+                }
+                p.failures = p.failures.saturating_add(1);
+                if p.failures < SPARE_FAILURES_MAX {
+                    // Read again over the same connection before hanging up
+                    // (a cancel may take down the peer's side of the link).
+                    info(format_args!("{}: couldn't read its Mycel info; reading again", sp(&pid)));
+                    p.phase = Phase::Reading(now);
+                    out.push(Cmd::ReadInfo(pid));
+                } else {
                     self.fail(&pid, "couldn't read its Mycel info", now, &mut out);
                 }
             }
@@ -307,7 +323,7 @@ impl Core {
             }
             Input::Tick => self.tick(now, &mut out),
             Input::RadioDown => {
-                for (key, _) in self.active.drain() {
+                for key in std::mem::take(&mut self.active).into_keys() {
                     out.push(Cmd::Unroute { key });
                     out.push(Cmd::Lost { key });
                 }
@@ -468,6 +484,14 @@ impl Core {
         if live && connected && p.psm.is_some() {
             p.phase = Phase::Spare;
             info(format_args!("{}: {why}; already linked, keeping the connection", sp(pid)));
+            return;
+        }
+        // A channel open that failed over a working connection: try again
+        // over it before hanging up (the peer may be about to open its own
+        // channel over the same radio link; cancelling could kill that).
+        if matches!(p.phase, Phase::Opening(_)) && p.psm.is_some() && p.failures < SPARE_FAILURES_MAX {
+            p.phase = Phase::Spare;
+            info(format_args!("{}: {why}; retrying over the same connection in {}", sp(pid), ms(wait)));
             return;
         }
         if connected || matches!(p.phase, Phase::Connecting(_)) {
@@ -1103,5 +1127,16 @@ mod tests {
         c.handle(t0, Input::Hello { chan: 1, key: key(2), name: "".into() });
         assert_eq!(c.connecting(t0), 0);
         assert_eq!(c.connecting(t0 + RECENT), 0);
+
+        // Linked over a channel the peer dialed while our own dial to it is
+        // still pending (its key unread): not "connecting to 1 more device".
+        let mut c = core(1, t0);
+        c.handle(t0, Input::Discovered("q".into()));
+        c.handle(t0, Input::ChannelOpened { chan: 1, pid: None });
+        c.handle(t0, Input::Hello { chan: 1, key: key(2), name: "".into() });
+        assert_eq!(c.connecting(t0), 0);
+        // a second unknown peripheral beyond the linked node does count
+        c.handle(t0, Input::Discovered("r".into()));
+        assert_eq!(c.connecting(t0), 1);
     }
 }

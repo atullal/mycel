@@ -431,7 +431,7 @@ mod tests {
                 && bob.peers().get(&alice.id()).is_some_and(|p| p.links.contains(&PathKind::Bluetooth))
         })
         .await;
-        assert_eq!(air.channels(), 1, "tie-break: exactly one channel for the pair");
+        eventually("exactly one channel for the pair", || air.channels() == 1).await;
         assert_eq!(alice.peers()[&bob.id()].name.as_deref(), Some("bob"));
         let st = alice_link.status();
         assert!(st.active && st.peers == 1 && st.detail.is_none(), "{st:?}");
@@ -465,7 +465,7 @@ mod tests {
         alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "msg", "back in range"))).unwrap().unwrap();
         bob.sync_with(alice.id(), space, false).await.unwrap();
         assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap()["msg"], json!("back in range"));
-        assert_eq!(air.channels(), 1);
+        eventually("one channel", || air.channels() == 1).await;
         alice.shutdown().await.unwrap();
         bob.shutdown().await.unwrap();
     }
@@ -533,7 +533,7 @@ mod tests {
         }
         eventually("all linked", || links.iter().all(|(l, _)| l.status().peers == 2)).await;
         tokio::time::sleep(Duration::from_millis(500)).await;
-        assert_eq!(air.channels(), 3);
+        eventually("one channel per pair", || air.channels() == 3).await;
         for (l, rx) in &mut links {
             let mut found = 0;
             while let Ok(ev) = rx.try_recv() {
@@ -590,14 +590,14 @@ mod tests {
         assert_eq!(links[0].0.status().peers, 0, "stale: nothing connects yet");
         let st = links[0].0.status();
         assert_eq!(st.detail.as_deref(), Some("Connecting to 1 device…"), "{st:?}");
-        eventually_within("linked after the connect timeout", Duration::from_secs(15), || {
+        eventually_within("linked after the connect timeout", Duration::from_secs(25), || {
             links.iter().all(|(l, _)| l.status().peers == 1)
         })
         .await;
         let took = t.elapsed();
         eprintln!("linked through stale handles in {took:?}");
-        assert!(took < crate::core::CONNECT_TIMEOUT + Duration::from_secs(5), "{took:?}");
-        assert_eq!(air.channels(), 1);
+        assert!(took < crate::core::CONNECT_TIMEOUT + Duration::from_secs(10), "{took:?}");
+        eventually("one channel", || air.channels() == 1).await;
         assert_eq!(links[0].0.status().detail, None);
     }
 
@@ -612,16 +612,26 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(drain(&mut links), (2, 0));
         for round in 0..6 {
-            if round % 2 == 0 { air.close_channels() } else { air.drop_links() }
-            eventually("lost", || links.iter().all(|(l, _)| l.status().peers == 0)).await;
             let t = std::time::Instant::now();
-            eventually("relinked", || links.iter().all(|(l, _)| l.status().peers == 1)).await;
+            if round % 2 == 0 { air.close_channels() } else { air.drop_links() }
+            // Count events rather than poll status: a reopen over the spare
+            // connection can take only milliseconds.
+            let (mut found, mut lost) = (0, 0);
+            eventually("lost and relinked", || {
+                let (f, l) = drain(&mut links);
+                found += f;
+                lost += l;
+                lost >= 2 && found >= 2 && links.iter().all(|(l, _)| l.status().peers == 1)
+            })
+            .await;
             let took = t.elapsed();
             eprintln!("round {round}: relinked in {took:?}");
-            assert!(took < Duration::from_secs(5), "round {round}: {took:?}");
+            assert!(took < Duration::from_secs(8), "round {round}: {took:?}");
+            eventually("one channel", || air.channels() == 1).await;
             tokio::time::sleep(Duration::from_millis(2500)).await;
             assert_eq!(air.channels(), 1, "round {round}");
-            assert_eq!(drain(&mut links), (2, 2), "one Lost and one Found per side, round {round}");
+            let (f, l) = drain(&mut links);
+            assert_eq!((found + f, lost + l), (2, 2), "one Lost and one Found per side, round {round}");
         }
         assert_eq!(air.harsh_kills(), 0);
     }

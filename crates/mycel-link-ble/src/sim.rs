@@ -19,7 +19,7 @@
 //! channel.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::time::{Duration, Instant};
 
 use mycel_crypto::SignPk;
@@ -75,10 +75,10 @@ struct Node {
     key: SignPk,
     epoch: u32,
     session: u64,
-    reported: HashSet<Pid>,
-    routes: HashMap<SignPk, ChanId>,
+    reported: BTreeSet<Pid>,
+    routes: BTreeMap<SignPk, ChanId>,
     /// Per peer key: `Some(t)` = unlinked since t; absent = never linked.
-    lost_since: HashMap<SignPk, Option<Duration>>,
+    lost_since: BTreeMap<SignPk, Option<Duration>>,
 }
 
 #[derive(Default, Debug)]
@@ -99,13 +99,13 @@ struct Sim {
     t0: Instant,
     now: Duration,
     q: BinaryHeap<Reverse<(Duration, u64)>>,
-    evs: HashMap<u64, Ev>,
+    evs: BTreeMap<u64, Ev>,
     seq: u64,
     rng: u64,
     nodes: Vec<Node>,
-    refs: HashMap<(usize, Pid), Ref>,
-    pairs: HashMap<u64, Pair>,
-    ends: HashMap<(usize, ChanId), u64>,
+    refs: BTreeMap<(usize, Pid), Ref>,
+    pairs: BTreeMap<u64, Pair>,
+    ends: BTreeMap<(usize, ChanId), u64>,
     next_chan: ChanId,
     next_pair: u64,
     attempts: u64,
@@ -124,6 +124,9 @@ fn epoch(pid: &str) -> u32 {
     pid.split('-').nth(1).unwrap().parse().unwrap()
 }
 
+/// No faults are injected during the last this-long of a run.
+const SETTLE: Duration = Duration::from_secs(60);
+
 fn ms(x: u64) -> Duration {
     Duration::from_millis(x)
 }
@@ -136,13 +139,13 @@ impl Sim {
             t0,
             now: Duration::ZERO,
             q: BinaryHeap::new(),
-            evs: HashMap::new(),
+            evs: BTreeMap::new(),
             seq: 0,
             rng: o.seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1,
             nodes: Vec::new(),
-            refs: HashMap::new(),
-            pairs: HashMap::new(),
-            ends: HashMap::new(),
+            refs: BTreeMap::new(),
+            pairs: BTreeMap::new(),
+            ends: BTreeMap::new(),
             next_chan: 1,
             next_pair: 1,
             attempts: 0,
@@ -161,9 +164,9 @@ impl Sim {
                 key,
                 epoch: 0,
                 session: 0,
-                reported: HashSet::new(),
-                routes: HashMap::new(),
-                lost_since: HashMap::new(),
+                reported: BTreeSet::new(),
+                routes: BTreeMap::new(),
+                lost_since: BTreeMap::new(),
             });
         }
         for n in 0..o.nodes {
@@ -434,7 +437,10 @@ impl Sim {
                 self.input(to.0, Input::Hello { chan: to.1, key, name: format!("n{from}") });
             }
             Ev::Fault => {
-                self.fault();
+                // The last minute is fault-free, so the end state is settled.
+                if self.now + SETTLE < self.o.duration {
+                    self.fault();
+                }
                 let next = Duration::from_secs(self.uniform(self.o.fault_every / 2, self.o.fault_every * 3 / 2));
                 self.at(next, Ev::Fault);
             }
@@ -577,14 +583,16 @@ fn check(sim: &Sim, max_gap: Duration) {
     assert!(st.first_link.iter().all(|t| *t <= Duration::from_secs(10)), "first link within 10 s: {r}");
     let mut g = st.gaps.clone();
     g.sort();
-    let p99 = g[(g.len() * 99 / 100).min(g.len() - 1)];
-    assert!(p99 <= Duration::from_secs(10), "99% of reconnects within 10 s: {r}");
+    // Over 10 s only when both sides' connects hang at once (then the 8 s
+    // connect timeout dominates): allow 1% of gaps, plus two for small runs.
+    let slow = g.iter().filter(|x| **x > Duration::from_secs(10)).count();
+    assert!(slow <= g.len() / 100 + 2, "99% of reconnects within 10 s ({slow} slower): {r}");
     assert!(g.last().copied().unwrap_or_default() <= max_gap, "no long silent gap: {r}");
     // a fault takes down at most one link per side; no extra flapping
     assert!(st.losts <= st.faults * 2 + 2, "no flapping: {r}");
     assert_eq!(st.dup_samples, 0, "duplicate channels never outlive the grace period: {r}");
     assert!(st.disagree_samples * 200 <= st.samples, "both ends use the same channel: {r}");
-    assert!(sim.all_linked() || sim.now > sim.o.duration, "linked at the end: {r}");
+    assert!(sim.all_linked(), "linked at the end: {r}");
 }
 
 #[test]
@@ -628,4 +636,27 @@ fn stale_handles_everywhere_still_link_quickly() {
     assert!(g[g.len() / 2] <= Duration::from_secs(10), "{}", sim.report());
     assert!(*g.last().unwrap() <= Duration::from_secs(60), "{}", sim.report());
     assert_eq!(sim.st.dup_samples, 0);
+}
+
+#[test]
+fn simulation_is_deterministic() {
+    let run = || {
+        let mut sim = Sim::new(Opts { nodes: 3, duration: Duration::from_secs(1800), ..base(77) });
+        sim.run();
+        (sim.report(), sim.st.gaps.clone(), sim.attempts)
+    };
+    assert_eq!(run(), run());
+}
+
+/// Many more seeds than the regular tests (`cargo test -p mycel-link-ble
+/// --release -- --ignored seed_sweep`).
+#[test]
+#[ignore]
+fn seed_sweep() {
+    for seed in 100..400 {
+        let nodes = if seed % 3 == 0 { 3 } else { 2 };
+        let mut sim = Sim::new(Opts { nodes, duration: Duration::from_secs(2 * 3600), ..base(seed) });
+        sim.run();
+        check(&sim, Duration::from_secs(20));
+    }
 }
