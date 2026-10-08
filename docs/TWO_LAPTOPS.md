@@ -295,6 +295,27 @@ and D at once (two routes) and keeps going when either walks away.
 `MYCEL_MESH_RELAY=0` makes a Mac use the mesh without relaying for others;
 `MYCEL_MESH=0` turns it off.
 
+## 5e. Beyond one mesh: gateways and carried messages
+
+Any Mycel device that has the internet is a **gateway** for the devices around it that don't. You can see it with two laptops and a third device.
+
+**Setup:**
+- **Laptop A** stays on the internet, with Bluetooth on.
+- **Laptop B** turns Wi-Fi off. It is Bluetooth-only, near A.
+- **A third device elsewhere** has the internet: a phone hotspot or another network.
+
+**What to expect:**
+1. Within a few seconds, B publishes a record through A ("reach me via A"). In the Network panel, B's Mesh row says "internet via A", and A's says "a gateway for them".
+2. The third device messages or calls B. It works, and it shows *via Mesh (gateway A, then the internet)*: one encrypted connection from the third device through A over Bluetooth to B.
+3. Turn Bluetooth off on B, then send B a message from the third device. When B comes back near A, A delivers it from its **mailbox**.
+
+**Store-and-forward:**
+- **Bundles:** when a member can't be reached live, what they lack travels as a signed, still-encrypted bundle. It goes along whatever part of the way is up, toward devices that have the internet, and waits at the destination's gateway.
+- **Limits:** carriers hold at most 64 MiB for others, 4 MiB per sender, for up to 7 days. They learn who the bundle is for and its size, never its content.
+- **Turning it off:** set `store_and_forward` to off in `MeshOptions`; there is no setting in the app yet. `MYCEL_MESH=0` turns the whole mesh off.
+
+How it works, and the research behind it: [ROUTING.md](ROUTING.md), and [ARCHITECTURE.md](ARCHITECTURE.md) §13.
+
 ## 6. Offline delivery
 
 1. Quit Mycel on laptop B (**Mycel > Quit Mycel**, or ⌘Q).

@@ -683,9 +683,16 @@ pub struct MemNet {
 
 impl MemNet {
     /// `n` (0..16) picks the transport id; `kind` is what it reports as.
+    /// (Bluetooth always uses the real Bluetooth transport id.)
     pub fn new(n: u64, kind: PathKind) -> MemNet {
         let id = if kind == PathKind::Bluetooth { TRANSPORT_BLUETOOTH } else { TRANSPORT_TEST_BASE + n };
         MemNet { id, kind, down: Arc::default(), inner: Arc::default(), shape: Arc::default() }
+    }
+
+    /// A radio of `kind` on its own test transport id `n` (0..16), so one
+    /// device can be on several radios of the same kind (multi-hop tests).
+    pub fn radio(n: u64, kind: PathKind) -> MemNet {
+        MemNet { id: TRANSPORT_TEST_BASE + n, kind, down: Arc::default(), inner: Arc::default(), shape: Arc::default() }
     }
 
     /// Limit the link to `bytes_per_sec` (e.g. ~20 KB/s for Bluetooth LE),
@@ -723,6 +730,19 @@ impl MemNet {
         for (pk, _) in &inner.started {
             for (_, tx) in &inner.started {
                 let _ = tx.send(LinkEvent::Lost { peer: *pk, addr: self.addr_of(pk) });
+            }
+        }
+    }
+
+    /// Undo [`MemNet::cut`]: back in range.
+    pub fn restore(&self) {
+        self.down.store(false, Ordering::SeqCst);
+        let inner = self.inner.lock();
+        for (pk, _) in &inner.started {
+            for (other, tx) in &inner.started {
+                if other != pk {
+                    let _ = tx.send(LinkEvent::Found { peer: *pk, addr: self.addr_of(pk), name: None });
+                }
             }
         }
     }

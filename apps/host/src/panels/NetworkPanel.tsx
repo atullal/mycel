@@ -34,9 +34,10 @@ const PATH: Record<PathKind, { name: string; text: string }> = {
   },
 };
 
-/** "via Peer-to-peer Wi-Fi", or "via Mesh (via Bob, 2 hops)". */
+/** "via Peer-to-peer Wi-Fi", "via Mesh (via Bob, 2 hops)", or "via Mesh (gateway Bob, then the internet)". */
 function viaText(p: PeerPaths): string {
   if (!p.via) return p.online ? "reachable" : "offline";
+  if (p.via === "mesh" && p.mesh?.gateway) return `via Mesh (gateway ${p.mesh.viaName}, then the internet)`;
   if (p.via === "mesh" && p.mesh) return `via Mesh (via ${p.mesh.viaName}, ${p.mesh.hops} hops)`;
   return `via ${PATH[p.via].name}`;
 }

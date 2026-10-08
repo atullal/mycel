@@ -649,6 +649,7 @@ impl Runtime {
                         via: hex_id(&m.via),
                         via_name: m.via_name.clone().unwrap_or_else(|| self.name_of(&m.via)),
                         hops: m.hops,
+                        gateway: m.gateway,
                     }),
                 }
             })
