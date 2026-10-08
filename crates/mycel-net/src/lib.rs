@@ -98,6 +98,18 @@ pub struct NodeOptions {
     pub links: Vec<Arc<dyn Link>>,
     /// Use IP at all (tests turn it off to force traffic onto links).
     pub ip: bool,
+    /// More protocols on the same endpoint (e.g. live calls). Each gets the
+    /// node's multipath connections, path selection and links for free.
+    pub extra_protocols: Vec<ExtraProtocol>,
+}
+
+/// Another protocol served on the node's endpoint: incoming connections with
+/// this ALPN are handed to `incoming`. The peer is authenticated (its key is
+/// `Connection::remote_id`), but nothing else is checked: the receiver must
+/// do its own authorization.
+pub struct ExtraProtocol {
+    pub alpn: Vec<u8>,
+    pub incoming: mpsc::UnboundedSender<Connection>,
 }
 
 impl NodeOptions {
@@ -113,6 +125,7 @@ impl NodeOptions {
             feed_validator: None,
             links: Vec::new(),
             ip: true,
+            extra_protocols: Vec::new(),
         }
     }
 }
@@ -374,6 +387,18 @@ fn gather(r: &Replica, want: &Inventory) -> Data {
 }
 
 // ─────────────────────────── protocol handlers ───────────────────────────
+
+/// Hands incoming connections of an [`ExtraProtocol`] to its owner.
+#[derive(Debug, Clone)]
+struct Forward(mpsc::UnboundedSender<Connection>);
+
+impl ProtocolHandler for Forward {
+    async fn accept(&self, conn: Connection) -> std::result::Result<(), AcceptError> {
+        self.0
+            .send(conn)
+            .map_err(|_| AcceptError::from_boxed(anyhow!("protocol is not running").into()))
+    }
+}
 
 #[derive(Clone)]
 struct Handler {
@@ -710,10 +735,11 @@ impl Node {
         // Same Ed25519 key for transport and for Mycel signatures (domain-separated).
         let secret = SecretKey::from_bytes(&keys.seed());
         let memory = MemoryLookup::new();
-        let alpns: Vec<Vec<u8>> = [ALPN_SYNC, ALPN_CARD, ALPN_EPH, ALPN_BLOB]
+        let mut alpns: Vec<Vec<u8>> = [ALPN_SYNC, ALPN_CARD, ALPN_EPH, ALPN_BLOB]
             .iter()
             .map(|a| a.to_vec())
             .collect();
+        alpns.extend(opts.extra_protocols.iter().map(|p| p.alpn.clone()));
         let builder = match opts.mode {
             NetMode::Local => Endpoint::builder(presets::Minimal)
                 .relay_mode(iroh::RelayMode::Disabled)
@@ -776,6 +802,9 @@ impl Node {
         let mut router = Router::builder(endpoint);
         for alpn in [ALPN_SYNC, ALPN_CARD, ALPN_EPH, ALPN_BLOB] {
             router = router.accept(alpn, Handler { inner: inner.clone(), alpn });
+        }
+        for p in opts.extra_protocols {
+            router = router.accept(p.alpn, Forward(p.incoming));
         }
         let router = router.spawn();
         let mut tasks = vec![tokio::spawn(scheduler(inner.clone()))];
@@ -942,6 +971,28 @@ impl Node {
             set.spawn(sync_once(self.inner.clone(), pk, space));
         }
         while set.join_next().await.is_some() {}
+    }
+
+    /// Open a connection to a device for another protocol (see
+    /// [`ExtraProtocol`]): dialed by key over every path the node knows
+    /// (network, links, relay), with multipath failover.
+    pub async fn connect(&self, peer: SignPk, alpn: &[u8]) -> Result<Connection> {
+        let res = connect(&self.inner, &peer, alpn).await;
+        match &res {
+            Ok(c) => {
+                self.inner.note_path(peer, c);
+                self.inner.mark_ok(peer);
+            }
+            Err(_) => self.inner.mark_fail(peer),
+        }
+        res
+    }
+
+    /// A connection of another protocol finished an exchange with `peer`:
+    /// count it as the peer being online, and remember the path it used.
+    pub fn note_connection(&self, peer: SignPk, conn: &Connection) {
+        self.inner.note_path(peer, conn);
+        self.inner.mark_ok(peer);
     }
 
     // ───────────── cards, ephemeral, blobs ─────────────

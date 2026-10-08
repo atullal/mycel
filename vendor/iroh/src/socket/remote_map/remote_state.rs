@@ -65,6 +65,9 @@ const GOOD_ENOUGH_LATENCY: Duration = Duration::from_millis(10);
 /// Even if we have some non-relay route that works.
 const UPGRADE_INTERVAL: Duration = Duration::from_secs(60);
 
+/// MYCEL PATCH: how often every custom-transport (link) path is pinged.
+const LINK_PATH_PING_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The time after which an idle [`RemoteStateActor`] stops.
 ///
 /// The actor only enters the idle state if no connections are active and no inbox senders exist
@@ -250,6 +253,8 @@ impl RemoteStateActor {
 
         let check_connections = time::interval(UPGRADE_INTERVAL);
         n0_future::pin!(check_connections);
+        let link_path_ping = time::interval(LINK_PATH_PING_INTERVAL);
+        n0_future::pin!(link_path_ping);
 
         loop {
             let scheduled_path_open = match self.state.scheduled_open_path {
@@ -319,6 +324,9 @@ impl RemoteStateActor {
                 }
                 _ = check_connections.tick() => {
                     self.check_connections();
+                }
+                _ = link_path_ping.tick() => {
+                    self.ping_link_paths();
                 }
                 _ = &mut idle_timeout => {
                     if self.is_idle(&inbox) {
@@ -745,6 +753,29 @@ impl RemoteStateActor {
 
             // Record the new selected path in the path watcher.
             conn_state.path_state.record_selected(&selected);
+        }
+    }
+
+    /// MYCEL PATCH: keep link (custom-transport) paths alive.
+    ///
+    /// noq re-arms a path's keepalive only when a packet *arrives* on it and
+    /// may acknowledge on any path, so on a quiet backup path one side can
+    /// stop sending on it entirely; the other side's path idle timer then
+    /// closes it, and a long-lived connection (a call) can no longer fail
+    /// over to it. Pinging every link path each second keeps both sides'
+    /// idle timers fresh, at ~50 bytes/s per path.
+    fn ping_link_paths(&self) {
+        for conn_state in self.connections.values() {
+            let Some(conn) = conn_state.handle.upgrade() else {
+                continue;
+            };
+            for (path_id, tuple) in conn_state.paths.iter() {
+                if matches!(tuple.remote(), transports::Addr::Custom(_))
+                    && let Some(path) = conn.path(*path_id)
+                {
+                    path.ping().ok();
+                }
+            }
         }
     }
 

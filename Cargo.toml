@@ -27,6 +27,12 @@ opt-level = 3
 # (the AEAD's generic code is instantiated here)
 [profile.dev.package.mycel-crypto]
 opt-level = 3
+# Live calls encode and decode audio in real time: the Opus codec and the call
+# pipeline must be optimized even in debug builds.
+[profile.dev.package.unsafe-libopus]
+opt-level = 3
+[profile.dev.package.mycel-call]
+opt-level = 2
 
 [profile.release]
 codegen-units = 1
