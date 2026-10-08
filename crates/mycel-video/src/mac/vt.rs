@@ -318,7 +318,7 @@ impl H264Encoder {
                 pb.raw(),
                 CMTime::micros(pts_us),
                 CMTime::INVALID,
-                props.as_deref().map(|d| cf(d)).unwrap_or(null()),
+                props.as_deref().map(cf).unwrap_or(null()),
                 null_mut(),
                 &mut info,
             )

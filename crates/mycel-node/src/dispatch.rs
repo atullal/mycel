@@ -124,14 +124,31 @@ struct Blob {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Conversation {
-    conversation: String,
+struct CallArg {
+    call: String,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CallArg {
+struct StartCall {
+    conversation: String,
+    #[serde(default)]
+    video: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AcceptCall {
     call: String,
+    #[serde(default)]
+    video: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Camera {
+    call: String,
+    on: bool,
 }
 
 #[derive(Deserialize)]
@@ -214,8 +231,19 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
             let d: Decline = args(a)?;
             ok(rt.decline_request(d.id, d.block)?)
         }
-        "start_call" => ok(rt.start_call(args::<Conversation>(a)?.conversation).await?),
-        "accept_call" => ok(rt.accept_call(args::<CallArg>(a)?.call).await?),
+        "start_call" => {
+            let s: StartCall = args(a)?;
+            ok(rt.start_call_with(s.conversation, s.video).await?)
+        }
+        "accept_call" => {
+            let s: AcceptCall = args(a)?;
+            ok(rt.accept_call_with(s.call, s.video).await?)
+        }
+        "set_camera" => {
+            let c: Camera = args(a)?;
+            ok(rt.set_camera(c.call, c.on).await?)
+        }
+        "video_keyframe" => ok(rt.video_keyframe(args::<CallArg>(a)?.call)?),
         "decline_call" => ok(rt.decline_call(args::<CallArg>(a)?.call)?),
         "end_call" => ok(rt.end_call(args::<CallArg>(a)?.call)?),
         "set_muted" => {

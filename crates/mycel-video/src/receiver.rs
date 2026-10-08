@@ -241,7 +241,7 @@ mod tests {
         // the camera restarted: 1..4 never sent, 5 is a keyframe
         assert_eq!(seqs(&r.push(f(5, true), t)), [5]);
         assert!(!r.needs_keyframe());
-        assert_eq!(r.tick(t).1, false, "nothing to ask for");
+        assert!(!r.tick(t).1, "nothing to ask for");
     }
 
     #[test]

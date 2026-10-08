@@ -8,11 +8,14 @@
 //!
 //! **Codec: H.264 through Apple's VideoToolbox.** Every Mac since 2011 has
 //! a hardware H.264 encoder and decoder; VideoToolbox drives them (with a
-//! software fallback) in real-time mode with no frame reordering, at a few
-//! percent of one core for 720p30. It ships with macOS, so there's nothing
-//! to bundle and no patent-licence question for us: Apple's codec licence
-//! covers its use. And every browser engine decodes H.264 in hardware too,
-//! which is what lets the webview decode (below). Alternatives considered:
+//! software fallback) in real-time mode with no frame reordering and, from
+//! macOS 11.3, low-latency rate control (no buffering in the encoder,
+//! steadier frame sizes). Measured here: encoding plus decoding a 720p frame
+//! takes ~5 ms, a 720p keyframe is ~21 KB and a delta ~3.5 KB at 1 Mbit/s.
+//! It ships with macOS, so there's nothing to bundle and no patent-licence
+//! question for us: Apple's codec licence covers its use. And every browser
+//! engine decodes H.264 in hardware too, which is what lets the webview
+//! decode (below). Alternatives considered:
 //! - *openh264* (Cisco, BSD): software only (several times the CPU of the
 //!   hardware path, and battery), a C++ build for both Mac architectures,
 //!   and Cisco's patent cover applies only to their prebuilt binaries, not
@@ -29,11 +32,12 @@
 //! is reset, so QUIC stops resending it, and the receiver asks for a
 //! keyframe if it lost one it needed. Audio stays in QUIC datagrams, which
 //! QUIC packs into each packet before any stream data, and video streams
-//! get the lowest stream priority, so video can't push audio aside. The
-//! alternative, datagrams with our own fragmentation, would lose a whole
-//! frame (and everything after it until a keyframe) on any one lost packet
-//! and need our own retransmission to do better: measured on a lossy link
-//! it is strictly worse for H.264, whose frames depend on each other.
+//! get the lowest stream priority, so video can't push audio aside within
+//! the connection; on the bottleneck itself the rate controller ([`rate`])
+//! keeps video's queue short. The alternative, datagrams with our own
+//! fragmentation, would lose a whole frame (and every frame after it until
+//! a keyframe, since H.264 frames depend on each other) on any one lost
+//! packet, unless we rebuilt retransmission that QUIC already has.
 //!
 //! **Decoding: in the webview, with WebCodecs.** The app hands the webview
 //! encoded frames (a few KB each) and its `VideoDecoder` decodes them in
@@ -42,7 +46,11 @@
 //! re-encode per frame) across the IPC bridge. WebCodecs `VideoDecoder`
 //! is in WebKit since Safari 16.4, which every macOS from 11 (Big Sur) can
 //! install, so the app's minimum system version stays at 11.0; a webview
-//! without it shows "video isn't supported" and the call stays audio-only.
+//! without it shows "video can't be shown" and the call goes on with voice.
+//! Checked in a WKWebView on macOS 27: H.264 Baseline and High supported,
+//! and this crate's VideoToolbox frames (720p and 240p, `examples/
+//! dump_frames.rs`) decode through the SDK's `videoCanvas` with the right
+//! test-pattern counters on the canvas.
 //! [`platform::H264Decoder`] decodes in Rust for tests and headless runs.
 
 pub mod pattern;

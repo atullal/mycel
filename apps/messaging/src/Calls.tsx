@@ -1,11 +1,11 @@
-import { useEffect, useState } from "react";
-import { useMycel } from "@mycel/sdk/react";
+import { useEffect, useRef, useState } from "react";
+import { useMycel, useVideoCanvas } from "@mycel/sdk/react";
 import type { CallInfo, PathKind } from "@mycel/sdk";
 import { Avatar, Icon, errorText } from "./ui.tsx";
 
-// Voice calls in the Messaging app: the incoming-call sheet, the in-call bar
-// and the bits they share. Audio itself runs in the Mycel runtime; this is
-// only the remote control.
+// Calls in the Messaging app: the incoming-call sheet, the in-call bar, the
+// video stage and the bits they share. Audio and video capture run in the
+// Mycel runtime; the webview only decodes and shows the video it's handed.
 
 export const PATH_LABEL: Record<PathKind, string> = {
   network: "Same network",
@@ -100,11 +100,11 @@ export function IncomingCall({ call, onAnswered }: { call: CallInfo; onAnswered:
   const [busy, setBusy] = useState<"accept" | "decline" | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const answer = async () => {
+  const answer = async (video: boolean) => {
     setBusy("accept");
     setError(null);
     try {
-      await mycel.calls.accept(call.id);
+      await mycel.calls.accept(call.id, { video });
       onAnswered(call.conversation);
     } catch (e) {
       setError(errorText(e));
@@ -128,7 +128,7 @@ export function IncomingCall({ call, onAnswered }: { call: CallInfo; onAnswered:
       <div className="mx-incoming-text" id={`mx-incoming-${call.id}`}>
         <strong>{call.peerName}</strong>
         <span>
-          Voice call
+          {call.video.remoteCamera ? "Video call" : "Call"}
           {call.path ? ` · via ${VIA_LABEL[call.path]}` : ""}
         </span>
         {error && (
@@ -141,7 +141,10 @@ export function IncomingCall({ call, onAnswered }: { call: CallInfo; onAnswered:
         <button className="mx-call-round is-decline" onClick={() => void decline()} disabled={!!busy} aria-label="Decline" title="Decline">
           <Icon.HangUp size={22} />
         </button>
-        <button className="mx-call-round is-accept" onClick={() => void answer()} disabled={!!busy} aria-label="Accept" title="Accept">
+        <button className="mx-call-round is-accept is-video" onClick={() => void answer(true)} disabled={!!busy} aria-label="Accept with video" title="Accept with video">
+          <Icon.Video size={21} />
+        </button>
+        <button className="mx-call-round is-accept" onClick={() => void answer(false)} disabled={!!busy} aria-label="Accept" title="Accept (voice)">
           <Icon.Phone size={21} />
         </button>
       </div>
@@ -191,6 +194,18 @@ export function CallBar({
     }
   };
   const hangUp = () => void mycel.calls.end(call.id).catch(() => {});
+  const cameraOn = call.video.camera === "on" || call.video.camera === "starting";
+  const toggleCamera = async () => {
+    setPending(true);
+    try {
+      await mycel.calls.setCamera(call.id, !cameraOn);
+    } catch {
+      // `video.error` says why (shown below)
+    } finally {
+      setPending(false);
+    }
+  };
+  const cameraProblem = call.video.camera === "denied" || call.video.camera === "failed" ? call.video.error : null;
 
   return (
     <div className={`mx-callbar is-${call.state}`} role="region" aria-label={`Call with ${call.peerName}`}>
@@ -208,6 +223,11 @@ export function CallBar({
           {active && call.remoteMuted && <span className="mx-callbar-rate"> · {call.peerName.split(" ")[0]} is muted</span>}
         </span>
       )}
+      {live && cameraProblem && (
+        <span className="mx-callbar-hint is-error" role="alert">
+          {cameraProblem}
+        </span>
+      )}
       {active && !call.echoCancellation && (
         <span className="mx-callbar-hint" title="This device has no echo cancellation">
           Use headphones to avoid echo
@@ -223,6 +243,16 @@ export function CallBar({
       )}
       {live && (
         <span className="mx-callbar-actions">
+          <button
+            className={`mx-icon-btn${cameraOn ? " is-on" : ""}`}
+            onClick={() => void toggleCamera()}
+            disabled={pending}
+            aria-pressed={cameraOn}
+            aria-label={cameraOn ? "Turn camera off" : "Turn camera on"}
+            title={cameraOn ? "Turn camera off" : "Turn camera on"}
+          >
+            {cameraOn ? <Icon.Video /> : <Icon.VideoOff />}
+          </button>
           {active && (
             <button
               className={`mx-icon-btn${call.muted ? " is-on" : ""}`}
@@ -241,5 +271,59 @@ export function CallBar({
         </span>
       )}
     </div>
+  );
+}
+
+/** The call has video in it: ours, theirs, or both. */
+export function hasVideo(c: CallInfo | null): boolean {
+  if (!c || !isLive(c)) return false;
+  const v = c.video;
+  return v.camera === "on" || v.camera === "starting" || v.remoteCamera;
+}
+
+/**
+ * The video of a call: their picture large, ours small in the corner
+ * (mirrored, as a mirror would show it), and what's happening when there's
+ * no picture: camera off, video paused on a slow connection, connecting.
+ */
+export function VideoStage({ call }: { call: CallInfo }) {
+  const remote = useRef<HTMLCanvasElement>(null);
+  const self = useRef<HTMLCanvasElement>(null);
+  const v = call.video;
+  const live = call.state === "active";
+  const them = useVideoCanvas(remote, { call: live ? call.id : null, source: "remote", peer: call.peer });
+  const me = useVideoCanvas(self, { call: live ? call.id : null, source: "local" });
+  const first = call.peerName.split(" ")[0] || call.peerName;
+  const ourCamera = v.camera === "on" || v.camera === "starting";
+
+  let note: string | null = null;
+  if (!them.supported) note = "Video can't be shown in this window (it needs WebCodecs: Safari 16.4 or later).";
+  else if (!live) note = call.direction === "outgoing" ? "Calling…" : "Connecting…";
+  else if (!v.remoteCamera) note = `${first}'s camera is off`;
+  else if (v.remotePaused) note = "Video paused: slow connection";
+  else if (!them.picture) note = "Connecting video…";
+
+  return (
+    <section className="mx-stage" aria-label={`Video call with ${call.peerName}`}>
+      <canvas ref={remote} className={`mx-stage-remote${them.picture && !note ? " is-on" : ""}`} aria-label={`${call.peerName}'s video`} />
+      {note && (
+        <div className="mx-stage-note">
+          <Avatar id={call.peer} name={call.peerName} size={64} />
+          <span>{note}</span>
+        </div>
+      )}
+      {/* always mounted, so the decoder attaches once; hidden with the camera off */}
+      <div className={`mx-stage-self${me.picture ? " is-on" : ""}${ourCamera ? "" : " is-hidden"}`} aria-hidden={!ourCamera}>
+        <canvas ref={self} aria-label="Your video" />
+        {v.paused && <span className="mx-stage-self-note">Your video is paused: slow connection</span>}
+        {!v.paused && !me.picture && <span className="mx-stage-self-note">Starting camera…</span>}
+      </div>
+      {live && them.picture && !note && v.recvWidth > 0 && (
+        <span className="mx-stage-stats" title="What you receive">
+          {v.recvHeight}p · {Math.round(v.recvFps)} fps
+          {v.latencyMs > 0 ? ` · ${v.latencyMs} ms` : ""}
+        </span>
+      )}
+    </section>
   );
 }

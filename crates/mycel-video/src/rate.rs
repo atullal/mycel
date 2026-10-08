@@ -1,8 +1,11 @@
 //! How much video to send: resolution, frame rate and bitrate, from the
 //! path in use and from how fast frames actually get through.
 //!
-//! - The **path** sets a ceiling: wired or Wi-Fi up to 720p30, peer-to-peer
-//!   Wi-Fi up to 480p30, relay up to 360p, Bluetooth none ("video paused:
+//! - The **path** sets a ceiling, from what its medium typically carries
+//!   (the prior the path selector uses too): video takes at most a quarter
+//!   of it, up to 720p30 on cable, a Wi-Fi network or UWB; 480p30 on
+//!   peer-to-peer Wi-Fi / Wi-Fi Direct (the radio hops channels); 360p via
+//!   a relay; none under 1 Mbit/s (Bluetooth, IEEE 802.15.4: "video paused:
 //!   slow connection", see [`BLUETOOTH`]).
 //! - Under that ceiling a **delay-based controller** sets the bitrate. Every
 //!   frame is its own QUIC stream, and the time from handing it to QUIC to
@@ -66,9 +69,11 @@ pub struct PathBudget {
 
 /// Bluetooth LE: `None` = video paused. A Mac-to-Mac L2CAP channel carries
 /// roughly 100–200 kbit/s in practice, shared with audio (12 kbit/s) and
-/// QUIC's own overhead; measurements with a 20 KB/s link (see the crate's
-/// tests) showed that even 160×90 at 5 fps added hundreds of ms of queueing
-/// to the audio at times, so video stays off on Bluetooth.
+/// QUIC's own overhead. Measured over a 20 KB/s link with 20 ms latency
+/// (`tiny_video_over_bluetooth_measurement` in mycel-call's tests): even
+/// 160×90 at 5 fps (~37 kbit/s) raised the audio's mouth-to-ear delay by
+/// ~90 ms (176→268, 162→249 ms) and lost 4–8 audio frames per 10 s, so
+/// video stays off on Bluetooth.
 pub const BLUETOOTH: Option<PathBudget> = None;
 
 /// `MYCEL_VIDEO_BLUETOOTH_KBPS=n`: send 160×90 at 5 fps within n kbit/s
@@ -80,16 +85,34 @@ fn bluetooth_override() -> Option<PathBudget> {
 }
 
 pub fn budget(path: Option<PathKind>) -> Option<PathBudget> {
-    match path {
-        // Every path starts low (a first keyframe the path can't carry would
-        // stall the audio behind it) and ramps up within a few seconds.
-        Some(PathKind::Network) => Some(PathBudget { start: START, max: 2_500_000, best: LADDER[0].1 }),
-        Some(PathKind::PeerWifi) => Some(PathBudget { start: START, max: 1_000_000, best: LADDER[1].1 }),
-        Some(PathKind::Relay) => Some(PathBudget { start: START, max: 500_000, best: LADDER[2].1 }),
-        Some(PathKind::Bluetooth) => bluetooth_override().or(BLUETOOTH),
-        None => Some(PathBudget { start: START, max: 1_000_000, best: LADDER[1].1 }),
+    let Some(kind) = path else {
+        // not known yet: modest
+        return Some(PathBudget { start: START, max: 1_000_000, best: LADDER[1].1 });
+    };
+    if kind == PathKind::Bluetooth {
+        return bluetooth_override().or(BLUETOOTH);
     }
+    // Any medium by what it typically carries (the same prior the path
+    // selector starts from): video may take a quarter of it, and a medium
+    // under 1 Mbit/s (Bluetooth, IEEE 802.15.4) carries none.
+    let prior = kind.prior_rate() * 8.0;
+    if prior < MIN_PATH_BPS {
+        return None;
+    }
+    let (best, cap) = match kind {
+        // the radio also hops to the Wi-Fi network's channel: steadier at 480p
+        PathKind::PeerWifi | PathKind::WifiDirect => (LADDER[1].1, 1_000_000),
+        // a shared server on the internet
+        PathKind::Relay => (LADDER[2].1, 500_000),
+        // cable, Wi-Fi network, UWB, anything else fast
+        _ => (LADDER[0].1, 2_500_000),
+    };
+    let max = cap.min((prior * 0.25) as u32);
+    Some(PathBudget { start: START.min(max), max, best: quality_for(max, best) })
 }
+
+/// Below this typical throughput a path gets no video.
+const MIN_PATH_BPS: f64 = 1_000_000.0;
 
 /// The best rung of [`LADDER`] for `bps`, no better than `best`.
 pub fn quality_for(bps: u32, best: Quality) -> Quality {
@@ -424,6 +447,25 @@ mod tests {
     const RTT: Duration = Duration::from_millis(20);
 
     #[test]
+    fn every_kind_of_path_has_a_budget() {
+        let best = |k| budget(Some(k)).map(|b| (b.best.height, b.max));
+        assert_eq!(best(PathKind::Ethernet), Some((720, 2_500_000)));
+        assert_eq!(best(PathKind::Network), Some((720, 2_500_000)));
+        assert_eq!(best(PathKind::Uwb), Some((720, 1_200_000)), "6.8 Mbit/s UWB: 720p within a quarter of it");
+        assert_eq!(best(PathKind::Other), Some((720, 2_000_000)));
+        assert_eq!(best(PathKind::PeerWifi), Some((480, 1_000_000)));
+        assert_eq!(best(PathKind::WifiDirect), best(PathKind::PeerWifi), "Wi-Fi Direct like AWDL");
+        assert_eq!(best(PathKind::Relay), Some((360, 500_000)));
+        assert_eq!(best(PathKind::Bluetooth), None, "paused");
+        assert_eq!(best(PathKind::Ieee802154), None, "paused");
+        for k in PathKind::ALL {
+            if let Some(b) = budget(Some(k)) {
+                assert!(b.start <= b.max && b.max >= MIN_BPS, "{k:?}");
+            }
+        }
+    }
+
+    #[test]
     fn ladder_and_caps() {
         assert_eq!(quality_for(3_000_000, LADDER[0].1), Quality::new(1280, 720, 30));
         assert_eq!(quality_for(3_000_000, LADDER[1].1), Quality::new(848, 480, 30), "peer Wi-Fi tops out at 480p");
@@ -543,7 +585,7 @@ mod tests {
             }
             now += Duration::from_micros(16_667);
         }
-        assert!((sent as i32 - fps as i32).abs() <= 2, "sent {sent} at {fps} fps");
+        assert!((sent - fps as i32).abs() <= 2, "sent {sent} at {fps} fps");
         assert!(not_yet > 20);
         now += Duration::from_secs(1);
         assert_eq!(c.admit(now, 10_000_000, Some(Duration::from_millis(50)), RTT), Admit::Backlog);

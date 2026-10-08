@@ -105,6 +105,8 @@ struct Call {
     video: Mutex<Option<VideoTrack>>,
     /// Our camera should be on (asked for before or during the call).
     camera: AtomicBool,
+    /// Why the camera couldn't be turned on before the call connected.
+    camera_error: Mutex<Option<String>>,
 }
 
 struct Mgr {
@@ -195,8 +197,11 @@ impl CallManager {
             let src = self.inner.video_source.read().clone();
             if let Err(e) = tokio::task::spawn_blocking(move || src.prepare()).await.context("camera check failed")? {
                 call.camera.store(false, Ordering::Relaxed);
+                *call.camera_error.lock() = Some(format!("{e:#}"));
+                self.inner.host.emit(CallEvent::Updated(info(&self.inner, &call)));
                 return Err(e);
             }
+            *call.camera_error.lock() = None;
         }
         let i = info(&self.inner, &call);
         self.inner.host.emit(CallEvent::Updated(i.clone()));
@@ -296,6 +301,7 @@ impl CallManager {
             error: Mutex::new(None),
             video: Mutex::new(None),
             camera: AtomicBool::new(false),
+            camera_error: Mutex::new(None),
         });
         mgr.calls.lock().insert(id, call.clone());
         let first = info(mgr, &call);
@@ -427,9 +433,21 @@ fn info(mgr: &Mgr, c: &Call) -> CallInfo {
         remote_level,
         echo_cancellation: audio.echo_cancellation(),
         stats,
-        video: c.video.lock().as_ref().map(|v| v.info()).unwrap_or_else(|| mycel_video::VideoInfo {
-            source: mgr.video_source.read().describe(),
-            ..Default::default()
+        video: c.video.lock().as_ref().map(|v| v.info()).unwrap_or_else(|| {
+            let error = c.camera_error.lock().clone();
+            mycel_video::VideoInfo {
+                camera: match &error {
+                    Some(e) if e.contains("isn't allowed") => mycel_video::CameraState::Denied,
+                    Some(_) => mycel_video::CameraState::Failed,
+                    None if c.camera.load(Ordering::Relaxed) && st.phase != CallPhase::Ended => {
+                        mycel_video::CameraState::Starting
+                    }
+                    None => mycel_video::CameraState::Off,
+                },
+                error,
+                source: mgr.video_source.read().describe(),
+                ..Default::default()
+            }
         }),
     }
 }
@@ -571,6 +589,7 @@ async fn handle_incoming(mgr: &Arc<Mgr>, conn: Connection) -> Result<()> {
         error: Mutex::new(None),
         video: Mutex::new(None),
         camera: AtomicBool::new(false),
+        camera_error: Mutex::new(None),
     });
     mgr.calls.lock().insert(id, call.clone());
     proto::send(&mut tx, &Ctrl::Ringing).await?;

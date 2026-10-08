@@ -3588,6 +3588,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "axum",
+ "bytes",
  "clap",
  "mycel-node",
  "serde",
@@ -3742,6 +3743,7 @@ dependencies = [
  "mycel-rules",
  "mycel-sync",
  "mycel-trust",
+ "mycel-video",
  "parking_lot",
  "postcard",
  "redb",

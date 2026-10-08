@@ -1,6 +1,5 @@
 //! The camera, through AVFoundation, and the camera permission.
 
-use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -176,7 +175,6 @@ impl VideoSource for Camera {
             session.addOutput(&output);
             session.commitConfiguration();
             session.startRunning();
-            let _ = std::ptr::null::<c_void>();
             Ok(SourceHandle::new(Running { session, _output: output, _delegate: delegate, _queue: queue }))
         }
     }

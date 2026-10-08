@@ -13,6 +13,7 @@ import {
   type ReactNode,
 } from "react";
 import { getMycel, type Mycel } from "../src/client.ts";
+import { canDecodeVideo, videoCanvas, type VideoSource } from "../src/video.ts";
 import type {
   CallId,
   CallInfo,
@@ -349,4 +350,42 @@ export function useCalls(): CallInfo[] {
   }, [client]);
 
   return useMemo(() => [...calls.values()].sort((a, b) => b.startedAt - a.startedAt), [calls]);
+}
+
+/**
+ * Show one video stream of a call on a canvas: the other side's video
+ * (`source: "remote"`, `peer` = their device) or our self-view
+ * (`source: "local"`). Frames are decoded in the webview with WebCodecs.
+ * Returns whether a picture is up and its size; `supported` is false when
+ * this webview or backend can't show video.
+ */
+export function useVideoCanvas(
+  canvas: React.RefObject<HTMLCanvasElement | null>,
+  opts: { call: CallId | null | undefined; source: VideoSource; peer?: PeerId | null },
+): { picture: { width: number; height: number } | null; supported: boolean } {
+  const client = useMycel();
+  const [picture, setPicture] = useState<{ width: number; height: number } | null>(null);
+  const supported = client.calls.videoSupported && canDecodeVideo();
+  const { call, source, peer } = opts;
+
+  useEffect(() => {
+    setPicture(null);
+    const el = canvas.current;
+    if (!call || !el || !supported) return;
+    const view = videoCanvas(el, {
+      onPicture: (width, height) => setPicture({ width, height }),
+      onNeedKeyframe: () => void client.calls.requestKeyframe(call).catch(() => {}),
+    });
+    const off = client.calls.onVideo((f) => {
+      if (f.source !== source) return;
+      if (source === "remote" && peer && f.peer !== peer) return;
+      view.push(f);
+    });
+    return () => {
+      off();
+      view.close();
+    };
+  }, [client, canvas, call, source, peer, supported]);
+
+  return { picture, supported };
 }

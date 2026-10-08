@@ -1933,6 +1933,100 @@
   gap: 10px;
 }
 
+.mx-callbar-hint.is-error {
+  color: var(--danger);
+  white-space: normal;
+}
+
+/* ---------------------------------------------------------------- video */
+
+/* Their picture large, ours small in the corner. Video is dark in both
+   themes (like any video player), so the stage keeps its own colours. */
+.mx-stage {
+  position: relative;
+  flex: none;
+  height: min(52vh, 460px);
+  min-height: 200px;
+  background: #101214;
+  color: #f2f3f4;
+  overflow: hidden;
+  border-bottom: 1px solid var(--line-soft);
+}
+.mx-stage-remote {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  opacity: 0;
+  transition: opacity 200ms;
+}
+.mx-stage-remote.is-on {
+  opacity: 1;
+}
+.mx-stage-note {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 16px;
+  text-align: center;
+  font-size: 14px;
+  color: rgba(242, 243, 244, 0.85);
+}
+.mx-stage-self {
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  width: clamp(112px, 22%, 220px);
+  aspect-ratio: 16 / 9;
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: #1d2023;
+  box-shadow: 0 4px 18px rgba(0, 0, 0, 0.45);
+  display: grid;
+  place-items: center;
+}
+.mx-stage-self.is-hidden {
+  display: none;
+}
+.mx-stage-self canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  /* a mirror, as people expect to see themselves */
+  transform: scaleX(-1);
+  opacity: 0;
+}
+.mx-stage-self.is-on canvas {
+  opacity: 1;
+}
+.mx-stage-self-note {
+  position: relative;
+  padding: 6px 8px;
+  font-size: 11.5px;
+  line-height: 1.3;
+  text-align: center;
+  color: rgba(242, 243, 244, 0.9);
+  background: rgba(0, 0, 0, 0.45);
+  border-radius: var(--r-sm);
+}
+.mx-stage-stats {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  padding: 3px 8px;
+  font-size: 11.5px;
+  font-variant-numeric: tabular-nums;
+  color: rgba(242, 243, 244, 0.9);
+  background: rgba(0, 0, 0, 0.4);
+  border-radius: 999px;
+}
 /* ---------------------------------------------------------------- narrow */
 
 @media (max-width: 1080px) {
@@ -1983,10 +2077,24 @@
     display: none;
   }
   .mx-callbar-path,
-  .mx-callbar-hint {
+  .mx-callbar-hint:not(.is-error),
+  .mx-meter-label {
     display: none;
   }
   .mx-callbar {
     padding-left: 12px;
+    gap: 8px;
+  }
+  .mx-callbar-meters {
+    gap: 4px;
+  }
+  .mx-stage {
+    height: 36vh;
+    min-height: 180px;
+  }
+  .mx-stage-self {
+    right: 10px;
+    bottom: 10px;
+    width: 34%;
   }
 }

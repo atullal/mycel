@@ -15,6 +15,7 @@ export function ChatView({
   inCall = false,
   callsBusy = false,
   onCall,
+  onVideoCall,
 }: {
   summary: ConversationSummary;
   me: string | undefined;
@@ -28,6 +29,8 @@ export function ChatView({
   callsBusy?: boolean;
   /** Start a voice call (direct conversations). */
   onCall?: () => void;
+  /** Start a call with our camera on. */
+  onVideoCall?: () => void;
 }) {
   const mycel = useMycel();
   const { messages, loading, hasMore, loadOlder, error } = useMessages(summary.id);
@@ -166,6 +169,17 @@ export function ChatView({
             aria-label={`Voice call ${summary.title}`}
           >
             <Icon.Phone />
+          </button>
+        )}
+        {summary.direct && onVideoCall && summary.active && !summary.request && (
+          <button
+            className={`mx-icon-btn mx-call-btn${inCall ? " is-on" : ""}`}
+            onClick={onVideoCall}
+            disabled={callsBusy}
+            title={inCall ? "In a call" : callsBusy ? "You're already in a call" : "Video call"}
+            aria-label={`Video call ${summary.title}`}
+          >
+            <Icon.Video />
           </button>
         )}
         <span className="mx-e2e" title="End-to-end encrypted. Only the people in this conversation can read it.">

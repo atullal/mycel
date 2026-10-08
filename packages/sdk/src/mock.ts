@@ -8,6 +8,7 @@
 // coming online, lazy attachments that "download", and a group you get added to.
 
 import type { ArgsOf, Command, FileHost, ResultOf, Transport } from "./transport.ts";
+import { encodeVideoFrame } from "./video.ts";
 import type {
   Attachment,
   CallEndReason,
@@ -590,8 +591,174 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
   interface MockCall {
     info: CallInfo;
     activeAt: number | null;
+    /** Our camera is wanted on. */
+    camera: boolean;
+    /** Running fake cameras: ours (self-view) and theirs. */
+    local: { stop(): void } | null;
+    remote: { stop(): void } | null;
   }
   const calls = new Map<string, MockCall>();
+
+  // --- video ------------------------------------------------------------------------
+  //
+  // A fake camera: an animated picture encoded to H.264 with the browser's own
+  // WebCodecs VideoEncoder, handed out in the runtime's frame layout, so the
+  // app decodes it exactly as it would real video. No VideoEncoder (or no
+  // H.264 encoder): no pictures, the call UI still works.
+
+  const videoHandlers = new Set<(frame: ArrayBuffer) => void>();
+
+  function fakeCamera(source: "remote" | "local", peer: string, label: string, hue: number): { stop(): void } | null {
+    const VE = (globalThis as { VideoEncoder?: typeof VideoEncoder }).VideoEncoder;
+    if (!VE || typeof document === "undefined") return null;
+    const [w, h, fps] = [640, 360, 15];
+    const canvas = document.createElement("canvas");
+    canvas.width = w;
+    canvas.height = h;
+    const g = canvas.getContext("2d");
+    if (!g) return null;
+    let seq = 0;
+    let config: Uint8Array | null = null;
+    let stopped = false;
+    const enc = new VE({
+      output: (chunk, meta) => {
+        const desc = meta?.decoderConfig?.description;
+        if (desc) config = new Uint8Array(desc instanceof ArrayBuffer ? desc : (desc as ArrayBufferView).buffer.slice(0));
+        const data = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(data);
+        const key = chunk.type === "key";
+        const buf = encodeVideoFrame({
+          source,
+          peer,
+          seq: seq++,
+          capturedAt: chunk.timestamp / 1000,
+          keyframe: key,
+          width: w,
+          height: h,
+          config: key ? config : null,
+          data,
+        });
+        for (const fn of [...videoHandlers]) fn(buf);
+      },
+      error: () => {
+        stopped = true;
+      },
+    });
+    try {
+      enc.configure({ codec: "avc1.42e01f", width: w, height: h, bitrate: 600_000, framerate: fps, latencyMode: "realtime", avc: { format: "avc" } });
+    } catch {
+      return null;
+    }
+    let n = 0;
+    const timer = setInterval(() => {
+      if (stopped || enc.state !== "configured") return;
+      const t = n / fps;
+      const grad = g.createLinearGradient(0, 0, w, h);
+      grad.addColorStop(0, `hsl(${hue} 45% ${30 + 6 * Math.sin(t)}%)`);
+      grad.addColorStop(1, `hsl(${(hue + 40) % 360} 50% 18%)`);
+      g.fillStyle = grad;
+      g.fillRect(0, 0, w, h);
+      // a "head and shoulders" that sways a little
+      const x = w / 2 + 18 * Math.sin(t * 0.9);
+      g.fillStyle = `hsl(${hue} 30% 78%)`;
+      g.beginPath();
+      g.arc(x, h * 0.42, 62, 0, Math.PI * 2);
+      g.fill();
+      g.beginPath();
+      g.ellipse(x, h * 1.02, 150, 120, 0, Math.PI, 0);
+      g.fill();
+      if (label) {
+        g.fillStyle = "rgba(255,255,255,0.85)";
+        g.font = "600 22px system-ui, sans-serif";
+        g.fillText(label, 20, h - 24);
+      }
+      const frame = new VideoFrame(canvas, { timestamp: Date.now() * 1000 });
+      enc.encode(frame, { keyFrame: n % (fps * 4) === 0 });
+      frame.close();
+      n++;
+    }, 1000 / fps);
+    return {
+      stop() {
+        stopped = true;
+        clearInterval(timer);
+        try {
+          enc.close();
+        } catch {
+          // already closed
+        }
+      },
+    };
+  }
+
+  /** Start or stop the fake cameras to match the call. */
+  function syncVideo(c: MockCall) {
+    const active = c.info.state === "active";
+    const slow = c.info.path === "bluetooth";
+    const wantLocal = active && c.camera;
+    if (wantLocal && !c.local) c.local = fakeCamera("local", meId, "", 205); // (the self-view is mirrored: no text)
+    if (!wantLocal && c.local) {
+      c.local.stop();
+      c.local = null;
+    }
+    // they turn their camera on a moment after we do, and leave it on
+    if (wantLocal && !c.info.video.remoteCamera) {
+      later(1500, () => {
+        if (c.info.state !== "active") return;
+        c.info.video.remoteCamera = true;
+        syncVideo(c);
+      });
+    }
+    const wantRemote = active && c.info.video.remoteCamera && !slow;
+    if (wantRemote && !c.remote) c.remote = fakeCamera("remote", c.info.peer, c.info.peerName, 145);
+    if (!wantRemote && c.remote) {
+      c.remote.stop();
+      c.remote = null;
+    }
+    const v = c.info.video;
+    v.camera = c.camera ? "on" : "off";
+    v.paused = c.camera && slow;
+    v.sending = c.camera && active && !slow;
+    v.remotePaused = v.remoteCamera && slow;
+    v.receiving = wantRemote;
+    v.sendWidth = v.sending ? 640 : 0;
+    v.sendHeight = v.sending ? 360 : 0;
+    v.sendFps = v.sending ? 15 : 0;
+    v.bitrate = v.sending ? 600_000 : 0;
+    v.sentBitrate = v.bitrate;
+    v.recvWidth = wantRemote ? 640 : 0;
+    v.recvHeight = wantRemote ? 360 : 0;
+    v.recvFps = wantRemote ? 15 : 0;
+    v.latencyMs = wantRemote ? 38 : 0;
+  }
+
+  function emptyVideo(): CallInfo["video"] {
+    return {
+      camera: "off",
+      error: null,
+      sending: false,
+      paused: false,
+      remoteCamera: false,
+      remotePaused: false,
+      receiving: false,
+      sendWidth: 0,
+      sendHeight: 0,
+      sendFps: 0,
+      bitrate: 0,
+      sentBitrate: 0,
+      queueMs: 0,
+      recvWidth: 0,
+      recvHeight: 0,
+      recvFps: 0,
+      latencyMs: 0,
+      framesSent: 0,
+      framesReceived: 0,
+      framesSkipped: 0,
+      keyframesSent: 0,
+      keyframeRequests: 0,
+      source: "Simulated camera",
+      encoder: "H.264 (WebCodecs)",
+    };
+  }
 
   function pathFor(p: Person | undefined): CallInfo["path"] {
     if (!p) return null;
@@ -631,6 +798,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
   function setCallState(c: MockCall, state: CallInfo["state"], end: CallEndReason | null = null) {
     if (c.info.state === "ended") return;
     c.info.state = state;
+    syncVideo(c);
     if (state === "active") {
       c.activeAt = Date.now();
       c.info.connectedAt = c.activeAt;
@@ -656,6 +824,9 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     const path = pathFor(peer);
     const c: MockCall = {
       activeAt: null,
+      camera: false,
+      local: null,
+      remote: null,
       info: {
         id: randomHex(32),
         conversation: conv.id,
@@ -690,6 +861,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
           heardToneHz: null,
           measuredRoundTripMs: null,
         },
+        video: emptyVideo(),
       },
     };
     calls.set(c.info.id, c);
@@ -704,17 +876,19 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     return c;
   }
 
-  function startCall(conversation: string): CallInfo {
+  function startCall(conversation: string, video = false): CallInfo {
     const conv = getConv(conversation);
     if (conv.invitedBy) throw "accept this message request before calling";
     if (!conv.active) throw "you're no longer a member of this conversation";
     const others = otherMembers(conv);
     if (others.length !== 1) throw "calls work in one-to-one conversations for now";
     const ringing = liveCalls().find((c) => c.info.direction === "incoming" && c.info.conversation === conversation && c.info.state === "ringing");
-    if (ringing) return acceptCall(ringing.info.id);
+    if (ringing) return acceptCall(ringing.info.id, video);
     if (liveCalls().length > 0) throw "You're already in a call.";
     const peer = people.get(others[0]!.id)!;
     const c = newCall(conv, peer, "outgoing");
+    c.camera = video;
+    syncVideo(c);
     const reachable = peer.online || peer.nearby;
     if (!reachable) {
       later(1800, () => {
@@ -733,8 +907,9 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     return snapshot(c);
   }
 
-  function acceptCall(id: string): CallInfo {
+  function acceptCall(id: string, video = false): CallInfo {
     const c = getCall(id);
+    if (video) c.camera = true;
     if (c.info.direction !== "incoming" || c.info.state !== "ringing") throw "This call isn't ringing any more.";
     for (const other of liveCalls()) if (other !== c) setCallState(other, "ended", "hungUp");
     setCallState(c, "connecting");
@@ -1109,8 +1284,17 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       }
       return summary(c);
     },
-    start_call: ({ conversation }) => startCall(conversation),
-    accept_call: ({ call }) => acceptCall(call),
+    start_call: ({ conversation, video }) => startCall(conversation, video ?? false),
+    accept_call: ({ call, video }) => acceptCall(call, video ?? false),
+    set_camera: ({ call, on }) => {
+      const c = getCall(call);
+      if (c.info.state === "ended") throw "This call already ended.";
+      c.camera = on;
+      syncVideo(c);
+      callUpdate(c);
+      return snapshot(c);
+    },
+    video_keyframe: () => null,
     decline_call: ({ call }) => {
       const c = getCall(call);
       setCallState(c, "ended", c.info.state === "ringing" && c.info.direction === "incoming" ? "declined" : "hungUp");
@@ -1215,7 +1399,16 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       handlers.add(handler);
       return () => handlers.delete(handler);
     },
+    video(handler) {
+      videoHandlers.add(handler);
+      return () => videoHandlers.delete(handler);
+    },
     dispose() {
+      for (const c of calls.values()) {
+        c.local?.stop();
+        c.remote?.stop();
+      }
+      videoHandlers.clear();
       for (const t of timers) clearTimeout(t);
       timers.clear();
       handlers.clear();

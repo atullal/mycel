@@ -2,6 +2,7 @@ import { createMockTransport } from "./mock.ts";
 import { createHttpTransport, isHttpRuntime } from "./http.ts";
 import { createTauriTransport, isTauri } from "./tauri.ts";
 import { toError, type ArgsOf, type Command, type FileHost, type ResultOf, type Transport } from "./transport.ts";
+import { parseVideoFrame, type VideoFrameData } from "./video.ts";
 import type {
   CallId,
   CallInfo,
@@ -116,10 +117,31 @@ export interface Mycel {
    * everything else. Watch `callIncoming` / `callUpdated`, or `useCalls()`.
    */
   calls: {
-    /** `start_call`: ring the other person in a direct conversation (resolves while `connecting`). */
-    start(conversation: ConversationId): Promise<CallInfo>;
-    /** `accept_call`: answer a ringing call (asks for the microphone the first time). */
-    accept(call: CallId): Promise<CallInfo>;
+    /**
+     * `start_call`: ring the other person in a direct conversation (resolves
+     * while `connecting`). `video: true` starts with our camera on (asking
+     * for the camera the first time).
+     */
+    start(conversation: ConversationId, opts?: { video?: boolean }): Promise<CallInfo>;
+    /** `accept_call`: answer a ringing call (asks for the microphone the first time); `video` turns our camera on. */
+    accept(call: CallId, opts?: { video?: boolean }): Promise<CallInfo>;
+    /**
+     * `set_camera`: turn our camera on or off, before or during a call. The
+     * first time, this waits for the user to answer the system's camera
+     * prompt; if they say no it rejects, and `video.error` says where to allow it.
+     */
+    setCamera(call: CallId, on: boolean): Promise<CallInfo>;
+    /** `video_keyframe`: our video decoder lost its place; get fresh keyframes. */
+    requestKeyframe(call: CallId): Promise<void>;
+    /**
+     * Encoded video frames as they arrive: the other side's video and our
+     * self-view. Decode them with `videoCanvas` (or `useVideoCanvas` in
+     * React). Returns an unsubscribe function. Without a video-capable
+     * backend nothing arrives (`videoSupported` is false).
+     */
+    onVideo(handler: (frame: VideoFrameData) => void): () => void;
+    /** The backend delivers video frames. */
+    readonly videoSupported: boolean;
     /** `decline_call` */
     decline(call: CallId): Promise<void>;
     /** `end_call`: hang up, or cancel a call that hasn't been answered. */
@@ -161,6 +183,9 @@ export function createMycel(transport: Transport): Mycel {
   }
   const none = {} as Record<string, never>;
   const done = () => undefined;
+  // one transport subscription for video, shared by every viewer
+  const videoHandlers = new Set<(frame: VideoFrameData) => void>();
+  let stopVideo: (() => void) | null = null;
 
   function on(type: string, handler: (event: MycelEvent) => void): () => void {
     return transport.listen((event) => {
@@ -219,8 +244,34 @@ export function createMycel(transport: Transport): Mycel {
         call("decline_request", opts.block ? { id, block: true } : { id }).then(done),
     },
     calls: {
-      start: (conversation) => call("start_call", { conversation }),
-      accept: (id) => call("accept_call", { call: id }),
+      start: (conversation, opts) => call("start_call", { conversation, video: opts?.video ?? false }),
+      accept: (id, opts) => call("accept_call", { call: id, video: opts?.video ?? false }),
+      setCamera: (id, on) => call("set_camera", { call: id, on }),
+      requestKeyframe: (id) => call("video_keyframe", { call: id }).then(done),
+      onVideo: (handler) => {
+        videoHandlers.add(handler);
+        if (!stopVideo && transport.video) {
+          stopVideo = transport.video((buf) => {
+            const f = parseVideoFrame(buf);
+            if (!f) return;
+            for (const h of [...videoHandlers]) {
+              try {
+                h(f);
+              } catch (err) {
+                console.error("[mycel] video handler failed", err);
+              }
+            }
+          });
+        }
+        return () => {
+          videoHandlers.delete(handler);
+          if (videoHandlers.size === 0 && stopVideo) {
+            stopVideo();
+            stopVideo = null;
+          }
+        };
+      },
+      videoSupported: !!transport.video,
       decline: (id) => call("decline_call", { call: id }).then(done),
       end: (id) => call("end_call", { call: id }).then(done),
       setMuted: (id, muted) => call("set_muted", { call: id, muted }),

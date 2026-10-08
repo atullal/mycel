@@ -271,6 +271,28 @@ async fn api_events(State(app): State<Shared>, headers: HeaderMap, Query(q): Que
     Sse::new(stream).keep_alive(KeepAlive::default()).into_response()
 }
 
+/// Encoded video frames (remote video and self-view) as one long binary
+/// response: each frame is a u32 LE length, then the frame
+/// (`mycel_video::UiFrame` layout). The page decodes them with WebCodecs.
+async fn api_video(State(app): State<Shared>, headers: HeaderMap, Query(q): Query<TokenQ>) -> Response {
+    if let Err(r) = guard(&app, &headers, q.t.as_deref()) {
+        return r;
+    }
+    // (a lagging reader skips frames; the page asks for a keyframe)
+    let stream = BroadcastStream::new(app.rt.video_frames()).filter_map(|f| {
+        let f = f.ok()?.encode();
+        let mut out = Vec::with_capacity(4 + f.len());
+        out.extend_from_slice(&(f.len() as u32).to_le_bytes());
+        out.extend_from_slice(&f);
+        Some(Ok::<_, std::convert::Infallible>(bytes::Bytes::from(out)))
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 #[derive(Deserialize)]
 struct UploadQ {
     name: String,
@@ -444,6 +466,7 @@ async fn serve(dev: DeviceArgs, http: SocketAddr, ui: Option<PathBuf>) -> Result
         .route("/api/health", get(health))
         .route("/api/cmd/{cmd}", post(api_cmd))
         .route("/api/events", get(api_events))
+        .route("/api/video", get(api_video))
         // uploads stream to disk: no body size limit
         .route("/api/upload", post(api_upload).layer(DefaultBodyLimit::disable()))
         .route("/api/file", get(api_file));

@@ -178,7 +178,8 @@ async fn video_both_ways_over_ip() {
     assert_eq!(at_bob.lock().undecodable, 0, "every frame decodes");
     assert!(fps > 25.0, "bob sees {fps:.1} fps");
     assert!(lat < 100.0 && max < 300.0, "latency {lat:.1} ms avg, {max:.1} max");
-    assert!(recent(&at_alice, 3.0).0 > 25.0, "and the other way");
+    let (back_fps, _, _) = recent(&at_alice, 3.0);
+    assert!(back_fps > 25.0, "and the other way: {back_fps:.1} fps, {:?}", p.a.info());
     assert!(recent(&alice_self, 3.0).0 > 25.0, "self-view");
     assert_eq!((ai.send_width, ai.send_height), (1280, 720), "a clean fast path reaches 720p");
     assert!(ai.sending && !ai.paused && ai.camera == CameraState::On);
@@ -212,7 +213,7 @@ async fn recovers_from_lost_frames_with_keyframes() {
     let p = pair(true, &[], Some(PathKind::Network)).await;
     let at_bob = watch(p.b_ui.subscribe(), UiSource::Remote);
     camera(&p.a, true).await;
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(6)).await; // ramped up to 30 fps
     p.a.drop_frames_for_test(45); // one lost frame every 1.5 s
     tokio::time::sleep(Duration::from_secs(9)).await;
     p.a.drop_frames_for_test(0);

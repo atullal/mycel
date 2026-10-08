@@ -268,6 +268,9 @@ pub fn run() {
             commands::end_call,
             commands::set_muted,
             commands::call_status,
+            commands::set_camera,
+            commands::video_keyframe,
+            commands::video_subscribe,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build the Mycel host");
