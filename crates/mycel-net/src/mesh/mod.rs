@@ -67,7 +67,7 @@ use tokio::sync::mpsc;
 use self::core::{Config, Out, Router, Time};
 pub use self::core::Stats as MeshStats;
 pub use self::wire::{mesh_addr, parse_mesh_addr};
-use self::wire::{MIN_QUIC_MTU, T_DATA, T_OGM};
+use self::wire::{MIN_QUIC_MTU, T_DATA, T_OGM, T_SEQREQ};
 use crate::link::{CustomAddr, Link, LinkEvent, LinkStatus, PathKind, TRANSPORT_MESH, n0_watcher, noq_udp};
 
 /// Hop connections between neighbours (and internet hops to gateways).
@@ -214,6 +214,8 @@ struct Driver {
     tap: Mutex<Option<Tap>>,
     dropped_queue: std::sync::atomic::AtomicU64,
     dropped_too_big: std::sync::atomic::AtomicU64,
+    /// Uplink cost override (tests, or a known slow link).
+    uplink: Mutex<Option<u32>>,
 }
 
 impl std::fmt::Debug for Driver {
@@ -267,6 +269,11 @@ impl Driver {
                 Out::Announce { to, ann } => {
                     if let Some(c) = self.conn(&to) {
                         let _ = c.send_datagram(wire::encode_announce(&ann));
+                    }
+                }
+                Out::SeqReq { to, req } => {
+                    if let Some(c) = self.conn(&to) {
+                        let _ = c.send_datagram(wire::encode_seqreq(&req));
                     }
                 }
                 Out::Frame { to, frame, relayed } => {
@@ -525,6 +532,11 @@ impl Driver {
                     self.with_router(|r, now| r.on_frame(from, f, now));
                 }
             }
+            Some(&T_SEQREQ) => {
+                if let Some(q) = wire::decode_seqreq(&d) {
+                    self.with_router(|r, now| r.on_seqreq(from, q, now));
+                }
+            }
             _ => {}
         }
     }
@@ -548,13 +560,32 @@ impl Driver {
         self.with_router(|r, now| r.on_resolved(peer, None, now));
     }
 
-    fn publish_reach(self: &Arc<Self>, _gateways: Vec<SignPk>) {}
+    fn publish_reach(self: &Arc<Self>, _gateways: Vec<(SignPk, u32)>) {}
 
     fn stats(&self) -> MeshStats {
         let mut s = self.router.lock().stats();
         s.dropped_queue += self.dropped_queue.load(Ordering::Relaxed);
         s.dropped_too_big += self.dropped_too_big.load(Ordering::Relaxed);
         s
+    }
+
+    /// Our internet cost as a gateway (0.1 ms units): set, or the mean RTT
+    /// of our internet hops, or a guess until there are any.
+    fn uplink_cost(&self) -> u32 {
+        if let Some(u) = *self.uplink.lock() {
+            return u;
+        }
+        let rtts: Vec<u32> = {
+            let hops = self.hops.lock();
+            hops.values()
+                .filter(|h| !h.direct)
+                .filter_map(|h| h.live())
+                .filter_map(|c| c.paths().iter().find(|p| p.is_selected()).map(|p| p.rtt()))
+                .filter(|r| !r.is_zero())
+                .map(|r| (r.as_micros() / 100).min(u32::MAX as u128) as u32)
+                .collect()
+        };
+        if rtts.is_empty() { core::DEFAULT_INTERNET_COST / 2 } else { rtts.iter().sum::<u32>() / rtts.len() as u32 }
     }
 
     fn internet_now(&self) -> bool {
@@ -580,16 +611,19 @@ async fn run(d: Arc<Driver>) {
         }
         let slow = Instant::now() >= next_slow;
         let internet = slow.then(|| d.internet_now());
+        let uplink = slow.then(|| d.uplink_cost());
         let name = d.name.lock().clone();
         let keys = d.keys.clone();
         d.with_router(|r, now| {
             if let Some(on) = internet {
                 r.set_internet(on);
             }
+            if let Some(u) = uplink {
+                r.set_uplink(u);
+            }
             if r.announce_due(now) {
-                let seq = r.next_seq(wall_ms());
-                let a = wire::sign_announce(&keys, seq, r.own_flags(), &name);
-                r.originate(a, now);
+                let o = r.next_announce(wall_ms());
+                r.originate(wire::sign_announce(&keys, o, &name), now);
             }
             r.tick(now);
         });
@@ -640,6 +674,7 @@ impl Mesh {
             tap: Mutex::default(),
             dropped_queue: Default::default(),
             dropped_too_big: Default::default(),
+            uplink: Mutex::default(),
         });
         Mesh { d }
     }
@@ -686,6 +721,12 @@ impl Mesh {
 
     pub fn stats(&self) -> MeshStats {
         self.d.stats()
+    }
+
+    /// Fix this device's announced internet cost (0.1 ms units) instead of
+    /// measuring it (tests; a metered or satellite uplink).
+    pub fn set_uplink(&self, units: Option<u32>) {
+        *self.d.uplink.lock() = units;
     }
 
     /// Tests: see every payload this device relays for others.

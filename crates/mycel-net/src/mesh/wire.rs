@@ -6,12 +6,13 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes, BytesMut};
 use mycel_crypto::{DeviceKeys, Sig, SignPk};
 
-use super::core::{Announce, Frame};
+use super::core::{Announce, Frame, Origination, SeqReq};
 use crate::link::{CustomAddr, TRANSPORT_MESH};
 
 const OGM_CTX: &str = "mycel/v1/mesh-announce";
 pub(crate) const T_OGM: u8 = 1;
 pub(crate) const T_DATA: u8 = 2;
+pub(crate) const T_SEQREQ: u8 = 3;
 /// Data frame header: type, ttl, flags, dst, src, waypoint, id, offset, total.
 pub const DATA_HDR: usize = 3 + 32 * 3 + 4 + 2 + 2;
 const F_REACHED: u8 = 1;
@@ -54,28 +55,65 @@ pub fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Our announcement, signed.
-pub fn sign_announce(keys: &DeviceKeys, seq: u64, flags: u8, name: &str) -> Announce {
+pub fn sign_announce(keys: &DeviceKeys, o: Origination, name: &str) -> Announce {
     let name = truncate(name, MAX_NAME);
     let origin = keys.sign_pk();
-    let sig = keys.sign(OGM_CTX, &[&origin.0, &seq.to_be_bytes(), &[flags], name.as_bytes()]);
-    Announce { hops: 0, cost: 0, origin, seq, flags, name: Arc::from(name), sig }
+    let sig = keys.sign(OGM_CTX, &signed_parts(&origin, o.seq, o.flags, o.scope, o.uplink, &name).each());
+    Announce {
+        hops: 0,
+        cost: 0,
+        origin,
+        seq: o.seq,
+        flags: o.flags,
+        scope: o.scope,
+        uplink: o.uplink,
+        name: Arc::from(name),
+        sig,
+    }
+}
+
+/// What the origin signs: everything but `hops` and `cost`.
+struct Parts {
+    origin: [u8; 32],
+    seq: [u8; 8],
+    rest: [u8; 6],
+    name: Vec<u8>,
+}
+
+impl Parts {
+    fn each(&self) -> [&[u8]; 4] {
+        [&self.origin, &self.seq, &self.rest, &self.name]
+    }
+}
+
+fn signed_parts(origin: &SignPk, seq: u64, flags: u8, scope: u8, uplink: u32, name: &str) -> Parts {
+    let u = uplink.to_be_bytes();
+    Parts {
+        origin: origin.0,
+        seq: seq.to_be_bytes(),
+        rest: [flags, scope, u[0], u[1], u[2], u[3]],
+        name: name.as_bytes().to_vec(),
+    }
 }
 
 /// The origin's signature over everything but `hops` and `cost`.
 pub fn verify_announce(a: &Announce) -> bool {
-    a.origin
-        .verify(OGM_CTX, &[&a.origin.0, &a.seq.to_be_bytes(), &[a.flags], a.name.as_bytes()], &a.sig)
-        .is_ok()
+    let p = signed_parts(&a.origin, a.seq, a.flags, a.scope, a.uplink, &a.name);
+    a.origin.verify(OGM_CTX, &p.each(), &a.sig).is_ok()
 }
 
+const OGM_FIXED: usize = 1 + 1 + 4 + 32 + 8 + 1 + 1 + 4 + 1;
+
 pub fn encode_announce(a: &Announce) -> Bytes {
-    let mut b = BytesMut::with_capacity(1 + 1 + 4 + 32 + 8 + 1 + 1 + a.name.len() + 64);
+    let mut b = BytesMut::with_capacity(OGM_FIXED + a.name.len() + 64);
     b.put_u8(T_OGM);
     b.put_u8(a.hops);
     b.put_u32(a.cost);
     b.put_slice(&a.origin.0);
     b.put_u64(a.seq);
     b.put_u8(a.flags);
+    b.put_u8(a.scope);
+    b.put_u32(a.uplink);
     b.put_u8(a.name.len() as u8);
     b.put_slice(a.name.as_bytes());
     b.put_slice(&a.sig.0);
@@ -83,8 +121,7 @@ pub fn encode_announce(a: &Announce) -> Bytes {
 }
 
 pub fn decode_announce(b: &[u8]) -> Option<Announce> {
-    const FIXED: usize = 1 + 1 + 4 + 32 + 8 + 1 + 1;
-    if b.len() < FIXED + 64 || b[0] != T_OGM {
+    if b.len() < OGM_FIXED + 64 || b[0] != T_OGM {
         return None;
     }
     let hops = b[1];
@@ -92,13 +129,35 @@ pub fn decode_announce(b: &[u8]) -> Option<Announce> {
     let origin = SignPk(b[6..38].try_into().ok()?);
     let seq = u64::from_be_bytes(b[38..46].try_into().ok()?);
     let flags = b[46];
-    let n = b[47] as usize;
-    if n > MAX_NAME || b.len() != FIXED + n + 64 {
+    let scope = b[47];
+    let uplink = u32::from_be_bytes(b[48..52].try_into().ok()?);
+    let n = b[52] as usize;
+    if n > MAX_NAME || b.len() != OGM_FIXED + n + 64 {
         return None;
     }
-    let name = std::str::from_utf8(&b[FIXED..FIXED + n]).ok()?;
-    let sig = Sig(b[FIXED + n..].try_into().ok()?);
-    Some(Announce { hops, cost, origin, seq, flags, name: Arc::from(name), sig })
+    let name = std::str::from_utf8(&b[OGM_FIXED..OGM_FIXED + n]).ok()?;
+    let sig = Sig(b[OGM_FIXED + n..].try_into().ok()?);
+    Some(Announce { hops, cost, origin, seq, flags, scope, uplink, name: Arc::from(name), sig })
+}
+
+pub fn encode_seqreq(r: &SeqReq) -> Bytes {
+    let mut b = BytesMut::with_capacity(1 + 32 + 8 + 1);
+    b.put_u8(T_SEQREQ);
+    b.put_slice(&r.origin.0);
+    b.put_u64(r.seq);
+    b.put_u8(r.hops);
+    b.freeze()
+}
+
+pub fn decode_seqreq(b: &[u8]) -> Option<SeqReq> {
+    if b.len() != 42 || b[0] != T_SEQREQ {
+        return None;
+    }
+    Some(SeqReq {
+        origin: SignPk(b[1..33].try_into().ok()?),
+        seq: u64::from_be_bytes(b[33..41].try_into().ok()?),
+        hops: b[41],
+    })
 }
 
 fn header(f: &Frame, offset: u16, b: &mut BytesMut) {
@@ -167,7 +226,8 @@ mod tests {
     #[test]
     fn announcements_round_trip_and_verify() {
         let k = DeviceKeys::generate();
-        let mut a = sign_announce(&k, 1_700_000_000_000, 1, "Atul’s MacBook Pro with a long name");
+        let o = Origination { seq: 1_700_000_000_000, flags: 1, scope: 2, uplink: 345 };
+        let mut a = sign_announce(&k, o, "Atul’s MacBook Pro with a long name");
         assert!(a.name.len() <= MAX_NAME);
         a.hops = 3;
         a.cost = 1234;
@@ -177,6 +237,11 @@ mod tests {
         let mut flipped = b.clone();
         flipped.flags = 0;
         assert!(!verify_announce(&flipped), "the gateway flag is signed");
+        let mut cheaper = b.clone();
+        cheaper.uplink = 1;
+        assert!(!verify_announce(&cheaper), "so is the uplink cost");
+        let r = SeqReq { origin: k.sign_pk(), seq: 42, hops: 3 };
+        assert_eq!(decode_seqreq(&encode_seqreq(&r)), Some(r));
     }
 
     #[test]
