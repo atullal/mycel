@@ -2,6 +2,7 @@
 
 Peer-to-peer, end-to-end encrypted, fully distributed apps. **No trusted server.** Works on a LAN with no internet at all.
 
+- **Current status and work in progress: [STATUS.md](STATUS.md)**
 - Design: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), including implementation status
 - Trust layer spec: [docs/TRUST.md](docs/TRUST.md)
 - App API: [docs/RUNTIME_API.md](docs/RUNTIME_API.md)
