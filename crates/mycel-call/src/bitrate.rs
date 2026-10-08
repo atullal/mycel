@@ -3,7 +3,8 @@
 //!
 //! Every path has a ceiling: fast local paths 32 kbps, the internet relay
 //! 24 kbps, Bluetooth LE 12 kbps (its real throughput is ~15–60 KB/s shared
-//! with everything else; 12 kbps Opus is ~1.5 KB/s, ~4 KB/s with headers).
+//! with everything else; 12 kbps Opus is ~1.5 KB/s, ~4 KB/s with headers);
+//! other media by their typical throughput (UWB 24, 802.15.4 12).
 //! A path change jumps straight to the new ceiling. Loss or a very high RTT
 //! steps down multiplicatively; a clean stretch steps back up slowly.
 
@@ -19,6 +20,10 @@ pub fn ceiling(kind: PathKind) -> u32 {
         // mesh hops may be Bluetooth: start lower; loss and RTT steer it from there
         PathKind::Relay | PathKind::Mesh => 24_000,
         PathKind::Bluetooth => 12_000,
+        // any other medium, by what it typically carries
+        other if other.prior_rate() >= 1_000_000.0 => 32_000,
+        other if other.prior_rate() >= 100_000.0 => 24_000,
+        _ => 12_000,
     }
 }
 

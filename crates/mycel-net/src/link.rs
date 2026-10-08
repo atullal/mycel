@@ -1,5 +1,6 @@
-//! Links: extra, non-IP paths between devices, carried as Iroh custom
-//! transports (Apple peer-to-peer Wi-Fi, Bluetooth LE, ...).
+//! Links: extra paths between devices, carried as Iroh custom transports
+//! (Apple peer-to-peer Wi-Fi, Bluetooth LE, any other network interface such
+//! as UWB / 802.15.4, Wi-Fi Direct or a cable, ...).
 //!
 //! A link moves opaque QUIC packets between two devices and announces which
 //! devices it can currently reach. Everything above it is unchanged: the same
@@ -36,12 +37,18 @@ pub use noq_udp;
 /// Custom transport ids (Iroh `CustomAddr::id`). "myc" + a link number.
 pub const TRANSPORT_PEER_WIFI: u64 = 0x6d79_6301;
 pub const TRANSPORT_BLUETOOTH: u64 = 0x6d79_6302;
+/// Any network interface (`mycel-link-iface`): the address carries the
+/// medium, see [`PathKind::of_custom_addr`].
+pub const TRANSPORT_IFACE: u64 = 0x6d79_6320;
 /// Multi-hop mesh (`mesh.rs`): QUIC packets relayed by other devices.
 pub const TRANSPORT_MESH: u64 = 0x6d79_6303;
 /// In-memory links for tests ([`MemNet`]) pick their own ids.
 pub const TRANSPORT_TEST_BASE: u64 = 0x6d79_63f0;
 
-/// What kind of path a packet travels on, for path selection and the UI.
+/// The medium a path travels over, for the UI and as a starting guess for
+/// path selection. Selection itself ranks paths by what they measure (RTT,
+/// throughput), so a new kind of radio needs no special case: only a prior
+/// ([`PathKind::prior_rate`]) until it has carried traffic.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum PathKind {
@@ -53,25 +60,74 @@ pub enum PathKind {
     Bluetooth,
     /// Through an internet relay server (end-to-end encrypted).
     Relay,
-    /// Relayed hop by hop by other nearby devices, over whatever links they
-    /// have (end-to-end encrypted; see `mesh.rs`).
+    /// A Wi-Fi Direct (Wi-Fi P2P) group, e.g. a Linux `p2p-*` interface.
+    WifiDirect,
+    /// An ultra-wideband radio (IEEE 802.15.4z HRP).
+    Uwb,
+    /// A low-power IEEE 802.15.4 radio: Thread, 6LoWPAN.
+    Ieee802154,
+    /// A cable: Ethernet, Thunderbolt or USB bridge.
+    Ethernet,
+    /// Any other network interface (802.11s or ad-hoc Wi-Fi mesh, ...); the
+    /// link's status names it.
+    Other,
+    /// Relayed hop by hop by other nearby Mycel devices, over whatever links
+    /// they have (end-to-end encrypted; see `mesh.rs`).
     Mesh,
 }
 
 impl PathKind {
+    /// Every kind, in a stable order (wire codes are indexes into this).
+    pub const ALL: [PathKind; 10] = [
+        PathKind::Network,
+        PathKind::PeerWifi,
+        PathKind::Bluetooth,
+        PathKind::Relay,
+        PathKind::WifiDirect,
+        PathKind::Uwb,
+        PathKind::Ieee802154,
+        PathKind::Ethernet,
+        PathKind::Other,
+        PathKind::Mesh,
+    ];
+
+    /// One-byte code carried in link addresses.
+    pub fn code(self) -> u8 {
+        PathKind::ALL.iter().position(|k| *k == self).expect("listed") as u8
+    }
+
+    /// Unknown codes (a newer peer) read as [`PathKind::Other`].
+    pub fn from_code(code: u8) -> PathKind {
+        PathKind::ALL.get(code as usize).copied().unwrap_or(PathKind::Other)
+    }
+
     pub fn of_custom(id: u64) -> PathKind {
         match id {
             TRANSPORT_BLUETOOTH => PathKind::Bluetooth,
+            TRANSPORT_IFACE => PathKind::Other,
             TRANSPORT_MESH => PathKind::Mesh,
             // test links pretend to be peer Wi-Fi unless they use the BT id
             _ => PathKind::PeerWifi,
         }
     }
 
+    /// The medium of a link address. Links whose transport carries several
+    /// media (network interfaces, test links) put its code in the first
+    /// byte (iface) or the byte after the node key (test links).
+    pub fn of_custom_addr(addr: &CustomAddr) -> PathKind {
+        match addr.id() {
+            TRANSPORT_IFACE => addr.data().first().map_or(PathKind::Other, |c| PathKind::from_code(*c)),
+            id if (TRANSPORT_TEST_BASE..TRANSPORT_TEST_BASE + 16).contains(&id) && addr.data().len() == 33 => {
+                PathKind::from_code(addr.data()[32])
+            }
+            id => PathKind::of_custom(id),
+        }
+    }
+
     pub fn of(addr: &TransportAddr) -> PathKind {
         match addr {
             TransportAddr::Relay(_) => PathKind::Relay,
-            TransportAddr::Custom(c) => PathKind::of_custom(c.id()),
+            TransportAddr::Custom(c) => PathKind::of_custom_addr(c),
             _ => PathKind::Network,
         }
     }
@@ -80,22 +136,33 @@ impl PathKind {
         match addr {
             Addr::Ip(_) => PathKind::Network,
             Addr::Relay(..) => PathKind::Relay,
-            Addr::Custom(c) => PathKind::of_custom(c.id()),
+            Addr::Custom(c) => PathKind::of_custom_addr(c),
         }
     }
 
-    /// Lower is preferred. Fast local paths compete on RTT; the relay needs
-    /// the internet and a third party; Bluetooth is the slowest, so it only
-    /// carries traffic when nothing else works. The mesh shares the relay's
-    /// tier: both are someone else forwarding ciphertext, so measured RTT
-    /// decides between them (and comparable ones aggregate). A mesh path
-    /// never competes with a direct one: it only exists to devices with no
-    /// direct link (`mesh.rs`).
-    fn tier(self) -> u8 {
+    /// What this medium typically delivers, in bytes per second: path
+    /// selection's guess until the path has been measured. Rough on purpose;
+    /// measurements replace it (see [`MycelPathSelector`]).
+    pub fn prior_rate(self) -> f64 {
+        const KB: f64 = 1000.0;
+        const MB: f64 = 1_000_000.0;
         match self {
-            PathKind::Network | PathKind::PeerWifi => 0,
-            PathKind::Relay | PathKind::Mesh => 1,
-            PathKind::Bluetooth => 2,
+            PathKind::Ethernet => 100.0 * MB,
+            PathKind::Network => 50.0 * MB,
+            PathKind::PeerWifi | PathKind::WifiDirect => 25.0 * MB,
+            // a shared server on the internet
+            PathKind::Relay => 2.0 * MB,
+            PathKind::Other => 1.0 * MB,
+            // 6.8 Mbit/s HRP UWB
+            PathKind::Uwb => 600.0 * KB,
+            // BLE L2CAP in practice
+            PathKind::Bluetooth => 30.0 * KB,
+            // 250 kbit/s, 6LoWPAN headers and mesh-under hops
+            PathKind::Ieee802154 => 15.0 * KB,
+            // at least two hops over links we don't know: below the relay
+            // until measured. (A mesh path never competes with a direct one:
+            // devices with a direct path get no mesh addresses.)
+            PathKind::Mesh => 500.0 * KB,
         }
     }
 
@@ -105,6 +172,11 @@ impl PathKind {
             PathKind::PeerWifi => "Peer-to-peer Wi-Fi",
             PathKind::Bluetooth => "Bluetooth",
             PathKind::Relay => "Internet relay",
+            PathKind::WifiDirect => "Wi-Fi Direct",
+            PathKind::Uwb => "UWB",
+            PathKind::Ieee802154 => "Thread / 802.15.4",
+            PathKind::Ethernet => "Cable",
+            PathKind::Other => "Other link",
             PathKind::Mesh => "Mesh",
         }
     }
@@ -115,6 +187,10 @@ impl PathKind {
 #[serde(rename_all = "camelCase")]
 pub struct LinkStatus {
     pub kind: PathKind,
+    /// What exactly this is, when the kind alone doesn't say ("802.11s mesh
+    /// on mesh0", "wpan0").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
     /// Working: advertising and discovering.
     pub active: bool,
     /// Why it isn't working, in words a user can act on ("Bluetooth is off").
@@ -144,6 +220,11 @@ pub trait Link: Send + Sync + 'static {
     /// The display name changed (some links advertise it).
     fn set_name(&self, _name: &str) {}
     fn status(&self) -> LinkStatus;
+    /// One status per medium, for links that drive several (one per network
+    /// interface kind).
+    fn statuses(&self) -> Vec<LinkStatus> {
+        vec![self.status()]
+    }
     /// Stop advertising and release the radio.
     fn stop(&self) {}
 }
@@ -174,8 +255,19 @@ const STREAM_WINDOW: u32 = 8 * 1024 * 1024;
 /// Whole-connection receive / send window.
 const CONN_WINDOW: u32 = 32 * 1024 * 1024;
 
-/// Within a tier, only switch when the new path is this much faster.
+/// Paths are ranked by the time a typical exchange of this many bytes takes
+/// on them: RTT + size / throughput. Big enough that throughput matters (the
+/// relay beats Bluetooth even when Bluetooth answers faster), small enough
+/// that RTT still decides between fast paths.
+const REF_BYTES: f64 = 64.0 * 1024.0;
+/// Only switch when the new path is this much cheaper (no flapping on jitter).
 const RTT_SWITCH_MIN: Duration = Duration::from_millis(5);
+/// The RTT is above `2 × base + this` while a path is busy: its queue is
+/// growing, so what it delivers now is what it can deliver.
+const QUEUE_SLACK: Duration = Duration::from_millis(10);
+/// ... judged only while it carries traffic (in use, and more than the
+/// probes every path gets: an idle path's RTT says nothing about its rate).
+const BUSY_MIN: f64 = 2_000.0;
 /// Direct IPv6 gets the same small edge Iroh's default selector gives it.
 const IPV6_ADVANTAGE: Duration = Duration::from_millis(3);
 /// A path joins the aggregate only while its base RTT is within this factor
@@ -222,6 +314,9 @@ struct PathHealth {
     at: Instant,
     /// Bytes per second over the last sample.
     rate: f64,
+    /// Estimated throughput: the medium's prior, raised by any faster
+    /// sample, lowered towards what it delivers while its queue grows.
+    capacity: f64,
     /// It was Available after the last selection.
     aggregated: bool,
     slow_until: Option<Instant>,
@@ -243,6 +338,7 @@ impl PathHealth {
             delivered: c.delivered,
             at: now,
             rate: 0.0,
+            capacity: PathKind::of_addr(&c.data.network_path().remote()).prior_rate(),
             aggregated: false,
             slow_until: None,
             slow_pause: AGG_SLOW_PAUSE,
@@ -282,16 +378,34 @@ impl PathHealth {
         if span >= 0.5 {
             self.rate = (c.delivered - self.delivered) as f64 / span;
             (self.delivered, self.at) = (c.delivered, now);
+            if self.rate > self.capacity {
+                self.capacity = self.rate;
+            } else if self.aggregated && self.rate >= BUSY_MIN && c.rtt > self.base_rtt * 2 + QUEUE_SLACK {
+                // saturated: this is about all it carries
+                self.capacity = 0.5 * (self.capacity + self.rate);
+            }
         }
     }
+
+    /// Time a [`REF_BYTES`] exchange takes on this path, in nanoseconds.
+    fn cost(&self, rtt: Duration) -> i128 {
+        cost(rtt, self.capacity)
+    }
+}
+
+fn cost(rtt: Duration, capacity: f64) -> i128 {
+    rtt.as_nanos() as i128 + (REF_BYTES / capacity.max(1.0) * 1e9) as i128
 }
 
 /// Picks the paths each connection sends on.
 ///
-/// The *selected* path is the fastest of the local paths (network,
-/// peer-to-peer Wi-Fi), else the relay, else Bluetooth. Sticky within a tier
-/// so jitter doesn't flap between paths; across tiers it moves immediately
-/// (e.g. back from Bluetooth the moment Wi-Fi returns).
+/// The *selected* path is the one where a typical exchange (64 KiB) finishes
+/// first: its RTT plus 64 KiB at its estimated throughput. The throughput
+/// starts as the medium's prior ([`PathKind::prior_rate`]: cable > Wi-Fi >
+/// relay > UWB > Bluetooth > 802.15.4) and follows what the path delivers,
+/// so any radio ranks itself by what it measures. Sticky (a switch needs a
+/// 5 ms gain) so jitter doesn't flap between paths, yet moving between very
+/// different paths is immediate (back from Bluetooth the moment Wi-Fi returns).
 ///
 /// Every other healthy path that is not much slower is marked *Available*
 /// too (Mycel's Iroh patch, `PathSelection::also_use`); noq's multipath
@@ -300,7 +414,8 @@ impl PathHealth {
 /// every second. A path stays a Backup when it would hold the others back
 /// (a stream's bytes are delivered in order, so a slow path delays the
 /// fast one: head-of-line blocking):
-/// - Bluetooth: always a backup unless it is the only path;
+/// - estimated throughput under 1/8 of the selected path's (Bluetooth or
+///   802.15.4 next to Wi-Fi): only a backup unless it is the only path;
 /// - base RTT (lowest seen) above `max(3 × selected, selected + 15 ms)`;
 ///   this also keeps the relay out on a LAN;
 /// - delivering under 1/8 of the selected path's rate while that one is
@@ -320,14 +435,17 @@ pub struct MycelPathSelector {
 }
 
 impl MycelPathSelector {
-    fn key(path: &FourTuple, rtt: Duration) -> (u8, i128) {
+    /// Lower is better.
+    fn key(path: &FourTuple, rtt: Duration, health: Option<&PathHealth>) -> i128 {
         let remote = path.remote();
-        let kind = PathKind::of_addr(&remote);
-        let mut biased = rtt.as_nanos() as i128;
+        let mut c = match health {
+            Some(h) => h.cost(rtt),
+            None => cost(rtt, PathKind::of_addr(&remote).prior_rate()),
+        };
         if matches!(remote, Addr::Ip(a) if a.is_ipv6()) {
-            biased -= IPV6_ADVANTAGE.as_nanos() as i128;
+            c -= IPV6_ADVANTAGE.as_nanos() as i128;
         }
-        (kind.tier(), biased)
+        c
     }
 
     /// The local interface an IP path leaves through (its name, or the
@@ -396,20 +514,37 @@ impl PathSelector for MycelPathSelector {
         let live: Vec<&Candidate<'_>> = cands.iter().filter(alive).collect();
         let pool: Vec<&Candidate<'_>> = if live.is_empty() { cands.iter().collect() } else { live };
         let current = pool.iter().copied().find(|c| Some(c.data.network_path()) == ctx.current());
-        let Some(best) = pool.iter().copied().min_by_key(|c| Self::key(c.data.network_path(), c.rtt)) else {
+        let key = |c: &Candidate<'_>| Self::key(c.data.network_path(), c.rtt, health.get(c.data.network_path()));
+        let Some(best) = pool.iter().copied().min_by_key(|c| key(c)) else {
             return selection;
         };
-        let (tier, rtt) = Self::key(best.data.network_path(), best.rtt);
-        let primary = match current.map(|c| (c, Self::key(c.data.network_path(), c.rtt))) {
-            Some((c, (ct, crtt))) if ct == tier && rtt + (RTT_SWITCH_MIN.as_nanos() as i128) > crtt => c,
+        let primary = match current {
+            Some(c) if key(best) + (RTT_SWITCH_MIN.as_nanos() as i128) > key(c) => c,
             _ => best,
         };
         selection.set(&primary.data);
+        if path_debug() {
+            for c in &cands {
+                let h = health.get(c.data.network_path());
+                eprintln!(
+                    "[path] {} rtt {:?} base {:?} rate {:.0} cap {:.0} cost {:.1} ms{}",
+                    PathKind::of_addr(&c.data.network_path().remote()).label(),
+                    c.rtt,
+                    h.map(|h| h.base_rtt),
+                    h.map_or(0.0, |h| h.rate),
+                    h.map_or(0.0, |h| h.capacity),
+                    key(c) as f64 / 1e6,
+                    if c.data.network_path() == primary.data.network_path() { " *" } else { "" }
+                );
+            }
+        }
         let primary_path = primary.data.network_path();
-        let (p_base, p_rate) = health.get(primary_path).map_or((primary.rtt, 0.0), |h| (h.base_rtt, h.rate));
+        let prior = |p: &FourTuple| PathKind::of_addr(&p.remote()).prior_rate();
+        let (p_base, p_rate, p_cap) = health
+            .get(primary_path)
+            .map_or((primary.rtt, 0.0, prior(primary_path)), |h| (h.base_rtt, h.rate, h.capacity));
 
         // Aggregation: more Available paths next to the selected one.
-        let aggregate = PathKind::of_addr(&primary_path.remote()) != PathKind::Bluetooth;
         let limit = (p_base * AGG_RTT_FACTOR).max(p_base + AGG_RTT_SLACK);
         let mut used_ifaces: Vec<String> = Vec::new();
         let mut used_remotes: Vec<IpAddr> = Vec::new();
@@ -438,8 +573,7 @@ impl PathSelector for MycelPathSelector {
             }
             // (A stale path keeps its status: demoting it before its idle
             // timeout closes it only delays resending what is in flight on it.)
-            let ok = aggregate
-                && PathKind::of_addr(&path.remote()) != PathKind::Bluetooth
+            let ok = h.capacity * AGG_RATE_RATIO >= p_cap
                 && h.base_rtt <= limit
                 && !h.lossy
                 && h.slow_until.is_none_or(|t| now >= t)
@@ -454,6 +588,12 @@ impl PathSelector for MycelPathSelector {
         }
         selection
     }
+}
+
+/// `MYCEL_PATH_DEBUG=1`: log every path's estimates at each selection.
+fn path_debug() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MYCEL_PATH_DEBUG").is_ok_and(|v| v == "1"))
 }
 
 /// Local IP → interface name (`en0`, `bridge0`, `lo0`, ...).
@@ -593,13 +733,16 @@ impl MemNet {
         Arc::new(MemLink { net: self.clone(), me, rx: Arc::new(tokio::sync::Mutex::new(rx)) })
     }
 
-    /// The address `pk` has on this link.
+    /// The address `pk` has on this link: the key, then the medium's code
+    /// (so [`PathKind::of_custom_addr`] knows what this link pretends to be).
     pub fn addr_of(&self, pk: &SignPk) -> CustomAddr {
-        CustomAddr::from_parts(self.id, &pk.0)
+        let mut data = pk.0.to_vec();
+        data.push(self.kind.code());
+        CustomAddr::from_parts(self.id, &data)
     }
 
     fn parse(&self, a: &CustomAddr) -> Option<SignPk> {
-        (a.id() == self.id).then(|| a.data().try_into().ok().map(SignPk)).flatten()
+        (a.id() == self.id).then(|| a.data().get(..32)?.try_into().ok().map(SignPk)).flatten()
     }
 }
 
@@ -638,6 +781,7 @@ impl Link for MemLink {
         let up = !self.net.down.load(Ordering::SeqCst);
         LinkStatus {
             kind: self.net.kind,
+            label: None,
             active: up,
             detail: None,
             peers: if up { self.net.inner.lock().started.len().saturating_sub(1) } else { 0 },
@@ -786,5 +930,44 @@ impl CustomSender for MemSender {
             }
         }
         Poll::Ready(Ok(()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn medium_codes_round_trip() {
+        for k in PathKind::ALL {
+            assert_eq!(PathKind::from_code(k.code()), k);
+        }
+        assert_eq!(PathKind::from_code(200), PathKind::Other, "a newer peer's medium");
+    }
+
+    #[test]
+    fn medium_of_link_addresses() {
+        let iface = |k: PathKind| CustomAddr::from_parts(TRANSPORT_IFACE, &[k.code(), 1, 2, 3]);
+        assert_eq!(PathKind::of_custom_addr(&iface(PathKind::Uwb)), PathKind::Uwb);
+        assert_eq!(PathKind::of_custom_addr(&iface(PathKind::WifiDirect)), PathKind::WifiDirect);
+        assert_eq!(PathKind::of_custom_addr(&CustomAddr::from_parts(TRANSPORT_IFACE, &[])), PathKind::Other);
+        assert_eq!(PathKind::of_custom_addr(&CustomAddr::from_parts(TRANSPORT_PEER_WIFI, &[0; 32])), PathKind::PeerWifi);
+        assert_eq!(PathKind::of_custom_addr(&CustomAddr::from_parts(TRANSPORT_BLUETOOTH, &[0; 32])), PathKind::Bluetooth);
+        let net = MemNet::new(3, PathKind::Ieee802154);
+        let pk = SignPk([7; 32]);
+        assert_eq!(PathKind::of_custom_addr(&net.addr_of(&pk)), PathKind::Ieee802154);
+        assert_eq!(net.parse(&net.addr_of(&pk)), Some(pk));
+    }
+
+    #[test]
+    fn priors_order_media_by_what_they_carry() {
+        let ms = Duration::from_millis;
+        // a 64 KiB exchange: the relay beats Bluetooth even with 5x its RTT
+        assert!(cost(ms(100), PathKind::Relay.prior_rate()) < cost(ms(20), PathKind::Bluetooth.prior_rate()));
+        assert!(cost(ms(10), PathKind::Uwb.prior_rate()) < cost(ms(10), PathKind::Ieee802154.prior_rate()));
+        // between fast paths, RTT decides
+        assert!(cost(ms(2), PathKind::PeerWifi.prior_rate()) < cost(ms(9), PathKind::Ethernet.prior_rate()));
+        // labels for every medium
+        assert!(PathKind::ALL.iter().all(|k| !k.label().is_empty()));
     }
 }

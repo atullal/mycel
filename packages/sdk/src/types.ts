@@ -119,11 +119,31 @@ export type NetworkMode = "local" | "lan" | "internet";
  * - `relay`: through an encrypted internet relay
  * - `mesh`: relayed hop by hop by other nearby Mycel devices (they can't read it)
  */
-export type PathKind = "network" | "peerWifi" | "bluetooth" | "relay" | "mesh";
+/**
+ * The medium a path travels over. Path selection ranks paths by what they
+ * measure, so any of these can carry traffic; the kind is for display.
+ * - `wifiDirect`: a Wi-Fi Direct (or Wi-Fi Aware) group
+ * - `uwb`: an ultra-wideband radio; `ieee802154`: Thread / 6LoWPAN
+ * - `ethernet`: a cable (Ethernet, Thunderbolt or USB bridge)
+ * - `other`: any other network interface (see `LinkStatus.label`)
+ */
+export type PathKind =
+  | "network"
+  | "peerWifi"
+  | "bluetooth"
+  | "relay"
+  | "wifiDirect"
+  | "uwb"
+  | "ieee802154"
+  | "ethernet"
+  | "other"
+  | "mesh";
 
-/** A non-IP link (peer-to-peer Wi-Fi, Bluetooth). */
+/** A link: peer-to-peer Wi-Fi, Bluetooth, or one kind of network interface. */
 export interface LinkStatus {
   kind: PathKind;
+  /** Which interfaces, for interface links ("lowpan0", "p2p-wlan0-0"). */
+  label?: string | null;
   active: boolean;
   /** Why it isn't working, in actionable words. */
   detail: string | null;

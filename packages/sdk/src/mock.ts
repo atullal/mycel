@@ -895,6 +895,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       links: [
         { kind: "peerWifi", active: true, detail: null, peers: 1 },
         { kind: "bluetooth", active: true, detail: null, peers: 1 },
+        { kind: "ethernet", label: "bridge0", active: true, detail: null, peers: 0 },
         { kind: "mesh", active: true, detail: "2 nearby, relaying for others", peers: 1 },
       ],
       peers: [...people.values()]

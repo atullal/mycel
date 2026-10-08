@@ -149,6 +149,7 @@ mod unavailable {
         fn status(&self) -> LinkStatus {
             LinkStatus {
                 kind: PathKind::PeerWifi,
+                label: None,
                 active: false,
                 detail: Some("Peer-to-peer Wi-Fi is only available on Apple devices".into()),
                 peers: 0,

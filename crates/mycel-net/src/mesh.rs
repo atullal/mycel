@@ -1232,6 +1232,7 @@ impl Link for Mesh {
         let neighbours = st.neighbours.values().filter(|n| n.live().is_some()).count();
         LinkStatus {
             kind: PathKind::Mesh,
+            label: None,
             active: self.core.endpoint.get().is_some() && !self.core.stopped.load(Ordering::Relaxed),
             detail: Some(match (neighbours, self.core.opts.relay) {
                 (0, _) => "No Mycel devices nearby to relay through".into(),
