@@ -283,13 +283,15 @@ impl Inner {
     }
 
     /// A link found or lost a peer: update the addresses Iroh may dial and
-    /// sync shared spaces with a newly reachable peer.
-    fn on_link_event(self: &Arc<Self>, kind: PathKind, ev: LinkEvent) {
+    /// sync shared spaces with a newly reachable peer. The medium comes from
+    /// the address (one link can drive several: network interfaces).
+    fn on_link_event(self: &Arc<Self>, ev: LinkEvent) {
         let (peer, newly) = match ev {
             LinkEvent::Found { peer, addr, name } => {
                 if peer == self.keys.sign_pk() {
                     return;
                 }
+                let kind = PathKind::of_custom_addr(&addr);
                 self.link_addrs.lock().entry(peer).or_default().insert(addr);
                 let mut peers = self.peers.lock();
                 let p = peers.entry(peer).or_default();
@@ -301,10 +303,11 @@ impl Inner {
                 (peer, newly)
             }
             LinkEvent::Lost { peer, addr } => {
+                let kind = PathKind::of_custom_addr(&addr);
                 let mut map = self.link_addrs.lock();
                 if let Some(set) = map.get_mut(&peer) {
                     set.remove(&addr);
-                    let still = set.iter().any(|a| PathKind::of_custom(a.id()) == kind);
+                    let still = set.iter().any(|a| PathKind::of_custom_addr(a) == kind);
                     if set.is_empty() {
                         map.remove(&peer);
                     }
@@ -961,7 +964,7 @@ impl Node {
             let inner = inner.clone();
             tasks.push(tokio::spawn(async move {
                 while let Some(ev) = rx.recv().await {
-                    inner.on_link_event(kind, ev);
+                    inner.on_link_event(ev);
                 }
             }));
         }
@@ -1020,9 +1023,10 @@ impl Node {
         self.inner.memory.add_endpoint_info(addr);
     }
 
-    /// Health of each link (peer-to-peer Wi-Fi, Bluetooth).
+    /// Health of each link (peer-to-peer Wi-Fi, Bluetooth, each kind of
+    /// network interface).
     pub fn link_status(&self) -> Vec<LinkStatus> {
-        self.inner.links.iter().map(|l| l.status()).collect()
+        self.inner.links.iter().flat_map(|l| l.statuses()).collect()
     }
 
     pub fn set_name(&self, name: &str) {

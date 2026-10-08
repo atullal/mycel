@@ -162,7 +162,7 @@ impl Link for BleLink {
         let detail = radio_detail(&radio, in_app())
             .or_else(|| self.hub.problem())
             .or_else(|| if on { connecting_detail(self.hub.connecting(), peers) } else { None });
-        LinkStatus { kind: PathKind::Bluetooth, active: on, detail, peers }
+        LinkStatus { kind: PathKind::Bluetooth, label: None, active: on, detail, peers }
     }
 
     fn stop(&self) {
