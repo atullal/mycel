@@ -371,6 +371,12 @@ async fn run_outgoing(mgr: Arc<Mgr>, call: Arc<Call>, nonce: [u8; 16], mut cmd_r
             r = &mut dial => break r,
             cmd = cmd_rx.recv() => match cmd {
                 Some(Cmd::Mute(_)) => continue,
+                Some(Cmd::Replaced) => {
+                    // they called us at the same moment and their call won
+                    call.state.lock().apply(Input::RemoteGlare, Instant::now());
+                    finish(&mgr, &call, None).await;
+                    return;
+                }
                 _ => {
                     // hung up while still dialing
                     call.state.lock().apply(Input::LocalHangUp, Instant::now());
