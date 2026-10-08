@@ -7,7 +7,15 @@
 //! keepers), and everything received is re-validated by the receiving
 //! `Replica` — nothing is trusted because of who sent it.
 //!
-//! Sync protocol (ALPN `mycel/sync/1`), one bi-stream, strictly alternating so
+//! Connections: one ALPN ([`wire::ALPN`]), and a long-lived connection per
+//! peer from a small connection pool (`pool.rs`; closed after [`POOL_IDLE`]
+//! without use, redialed when it breaks). Every exchange is a new QUIC stream on it, labelled by a
+//! [`wire::StreamKind`] byte; the server accepts streams in a loop. QUIC does
+//! the multiplexing, flow control and loss recovery; stream priorities send
+//! messages ahead of file bytes. No handshake per sync, and the connection's
+//! extra paths (links, other interfaces) stay open and measured.
+//!
+//! Sync protocol (stream kind `Sync`), one bi-stream, strictly alternating so
 //! neither side can deadlock on flow control:
 //!
 //! ```text
@@ -18,12 +26,14 @@
 //! ```
 
 mod blobs;
+mod pool;
 pub mod link;
 pub mod wire;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // parking_lot: no lock poisoning, so a panic can't wedge the whole node.
 use parking_lot::Mutex;
@@ -33,10 +43,11 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, PublicKey, SecretKey,
     address_lookup::{MemoryLookup, UserData},
-    endpoint::{Connection, presets},
+    endpoint::{Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
+use pool::{Pool, PooledConn};
 use mycel_crypto::{DeviceKeys, Hash32, SignPk};
 use mycel_sync::{EnvelopeId, FeedValidator, Replica, Store};
 use mycel_trust::{Role, SignedOp, SpaceId};
@@ -49,11 +60,15 @@ pub use link::{Link, LinkEvent, LinkStatus, PathKind};
 pub use wire::ContactCard;
 use wire::*;
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+/// A pooled connection unused (no stream open from our side) this long is closed.
+pub const POOL_IDLE: Duration = Duration::from_secs(60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 const PERIODIC_SYNC: Duration = Duration::from_secs(15);
 const ONLINE_WINDOW: Duration = Duration::from_secs(45);
-const DEBOUNCE: Duration = Duration::from_millis(80);
+/// Changes are pushed this long after they happen (coalescing a burst). Short:
+/// a sync is one stream on a pooled connection, no handshake.
+const DEBOUNCE: Duration = Duration::from_millis(5);
 /// Max membership ops accepted in a pushed invite.
 const MAX_INVITE_OPS: usize = 4096;
 
@@ -61,7 +76,7 @@ fn to_sign_pk(pk: &PublicKey) -> SignPk {
     SignPk(*pk.as_bytes())
 }
 
-fn to_endpoint_id(pk: &SignPk) -> Result<EndpointId> {
+pub(crate) fn to_endpoint_id(pk: &SignPk) -> Result<EndpointId> {
     Ok(PublicKey::from_bytes(&pk.0)?)
 }
 
@@ -201,8 +216,24 @@ struct Inner {
     /// Spaces needing a push to all members; `None` key = everything (periodic).
     dirty: Mutex<HashSet<SpaceId>>,
     wake: Notify,
-    inflight: Mutex<HashSet<(SignPk, SpaceId)>>,
+    /// Syncs running now; `true` = something changed meanwhile, run again.
+    inflight: Mutex<HashMap<(SignPk, SpaceId), bool>>,
     sync_slots: Semaphore,
+    /// Outgoing connections, one per peer, reused for every exchange.
+    pool: Pool,
+    /// Connections accepted from peers (each one is a QUIC handshake).
+    accepted: AtomicU64,
+    /// Blob bytes served to fetching members.
+    blob_served: AtomicU64,
+}
+
+/// How many QUIC connections (handshakes) a node has made.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ConnectionCounts {
+    /// Dialed by us (through the pool).
+    pub dialed: u64,
+    /// Accepted from peers.
+    pub accepted: u64,
 }
 
 impl Inner {
@@ -403,31 +434,77 @@ impl ProtocolHandler for Forward {
 #[derive(Clone)]
 struct Handler {
     inner: Arc<Inner>,
-    alpn: &'static [u8],
 }
 
 impl std::fmt::Debug for Handler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Handler({})", String::from_utf8_lossy(self.alpn))
+        write!(f, "Handler(mycel)")
     }
 }
 
 impl ProtocolHandler for Handler {
     async fn accept(&self, conn: Connection) -> std::result::Result<(), AcceptError> {
-        let res = match self.alpn {
-            ALPN_SYNC => serve_sync(&self.inner, conn).await,
-            ALPN_CARD => serve_card(&self.inner, conn).await,
-            ALPN_EPH => serve_eph(&self.inner, conn).await,
-            ALPN_BLOB => blobs::serve(&self.inner, conn).await,
-            _ => Err(anyhow!("unknown alpn")),
-        };
-        res.map_err(|e| AcceptError::from_boxed(e.into()))
+        serve_conn(&self.inner, conn).await;
+        Ok(())
     }
 }
 
-async fn serve_sync(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
+/// Serve every stream a peer opens on one connection, for as long as it
+/// lives: each stream is one exchange, handled concurrently with the others.
+async fn serve_conn(inner: &Arc<Inner>, conn: Connection) {
+    inner.accepted.fetch_add(1, Ordering::Relaxed);
     let peer = to_sign_pk(&conn.remote_id());
-    let (mut tx, mut rx) = conn.accept_bi().await?;
+    loop {
+        tokio::select! {
+            bi = conn.accept_bi() => {
+                let Ok((tx, rx)) = bi else { break };
+                let (inner, conn) = (inner.clone(), conn.clone());
+                tokio::spawn(async move {
+                    let _ = serve_bi(&inner, &conn, peer, tx, rx).await;
+                });
+            }
+            uni = conn.accept_uni() => {
+                let Ok(rx) = uni else { break };
+                let inner = inner.clone();
+                tokio::spawn(async move {
+                    let _ = serve_uni(&inner, peer, rx).await;
+                });
+            }
+        }
+    }
+}
+
+async fn stream_kind(rx: &mut RecvStream) -> Result<StreamKind> {
+    let mut b = [0u8; 1];
+    rx.read_exact(&mut b).await?;
+    StreamKind::from_byte(b[0]).ok_or_else(|| anyhow!("unknown stream kind {}", b[0]))
+}
+
+async fn serve_bi(inner: &Arc<Inner>, conn: &Connection, peer: SignPk, tx: SendStream, mut rx: RecvStream) -> Result<()> {
+    let kind = stream_kind(&mut rx).await?;
+    tx.set_priority(kind.priority()).ok();
+    match kind {
+        StreamKind::Sync => serve_sync(inner, conn, peer, tx, rx).await,
+        StreamKind::Card => serve_card(inner, tx).await,
+        StreamKind::Blob => blobs::serve(inner, peer, tx, rx).await,
+        StreamKind::Ephemeral => bail!("ephemeral messages use uni-streams"),
+    }
+}
+
+async fn serve_uni(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) -> Result<()> {
+    match stream_kind(&mut rx).await? {
+        StreamKind::Ephemeral => serve_eph(inner, peer, rx).await,
+        other => bail!("{other:?} needs a bi-stream"),
+    }
+}
+
+async fn serve_sync(
+    inner: &Arc<Inner>,
+    conn: &Connection,
+    peer: SignPk,
+    mut tx: SendStream,
+    mut rx: RecvStream,
+) -> Result<()> {
     let mut msg: SyncMsg = recv(&mut rx).await?;
     loop {
         let SyncMsg::Hello { space, inv, invite } = msg else {
@@ -443,7 +520,7 @@ async fn serve_sync(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
                 }
                 Some(ops) => {
                     if !accept_invite(inner, peer, space, ops) {
-                        return deny(conn, tx).await;
+                        return deny(tx).await;
                     }
                 }
             }
@@ -458,11 +535,10 @@ async fn serve_sync(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
         let Some(reply) = reply else {
             let proof = inner.with_space(&space, |r| r.revocation_proof(&peer))?;
             if proof.is_empty() {
-                return deny(conn, tx).await;
+                return deny(tx).await;
             }
             send(&mut tx, &SyncMsg::Removed { ops: proof }).await?;
             tx.finish()?;
-            let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
             return Ok(());
         };
         send(&mut tx, &reply).await?;
@@ -474,19 +550,17 @@ async fn serve_sync(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
         send(&mut tx, &SyncMsg::Data { data: out }).await?;
         tx.finish()?;
         inner.ingest(&space, peer, data, &sent);
-        inner.note_path(peer, &conn);
+        inner.note_path(peer, conn);
         inner.mark_ok(peer);
-        conn.closed().await;
         return Ok(());
     }
 }
 
-/// Tell the client no, then wait for it to hang up: closing first would
-/// race the reply and the client would only see "connection lost".
-async fn deny(conn: Connection, mut tx: iroh::endpoint::SendStream) -> Result<()> {
+/// Tell the client no. (The connection stays up: finishing the stream
+/// delivers the reply.)
+async fn deny(mut tx: SendStream) -> Result<()> {
     send(&mut tx, &SyncMsg::Denied).await?;
     tx.finish()?;
-    let _ = tokio::time::timeout(Duration::from_secs(5), conn.closed()).await;
     Ok(())
 }
 
@@ -526,20 +600,15 @@ fn accept_invite(inner: &Arc<Inner>, from: SignPk, space: SpaceId, ops: Vec<Sign
     true
 }
 
-async fn serve_card(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
-    // Server-initiated stream: a client-opened stream only exists once the
-    // client writes to it, and the client has nothing to say here.
-    let mut tx = conn.open_uni().await?;
+/// Anyone may ask for our card (it's public and self-signed).
+async fn serve_card(inner: &Arc<Inner>, mut tx: SendStream) -> Result<()> {
     let card = ContactCard::new(&inner.keys, &inner.name.lock().clone());
     send(&mut tx, &card).await?;
     tx.finish()?;
-    conn.closed().await;
     Ok(())
 }
 
-async fn serve_eph(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
-    let peer = to_sign_pk(&conn.remote_id());
-    let mut rx = conn.accept_uni().await?;
+async fn serve_eph(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) -> Result<()> {
     let msg: EphMsg = recv(&mut rx).await?;
     let data = inner.with_space(&msg.space, |r| {
         if !r.is_member(&peer) {
@@ -556,6 +625,7 @@ async fn serve_eph(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
 
 // ─────────────────────────────── client side ───────────────────────────────
 
+/// A fresh connection for another protocol ([`Node::connect`]).
 async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpn: &[u8]) -> Result<Connection> {
     let addr = inner.addr_of(peer)?;
     match tokio::time::timeout(CONNECT_TIMEOUT, inner.endpoint.connect(addr, alpn)).await {
@@ -565,13 +635,63 @@ async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpn: &[u8]) -> Result<Conne
     }
 }
 
+/// The pooled connection to `peer`, dialed if there is none. One that has
+/// already closed is dropped from the pool and redialed.
+pub(crate) async fn pooled(inner: &Arc<Inner>, peer: &SignPk) -> Result<PooledConn> {
+    inner.pool.get(peer).await
+}
+
+/// Run one exchange (`$body`, a future using `$conn`) on the pooled
+/// connection to `$peer`. If it fails because that connection died (the
+/// peer restarted, moved networks...), drop it and try once more on a
+/// freshly dialed one.
+macro_rules! on_conn {
+    ($inner:expr, $peer:expr, |$conn:ident| $body:expr) => {{
+        let mut retried = false;
+        loop {
+            let $conn = match pooled($inner, $peer).await {
+                Ok(c) => c,
+                Err(e) => break Err(e),
+            };
+            match $body.await {
+                Err(_) if !retried && $conn.close_reason().is_some() => {
+                    retried = true;
+                    drop($conn);
+                    $inner.pool.forget($peer);
+                }
+                res => break res,
+            }
+        }
+    }};
+}
+pub(crate) use on_conn;
+
+/// Open a bi-stream of `kind` (labelled and prioritised).
+pub(crate) async fn open_bi(conn: &Connection, kind: StreamKind) -> Result<(SendStream, RecvStream)> {
+    let (mut tx, rx) = conn.open_bi().await?;
+    tx.set_priority(kind.priority()).ok();
+    tx.write_all(&[kind as u8]).await?;
+    Ok((tx, rx))
+}
+
 async fn sync_session(inner: &Arc<Inner>, peer: SignPk, space: SpaceId, trust_peer: bool) -> Result<SyncStats> {
     let hello = inner.with_space(&space, |r| {
         (trust_peer || r.is_member(&peer)).then(|| (inventory(r), r.all_ops()))
     })?;
     let (inv, ops) = hello.ok_or_else(|| anyhow!("peer is not a member of this space"))?;
-    let conn = connect(inner, &peer, ALPN_SYNC).await?;
-    let (mut tx, mut rx) = conn.open_bi().await?;
+    on_conn!(inner, &peer, |conn| sync_exchange(inner, &conn, peer, space, inv.clone(), ops.clone()))
+}
+
+/// One sync session on its own stream of `conn`.
+async fn sync_exchange(
+    inner: &Arc<Inner>,
+    conn: &Connection,
+    peer: SignPk,
+    space: SpaceId,
+    inv: Inventory,
+    ops: Vec<SignedOp>,
+) -> Result<SyncStats> {
+    let (mut tx, mut rx) = open_bi(conn, StreamKind::Sync).await?;
     send(&mut tx, &SyncMsg::Hello { space, inv: inv.clone(), invite: None }).await?;
     let mut reply: SyncMsg = recv(&mut rx).await?;
     if matches!(reply, SyncMsg::NeedInvite) {
@@ -582,7 +702,6 @@ async fn sync_session(inner: &Arc<Inner>, peer: SignPk, space: SpaceId, trust_pe
         SyncMsg::Accept { inv, want } => (inv, want),
         SyncMsg::Denied => bail!("peer denied sync (we are not a member)"),
         SyncMsg::Removed { ops } => {
-            conn.close(0u32.into(), b"removed");
             let res = inner.with_space(&space, |r| r.ingest_batch(ops, vec![]))?;
             if res.changed() {
                 inner.emit(NetEvent::SpaceChanged { space });
@@ -604,21 +723,37 @@ async fn sync_session(inner: &Arc<Inner>, peer: SignPk, space: SpaceId, trust_pe
     let SyncMsg::Data { data } = recv(&mut rx).await? else {
         bail!("expected Data");
     };
-    inner.note_path(peer, &conn);
-    conn.close(0u32.into(), b"done");
+    inner.note_path(peer, conn);
     Ok(inner.ingest(&space, peer, data, &sent))
 }
 
 async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
-    if !inner.inflight.lock().insert((peer, space)) {
-        return;
+    {
+        let mut inflight = inner.inflight.lock();
+        if let Some(again) = inflight.get_mut(&(peer, space)) {
+            // One is running: it may have missed this change, so it runs once more.
+            *again = true;
+            return;
+        }
+        inflight.insert((peer, space), false);
     }
     let _slot = inner.sync_slots.acquire().await;
-    let res = tokio::time::timeout(SESSION_TIMEOUT, sync_session(&inner, peer, space, false)).await;
-    inner.inflight.lock().remove(&(peer, space));
-    match res {
-        Ok(Ok(_)) => inner.mark_ok(peer),
-        _ => inner.mark_fail(peer),
+    loop {
+        let res = tokio::time::timeout(SESSION_TIMEOUT, sync_session(&inner, peer, space, false)).await;
+        let ok = matches!(res, Ok(Ok(_)));
+        if ok {
+            inner.mark_ok(peer);
+        } else {
+            inner.mark_fail(peer);
+        }
+        let mut inflight = inner.inflight.lock();
+        match inflight.get_mut(&(peer, space)) {
+            Some(again) if *again && ok => *again = false,
+            _ => {
+                inflight.remove(&(peer, space));
+                return;
+            }
+        }
     }
 }
 
@@ -735,10 +870,7 @@ impl Node {
         // Same Ed25519 key for transport and for Mycel signatures (domain-separated).
         let secret = SecretKey::from_bytes(&keys.seed());
         let memory = MemoryLookup::new();
-        let mut alpns: Vec<Vec<u8>> = [ALPN_SYNC, ALPN_CARD, ALPN_EPH, ALPN_BLOB]
-            .iter()
-            .map(|a| a.to_vec())
-            .collect();
+        let mut alpns: Vec<Vec<u8>> = vec![ALPN.to_vec()];
         alpns.extend(opts.extra_protocols.iter().map(|p| p.alpn.clone()));
         let builder = match opts.mode {
             NetMode::Local => Endpoint::builder(presets::Minimal)
@@ -752,7 +884,7 @@ impl Node {
         let mut builder = builder
             .secret_key(secret)
             .alpns(alpns)
-            .path_selector(Arc::new(link::MycelPathSelector))
+            .path_selector(Arc::new(link::MycelPathSelector::default()))
             .transport_config(link::transport_config());
         if let Some(ud) = lan_user_data(&opts.name) {
             builder = builder.user_data_for_address_lookup(ud);
@@ -777,6 +909,7 @@ impl Node {
             None
         };
         let (events, _) = broadcast::channel(1024);
+        let pool = Pool::new(endpoint.clone());
         let inner = Arc::new(Inner {
             keys,
             mode: opts.mode,
@@ -798,16 +931,23 @@ impl Node {
             wake: Notify::new(),
             inflight: Mutex::default(),
             sync_slots: Semaphore::new(16),
+            pool,
+            accepted: AtomicU64::new(0),
+            blob_served: AtomicU64::new(0),
         });
-        let mut router = Router::builder(endpoint);
-        for alpn in [ALPN_SYNC, ALPN_CARD, ALPN_EPH, ALPN_BLOB] {
-            router = router.accept(alpn, Handler { inner: inner.clone(), alpn });
-        }
+        let mut router = Router::builder(endpoint).accept(ALPN, Handler { inner: inner.clone() });
         for p in opts.extra_protocols {
             router = router.accept(p.alpn, Forward(p.incoming));
         }
         let router = router.spawn();
         let mut tasks = vec![tokio::spawn(scheduler(inner.clone()))];
+        let reaper = inner.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                reaper.pool.reap(POOL_IDLE);
+            }
+        }));
         if let Some(mdns) = mdns {
             tasks.push(tokio::spawn(watch_mdns(inner.clone(), mdns)));
         }
@@ -988,6 +1128,20 @@ impl Node {
         res
     }
 
+    /// QUIC connections (handshakes) this node has dialed and accepted.
+    pub fn connection_counts(&self) -> ConnectionCounts {
+        ConnectionCounts {
+            dialed: self.inner.pool.dialed.load(Ordering::Relaxed),
+            accepted: self.inner.accepted.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Close pooled connections unused for `idle` now (the node does this
+    /// itself every few seconds with [`POOL_IDLE`]).
+    pub fn close_idle_connections(&self, idle: Duration) {
+        self.inner.pool.reap(idle);
+    }
+
     /// A connection of another protocol finished an exchange with `peer`:
     /// count it as the peer being online, and remember the path it used.
     pub fn note_connection(&self, peer: SignPk, conn: &Connection) {
@@ -999,10 +1153,12 @@ impl Node {
 
     /// Fetch a device's self-signed contact card (anyone may ask).
     pub async fn fetch_card(&self, peer: SignPk) -> Result<ContactCard> {
-        let conn = connect(&self.inner, &peer, ALPN_CARD).await?;
-        let mut rx = conn.accept_uni().await?;
-        let card: ContactCard = recv(&mut rx).await?;
-        conn.close(0u32.into(), b"done");
+        let inner = &self.inner;
+        let card: ContactCard = on_conn!(inner, &peer, |conn| async {
+            let (mut tx, mut rx) = open_bi(&conn, StreamKind::Card).await?;
+            tx.finish()?;
+            recv::<ContactCard>(&mut rx).await
+        })?;
         card.verify()?;
         if card.keys.sign_pk != peer {
             bail!("card does not belong to peer");
@@ -1036,16 +1192,15 @@ impl Node {
             let inner = self.inner.clone();
             let msg = msg.clone();
             tokio::spawn(async move {
-                let Ok(conn) = connect(&inner, &pk, ALPN_EPH).await else {
-                    return;
-                };
-                if let Ok(mut tx) = conn.open_uni().await
-                    && send(&mut tx, &*msg).await.is_ok()
-                    && tx.finish().is_ok()
-                {
-                    let _ = tx.stopped().await;
-                }
-                conn.close(0u32.into(), b"done");
+                let _ = on_conn!(&inner, &pk, |conn| async {
+                    let mut tx = conn.open_uni().await?;
+                    tx.set_priority(StreamKind::Ephemeral.priority()).ok();
+                    tx.write_all(&[StreamKind::Ephemeral as u8]).await?;
+                    send(&mut tx, &*msg).await?;
+                    tx.finish()?;
+                    tx.stopped().await?;
+                    anyhow::Ok(())
+                });
             });
         }
         Ok(())
@@ -1058,6 +1213,7 @@ impl Node {
         for l in &self.inner.links {
             l.stop();
         }
+        self.inner.pool.shutdown();
         self.router.shutdown().await?;
         Ok(())
     }

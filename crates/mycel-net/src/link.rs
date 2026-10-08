@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
@@ -19,7 +20,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use iroh::TransportAddr;
 use iroh::endpoint::transports::{
-    Addr, CustomEndpoint, CustomSender, CustomTransport, FourTuple, PathSelection, PathSelectionContext,
+    Addr, CustomEndpoint, CustomSender, CustomTransport, FourTuple, PathSelection, PathSelectionContext, PathSelectionData,
     PathSelector, RecvInfo, Transmit,
 };
 use mycel_crypto::SignPk;
@@ -138,27 +139,174 @@ pub trait Link: Send + Sync + 'static {
 
 // ───────────────────────────── path selection ─────────────────────────────
 
-/// QUIC settings for multipath failover: every path is probed often enough
-/// that a dead one (Wi-Fi network left, radio out of range) is noticed in a
-/// few seconds instead of Iroh's default 15, and traffic moves to the next.
+/// QUIC settings for multipath failover and aggregation: every path is
+/// probed often enough that a dead one (Wi-Fi network left, radio out of
+/// range) is noticed in a few seconds instead of Iroh's default 15, and
+/// traffic moves to the next.
+///
+/// Flow-control windows are raised from noq's defaults (1.25 MB per stream,
+/// sized for 100 Mbit/s at 100 ms) so one stream can fill several aggregated
+/// paths even when a loaded radio queue adds a few hundred ms of RTT. The
+/// connection-wide window caps what a peer can make us buffer.
 pub fn transport_config() -> iroh::endpoint::QuicTransportConfig {
     iroh::endpoint::QuicTransportConfig::builder()
         .default_path_keep_alive_interval(Duration::from_millis(1500))
         .default_path_max_idle_timeout(Duration::from_secs(5))
+        .stream_receive_window(STREAM_WINDOW.into())
+        .receive_window(CONN_WINDOW.into())
+        .send_window(u64::from(CONN_WINDOW))
         .build()
 }
+
+/// Per-stream receive window: 8 MiB (≈ 40 MB/s at 200 ms RTT).
+const STREAM_WINDOW: u32 = 8 * 1024 * 1024;
+/// Whole-connection receive / send window.
+const CONN_WINDOW: u32 = 32 * 1024 * 1024;
 
 /// Within a tier, only switch when the new path is this much faster.
 const RTT_SWITCH_MIN: Duration = Duration::from_millis(5);
 /// Direct IPv6 gets the same small edge Iroh's default selector gives it.
 const IPV6_ADVANTAGE: Duration = Duration::from_millis(3);
+/// A path joins the aggregate only while its base RTT is within this factor
+/// of the selected path's ...
+const AGG_RTT_FACTOR: u32 = 3;
+/// ... or within this much of it (on a LAN, 1 ms vs 4 ms is no reason to
+/// leave a fast path idle: the reordering it causes is tiny).
+const AGG_RTT_SLACK: Duration = Duration::from_millis(15);
+/// A path that delivers less than 1/8 of what the selected path does while
+/// both are busy is dropped from the aggregate for a while ...
+const AGG_RATE_RATIO: f64 = 8.0;
+/// ... (if the selected path moves at least this many bytes per second) ...
+const AGG_BUSY: f64 = 1_000_000.0;
+/// ... first for this long, doubling each time it is judged slow again.
+const AGG_SLOW_PAUSE: Duration = Duration::from_secs(30);
+const AGG_SLOW_PAUSE_MAX: Duration = Duration::from_secs(300);
+/// Leaves the aggregate above this loss rate, rejoins below the lower one.
+/// High, because congestion control itself causes loss on a full queue.
+const AGG_LOSS_MAX: f64 = 0.25;
+const AGG_LOSS_OK: f64 = 0.10;
+/// Loss is judged over at least this many packets.
+const AGG_LOSS_MIN_PACKETS: u64 = 200;
+/// The base RTT may drift up this much per second (routes change).
+const BASE_RTT_DRIFT: f64 = 0.01;
+/// Every path is pinged each second from both ends (Iroh patch), so a path
+/// that has received nothing for this long is dead (radio gone, network
+/// left) even before its idle timeout closes it.
+const STALE: Duration = Duration::from_secs(3);
 
-/// Picks the path for each connection: the fastest of the local paths
-/// (network, peer-to-peer Wi-Fi), else the relay, else Bluetooth. Sticky
-/// within a tier so jitter doesn't flap between paths; across tiers it moves
-/// immediately (e.g. back from Bluetooth the moment Wi-Fi returns).
+/// What the selector remembers about a path between selections.
+#[derive(Debug)]
+struct PathHealth {
+    /// Datagrams sent and lost at the last loss sample.
+    sent: u64,
+    lost: u64,
+    /// Smoothed loss rate.
+    loss: f64,
+    lossy: bool,
+    /// Lowest RTT seen, drifting up slowly: the path's own latency, without
+    /// the queueing delay a busy path adds.
+    base_rtt: Duration,
+    /// Bytes acknowledged (sent − lost) at the last rate sample, and when.
+    delivered: u64,
+    at: Instant,
+    /// Bytes per second over the last sample.
+    rate: f64,
+    /// It was Available after the last selection.
+    aggregated: bool,
+    slow_until: Option<Instant>,
+    slow_pause: Duration,
+    /// Datagrams received so far, and when that last went up.
+    received: u64,
+    heard: Instant,
+    seen: Instant,
+}
+
+impl PathHealth {
+    fn new(now: Instant, c: &Candidate<'_>) -> Self {
+        PathHealth {
+            sent: c.sent,
+            lost: c.lost,
+            loss: 0.0,
+            lossy: false,
+            base_rtt: c.rtt,
+            delivered: c.delivered,
+            at: now,
+            rate: 0.0,
+            aggregated: false,
+            slow_until: None,
+            slow_pause: AGG_SLOW_PAUSE,
+            received: c.received,
+            heard: now,
+            seen: now,
+        }
+    }
+
+    fn stale(&self, now: Instant) -> bool {
+        now.duration_since(self.heard) > STALE
+    }
+
+    fn update(&mut self, now: Instant, c: &Candidate<'_>) {
+        let dt = now.duration_since(self.seen).as_secs_f64();
+        self.seen = now;
+        // Counters are sums over connections; one closing makes them drop.
+        if c.sent < self.sent || c.lost < self.lost || c.delivered < self.delivered {
+            (self.sent, self.lost, self.delivered, self.at) = (c.sent, c.lost, c.delivered, now);
+        }
+        if c.received != self.received {
+            (self.received, self.heard) = (c.received, now);
+        }
+        let drifted = self.base_rtt.mul_f64(1.0 + BASE_RTT_DRIFT * dt);
+        self.base_rtt = drifted.min(c.rtt);
+        let (ds, dl) = (c.sent - self.sent, c.lost - self.lost);
+        if ds >= AGG_LOSS_MIN_PACKETS {
+            self.loss = 0.5 * self.loss + 0.5 * (dl as f64 / ds as f64).min(1.0);
+            (self.sent, self.lost) = (c.sent, c.lost);
+        }
+        if self.loss > AGG_LOSS_MAX {
+            self.lossy = true;
+        } else if self.loss < AGG_LOSS_OK {
+            self.lossy = false;
+        }
+        let span = now.duration_since(self.at).as_secs_f64();
+        if span >= 0.5 {
+            self.rate = (c.delivered - self.delivered) as f64 / span;
+            (self.delivered, self.at) = (c.delivered, now);
+        }
+    }
+}
+
+/// Picks the paths each connection sends on.
+///
+/// The *selected* path is the fastest of the local paths (network,
+/// peer-to-peer Wi-Fi), else the relay, else Bluetooth. Sticky within a tier
+/// so jitter doesn't flap between paths; across tiers it moves immediately
+/// (e.g. back from Bluetooth the moment Wi-Fi returns).
+///
+/// Every other healthy path that is not much slower is marked *Available*
+/// too (Mycel's Iroh patch, `PathSelection::also_use`); noq's multipath
+/// scheduler then sends on all Available paths, each within its own
+/// congestion window, so their bandwidth adds up. Iroh re-runs selection
+/// every second. A path stays a Backup when it would hold the others back
+/// (a stream's bytes are delivered in order, so a slow path delays the
+/// fast one: head-of-line blocking):
+/// - Bluetooth: always a backup unless it is the only path;
+/// - base RTT (lowest seen) above `max(3 × selected, selected + 15 ms)`;
+///   this also keeps the relay out on a LAN;
+/// - delivering under 1/8 of the selected path's rate while that one is
+///   busy: out for 30 s, doubling up to 5 min;
+/// - more than 25 % packet loss (back in below 10 %);
+/// - a second IP path out of the same local interface or to the same remote
+///   address (IPv4 and IPv6 over one Wi-Fi are one radio). Distinct
+///   interfaces (Ethernet, Thunderbolt bridge, Wi-Fi) each count.
+///
+/// A path that has received nothing for 3 s (every path is pinged each
+/// second) is dead: it is not *selected* while another path lives, so Iroh
+/// doesn't keep reopening it on other connections to the peer.
 #[derive(Debug, Default)]
-pub struct MycelPathSelector;
+pub struct MycelPathSelector {
+    health: Mutex<HashMap<FourTuple, PathHealth>>,
+    ifaces: Mutex<Option<(Instant, HashMap<IpAddr, String>)>>,
+}
 
 impl MycelPathSelector {
     fn key(path: &FourTuple, rtt: Duration) -> (u8, i128) {
@@ -170,37 +318,176 @@ impl MycelPathSelector {
         }
         (kind.tier(), biased)
     }
+
+    /// The local interface an IP path leaves through (its name, or the
+    /// local IP itself when the OS doesn't say).
+    fn interface_of(&self, local: Option<IpAddr>) -> Option<String> {
+        let ip = local?;
+        let mut cache = self.ifaces.lock();
+        if cache.as_ref().is_none_or(|(t, _)| t.elapsed() > Duration::from_secs(5)) {
+            *cache = Some((Instant::now(), interface_names()));
+        }
+        let names = &cache.as_ref().expect("just filled").1;
+        Some(names.get(&ip).cloned().unwrap_or_else(|| ip.to_string()))
+    }
+}
+
+/// One candidate path, its stats summed over the connections it is on.
+struct Candidate<'a> {
+    data: PathSelectionData<'a>,
+    rtt: Duration,
+    sent: u64,
+    lost: u64,
+    /// Bytes sent and not lost.
+    delivered: u64,
+    received: u64,
 }
 
 impl PathSelector for MycelPathSelector {
     fn select(&self, ctx: &PathSelectionContext<'_>) -> PathSelection {
-        let current = ctx.current();
-        let mut best = None;
-        let mut best_key = None;
-        let mut current_key: Option<(u8, i128)> = None;
+        // The same path can be on several connections to the peer.
+        let mut cands: Vec<Candidate<'_>> = Vec::new();
         for p in ctx.paths() {
-            let Some(stats) = p.stats() else { continue };
-            let key = Self::key(p.network_path(), stats.rtt);
-            if Some(p.network_path()) == current && current_key.is_none_or(|c| key < c) {
-                current_key = Some(key);
-            }
-            if best_key.is_none_or(|b| key < b) {
-                best_key = Some(key);
-                best = Some(p);
+            let Some(s) = p.stats() else { continue };
+            let delivered = s.udp_tx.bytes.saturating_sub(s.lost_bytes);
+            match cands.iter_mut().find(|c| c.data.network_path() == p.network_path()) {
+                Some(c) => {
+                    c.rtt = c.rtt.min(s.rtt);
+                    c.sent += s.udp_tx.datagrams;
+                    c.lost += s.lost_packets;
+                    c.delivered += delivered;
+                    c.received += s.udp_rx.datagrams;
+                }
+                None => cands.push(Candidate {
+                    rtt: s.rtt,
+                    sent: s.udp_tx.datagrams,
+                    lost: s.lost_packets,
+                    delivered,
+                    received: s.udp_rx.datagrams,
+                    data: p,
+                }),
             }
         }
         let mut selection = PathSelection::none();
-        let (Some(best), Some((tier, rtt))) = (best, best_key) else {
+        let now = Instant::now();
+        let mut health = self.health.lock();
+        health.retain(|_, h| now.duration_since(h.seen) < Duration::from_secs(120));
+        for c in &cands {
+            match health.get_mut(c.data.network_path()) {
+                Some(h) => h.update(now, c),
+                None => {
+                    health.insert(c.data.network_path().clone(), PathHealth::new(now, c));
+                }
+            }
+        }
+        // Dead paths (nothing received lately) are skipped while any path lives.
+        let alive = |c: &&Candidate<'_>| health.get(c.data.network_path()).is_none_or(|h| !h.stale(now));
+        let live: Vec<&Candidate<'_>> = cands.iter().filter(alive).collect();
+        let pool: Vec<&Candidate<'_>> = if live.is_empty() { cands.iter().collect() } else { live };
+        let current = pool.iter().copied().find(|c| Some(c.data.network_path()) == ctx.current());
+        let Some(best) = pool.iter().copied().min_by_key(|c| Self::key(c.data.network_path(), c.rtt)) else {
             return selection;
         };
-        match current_key {
-            None => selection.set(&best),
-            Some((ct, _)) if ct != tier => selection.set(&best),
-            Some((_, crtt)) if rtt + RTT_SWITCH_MIN.as_nanos() as i128 <= crtt => selection.set(&best),
-            _ => {}
+        let (tier, rtt) = Self::key(best.data.network_path(), best.rtt);
+        let primary = match current.map(|c| (c, Self::key(c.data.network_path(), c.rtt))) {
+            Some((c, (ct, crtt))) if ct == tier && rtt + (RTT_SWITCH_MIN.as_nanos() as i128) > crtt => c,
+            _ => best,
+        };
+        selection.set(&primary.data);
+        let primary_path = primary.data.network_path();
+        let (p_base, p_rate) = health.get(primary_path).map_or((primary.rtt, 0.0), |h| (h.base_rtt, h.rate));
+
+        // Aggregation: more Available paths next to the selected one.
+        let aggregate = PathKind::of_addr(&primary_path.remote()) != PathKind::Bluetooth;
+        let limit = (p_base * AGG_RTT_FACTOR).max(p_base + AGG_RTT_SLACK);
+        let mut used_ifaces: Vec<String> = Vec::new();
+        let mut used_remotes: Vec<IpAddr> = Vec::new();
+        let mut distinct_ip = |path: &FourTuple| -> bool {
+            let FourTuple::Ip { remote, local } = path else { return true };
+            let iface = self.interface_of(*local);
+            if used_remotes.contains(&remote.ip()) || iface.as_ref().is_some_and(|i| used_ifaces.contains(i)) {
+                return false;
+            }
+            used_remotes.push(remote.ip());
+            used_ifaces.extend(iface);
+            true
+        };
+        distinct_ip(primary_path);
+        let mut rest: Vec<&Candidate<'_>> = cands.iter().filter(|c| c.data.network_path() != primary_path).collect();
+        rest.sort_by_key(|c| c.rtt);
+        for c in rest {
+            let path = c.data.network_path();
+            let Some(h) = health.get_mut(path) else { continue };
+            // Too slow while both were busy: pause it.
+            if h.aggregated && p_rate >= AGG_BUSY && h.rate * AGG_RATE_RATIO < p_rate {
+                h.slow_until = Some(now + h.slow_pause);
+                h.slow_pause = (h.slow_pause * 2).min(AGG_SLOW_PAUSE_MAX);
+            } else if h.aggregated && p_rate >= AGG_BUSY {
+                h.slow_pause = AGG_SLOW_PAUSE;
+            }
+            // (A stale path keeps its status: demoting it before its idle
+            // timeout closes it only delays resending what is in flight on it.)
+            let ok = aggregate
+                && PathKind::of_addr(&path.remote()) != PathKind::Bluetooth
+                && h.base_rtt <= limit
+                && !h.lossy
+                && h.slow_until.is_none_or(|t| now >= t)
+                && distinct_ip(path);
+            h.aggregated = ok;
+            if ok {
+                selection.also_use(&c.data);
+            }
+        }
+        if let Some(h) = health.get_mut(primary_path) {
+            h.aggregated = true;
         }
         selection
     }
+}
+
+/// Local IP → interface name (`en0`, `bridge0`, `lo0`, ...).
+#[cfg(unix)]
+fn interface_names() -> HashMap<IpAddr, String> {
+    let mut out = HashMap::new();
+    let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: getifaddrs fills a linked list that we free with freeifaddrs.
+    if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
+        return out;
+    }
+    let mut cur = addrs;
+    while !cur.is_null() {
+        // SAFETY: `cur` is a node of the list getifaddrs returned.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null() || ifa.ifa_name.is_null() {
+            continue;
+        }
+        // SAFETY: ifa_addr points to a sockaddr of the family it names.
+        let ip = unsafe {
+            match i32::from((*ifa.ifa_addr).sa_family) {
+                libc::AF_INET => {
+                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
+                    IpAddr::from(u32::from_be(sa.sin_addr.s_addr).to_be_bytes())
+                }
+                libc::AF_INET6 => {
+                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
+                    IpAddr::from(sa.sin6_addr.s6_addr)
+                }
+                _ => continue,
+            }
+        };
+        // SAFETY: ifa_name is a NUL-terminated C string.
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) };
+        out.insert(ip, name.to_string_lossy().into_owned());
+    }
+    // SAFETY: frees the list allocated above.
+    unsafe { libc::freeifaddrs(addrs) };
+    out
+}
+
+#[cfg(not(unix))]
+fn interface_names() -> HashMap<IpAddr, String> {
+    HashMap::new()
 }
 
 // ─────────────────────────── in-memory test links ───────────────────────────

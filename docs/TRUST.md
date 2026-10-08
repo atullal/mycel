@@ -146,7 +146,7 @@ aad_i    = "mycel/v0/stream-chunk" ‖ len(A): u32 LE ‖ A ‖ chunk_size: u32 
 - **Legacy format:** attachments sent before this used one-shot `XChaCha20-Poly1305(key, nonce, A, plaintext)`. A blob without the magic prefix is opened that way. Only blobs up to 64 MiB are opened like that (the old cap was 50 MiB), so a hostile reference can't make a peer read a huge blob into memory.
 - Code: `crates/mycel-crypto/src/stream.rs`. Tests cover roundtrip at chunk boundaries (0, 1, chunk − 1, chunk, chunk + 1, many chunks), tampering, wrong key/nonce/AAD, truncation, extension, reordering, duplication and chunk-size changes.
 
-**Transfer.** Blobs are stored per space (`blobs/<space>/<blob>`) and served only to the space's members (ALPN `mycel/blob/0`). They are streamed between QUIC and disk into `<blob>.part`. The receiver checks the BLAKE3 hash of the whole blob before renaming it into place, so a peer can't substitute data. An interrupted transfer resumes from the `.part`, possibly from a different member. The final hash check covers the prefix too, and a bad prefix is discarded and fetched again.
+**Transfer.** Blobs are stored per space (`blobs/<space>/<blob>`) and served only to the space's members (stream kind `Blob` on ALPN `mycel/2`). They are streamed between QUIC and disk into `<blob>.part`, in disjoint ranges from every member that has the blob. The receiver checks the BLAKE3 hash of the whole blob before renaming it into place, so a peer can't substitute data. An interrupted transfer resumes from the `.part`, possibly from a different member. The final hash check covers the prefix too, and a bad prefix is discarded and fetched again.
 
 **Availability and disk use.** There is no size limit and no per-space quota.
 - Blobs up to 16 MiB are pushed to every member as soon as they're posted. Bigger ones are pushed only to keepers, and members fetch them when their user clicks download, from anyone in the space who has them.
@@ -155,7 +155,7 @@ aad_i    = "mycel/v0/stream-chunk" ‖ len(A): u32 LE ‖ A ‖ chunk_size: u32 
 
 ## 8. Transport rules
 
-- **ALPN** `mycel/sync/1` (plus `mycel/card/0`, `mycel/eph/0`, `mycel/blob/0`). Iroh authenticates the remote node ID, which equals the remote `sign_pk`.
+- **ALPN** `mycel/2`: one connection per pair of devices; sync, cards, ephemeral messages and blobs are QUIC streams on it, labelled by a stream-kind byte (until 2026-10-08: `mycel/sync/1`, `mycel/card/0`, `mycel/eph/0`, `mycel/blob/0`). Iroh authenticates the remote node ID, which equals the remote `sign_pk`.
 - **Responders serve a space only to its current members**, including Relays. Requests from non-members are refused.
 - **Sync order:** membership ops first, then envelopes (set difference over IDs in v0; range-based reconciliation later).
 - **Everything received is validated by the receiver.** Nothing is trusted because of who sent it.
@@ -190,7 +190,7 @@ An independent adversarial review found these issues. All are fixed, each with a
 - mDNS and the card protocol reveal device names and public keys on the LAN, by design.
 
 **Spec drift fixed in this doc:**
-- The sync ALPN is `mycel/sync/1`.
+- The sync protocol runs as `Sync` streams on ALPN `mycel/2` (it was ALPN `mycel/sync/1`).
 - The header field is `stream` (Doc or Feed), not `doc`.
 - Seniority is computed from ops that pass authorization ignoring concurrency.
 - Forks before a cutoff are tolerated but not yet surfaced in the UI.

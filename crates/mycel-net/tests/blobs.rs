@@ -125,20 +125,24 @@ async fn big_blobs_stream_resume_and_follow_push_policy() {
         let bob = Arc::new(bob);
         let b = bob.clone();
         let task = tokio::spawn(async move { b.fetch_blob_with_progress(space, hash, progress).await });
-        eventually("download under way", || seen.lock().last().is_some_and(|(d, _)| *d >= 4 * MIB as u64)).await;
+        eventually("download under way", || seen.lock().last().is_some_and(|(d, _)| *d >= 12 * MIB as u64)).await;
         task.abort();
         let _ = task.await;
         bob
     };
-    let partial = std::fs::metadata(part(&bob_dir, &space, &hash)).unwrap().len();
-    assert!(partial > 0 && partial < big.len() as u64, "interrupted download leaves a .part ({partial})");
+    // Pieces come from Alice and the keeper at once, so the `.part` has
+    // holes; a `.ranges` file next to it says which bytes are there.
+    let before = seen.lock().last().unwrap().0;
+    assert!(before < big.len() as u64, "interrupted part way ({before})");
+    assert!(part(&bob_dir, &space, &hash).exists(), "interrupted download leaves a .part");
+    assert!(part(&bob_dir, &space, &hash).with_extension("ranges").exists());
     assert!(fetch.blob_path(&space, &hash).is_none());
 
     // …and resumes where it stopped.
     let (progress, seen) = recorder();
     let path = fetch.fetch_blob_with_progress(space, hash, progress).await.unwrap();
     let first = seen.lock()[0];
-    assert!(first.0 >= partial, "resumed from {first:?}, partial {partial}");
+    assert!(first.0 >= 4 * MIB as u64 && first.0 <= before, "resumed from {first:?}, had {before}");
     assert_eq!(seen.lock().last().unwrap(), &(big.len() as u64, big.len() as u64));
     assert_eq!(std::fs::read(&path).unwrap(), big);
     assert!(!part(&bob_dir, &space, &hash).exists());
