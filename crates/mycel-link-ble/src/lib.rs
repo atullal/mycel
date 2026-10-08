@@ -16,11 +16,13 @@
 //! Layout, so other platforms can slot in:
 //! - [`wire`], [`core`], `hub`, `transport`: platform-independent (framing, the
 //!   connection state machine, routing, the Iroh custom transport).
-//! - `macos`: CoreBluetooth backend. Linux (BlueZ), Windows, iOS and Android
-//!   backends implement the same small `Backend` trait.
+//! - `macos`: CoreBluetooth backend; `linux`: BlueZ backend (via `bluer`),
+//!   wire-compatible with it, so Macs and Linux machines link with each
+//!   other. Windows, iOS and Android backends implement the same small
+//!   `Backend` trait.
 
 // Without a backend the shared machinery is unused (until one is written).
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -36,6 +38,8 @@ mod hub;
 mod transport;
 pub mod wire;
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -69,7 +73,9 @@ pub(crate) trait Backend: Send + Sync + 'static {
 /// On macOS this uses CoreBluetooth. The host app's Info.plist must contain
 /// `NSBluetoothAlwaysUsageDescription` (macOS kills an app without it on first
 /// Bluetooth use); a command-line tool uses its terminal's Bluetooth
-/// permission. On other platforms the link reports itself unavailable.
+/// permission. On Linux it uses BlueZ (`bluetoothd`); the user needs to be
+/// allowed to advertise (the `bluetooth` group on most distributions). On
+/// other platforms the link reports itself unavailable.
 pub fn link(me: SignPk, name: &str) -> Arc<dyn Link> {
     BleLink::new(me, name, platform_backend())
 }
@@ -79,16 +85,21 @@ fn platform_backend() -> Box<dyn Backend> {
     Box::new(macos::Mac::new())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+fn platform_backend() -> Box<dyn Backend> {
+    Box::new(linux::Linux::new())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn platform_backend() -> Box<dyn Backend> {
     Box::new(Unsupported)
 }
 
 /// No Bluetooth backend for this platform yet.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
 struct Unsupported;
 
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
 const UNSUPPORTED: &str = "Bluetooth links aren't available on this platform yet";
 
 impl Backend for Unsupported {

@@ -24,6 +24,16 @@ objc2-core-bluetooth = "0.3.2"
 objc2-core-foundation = { version = "0.3.2", features = ["CFRunLoop", "CFDate", "CFString", "block2"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSBundle", "NSData", "NSDate", "NSDictionary", "NSError", "NSObject", "NSRunLoop", "NSStream", "NSString", "NSUUID", "NSValue"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+bluer = { version = "0.17.4", features = ["bluetoothd", "l2cap"] }
+dbus = { version = "0.9.11", optional = true, features = ["vendored"] }
+futures-util = "0.3"
+tokio = { version = "1.53.2", features = ["sync", "rt", "time", "macros", "io-util"] }
+
+[features]
+# Build libdbus from source (Linux systems without libdbus-1-dev; cross-checks).
+vendored-dbus = ["dep:dbus"]
+
 [dev-dependencies]
 mycel-sync = { version = "0.1.0", path = "../mycel-sync" }
 mycel-trust = { version = "0.1.0", path = "../mycel-trust" }
