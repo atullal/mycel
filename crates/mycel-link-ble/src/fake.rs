@@ -1,8 +1,15 @@
 //! A fake radio for tests: runs the real state machine, framing, routing and
 //! Iroh transport of several in-process links, with the CoreBluetooth calls
 //! replaced by an in-memory "air". Proves everything above the radio.
+//!
+//! The air models what CoreBluetooth did between two real Macs: a scan
+//! reports each peripheral once (until the next rescan); a connect to a stale
+//! handle never completes; and both devices share one radio link, so
+//! cancelling a connected peripheral tears down every channel between the two
+//! devices, the peer's included (the pessimistic reading of the bluetoothd
+//! logs). The deterministic long-run version of this is in `sim`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -41,6 +48,13 @@ struct AirInner {
     pairs: Vec<Pair>,
     next_chan: ChanId,
     cut: bool,
+    /// BLE connections: (central, peripheral).
+    conns: HashSet<(usize, usize)>,
+    /// (central, peripheral): the central's handle is stale; connects hang
+    /// until it drops the handle (Forget) and takes a fresh one.
+    stale: HashSet<(usize, usize)>,
+    /// Cancels that tore down a channel the *peer* had dialed.
+    harsh_kills: usize,
 }
 
 pub struct Air {
@@ -171,15 +185,8 @@ impl Air {
 
     /// Radio silence: every channel drops, nothing connects.
     pub fn cut(&self) {
-        let pairs = {
-            let mut a = self.inner.lock();
-            a.cut = true;
-            std::mem::take(&mut a.pairs)
-        };
-        for p in pairs {
-            self.close_end(&p.dialer);
-            self.close_end(&p.acceptor);
-        }
+        self.inner.lock().cut = true;
+        self.drop_links();
     }
 
     /// Back in range: everyone sees everyone again.
@@ -200,6 +207,36 @@ impl Air {
 
     pub fn channels(&self) -> usize {
         self.inner.lock().pairs.len()
+    }
+
+    /// Every handle any node has (or will get) for any other is stale.
+    pub fn make_stale(&self, nodes: usize) {
+        let mut a = self.inner.lock();
+        for n in 0..nodes {
+            for o in 0..nodes {
+                if n != o {
+                    a.stale.insert((n, o));
+                }
+            }
+        }
+    }
+
+    /// The stack closes every channel (both ends see it end); connections stay.
+    pub fn close_channels(&self) {
+        self.close_where(|_| true);
+    }
+
+    /// The radio link between every pair drops (supervision timeout).
+    pub fn drop_links(&self) {
+        let conns: Vec<(usize, usize)> = std::mem::take(&mut self.inner.lock().conns).into_iter().collect();
+        self.close_where(|_| true);
+        for (n, o) in conns {
+            self.job(Job::Input(n, Input::Disconnected(pid(o))));
+        }
+    }
+
+    pub fn harsh_kills(&self) -> usize {
+        self.inner.lock().harsh_kills
     }
 
     fn job(&self, j: Job) {
@@ -260,10 +297,25 @@ impl Air {
         let cut = self.inner.lock().cut;
         match cmd {
             Cmd::Connect(p) if cut => self.job(Job::Input(n, Input::ConnectFailed(p))),
-            Cmd::Connect(p) => self.job(Job::Input(n, Input::Connected(p))),
+            Cmd::Connect(p) => {
+                let o = idx(&p);
+                let mut a = self.inner.lock();
+                if a.stale.contains(&(n, o)) {
+                    return; // never completes
+                }
+                a.conns.insert((n, o));
+                drop(a);
+                self.job(Job::Input(n, Input::Connected(p)));
+            }
+            Cmd::Forget(p) => {
+                self.inner.lock().stale.remove(&(n, idx(&p)));
+            }
             Cmd::ReadInfo(p) => {
                 let (key, name) = self.inner.lock().keys[idx(&p)].clone();
                 self.job(Job::Input(n, Input::Info(p, GattInfo { psm: 0x80, key, name })));
+            }
+            Cmd::OpenChannel(p, _) if !self.inner.lock().conns.contains(&(n, idx(&p))) => {
+                self.job(Job::Input(n, Input::OpenFailed(p)))
             }
             Cmd::OpenChannel(p, _) => {
                 let o = idx(&p);
@@ -299,9 +351,24 @@ impl Air {
             }
             Cmd::Disconnect(p) => {
                 let o = idx(&p);
-                // the L2CAP channels dialed over this connection die with it
-                self.close_where(|pair| pair.dialer.node == n && pair.acceptor.node == o);
+                let (connected, theirs) = {
+                    let mut a = self.inner.lock();
+                    let connected = a.conns.remove(&(n, o));
+                    let theirs = connected && a.conns.remove(&(o, n));
+                    if connected && a.pairs.iter().any(|q| q.dialer.node == o && q.acceptor.node == n) {
+                        a.harsh_kills += 1;
+                    }
+                    (connected, theirs)
+                };
+                if !connected {
+                    return; // a pending connect: cancelled quietly
+                }
+                // One radio link between the two: it goes, with every channel on it.
+                self.close_where(|q| (q.dialer.node, q.acceptor.node) == (n, o) || (q.dialer.node, q.acceptor.node) == (o, n));
                 self.job(Job::Input(n, Input::Disconnected(p)));
+                if theirs {
+                    self.job(Job::Input(o, Input::Disconnected(pid(n))));
+                }
             }
             Cmd::Rescan if !cut => {
                 let nodes: Vec<usize> = self.inner.lock().hubs.keys().copied().collect();
@@ -327,8 +394,12 @@ mod tests {
     use mycel_trust::Role;
     use serde_json::json;
 
-    async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
-        for _ in 0..200 {
+    async fn eventually(what: &str, f: impl FnMut() -> bool) {
+        eventually_within(what, Duration::from_secs(10), f).await
+    }
+
+    async fn eventually_within(what: &str, limit: Duration, mut f: impl FnMut() -> bool) {
+        for _ in 0..(limit.as_millis() / 50) {
             if f() {
                 return;
             }
@@ -473,5 +544,85 @@ mod tests {
             }
             assert_eq!(found, 2, "each peer found once ({:?})", l.hub);
         }
+        assert_eq!(air.harsh_kills(), 0, "never cancelled a link carrying the peer's channel");
+    }
+
+    type Links = Vec<(Arc<BleLink>, tokio::sync::mpsc::UnboundedReceiver<mycel_net::LinkEvent>)>;
+
+    fn start_links(air: &Arc<Air>, n: usize) -> Links {
+        let links: Links = (0..n)
+            .map(|i| {
+                let l = air.link(DeviceKeys::generate().sign_pk(), &format!("n{i}"));
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                (l, tx, rx)
+            })
+            .map(|(l, tx, rx)| {
+                l.start(tx).unwrap();
+                (l, rx)
+            })
+            .collect();
+        links
+    }
+
+    fn drain(links: &mut Links) -> (usize, usize) {
+        let (mut found, mut lost) = (0, 0);
+        for (_, rx) in links.iter_mut() {
+            while let Ok(ev) = rx.try_recv() {
+                match ev {
+                    mycel_net::LinkEvent::Found { .. } => found += 1,
+                    mycel_net::LinkEvent::Lost { .. } => lost += 1,
+                }
+            }
+        }
+        (found, lost)
+    }
+
+    /// Connects to stale handles never complete: after the connect timeout
+    /// the handles are dropped, fresh ones come from a rescan, and the link
+    /// comes up.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stale_handles_recover_via_fresh_discovery() {
+        let air = Air::new();
+        air.make_stale(2);
+        let t = std::time::Instant::now();
+        let links = start_links(&air, 2);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(links[0].0.status().peers, 0, "stale: nothing connects yet");
+        let st = links[0].0.status();
+        assert_eq!(st.detail.as_deref(), Some("Connecting to 1 device…"), "{st:?}");
+        eventually_within("linked after the connect timeout", Duration::from_secs(15), || {
+            links.iter().all(|(l, _)| l.status().peers == 1)
+        })
+        .await;
+        let took = t.elapsed();
+        eprintln!("linked through stale handles in {took:?}");
+        assert!(took < crate::core::CONNECT_TIMEOUT + Duration::from_secs(5), "{took:?}");
+        assert_eq!(air.channels(), 1);
+        assert_eq!(links[0].0.status().detail, None);
+    }
+
+    /// Channels closed by the stack and radio links dropping, again and
+    /// again: each time both sides are linked again within seconds, over
+    /// exactly one channel, with one Lost and one Found per side.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn drops_and_remote_closes_reconnect_within_seconds() {
+        let air = Air::new();
+        let mut links = start_links(&air, 2);
+        eventually("linked", || links.iter().all(|(l, _)| l.status().peers == 1)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(drain(&mut links), (2, 0));
+        for round in 0..6 {
+            if round % 2 == 0 { air.close_channels() } else { air.drop_links() }
+            eventually("lost", || links.iter().all(|(l, _)| l.status().peers == 0)).await;
+            let t = std::time::Instant::now();
+            eventually("relinked", || links.iter().all(|(l, _)| l.status().peers == 1)).await;
+            let took = t.elapsed();
+            eprintln!("round {round}: relinked in {took:?}");
+            assert!(took < Duration::from_secs(5), "round {round}: {took:?}");
+            tokio::time::sleep(Duration::from_millis(2500)).await;
+            assert_eq!(air.channels(), 1, "round {round}");
+            assert_eq!(drain(&mut links), (2, 2), "one Lost and one Found per side, round {round}");
+        }
+        assert_eq!(air.harsh_kills(), 0);
     }
 }

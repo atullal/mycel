@@ -24,14 +24,17 @@
 //! 3. In Terminal: `target/release/examples/ble_chat alice` (other Mac: `bob`).
 //!    First run: macOS asks "Allow Terminal to use Bluetooth?" — Allow. (Or
 //!    System Settings > Privacy & Security > Bluetooth > enable your terminal.)
-//! 4. Within ~10 s each side prints `saw …`, `… is node xxxxxxxx "bob"`,
-//!    `L2CAP channel 1 open`, `linked to …`, then `found …`, the invite, and
+//! 4. Within ~10 s each side prints `saw Mycel device …`, `dialing …`,
+//!    `connected to … in 1.4 s`, `… is node xxxxxxxx "bob"`, `channel N open`,
+//!    `channel N: hello from …`, `linked to …`, then `found …`, the invite, and
 //!    `chat doc: {"hello from alice":"hi!","hello from bob":"hi!"}` with
-//!    `path: Bluetooth`.
+//!    `path: Bluetooth`. (Both sides dial; if both channels come up, both
+//!    print `two channels to …: keeping A …, dropping B …` naming the same A.)
 //! 5. Type a line on one Mac; it shows up in `chat doc:` on the other.
 //!    `/bench 64` reports KiB/s.
 //! 6. Optional: carry one laptop out of range — `lost …` — and back —
-//!    `linked to …` again, and chat resumes.
+//!    `linked to …` again within seconds, and chat resumes. Every channel
+//!    close is logged with who closed it and why.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

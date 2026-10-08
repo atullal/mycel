@@ -5,8 +5,10 @@
 //! publishes an L2CAP connection-oriented channel, and serves a GATT
 //! characteristic with the channel's PSM plus its node key and name) and a
 //! *central* (scans for the service, reads the characteristic, opens the
-//! channel). Only the device with the lower node key dials, so each pair gets
-//! one channel. Iroh's QUIC packets travel over the channel, length-framed
+//! channel). Both devices dial; the first channel up carries the traffic and
+//! is never hung up (see [`core`] for the rules that keep exactly one channel
+//! per pair and reconnect within seconds). Iroh's QUIC packets travel over
+//! the channel, length-framed
 //! (see [`wire`]); QUIC on top does encryption, authentication, congestion
 //! control and loss recovery, so this link just moves bytes and drops packets
 //! when the radio can't keep up.
@@ -39,6 +41,8 @@ mod macos;
 
 #[cfg(test)]
 mod fake;
+#[cfg(test)]
+mod sim;
 
 pub use hub::Radio;
 use hub::Hub;
@@ -154,13 +158,26 @@ impl Link for BleLink {
     fn status(&self) -> LinkStatus {
         let radio = self.hub.radio();
         let on = radio == Radio::On;
-        let detail = radio_detail(&radio, in_app()).or_else(|| self.hub.problem());
-        LinkStatus { kind: PathKind::Bluetooth, active: on, detail, peers: if on { self.hub.peers() } else { 0 } }
+        let peers = if on { self.hub.peers() } else { 0 };
+        let detail = radio_detail(&radio, in_app())
+            .or_else(|| self.hub.problem())
+            .or_else(|| if on { connecting_detail(self.hub.connecting(), peers) } else { None });
+        LinkStatus { kind: PathKind::Bluetooth, active: on, detail, peers }
     }
 
     fn stop(&self) {
         self.backend.stop();
         self.hub.set_events(None);
+    }
+}
+
+/// "Connecting to 1 device…" while devices in range aren't linked yet.
+fn connecting_detail(connecting: usize, linked: usize) -> Option<String> {
+    let more = if linked > 0 { " more" } else { "" };
+    match connecting {
+        0 => None,
+        1 => Some(format!("Connecting to 1{more} device…")),
+        n => Some(format!("Connecting to {n}{more} devices…")),
     }
 }
 
@@ -180,9 +197,11 @@ fn in_app() -> bool {
 
 static LOG: AtomicU8 = AtomicU8::new(0);
 
-/// Log to stderr: 0 = quiet (default), 1 = links found/lost and radio
-/// changes, 2 = every state machine input and command. `MYCEL_BLE_LOG`
-/// overrides at startup.
+/// Log to stderr: 0 = quiet (default), 1 = every connect attempt and result,
+/// channel open/close (with who closed it and why), tie-break decisions and
+/// radio changes, 2 = also every state machine input and command.
+/// `MYCEL_BLE_LOG` overrides at startup. Lines carry local wall-clock time
+/// so two devices' logs (and bluetoothd's) can be lined up.
 pub fn set_log_level(level: u8) {
     LOG.store(level, Ordering::Relaxed);
 }
@@ -199,14 +218,31 @@ fn level() -> u8 {
 
 pub(crate) fn info(args: std::fmt::Arguments) {
     if level() >= 1 {
-        eprintln!("[ble] {args}");
+        eprintln!("{} [ble] {args}", clock());
     }
 }
 
 pub(crate) fn debug(args: std::fmt::Arguments) {
     if level() >= 2 {
-        eprintln!("[ble] {args}");
+        eprintln!("{} [ble] {args}", clock());
     }
+}
+
+/// Local time of day, `HH:MM:SS.mmm`.
+fn clock() -> String {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let ms = now.subsec_millis();
+    #[cfg(unix)]
+    {
+        let secs = now.as_secs() as libc::time_t;
+        // SAFETY: localtime_r only writes the tm we pass it.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if !unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+            return format!("{:02}:{:02}:{:02}.{ms:03}", tm.tm_hour, tm.tm_min, tm.tm_sec);
+        }
+    }
+    let s = now.as_secs() % 86400;
+    format!("{:02}:{:02}:{:02}.{ms:03}Z", s / 3600, s / 60 % 60, s % 60)
 }
 
 #[cfg(test)]
@@ -219,6 +255,9 @@ mod tests {
         assert_eq!(radio_detail(&Radio::Off, true).unwrap(), "Bluetooth is off");
         assert!(radio_detail(&Radio::Unauthorized, true).unwrap().contains("Allow Mycel to use Bluetooth"));
         assert!(radio_detail(&Radio::Unauthorized, false).unwrap().contains("terminal app"));
+        assert_eq!(connecting_detail(0, 0), None);
+        assert_eq!(connecting_detail(1, 0).unwrap(), "Connecting to 1 device…");
+        assert_eq!(connecting_detail(2, 1).unwrap(), "Connecting to 2 more devices…");
     }
 
     #[test]
