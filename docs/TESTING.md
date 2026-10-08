@@ -67,6 +67,33 @@ Not exercised here: real microphones and speakers, Apple's voice-processing
 unit (echo cancellation), and real peer-to-peer Wi-Fi / Bluetooth radios
 (that needs two Macs: [TWO_LAPTOPS.md](TWO_LAPTOPS.md) §5b).
 
+**Group calls** (`crates/mycel-call/tests/group_calls.rs`, real nodes and real
+QUIC, a different test tone per person; each device checks that its mix holds
+every other person's tone and not its own):
+- Alice (1 kHz bursts) calls a group of four, and Bob, Carol and Dave all
+  ring. Bob and Carol answer, and Dave declines.
+  - The 3-way mesh is up **~105 ms** after Alice presses call.
+  - Alice's voice reaches Bob and Carol in **80–100 ms**, mouth to ear, mixed
+    with the third person's.
+  - Each person is reached on the network path at 32 kbps, with 0 frames lost.
+- Dave's call stays `joinable` (*3 in call*). He joins with the call button
+  and is meshed with all three others in **~52 ms**, then hears all three.
+- Bob leaves and the others go on. Alice, who started the call, leaves too,
+  and Carol and Dave still hear each other. When Carol leaves, Dave's call
+  ends (`remoteHungUp`).
+- Outsiders are refused. Eve, not in the group, sends `Join`, `Watch` or
+  `Ring` with the real call reference. Both devices in the call answer
+  `Denied` and nothing shows up.
+- Carol is removed from the group mid-call, then tries to join. Her join
+  ends `failed` and nobody hears her.
+- With no IP at all, three devices on in-memory peer-to-peer Wi-Fi links hold
+  a 3-way call, each person on the `peerWifi` path.
+- `group_call_between_runtimes` runs the same flow through the JSON command
+  table: `group`, `title`, `participants` and `joinedCount`.
+- In the UI (mock runtime), tiles show each person's level ring, path and
+  bitrate ([screenshot](screenshots/17-group-call.png)), and a call you
+  declined offers **Join call** ([screenshot](screenshots/18-group-call-join.png)).
+
 ## Real-device run (2026-10-07, this Mac, LAN mode)
 
 Setup: three `mycel serve --net lan` devices (Alice, Bob, Carol) plus one `mycel keeper --net lan`, each a separate process with its own identity and storage. The real web UI was driven in headless Chrome.

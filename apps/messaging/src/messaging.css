@@ -1933,6 +1933,142 @@
   gap: 10px;
 }
 
+/* a group call you're in: everyone's tile under the conversation header */
+.mx-gcall {
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--accent-soft) 35%, var(--surface));
+  padding: 10px 16px 8px;
+}
+.mx-gcall ul {
+  display: flex;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+.mx-gcall-tile {
+  flex: 0 0 92px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 6px 4px 4px;
+  border-radius: var(--r-md, 12px);
+  text-align: center;
+  transition: background 160ms;
+}
+.mx-gcall-tile.is-speaking {
+  background: color-mix(in srgb, var(--online) 10%, transparent);
+}
+.mx-gcall-avatar {
+  position: relative;
+  display: inline-grid;
+  border-radius: 50%;
+  margin-bottom: 4px;
+  /* the ring grows with the level of what they say (--lvl, 0..1) */
+  box-shadow: 0 0 0 calc(2px + var(--lvl, 0) * 5px) color-mix(in srgb, var(--online) calc(var(--lvl, 0) * 70%), transparent);
+  transition: box-shadow 90ms linear;
+}
+.mx-gcall-tile.is-pending .mx-gcall-avatar::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid var(--accent);
+  animation: mx-ring 1.4s ease-out infinite;
+}
+.mx-gcall-tile.is-away .mx-gcall-avatar {
+  opacity: 0.45;
+  filter: grayscale(0.6);
+}
+.mx-gcall-muted {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--danger);
+  color: #fff;
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.mx-gcall-name {
+  max-width: 100%;
+  font-size: 12.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mx-gcall-detail {
+  max-width: 100%;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--ink-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mx-gcall-tile.is-speaking .mx-gcall-detail {
+  color: var(--online);
+}
+
+/* a group call going on without you */
+.mx-join {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line-soft);
+  background: color-mix(in srgb, var(--online) 9%, var(--surface));
+  animation: mx-callbar-in 160ms ease-out;
+}
+.mx-join-faces {
+  display: inline-flex;
+  flex: none;
+}
+.mx-join-faces > * {
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.mx-join-faces > * + * {
+  margin-left: -8px;
+}
+.mx-join-text {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.mx-join-text strong {
+  font-size: 13.5px;
+  font-weight: 650;
+}
+.mx-join-text span {
+  font-size: 12.5px;
+  color: var(--ink-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.mx-join-text span.is-error {
+  color: var(--danger);
+  white-space: normal;
+}
+.mx-join-btn {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--online);
+  border-color: var(--online);
+}
+
 /* ---------------------------------------------------------------- narrow */
 
 @media (max-width: 1080px) {
@@ -1984,6 +2120,20 @@
   }
   .mx-callbar-path,
   .mx-callbar-hint {
+    display: none;
+  }
+  .mx-gcall {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+  .mx-gcall-tile {
+    flex-basis: 76px;
+  }
+  .mx-join {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
+  .mx-join-faces {
     display: none;
   }
   .mx-callbar {

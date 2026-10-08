@@ -1,38 +1,71 @@
-//! Call signalling (ALPN `mycel/call/0`).
+//! Call signalling (ALPN `mycel/call/1`).
 //!
-//! The caller dials the callee's device key directly, so a call only needs
-//! both devices online: no server, no prior connection. One QUIC connection
-//! per call; it inherits the node's multipath paths (network, peer-to-peer
-//! Wi-Fi, relay, Bluetooth) and moves between them mid-call.
+//! A call is a full mesh: every participant has one QUIC connection (a
+//! "leg") to every other participant, dialed straight to their device key.
+//! A call therefore only needs the devices online (no server), and it
+//! inherits the node's multipath paths (network, peer-to-peer Wi-Fi, relay,
+//! Bluetooth). A 1:1 call is the two-person case.
 //!
-//! One bidirectional control stream, opened by the caller, carries small
-//! length-prefixed postcard messages ([`Ctrl`]):
+//! Each leg has one bidirectional control stream, opened by the dialer and
+//! carrying small length-prefixed postcard messages ([`Ctrl`]). Its first
+//! message says why the leg exists:
 //!
 //! ```text
-//! caller                          callee
-//!   Ring{space, nonce, call} ───▶   checks: call == derive(space, caller, nonce),
-//!                                   both are members of `space`
-//!                         ◀───  Ringing | Busy | Glare | Denied
-//!                         ◀───  Accept | Decline           (user answers)
-//!   Started ────────────────▶      (media flows both ways: datagrams)
-//!   Mute / Report / HangUp ◀──▶    Mute / Report / HangUp
+//! Ring: the initiator rings a member      Join: a participant connects to
+//!                                         another one already in the call
+//! dialer                member            joiner                participant
+//!   Ring{call, group} ──▶ checks the call   Join{call} ─────────▶ in that call?
+//!            ◀── Ringing | Busy | Glare |              ◀── Started | Full |
+//!                Existing | Denied                         Glare | Denied
+//!            ◀── Accept | Decline{missed}  (media flows both ways)
+//!   Started ──▶ (media flows both ways)
+//!
+//! Watch: someone who declined or missed a group call keeps hearing who is
+//! in it, through one participant, so they can join later:
+//!   Watch{call} ──▶   ◀── Roster ...    later: Accept ──▶  ◀── Started
+//!
+//! On any leg, at any time: Roster{joined} · Mute · Report · HangUp
 //! ```
 //!
-//! Audio goes in QUIC datagrams ([`crate::frame`]), or on a unidirectional
-//! stream if a path can't carry datagrams. The call id binds the call to the
-//! conversation: it is derived from the space id, the caller's key (the
-//! QUIC-authenticated peer) and a random nonce, and both sides check it.
+//! A [`CallRef`] names a call: its conversation (space), its initiator, a
+//! random nonce, and the call id derived from those three. The receiving
+//! side checks:
+//! - the id;
+//! - that the dialer (the QUIC-authenticated peer) is a current member of
+//!   the conversation;
+//! - for `Ring`, that the dialer is the initiator.
 //!
-//! Group calls can come later on the same protocol: a group call is a mesh
-//! of these 1:1 connections sharing one call id (`Ring` would carry the
-//! participant list); nothing here assumes exactly two people per space.
+//! A device takes `Join` and `Watch` only for a call it is in itself.
+//!
+//! Who dials whom:
+//! - The initiator rings every member.
+//! - Whoever joins dials `Join` to everyone in the roster it has no leg to.
+//! - When two joiners dial each other at once, the leg dialed by the lower
+//!   key survives; the other side answers `Glare`.
+//!
+//! Everyone in the call sends `Roster` on all its legs whenever its set of
+//! joined peers changes. That is how newcomers, ringing members and watchers
+//! all learn who is in the call.
+//!
+//! Media is Opus in QUIC datagrams on each leg ([`crate::frame`]), or on a
+//! unidirectional stream when a path can't carry datagrams. Every datagram
+//! and media stream starts with a one-byte track kind, so other tracks such
+//! as video share the same legs (see [`crate::engine::TrackSink`]).
+//!
+//! Calls are capped at [`MAX_PARTICIPANTS`]. In a full mesh, every device
+//! encodes each frame once per bitrate tier, but sends and decodes it once
+//! per peer. So upload and CPU grow with the number of people:
+//! 7 peers × 32 kbps ≈ 0.3 Mbps up per device, which Bluetooth can't carry
+//! and a busy Wi-Fi barely can.
 
 use anyhow::{Result, bail};
 use mycel_crypto::{Hash32, SignPk};
 use serde::{Deserialize, Serialize};
 
-pub const ALPN_CALL: &[u8] = b"mycel/call/0";
-pub const VERSION: u16 = 0;
+pub const ALPN_CALL: &[u8] = b"mycel/call/1";
+pub const VERSION: u16 = 1;
+/// Most people in one call (you included).
+pub const MAX_PARTICIPANTS: usize = 8;
 /// Control messages are tiny; refuse anything bigger.
 pub const MAX_CTRL: usize = 4096;
 const CTX_CALL_ID: &str = "mycel/v0/call-id";
@@ -44,27 +77,60 @@ pub fn call_id(space: &Hash32, caller: &SignPk, nonce: &[u8; 16]) -> CallId {
     Hash32::digest(CTX_CALL_ID, &[space.0.as_slice(), &caller.0, nonce].concat())
 }
 
+/// Everything that names a call.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallRef {
+    pub space: Hash32,
+    pub initiator: SignPk,
+    pub nonce: [u8; 16],
+    pub call: CallId,
+}
+
+impl CallRef {
+    pub fn new(space: Hash32, initiator: SignPk, nonce: [u8; 16]) -> CallRef {
+        CallRef { space, initiator, nonce, call: call_id(&space, &initiator, &nonce) }
+    }
+
+    /// The id really is derived from the rest.
+    pub fn is_valid(&self) -> bool {
+        self.call == call_id(&self.space, &self.initiator, &self.nonce)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ctrl {
-    /// Caller → callee: please ring.
-    Ring { version: u16, space: Hash32, nonce: [u8; 16], call: CallId },
-    /// Callee: it's ringing.
+    /// Initiator → member: please ring. `group`: more than two people may join.
+    Ring { version: u16, call: CallRef, group: bool },
+    /// Participant → participant: I'm in this call too; let's talk.
+    Join { version: u16, call: CallRef },
+    /// Someone not in the call → participant: keep me told who's in it.
+    Watch { version: u16, call: CallRef },
+    /// It's ringing.
     Ringing,
     Accept,
-    Decline,
-    /// Callee is in another call.
+    /// Not answering (`missed`: nobody answered, it rang out).
+    Decline { missed: bool },
+    /// In another call.
     Busy,
-    /// We called each other at the same time and your call loses; mine is
-    /// ringing you (see `state::on_ring`).
+    /// We started calls in the same conversation at the same moment and
+    /// yours loses (or, answering a `Join`, we dialed each other and the
+    /// leg I dialed wins).
     Glare,
-    /// Not allowed (not a member of that conversation).
+    /// There's already a call going on in this conversation: join it.
+    Existing { call: CallRef },
+    /// Not allowed (not a member, or not in that call).
     Denied,
-    /// Caller: accept seen, media running.
+    /// The call already has [`MAX_PARTICIPANTS`] people.
+    Full,
+    /// Media is running (answer to `Accept` or `Join`).
     Started,
+    /// I've left the call (or stopped ringing you).
     HangUp,
     Mute { muted: bool },
     /// Receiver report, about once a second: what arrived of what was sent.
     Report { loss_ppm: u32, jitter_ms: u16, bitrate: u32 },
+    /// The peers the sender is talking to, plus the sender if it's in the call.
+    Roster { joined: Vec<SignPk> },
 }
 
 impl Ctrl {
@@ -120,15 +186,24 @@ mod tests {
         assert_ne!(id, call_id(&Hash32([4; 32]), &a, &n), "another conversation");
         assert_ne!(id, call_id(&space, &b, &n), "another caller");
         assert_ne!(id, call_id(&space, &a, &[8; 16]), "another nonce");
+        let r = CallRef::new(space, a, n);
+        assert!(r.is_valid());
+        assert!(!CallRef { initiator: b, ..r }.is_valid(), "someone else's call id");
     }
 
     #[test]
     fn messages_round_trip() {
+        let call = CallRef::new(Hash32([5; 32]), SignPk([8; 32]), [6; 16]);
         let msgs = [
-            Ctrl::Ring { version: VERSION, space: Hash32([5; 32]), nonce: [6; 16], call: Hash32([7; 32]) },
+            Ctrl::Ring { version: VERSION, call, group: true },
+            Ctrl::Join { version: VERSION, call },
+            Ctrl::Watch { version: VERSION, call },
+            Ctrl::Existing { call },
             Ctrl::Ringing,
+            Ctrl::Decline { missed: true },
             Ctrl::Mute { muted: true },
             Ctrl::Report { loss_ppm: 12_000, jitter_ms: 9, bitrate: 32_000 },
+            Ctrl::Roster { joined: vec![SignPk([1; 32]), SignPk([2; 32])] },
             Ctrl::HangUp,
         ];
         for m in msgs {
@@ -139,5 +214,8 @@ mod tests {
         }
         assert!(Ctrl::decode(&[0xff, 0xff, 0xff]).is_err());
         assert!(Ctrl::decode(&vec![0; MAX_CTRL + 1]).is_err());
+        // a full roster stays far below the size limit
+        let roster = Ctrl::Roster { joined: vec![SignPk([9; 32]); MAX_PARTICIPANTS] };
+        assert!(roster.encode().len() < MAX_CTRL / 4);
     }
 }

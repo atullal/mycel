@@ -45,11 +45,12 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
 
   const contactsById = useMemo(() => new Map<string, Contact>(contacts.map((c) => [c.id, c])), [contacts]);
 
-  // Voice calls: one incoming ring at a time, one call in progress.
+  // Voice calls: one incoming ring at a time, one call in progress (plus
+  // group calls going on without you, which you may join).
   const mycel = useMycel();
   const calls = visibleCalls(useCalls());
   const ringing = calls.find((c) => c.direction === "incoming" && c.state === "ringing") ?? null;
-  const barCall = calls.find((c) => isLive(c) && c !== ringing) ?? calls.find((c) => !isLive(c)) ?? null;
+  const barCall = calls.find((c) => isLive(c) && c !== ringing) ?? calls.find((c) => c.state === "ended") ?? null;
   const liveCall = calls.find((c) => isLive(c) && c !== ringing) ?? null;
   const [callError, setCallError] = useState<string | null>(null);
   const startCall = useCallback(
@@ -80,6 +81,9 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
   }, []);
 
   const current = conversations.find((c) => c.id === selected) ?? null;
+  const currentCall = current
+    ? (calls.find((c) => c.conversation === current.id && (isLive(c) || c.state === "joinable")) ?? null)
+    : null;
 
   return (
     <div className={`mx-root${current ? " has-selection" : ""}${membersOpen && current ? " members-open" : ""}`}>
@@ -104,6 +108,8 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
             inCall={liveCall?.conversation === current.id}
             callsBusy={liveCall != null}
             onCall={() => void startCall(current.id)}
+            call={currentCall}
+            meName={profile?.name}
           />
         ) : (
           <NoSelection

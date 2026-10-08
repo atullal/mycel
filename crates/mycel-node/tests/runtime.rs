@@ -632,3 +632,87 @@ async fn voice_call_between_runtimes() {
         let _ = std::fs::remove_dir_all(rt.data_dir());
     }
 }
+
+/// A group call between three runtimes through the JSON command table:
+/// everyone rings, both answer, everyone hears both others, and the call
+/// goes on until the last person leaves.
+#[tokio::test(flavor = "multi_thread")]
+async fn group_call_between_runtimes() {
+    use mycel_node::api::{CallEndReason, CallPhase};
+    use mycel_node::call::audio::{AudioIo, TestAudio, TestSource};
+    use mycel_node::call::level::goertzel;
+    use mycel_node::dispatch::dispatch;
+    use serde_json::json;
+
+    let dirs: Vec<PathBuf> = ["ga", "gb", "gc"].iter().map(|n| tmp(n)).collect();
+    let alice = open(&dirs[0], "Alice", free_port(), false).await;
+    let bob = open(&dirs[1], "Bob", free_port(), false).await;
+    let carol = open(&dirs[2], "Carol", free_port(), false).await;
+    connect_all(&[&alice, &bob, &carol]);
+    let tones = [440.0, 660.0, 880.0];
+    let audio: Vec<Arc<TestAudio>> =
+        tones.iter().map(|hz| Arc::new(TestAudio::new(TestSource::Sine { hz: *hz, amp: 0.5 }))).collect();
+    for (rt, a) in [&alice, &bob, &carol].iter().zip(&audio) {
+        rt.calls().set_audio(a.clone() as Arc<dyn AudioIo>);
+    }
+    let b = alice.add_contact(bob.profile().contact_code).unwrap();
+    let c = alice.add_contact(carol.profile().contact_code).unwrap();
+    let conv = alice.create_conversation(Some("Trio".into()), vec![b.id.clone(), c.id.clone()]).unwrap();
+    eventually("all joined", || bob.conversations().len() == 1 && carol.conversations().len() == 1).await;
+    bob.accept_request(conv.id.clone()).unwrap();
+    carol.accept_request(conv.id.clone()).unwrap();
+
+    let out = dispatch(&alice, "start_call", json!({ "conversation": conv.id })).await.unwrap();
+    assert_eq!(out["group"], true);
+    assert_eq!(out["title"], "Trio");
+    let id = out["id"].as_str().unwrap().to_string();
+    for rt in [&bob, &carol] {
+        eventually("it rings", || rt.call_status().iter().any(|c| c.id == id && c.state == CallPhase::Ringing)).await;
+        let st = dispatch(rt, "call_status", json!({})).await.unwrap();
+        assert_eq!(st[0]["peerName"], "Alice");
+        assert_eq!(st[0]["group"], true);
+        dispatch(rt, "accept_call", json!({ "call": id })).await.unwrap();
+    }
+    let all_in = |rts: &[&Arc<mycel_node::Runtime>], n: u32| {
+        rts.iter().all(|rt| rt.call_status().first().is_some_and(|c| c.state == CallPhase::Active && c.joined_count == n))
+    };
+    eventually("three in the call", || all_in(&[&alice, &bob, &carol], 3)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for (i, a) in audio.iter().enumerate() {
+        let rec = a.recording();
+        let rec = rec.lock();
+        let tail = &rec.samples[rec.samples.len() - 48_000..];
+        let floor = goertzel(tail, 1_500.0, 48_000).max(1e-9);
+        for (j, hz) in tones.iter().enumerate() {
+            let snr = goertzel(tail, *hz, 48_000) / floor;
+            if i != j {
+                assert!(snr > 30.0, "runtime {i} hears {hz} Hz (snr {snr:.1})");
+            }
+        }
+    }
+    let st = dispatch(&bob, "call_status", json!({})).await.unwrap();
+    let people = st[0]["participants"].as_array().unwrap();
+    assert_eq!(people.len(), 2);
+    for p in people {
+        assert_eq!(p["state"], "joined");
+        assert_eq!(p["path"], "network");
+        assert_eq!(p["bitrate"], 32_000);
+    }
+    // Bob has Alice as a contact (her name); Carol only as a group member
+    assert!(people.iter().any(|p| p["name"] == "Alice"));
+    assert_eq!(st[0]["joinedCount"], 3);
+
+    // Bob leaves: Alice and Carol go on; Carol leaves: it's over for Alice
+    dispatch(&bob, "end_call", json!({ "call": id })).await.unwrap();
+    eventually("two left in the call", || all_in(&[&alice, &carol], 2)).await;
+    dispatch(&carol, "end_call", json!({ "call": id })).await.unwrap();
+    eventually("alice's call ends", || {
+        alice.call_status().first().is_some_and(|c| c.end_reason == Some(CallEndReason::RemoteHungUp))
+    })
+    .await;
+
+    for rt in [alice, bob, carol] {
+        rt.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(rt.data_dir());
+    }
+}

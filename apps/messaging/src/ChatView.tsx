@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { useMessages, useMycel, useTyping } from "@mycel/sdk/react";
-import type { Contact, ConversationSummary, MessageView } from "@mycel/sdk";
+import type { CallInfo, Contact, ConversationSummary, MessageView } from "@mycel/sdk";
 import { MessageList } from "./MessageList.tsx";
 import { Composer, type ComposerHandle } from "./Composer.tsx";
 import { ConversationAvatar, Icon, errorText } from "./ui.tsx";
+import { GroupCallPanel, JoinBanner, isLive } from "./Calls.tsx";
 
 export function ChatView({
   summary,
@@ -15,6 +16,8 @@ export function ChatView({
   inCall = false,
   callsBusy = false,
   onCall,
+  call = null,
+  meName = "You",
 }: {
   summary: ConversationSummary;
   me: string | undefined;
@@ -26,8 +29,12 @@ export function ChatView({
   inCall?: boolean;
   /** Some call is in progress (one at a time). */
   callsBusy?: boolean;
-  /** Start a voice call (direct conversations). */
+  /** Start a voice call: the other person, or the whole group. */
   onCall?: () => void;
+  /** This conversation's call: one you're in, or a group call you may join. */
+  call?: CallInfo | null;
+  /** Your name, for your own tile in a group call. */
+  meName?: string;
 }) {
   const mycel = useMycel();
   const { messages, loading, hasMore, loadOlder, error } = useMessages(summary.id);
@@ -56,6 +63,7 @@ export function ChatView({
   }, [mycel, summary.id, unread, summary.active, summary.request, messages.length]);
 
   const others = summary.members.filter((m) => !m.isMe && m.role !== "keeper");
+  const joinable = call?.state === "joinable";
   const keepers = summary.members.filter((m) => m.role === "keeper");
 
   const subtitle = useMemo(() => {
@@ -157,13 +165,23 @@ export function ChatView({
           <h2>{summary.title}</h2>
           <p>{subtitle}</p>
         </div>
-        {summary.direct && onCall && summary.active && !summary.request && (
+        {onCall && summary.active && !summary.request && others.length > 0 && (
           <button
             className={`mx-icon-btn mx-call-btn${inCall ? " is-on" : ""}`}
             onClick={onCall}
-            disabled={callsBusy}
-            title={inCall ? "In a call" : callsBusy ? "You're already in a call" : "Voice call"}
-            aria-label={`Voice call ${summary.title}`}
+            disabled={callsBusy && !joinable}
+            title={
+              inCall
+                ? "In a call"
+                : joinable
+                  ? "Join the group call"
+                  : callsBusy
+                    ? "You're already in a call"
+                    : summary.direct
+                      ? "Voice call"
+                      : "Call the group"
+            }
+            aria-label={summary.direct ? `Voice call ${summary.title}` : `Call everyone in ${summary.title}`}
           >
             <Icon.Phone />
           </button>
@@ -182,6 +200,11 @@ export function ChatView({
           <Icon.People />
         </button>
       </header>
+
+      {call && joinable && <JoinBanner call={call} />}
+      {call && call.group && isLive(call) && !(call.direction === "incoming" && call.state === "ringing") && (
+        <GroupCallPanel call={call} me={{ id: me ?? "", name: meName }} />
+      )}
 
       <MessageList
         me={me}
