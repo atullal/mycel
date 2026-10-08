@@ -17,6 +17,7 @@
 //! S → C  Data{data}
 //! ```
 
+mod blobs;
 pub mod link;
 pub mod wire;
 
@@ -42,6 +43,7 @@ use mycel_trust::{Role, SignedOp, SpaceId};
 use n0_future::StreamExt;
 use tokio::sync::{Notify, Semaphore, broadcast, mpsc};
 
+pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_free_space, free_space, human_size};
 pub use iroh;
 pub use link::{Link, LinkEvent, LinkStatus, PathKind};
 pub use wire::ContactCard;
@@ -52,8 +54,6 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 const PERIODIC_SYNC: Duration = Duration::from_secs(15);
 const ONLINE_WINDOW: Duration = Duration::from_secs(45);
 const DEBOUNCE: Duration = Duration::from_millis(80);
-/// Per-space blob storage quota on each device.
-const MAX_SPACE_BLOBS: u64 = 2 * 1024 * 1024 * 1024;
 /// Max membership ops accepted in a pushed invite.
 const MAX_INVITE_OPS: usize = 4096;
 
@@ -328,15 +328,6 @@ impl Inner {
             .map(|d| d.join(space.to_string()).join(hash.to_string()))
     }
 
-    fn space_blob_bytes(&self, space: &SpaceId) -> u64 {
-        let Some(dir) = self.blob_dir.as_ref().map(|d| d.join(space.to_string())) else {
-            return 0;
-        };
-        std::fs::read_dir(dir)
-            .map(|rd| rd.flatten().filter_map(|e| e.metadata().ok()).map(|m| m.len()).sum())
-            .unwrap_or(0)
-    }
-
     /// Apply received data; on change, notify the app and forward to other members.
     fn ingest(&self, space: &SpaceId, peer: SignPk, data: Data, sent: &[EnvelopeId]) -> SyncStats {
         let res = {
@@ -402,7 +393,7 @@ impl ProtocolHandler for Handler {
             ALPN_SYNC => serve_sync(&self.inner, conn).await,
             ALPN_CARD => serve_card(&self.inner, conn).await,
             ALPN_EPH => serve_eph(&self.inner, conn).await,
-            ALPN_BLOB => serve_blob(&self.inner, conn).await,
+            ALPN_BLOB => blobs::serve(&self.inner, conn).await,
             _ => Err(anyhow!("unknown alpn")),
         };
         res.map_err(|e| AcceptError::from_boxed(e.into()))
@@ -535,62 +526,6 @@ async fn serve_eph(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
         inner.mark_ok(peer);
         inner.emit(NetEvent::Ephemeral { space: msg.space, from: peer, data });
     }
-    Ok(())
-}
-
-async fn serve_blob(inner: &Arc<Inner>, conn: Connection) -> Result<()> {
-    let peer = to_sign_pk(&conn.remote_id());
-    let (mut tx, mut rx) = conn.accept_bi().await?;
-    let req: BlobReq = recv(&mut rx).await?;
-    let (space, hash) = match &req {
-        BlobReq::Get { space, hash } | BlobReq::Put { space, hash, .. } => (*space, *hash),
-    };
-    let allowed = inner
-        .spaces
-        .lock()
-        .get(&space)
-        .is_some_and(|r| r.is_member(&peer));
-    let path = inner.blob_path(&space, &hash);
-    match (req, allowed, path) {
-        (_, false, _) | (_, _, None) => send(&mut tx, &BlobResp::Denied).await?,
-        (BlobReq::Get { .. }, true, Some(path)) => match tokio::fs::read(&path).await {
-            Ok(bytes) => {
-                send(&mut tx, &BlobResp::Found { len: bytes.len() as u64 }).await?;
-                tx.write_all(&bytes).await?;
-            }
-            Err(_) => send(&mut tx, &BlobResp::NotFound).await?,
-        },
-        (BlobReq::Put { len, .. }, true, Some(path)) => {
-            if len > MAX_BLOB {
-                bail!("blob too large");
-            }
-            if inner.space_blob_bytes(&space) + len > MAX_SPACE_BLOBS {
-                send(&mut tx, &BlobResp::Denied).await?;
-                tx.finish()?;
-                return Ok(());
-            }
-            let mut bytes = vec![0u8; len as usize];
-            rx.read_exact(&mut bytes).await?;
-            if blob_hash(&bytes) != hash {
-                bail!("blob hash mismatch");
-            }
-            write_blob(&path, &bytes).await?;
-            inner.emit(NetEvent::BlobStored { hash });
-            send(&mut tx, &BlobResp::Stored).await?;
-        }
-    }
-    tx.finish()?;
-    conn.closed().await;
-    Ok(())
-}
-
-async fn write_blob(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        tokio::fs::create_dir_all(dir).await?;
-    }
-    let tmp = path.with_extension("tmp");
-    tokio::fs::write(&tmp, bytes).await?;
-    tokio::fs::rename(&tmp, path).await?;
     Ok(())
 }
 
@@ -1065,55 +1000,6 @@ impl Node {
         Ok(())
     }
 
-    pub fn blob_path(&self, space: &SpaceId, hash: &Hash32) -> Option<PathBuf> {
-        self.inner.blob_path(space, hash).filter(|p| p.exists())
-    }
-
-    /// Store an (already encrypted) blob locally and push it to online
-    /// members and keepers in the background. Returns its hash.
-    pub async fn put_blob(&self, space: SpaceId, bytes: Vec<u8>) -> Result<Hash32> {
-        if bytes.len() as u64 > MAX_BLOB {
-            bail!("file too large (max {} MiB)", MAX_BLOB / 1024 / 1024);
-        }
-        let hash = blob_hash(&bytes);
-        let path = self.inner.blob_path(&space, &hash).context("blob storage disabled")?;
-        write_blob(&path, &bytes).await?;
-        let me = self.id();
-        let members: Vec<SignPk> = self.with_space(&space, |r| {
-            r.members().into_iter().map(|(k, _)| k.sign_pk).filter(|p| *p != me).collect()
-        })?;
-        let bytes = Arc::new(bytes);
-        for pk in members {
-            let (inner, bytes) = (self.inner.clone(), bytes.clone());
-            tokio::spawn(async move {
-                let _ = push_blob(&inner, pk, space, hash, &bytes).await;
-            });
-        }
-        Ok(hash)
-    }
-
-    /// Get a blob: local if present, otherwise from any member that has it.
-    pub async fn fetch_blob(&self, space: SpaceId, hash: Hash32) -> Result<PathBuf> {
-        if let Some(p) = self.blob_path(&space, &hash) {
-            return Ok(p);
-        }
-        let me = self.id();
-        let mut members: Vec<SignPk> = self.with_space(&space, |r| {
-            r.members().into_iter().map(|(k, _)| k.sign_pk).filter(|p| *p != me).collect()
-        })?;
-        let peers = self.peers();
-        members.sort_by_key(|pk| !peers.get(pk).is_some_and(|p| p.online()));
-        for pk in members {
-            if let Ok(bytes) = get_blob(&self.inner, pk, space, hash).await {
-                let path = self.inner.blob_path(&space, &hash).context("blob storage disabled")?;
-                write_blob(&path, &bytes).await?;
-                self.inner.emit(NetEvent::BlobStored { hash });
-                return Ok(path);
-            }
-        }
-        bail!("blob not available from any reachable member")
-    }
-
     pub async fn shutdown(&self) -> Result<()> {
         for t in &self.tasks {
             t.abort();
@@ -1124,39 +1010,4 @@ impl Node {
         self.router.shutdown().await?;
         Ok(())
     }
-}
-
-async fn push_blob(inner: &Arc<Inner>, pk: SignPk, space: SpaceId, hash: Hash32, bytes: &[u8]) -> Result<()> {
-    let conn = connect(inner, &pk, ALPN_BLOB).await?;
-    let (mut tx, mut rx) = conn.open_bi().await?;
-    send(&mut tx, &BlobReq::Put { space, hash, len: bytes.len() as u64 }).await?;
-    tx.write_all(bytes).await?;
-    tx.finish()?;
-    let resp: BlobResp = recv(&mut rx).await?;
-    conn.close(0u32.into(), b"done");
-    match resp {
-        BlobResp::Stored => Ok(()),
-        other => bail!("push failed: {other:?}"),
-    }
-}
-
-async fn get_blob(inner: &Arc<Inner>, pk: SignPk, space: SpaceId, hash: Hash32) -> Result<Vec<u8>> {
-    let conn = connect(inner, &pk, ALPN_BLOB).await?;
-    let (mut tx, mut rx) = conn.open_bi().await?;
-    send(&mut tx, &BlobReq::Get { space, hash }).await?;
-    tx.finish()?;
-    let resp: BlobResp = recv(&mut rx).await?;
-    let BlobResp::Found { len } = resp else {
-        bail!("not found: {resp:?}");
-    };
-    if len > MAX_BLOB {
-        bail!("blob too large");
-    }
-    let mut bytes = vec![0u8; len as usize];
-    rx.read_exact(&mut bytes).await?;
-    conn.close(0u32.into(), b"done");
-    if blob_hash(&bytes) != hash {
-        bail!("blob hash mismatch");
-    }
-    Ok(bytes)
 }

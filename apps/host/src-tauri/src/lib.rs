@@ -165,7 +165,7 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
             } else {
                 ""
             };
-            format!("cannot open Mycel data in {}: {e}{hint}", data_dir.display())
+            format!("cannot open Mycel data in {}: {e:#}{hint}", data_dir.display())
         })?;
 
     allow_attachment_files(app, &data_dir)?;
@@ -239,6 +239,7 @@ pub fn run() {
             commands::fetch_attachment,
             commands::accept_request,
             commands::decline_request,
+            commands::stage_file,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build the Mycel host");

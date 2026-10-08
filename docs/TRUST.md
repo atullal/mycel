@@ -128,6 +128,31 @@ ciphertext = XChaCha20-Poly1305(key = epoch key, nonce, aad = "mycel/v0/content"
 
 **Materialization:** a document = the valid, decryptable changes, applied in causal order. If a newly arrived revocation invalidates envelopes that were already applied, the peer **rebuilds** the document from its envelope store. Every peer holding the same graph and envelopes arrives at the same document.
 
+## 7b. Attachments (blobs)
+
+An attachment is a **blob**: immutable bytes, content-addressed by `BlobId = BLAKE3-derive_key("mycel/v0/blob", sealed bytes)`. The chat message (an encrypted feed entry, §7) carries an `AttachmentRef { blob, key, nonce, name, mime, size }`. So the per-attachment key travels end-to-end encrypted, and the signed message pins the exact ciphertext by hash.
+
+**Encryption (streaming, any size).** Each attachment gets a fresh random 256-bit `key` and 192-bit `nonce`. The plaintext is sealed with the STREAM construction (Hoang–Reyhanitabar–Rogaway–Vizár) over XChaCha20-Poly1305:
+
+```
+blob     = "MYCELBLOB1\0" ‖ chunk_size: u32 LE ‖ C_0 ‖ … ‖ C_n            (n ≥ 0, chunk_size = 1 MiB)
+C_i      = XChaCha20-Poly1305(key, nonce_i, aad_i, P_i)                   (|P_i| = chunk_size for i < n, 0..=chunk_size for i = n)
+nonce_i  = nonce with its last 8 bytes XORed with i (u64 LE)
+aad_i    = "mycel/v0/stream-chunk" ‖ len(A): u32 LE ‖ A ‖ chunk_size: u32 LE ‖ i: u64 LE ‖ final: u8     (A = "mycel/v0/attachment")
+```
+
+- The final flag and the index are authenticated, so chunks can't be dropped, reordered, duplicated, truncated at a chunk boundary or extended. An empty file is one empty final chunk. The header's chunk size is bound into every chunk's AAD.
+- Memory is one chunk (plus I/O buffers) whatever the file size. Encryption reads the source once, writing the sealed blob (hashed as it's written) and the sender's plaintext copy in the same pass.
+- **Legacy format:** attachments sent before this used one-shot `XChaCha20-Poly1305(key, nonce, A, plaintext)`. A blob without the magic prefix is opened that way. Only blobs up to 64 MiB are opened like that (the old cap was 50 MiB), so a hostile reference can't make a peer read a huge blob into memory.
+- Code: `crates/mycel-crypto/src/stream.rs`. Tests cover roundtrip at chunk boundaries (0, 1, chunk − 1, chunk, chunk + 1, many chunks), tampering, wrong key/nonce/AAD, truncation, extension, reordering, duplication and chunk-size changes.
+
+**Transfer.** Blobs are stored per space (`blobs/<space>/<blob>`) and served only to the space's members (ALPN `mycel/blob/0`). They are streamed between QUIC and disk into `<blob>.part`. The receiver checks the BLAKE3 hash of the whole blob before renaming it into place, so a peer can't substitute data. An interrupted transfer resumes from the `.part`, possibly from a different member. The final hash check covers the prefix too, and a bad prefix is discarded and fetched again.
+
+**Availability and disk use.** There is no size limit and no per-space quota.
+- Blobs up to 16 MiB are pushed to every member as soon as they're posted. Bigger ones are pushed only to keepers, and members fetch them when their user clicks download, from anyone in the space who has them.
+- Receivers enforce this: a personal device refuses an unsolicited push above 16 MiB, so a member can't fill your disk with large files you never opened. Keepers accept any size.
+- Every transfer is refused if it would leave less than 1 GiB of free disk space.
+
 ## 8. Transport rules
 
 - **ALPN** `mycel/sync/1` (plus `mycel/card/0`, `mycel/eph/0`, `mycel/blob/0`). Iroh authenticates the remote node ID, which equals the remote `sign_pk`.
@@ -139,7 +164,7 @@ ciphertext = XChaCha20-Poly1305(key = epoch key, nonce, aad = "mycel/v0/content"
 
 | Spec section | Code | Tests |
 |---|---|---|
-| §2 primitives | `crates/mycel-crypto` | 6 unit tests: domain separation, framing, kex binding, lockbox info binding, AEAD tamper |
+| §2 primitives | `crates/mycel-crypto` | 14 unit tests: domain separation, framing, kex binding, lockbox info binding, AEAD tamper; streaming attachment AEAD (§7b): chunk boundaries, tamper, truncation, extension, reorder, legacy detection, incremental digest |
 | §3–§6 graph, resolution, epochs | `crates/mycel-trust` (`resolve.rs` = §5) | 13 tests: forged admin ops, pending ops, removal + rotation, concurrent revocation, mutual removal (seniority), delivery-order convergence, rotation recipient checks, bad key commitment, last admin, self-healing rotation |
 | §7 envelopes | `crates/mycel-sync` | 9 tests: replication, reader writes rejected, keeper can't read, outsider/tampered envelopes, forged actor, backdated writes after removal, 3-way convergence, demotion |
 | §8 transport | `crates/mycel-net` | end-to-end over real Iroh QUIC: 5 nodes (admin, writer, reader, keeper, outsider) |
@@ -157,7 +182,7 @@ An independent adversarial review found these issues. All are fixed, each with a
 | 5 | Medium | Duplicate Automerge (actor, seq) could make docs diverge | Equivocation detected: the lowest envelope ID wins on every peer, and the doc is rebuilt canonically |
 | 6 | Medium | Overflow panic poisoned the global lock (crash loop) | `checked_add`; `parking_lot` mutexes (no poisoning) |
 | 7 | Low | Members who had left could keep posting with backdated heads | `Leave` carries a cutoff and is treated as a revocation |
-| 8 | Low | Blobs weren't scoped to a space, and had no quota | Per-space blob directories, 2 GiB per-space quota |
+| 8 | Low | Blobs weren't scoped to a space, and had no quota | Per-space blob directories. The 2 GiB per-space quota was later replaced (§7b) by refusing unsolicited pushes above 16 MiB on personal devices and refusing any transfer that would leave less than 1 GiB free |
 | 9 | Low | Local HTTP API gaps | Per-run secret token (embedded in the page, `0600` file for the CLI) on every route; file serving limited to attachment folders; browser attachments must come from uploads |
 
 **Still open:**

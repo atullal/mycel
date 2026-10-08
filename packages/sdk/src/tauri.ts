@@ -1,5 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen as tauriListen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import type { ArgsOf, Command, FileHost, ResultOf, Transport } from "./transport.ts";
@@ -24,6 +25,38 @@ const tauriFiles: FileHost = {
   },
   async open(path) {
     await openPath(path);
+  },
+  async stage(files) {
+    const paths: string[] = [];
+    for (const f of files) {
+      // Raw body (no JSON): the `stage_file` command writes it under uploads/.
+      const bytes = new Uint8Array(await f.arrayBuffer());
+      paths.push(
+        await invoke<string>("stage_file", bytes, {
+          headers: { "x-mycel-name": encodeURIComponent(f.name || "pasted") },
+        }),
+      );
+    }
+    return paths;
+  },
+  onDragDrop(handler) {
+    let off: (() => void) | null = null;
+    let cancelled = false;
+    void getCurrentWebview()
+      .onDragDropEvent((e) => {
+        const p = e.payload;
+        if (p.type === "enter" || p.type === "over") handler({ type: "over" });
+        else if (p.type === "leave") handler({ type: "leave" });
+        else if (p.type === "drop") handler({ type: "drop", paths: p.paths });
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else off = fn;
+      });
+    return () => {
+      cancelled = true;
+      off?.();
+    };
   },
 };
 

@@ -11,6 +11,7 @@
 pub mod api;
 pub mod dispatch;
 pub mod links;
+mod files;
 mod runtime;
 pub mod store;
 

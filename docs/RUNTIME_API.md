@@ -70,10 +70,19 @@ impl Runtime {
 | `fetch_attachment` | `{ blob }` | `string` (path) |
 | `accept_request` | `{ id }` | `ConversationSummary` |
 | `decline_request` | `{ id, block? }` | `null` |
+| `stage_file` | raw bytes as the body; `x-mycel-name` header = URI-encoded file name | `string` (path to pass in `attachments`) |
 
-Errors are rejected promises carrying a human-readable string.
+`stage_file` is host-only (Tauri). It is for pasted images and other files without a path. The SDK calls it through `files.stage()`.
 
-**Event:** the Tauri event `mycel://event` carries one `Event` (tagged by `type`): `conversationUpdated`, `conversationAdded`, `typing`, `contactsChanged`, `nearbyChanged`, `networkChanged`, `blobReady`.
+Errors are rejected promises carrying a human-readable string. It includes the cause, e.g. `macOS didn't let Mycel read /Users/me/Desktop/x.mov. Allow Mycel in System Settings > Privacy & Security > Files and Folders …: Operation not permitted (os error 1)`.
+
+**Event:** the Tauri event `mycel://event` carries one `Event` (tagged by `type`): `conversationUpdated`, `conversationAdded`, `typing`, `contactsChanged`, `nearbyChanged`, `networkChanged`, `blobReady`, `transferProgress`.
+
+`transferProgress { direction: "upload" | "download", id, done, total }`:
+- Emitted at most every 250 ms, plus a final event with `done == total`.
+- For uploads, `id` is the exact string passed in `send_message`'s `attachments`, and the bytes count plaintext encrypted.
+- For downloads, `id` is the blob id, and the bytes count sealed bytes received.
+- The SDK's React hook `useTransfer(id)` returns the latest `{ done, total }`.
 
 ## Semantics the UI can rely on
 - **Instant local writes:** `send_message` returns as soon as the message is written locally (`delivery: "local"`). It moves to `sent`, then `delivered`, then `read` as peers sync, and each step emits `conversationUpdated`.
@@ -82,6 +91,15 @@ Errors are rejected promises carrying a human-readable string.
 - **Typing is ephemeral:** a `typing` event should be shown for about 4 seconds.
 - **Message order:** messages arrive in causal order. `sentAt` is display-only (the author's clock).
 - **Attachments are lazy:** an attachment's `localPath` is `null` until fetched. Call `fetch_attachment`, then wait for `blobReady`.
+- **Attachments of any size:**
+  - There is no size limit. Files are encrypted and transferred as streams with bounded memory (docs/TRUST.md §7b).
+  - Attachments up to 16 MiB are pushed to members right away. Bigger ones are downloaded when you call `fetch_attachment`, from the sender, a keeper or any member that has them. An interrupted download resumes where it stopped.
+  - A transfer is refused, with a clear error, if it would leave less than 1 GiB of free disk.
+  - `send_message` resolves once the files are encrypted locally. Watch `transferProgress` while it runs.
+- **What `attachments` accepts:**
+  - Local file paths, or `file://` URLs.
+  - A folder or macOS package (`.app`, `.pages`, `.key`, `.rtfd`, …) is sent as `<name>.zip`.
+  - Files staged under the data dir's `uploads/` (HTTP uploads, `stage_file`) are deleted once the message is sent; the attachment then lives in `files/`.
 - **Offline-first:** everything works with no network at all. Peers on the same LAN find each other via mDNS with no internet.
 
 ## Message requests
@@ -108,8 +126,8 @@ When someone who isn't your contact adds you, the conversation arrives with `req
 |---|---|
 | `POST /api/cmd/<command>` | JSON args → JSON result; errors are `400 {"error": "..."}`. Requires the header `X-Mycel: 1`. |
 | `GET /api/events` | Server-Sent Events, one JSON `Event` per message |
-| `POST /api/upload?name=<file>` | Raw body → `{"path": "..."}` to pass in `attachments`. Requires `X-Mycel: 1`. |
-| `GET /api/file?path=<path>` | Serves files under the data dir only (sandboxed, nosniff) |
+| `POST /api/upload?name=<file>` | Raw body, streamed to disk with no size limit → `{"path": "..."}` to pass in `attachments`. Requires `X-Mycel: 1`. |
+| `GET /api/file?path=<path>` | Serves attachment files under the data dir only (sandboxed, nosniff). Streamed, with `Range` support |
 | `GET /api/boot.js` | Tells `@mycel/sdk` to use the HTTP transport |
 
 **Security:**

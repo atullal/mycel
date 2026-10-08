@@ -31,7 +31,7 @@ npm install && npm run build                  # UI
 cargo build -p mycel-cli                      # CLI
 ./target/debug/mycel serve --name Alice       # then open http://127.0.0.1:7777
 ./target/debug/mycel keeper --data ~/.mycel-keeper   # optional always-on keeper
-cargo test --workspace --exclude mycel-host   # 79 Rust tests
+cargo test --workspace --exclude mycel-host   # 93 Rust tests
 ```
 
 Native app: `cd apps/host && cargo tauri build` (see [docs/TWO_LAPTOPS.md](docs/TWO_LAPTOPS.md)).

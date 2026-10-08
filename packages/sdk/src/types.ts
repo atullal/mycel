@@ -153,6 +153,12 @@ export interface NetworkStatus {
   peers: PeerPaths[];
 }
 
+/**
+ * - `upload`: encrypting an attachment we're sending.
+ * - `download`: downloading an attachment someone sent.
+ */
+export type TransferDirection = "upload" | "download";
+
 /** Pushed to UIs (Tauri event `mycel://event`), tagged by `type`. */
 export type MycelEvent =
   /** Anything about a conversation changed (messages, members, receipts). */
@@ -163,7 +169,13 @@ export type MycelEvent =
   | { type: "contactsChanged" }
   | { type: "nearbyChanged" }
   | { type: "networkChanged" }
-  | { type: "blobReady"; blob: string };
+  | { type: "blobReady"; blob: string }
+  /**
+   * An attachment transfer moved forward (at most every 250 ms, plus a final
+   * event with `done === total`). `id` is the path passed to `send_message`
+   * for uploads, and the blob id for downloads.
+   */
+  | { type: "transferProgress"; direction: TransferDirection; id: string; done: number; total: number };
 
 /** Alias matching the Rust name. */
 export type Event = MycelEvent;
@@ -182,4 +194,5 @@ export const EVENT_TYPES: readonly EventType[] = [
   "nearbyChanged",
   "networkChanged",
   "blobReady",
+  "transferProgress",
 ] as const;

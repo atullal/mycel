@@ -657,7 +657,11 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     const b = blobs.get(blob);
     if (!b) throw "Unknown attachment";
     if (!b.local) {
-      await new Promise((r) => later(900 + Math.random() * 600, () => r(null)));
+      const total = Math.max(b.size, 1);
+      for (let i = 1; i <= 4; i++) {
+        await new Promise((r) => later(250 + Math.random() * 150, () => r(null)));
+        emit({ type: "transferProgress", direction: "download", id: blob, done: Math.round((total * i) / 4), total });
+      }
       b.local = true;
       emit({ type: "blobReady", blob });
       for (const c of convs.values()) {
@@ -990,6 +994,13 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     },
     async open(path) {
       if (typeof window !== "undefined") window.open(files.url(path), "_blank", "noopener");
+    },
+    async stage(list) {
+      return list.map((f) => {
+        const path = `mock://upload/${++uploadSeq}/${encodeURIComponent(f.name || "pasted")}`;
+        uploads.set(path, f);
+        return path;
+      });
     },
   };
 

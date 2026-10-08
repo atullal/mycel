@@ -1,5 +1,5 @@
 export * from "./types.ts";
-export type { ArgsOf, Command, Commands, FileHost, ResultOf, Transport } from "./transport.ts";
+export type { ArgsOf, Command, Commands, FileDragEvent, FileHost, ResultOf, Transport } from "./transport.ts";
 export { toError } from "./transport.ts";
 export { createTauriTransport, isTauri, EVENT_NAME } from "./tauri.ts";
 export { createMockTransport, mockContactCode, MOCK_CONTACT_CODES } from "./mock.ts";
