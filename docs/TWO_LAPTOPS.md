@@ -49,7 +49,12 @@ between them over the local network only. No accounts, no server, no internet.
      set Mycel to *Allow incoming connections*.) Because the app is unsigned,
      macOS may ask again after you replace the app with a new build.
 
-   Without these two permissions the laptops can't see or reach each other.
+   - *"Mycel would like to use Bluetooth"* → **Allow** (the Bluetooth path;
+     System Settings > Privacy & Security > Bluetooth if you missed it).
+   - When you first attach a file from Desktop, Documents or Downloads, macOS
+     may ask to let Mycel read that folder → **Allow**.
+
+   Without the network permissions the laptops can't see or reach each other.
 
 5. **Name each laptop.** A new profile is called "Anonymous", so both laptops
    start with the same name. Click your avatar at the bottom of the left rail
@@ -58,8 +63,13 @@ between them over the local network only. No accounts, no server, no internet.
 
 ## 2. Make sure there's no internet (optional, but that's the point)
 
-Mycel's default network mode (`lan`) never contacts the internet: it finds
-peers with mDNS on the local network and talks to them directly over QUIC.
+By default Mycel uses **every path** it has (the Network panel calls this
+*All paths*): the same network, peer-to-peer Wi-Fi, Bluetooth, and encrypted
+internet relays when the internet is there. None of the local paths need the
+internet. To be strict about it, open **Network** in the left rail, pick
+**Local only** and click **Restart now**: Mycel then never contacts the
+internet at all.
+
 To prove it, cut the internet while keeping the two Macs on one local network:
 
 - **Unplug the router's WAN / internet cable** (or disable its uplink); the Wi-Fi
@@ -100,14 +110,44 @@ Pick either way:
    it), *read* (everyone has opened the chat).
 3. Try the rest: replies, reactions, edit (↑ on an empty composer edits your
    last message), delete, typing indicator, group chats with a third device.
-4. **Files:** click the paperclip (**Attach files**), pick a file, send. On the
-   other laptop the attachment appears with a download button; it's fetched
-   directly from the sender, encrypted, when clicked.
+4. **Files, any size:** click the paperclip (**Attach files**), drag files onto
+   the conversation, or paste one. Folders and packages (`.pages`, `.app`…) are
+   sent as a `.zip`. Files up to 16 MB are sent to the other laptop right away;
+   bigger ones (multi-GB videos are fine) download when the other side clicks
+   the download button, with a progress bar. An interrupted download resumes.
 
-The **Network** button in the rail shows who is connected and which local
-addresses this Mac is listening on.
+The **Network** button in the rail shows each path (same network, peer-to-peer
+Wi-Fi, Bluetooth, internet relay), whether it's working, and which path each
+person is reached by right now.
 
-## 5. Offline delivery
+## 5. No network at all: peer-to-peer Wi-Fi and Bluetooth
+
+The two laptops don't need to share a network. Try each step and watch the
+**Network** panel's *Talking to* list say which path is used:
+
+1. **Leave the Wi-Fi network, keep Wi-Fi on** (on both Macs: Wi-Fi menu >
+   disconnect, or forget the network; unplug Ethernet). Mycel switches to
+   **Peer-to-peer Wi-Fi**: the same Apple radio link AirDrop uses. Messages and
+   files keep working, at Wi-Fi speed, within a few seconds. Range is roughly a
+   room or two.
+2. **Turn Wi-Fi off entirely** (keep Bluetooth on). Mycel falls back to
+   **Bluetooth**. Messages still go through, but it's slow (roughly 15–60 KB/s):
+   fine for text, slow for photos, impractical for big files. Range is about
+   10 m.
+3. **Turn Wi-Fi back on / rejoin the network.** Mycel moves back to the faster
+   path by itself.
+
+A transfer that's already running moves to the next path when the current one
+dies (it pauses for about 5 seconds while the dead path is detected).
+
+If a path doesn't come up: the Network panel's *Paths* list says why (e.g.
+"Bluetooth is off", or the permission to allow). Peer-to-peer Wi-Fi and
+Bluetooth are new and had only been tested on one Mac before this; if either
+doesn't connect between your laptops, run Mycel from Terminal
+(`MYCEL_AWDL_DEBUG=1 MYCEL_BLE_LOG=2 /Applications/Mycel.app/Contents/MacOS/mycel-host`)
+and keep the log.
+
+## 6. Offline delivery
 
 1. Quit Mycel on laptop B (**Mycel > Quit Mycel**, or ⌘Q).
 2. On laptop A, send a few messages to B. They keep the clock mark
@@ -119,7 +159,7 @@ addresses this Mac is listening on.
 Messages are stored on the sender until a recipient (or a keeper, below) gets
 them, so the sender has to be running when the recipient comes back.
 
-## 6. Optional: a keeper on a third machine
+## 7. Optional: a keeper on a third machine
 
 A *keeper* is an always-on device that holds encrypted copies of a
 conversation and relays them to members who are offline. It can't read them.
@@ -182,8 +222,11 @@ MYCEL_DATA_DIR=/tmp/mycel-b MYCEL_NAME="Laptop B" MYCEL_NET=lan "$APP" &
 
 - `MYCEL_DATA_DIR`: data folder (default: the Application Support folder above).
 - `MYCEL_NAME`: display name; if set, it replaces the saved name on every launch.
-- `MYCEL_NET`: `lan` (default, no internet), `internet` (adds public relays and
-  hole punching so peers can meet across networks), or `local` (this Mac only).
+- `MYCEL_NET`: `internet` (every path, the default), `lan` (local paths only,
+  never the internet) or `local` (this Mac only). Overrides the Network panel.
+- `MYCEL_LINKS`: `all` (default), `none`, or a list of `awdl,ble`.
+- `MYCEL_IP=0`: turn off ordinary Wi-Fi/Ethernet IP, leaving only peer-to-peer
+  Wi-Fi and Bluetooth (to prove those paths work on their own).
 
 ## Troubleshooting
 

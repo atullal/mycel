@@ -2,15 +2,17 @@
 
 ## Automated (run `cargo test --workspace --exclude mycel-host`)
 
-All 93 tests pass and clippy is clean (2026-10-07).
+All 123 tests pass and clippy is clean (2026-10-07).
 
 | Crate | Tests | What they prove |
 |---|---|---|
 | `mycel-crypto` | 14 | Domain separation, framing, kex binding, lockbox info binding, AEAD tamper detection; **streaming attachment AEAD**: chunk-boundary sizes (0, 1, exactly one chunk, many), tamper, wrong key/nonce/AAD, truncation, extension, reorder/duplicate, chunk-size change, legacy one-shot detection, incremental digest == one-shot |
 | `mycel-trust` | 17 | Forged admin ops, pending ops, removal + rotation, concurrent revocation, mutual removal (seniority), delivery-order convergence, rotation recipient checks, bad key commitment, last admin, self-healing rotation, batch insert, leave, **epoch-ID reuse rejected**, **ops from never-added keys dropped** |
 | `mycel-sync` | 14 | Replication, reader writes rejected, keeper can't read, outsider/tampered envelopes, forged actor, backdated writes after removal, 3-way convergence, demotion, feed causal order, restore from storage, 2,000-message ingest, **doc equivocation resolves identically everywhere** |
-| `mycel-net` | 7 | Real QUIC between 5 nodes; invites + live sync with no manual calls; refusing invites; contact cards, typing, encrypted blobs; **real mDNS discovery on this machine**; **40 MiB blob streamed to disk, interrupted download resumed from its `.part`, corrupt partial copy detected and refetched from another member while the sender is offline, push policy (small → everyone, big → keepers only)**; free-space guard |
+| `mycel-net` | 9 | **Links**: two devices with no IP at all sync over in-memory links, prefer peer-to-peer Wi-Fi, fall back to Bluetooth; **a live QUIC connection moves to another link mid-transfer** (failover ≈5 s); Real QUIC between 5 nodes; invites + live sync with no manual calls; refusing invites; contact cards, typing, encrypted blobs; **real mDNS discovery on this machine**; **40 MiB blob streamed to disk, interrupted download resumed from its `.part`, corrupt partial copy detected and refetched from another member while the sender is offline, push policy (small → everyone, big → keepers only)**; free-space guard |
 | `mycel-node` | 10 | Full messaging API on real storage: DMs, delivery → read, replies, reactions, edits, deletes, attachments, **restart persistence**, **keeper delivery while the sender is offline**, group admin removal, **L4 rules rejecting a forged op**, **message requests + declined/blocked strangers stay out**, **contact-code address hints connect without discovery**, **hostile attachment names neutralized**; **120 MiB attachment (past the old 50 MiB cap) byte-exact between two nodes with upload/download progress**, **legacy one-shot attachments still open**, **folders sent as .zip via a `file://` URL**, `file://` decoding, **unreadable files explain why** (missing, permission denied → macOS privacy hint) |
+| `mycel-link-awdl` | 9 | Control datagrams, TXT records, interface filtering; plus 2 ignored Bonjour loopback tests (`-- --ignored`) |
+| `mycel-link-ble` | 19 | Framing, bounded queues, connection state machine (who dials, duplicates, timeouts, backoff), fake-radio sync between real nodes with IP off, macOS stream code over in-process pipes |
 | `mycel-kit-chat` | 4 | Author-only edits/deletes, reactions, receipts/unread, admin-only meta, garbage tolerance |
 | `mycel-rules(-abi)` | 27 | Deterministic WASM engine: fuel/memory limits, banned features, ABI violations, chat rules, wire compatibility with the chat kit |
 
@@ -65,3 +67,16 @@ cargo build -p mycel-cli && npm install && npm run build
 open http://127.0.0.1:7701 http://127.0.0.1:7702
 ```
 For two laptops, see [TWO_LAPTOPS.md](TWO_LAPTOPS.md).
+
+## Network paths and big files (2026-10-07, this Mac)
+
+**Any-size files, real UI.** Two `mycel serve --net lan` devices, UI driven in headless Chrome. A 300 MB file was attached with the file picker and sent: delivered in about 7 s. Bob clicked download and watched a progress bar ([screenshot](screenshots/13-big-file-progress.png)): done in about 5 s, sha256 identical, Bob's process stayed at 39 MB of memory. The agent's own runs: 1 GiB in 21 s, peak memory about 42 MB.
+
+**Peer-to-peer Wi-Fi only.** Two devices with `MYCEL_IP=0` (no Wi-Fi/Ethernet IP transport at all, only links):
+- each found the other over the Bonjour peer-to-peer service, `network_status` showed `available: ["peerWifi"]`, `via: "peerWifi"`
+- a message and a 20 MB attachment went A → B; the file's sha256 matched, A's message went to *delivered*
+- `lsof` on B: the only peer sockets were UDP on `fe80…%awdl0`, plus mDNS
+
+On one Mac the AWDL traffic loops locally, so the real radio test needs two Macs (see TWO_LAPTOPS.md §7). Bluetooth: advertising, L2CAP publishing and scanning were verified on this Mac (121 nearby BLE devices seen); a Mac can't connect to itself, so the Bluetooth path's first real crossing is the two-laptop test.
+
+**Network panel** shows the mode switch, each path's state and which path each person is reached by ([screenshot](screenshots/14-network-paths.png)).
