@@ -690,7 +690,16 @@ async fn group_call_between_runtimes() {
             }
         }
     }
-    let st = dispatch(&bob, "call_status", json!({})).await.unwrap();
+    // Each person's path is known once that connection has an RTT sample;
+    // under load that can trail the audio by a moment.
+    let mut st = json!(null);
+    for _ in 0..50 {
+        st = dispatch(&bob, "call_status", json!({})).await.unwrap();
+        if st[0]["participants"].as_array().is_some_and(|ps| ps.iter().all(|p| p["path"] == "network")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let people = st[0]["participants"].as_array().unwrap();
     assert_eq!(people.len(), 2);
     for p in people {

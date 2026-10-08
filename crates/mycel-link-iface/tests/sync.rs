@@ -77,6 +77,10 @@ async fn sync_over_an_interface_with_ip_off() {
         alice.peers().get(&bob.id()).is_some_and(|p| !p.links.is_empty() && p.online())
     })
     .await;
+    eventually("alice found over the interface", || {
+        bob.peers().get(&alice.id()).is_some_and(|p| !p.links.is_empty() && p.online())
+    })
+    .await;
     let (_, kind, local) = alink.in_use().into_iter().find(|(n, ..)| *n == iface).expect("socket on the interface");
     eprintln!("alice on {iface} ({}) at {local}; peers {:?}", kind.label(), alink.peers().len());
 
