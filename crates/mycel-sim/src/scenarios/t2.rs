@@ -1112,7 +1112,7 @@ fn global_scale(o: Opts) -> ScenarioResult {
     let kind = |k: &str| cand.extra.get("control_b_s_per_device").and_then(|v| v.get(k)).and_then(|v| v.as_f64());
     if let (Some(routing), Some(carrier)) = (kind("routing"), kind("carrier")) {
         r.at_most("of which routing (announcements, seqno requests)", routing, 1000.0, "B/s");
-        r.note(format!("Control traffic per device: routing {routing:.0} B/s, store-and-forward carrier {carrier:.0} B/s (summaries with up to 64 predictabilities to every neighbour every 10 s; docs/SIMULATION.md §4)."));
+        r.note(format!("Control traffic per device: routing {routing:.0} B/s, store-and-forward carrier {carrier:.0} B/s (summaries of what changed, everything every 60 s; docs/SIMULATION.md §4)."));
     }
     expect(&mut r, &o, false);
     let inet = w.specs.iter().filter(|s| s.inet.is_some()).count();

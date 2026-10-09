@@ -308,6 +308,20 @@ lifetime, copies) is signed by the source.
   (Sending the whole payload and refusing at the end turned 95–99% of the
   link time on conference traces into refused transfers, retried every
   second: `docs/BENCHMARKS.md` §6.1.)
+- **Summaries say what changed** (`Carrier::summaries`). A new hop
+  connection gets everything: the bundles held, the latest receipts, room,
+  and the most useful 64 predictabilities. After that a neighbour hears what
+  changed, at most every 2 s: bundles taken since, receipts learnt since,
+  room, and the predictabilities the gradient uses between full summaries.
+  With the internet gradient that is P(internet), plus P(destination) for
+  the destinations it holds bundles for that the internet doesn't lead to
+  (its summary `wants` them). Every 60 s it gets everything held again, so
+  it learns what we dropped, with the full predictability table, so
+  PRoPHET's transitivity keeps carrying destination predictabilities hop
+  by hop. Nothing changes, nothing is sent. A summary that may not have
+  arrived (its stream failed) resets the neighbour to "tell it
+  everything". Sending all 64 predictabilities to every neighbour every
+  10 s cost 8 kB/s per device at 2,000 devices (`docs/SIMULATION.md` §4).
 - **Resume.** A transfer cut short (the median Helsinki contact lasts
   2.4 s) leaves its bytes with the receiver for 5 minutes, bounded to a
   quarter of its store. The next offer of that bundle, from any carrier,

@@ -14,8 +14,12 @@
 //! - **Records**: `Out::PublishReach` puts the device's record in the
 //!   directory; `Out::Resolve` looks one up (DHT-like delay).
 //! - **Data**: an app message is split into packets of at most 1,200 bytes
-//!   (QUIC's packets), sent with `Router::send` (or straight over the radio
-//!   to a neighbour: direct paths never use the mesh). The destination acks
+//!   (QUIC's packets), sent with `Router::send`, or straight to the peer
+//!   where a direct path exists: over the radio to a neighbour, or over the
+//!   internet once two devices with the internet have a connection (the
+//!   node's Iroh connection, pooled for [`mycel_net::POOL_IDLE`]; the
+//!   first packet pays the lookup and the dial). Direct paths never use
+//!   the mesh, and the core refuses data for a neighbour. The destination acks
 //!   each complete message; the sender retransmits unacked messages with
 //!   exponential backoff (1 s → 30 s, for 10 min), as QUIC and Mycel's sync
 //!   would. The ack's arrival is the message's receipt (round trip).
@@ -29,8 +33,9 @@
 //!   a bundle, which moves along live and partial routes (`Router::toward`)
 //!   with custody, down the PRoPHET gradient toward the destination or the
 //!   internet, or sprays. Carriers exchange summaries (held ids, receipts,
-//!   predictabilities) when they meet and every 10 s; the destination signs a
-//!   receipt. Delivery is whichever arrives first.
+//!   room, predictabilities) when they meet and then when something changes
+//!   (`Carrier::summaries`); the destination signs a receipt. Delivery is
+//!   whichever arrives first.
 
 use crate::stats::{Map, Set};
 use std::cell::Cell;
@@ -53,6 +58,8 @@ const PKT_HDR: usize = 1 + 4 + 2 + 2;
 const TAG_DATA: u8 = 1;
 const TAG_ACK: u8 = 2;
 const HANDSHAKE: u32 = 1200;
+/// [`mycel_net::POOL_IDLE`] in engine time.
+const POOL_IDLE_US: Time = 60 * SEC;
 
 /// A device's key in the simulation (deterministic from its id).
 pub fn key(i: NodeId) -> SignPk {
@@ -139,6 +146,9 @@ pub struct Global {
     /// Control bytes sent, by kind: routing (announcements, seqno
     /// requests), carrier (summaries, offers, answers, acks), dials, other.
     pub ctrl_by_kind: [u64; 4],
+    /// Internet peers we have a connection to (the node's pooled QUIC
+    /// connections) and when it last carried a packet.
+    conns: Map<NodeId, Time>,
     buffer_at: Time,
     buffer_now: u64,
 }
@@ -195,6 +205,7 @@ impl Global {
             buffer_peak: 0,
             buffer_area: 0.0,
             ctrl_by_kind: [0; 4],
+            conns: Map::default(),
             buffer_at: 0,
             buffer_now: 0,
         }
@@ -244,16 +255,24 @@ impl Global {
         self.note_buffer(cx);
     }
 
-    fn dtn_summaries(&mut self, cx: &mut Cx<Frame>) {
+    /// Summaries due now (the carrier decides: everything to a new
+    /// neighbour, then what changes). Every 10 s, neighbours still in range
+    /// count as encounters again.
+    fn dtn_summaries(&mut self, cx: &mut Cx<Frame>, encounters: bool) {
         let now = Self::ms(cx);
         let Some(c) = self.dtn.as_mut() else { return };
         let nbs: Vec<SignPk> = self.core.neighbours().into_iter().map(|(k, _)| k).collect();
-        for k in &nbs {
-            c.encounter(*k, now);
+        if encounters {
+            for k in &nbs {
+                c.encounter(*k, now);
+            }
         }
-        let s = Rc::new(c.summary(now));
-        for k in nbs {
-            self.send_to(cx, node(&k), Frame::Summary(s.clone()), None);
+        for (k, s) in c.summaries(now, &nbs) {
+            if !self.send_to(cx, node(&k), Frame::Summary(Rc::new(s)), None)
+                && let Some(c) = self.dtn.as_mut()
+            {
+                c.new_contact(k); // it heard nothing: tell it everything next time
+            }
         }
     }
 
@@ -425,18 +444,34 @@ impl Global {
     }
 
     fn send_packet(&mut self, cx: &mut Cx<Frame>, dst: NodeId, p: Bytes) {
+        let msg = packet_msg(&p);
+        let size = p.len() as u32;
         if cx.radios_to(dst).is_some() {
             // a direct path: never through the mesh
-            let msg = packet_msg(&p);
-            let size = p.len() as u32;
             cx.send_radio(dst, Frame::Direct(p), size, false, msg);
             return;
         }
+        let (now_us, pk) = (cx.now(), key(dst));
+        // a connection to it over the internet: Iroh's own, direct (as in the
+        // node; the core refuses data for a neighbour, and an internet hop
+        // is one)
+        if self.conn_warm(dst, now_us) || self.core.is_neighbour(&pk) {
+            if cx.send_inet(dst, Frame::Direct(p.clone()), size + 20, false, msg) {
+                self.conns.insert(dst, now_us);
+                return;
+            }
+            self.conns.remove(&dst);
+        }
         let now = Self::ms(cx);
-        let pk = key(dst);
         self.core.send(pk, self.pk, p, false, now);
         self.effects(cx);
         self.busy(cx);
+    }
+
+    /// We exchanged packets with `peer` over the internet within the
+    /// node's connection-pool idle time ([`mycel_net::POOL_IDLE`]).
+    fn conn_warm(&self, peer: NodeId, now_us: Time) -> bool {
+        self.conns.get(&peer).is_some_and(|t| now_us.saturating_sub(*t) < POOL_IDLE_US)
     }
 
     /// Send what the window allows: parts not acked and not in flight.
@@ -497,7 +532,9 @@ impl Router for Global {
             Frame::Answer { .. } => 60,
             Frame::Bundle(b, _) => b.payload.len() as u32 + 80,
             Frame::BundleAck { .. } => 80,
-            Frame::Summary(s) => (16 + 32 * s.ids.len() + 96 * s.receipts.len() + 36 * s.preds.len() + 16 * s.evictable.len()) as u32,
+            Frame::Summary(s) => {
+                (16 + 32 * s.ids.len() + 96 * s.receipts.len() + 36 * s.preds.len() + 16 * s.evictable.len() + 32 * s.wants.len()) as u32
+            }
         }
     }
 
@@ -536,8 +573,14 @@ impl Router for Global {
             self.core.set_cost(pk, radio_units(techs));
             if let Some(c) = self.dtn.as_mut() {
                 c.encounter(pk, now);
-                let s = Rc::new(c.summary(now));
-                self.send_to(cx, nb, Frame::Summary(s), None);
+                c.new_contact(pk);
+                for (k, s) in c.summaries(now, &[pk]) {
+                    if !self.send_to(cx, node(&k), Frame::Summary(Rc::new(s)), None)
+                        && let Some(c) = self.dtn.as_mut()
+                    {
+                        c.new_contact(k);
+                    }
+                }
             }
         } else {
             self.core.hop_down(pk, now);
@@ -554,7 +597,7 @@ impl Router for Global {
         self.dtn_plan(cx);
     }
 
-    fn on_frame(&mut self, cx: &mut Cx<Frame>, from: NodeId, _over: Over, f: Frame) {
+    fn on_frame(&mut self, cx: &mut Cx<Frame>, from: NodeId, over: Over, f: Frame) {
         if !cx.online() {
             return;
         }
@@ -574,14 +617,21 @@ impl Router for Global {
                 }
                 self.core.on_frame(fpk, d, now);
             }
-            Frame::Direct(p) => self.on_packet(cx, from, p),
+            Frame::Direct(p) => {
+                if matches!(over, Over::Inet) {
+                    self.conns.insert(from, cx.now());
+                }
+                self.on_packet(cx, from, p)
+            }
             Frame::Dial => {
+                self.conns.insert(from, cx.now());
                 self.core.hop_up(fpk, now);
                 let c = Self::inet_units(cx, from);
                 self.core.set_cost(fpk, c);
                 cx.send_inet(from, Frame::DialAck, HANDSHAKE, true, None);
             }
             Frame::DialAck => {
+                self.conns.insert(from, cx.now());
                 self.core.hop_up(fpk, now);
                 let c = Self::inet_units(cx, from);
                 self.core.set_cost(fpk, c);
@@ -691,9 +741,8 @@ impl Router for Global {
                     if let Some(c) = self.dtn.as_mut() {
                         c.tick(now);
                     }
-                    if now / 10_000 != now.saturating_sub(self.period / MS) / 10_000 {
-                        self.dtn_summaries(cx);
-                    }
+                    let encounters = now / 10_000 != now.saturating_sub(self.period / MS) / 10_000;
+                    self.dtn_summaries(cx, encounters);
                     self.dtn_plan(cx);
                 }
                 // forget packet ids after a while (loop detection window)
@@ -792,12 +841,21 @@ impl Router for Global {
                     c.transferred(key(to), o.id, o.copies, false, now);
                 }
             }
+            // a summary that didn't arrive: the next one tells it everything
+            Frame::Summary(_) => {
+                if let Some(c) = self.dtn.as_mut() {
+                    c.new_contact(key(to));
+                }
+            }
             _ => {}
         }
     }
 
     fn on_online(&mut self, cx: &mut Cx<Frame>, online: bool) {
         let now = Self::ms(cx);
+        if !online {
+            self.conns.clear();
+        }
         self.core.set_internet(online && cx.has_inet());
         self.core.tick(now);
         self.effects(cx);

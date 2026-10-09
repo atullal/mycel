@@ -284,7 +284,6 @@ struct Driver {
     carrier: Option<Mutex<dtn::Carrier>>,
     /// Where bundles for us go (the node ingests them).
     bundle_sink: Mutex<Option<mpsc::UnboundedSender<(SignPk, Bytes)>>>,
-    last_summary: Mutex<HashMap<SignPk, Instant>>,
 }
 
 impl std::fmt::Debug for Driver {
@@ -487,7 +486,9 @@ impl Driver {
         {
             c.lock().encounter(peer, self.now());
         }
-        self.last_summary.lock().remove(&peer); // tell it what we hold, soon
+        if let Some(c) = &self.carrier {
+            c.lock().new_contact(peer); // tell it what we hold, soon
+        }
         self.keep(tokio::spawn(self.clone().serve_streams(peer, conn.clone())));
         let me = self.clone();
         let task = tokio::spawn(async move {
@@ -784,11 +785,13 @@ impl Driver {
         let Some((&K_SUMMARY, body)) = bytes.split_first() else { return Ok(()) };
         let w: WireSummary = postcard::from_bytes(body)?;
         let s = dtn::Summary {
+            full: w.full,
             ids: w.ids,
             receipts: w.receipts.into_iter().map(|(id, dst, sig)| dtn::Receipt { id, dst, sig }).collect(),
             preds: w.preds,
             free: w.free,
             evictable: w.evictable,
+            wants: w.wants,
         };
         let now = self.now();
         if let Some(c) = &self.carrier {
@@ -886,45 +889,33 @@ impl Driver {
             c.set_internet(internet);
             c.set_clock(now, wall_ms());
         }
-        // summaries: on a new neighbour at once, then every few seconds
-        let due: Vec<SignPk> = {
-            let mut last = self.last_summary.lock();
-            last.retain(|k, _| neighbours.contains(k));
-            neighbours
-                .iter()
-                .filter(|k| last.get(*k).is_none_or(|t| t.elapsed() >= SUMMARY_EVERY))
-                .copied()
-                .collect::<Vec<_>>()
-                .into_iter()
-                .inspect(|k| {
-                    last.insert(*k, Instant::now());
-                })
-                .collect()
-        };
-        if !due.is_empty() {
-            let s = c.lock().summary(now);
+        // summaries: everything to a new neighbour, then what changes
+        let due = c.lock().summaries(now, &neighbours);
+        for (k, s) in due {
             let wire = WireSummary {
+                full: s.full,
                 ids: s.ids,
                 receipts: s.receipts.into_iter().map(|r| (r.id, r.dst, r.sig)).collect(),
                 preds: s.preds,
                 free: s.free,
                 evictable: s.evictable,
+                wants: s.wants,
             };
-            if let Ok(body) = postcard::to_allocvec(&wire) {
-                let mut msg = vec![K_SUMMARY];
-                msg.extend_from_slice(&body);
-                let msg = Bytes::from(msg);
-                for k in due {
-                    let Some(conn) = self.conn(&k) else { continue };
-                    let msg = msg.clone();
-                    self.keep(tokio::spawn(async move {
-                        if let Ok(mut tx) = conn.open_uni().await {
-                            let _ = tx.write_all(&msg).await;
-                            let _ = tx.finish();
-                        }
-                    }));
+            let Ok(body) = postcard::to_allocvec(&wire) else { continue };
+            let Some(conn) = self.conn(&k) else { continue };
+            let mut msg = vec![K_SUMMARY];
+            msg.extend_from_slice(&body);
+            let me = self.clone();
+            self.keep(tokio::spawn(async move {
+                let sent = match conn.open_uni().await {
+                    Ok(mut tx) => tx.write_all(&msg).await.is_ok() && tx.finish().is_ok(),
+                    Err(_) => false,
+                };
+                // it may have heard nothing: tell it everything next time
+                if !sent && let Some(c) = &me.carrier {
+                    c.lock().new_contact(k);
                 }
-            }
+            }));
         }
         // what can move now: live/partial routes, gradient, spray
         let plan = {
@@ -1104,7 +1095,6 @@ impl Mesh {
             records_published: Default::default(),
             carrier,
             bundle_sink: Mutex::default(),
-            last_summary: Mutex::default(),
         });
         Mesh { d }
     }
@@ -1300,7 +1290,6 @@ const K_SUMMARY: u8 = 1;
 const K_OFFER: u8 = 3;
 const MAX_SUMMARY: usize = 256 * 1024;
 const MAX_OFFER: usize = 1024;
-const SUMMARY_EVERY: Duration = Duration::from_secs(5);
 const DTN_EVERY: Duration = Duration::from_secs(1);
 
 /// A bundle offered before its payload.
@@ -1336,12 +1325,16 @@ impl From<dtn::Answer> for WireAnswer {
 
 #[derive(Serialize, Deserialize)]
 struct WireSummary {
+    /// `ids` are all it holds (else: what it took since its last summary).
+    full: bool,
     ids: Vec<Hash32>,
     receipts: Vec<(Hash32, SignPk, mycel_crypto::Sig)>,
     preds: Vec<(SignPk, f32)>,
     free: u64,
     /// (ms until it expires, size) of what could make way.
     evictable: Vec<(u64, u64)>,
+    /// Destinations it asks our predictabilities for.
+    wants: Vec<SignPk>,
 }
 
 /// A bundle's id: the same data for the same destination is the same bundle.

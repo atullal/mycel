@@ -42,6 +42,17 @@
 //! not a fresh lifetime per hop. Summaries say how much room is left and
 //! what could make way, so neighbours don't offer what would be refused.
 //!
+//! **Summaries** ([`Carrier::summaries`]) tell each neighbour what it
+//! needs, when it changes: what we hold (so it isn't offered again), new
+//! receipts, our room, and the predictabilities the configured gradient
+//! uses. With [`Gradient::Internet`] that is our predictability for the
+//! internet, plus, for the destinations a neighbour holds bundles for
+//! that the internet can't reach (its summary `wants` them), ours for
+//! those. A neighbour gets everything at first contact, what changed at
+//! most every [`SUMMARY_GAP`], and everything held every [`SUMMARY_FULL`]
+//! (so it learns what we dropped). Nothing changes, nothing is sent
+//! (docs/SIMULATION.md §4).
+//!
 //! **Offers.** A bundle is offered before it is sent ([`Offer`] →
 //! [`Answer`]): a refusal costs a round trip, not the payload. A transfer
 //! cut short leaves its bytes with the receiver ([`Carrier::keep_partial`])
@@ -60,7 +71,9 @@
 //!   keep_partial(id, src, bytes, now)          a transfer to us was cut short
 //!   partial(id) -> Option<&Bytes>              what arrived of it so far
 //!   accept(from, Bundle, copies, now, verify)  the whole bundle -> Accepted
-//!   summary(now) -> Summary                    what to tell neighbours
+//!   summaries(now, neighbours) -> Vec<(peer, Summary)>   what to tell whom now
+//!   new_contact(peer)                          a new hop connection: tell it everything
+//!   summary(now) -> Summary                    everything, to anyone
 //!   on_summary(from, Summary, now, verify_receipt)
 //!   add_receipt(Receipt)                       we were the destination
 //!   plan(now, toward, neighbours) -> Vec<Transfer>   what to offer to whom now
@@ -117,6 +130,11 @@ const SUMMARY_IDS: usize = 512;
 const SUMMARY_RECEIPTS: usize = 256;
 const SUMMARY_PREDS: usize = 64;
 const SUMMARY_EVICTABLE: usize = 32;
+const SUMMARY_WANTS: usize = 16;
+/// What changed goes to a neighbour at most this often (ms)...
+pub const SUMMARY_GAP: Time = 2_000;
+/// ...and everything we hold this often, for it to drop what we no longer do.
+pub const SUMMARY_FULL: Time = 60_000;
 const RECEIPTS_MAX: usize = 4096;
 /// A transfer in flight to a neighbour is not repeated meanwhile.
 const IN_FLIGHT: Time = 30_000;
@@ -317,10 +335,15 @@ pub struct Receipt {
 /// What a carrier tells its neighbours.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Summary {
+    /// `ids` are everything it holds (they replace what we knew), not only
+    /// what it took since its last summary to us.
+    pub full: bool,
     /// Bundles it holds (so nobody sends them again).
     pub ids: Vec<Hash32>,
+    /// Receipts it hasn't told us of yet.
     pub receipts: Vec<Receipt>,
-    /// Its delivery predictabilities (including [`INTERNET`]).
+    /// The delivery predictabilities its gradient uses (including
+    /// [`INTERNET`]); they replace its last ones.
     pub preds: Vec<(SignPk, f32)>,
     /// Bytes it still has room for, for others.
     pub free: u64,
@@ -328,6 +351,9 @@ pub struct Summary {
     /// (ms until they expire, size). Only a bundle expiring later can push
     /// them out.
     pub evictable: Vec<(u64, u64)>,
+    /// Destinations it holds bundles for that the internet doesn't lead
+    /// to: it asks for our predictabilities for them.
+    pub wants: Vec<SignPk>,
 }
 
 /// Hand `copies` copies of bundle `id` to `to` (custody if it is all of them).
@@ -385,6 +411,19 @@ struct Held {
     until: Time,
     /// Who handed it to us: gradient and spray never send it back.
     from: Option<SignPk>,
+    /// `Carrier::rev` when we took it (what a summary says is new).
+    rev: u64,
+}
+
+/// What we last told a neighbour, and when.
+#[derive(Clone, Copy, Debug)]
+struct Sent {
+    at: Time,
+    full_at: Time,
+    rev: u64,
+    receipts: u64,
+    /// `Carrier::fingerprint` of its predictabilities and our wants.
+    fp: u64,
 }
 
 /// The room a neighbour last said it had, less what we sent it since.
@@ -483,7 +522,17 @@ pub struct Carrier {
     /// When each neighbour last told us anything (for forgetting).
     nb_heard: Map<SignPk, Time>,
     receipts: Map<Hash32, Receipt>,
-    receipt_order: VecDeque<Hash32>,
+    /// Receipts in the order we learnt them, numbered.
+    receipt_order: VecDeque<(u64, Hash32)>,
+    receipt_seq: u64,
+    /// Bumped whenever what we hold changes.
+    rev: u64,
+    /// What we last told each neighbour.
+    sent: Map<SignPk, Sent>,
+    /// Destinations of bundles we hold that the internet doesn't lead to.
+    wanted: Vec<SignPk>,
+    /// What each neighbour asked our predictabilities for.
+    nb_wants: Map<SignPk, Vec<SignPk>>,
     /// Offers under way: bundle -> (to, since, copies). Their copies aren't
     /// ours to give again meanwhile (a transfer can take seconds).
     in_flight: Map<Hash32, Vec<(SignPk, Time, u8)>>,
@@ -512,6 +561,11 @@ impl Carrier {
             nb_heard: Map::default(),
             receipts: Map::default(),
             receipt_order: VecDeque::new(),
+            receipt_seq: 0,
+            rev: 0,
+            sent: Map::default(),
+            wanted: Vec::new(),
+            nb_wants: Map::default(),
             in_flight: Map::default(),
             partial: Map::default(),
             partial_used: 0,
@@ -541,6 +595,9 @@ impl Carrier {
     }
 
     pub fn set_internet(&mut self, on: bool) {
+        if self.internet != on {
+            self.rev += 1;
+        }
         self.internet = on;
     }
 
@@ -808,12 +865,14 @@ impl Carrier {
         }
         self.drop_partial(&b.id);
         self.expiry.insert((until, b.id));
-        self.held.insert(b.id, Held { b, copies, until, from });
+        self.rev += 1;
+        self.held.insert(b.id, Held { b, copies, until, from, rev: self.rev });
         Ok(())
     }
 
     fn drop_held(&mut self, id: &Hash32) {
         let Some(h) = self.held.remove(id) else { return };
+        self.rev += 1;
         self.expiry.remove(&(h.until, *id));
         if h.from.is_some() {
             let size = h.b.payload.len() as u64;
@@ -839,26 +898,124 @@ impl Carrier {
         }
         self.drop_partial(&r.id);
         if self.receipts.insert(r.id, r).is_none() {
-            self.receipt_order.push_back(r.id);
+            self.receipt_seq += 1;
+            self.receipt_order.push_back((self.receipt_seq, r.id));
             while self.receipt_order.len() > RECEIPTS_MAX {
-                if let Some(old) = self.receipt_order.pop_front() {
+                if let Some((_, old)) = self.receipt_order.pop_front() {
                     self.receipts.remove(&old);
                 }
             }
         }
     }
 
+    /// Everything, to anyone (no neighbour's wants answered).
     pub fn summary(&self, now: Time) -> Summary {
-        let mut preds: Vec<(SignPk, f32)> = self
-            .pred
-            .keys()
-            .map(|k| (*k, self.p(k, now) as f32))
-            .chain(std::iter::once((INTERNET, self.p(&INTERNET, now) as f32)))
-            .filter(|(_, p)| *p > 0.01)
-            .collect();
+        self.build(None, true, None, now)
+    }
+
+    /// `peer` is a new contact (a hop connection just came up): the next
+    /// [`Carrier::summaries`] tells it everything.
+    pub fn new_contact(&mut self, peer: SignPk) {
+        self.sent.remove(&peer);
+    }
+
+    /// The summaries due now: everything for a neighbour we haven't told
+    /// anything yet and, every [`SUMMARY_FULL`], for the others; what
+    /// changed since our last one, at most every [`SUMMARY_GAP`]; nothing
+    /// if nothing did.
+    pub fn summaries(&mut self, now: Time, neighbours: &[SignPk]) -> Vec<(SignPk, Summary)> {
+        let mut out = Vec::new();
+        for k in neighbours {
+            let last = self.sent.get(k).copied();
+            let fp = self.fingerprint(k, now);
+            let full = match last {
+                None => true,
+                Some(s) if now.saturating_sub(s.full_at) >= SUMMARY_FULL => true,
+                Some(s)
+                    if now.saturating_sub(s.at) >= SUMMARY_GAP
+                        && (s.rev != self.rev || s.receipts != self.receipt_seq || s.fp != fp) =>
+                {
+                    false
+                }
+                Some(_) => continue,
+            };
+            out.push((*k, self.build(Some(k), full, last, now)));
+            let full_at = match last {
+                Some(s) if !full => s.full_at,
+                _ => now,
+            };
+            self.sent.insert(*k, Sent { at: now, full_at, rev: self.rev, receipts: self.receipt_seq, fp });
+        }
+        out
+    }
+
+    /// The predictabilities our gradient uses, for neighbour `nb`. A
+    /// gradient that follows destinations, and any `full` summary, gets the
+    /// most useful [`SUMMARY_PREDS`] (the internet's among them: PRoPHET's
+    /// transitivity carries them hop by hop, and [`Gradient::Internet`]
+    /// falls back on destinations the internet doesn't lead to). Between
+    /// full summaries, [`Gradient::Internet`] sends only the internet's, and
+    /// ours for the destinations `nb` asked for. No gradient, none.
+    fn preds_for(&self, nb: Option<&SignPk>, full: bool, now: Time) -> Vec<(SignPk, f32)> {
+        let all = || self.pred.keys().copied().chain(std::iter::once(INTERNET));
+        let mut preds: Vec<(SignPk, f32)> = match self.cfg.gradient {
+            Gradient::Off => return Vec::new(),
+            Gradient::Internet if !full => std::iter::once(INTERNET).map(|k| (k, self.p(&k, now) as f32)).collect(),
+            _ => all().map(|k| (k, self.p(&k, now) as f32)).collect(),
+        };
+        preds.retain(|(_, p)| *p > 0.01);
         preds.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
         preds.dedup_by_key(|(k, _)| *k);
         preds.truncate(SUMMARY_PREDS);
+        // and what `nb` asked for, whatever its rank
+        if self.cfg.gradient == Gradient::Internet
+            && let Some(w) = nb.and_then(|k| self.nb_wants.get(k))
+        {
+            for k in w {
+                let p = self.p(k, now) as f32;
+                if p > 0.01 && !preds.iter().any(|(x, _)| x == k) {
+                    preds.push((*k, p));
+                }
+            }
+        }
+        preds
+    }
+
+    /// What `nb` would hear from us besides bundles and receipts: our
+    /// predictabilities for it, to a twentieth (they age by the minute;
+    /// a summary per drift would be noise), and what we want.
+    fn fingerprint(&self, nb: &SignPk, now: Time) -> u64 {
+        let mut h = WordHash::default();
+        for (k, p) in self.preds_for(Some(nb), false, now) {
+            h.write(&k.0);
+            h.write(&[(p * 20.0).round() as u8]);
+        }
+        h.write(&[0xfe]);
+        for k in &self.wanted {
+            h.write(&k.0);
+        }
+        h.finish()
+    }
+
+    /// A summary for `nb` (`None`: anyone): everything held, and the latest
+    /// receipts, if `full`; else what we took and learnt since `last`.
+    fn build(&self, nb: Option<&SignPk>, full: bool, last: Option<Sent>, now: Time) -> Summary {
+        let ids = match last {
+            Some(l) if !full => self.held.iter().filter(|(_, h)| h.rev > l.rev).map(|(k, _)| *k).take(SUMMARY_IDS).collect(),
+            _ => self.held.keys().rev().take(SUMMARY_IDS).copied().collect(),
+        };
+        // receipts it hasn't heard from us (a summary that may not have
+        // arrived resets this: `new_contact`)
+        let since = last.map_or(0, |l| l.receipts);
+        let receipts = self
+            .receipt_order
+            .iter()
+            .rev()
+            .take_while(|(n, _)| *n > since)
+            .take(SUMMARY_RECEIPTS)
+            .filter_map(|(_, id)| self.receipts.get(id))
+            .copied()
+            .collect();
         let (free, evictable) = if self.cfg.carry {
             let mut v: Vec<(u64, u64)> = self
                 .held
@@ -875,13 +1032,7 @@ impl Carrier {
         } else {
             (0, Vec::new())
         };
-        Summary {
-            ids: self.held.keys().rev().take(SUMMARY_IDS).copied().collect(),
-            receipts: self.receipt_order.iter().rev().take(SUMMARY_RECEIPTS).filter_map(|id| self.receipts.get(id)).copied().collect(),
-            preds,
-            free,
-            evictable,
-        }
+        Summary { full, ids, receipts, preds: self.preds_for(nb, full, now), free, evictable, wants: self.wanted.clone() }
     }
 
     /// A neighbour's summary: what it holds and has room for, receipts
@@ -889,11 +1040,20 @@ impl Carrier {
     /// transitivity).
     pub fn on_summary(&mut self, from: SignPk, s: Summary, now: Time, mut verify_receipt: impl FnMut(&Receipt) -> bool) {
         let ids = s.ids.iter().copied().take(SUMMARY_IDS);
-        if s.ids.len() < SUMMARY_IDS {
+        if s.full && s.ids.len() < SUMMARY_IDS {
             self.nb_has.insert(from, ids.collect());
         } else {
-            // a full list is only part of what it holds: add to what we knew
+            // what it took since, or a full list that is only part of what
+            // it holds: add to what we knew
             self.nb_has.entry(from).or_default().extend(ids);
+        }
+        if s.wants.is_empty() {
+            self.nb_wants.remove(&from);
+        } else {
+            let mut w: Vec<SignPk> = s.wants.iter().copied().take(SUMMARY_WANTS).collect();
+            w.sort();
+            w.dedup();
+            self.nb_wants.insert(from, w);
         }
         self.nb_heard.insert(from, now);
         self.nb_refused.remove(&from);
@@ -907,8 +1067,9 @@ impl Carrier {
             }
         }
         let p_from = self.p(&from, now);
-        let mut table: NbPreds = Vec::with_capacity(s.preds.len().min(SUMMARY_PREDS));
-        for (x, px) in s.preds.into_iter().take(SUMMARY_PREDS) {
+        let full = s.full;
+        let mut table: NbPreds = Vec::with_capacity(s.preds.len().min(SUMMARY_PREDS + SUMMARY_WANTS));
+        for (x, px) in s.preds.into_iter().take(SUMMARY_PREDS + SUMMARY_WANTS) {
             let px = (px as f64).clamp(0.0, 1.0);
             table.push((x, px as f32));
             if x == self.me {
@@ -920,7 +1081,13 @@ impl Carrier {
                 self.set_p(x, via, now);
             }
         }
-        // sorted for lookups; of repeated keys the last counts, as before
+        // between full summaries, what it sends updates what we knew
+        if !full && let Some(old) = self.nb_pred.get(&from) {
+            let mut merged = old.clone();
+            merged.extend(table);
+            table = merged;
+        }
+        // sorted for lookups; of repeated keys the last counts
         table.reverse();
         table.sort_by_key(|x| x.0);
         table.dedup_by_key(|(k, _)| *k);
@@ -951,6 +1118,7 @@ impl Carrier {
             .collect();
         let flying = !self.in_flight.is_empty();
         let mut out = Vec::new();
+        let mut unreachable = Vec::new();
         for (id, h) in &self.held {
             let (dst, giver, size, until) = (h.b.dst, h.from, h.b.payload.len() as u64, h.until);
             let flight = if flying { self.in_flight.get(id) } else { None };
@@ -974,7 +1142,11 @@ impl Carrier {
             let pick = if let Some(n) = nbs.iter().find(|n| n.k == dst) {
                 (!busy(n)).then_some((dst, copies, Why::Deliver))
             } else {
-                match toward(&dst) {
+                let t = toward(&dst);
+                if t == Toward::Unreachable {
+                    unreachable.push(dst);
+                }
+                match t {
                     Toward::Hop(n) => {
                         let busy = match nbs.iter().find(|x| x.k == n) {
                             Some(x) => busy(x),
@@ -1034,6 +1206,16 @@ impl Carrier {
         for t in &out {
             self.in_flight.entry(t.id).or_default().push((t.to, now, t.copies));
         }
+        // what we ask neighbours' predictabilities for (with the other
+        // gradients they send them all)
+        if self.cfg.gradient == Gradient::Internet {
+            unreachable.sort();
+            unreachable.dedup();
+            unreachable.truncate(SUMMARY_WANTS);
+        } else {
+            unreachable.clear();
+        }
+        self.wanted = unreachable;
         // deliveries first, then live routes, the gradient, spraying: a
         // contact may end before everything is through
         out.sort_by_key(|t| t.why as u8);
@@ -1103,12 +1285,14 @@ impl Carrier {
         for id in stale {
             self.drop_partial(&id);
         }
+        self.sent.retain(|_, x| now.saturating_sub(x.at) < NB_FORGET);
         // forget negligible predictabilities
         self.pred.retain(|_, (p, at)| *p * GAMMA_PER_MIN.powf(now.saturating_sub(*at) as f64 / 60_000.0) > 0.001);
         // and what neighbours long gone told us
         let gone: Vec<SignPk> = self.nb_heard.iter().filter(|(_, t)| now.saturating_sub(**t) >= NB_FORGET).map(|(k, _)| *k).collect();
         for k in gone {
             self.nb_heard.remove(&k);
+            self.nb_wants.remove(&k);
             self.nb_pred.remove(&k);
             self.nb_has.remove(&k);
             self.nb_room.remove(&k);
