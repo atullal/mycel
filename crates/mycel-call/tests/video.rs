@@ -476,6 +476,7 @@ fn watch_people(rx: broadcast::Receiver<UiFrame>) -> PerPerson {
 /// stream (a tile), each in order, and every participant's video shows.
 #[tokio::test(flavor = "multi_thread")]
 async fn group_video_call_of_three() {
+    let _measuring = MEASURING.lock().await;
     let alice = device("alice", TestSource::Sine { hz: 440.0, amp: 0.5 }, true, &[]).await;
     let bob = device("bob", TestSource::Sine { hz: 550.0, amp: 0.5 }, true, &[]).await;
     let carol = device("carol", TestSource::Sine { hz: 660.0, amp: 0.5 }, true, &[]).await;
