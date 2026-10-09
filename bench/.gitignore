@@ -1,8 +1,8 @@
 # External tools, raw datasets and regenerable intermediates (bench/fetch.sh, bench/run.py)
-external/
-data/
-traces/out/
-one/gen/
+/external
+/data
+/traces/out
+/one/gen
 results/helsinki-capture/
 results/meshtasticator/*.json
 results/one/*/run.log
