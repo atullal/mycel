@@ -17,8 +17,16 @@
 //!    RFC 6693) for the destination or for **the internet** (a virtual
 //!    destination: devices with the internet have P = 1), so data climbs
 //!    toward connectivity instead of wandering.
-//! 3. **Spray-and-Wait**: nobody knows anything: spread the few copies it
-//!    has, then wait for direct delivery.
+//!    If a device with the internet finds the destination isn't on it (no
+//!    reachability record, and dialling it failed), the internet doesn't
+//!    count for that bundle: it moves by predictability for the
+//!    destination alone, and the device may spray it.
+//! 3. **Spray-and-Focus** (Spyropoulos et al., 2007): while it holds more
+//!    than one copy, hand half to the neighbour with the best predictability
+//!    that has none, even one no better than itself: an equally placed
+//!    passer-by may be the one walking to the destination. A single copy
+//!    moves only along the gradient. A device with the internet doesn't
+//!    spray: it is where copies should end up (a mailbox).
 //!
 //! A device with the internet that holds a bundle for a destination behind
 //! itself (it is one of the destination's gateways) is its **mailbox**: it
@@ -66,6 +74,10 @@ const SUMMARY_PREDS: usize = 64;
 const RECEIPTS_MAX: usize = 4096;
 /// A transfer in flight to a neighbour is not repeated meanwhile.
 const IN_FLIGHT: Time = 30_000;
+/// A neighbour's summary is forgotten this long after we last heard from it
+/// (neighbours in range send one every few seconds; a phone in a crowd
+/// meets thousands of devices a day).
+const NB_FORGET: Time = 10 * 60_000;
 
 #[derive(Clone, Debug)]
 pub struct DtnConfig {
@@ -170,6 +182,8 @@ pub struct DtnStats {
     pub expired: u64,
     pub cleared_by_receipt: u64,
     pub refused: u64,
+    /// Carried bundles dropped to make room for fresher ones.
+    pub evicted: u64,
 }
 
 struct Held {
@@ -194,6 +208,8 @@ pub struct Carrier {
     /// Neighbours' last summaries: their predictabilities and ids.
     nb_pred: Map<SignPk, Map<SignPk, f64>>,
     nb_has: Map<SignPk, Set<Hash32>>,
+    /// When each neighbour last told us anything (for forgetting).
+    nb_heard: Map<SignPk, Time>,
     receipts: Map<Hash32, Receipt>,
     receipt_order: VecDeque<Hash32>,
     in_flight: Map<(Hash32, SignPk), Time>,
@@ -212,6 +228,7 @@ impl Carrier {
             pred: Map::default(),
             nb_pred: Map::default(),
             nb_has: Map::default(),
+            nb_heard: Map::default(),
             receipts: Map::default(),
             receipt_order: VecDeque::new(),
             in_flight: Map::default(),
@@ -265,10 +282,12 @@ impl Carrier {
         self.p(dst, now).max(self.p(&INTERNET, now))
     }
 
-    fn nb_utility(&self, nb: &SignPk, dst: &SignPk) -> f64 {
+    /// A neighbour's utility for `dst`, counting its way to the internet
+    /// only if the internet leads to `dst` (`inet`).
+    fn nb_utility(&self, nb: &SignPk, dst: &SignPk, inet: bool) -> f64 {
         self.nb_pred.get(nb).map_or(0.0, |t| {
             let d = t.get(dst).copied().unwrap_or(0.0);
-            let i = t.get(&INTERNET).copied().unwrap_or(0.0);
+            let i = if inet { t.get(&INTERNET).copied().unwrap_or(0.0) } else { 0.0 };
             d.max(i)
         })
     }
@@ -297,6 +316,7 @@ impl Carrier {
         verify: impl FnOnce(&Bundle) -> bool,
     ) -> Accepted {
         self.nb_has.entry(from).or_default().insert(b.id);
+        self.nb_heard.insert(from, now);
         if self.receipts.contains_key(&b.id) {
             return Accepted::Duplicate;
         }
@@ -339,21 +359,54 @@ impl Carrier {
             return Err("expired");
         }
         if !ours {
-            if self.used + size > self.cfg.capacity {
-                return Err("store full");
-            }
             if self.by_source.get(&b.src).copied().unwrap_or(0) + size > self.cfg.per_source {
                 return Err("source over its share");
             }
+            if self.used + size > self.cfg.capacity && !self.make_room(size, now + lifetime) {
+                return Err("store full");
+            }
         }
-        self.used += size;
-        *self.by_source.entry(b.src).or_default() += size;
+        // `capacity` and `per_source` bound what we carry for others; our
+        // own bundles are the user's own messages
+        if !ours {
+            self.used += size;
+            *self.by_source.entry(b.src).or_default() += size;
+        }
         self.held.insert(b.id, Held { b, copies, until: now + lifetime, from });
         Ok(())
     }
 
+    /// Full: drop carried bundles (never our own) that expire before one
+    /// expiring at `until`, soonest first, if that frees `size` bytes
+    /// (drop-oldest: Lindgren & Phanse, 2006). Nothing is dropped otherwise.
+    fn make_room(&mut self, size: u64, until: Time) -> bool {
+        let mut older: Vec<(Time, Hash32, u64)> = self
+            .held
+            .iter()
+            .filter(|(_, h)| h.from.is_some() && h.until < until)
+            .map(|(id, h)| (h.until, *id, h.b.payload.len() as u64))
+            .collect();
+        let need = (self.used + size).saturating_sub(self.cfg.capacity);
+        if older.iter().map(|x| x.2).sum::<u64>() < need {
+            return false;
+        }
+        older.sort();
+        let mut freed = 0;
+        for (_, id, n) in older {
+            if freed >= need {
+                break;
+            }
+            self.drop_held(&id);
+            self.stats.evicted += 1;
+            freed += n;
+        }
+        true
+    }
+
     fn drop_held(&mut self, id: &Hash32) {
-        if let Some(h) = self.held.remove(id) {
+        if let Some(h) = self.held.remove(id)
+            && h.from.is_some()
+        {
             let size = h.b.payload.len() as u64;
             self.used = self.used.saturating_sub(size);
             if let Some(s) = self.by_source.get_mut(&h.b.src) {
@@ -407,6 +460,7 @@ impl Carrier {
     /// `verify_receipt`), and its predictabilities (PRoPHET transitivity).
     pub fn on_summary(&mut self, from: SignPk, s: Summary, now: Time, mut verify_receipt: impl FnMut(&Receipt) -> bool) {
         self.nb_has.insert(from, s.ids.iter().copied().take(SUMMARY_IDS).collect());
+        self.nb_heard.insert(from, now);
         for r in s.receipts.into_iter().take(SUMMARY_RECEIPTS) {
             if !self.receipts.contains_key(&r.id) && verify_receipt(&r) {
                 self.add_receipt(r);
@@ -454,20 +508,29 @@ impl Carrier {
                 match toward(&dst) {
                     Toward::Hop(n) => Some((n, copies, Why::Route)),
                     Toward::Soon => None, // a lookup or dial is under way: wait for it
-                    Toward::Nowhere => {
+                    t @ (Toward::Nowhere | Toward::Unreachable) => {
+                        // the internet leads there unless it has just proved not to
+                        let inet = t == Toward::Nowhere;
                         // 2. the gradient: a clearly better neighbour
-                        let mine = self.utility(&dst, now);
+                        let mine = if inet { self.utility(&dst, now) } else { self.p(&dst, now) };
                         let best = neighbours
                             .iter()
                             .filter(|n| !busy(self, n) && !back(n))
-                            .map(|n| (self.nb_utility(n, &dst), *n))
+                            .map(|n| (self.nb_utility(n, &dst, inet), *n))
                             .filter(|(u, _)| *u > mine + MARGIN)
                             .max_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
                         match best {
                             Some((_, n)) => Some((n, if copies > 1 { copies / 2 } else { 1 }, Why::Gradient)),
-                            None if copies > 1 && mine == 0.0 => {
-                                // 3. Spray-and-Wait: half the copies to anyone without it
-                                neighbours.iter().find(|n| !busy(self, n) && !back(n)).map(|n| (*n, copies / 2, Why::Spray))
+                            None if copies > 1 && (!self.internet || !inet) => {
+                                // 3. spray: half the copies to the likeliest neighbour
+                                // without it that is no worse a carrier than us
+                                neighbours
+                                    .iter()
+                                    .filter(|n| !busy(self, n) && !back(n))
+                                    .map(|n| (self.nb_utility(n, &dst, inet), *n))
+                                    .filter(|(u, _)| *u + MARGIN >= mine)
+                                    .max_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)))
+                                    .map(|(_, n)| (n, copies / 2, Why::Spray))
                             }
                             None => None,
                         }
@@ -481,16 +544,20 @@ impl Carrier {
                 out.push(Transfer { to, id, copies: give.max(1), why });
             }
         }
+        // deliveries first, then live routes, the gradient, spraying: a
+        // contact may end before everything is through
+        out.sort_by_key(|t| t.why as u8);
         out
     }
 
     /// `to` took (`ok`) or didn't take `copies` copies of `id`.
-    pub fn transferred(&mut self, to: SignPk, id: Hash32, copies: u8, ok: bool, _now: Time) {
+    pub fn transferred(&mut self, to: SignPk, id: Hash32, copies: u8, ok: bool, now: Time) {
         self.in_flight.remove(&(id, to));
         if !ok {
             return;
         }
         self.nb_has.entry(to).or_default().insert(id);
+        self.nb_heard.insert(to, now);
         let gone = match self.held.get_mut(&id) {
             Some(h) if h.b.dst == to => true, // delivered
             Some(h) => {
@@ -513,6 +580,18 @@ impl Carrier {
         }
         // forget negligible predictabilities
         self.pred.retain(|_, (p, at)| *p * GAMMA_PER_MIN.powf(now.saturating_sub(*at) as f64 / 60_000.0) > 0.001);
+        // and what neighbours long gone told us
+        let gone: Vec<SignPk> = self.nb_heard.iter().filter(|(_, t)| now.saturating_sub(**t) >= NB_FORGET).map(|(k, _)| *k).collect();
+        for k in gone {
+            self.nb_heard.remove(&k);
+            self.nb_pred.remove(&k);
+            self.nb_has.remove(&k);
+        }
+    }
+
+    /// Neighbours whose summaries we remember.
+    pub fn remembered(&self) -> usize {
+        self.nb_pred.len().max(self.nb_has.len())
     }
 }
 

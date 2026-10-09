@@ -3796,6 +3796,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "mycel-sim"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "libc",
+ "mycel-call",
+ "mycel-crypto",
+ "mycel-net",
+ "mycel-sync",
+ "mycel-trust",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "mycel-sync"
 version = "0.1.0"
 dependencies = [

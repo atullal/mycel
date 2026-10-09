@@ -28,6 +28,7 @@
 mod blobs;
 mod pool;
 pub mod link;
+pub mod emu;
 pub mod mesh;
 pub mod wire;
 
@@ -66,6 +67,11 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 /// A pooled connection unused (no stream open from our side) this long is closed.
 pub const POOL_IDLE: Duration = Duration::from_secs(60);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+/// A sync not through by now is also handed to store-and-forward carriers
+/// (the live attempt keeps going): a stale connection to a peer that moved
+/// away only times out at [`SESSION_TIMEOUT`], and a passer-by who could
+/// carry it may be gone by then.
+const BUNDLE_AFTER: Duration = Duration::from_secs(10);
 const PERIODIC_SYNC: Duration = Duration::from_secs(15);
 const ONLINE_WINDOW: Duration = Duration::from_secs(45);
 /// Changes are pushed this long after they happen (coalescing a burst). Short:
@@ -826,7 +832,15 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
     }
     let _slot = inner.sync_slots.acquire().await;
     loop {
-        let res = tokio::time::timeout(SESSION_TIMEOUT, sync_session(&inner, peer, space, false)).await;
+        let session = tokio::time::timeout(SESSION_TIMEOUT, sync_session(&inner, peer, space, false));
+        tokio::pin!(session);
+        let res = tokio::select! {
+            r = &mut session => r,
+            _ = tokio::time::sleep(BUNDLE_AFTER) => {
+                inner.offer_bundle(peer, space);
+                session.await
+            }
+        };
         let ok = matches!(res, Ok(Ok(_)));
         if ok {
             inner.mark_ok(peer);

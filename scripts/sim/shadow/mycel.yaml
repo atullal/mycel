@@ -1,0 +1,35 @@
+# Shadow (https://shadow.github.io): real Mycel CLI processes on a simulated
+# network, with real syscalls intercepted, on one Linux machine. Linux only.
+#
+#   cargo build --release -p mycel-cli
+#   python3 scripts/sim/shadow/make-graph.py > scripts/sim/shadow/world.gml
+#   shadow scripts/sim/shadow/mycel.yaml
+#
+# The GML graph has one node per city with bandwidth and latency from the
+# same models as mycel-sim (fibre over the great circle × 1.4, plus access
+# links), or from WonderNetwork's measured RTTs (make-graph.py --measured).
+# Hosts run `mycel serve` (the localhost API); Mycel's IP transport is what Shadow simulates (Bluetooth/AWDL
+# links are tier 1's job).
+general:
+  stop_time: 10 min
+  model_unblocked_syscall_latency: true
+network:
+  graph:
+    type: gml
+    file:
+      path: world.gml
+hosts:
+  newyork1:
+    network_node_id: 0
+    processes:
+      - path: ../../../target/release/mycel
+        args: serve --data /tmp/mycel-ny1 --net local --port 4000
+        start_time: 1s
+  london1:
+    network_node_id: 1
+    processes:
+      - path: ../../../target/release/mycel
+        args: serve --data /tmp/mycel-ld1 --net local --port 4000
+        start_time: 1s
+      # A traffic driver (send messages through the localhost API, log
+      # delivery times) is the remaining piece; not written yet.

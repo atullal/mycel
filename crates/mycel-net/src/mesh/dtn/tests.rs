@@ -177,6 +177,89 @@ fn mailbox_until_the_destination_appears() {
     assert!(!w.nodes[0].holds(&x.id));
 }
 
+/// Camps A and B split after everyone met; a passer-by beside A ranks
+/// the same as A for B. With copies to spare, A sprays half to it anyway
+/// (Spray-and-Focus), and the passer-by delivers when it reaches B. (Spraying
+/// only when nobody knew anything left the bundle stuck at A.)
+#[test]
+fn a_passer_by_as_good_as_the_holder_gets_a_copy() {
+    let mut w = World::new(3, |_| DtnConfig::default());
+    let (a, mule, b) = (0, 1, 2);
+    w.meet(a, b);
+    w.meet(mule, b);
+    w.meet(a, mule);
+    w.step(1_000);
+    w.apart();
+    w.meet(a, mule);
+    let x = bundle(key(a as u32), key(b as u32), 4, 3_600_000);
+    w.nodes[a].originate(x.clone(), w.now).unwrap();
+    let (pa, pm) = (w.nodes[a].utility(&key(b as u32), w.now), w.nodes[mule].utility(&key(b as u32), w.now));
+    assert!((pa - pm).abs() < MARGIN, "equally placed: {pa} vs {pm}");
+    w.step(1_000);
+    assert!(w.nodes[mule].holds(&x.id), "the passer-by carries a copy");
+    assert!(w.transfers.contains(&(a, mule, Why::Spray)));
+    w.apart();
+    w.meet(mule, b);
+    w.step(60_000);
+    assert_eq!(w.delivered.iter().map(|d| (d.0, d.1)).collect::<Vec<_>>(), vec![(b, x.id)]);
+}
+
+/// What a neighbour told us is forgotten once it has been gone a while,
+/// so a phone meeting thousands of devices doesn't keep thousands of tables.
+#[test]
+fn neighbours_long_gone_are_forgotten() {
+    let mut w = World::new(40, |_| DtnConfig::default());
+    for j in 1..40 {
+        w.apart();
+        w.meet(0, j);
+        w.step(1_000);
+    }
+    assert_eq!(w.nodes[0].remembered(), 39);
+    w.apart();
+    w.meet(0, 1);
+    for _ in 0..11 {
+        w.step(60_000);
+    }
+    assert_eq!(w.nodes[0].remembered(), 1, "only the neighbour still in range");
+}
+
+/// A full store makes room for a fresher bundle by dropping the carried
+/// one nearest its expiry; never our own, and never for an older one.
+#[test]
+fn a_full_store_drops_the_oldest_carried_bundle() {
+    let cfg = DtnConfig { capacity: 2000, per_source: 2000, ..DtnConfig::default() };
+    let mut c = Carrier::new(key(0), cfg);
+    let mine = bundle(key(0), key(9), 1, 100_000);
+    c.originate(mine.clone(), 0).unwrap();
+    let old = bundle(key(1), key(9), 2, 50_000);
+    let mid = bundle(key(2), key(9), 3, 80_000);
+    assert_eq!(c.accept(key(1), old.clone(), 1, 0, |_| true), Accepted::Stored);
+    assert_eq!(c.accept(key(2), mid.clone(), 1, 0, |_| true), Accepted::Stored);
+    // full (2 × 1000 carried; our own doesn't count): a later expiry replaces `old`
+    let fresh = bundle(key(3), key(9), 4, 90_000);
+    assert_eq!(c.accept(key(3), fresh.clone(), 1, 0, |_| true), Accepted::Stored);
+    assert!(!c.holds(&old.id) && c.holds(&mid.id) && c.holds(&fresh.id) && c.holds(&mine.id));
+    assert_eq!(c.stats().evicted, 1);
+    // one expiring sooner than everything carried is refused instead
+    let stale = bundle(key(4), key(9), 5, 10_000);
+    assert_eq!(c.accept(key(4), stale.clone(), 1, 0, |_| true), Accepted::Refused("store full"));
+    assert!(c.holds(&mid.id) && c.holds(&fresh.id));
+}
+
+/// A mailbox with copies to spare still keeps them (it doesn't spray).
+#[test]
+fn a_mailbox_does_not_spray() {
+    let mut w = World::new(3, |_| DtnConfig::default());
+    w.nodes[0].set_internet(true);
+    let x = bundle(key(0), key(2), 5, 3_600_000);
+    w.nodes[0].originate(x.clone(), 0).unwrap();
+    w.meet(0, 1);
+    for _ in 0..5 {
+        w.step(60_000);
+    }
+    assert!(!w.nodes[1].holds(&x.id));
+}
+
 /// Once the destination has it, its signed receipt spreads and every
 /// carrier drops its copy.
 #[test]
