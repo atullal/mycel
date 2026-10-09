@@ -16,19 +16,22 @@ builds.
 | Same Wi-Fi / LAN (mDNS) | yes | yes¹ | yes² | yes | yes |
 | Internet (relays, hole punching, DHT lookup) | yes | yes | yes | yes | yes |
 | Mesh routing and store-and-forward through other devices | yes | yes | yes | yes | yes |
-| Peer-to-peer Wi-Fi with no network (AWDL) | yes | not yet³ | not yet (Wi-Fi Direct) | no | Wi-Fi Direct code, off by default |
-| Bluetooth LE link | yes | not yet³ | not yet | not yet | BlueZ, never run on hardware |
+| Peer-to-peer Wi-Fi with no network (AWDL) | yes | on, untested³ | not yet (Wi-Fi Direct) | no | Wi-Fi Direct code, off by default |
+| Bluetooth LE link | yes | on, untested³ | not yet | not yet | BlueZ, never run on hardware |
 | Voice calls | echo cancelled | echo cancelled | echo cancelled⁴ | no echo cancellation⁵ | no echo cancellation⁵ |
-| Sending video | yes | not yet³ | not yet | not yet | not yet |
+| Sending video | yes | on, untested³ | not yet | not yet | not yet |
 | Opening a received file | default app | share sheet | "Open with" | default app | default app |
 | Keeps running in the background | yes | no⁶ | partly⁶ | yes | yes |
 
 1. iOS asks for Local Network access the first time; without it, only internet
    paths work.
 2. `MainActivity` holds a Wi-Fi multicast lock so mDNS packets get through.
-3. The Mac code uses Network.framework, CoreBluetooth, AVFoundation and
-   VideoToolbox, which iOS has too; it still needs porting (camera
-   orientation, background rules).
+3. The Mac code (Network.framework, CoreBluetooth, AVFoundation and
+   VideoToolbox) now runs on iOS too, with the front camera and upright
+   frames for a phone held in portrait. It hasn't been tried on an iPhone or
+   iPad yet; the Simulator has neither radio (Bluetooth reports
+   "Unsupported" and the app carries on). iOS only allows these in the
+   foreground.
 4. AAudio's voice-communication input preset (`crates/mycel-call/src/android.rs`).
 5. Plain devices through `cpal`: use headphones, or the far end hears itself.
 6. Phones suspend apps in the background, so messages arrive when Mycel is
@@ -38,6 +41,10 @@ builds.
 "Not yet" means the app builds and runs there without that feature. Calls on
 those devices still receive the other side's video if the web view can decode
 H.264 (WebCodecs).
+
+The on-screen keyboard: on Android the page shrinks above it and the tab bar
+hides (tested). On iPhone the app follows the visual viewport the same way,
+which still needs a check on a device.
 
 ## Building
 

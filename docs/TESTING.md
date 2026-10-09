@@ -229,6 +229,7 @@ automation tools don't support Xcode 27 yet).
 | Phone → desktop: add contact, send, reply | Android (DevTools, then the real UI) | ok both ways; replied through the on-screen keyboard |
 | On-screen keyboard | Android | page shrinks above the keyboard, composer stays in sight, tab bar hides while typing |
 | Back button | Android | closes the keyboard, then returns from a conversation to the list; from the list it leaves the app |
+| Attachments from a desktop peer (PNG + text file) | Android | both arrive; the photo downloads and shows inline; the text file opens in the system viewer through the FileProvider ("Open with") |
 | Voice call setup | Android | system microphone prompt on the first call, then the desktop peer rings; hang-up shows "missed" there (no audio device in the emulator) |
 | Bluetooth / peer-to-peer Wi-Fi without the hardware | iPhone simulator | Bluetooth reports "Unsupported" and the app carries on |
 | Core tests on Linux and Windows | GitHub Actions (`apps.yml`) | first run: runtime, sync, trust, net, links pass; Apple-only video tests now skipped there; timing tests run optimised |
