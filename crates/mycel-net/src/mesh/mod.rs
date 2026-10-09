@@ -69,7 +69,7 @@ use tokio::sync::mpsc;
 use self::core::{Config, Out, Router, Time};
 pub use self::core::Stats as MeshStats;
 pub use self::wire::{mesh_addr, parse_mesh_addr};
-use self::wire::{MIN_QUIC_MTU, T_DATA, T_OGM, T_SEQREQ};
+use self::wire::{MIN_QUIC_MTU, T_DATA, T_OGM, T_OGMS, T_SEQREQ};
 use crate::link::{CustomAddr, Link, LinkEvent, LinkStatus, PathKind, TRANSPORT_MESH, n0_watcher, noq_udp};
 
 /// Hop connections between neighbours (and internet hops to gateways).
@@ -305,13 +305,14 @@ impl Driver {
     }
 
     fn exec(self: &Arc<Self>, outs: Vec<Out>) {
+        // announcements go out batched per neighbour, after the rest
+        let mut anns: Vec<(SignPk, Vec<core::Announce>)> = Vec::new();
         for o in outs {
             match o {
-                Out::Announce { to, ann } => {
-                    if let Some(c) = self.conn(&to) {
-                        let _ = c.send_datagram(wire::encode_announce(&ann));
-                    }
-                }
+                Out::Announce { to, ann } => match anns.iter_mut().find(|(k, _)| *k == to) {
+                    Some((_, v)) => v.push(ann),
+                    None => anns.push((to, vec![ann])),
+                },
                 Out::SeqReq { to, req } => {
                     if let Some(c) = self.conn(&to) {
                         let _ = c.send_datagram(wire::encode_seqreq(&req));
@@ -342,6 +343,17 @@ impl Driver {
                 Out::RouteDown { dst, via } => {
                     self.send_event(LinkEvent::Lost { peer: dst, addr: mesh_addr(&dst, &via) });
                 }
+            }
+        }
+        for (to, v) in anns {
+            let Some(c) = self.conn(&to) else { continue };
+            if let [a] = &v[..] {
+                let _ = c.send_datagram(wire::encode_announce(a));
+                continue;
+            }
+            let max = c.max_datagram_size().unwrap_or(MIN_QUIC_MTU);
+            for d in wire::encode_announces(&v, max) {
+                let _ = c.send_datagram(d);
             }
         }
     }
@@ -568,6 +580,17 @@ impl Driver {
                 if let Some(a) = wire::decode_announce(&d) {
                     let wall = wall_ms();
                     self.with_router(|r, now| r.on_announce(from, a, now, wall, wire::verify_announce));
+                }
+            }
+            Some(&T_OGMS) => {
+                let anns = wire::decode_announces(&d);
+                if !anns.is_empty() {
+                    let wall = wall_ms();
+                    self.with_router(|r, now| {
+                        for a in anns {
+                            r.on_announce(from, a, now, wall, wire::verify_announce);
+                        }
+                    });
                 }
             }
             Some(&T_DATA) => {

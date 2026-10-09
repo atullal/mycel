@@ -266,6 +266,36 @@ impl Net {
     pub fn has_route(&self, from: usize, to: usize) -> bool {
         self.nodes[from].next_hop_local(&self.k(to), self.now).is_some()
     }
+
+    /// Following next hops from `from` reaches `to`.
+    pub fn routed(&self, from: usize, to: usize) -> bool {
+        let mut at = from;
+        for _ in 0..16 {
+            match self.nodes[at].next_hop_local(&self.k(to), self.now) {
+                Some(n) if self.index[&n] == to => return true,
+                Some(n) => at = self.index[&n],
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Radio hops between two devices (breadth-first over the links).
+    pub fn hops(&self, from: usize, to: usize) -> Option<usize> {
+        let mut dist = vec![usize::MAX; self.nodes.len()];
+        let mut q = std::collections::VecDeque::from([from]);
+        dist[from] = 0;
+        while let Some(u) = q.pop_front() {
+            for &(a, b) in &self.links {
+                let v = if a == u { b } else if b == u { a } else { continue };
+                if dist[v] == usize::MAX {
+                    dist[v] = dist[u] + 1;
+                    q.push_back(v);
+                }
+            }
+        }
+        (dist[to] != usize::MAX).then_some(dist[to])
+    }
 }
 
 /// A random geometric graph: `n` devices in a square, linked within `range`.
@@ -612,6 +642,74 @@ fn convergence_time_to_learn_new_routes() {
         "learn: 2-hop neighbours across the new link after {t_near:?} ms; all routes up to 8 hops after {t_all:?} ms (period 500 ms)"
     );
     assert!(t_all.is_some_and(|t| t <= 4 * 500 * 2), "{t_all:?}");
+}
+
+/// Babel-like timing (16 s periods): a device meeting a mesh learns its
+/// neighbours' routes from the greeting and announces itself to the full
+/// scope at once, so nobody waits for a period.
+#[test]
+fn new_neighbours_are_greeted_and_lone_devices_announce_fully() {
+    for greet in [Greet::Near, Greet::Own] {
+        let mut net = Net::new(7, |i| Config { announce_every: 16_000, greet, seed: i as u64 + 1, ..Config::default() });
+        for i in 0..5 {
+            net.link(i, i + 1);
+        }
+        // node 6 is alone for a while: its announcements reach nobody, and
+        // the latest ones are near-scope (fisheye)
+        net.run(100_000);
+        assert!(net.has_route(0, 5) && net.has_route(5, 0));
+        net.link(6, 5);
+        let start = net.now;
+        let (mut t_far, mut t_near) = (None, None);
+        net.until(16_000, |n| {
+            if t_far.is_none() && n.has_route(0, 6) {
+                t_far = Some(n.now - start);
+            }
+            if t_near.is_none() && n.has_route(6, 4) {
+                t_near = Some(n.now - start);
+            }
+            t_far.is_some() && t_near.is_some()
+        });
+        eprintln!("greet {greet:?}: 5 hops away learns the newcomer in {t_far:?} ms, the newcomer learns 2 hops away in {t_near:?} ms");
+        assert!(t_far.is_some_and(|t| t <= 600), "a lone device's first neighbour: full scope at once ({t_far:?})");
+        match greet {
+            Greet::Near => assert!(t_near.is_some_and(|t| t <= 100), "{t_near:?}"),
+            _ => assert!(t_near.is_none_or(|t| t > 1_000), "without a greeting it waits for a period ({t_near:?})"),
+        }
+        assert_eq!(net.loops_toward(6), 0);
+        assert_eq!(net.loops_toward(0), 0);
+    }
+}
+
+/// Over unicast hops, the broadcast-style flood reduction (skip a
+/// rebroadcast after hearing 3 equal copies) leaves devices out: those
+/// copies reached their senders' neighbours, not ours. Off by default.
+#[test]
+fn flood_reduction_is_off_and_floods_reach_everyone() {
+    assert!(!Config::default().flood_reduction);
+    let edges = geometric(60, 100.0, 24.0, 7);
+    let coverage = |reduction: bool| {
+        let mut net = Net::new(60, |i| Config { announce_every: 500, flood_reduction: reduction, seed: i as u64 + 1, ..Config::default() });
+        for (a, b) in &edges {
+            net.link(*a, *b);
+        }
+        net.run(3_000);
+        let mut ok = 0;
+        let mut all = 0;
+        for a in 0..60 {
+            for b in 0..60 {
+                if a != b && net.hops(a, b).is_some_and(|h| h <= 6) {
+                    all += 1;
+                    ok += net.routed(a, b) as usize;
+                }
+            }
+        }
+        ok as f64 / all as f64
+    };
+    let (off, on) = (coverage(false), coverage(true));
+    eprintln!("pairs within 8 hops routed after 3 s: reduction off {:.1}%, on {:.1}%", 100.0 * off, 100.0 * on);
+    assert!(off >= 0.99, "{off}");
+    assert!(off >= on);
 }
 
 /// A link in the middle of a line dies: with retractions, nobody keeps

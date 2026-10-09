@@ -12,9 +12,12 @@
 //! - **Local routes**: distance vector over signed originator announcements
 //!   (B.A.T.M.A.N.), made loop-free *during* convergence by Babel's
 //!   feasibility condition, with retractions and seqno requests on loss,
-//!   fisheye scoping (2 hops every period, the full scope every 4th) and
-//!   flood reduction. Up to `routes` routes per destination (distinct first
-//!   hops) are offered to QUIC as separate paths.
+//!   and Babel's timing: a long period (16 s), with what changes sent at
+//!   once (retractions, seqno requests, a lone device's first neighbour)
+//!   and a new neighbour greeted with our routes. Fisheye scoping: 2 hops
+//!   every period, the full scope every 8th. Up to `routes` routes per
+//!   destination (distinct first hops) are offered to QUIC as separate
+//!   paths.
 //! - **Gateways**: a device with the internet that relays for others sets
 //!   [`F_GATEWAY`] and its uplink cost in its (signed) announcements. A
 //!   device *without* the internet keeps a **default route** to the gateway
@@ -100,9 +103,10 @@ pub const MAX_CLOCK_SKEW_MS: u64 = 10 * 60 * 1000;
 /// Fisheye: every period an origin announces to this many hops ...
 pub const NEAR_SCOPE: u8 = 2;
 /// ... and to its full scope every this many periods (far routes refresh,
-/// and expire, this much slower).
-pub const FAR_EVERY: u64 = 4;
-/// Flood reduction: with this many direct neighbours or more ...
+/// and expire, this much slower; [`Config::far_every`]).
+pub const FAR_EVERY: u64 = 8;
+/// Flood reduction (off by default: it assumes broadcast radios): with
+/// this many direct neighbours or more ...
 const DENSE: usize = 8;
 /// ... skip a rebroadcast that this many neighbours already made as well.
 const REDUNDANT: usize = 3;
@@ -162,6 +166,20 @@ impl Hasher for Fnv {
 pub type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fnv>>;
 pub type Set<K> = HashSet<K, BuildHasherDefault<Fnv>>;
 
+/// What a new direct neighbour is told at once, besides our own
+/// announcement. Babel sends a new neighbour a full update instead of
+/// letting it wait for the next periodic one; with long periods that is
+/// what keeps discovery fast when devices meet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Greet {
+    /// Only our own announcement.
+    Own,
+    /// Our routes to direct neighbours (2 hops for it) and to gateways.
+    Near,
+    /// Every route it may hear (each within its announcement's scope).
+    All,
+}
+
 /// How a device takes part.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -173,13 +191,25 @@ pub struct Config {
     pub relay_rate_total: u64,
     /// Routes (QUIC paths, through distinct neighbours) kept per destination.
     pub routes: usize,
-    /// Hops a frame or an announcement may travel.
+    /// Hops a frame or an announcement may travel. Routes follow the
+    /// cheapest path, which can be a hop or two longer than the fewest
+    /// hops: 10 covers devices 8 radio hops away.
     pub max_hops: u8,
-    /// How often this device announces itself (ms).
+    /// How often this device announces itself (ms). Routes don't depend on
+    /// it to notice a lost link (hop connections time out in seconds and
+    /// trigger retractions), only to refresh: Babel's 16 s.
     pub announce_every: Time,
     /// Fisheye scoping (off: every announcement floods the full scope).
     pub fisheye: bool,
-    /// Flood reduction in dense neighbourhoods.
+    /// With fisheye: announce to the full scope every this many periods
+    /// (far routes refresh, and expire, this much slower).
+    pub far_every: u64,
+    /// What a new direct neighbour is sent at once.
+    pub greet: Greet,
+    /// Flood reduction in dense neighbourhoods: skip a rebroadcast heard 3
+    /// times. Made for broadcast radios, where those 3 copies reached our
+    /// neighbours too; over unicast hops they reached theirs, and devices
+    /// get left out (docs/SIMULATION.md §4, finding 1). Off by default.
     pub flood_reduction: bool,
     /// With the internet: relay between it and the mesh for others.
     pub gateway: bool,
@@ -206,10 +236,12 @@ impl Default for Config {
             relay_rate_per_neighbour: 1 << 20,
             relay_rate_total: 4 << 20,
             routes: 3,
-            max_hops: 8,
-            announce_every: 2_000,
+            max_hops: 10,
+            announce_every: 16_000,
             fisheye: true,
-            flood_reduction: true,
+            far_every: FAR_EVERY,
+            greet: Greet::All,
+            flood_reduction: false,
             gateway: true,
             gateway_rate: 2 << 20,
             gateways: 2,
@@ -218,6 +250,34 @@ impl Default for Config {
             verified_max: VERIFIED_MAX,
             seed: 0x6d79_6365_6c21,
         }
+    }
+}
+
+impl Config {
+    /// Settings from `key=value` pairs, for simulations and benchmarks:
+    /// `every` (ms), `far` (periods), `hops`, `greet` (own, near, all), `fisheye`
+    /// and `reduction` (on, off).
+    pub fn tune(&mut self, s: &str) -> Result<(), String> {
+        let on = |kv: &str, v: &str| match v {
+            "on" => Ok(true),
+            "off" => Ok(false),
+            _ => Err(format!("{kv}: on or off")),
+        };
+        for kv in s.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+            let (k, v) = kv.split_once('=').ok_or_else(|| format!("{kv}: expected key=value"))?;
+            match (k, v) {
+                ("every", n) => self.announce_every = n.parse().map_err(|e| format!("{kv}: {e}"))?,
+                ("far", n) => self.far_every = n.parse().map_err(|e| format!("{kv}: {e}"))?,
+                ("hops", n) => self.max_hops = n.parse().map_err(|e| format!("{kv}: {e}"))?,
+                ("greet", "own") => self.greet = Greet::Own,
+                ("greet", "near") => self.greet = Greet::Near,
+                ("greet", "all") => self.greet = Greet::All,
+                ("fisheye", v) => self.fisheye = on(kv, v)?,
+                ("reduction", v) => self.flood_reduction = on(kv, v)?,
+                _ => return Err(format!("{kv}: unknown knob")),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -663,13 +723,13 @@ impl Router {
 
     /// Far routes (beyond the near scope) refresh, and expire, this much slower.
     fn scale(&self, hops: u8) -> u64 {
-        if self.cfg.fisheye && hops > NEAR_SCOPE { FAR_EVERY } else { 1 }
+        if self.cfg.fisheye && hops > NEAR_SCOPE { self.cfg.far_every.max(1) } else { 1 }
     }
 
     /// How long an origin without routes is remembered (its feasibility
     /// distance keeps stale announcements from forming loops meanwhile).
     fn gc_after(&self) -> Time {
-        self.cfg.announce_every * 3 * FAR_EVERY * 2
+        self.cfg.announce_every * 3 * self.cfg.far_every.max(1) * 2
     }
 
     /// A via's seqno is recent enough, and it was heard recently enough.
@@ -749,11 +809,58 @@ impl Router {
         self.stats.hop_connections += 1;
         self.dialing.remove(&peer);
         self.backoff.remove(&peer);
-        if direct && let Some(a) = self.own.clone() {
+        if direct {
+            if self.direct_up().all(|k| k == peer) {
+                // our first neighbour: announce to the full scope now (what
+                // we announced alone reached nobody)
+                self.next_announce = self.next_announce.min(now);
+                self.force_full = true;
+            } else if let Some(a) = self.own.clone() {
+                self.stats.announcements_sent += 1;
+                self.out.push(Out::Announce { to: peer, ann: a });
+            }
+            self.greet(peer, now);
+        }
+        self.release(peer, now);
+    }
+
+    /// Tell a new direct neighbour our current routes ([`Config::greet`]),
+    /// as a periodic rebroadcast would: newest seqno, our cost, within each
+    /// announcement's scope. What is new to it travels on from there; what
+    /// its other neighbours already have stops at it (it has forwarded that
+    /// seqno). Advertising updates our feasibility distances, as in
+    /// `flush_announcements`.
+    fn greet(&mut self, peer: SignPk, now: Time) {
+        if self.cfg.greet == Greet::Own || !self.cfg.relay {
+            return;
+        }
+        let mut keys: Vec<SignPk> = self.origins.keys().filter(|k| **k != peer).copied().collect();
+        keys.sort();
+        for origin in keys {
+            // never back where it came from
+            let Some((_, via)) = self.best_route(&origin, now).filter(|(n, _)| *n != peer) else { continue };
+            let max_hops = self.cfg.max_hops;
+            let near = self.cfg.greet == Greet::Near;
+            let Some(o) = self.origins.get_mut(&origin) else { continue };
+            let gateway = o.latest.flags & F_GATEWAY != 0;
+            if via.seq != o.newest
+                || via.hops >= o.latest.scope.min(max_hops)
+                || (near && via.hops >= NEAR_SCOPE && !gateway)
+                || o.heard.iter().any(|(k, _)| *k == peer)
+            {
+                continue;
+            }
+            let mut a = o.latest.clone();
+            a.hops = via.hops;
+            a.cost = via.cost;
+            o.fd = match o.fd {
+                Some((s, c)) if s == o.newest => Some((s, c.min(via.cost))),
+                _ => Some((o.newest, via.cost)),
+            };
+            o.retracted = false;
             self.stats.announcements_sent += 1;
             self.out.push(Out::Announce { to: peer, ann: a });
         }
-        self.release(peer, now);
     }
 
     pub fn hop_down(&mut self, peer: SignPk, now: Time) {
@@ -844,7 +951,7 @@ impl Router {
     /// and our uplink cost.
     pub fn next_announce(&mut self, wall: u64) -> Origination {
         self.seq = wall.max(self.seq + 1);
-        let full = !self.cfg.fisheye || self.originated.is_multiple_of(FAR_EVERY) || self.force_full;
+        let full = !self.cfg.fisheye || self.originated.is_multiple_of(self.cfg.far_every.max(1)) || self.force_full;
         self.force_full = false;
         self.originated += 1;
         let scope = if full { self.cfg.max_hops } else { NEAR_SCOPE.min(self.cfg.max_hops) };
@@ -897,7 +1004,7 @@ impl Router {
             self.stats.announcements_stale += 1;
             return;
         }
-        let far_window = self.cfg.announce_every * 3 * FAR_EVERY;
+        let far_window = self.cfg.announce_every * 3 * self.cfg.far_every.max(1);
         if self.origins.get(&a.origin).is_some_and(|o| a.seq + far_window < o.newest) {
             self.stats.announcements_stale += 1;
             return;
@@ -1642,11 +1749,12 @@ impl Router {
             let mut silent: Vec<SignPk> = Vec::new();
             let timeout = self.cfg.announce_every * 7 / 2;
             let fisheye = self.cfg.fisheye;
+            let far_every = self.cfg.far_every.max(1);
             let mut next = Time::MAX;
             for (k, o) in self.origins.iter_mut() {
                 let before = o.via.len();
                 o.via.retain(|(_, v)| {
-                    let scale = if fisheye && v.hops > NEAR_SCOPE { FAR_EVERY } else { 1 };
+                    let scale = if fisheye && v.hops > NEAR_SCOPE { far_every } else { 1 };
                     let keep = now.saturating_sub(v.at) < timeout * scale;
                     if keep {
                         next = next.min(v.at + timeout * scale);
