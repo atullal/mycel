@@ -225,8 +225,11 @@ impl Tech {
     /// Bluetooth LE queues per peer: one L2CAP channel each, with the real
     /// link's drop-tail queue of `mycel_link_ble::OUT_QUEUE_BYTES` (16 KiB),
     /// and the controller serving connections in turn.
+    /// `MYCEL_SIM_BLE_QUEUE=radio` brings back the old model (one 250 ms FIFO
+    /// per radio) for comparison.
     pub fn peer_queue(self) -> Option<usize> {
-        matches!(self, Tech::Ble).then_some(16 * 1024)
+        let radio = std::env::var("MYCEL_SIM_BLE_QUEUE").is_ok_and(|v| v == "radio");
+        (matches!(self, Tech::Ble) && !radio).then_some(16 * 1024)
     }
 }
 
