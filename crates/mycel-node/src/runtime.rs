@@ -1483,8 +1483,8 @@ impl Runtime {
     }
 
     /// The app's video decoder needs a fresh start: keyframes, please.
-    pub fn video_keyframe(&self, call: String) -> Result<()> {
-        self.calls.video_keyframe(&call)
+    pub fn video_keyframe(&self, call: String, source: Option<String>) -> Result<()> {
+        self.calls.video_keyframe(&call, source.as_deref())
     }
 
     /// Encoded video frames for the app to decode and show: every call's

@@ -5,6 +5,8 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { openPath } from "@tauri-apps/plugin-opener";
 import type { ArgsOf, Command, FileHost, ResultOf, Transport } from "./transport.ts";
 import type { MycelEvent } from "./types.ts";
+import { WebCamera } from "./webcam.ts";
+import { bytesAsJson, invokeBytes } from "./ipc.ts";
 
 /** The Tauri event name the host emits runtime events on. */
 export const EVENT_NAME = "mycel://event";
@@ -65,13 +67,25 @@ const tauriFiles: FileHost = {
   async stage(files) {
     const paths: string[] = [];
     for (const f of files) {
-      // Raw body (no JSON): the `stage_file` command writes it under uploads/.
-      const bytes = new Uint8Array(await f.arrayBuffer());
-      paths.push(
-        await invoke<string>("stage_file", bytes, {
-          headers: { "x-mycel-name": encodeURIComponent(f.name || "pasted") },
-        }),
-      );
+      const name = encodeURIComponent(f.name || "pasted");
+      if (!bytesAsJson) {
+        // Raw body: the `stage_file` command writes it under uploads/.
+        const bytes = new Uint8Array(await f.arrayBuffer());
+        paths.push(await invokeBytes<string>("stage_file", bytes, { "x-mycel-name": name }));
+        continue;
+      }
+      // Android (base64 over JSON): in pieces, so big files fit.
+      const piece = 2 * 1024 * 1024;
+      let path = "";
+      for (let at = 0; at === 0 || at < f.size; at += piece) {
+        const bytes = new Uint8Array(await f.slice(at, at + piece).arrayBuffer());
+        path = await invokeBytes<string>(
+          "stage_file",
+          bytes,
+          at === 0 ? { "x-mycel-name": name } : { "x-mycel-append": encodeURIComponent(path) },
+        );
+      }
+      paths.push(path);
     }
     return paths;
   },
@@ -103,6 +117,14 @@ const tauriFiles: FileHost = {
 export function createTauriTransport(): Transport {
   const handlers = new Set<(event: MycelEvent) => void>();
   let unlisten: Promise<() => void> | null = null;
+
+  // Our camera where the host has none (Android, Windows, Linux): the web
+  // view captures and encodes while a call has the camera on (webcam.ts).
+  const webcam = new WebCamera();
+  void tauriListen<MycelEvent>(EVENT_NAME, (e) => {
+    const ev = e.payload;
+    if (ev.type === "callUpdated" || ev.type === "callIncoming") webcam.onCall(ev.call);
+  });
 
   const ensureListening = () => {
     if (unlisten) return;

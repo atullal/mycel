@@ -285,6 +285,10 @@ impl H264Encoder {
         Ok(enc)
     }
 
+    /// Only a source that encodes itself (`web`) can change size in place;
+    /// the track re-creates this encoder instead.
+    pub fn retarget(&mut self, _width: u32, _height: u32, _fps: u32) {}
+
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
     }

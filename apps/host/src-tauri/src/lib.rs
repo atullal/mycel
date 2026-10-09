@@ -299,8 +299,33 @@ pub extern "system" fn Java_dev_mycel_host_MainActivity_onActivityReady(
     });
 }
 
+/// Android apps get no environment. For testing, `debug.mycel.<name>`
+/// system properties (`adb shell setprop debug.mycel.audio test`) stand in
+/// for the `MYCEL_<NAME>` variables documented at the top of this file and
+/// in the crates (`MYCEL_AUDIO`, `MYCEL_VIDEO_DEBUG`, `MYCEL_NET`, ...).
+#[cfg(target_os = "android")]
+fn env_from_properties() {
+    for name in ["AUDIO", "VIDEO_DEBUG", "NET", "LINKS", "MESH", "BLE_LOG"] {
+        let var = format!("MYCEL_{name}");
+        if std::env::var_os(&var).is_some() {
+            continue;
+        }
+        let Ok(key) = std::ffi::CString::new(format!("debug.mycel.{}", name.to_ascii_lowercase())) else { continue };
+        let mut value = [0 as std::ffi::c_char; 92]; // PROP_VALUE_MAX
+        // SAFETY: a NUL-terminated key and a PROP_VALUE_MAX buffer.
+        if unsafe { libc::__system_property_get(key.as_ptr(), value.as_mut_ptr()) } > 0 {
+            // SAFETY: NUL-terminated by __system_property_get.
+            let v = unsafe { std::ffi::CStr::from_ptr(value.as_ptr()) }.to_string_lossy().into_owned();
+            // SAFETY: during startup, before the runtime's threads read the environment.
+            unsafe { std::env::set_var(&var, v) };
+        }
+    }
+}
+
 /// Open the runtime and wire it to the app.
 fn start(app: &mut tauri::App) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    env_from_properties();
     let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => app
@@ -429,6 +454,8 @@ pub fn run() {
             commands::set_camera,
             commands::video_keyframe,
             commands::video_subscribe,
+            commands::video_targets,
+            commands::video_push,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build the Mycel host");

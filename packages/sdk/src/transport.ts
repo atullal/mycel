@@ -61,7 +61,7 @@ export interface Commands {
   start_call: [{ conversation: ConversationId; video?: boolean }, CallInfo];
   accept_call: [{ call: CallId; video?: boolean }, CallInfo];
   set_camera: [{ call: CallId; on: boolean }, CallInfo];
-  video_keyframe: [{ call: CallId }, null];
+  video_keyframe: [{ call: CallId; source?: "local" | "remote" | null }, null];
   decline_call: [{ call: CallId }, null];
   end_call: [{ call: CallId }, null];
   set_muted: [{ call: CallId; muted: boolean }, CallInfo];

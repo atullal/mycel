@@ -130,6 +130,15 @@ struct CallArg {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct KeyframeArg {
+    call: String,
+    /// "local" (our self-view), "remote" (from the others), or both.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartCall {
     conversation: String,
     #[serde(default)]
@@ -243,7 +252,10 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
             let c: Camera = args(a)?;
             ok(rt.set_camera(c.call, c.on).await?)
         }
-        "video_keyframe" => ok(rt.video_keyframe(args::<CallArg>(a)?.call)?),
+        "video_keyframe" => {
+            let k: KeyframeArg = args(a)?;
+            ok(rt.video_keyframe(k.call, k.source)?)
+        }
         "decline_call" => ok(rt.decline_call(args::<CallArg>(a)?.call)?),
         "end_call" => ok(rt.end_call(args::<CallArg>(a)?.call)?),
         "set_muted" => {

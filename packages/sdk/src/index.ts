@@ -9,3 +9,4 @@ export type { MessagesOptions, Mycel, SendOptions } from "./client.ts";
 export { createHttpTransport, isHttpRuntime } from "./http.ts";
 export { canDecodeVideo, codecString, encodeVideoFrame, parseVideoFrame, videoCanvas } from "./video.ts";
 export type { VideoCanvas, VideoCanvasOptions, VideoFrameData, VideoSource } from "./video.ts";
+export { webCameraStream } from "./webcam.ts";

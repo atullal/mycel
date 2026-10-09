@@ -3660,6 +3660,7 @@ dependencies = [
 name = "mycel-host"
 version = "0.1.0"
 dependencies = [
+ "data-encoding",
  "jni 0.21.1",
  "libc",
  "mycel-node",

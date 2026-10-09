@@ -360,10 +360,17 @@ impl CallManager {
     }
 
     /// The app's video decoders lost their place (or just started): get
-    /// fresh keyframes from everyone, and for the self-view.
-    pub fn video_keyframe(&self, id: &str) -> Result<()> {
+    /// fresh keyframes for the self-view (`source` "local"), from the others
+    /// ("remote"), or both (`None`). Asking only where needed matters: a
+    /// keyframe is several times a frame's size.
+    pub fn video_keyframe(&self, id: &str, source: Option<&str>) -> Result<()> {
         let call = self.find(id)?;
-        self.inner.video.keyframes(&call.id());
+        let (local, remote) = match source {
+            Some("local") => (true, false),
+            Some("remote") => (false, true),
+            _ => (true, true),
+        };
+        self.inner.video.keyframes(&call.id(), local, remote);
         Ok(())
     }
 

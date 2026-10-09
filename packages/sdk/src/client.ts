@@ -153,8 +153,11 @@ export interface Mycel {
      * prompt; if they say no it rejects, and `video.error` says where to allow it.
      */
     setCamera(call: CallId, on: boolean): Promise<CallInfo>;
-    /** `video_keyframe`: our video decoders lost their place; get fresh keyframes. */
-    requestKeyframe(call: CallId): Promise<void>;
+    /**
+     * `video_keyframe`: a video decoder lost its place; get a fresh keyframe
+     * for the self-view (`"local"`), from the others (`"remote"`), or both.
+     */
+    requestKeyframe(call: CallId, source?: "local" | "remote"): Promise<void>;
     /**
      * Encoded video frames as they arrive: everyone's video (one stream per
      * person, `frame.peer` says whose) and our self-view. Decode them with
@@ -274,7 +277,7 @@ export function createMycel(transport: Transport): Mycel {
       join: (id, opts) =>
         askForMicrophone(transport).then(() => call("accept_call", { call: id, video: opts?.video ?? false })),
       setCamera: (id, on) => call("set_camera", { call: id, on }),
-      requestKeyframe: (id) => call("video_keyframe", { call: id }).then(done),
+      requestKeyframe: (id, source) => call("video_keyframe", source ? { call: id, source } : { call: id }).then(done),
       onVideo: (handler) => {
         videoHandlers.add(handler);
         if (!stopVideo && transport.video) {

@@ -14,6 +14,7 @@ import {
 } from "react";
 import { getMycel, type Mycel } from "../src/client.ts";
 import { canDecodeVideo, videoCanvas, type VideoSource } from "../src/video.ts";
+import { webCameraStream } from "../src/webcam.ts";
 import type {
   CallId,
   CallInfo,
@@ -352,6 +353,46 @@ export function useCalls(): CallInfo[] {
   return useMemo(() => [...calls.values()].sort((a, b) => b.startedAt - a.startedAt), [calls]);
 }
 
+/** Draw the web view's camera stream (if it's capturing) onto `canvas`, ~30 times a second. */
+function drawCameraStream(canvas: HTMLCanvasElement, onSize: (w: number, h: number) => void) {
+  const ctx = canvas.getContext("2d");
+  let video: HTMLVideoElement | null = null;
+  let timer = 0;
+  let drawing = false;
+  const tick = () => {
+    const stream = webCameraStream();
+    drawing = !!stream;
+    if (stream && !video) {
+      video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.srcObject = stream;
+      void video.play().catch(() => {});
+    } else if (!stream && video) {
+      video.srcObject = null;
+      video = null;
+    }
+    if (video && video.videoWidth > 0) {
+      const { videoWidth: w, videoHeight: h } = video;
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+        onSize(w, h);
+      }
+      ctx?.drawImage(video, 0, 0, w, h);
+    }
+    timer = window.setTimeout(tick, 33);
+  };
+  tick();
+  return {
+    live: () => drawing,
+    stop: () => {
+      clearTimeout(timer);
+      if (video) video.srcObject = null;
+    },
+  };
+}
+
 /**
  * Show one video stream of a call on a canvas: the other side's video
  * (`source: "remote"`, `peer` = their device) or our self-view
@@ -374,15 +415,20 @@ export function useVideoCanvas(
     if (!call || !el || !supported) return;
     const view = videoCanvas(el, {
       onPicture: (width, height) => setPicture({ width, height }),
-      onNeedKeyframe: () => void client.calls.requestKeyframe(call).catch(() => {}),
+      onNeedKeyframe: () => void client.calls.requestKeyframe(call, source).catch(() => {}),
     });
+    // Where the web view captures the camera itself (Android, Windows,
+    // Linux), the self-view draws that stream: no decoding our own frames.
+    const camera = source === "local" ? drawCameraStream(el, (w, h) => setPicture({ width: w, height: h })) : null;
     const off = client.calls.onVideo((f) => {
       if (f.source !== source) return;
       if (source === "remote" && peer && f.peer !== peer) return;
+      if (camera?.live()) return;
       view.push(f);
     });
     return () => {
       off();
+      camera?.stop();
       view.close();
     };
   }, [client, canvas, call, source, peer, supported]);
