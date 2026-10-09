@@ -275,9 +275,11 @@ mod tests {
     fn read_errors_explain_themselves() {
         let e = read_error(Path::new("/x/y"), io::Error::from(io::ErrorKind::NotFound));
         assert!(format!("{e:#}").starts_with("can't find /x/y"));
-        let e = read_error(Path::new("/x/y"), io::Error::from_raw_os_error(1));
+        // EPERM on Unix, ERROR_ACCESS_DENIED on Windows
+        let (code, os_says) = if cfg!(windows) { (5, "access is denied") } else { (1, "not permitted") };
+        let e = read_error(Path::new("/x/y"), io::Error::from_raw_os_error(code));
         let s = format!("{e:#}");
-        assert!(s.contains("/x/y") && s.to_lowercase().contains("not permitted"), "{s}");
+        assert!(s.contains("/x/y") && s.to_lowercase().contains(os_says), "{s}");
         #[cfg(target_os = "macos")]
         assert!(s.contains("Privacy & Security"), "{s}");
     }

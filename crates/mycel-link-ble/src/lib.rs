@@ -22,7 +22,7 @@
 //!   `Backend` trait.
 
 // Without a backend the shared machinery is unused (until one is written).
-#![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+#![cfg_attr(not(any(target_os = "macos", target_os = "ios", target_os = "linux")), allow(dead_code))]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -40,7 +40,7 @@ pub mod wire;
 
 #[cfg(target_os = "linux")]
 mod linux;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod macos;
 
 #[cfg(test)]
@@ -80,7 +80,7 @@ pub fn link(me: SignPk, name: &str) -> Arc<dyn Link> {
     BleLink::new(me, name, platform_backend())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 fn platform_backend() -> Box<dyn Backend> {
     Box::new(macos::Mac::new())
 }
@@ -90,16 +90,16 @@ fn platform_backend() -> Box<dyn Backend> {
     Box::new(linux::Linux::new())
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "linux")))]
 fn platform_backend() -> Box<dyn Backend> {
     Box::new(Unsupported)
 }
 
 /// No Bluetooth backend for this platform yet.
-#[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", target_os = "ios", target_os = "linux"), allow(dead_code))]
 struct Unsupported;
 
-#[cfg_attr(any(target_os = "macos", target_os = "linux"), allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", target_os = "ios", target_os = "linux"), allow(dead_code))]
 const UNSUPPORTED: &str = "Bluetooth links aren't available on this platform yet";
 
 impl Backend for Unsupported {
@@ -194,11 +194,11 @@ fn connecting_detail(connecting: usize, linked: usize) -> Option<String> {
 
 /// Running inside an app bundle (vs. a command-line tool under a terminal).
 fn in_app() -> bool {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         macos::in_app_bundle()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         true
     }

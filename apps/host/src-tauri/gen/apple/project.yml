@@ -81,12 +81,18 @@ targets:
       # Iroh's network monitor and DNS lookup (netdev, n0-dns-resolver)
       - sdk: SystemConfiguration.framework
       # Mycel's Rust code (a static library carries no link flags for Xcode):
-      # calls (voice processing, audio session, microphone permission) and
-      # interface watching.
+      # calls (voice processing, audio session, microphone permission),
+      # peer-to-peer Wi-Fi (AWDL) and interface watching.
       - sdk: AVFoundation.framework
       - sdk: AudioToolbox.framework
       - sdk: CoreAudio.framework
       - sdk: Network.framework
+      # peer-to-peer links: Bluetooth LE (Network.framework above does AWDL)
+      - sdk: CoreBluetooth.framework
+      # video calls: camera frames and hardware H.264
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: VideoToolbox.framework
       - sdk: UIKit.framework
       - sdk: WebKit.framework
     preBuildScripts:

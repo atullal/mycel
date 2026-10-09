@@ -27,7 +27,7 @@ class MainActivity : TauriActivity() {
 
   // The page draws under the status and navigation bars (Android 15+ makes
   // every app edge to edge); it pads itself by these, in CSS pixels.
-  @Volatile private var insetsJson = """{"top":0,"right":0,"bottom":0,"left":0}"""
+  @Volatile private var insetsJson = """{"top":0,"right":0,"bottom":0,"left":0,"keyboard":false}"""
 
   override fun onCreate(savedInstanceState: Bundle?) {
     // No scrim behind 3-button navigation: the page's own bar runs under it.
@@ -62,7 +62,7 @@ class MainActivity : TauriActivity() {
       (view.parent as? View)?.let { it.setPadding(0, 0, 0, imeBottom) }
       val d = resources.displayMetrics.density
       val bottom = if (keyboard) 0f else bars.bottom / d
-      insetsJson = """{"top":${bars.top / d},"right":${bars.right / d},"bottom":$bottom,"left":${bars.left / d}}"""
+      insetsJson = """{"top":${bars.top / d},"right":${bars.right / d},"bottom":$bottom,"left":${bars.left / d},"keyboard":$keyboard}"""
       (view as WebView).evaluateJavascript(
         "window.dispatchEvent(new CustomEvent('mycel-insets', { detail: $insetsJson }))", null)
       insets

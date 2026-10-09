@@ -62,16 +62,16 @@ pub mod source;
 pub mod track;
 pub mod wire;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod mac;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
 mod stub;
 
 /// The video backend for this platform.
 pub mod platform {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub use crate::mac::{CAMERA_DENIED, H264Decoder, H264Encoder, PixelBuffer, camera};
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     pub use crate::stub::{CAMERA_DENIED, H264Decoder, H264Encoder, PixelBuffer, camera};
 }
 

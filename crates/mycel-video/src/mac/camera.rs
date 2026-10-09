@@ -21,8 +21,11 @@ use super::ffi::*;
 use super::vt::PixelBuffer;
 use crate::source::{Picture, PictureSink, SourceHandle, VideoSource, wall_us};
 
+#[cfg(target_os = "macos")]
 pub const CAMERA_DENIED: &str =
     "Mycel isn't allowed to use the camera. Allow it in System Settings > Privacy & Security > Camera, then turn the camera on again.";
+#[cfg(target_os = "ios")]
+pub const CAMERA_DENIED: &str = "Mycel isn't allowed to use the camera. Turn it on in Settings > Mycel, then turn the camera on again.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CameraPermission {
@@ -35,6 +38,28 @@ pub enum CameraPermission {
 fn media_video() -> &'static NSString {
     // SAFETY: an AVFoundation constant.
     unsafe { AVMediaTypeVideo }.expect("AVMediaTypeVideo")
+}
+
+/// The camera to use: the system default on a Mac; the front (selfie)
+/// camera on iPhone and iPad.
+fn default_camera() -> Option<Retained<AVCaptureDevice>> {
+    #[cfg(target_os = "ios")]
+    {
+        use objc2_av_foundation::{AVCaptureDevicePosition, AVCaptureDeviceTypeBuiltInWideAngleCamera};
+        // SAFETY: class methods taking AVFoundation constants.
+        let front = unsafe {
+            AVCaptureDevice::defaultDeviceWithDeviceType_mediaType_position(
+                AVCaptureDeviceTypeBuiltInWideAngleCamera,
+                Some(media_video()),
+                AVCaptureDevicePosition::Front,
+            )
+        };
+        if front.is_some() {
+            return front;
+        }
+    }
+    // SAFETY: a class method taking a media type.
+    unsafe { AVCaptureDevice::defaultDeviceWithMediaType(media_video()) }
 }
 
 /// What the user decided about camera access (never prompts).
@@ -119,8 +144,8 @@ pub struct Camera {
 impl Camera {
     fn look_up_name(&self) -> &str {
         self.name.get_or_init(|| {
-            // SAFETY: a class method taking a media type.
-            unsafe { AVCaptureDevice::defaultDeviceWithMediaType(media_video()) }
+            default_camera()
+                // SAFETY: a plain property read.
                 .map(|d| unsafe { d.localizedName() }.to_string())
                 .unwrap_or_else(|| "No camera".into())
         })
@@ -161,7 +186,7 @@ impl VideoSource for Camera {
         // SAFETY: AVFoundation calls with valid arguments; the session is
         // configured before it starts running.
         unsafe {
-            let device = AVCaptureDevice::defaultDeviceWithMediaType(media_video()).context("No camera found.")?;
+            let device = default_camera().context("No camera found.")?;
             let input = AVCaptureDeviceInput::deviceInputWithDevice_error(&device)
                 .map_err(|e| anyhow!("The camera can't be opened: {}", e.localizedDescription()))?;
             let session = AVCaptureSession::new();
@@ -188,6 +213,16 @@ impl VideoSource for Camera {
                 bail!("The camera's video can't be read.");
             }
             session.addOutput(&output);
+            // A phone's camera delivers frames sideways (its sensor is
+            // landscape): turn them upright for a phone held in portrait.
+            // (videoRotationAngle replaces this from iOS 17; Mycel runs on 16.4.)
+            #[cfg(target_os = "ios")]
+            #[allow(deprecated)]
+            if let Some(connection) = output.connectionWithMediaType(media_video())
+                && connection.isVideoOrientationSupported()
+            {
+                connection.setVideoOrientation(objc2_av_foundation::AVCaptureVideoOrientation::Portrait);
+            }
             session.commitConfiguration();
             session.startRunning();
             Ok(SourceHandle::new(Running { session, _output: output, _delegate: delegate, _queue: queue }))

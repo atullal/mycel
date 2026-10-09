@@ -283,8 +283,9 @@ mod tests {
         let mut en0 = iface("en0", Hw::Ethernet);
         en0.routable = true;
         assert_eq!(classify(&en0, &r), Decision::Skip("the network path covers it"));
-        // IP off: it is ours
-        assert_eq!(kind(classify(&en0, &Rules::default())), Some(PathKind::Network));
+        // IP off: it is ours (Linux can tell a cable from Wi-Fi; macOS calls both Ethernet)
+        let wired = if cfg!(target_os = "linux") { PathKind::Ethernet } else { PathKind::Network };
+        assert_eq!(kind(classify(&en0, &Rules::default())), Some(wired));
         // a cable between two Macs: link-local only
         let bridge = iface("bridge0", Hw::Virtual);
         assert_eq!(kind(classify(&bridge, &r)), Some(PathKind::Ethernet));

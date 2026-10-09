@@ -1,4 +1,4 @@
-//! macOS: AVFoundation camera, VideoToolbox H.264.
+//! Apple (macOS, iOS, iPadOS): AVFoundation camera, VideoToolbox H.264.
 
 pub mod camera;
 pub mod ffi;

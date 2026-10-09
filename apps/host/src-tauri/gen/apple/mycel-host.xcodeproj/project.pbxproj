@@ -16,10 +16,14 @@
 		29426F89DE0158041CC30213 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5A349B4824C84E56ABB96DEF /* UIKit.framework */; };
 		3301C2B5D172AAB982AEA3E5 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2204F13D38537B628284E8EB /* Security.framework */; };
 		3DBBABA22AEE2EDCD19BF954 /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = E3410D8570D2354B50546AE0 /* libapp.a */; };
+		41450B1FED51FA1AE16ED509 /* CoreBluetooth.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = D864E3D2A0B6634BB0535B60 /* CoreBluetooth.framework */; };
 		60D7FD85D5EBEAD5CEBFA116 /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 782DC6CEC25A603744C016AF /* assets */; };
 		6338B22365CF928DC5F58B4D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = BCB5A42EA6A0A31A5D1F76FA /* LaunchScreen.storyboard */; };
 		69E599B493ED66268B5070A4 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B81AFB5AF7FDD0E5767D6800 /* Assets.xcassets */; };
+		7158F7D9A0E3175227D5F9C2 /* CoreMedia.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AB39F84949BAF13ABCFBBBC1 /* CoreMedia.framework */; };
 		74DEEB8A18334D5B97C71F89 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 679763AB647C60B15B6FDD93 /* AVFoundation.framework */; };
+		8B3907D2367E80EF0C53B047 /* CoreVideo.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 295924B2D0781FC5A55540A7 /* CoreVideo.framework */; };
+		942E1DC59B2DFA7565233AB2 /* VideoToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 140E1446C2A0F30FBAB5FEAF /* VideoToolbox.framework */; };
 		A9D14FED31C5EC0538FAFD65 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FDC4E509A7735B5C449D2BDE /* CoreGraphics.framework */; };
 		B64EC3162C52762530942CA3 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AB0834A1176DECD442A96363 /* Network.framework */; };
 		E3157AAD487DA50416BE5FE9 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 52003193EBBDF815F4940BAD /* MetalKit.framework */; };
@@ -29,8 +33,10 @@
 /* Begin PBXFileReference section */
 		0A97AF905AA005454B60AAD3 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
 		13FFCBA147B88846A2082673 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
+		140E1446C2A0F30FBAB5FEAF /* VideoToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = VideoToolbox.framework; path = System/Library/Frameworks/VideoToolbox.framework; sourceTree = SDKROOT; };
 		2204F13D38537B628284E8EB /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		25619DBB3DECB15CF1D8AE39 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		295924B2D0781FC5A55540A7 /* CoreVideo.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreVideo.framework; path = System/Library/Frameworks/CoreVideo.framework; sourceTree = SDKROOT; };
 		3781B1EEFDD85EE7ADFA2A94 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
 		456310891DC9817B03F81E18 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
 		490F4E0794B72DF85E5C0D13 /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AudioToolbox.framework; path = System/Library/Frameworks/AudioToolbox.framework; sourceTree = SDKROOT; };
@@ -45,9 +51,11 @@
 		916D698AAC9440D4E351E388 /* open_file.rs */ = {isa = PBXFileReference; path = open_file.rs; sourceTree = "<group>"; };
 		9A6B639B004365D80CF93865 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		AB0834A1176DECD442A96363 /* Network.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Network.framework; path = System/Library/Frameworks/Network.framework; sourceTree = SDKROOT; };
+		AB39F84949BAF13ABCFBBBC1 /* CoreMedia.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMedia.framework; path = System/Library/Frameworks/CoreMedia.framework; sourceTree = SDKROOT; };
 		B81AFB5AF7FDD0E5767D6800 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		BCB5A42EA6A0A31A5D1F76FA /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
 		C302A7387C1635AFA6B0089F /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		D864E3D2A0B6634BB0535B60 /* CoreBluetooth.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreBluetooth.framework; path = System/Library/Frameworks/CoreBluetooth.framework; sourceTree = SDKROOT; };
 		E3410D8570D2354B50546AE0 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		EDCC05E921083F3A6DECDDE0 /* CoreAudio.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreAudio.framework; path = System/Library/Frameworks/CoreAudio.framework; sourceTree = SDKROOT; };
 		F28713F927B873D3AFF06791 /* mycel-host_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "mycel-host_iOS.entitlements"; sourceTree = "<group>"; };
@@ -70,6 +78,10 @@
 				26C3B8E35679824BE64FBFF1 /* AudioToolbox.framework in Frameworks */,
 				22942AA51F1A7C6E2D9D79F5 /* CoreAudio.framework in Frameworks */,
 				B64EC3162C52762530942CA3 /* Network.framework in Frameworks */,
+				41450B1FED51FA1AE16ED509 /* CoreBluetooth.framework in Frameworks */,
+				7158F7D9A0E3175227D5F9C2 /* CoreMedia.framework in Frameworks */,
+				8B3907D2367E80EF0C53B047 /* CoreVideo.framework in Frameworks */,
+				942E1DC59B2DFA7565233AB2 /* VideoToolbox.framework in Frameworks */,
 				29426F89DE0158041CC30213 /* UIKit.framework in Frameworks */,
 				00977C04DFF0F52A6E2A829B /* WebKit.framework in Frameworks */,
 			);
@@ -128,7 +140,10 @@
 				490F4E0794B72DF85E5C0D13 /* AudioToolbox.framework */,
 				679763AB647C60B15B6FDD93 /* AVFoundation.framework */,
 				EDCC05E921083F3A6DECDDE0 /* CoreAudio.framework */,
+				D864E3D2A0B6634BB0535B60 /* CoreBluetooth.framework */,
 				FDC4E509A7735B5C449D2BDE /* CoreGraphics.framework */,
+				AB39F84949BAF13ABCFBBBC1 /* CoreMedia.framework */,
+				295924B2D0781FC5A55540A7 /* CoreVideo.framework */,
 				E3410D8570D2354B50546AE0 /* libapp.a */,
 				3781B1EEFDD85EE7ADFA2A94 /* Metal.framework */,
 				52003193EBBDF815F4940BAD /* MetalKit.framework */,
@@ -137,6 +152,7 @@
 				2204F13D38537B628284E8EB /* Security.framework */,
 				13FFCBA147B88846A2082673 /* SystemConfiguration.framework */,
 				5A349B4824C84E56ABB96DEF /* UIKit.framework */,
+				140E1446C2A0F30FBAB5FEAF /* VideoToolbox.framework */,
 				9A6B639B004365D80CF93865 /* WebKit.framework */,
 			);
 			name = Frameworks;

@@ -55,7 +55,7 @@ if [ "$MODE" = release ]; then
   if [ ! -f "$KEYSTORE" ]; then
     echo "Making the Android signing key in $KEYDIR (back this folder up)."
     mkdir -p "$KEYDIR" && chmod 700 "$KEYDIR"
-    PASS="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 32)"
+    PASS="$(openssl rand -hex 24)"
     keytool -genkeypair -v -keystore "$KEYSTORE" -alias mycel -keyalg RSA -keysize 4096 -validity 10000 \
       -storepass "$PASS" -keypass "$PASS" -dname "CN=Mycel" >/dev/null
     printf 'storeFile=%s\nkeyAlias=mycel\npassword=%s\n' "$KEYSTORE" "$PASS" > "$PROPS"

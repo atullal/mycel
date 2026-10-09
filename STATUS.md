@@ -1,6 +1,6 @@
 # Mycel: where things stand
 
-*Last updated: 2026-10-09, 10:45 am ET. This is a snapshot for collaborators. The
+*Last updated: 2026-10-09, 2:30 pm ET. This is a snapshot for collaborators. The
 design docs in `docs/` are the source of truth.*
 
 ## TL;DR
@@ -18,6 +18,9 @@ design docs in `docs/` are the source of truth.*
   - **benchmarks** against established routers (`bench/`);
   - the fixes they led to: a faster and leaner carrier, 8× less routing
     overhead, a crash fix, a memory-leak fix, and a multipath fix.
+- **New in the afternoon of 2026-10-09: apps for iPhone and iPad, Android,
+  Windows and Linux** next to the Mac app. Same UI and runtime everywhere;
+  what works on which platform is in [docs/PLATFORMS.md](docs/PLATFORMS.md).
 - Test build: the [dev-2026-10-09 pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-09).
   **Its wire format changed, so every device needs this build.**
 
@@ -35,6 +38,18 @@ design docs in `docs/` are the source of truth.*
    is in [docs/TWO_LAPTOPS.md](docs/TWO_LAPTOPS.md).
 
 To build from source, see the [README](README.md). `cargo test --workspace --exclude mycel-host` runs about 300 Rust tests.
+
+## Apps for every platform
+
+How to build and install each one: [docs/PLATFORMS.md](docs/PLATFORMS.md).
+
+| Platform | State |
+|---|---|
+| macOS | as before (universal DMG) |
+| iPhone, iPad | Runs on the iOS 27 Simulator (iPhone and iPad layouts). Messages to and from a desktop peer work. On devices it needs an Apple ID in Xcode to sign (`scripts/package-ios.sh --install`). Voice calls use Apple's voice processing. Peer-to-peer Wi-Fi, Bluetooth and the camera now share the Mac code, but haven't run on an iPhone yet. |
+| Android 9+ | Signed release APK (`scripts/package-android.sh`). Tested on the Android 14 emulator: messages in both directions through the real UI, the on-screen keyboard, and profile and contact codes. Voice calls use the phone's echo canceller. No Bluetooth, Wi-Fi Direct or camera yet. |
+| Windows 10+ | NSIS installer and MSI built by GitHub Actions. Not run on a Windows machine yet. |
+| Linux | deb, rpm and AppImage built by GitHub Actions. Not run on a Linux desktop yet. |
 
 ## Where to read
 
@@ -119,6 +134,15 @@ largest size this Mac runs. That's up to 100 seats for the conference and
 ±3–6 points (SIMULATION.md §4, open 12).
 
 ## Known issues and open questions
+
+- **New platforms, first builds:**
+  - Windows and Linux builds have only passed CI so far.
+  - iPhone peer-to-peer Wi-Fi, Bluetooth and the camera are untested on
+    hardware.
+  - The on-screen keyboard is checked on Android but not on an iPhone yet.
+  - Phones suspend Mycel in the background. Messages arrive when it's opened
+    again, or through a keeper or store-and-forward.
+  - Sending video works from Apple devices only.
 
 - **Bluetooth between two real Macs.** The link connects without pairing, but
   in one test session one laptop kept hanging up after 5–10 s and stopped

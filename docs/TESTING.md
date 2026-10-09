@@ -213,3 +213,22 @@ Re-run: `head -c 1073741824 /dev/urandom > /tmp/big.bin; python3 scripts/net-ben
 
 Run them with output: `cargo test -p mycel-net mesh -- --nocapture`, `cargo test -p mycel-net --test global -- --nocapture`.
 
+
+## Phones and the other platforms (2026-10-09)
+
+Simulators on this Mac, a desktop peer from `mycel serve`. Android was driven
+through its real UI with `adb shell input`, plus Chrome DevTools on the debug
+build. The iOS Simulator was checked from screenshots and the app's log (tap
+automation tools don't support Xcode 27 yet).
+
+| Test | Where | Result |
+|---|---|---|
+| App starts, runtime opens, profile named after the device | iPhone 18 Pro and iPad Pro 11" simulators (iOS 27), Pixel 7 emulator (Android 14) | ok ("iPhone 18 Pro", "iPad Pro 11-inch (M5)", "Android SDK built for arm64") |
+| Layout under the status bar / notch / home indicator / navigation bar | same | phone layout edge to edge; iPad two-pane layout |
+| Desktop peer → phone: message request arrives | iPhone simulator (found over mDNS), Android release APK (contact code, emulator behind NAT) | ok, a few seconds |
+| Phone → desktop: add contact, send, reply | Android (DevTools, then the real UI) | ok both ways; replied through the on-screen keyboard |
+| On-screen keyboard | Android | page shrinks above the keyboard, composer stays in sight, tab bar hides while typing |
+| Back button | Android | closes the keyboard, then returns from a conversation to the list; from the list it leaves the app |
+| Voice call setup | Android | system microphone prompt on the first call, then the desktop peer rings; hang-up shows "missed" there (no audio device in the emulator) |
+| Bluetooth / peer-to-peer Wi-Fi without the hardware | iPhone simulator | Bluetooth reports "Unsupported" and the app carries on |
+| Core tests on Linux and Windows | GitHub Actions (`apps.yml`) | first run: runtime, sync, trust, net, links pass; Apple-only video tests now skipped there; timing tests run optimised |
