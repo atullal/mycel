@@ -49,7 +49,7 @@ How to build and install each one: [docs/PLATFORMS.md](docs/PLATFORMS.md).
 | iPhone, iPad | Runs on the iOS 27 Simulator (iPhone and iPad layouts). Messages to and from a desktop peer work. On devices it needs an Apple ID in Xcode to sign (`scripts/package-ios.sh --install`). Voice calls use Apple's voice processing. Peer-to-peer Wi-Fi, Bluetooth and the camera now share the Mac code, but haven't run on an iPhone yet. |
 | Android 9+ | Signed release APK (`scripts/package-android.sh`). Tested on the Android 14 emulator: messages in both directions through the real UI, the on-screen keyboard, and profile and contact codes. Voice calls use the phone's echo canceller. No Bluetooth, Wi-Fi Direct or camera yet. |
 | Windows 10+ | NSIS installer and MSI built by GitHub Actions. CI launches the app on a Windows runner: the runtime opens and the UI renders in WebView2 (screenshot artifact). Not tried on a desktop PC yet. |
-| Linux | deb, rpm and AppImage built by GitHub Actions. CI launches the app under a virtual display: the runtime opens and the UI renders in WebKitGTK (screenshot artifact). On that bare CI machine it took about 25 s to open (likely a desktop D-Bus service timing out; being checked). Not tried on a Linux desktop yet. |
+| Linux | deb, rpm and AppImage built by GitHub Actions. CI launches the app under a virtual display: the runtime opens and the UI renders in WebKitGTK (screenshot artifact). On that bare CI machine it takes about 25 s to open: GTK's application startup waits for desktop D-Bus services the runner doesn't have (seen in a stack dump, before any Mycel code runs). Desktop sessions provide them. Not tried on a Linux desktop yet. |
 
 ## Where to read
 

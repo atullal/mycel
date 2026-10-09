@@ -233,5 +233,5 @@ automation tools don't support Xcode 27 yet).
 | Voice call setup | Android | system microphone prompt on the first call, then the desktop peer rings; hang-up shows "missed" there (no audio device in the emulator) |
 | Bluetooth / peer-to-peer Wi-Fi without the hardware | iPhone simulator | Bluetooth reports "Unsupported" and the app carries on |
 | Core tests on Linux and Windows | GitHub Actions (`apps.yml`), optimised build | Linux: all pass. Windows: 265 of 267; the 2 failures rank emulated links by speed (timer granularity suspected). Apple-only video tests skipped there |
-| Linux and Windows apps launch | GitHub Actions smoke test | runtime opens, app still running after the wait, UI renders (WebKitGTK, WebView2 screenshots). Linux took ~25 s to open on the bare runner |
+| Linux and Windows apps launch | GitHub Actions smoke test | runtime opens, app still running after the wait, UI renders (WebKitGTK, WebView2 screenshots). Linux took ~25 s to open on the bare runner: GTK's `g_application_register` waits on a desktop D-Bus service that isn't there (thread dump), before Mycel's code runs |
 | Rules engine at every optimisation level | `mycel-rules` tests at opt-level 2 | stack overflow with wasmi's tail-call dispatch; fixed with portable dispatch, same fuel (56603 for a 16 KiB message) |
