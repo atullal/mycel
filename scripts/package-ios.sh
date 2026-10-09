@@ -5,6 +5,8 @@
 #   scripts/package-ios.sh --install [NAME]   # ...and install it on a connected
 #                                             #    iPhone/iPad (default: the first one)
 #   scripts/package-ios.sh --simulator        # Simulator build (.app, unsigned)
+#   scripts/package-ios.sh --unsigned         # unsigned device .ipa, for re-signing
+#                                             #    (Sideloadly, AltStore, `codesign`)
 #
 # Device builds are signed with the Apple development team in
 # apps/host/src-tauri/tauri.conf.json (bundle > iOS > developmentTeam). Xcode
@@ -22,8 +24,9 @@ case "${1:-}" in
   "") ;;
   --install) INSTALL=1; DEVICE="${2:-}" ;;
   --simulator) MODE=simulator ;;
-  -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
-  *) echo "unknown option: $1 (use --install, --simulator or nothing)" >&2; exit 2 ;;
+  --unsigned) MODE=unsigned ;;
+  -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
+  *) echo "unknown option: $1 (use --install, --simulator, --unsigned or nothing)" >&2; exit 2 ;;
 esac
 
 command -v xcodebuild >/dev/null || { echo "Xcode not found: install it from the App Store" >&2; exit 1; }
@@ -58,6 +61,20 @@ if [ "$MODE" = simulator ]; then
 fi
 
 rustup target add aarch64-apple-ios >/dev/null
+if [ "$MODE" = unsigned ]; then
+  (cd apps/host && cargo tauri ios build --target aarch64 --no-sign --archive-only)
+  APP="$APPLE/build/mycel-host_iOS.xcarchive/Products/Applications/Mycel.app"
+  [ -d "$APP" ] || { echo "no archive found" >&2; exit 1; }
+  STAGE="$(mktemp -d)"
+  trap 'rm -rf "$STAGE"' EXIT
+  mkdir "$STAGE/Payload" && ditto "$APP" "$STAGE/Payload/Mycel.app"
+  DEST="$OUT/Mycel_${VERSION}_ios-unsigned.ipa"
+  rm -f "$DEST"
+  (cd "$STAGE" && zip -qry "$DEST" Payload)
+  echo
+  echo "Built $DEST ($(du -h "$DEST" | cut -f1)), unsigned: re-sign it to install."
+  exit 0
+fi
 (cd apps/host && cargo tauri ios build --target aarch64 --export-method debugging)
 IPA="$(ls -t "$APPLE"/build/arm64/*.ipa 2>/dev/null | head -1)"
 [ -f "$IPA" ] || { echo "no .ipa produced (see the Xcode output above)" >&2; exit 1; }

@@ -23,6 +23,7 @@ tauri-build = { version = "2", features = [] }
 mycel-node = { path = "../../../crates/mycel-node" }
 tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -39,9 +40,11 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
 objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-foundation", "UIActivityViewController", "UIDevice", "UIPopoverPresentationController", "UIPresentationController", "UIResponder", "UIView", "UIViewController"] }
 
-# Calls into MainActivity (opening attachments).
+# Calls into MainActivity and MycelService (attachments, notifications, a
+# window for a reopened activity).
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
+ndk-context = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }

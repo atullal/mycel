@@ -22,4 +22,8 @@
 # Mycel: called from Rust over JNI (src/open_file.rs), so R8 can't see a caller.
 -keep class dev.mycel.host.MainActivity {
     public void openFile(java.lang.String);
+    private native void onActivityReady();
+}
+-keep class dev.mycel.host.MycelService {
+    public static void notify(android.content.Context, java.lang.String, java.lang.String);
 }

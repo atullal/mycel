@@ -20,6 +20,12 @@
   <string>Mycel uses the camera only during video calls, when you turn it on, or to take a photo you choose to send. It goes end-to-end encrypted, directly to the person you're talking to.</string>
   <key>NSBluetoothAlwaysUsageDescription</key>
   <string>Mycel uses Bluetooth to reach nearby phones and computers running Mycel when there is no Wi-Fi, and sends them your end-to-end encrypted messages directly.</string>
+  <!-- A call keeps going when the phone locks or another app opens (iOS
+       allows this while the call's audio session is active). -->
+  <key>UIBackgroundModes</key>
+  <array>
+    <string>audio</string>
+  </array>
   <key>NSPhotoLibraryUsageDescription</key>
   <string>Mycel reads the photos and videos you choose to send.</string>
 </dict>

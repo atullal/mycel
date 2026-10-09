@@ -1,8 +1,10 @@
 package dev.mycel.host
 
+import android.Manifest
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.wifi.WifiManager
 import android.os.Build
@@ -15,6 +17,7 @@ import android.webkit.WebView
 import android.widget.Toast
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
+import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -34,6 +37,17 @@ class MainActivity : TauriActivity() {
     enableEdgeToEdge(navigationBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT))
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) window.isNavigationBarContrastEnforced = false
     super.onCreate(savedInstanceState)
+    // Notifications for new messages and calls (Android 13+ asks), then stay
+    // connected in the background.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+      ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+    ) {
+      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS)) {}
+    }
+    ContextCompat.startForegroundService(this, Intent(this, MycelService::class.java))
+    // Reopened after being swiped away: the app (and runtime) kept running;
+    // Rust gives this activity a window (src/lib.rs).
+    onActivityReady()
     val wifi = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
     multicastLock = wifi?.createMulticastLock("mycel-mdns")?.apply {
       setReferenceCounted(false)
@@ -68,6 +82,8 @@ class MainActivity : TauriActivity() {
       insets
     }
   }
+
+  private external fun onActivityReady()
 
   /** Open a received attachment with another app. Called from Rust (src/open_file.rs). */
   @Suppress("unused")

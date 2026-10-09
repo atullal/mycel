@@ -685,6 +685,7 @@ impl MemNet {
     /// `n` (0..16) picks the transport id; `kind` is what it reports as.
     /// (Bluetooth always uses the real Bluetooth transport id.)
     pub fn new(n: u64, kind: PathKind) -> MemNet {
+        crate::fine_timers();
         let id = if kind == PathKind::Bluetooth { TRANSPORT_BLUETOOTH } else { TRANSPORT_TEST_BASE + n };
         MemNet { id, kind, down: Arc::default(), inner: Arc::default(), shape: Arc::default() }
     }

@@ -985,8 +985,25 @@ pub struct Node {
     tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
+/// Windows rounds sleeps and timeouts up to its 15.6 ms default timer tick,
+/// which skews QUIC's pacing and loss timers, 20 ms call audio and the
+/// emulated links' delays (tests ranked a 5 ms link below a slower one).
+/// Ask for 1 ms, as browsers do for media; since Windows 10 2004 this only
+/// affects this process. A no-op elsewhere.
+pub fn fine_timers() {
+    #[cfg(windows)]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        // SAFETY: a plain winmm call. Never undone: it lasts as long as the process.
+        ONCE.call_once(|| unsafe {
+            windows_sys::Win32::Media::timeBeginPeriod(1);
+        });
+    }
+}
+
 impl Node {
     pub async fn spawn(keys: Arc<DeviceKeys>, opts: NodeOptions) -> Result<Self> {
+        fine_timers();
         // Same Ed25519 key for transport and for Mycel signatures (domain-separated).
         let secret = SecretKey::from_bytes(&keys.seed());
         let memory = MemoryLookup::new();

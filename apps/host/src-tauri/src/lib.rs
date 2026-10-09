@@ -16,6 +16,7 @@
 //! - `MYCEL_NAME`: display name to use when creating a new profile.
 
 mod commands;
+mod notify;
 mod open_file;
 
 use std::path::PathBuf;
@@ -23,7 +24,7 @@ use std::sync::Arc;
 
 use mycel_node::{Runtime, RuntimeOptions};
 use mycel_node::api::{Event, NetworkMode};
-use tauri::{AppHandle, Emitter, Manager, RunEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tokio::sync::broadcast::error::RecvError;
 
 /// Tauri event carrying one runtime `Event` to the webview.
@@ -51,8 +52,9 @@ pub(crate) fn set_window_title(app: &AppHandle, name: &str) {
     }
 }
 
-/// Forward runtime events to the webview until the runtime shuts down.
-fn forward_events(app: AppHandle, runtime: Rt) {
+/// Forward runtime events to the webview until the runtime shuts down, and
+/// turn new messages and calls into notifications while nobody's looking.
+fn forward_events(app: AppHandle, runtime: Rt, notifier: Arc<notify::Notifier>) {
     // Subscribe before spawning so nothing emitted after startup is missed.
     let mut rx = runtime.subscribe();
     tauri::async_runtime::spawn(async move {
@@ -61,6 +63,11 @@ fn forward_events(app: AppHandle, runtime: Rt) {
                 Ok(event) => {
                     if let Err(e) = app.emit(EVENT, &event) {
                         eprintln!("mycel-host: failed to emit event: {e}");
+                    }
+                    // A notification problem must never stop the events.
+                    let notify = std::panic::AssertUnwindSafe(|| notifier.on_event(&app, &runtime, &event));
+                    if std::panic::catch_unwind(notify).is_err() {
+                        eprintln!("mycel-host: notifying about an event failed");
                     }
                 }
                 Err(RecvError::Lagged(skipped)) => {
@@ -218,6 +225,80 @@ fn edge_to_edge(window: &tauri::WebviewWindow) {
     });
 }
 
+/// iPhone and iPad: going to the background, ask iOS for the time it allows
+/// (about 30 s) so a message sent just before the phone locks still goes
+/// out. iOS ends the task when the time is up; we end it a little earlier.
+#[cfg(target_os = "ios")]
+fn finish_in_background(handle: &AppHandle) {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+    fn shared_app() -> Option<&'static AnyObject> {
+        let cls = AnyClass::get(c"UIApplication")?;
+        // SAFETY: +sharedApplication returns the app singleton (main thread).
+        let app: *mut AnyObject = unsafe { msg_send![cls, sharedApplication] };
+        // SAFETY: the singleton lives as long as the process.
+        unsafe { app.as_ref() }
+    }
+    let Some(app) = shared_app() else { return };
+    let none: *mut AnyObject = std::ptr::null_mut();
+    // SAFETY: on the main thread (Tauri's event loop); a nil expiration
+    // handler is allowed; returns an NSUInteger task id.
+    let task: usize = unsafe { msg_send![app, beginBackgroundTaskWithExpirationHandler: none] };
+    if task == 0 {
+        return; // UIBackgroundTaskInvalid
+    }
+    let handle = handle.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(25));
+        let _ = handle.run_on_main_thread(move || {
+            if let Some(app) = shared_app() {
+                // SAFETY: ends the task begun above, on the main thread.
+                let _: () = unsafe { msg_send![app, endBackgroundTask: task] };
+            }
+        });
+    });
+}
+
+/// The main window, from tauri.conf.json (`"create": false` there: see `run`).
+fn open_main_window(app: &AppHandle) -> tauri::Result<()> {
+    let Some(config) = app.config().app.windows.iter().find(|w| w.label == "main").cloned() else {
+        return Ok(());
+    };
+    let window = tauri::WebviewWindowBuilder::from_config(app, &config)?.build()?;
+    #[cfg(target_os = "ios")]
+    edge_to_edge(&window);
+    #[cfg(not(target_os = "ios"))]
+    let _ = window;
+    if let Some(rt) = app.try_state::<Rt>() {
+        set_window_title(app, &rt.profile().name);
+    }
+    Ok(())
+}
+
+/// Android: swiping Mycel away from recents destroys its activity, not the
+/// app. MycelService keeps the process, so the runtime keeps receiving; when
+/// the app is opened again, MainActivity.onCreate calls this to give the new
+/// activity a window (tao binds it to the activity that has none).
+#[cfg(target_os = "android")]
+static APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mycel_host_MainActivity_onActivityReady(
+    _env: jni::JNIEnv,
+    _activity: jni::objects::JObject,
+) {
+    let Some(app) = APP.get() else { return }; // the first activity: setup opens it
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if handle.get_webview_window("main").is_none()
+            && let Err(e) = open_main_window(&handle)
+        {
+            eprintln!("mycel-host: can't reopen the window: {e}");
+        }
+    });
+}
+
 /// Open the runtime and wire it to the app.
 fn start(app: &mut tauri::App) -> Result<(), String> {
     let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
@@ -254,7 +335,9 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
 
     allow_attachment_files(app, &data_dir)?;
 
-    forward_events(app.handle().clone(), runtime.clone());
+    let notifier = Arc::new(notify::Notifier::new(&runtime));
+    forward_events(app.handle().clone(), runtime.clone(), notifier.clone());
+    app.manage(notifier);
     app.manage(runtime);
 
     eprintln!(
@@ -284,6 +367,7 @@ fn fail_to_start(app: &AppHandle, msg: String) {
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let started = start(app);
@@ -292,14 +376,9 @@ pub fn run() {
             // the runtime opens (as on phones) would otherwise get "state not
             // managed" from its first commands. It opens on failure too, so
             // phones have a window to show the error on.
-            let config = app.config().app.windows.iter().find(|w| w.label == "main").cloned();
-            if let Some(config) = config {
-                let window = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?.build()?;
-                #[cfg(target_os = "ios")]
-                edge_to_edge(&window);
-                #[cfg(not(target_os = "ios"))]
-                let _ = window;
-            }
+            open_main_window(app.handle())?;
+            #[cfg(target_os = "android")]
+            let _ = APP.set(app.handle().clone());
             match started {
                 Ok(()) => {
                     let name = app.state::<Rt>().profile().name;
@@ -355,6 +434,34 @@ pub fn run() {
         .expect("failed to build the Mycel host");
 
     app.run(|app, event| {
+        // Whether anyone is looking, for notifications.
+        // Android: the window goes when the activity does (swiped away from
+        // recents); keep the app and its runtime (see `onActivityReady`).
+        #[cfg(target_os = "android")]
+        if let RunEvent::ExitRequested { api, code: None, .. } = &event {
+            api.prevent_exit();
+        }
+        let away = match &event {
+            RunEvent::WindowEvent { label, event, .. } if label == "main" => match event {
+                WindowEvent::Focused(focused) => Some(!focused),
+                WindowEvent::Destroyed => Some(true),
+                #[cfg(mobile)]
+                WindowEvent::Suspended => Some(true),
+                #[cfg(mobile)]
+                WindowEvent::Resumed => Some(false),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(away) = away
+            && let Some(notifier) = app.try_state::<Arc<notify::Notifier>>()
+        {
+            notifier.set_away(away);
+        }
+        #[cfg(target_os = "ios")]
+        if let RunEvent::WindowEvent { event: WindowEvent::Suspended, .. } = &event {
+            finish_in_background(app);
+        }
         if let RunEvent::Exit = event
             && let Some(runtime) = app.try_state::<Rt>()
         {
