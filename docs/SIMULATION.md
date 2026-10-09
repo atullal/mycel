@@ -95,7 +95,9 @@ core and carrier (tier 2), the real node (tier 1). ✅ pass, ⏳ fails as
 expected (reason in the report: a known gap or a finding), ❌ fail.
 
 The scenarios ran as separate processes and were joined with
-`mycel-sim merge`. The Mac was heavily loaded throughout: another agent's
+`mycel-sim merge`. The rows marked *(carrier)* were rerun on 9 October
+with the store-and-forward fixes from the benchmarks (§4, fixed 8), on a
+less loaded machine. The Mac was heavily loaded throughout: another agent's
 Java simulations, a host build and other apps, a load average of ~20 on
 18 cores, and 8 of 9 GB swap in use. Wall times are pessimistic, and the
 real-time tier-1 latencies (calls especially) carry that load. The ONE
@@ -110,25 +112,25 @@ machine it measured 500 nodes in 1.2 GB (§1).
 | `apartment-80211s` | 1 | full | ✅ | messages: 100% delivered, p50 0.083 s, p95 0.095 s, optimality p50/p95/p99 5.63/6.98/6.98× · bulk: next flat 8.2 MB/s, 7 flats away 2.2 MB/s | 10 s |
 | `conference` | 1 | 24 seats (scale 0.1; 100 didn't finish, 300 crashed) | ⏳ | messages: 80% delivered, p50 0.853 s, p95 3.36 s, optimality p50/p95/p99 22.7/89.5/89.5×<br>✗ messages: delivery: 80.0 % (target ≥ 95.0 %); ✗ messages: latency p95: 3.36 s (target ≤ 3.00 s) | 180 s |
 | `city-block` | 1 | full | ✅ | 8 hops: 100% delivered, p50 0.957 s, p95 1.01 s, optimality p50/p95/p99 3.19/3.38/3.38× · 9 hops: not delivered (max_hops = 8) | 70 s |
-| `shutdown` | 1 | full | ❌ | messages (connected at the time): 90% delivered, p50 4.81 s, p95 14.4 s, optimality p50/p95/p99 113/393/898× · call between two walkers: setup None, heard false, loss 0.0%, path None, Some("walker1 couldn't join: timed out")<br>✗ messages (connected at the time): latency p95: 14.4 s (target ≤ 10.0 s) | 716 s |
-| `disaster-live` | 1 | full | ✅ | member mule: 49 s; stranger mule: 50 s | 62 s |
+| `shutdown` | 1 | 15 walkers (scale 0.5; full size before: +4.8 GB, see finding 8) *(carrier)* | ✅ | messages (connected at the time): 100% delivered, p50 0.231 s, p95 0.359 s, optimality p50/p95/p99 3.63/5.42/5.42× · call between two walkers: setup 0.698 s, heard, loss 4.4%, path Mesh | 106 s |
+| `disaster-live` | 1 | full *(carrier)* | ✅ | member mule: 49 s; stranger mule: 49 s (it never arrived before fixed 2) | 62 s |
 | `rural-line` | 1 | full | ✅ | messages: 100% delivered, p50 0.114 s, p95 0.130 s, optimality p50/p95/p99 5.67/6.78/6.78× · bulk: next house 6.6 MB/s, 5 hops 0.59 MB/s | 20 s |
 | `us-eu-live` | 1 | full | ⏳ | messages: 100% delivered, p50 0.814 s, p95 1.40 s, optimality p50/p95/p99 4.31/7.43/7.43× · call: setup 1.79 s, loss 66.7%, latency 175 ms, path None<br>✗ call: audio loss: 66.7 % (target ≤ 5.00 %) | 63 s |
 | `nat-relay` | 1 | full | ✅ | messages: 100% delivered, p50 0.233 s, p95 0.488 s, optimality p50/p95/p99 3.32/4.57/4.80× · during the relay outage: 100% delivered, p50 0.263 s, p95 0.772 s, optimality p50/p95/p99 3.32/6.39/130× | 23 s |
 | `adversarial-live` | 1 | full | ✅ | messages past a black hole and a storm: 100% delivered, p50 1.87 s, p95 4.01 s, optimality p50/p95/p99 24.9/53.5/53.5× | 46 s |
 | `multipath` | 1 | full | ✅ | 3 links 8.0 MB/s, 1 link 2.9 MB/s (2.78×) | 21 s |
 | `mixed-room` | 1 | full | ✅ | Ethernet→Some(Ethernet), Wi-Fi Direct→Some(WifiDirect), UWB→Some(Uwb), Bluetooth LE→Some(Bluetooth) | 30 s |
-| `us-eu` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.783 s, optimality p50/p95/p99 1.27/2.30/4.52× | 1 s |
-| `gateway-choice` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 1.12 s, optimality p50/p95/p99 2.49/6.41/6.50× · 100% of relayed bytes via the far fibre gateway | 0 s |
+| `us-eu` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 0.799 s, optimality p50/p95/p99 1.29/2.29/4.19× | 1 s |
+| `gateway-choice` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 1.12 s, optimality p50/p95/p99 2.49/6.41/6.50× · 100% of relayed bytes via the far fibre gateway | 0 s |
 | `routing-convergence` | 2 | full | ⏳ | global core: 99% routed in never, 100% in never, 0 loops, re-converged in never, stretch 1.06× · main: 99% in never, 0 loops, re-converged in never<br>✗ cold start: 99% of pairs within 8 hops routed: ∞ s (target ≤ 12.0 s); ✗ after the busiest device fails: 99% routed again: ∞ s (target ≤ 8.00 s) | 39 s |
 | `flood-scaling` | 2 | full | ⏳ | largest N: global core 76.9% of BLE, main 136.1%<br>✗ announcement traffic at the largest N, as a share of one BLE radio: 76.9 % (target ≤ 10.0 %) | 1344 s |
-| `partial-route` | 2 | full | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.5 s; sender-holds 100% p50 98.2 s · gap 300 m: global core + DTN 100%; stand-in custody 0% p50 0 s; sender-holds 0% p50 0 s | 0 s |
-| `disaster-dtn` | 2 | full | ⏳ | global core + DTN: 60% delivered, p95 7160 s, optimality p50/p95/p99 1.11/3.98/4.68× · main (mesh before GLOBAL): 0% delivered, p95 0 s, optimality p50/p95/p99 0/0/0× · stand-in (design reference): 8% delivered, p95 1.36 s, optimality p50/p95/p99 2.43/2.45/…<br>✗ delivery within 3 h (of feasible): 60.0 % (target ≥ 80.0 %); ✗ copies per message: 28.1  (target ≤ 8.00 ) | 45 s |
-| `mailbox` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
+| `partial-route` | 2 | full *(carrier)* | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.5 s; sender-holds 100% p50 98.2 s · gap 300 m: global core + DTN 100%; stand-in custody 0% p50 0 s; sender-holds 0% p50 0 s | 0 s |
+| `disaster-dtn` | 2 | full *(carrier)* | ⏳ | global core + DTN: 87% delivered (mean of seeds 1–5: 90%), p95 5917 s, optimality p50/p95/p99 1.00/3.93/5.04× · PRoPHET 58%, spray-and-wait (L=8) 32%, epidemic 100%<br>✗ copies per message: 33.5 (target ≤ 8.00): expected, open finding 3 | 31 s |
+| `mailbox` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
 | `global-scale` | 2 | 10,003 devices (0.1) | ❌ | global core + DTN: 100% delivered, p95 0.819 s, optimality p50/p95/p99 6.12/12.9/19.2× · 10003 devices, 71% with internet; 673610627 events in 1982 s wall<br>✗ optimality p95 (achieved / fastest feasible): 12.9 × (target ≤ 5.00 ×); ✗ control traffic per device: 6051 B/s (target ≤ 1000 B/s) | 2682 s |
-| `churn` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 65.2 s, optimality p50/p95/p99 5.88/14.6/27.8× | 2878 s |
+| `churn` | 2 | 1,001 devices (scale 0.1) *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.5/17.1× (full size before the carrier fixes: 100%, p95 65.2 s) | 98 s |
 | `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 15.0 s, optimality p50/p95/p99 32.7/718/2015× · global core + DTN: clean 100%, attacked 100%, Sybil gateway 100% | 980 s |
-| `trace-replay` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 1294 s, optimality p50/p95/p99 0.653/1.54/2.50× · trace: synthetic (40 devices) (40 devices, 17562 contacts over 72.0 h) | 141 s |
+| `trace-replay` | 2 | full *(carrier)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible, p50 4.8 s, p95 1212 s, optimality p50/p95/p99 0.630/1.38/2.70× · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5) | 106 s |
 | `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 53%, 68%, 83%, 92%, 93% | 0 s |
 
 ## 4. Findings
@@ -195,6 +197,43 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    - Tier 2 uses `verified_max: 64` (signatures are stubbed); the 4,096-entry
      cache was ~300 KB per router.
 
+8. **The carrier's measured fixes (from `docs/BENCHMARKS.md` §6) are
+   applied** to `mesh/dtn.rs`, the node (`mesh/mod.rs`) and tier 2:
+   - bundles are offered before their payload, and a refusal costs a
+     round trip, not the transfer;
+   - summaries carry the room left, so full carriers aren't offered
+     anything;
+   - a cut transfer resumes;
+   - lifetimes run from creation;
+   - a source over its share makes way with its own bundles first;
+   - copies in flight aren't given twice. Before this, a single copy in
+     custody offered to a second neighbour while the first transfer was
+     still under way became two. On `disaster-dtn` that alone was half
+     the copies per message (60 → 34).
+   - Policy: spray-first, a single copy follows predictability toward the
+     internet only, and small bundles get more copies (32 at 16 KiB or
+     less, 4 at 256 KiB or more).
+
+   Effect, seed 1 unless noted:
+   - `disaster-dtn`: 60% → 87% (mean of 5 seeds 90%). With the old policy
+     (Spray-and-Focus, max(P(dst), P(internet)), 4 copies) on the new
+     mechanics: 52% (mean of 5 seeds). With no gradient: 77%. With 4, 8
+     or 16 copies for small bundles: 60%, 69% or 68%.
+   - `trace-replay` on real traces: Infocom 2005 13.0% → 27.9% of
+     messages; Infocom 2006 31.3% → 51.2%, ahead of PRoPHET (38.6%),
+     Spray-and-Wait (28.6%) and Epidemic (20.6%).
+
+   Choose carrier policies for any scenario with
+   `MYCEL_DTN=spray=focus,gradient=both,copies_small=4` (see
+   `DtnConfig::tune`). Tests in `mesh/dtn/tests.rs`:
+   - `offers_are_refused_before_the_payload`;
+   - `a_refusal_marks_the_neighbour_full_until_its_next_summary`;
+   - `cut_transfers_resume`;
+   - `lifetimes_run_from_creation_not_per_hop`;
+   - `a_source_over_its_share_makes_way_with_its_own`;
+   - `copies_by_size`, `spray_modes`;
+   - `copies_in_flight_are_not_given_twice`.
+
 ### Open (with evidence)
 
 1. **Announcements overload Bluetooth: the top finding.** Every
@@ -224,28 +263,33 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
 
    Repro: `mycel-sim routing-convergence`, `mycel-sim flood-scaling`,
    `mycel-sim global-scale --scale 0.02`.
-2. **The carrier trails simple baselines on conference contact traces.**
-   On the real Infocom traces (§5) it delivers 13% (2005) and 31% (2006)
-   of messages. PRoPHET delivers 31% and 39%, Spray-and-Wait 27% and 29%,
-   Epidemic 19% and 21% (buffer-bound). On Infocom 2005, 94% of its
-   bundles expire undelivered. Suspects: custody along mesh routes that exist
-   for minutes, then break; 6 copies against unbounded replication; the
-   no-worse spray filter. Repro: `MYCEL_TRACE=…/contacts.Exp3.dat mycel-sim trace-replay`.
-3. **`disaster-dtn` delivers 60% in 3 h** (target 80%; PRoPHET 58%,
-   Spray-and-Wait 32%, Epidemic 100%). Utility max(P(dst), P(internet))
-   pulls bundles for camp-to-camp destinations, which aren't on the
-   internet, up to the one satellite gateway. Only there does a failed
-   dial reveal that the internet doesn't lead to them, and by then copies
-   are spent. Carriers could share "not on the internet" per destination
-   in summaries. Copies per message count every custody hand-off (28).
+2. **On Infocom 2005 the carrier still trails PRoPHET slightly** (§5):
+   27.9% of messages against 30.7%, at a third of its median latency
+   (1,349 s against 4,371 s) and a seventh of its overhead (8.7 against
+   59.7). Before fixed 8 it delivered 13%. On Infocom 2006 it now leads
+   (51.2% against 38.6%). Following predictability for the destination
+   rather than the internet speeds the median (782 s) but delivers less
+   (23.6%). Repro: `MYCEL_TRACE=bench/data/infocom2005/contacts.Exp3.dat mycel-sim trace-replay`.
+3. **`disaster-dtn`: many copies per message** (34 at seed 1, against a
+   target of 8 set for Spray-and-Wait; delivery now 87–93%). The metric
+   counts every custody hand-off, and a single copy climbing the internet
+   gradient changes hands many times as people move: 17 per message with
+   no gradient, 35 with it, for 13 points more delivery. Small bundles
+   also start with 32 copies, chosen for chat speed
+   (`docs/BENCHMARKS.md` §6.5); with 4 the count is still 22. A hand-off
+   only to a neighbour better by a wider margin, or a hand-off budget per
+   bundle, would cut it; both trade delivery.
 4. **`global-scale` optimality p95 is 12.9×** (target 5×). Messages to
    new peers pay a record lookup (~2 × access + 150 ms) and a dial; the
    oracle has neither. A target per "first contact" vs "warm connection"
    would say more. Delivery is 100%, p95 0.8 s.
-5. **Spray-and-Focus vs the old spray rule.** Before drop-oldest, spraying
-   to equals cost the synthetic trace 4 points (96% vs 100%). With
-   drop-oldest it delivers 99.8% (PRoPHET 99.2%), p95 1,294 s, and moves
-   `disaster-dtn` from 38% to 60%.
+5. **Spray policy.** Spray-and-Focus (copies only to neighbours no worse
+   than us) replaced spraying only on zero knowledge and moved
+   `disaster-dtn` from 38% to 60%. Spray-first (copies to the likeliest
+   neighbour, better or not, while there are copies to spare) now
+   replaces it: 90% on `disaster-dtn` (mean of 5 seeds) with the other
+   fixes, and on The ONE's Helsinki trace 62.9% against 39.5%
+   (`docs/BENCHMARKS.md` §6.5).
 6. **Tier-2 memory is ~200 KB per device** at 10k, mostly routing state
    for ~80 origins (route entries, `heard` lists) and neighbours'
    64-entry predictability maps. A sorted `Vec` instead of a `HashMap` for
@@ -303,17 +347,17 @@ Metrics: delivery ratio, latency distribution, The ONE's overhead ratio
 
 | Trace | Router | Delivered (of 4,000) | Latency p50 | p95 | Overhead | Buffer avg |
 |---|---|---:|---:|---:|---:|---:|
-| Infocom 2005 (41 iMotes, 70.6 h, 17,712 contacts) | **global core + DTN** | 13.0% | 2,619 s | 21,650 s | 66.6 | 1913 kB |
+| Infocom 2005 (41 iMotes, 70.6 h, 17,712 contacts) | **global core + DTN** | 27.9% (13.0% before fixed 8) | 1,349 s | 15,532 s | 8.7 | 1653 kB |
 | Infocom 2005 (41 iMotes, 70.6 h, 17,712 contacts) | epidemic | 18.8% | 6,222 s | 17,124 s | 116.3 | 2205 kB |
 | Infocom 2005 (41 iMotes, 70.6 h, 17,712 contacts) | PRoPHET | 30.7% | 4,371 s | 16,194 s | 59.7 | 1712 kB |
 | Infocom 2005 (41 iMotes, 70.6 h, 17,712 contacts) | spray-and-wait (L=6) | 26.7% | 2,452 s | 15,894 s | 8.1 | 2148 kB |
 | Infocom 2005 (41 iMotes, 70.6 h, 17,712 contacts) | managed flooding (7 hops) | 5.7% | 15 s | 49 s | – | – |
-| Infocom 2006 (98 iMotes, 93.7 h, 149,066 contacts) | **global core + DTN** | 31.3% | 2,496 s | 18,822 s | 43.3 | 1504 kB |
+| Infocom 2006 (98 iMotes, 93.7 h, 149,066 contacts) | **global core + DTN** | 51.2% (31.3% before fixed 8) | 1,040 s | 15,218 s | 9.1 | 999 kB |
 | Infocom 2006 (98 iMotes, 93.7 h, 149,066 contacts) | epidemic | 20.6% | 6,597 s | 16,984 s | 289.1 | 1652 kB |
 | Infocom 2006 (98 iMotes, 93.7 h, 149,066 contacts) | PRoPHET | 38.6% | 4,274 s | 16,633 s | 153.1 | 1192 kB |
 | Infocom 2006 (98 iMotes, 93.7 h, 149,066 contacts) | spray-and-wait (L=6) | 28.6% | 1,922 s | 15,736 s | 12.2 | 1437 kB |
 | Infocom 2006 (98 iMotes, 93.7 h, 149,066 contacts) | managed flooding (7 hops) | 14.2% | 33 s | 78 s | – | – |
-| Synthetic, same shape (40 devices, 72 h, 17,562 contacts) | **global core + DTN** | 99.8% | 5 s | 1,294 s | 4.0 | 288 kB |
+| Synthetic, same shape (40 devices, 72 h, 17,562 contacts) | **global core + DTN** | 99.5% | 5 s | 1,212 s | 3.4 | 236 kB |
 | Synthetic, same shape (40 devices, 72 h, 17,562 contacts) | epidemic | 65.7% | 4,353 s | 15,804 s | 151.7 | 2534 kB |
 | Synthetic, same shape (40 devices, 72 h, 17,562 contacts) | PRoPHET | 99.2% | 398 s | 5,591 s | 86.4 | 2518 kB |
 | Synthetic, same shape (40 devices, 72 h, 17,562 contacts) | spray-and-wait (L=6) | 56.5% | 146 s | 7,224 s | 7.2 | 2522 kB |
@@ -323,9 +367,10 @@ Run on this Mac with the real traces (`MYCEL_TRACE=…/contacts.Exp3.dat` and
 `contacts.Exp6.dat`), seed 1. Overhead is The ONE's (relayed − delivered) ÷
 delivered. Managed flooding only forwards to devices in contact now, so it
 has no buffer. Epidemic is buffer-bound at 5 MB: it floods the buffers and
-evicts. On the real conference traces, GLOBAL's carrier trails PRoPHET by a
-wide margin (open finding 2). On the synthetic trace it delivers the most,
-fastest. The ONE's own routers on the same traces (Epidemic, PRoPHET,
+evicts. With the carrier fixes (§4, fixed 8) GLOBAL's carrier leads on
+Infocom 2006 and trails PRoPHET by 3 points on Infocom 2005, at a fraction
+of its latency and overhead (open finding 2). On the synthetic trace it
+delivers the most, fastest. The ONE's own routers on the same traces (Epidemic, PRoPHET,
 Spray-and-Wait, MaxProp) are in `docs/BENCHMARKS.md` (the bench work); its
 link model differs: whole messages over contacts that must last.
 

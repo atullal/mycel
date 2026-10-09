@@ -1,0 +1,22 @@
+Message stats for scenario infocom2006-heavy-focus-both
+sim_time: 337478.0000
+created: 11250
+started: 54288
+relayed: 53600
+aborted: 503
+offers: 57685
+refused: 1713
+duplicates: 1684
+delivered: 6134
+delivered_after_ttl: 0
+delivery_prob: 0.5452
+overhead_ratio: 7.7382
+latency_avg: 2293.6391
+latency_med: 385.5000
+hopcount_avg: 4.3968
+hopcount_med: 4
+transfers_by_reason: deliver 6188 route 25200 gradient 11841 spray 11059
+carrier: expired 4728 cleared_by_receipt 3972 refused 1713 accepted 47019 evicted 9126 resumed 142
+refused_by: {"source over its share": 1, "store full": 1712}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: Focus, gradient: Both, carry: true }, resume true
+(98 devices, 284612 contact events, 112.1 s)

@@ -1,0 +1,22 @@
+Message stats for scenario helsinki-gw-chat-copies-4
+sim_time: 43195.6000
+created: 1444
+started: 18620
+relayed: 18620
+aborted: 0
+offers: 18918
+refused: 0
+duplicates: 298
+delivered: 1334
+delivered_after_ttl: 0
+delivery_prob: 0.9238
+overhead_ratio: 12.9580
+latency_avg: 3054.1014
+latency_med: 1971.6000
+hopcount_avg: 4.5577
+hopcount_med: 4
+transfers_by_reason: deliver 1334 route 3028 gradient 10557 spray 3701
+carrier: expired 0 cleared_by_receipt 3113 refused 0 accepted 17286 evicted 0 resumed 0
+refused_by: {}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 4, spray: First, gradient: Internet, carry: true }, resume true
+(126 devices, 61986 contact events, 3.1 s)

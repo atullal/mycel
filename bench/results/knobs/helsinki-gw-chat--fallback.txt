@@ -1,0 +1,22 @@
+Message stats for scenario helsinki-gw-chat-fallback
+sim_time: 43195.6000
+created: 1444
+started: 51920
+relayed: 51920
+aborted: 0
+offers: 52254
+refused: 0
+duplicates: 334
+delivered: 1382
+delivered_after_ttl: 0
+delivery_prob: 0.9571
+overhead_ratio: 36.5687
+latency_avg: 1856.9839
+latency_med: 1381.0000
+hopcount_avg: 3.7547
+hopcount_med: 4
+transfers_by_reason: deliver 1382 route 4516 gradient 27593 spray 18429
+carrier: expired 0 cleared_by_receipt 25138 refused 0 accepted 50538 evicted 0 resumed 0
+refused_by: {}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: Fallback, gradient: Internet, carry: true }, resume true
+(126 devices, 61986 contact events, 3.0 s)

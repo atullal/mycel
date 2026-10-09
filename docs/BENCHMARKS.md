@@ -18,52 +18,47 @@ CORE/EMANE, quic-network-simulator, libp2p perf) are scripted in
 
 ## Headline
 
-"With fixes" is the experimental carrier with the fixes measured in §6
-(`all,spray,evict,inet`, 4 copies). It is **not** in `mesh/dtn.rs` yet. "≤ 1 h" is the share of
-*all* messages created that arrived within an hour.
+Mycel's carrier now has the fixes of §6, applied to `mesh/dtn.rs` and the
+node's protocol, with the defaults chosen in §6.5: spray-first, a single
+copy follows predictability toward the internet, 32 copies for bundles of
+16 KiB or less falling to 4 at 256 KiB, offers before payloads, resume,
+lifetimes from creation, and eviction of the soonest-expiring carried
+bundles. "Before" is the carrier this benchmark first measured. "≤ 1 h" is
+the share of *all* messages created that arrived within an hour.
 
-| Trace | Workload | Best ONE router (delivery) | Its ≤ 1 h | Its overhead | Mycel today | Mycel ≤ 1 h | Mycel overhead | Mycel with fixes | Fixes ≤ 1 h |
+| Trace | Workload | Best ONE router (delivery) | Its ≤ 1 h | Its overhead | Mycel before | Before ≤ 1 h | Mycel now | Now ≤ 1 h | Now overhead |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| cambridge | heavy | MaxProp 9.4 % | 8.8 % | 10.4 | 9.4 % | 5.7 % | 0.2 | 14.7 % | 10.7 % |
-| infocom2005 | heavy | MaxProp 20.4 % | 16.8 % | 66.0 | 22.0 % | 7.7 % | 0.4 | 31.7 % | 22.0 % |
-| infocom2006 | heavy | MaxProp 38.0 % | 30.0 % | 202.8 | 28.9 % | 16.1 % | 6.0 | 56.8 % | 42.9 % |
-| infocom2006-gw | heavy | MaxProp 40.3 % | 33.0 % | 277.0 | 40.9 % | 24.8 % | 7.3 | 58.1 % | 47.7 % |
-| helsinki | heavy | MaxProp 47.4 % | 18.9 % | 31.8 | 30.4 % | 8.2 % | 6.1 | 73.1 % | 34.6 % |
-| helsinki-gw | heavy | MaxProp 51.2 % | 21.4 % | 35.6 | 31.9 % | 8.7 % | 6.3 | 39.6 % | 25.1 % |
-| cambridge | chat | MaxProp 51.5 % | 11.9 % | 6.0 | 45.9 % | 11.1 % | 4.7 | 48.5 % | 11.3 % |
-| infocom2005 | chat | MaxProp 84.2 % | 24.6 % | 36.8 | 82.5 % | 23.3 % | 7.2 | 82.5 % | 23.9 % |
-| infocom2006 | chat | MaxProp 83.2 % | – | 215.4 | 82.9 % | 44.8 % | 6.2 | – | – |
-| infocom2006-gw | chat | SprayAndWait 76.6 % | – | 3.4 | 84.4 % | 51.3 % | 4.0 | – | – |
-| helsinki | chat | MaxProp 98.1 % | 98.0 % | 90.4 | 87.7 % | 49.7 % | 17.8 | 91.3 % | 60.7 % |
-| helsinki-gw | chat | MaxProp 98.1 % | 98.1 % | 102.1 | 90.7 % | 59.6 % | 12.5 | 92.7 % | 67.1 % |
+| cambridge | heavy | MaxProp 9.4 % | 8.8 % | 10.4 | 9.4 % | 5.7 % | **14.8 %** | **10.6 %** | 5.1 |
+| infocom2005 | heavy | MaxProp 20.4 % | 16.8 % | 66.0 | 22.0 % | 7.7 % | **32.1 %** | **22.1 %** | 7.1 |
+| infocom2006 | heavy | MaxProp 38.0 % | 30.0 % | 202.8 | 28.9 % | 16.1 % | **57.0 %** | **43.0 %** | 7.3 |
+| infocom2006-gw | heavy | MaxProp 40.3 % | 33.0 % | 277.0 | 40.9 % | 24.8 % | **58.3 %** | **48.2 %** | 5.3 |
+| helsinki | heavy | MaxProp 47.4 % (Spray-and-Wait: 30.5 % ≤ 1 h) | 18.9 % | 31.8 | 30.4 % | 8.2 % | **62.9 %** | 30.5 % | 4.7 |
+| helsinki-gw | heavy | MaxProp 51.2 % (Spray-and-Wait: 31.3 % ≤ 1 h) | 21.4 % | 35.6 | 31.9 % | 8.7 % | 37.2 % | 24.3 % | 19.4 |
+| cambridge | chat | MaxProp 51.5 % | 11.9 % | 6.0 | 45.9 % | 11.1 % | 50.6 % | 11.5 % | 5.1 |
+| infocom2005 | chat | MaxProp 84.2 % | 24.6 % | 36.8 | 82.5 % | 23.3 % | 84.1 % | 24.4 % | 16.2 |
+| infocom2006 | chat | MaxProp 83.2 % | – | 215.4 | 82.9 % | 44.8 % | 83.2 % | 46.9 % | 18.3 |
+| infocom2006-gw | chat | Spray-and-Wait 76.6 % | – | 3.4 | 84.4 % | 51.3 % | **84.4 %** | 51.6 % | 11.1 |
+| helsinki | chat | MaxProp 98.1 % | 98.0 % | 90.4 | 87.7 % | 49.7 % | 97.2 % | 94.4 % | 26.1 |
+| helsinki-gw | chat | MaxProp 98.1 % | 98.1 % | 102.1 | 90.7 % | 59.6 % | 96.0 % | 87.7 % | 37.3 |
 
-- **Today, Mycel's carrier is frugal but slow with big messages.**
-  - It sends 0.2–18 relays per delivered message. Epidemic, PRoPHET and
-    MaxProp send 6–1,343.
-  - On the conference traces it delivers about as much as the best ONE
-    router. But with 0.5–1 MB messages, fewer arrive within an hour than
-    with any ONE router on Cambridge and Helsinki, Direct Delivery
-    included. On Infocom 2005 only Epidemic is slower.
-  - **Cause:** 95–99% of its transfers on the conference traces are
-    refused by full receivers, only after the whole payload has crossed
-    the link, and then retried (§6.1).
-- **Short contacts (Helsinki) are its worst case.** It matches Direct
-  Delivery (§6.2).
-- **The fixes, measured on the same inputs:**
-  - Four bug fixes (§6.1–6.2), eviction and spray-first (§6.3–6.4).
-  - They make Mycel beat the best ONE router on 5 of 6 heavy traces, on
-    total delivery and on delivery within an hour.
-  - They do it with 2–36× fewer transmissions than MaxProp.
-  - The exception is Helsinki-gw: the gradient toward 6 tram gateways
-    with 5 MB stores (§6.3).
-- **Chat-sized messages.**
-  - On Infocom 2005 and 2006, Mycel is within 2 points of MaxProp today,
-    at 1/5–1/35 of its overhead. On Cambridge it delivers 46% against
-    MaxProp's 51.5%.
-  - On Infocom 2006 with gateways it is the best of the routers that
-    finished: 84.4% delivered with a 25-minute median, against 76.6% and
-    2 hours for Spray-and-Wait. MaxProp didn't finish.
-  - On Helsinki it needs a bigger copy budget for small bundles (§6.3).
+- **Heavy messages: Mycel now beats the best ONE router on 5 of 6 traces**,
+  on total delivery and on delivery within an hour (Helsinki within an
+  hour: a tie with Spray-and-Wait), with 2–52× fewer transmissions than
+  MaxProp. Before the fixes it delivered as much on the conference
+  traces but far later, and lost on Helsinki: 95–99% of its transfers were
+  refused only after the whole payload had crossed the link (§6.1).
+- **Chat-sized messages: level with MaxProp** on Cambridge and both
+  Infocoms (within 1 point, with up to 12× less overhead), best on
+  Infocom 2006 with gateways. On Helsinki, 32 copies for small bundles
+  take delivery within an hour from 50% to 94%; MaxProp still gets 98%
+  there by copying to everyone (overhead 90 against 26).
+- **Remaining loss: Helsinki with gateways, heavy.** The single copy
+  climbs toward the 6 tram gateways, which move fast (contacts of seconds)
+  and have 5 MB stores: transfers to them are cut and their stores fill.
+  Without the internet gradient Mycel delivers 55.0% there, above MaxProp's
+  51.2%, but the gradient is worth 13 points of delivery in the
+  simulator's disaster zone, where the internet is a few partitions away
+  (§6.5). Real gateways are mostly static, with 64 MiB stores.
 - **Local routing against Meshtastic's flooding.** Mycel's routes deliver
   98–100% of direct messages, against 39–73% for flooding, with 2–3 data
   transmissions against 6–16. Its announcements don't fit a LoRa channel
@@ -126,6 +121,13 @@ parameters with a 30 s time unit.
 - **Timing:** the carrier plans every second, as the real driver does
   (`DTN_EVERY`). Summaries go out when a contact comes up and every 5 s
   after that.
+- **Offers and resume, as on the node:** each bundle is offered before its
+  payload, and a device tries its planned hand-offs in order until one is
+  taken. An offer costs no link time here (it is a round trip, against
+  seconds of payload). A transfer cut when a contact ends leaves the bytes
+  that arrived with the receiver, and the next offer of that bundle sends
+  only the rest (`--no-resume` turns that off: The ONE's routers can't
+  resume).
 - **Live routes:** these come from a breadth-first search over the contacts
   that are up now. `route-check` runs the real `Router` on the same traces
   to check that shortcut. On 30 minutes of Infocom 2006, whenever a
@@ -135,9 +137,9 @@ parameters with a 30 s time unit.
 
 Differences that matter when reading the tables:
 - **Full buffers.** The ONE's buffers drop the oldest messages when full,
-  including the sender's own. Mycel's carrier refuses new bundles instead,
-  so strangers can't push others' data out. It also keeps its own
-  messages for their whole lifetime.
+  including the sender's own. Mycel's carrier drops the carried bundles
+  that expire soonest, never the device's own, whose messages don't count
+  against the room it lends to others.
 - **Bundle size.** Mycel's real maximum is 256 KiB, and the node splits
   bigger data. The replay raises it to 4 MiB so that one message is one
   bundle, as in The ONE.
@@ -147,12 +149,12 @@ Differences that matter when reading the tables:
 ```sh
 bench/fetch.sh                          # tools + traces (once)
 bench/one/one.sh build                  # compile The ONE (once)
-cargo build --release -p mycel-bench
+cargo build --profile replay -p mycel-bench   # speed-optimised (the release profile optimises for size)
 bench/run.py                            # every trace × workload, both sides; skips finished runs
 bench/run.py --routers mycel --force    # Mycel only, all traces: after changing mesh/dtn.rs
 bench/run.py --only helsinki --workloads heavy --routers mycel --force   # one case
 bench/run.py --summary-only             # rebuild bench/results/summary.{md,csv}
-bench/ablation.py                       # the carrier fixes of §6, one at a time
+bench/ablation.py                       # the carrier's policy knobs (§6.5), one variant at a time
 bench/external/venv/bin/python bench/meshtasticator/run.py   # Meshtasticator sweep
 ./target/release/mesh-routing bench/results/meshtasticator/dm-*.json > bench/results/meshtasticator/mycel-routing.csv
 python3 bench/meshtasticator/report.py
@@ -166,7 +168,8 @@ run again. On this Mac every run takes seconds to minutes except Infocom
 - MaxProp: 73 min, and more than 2 h 23 min with gateways (not
   finished).
 
-Mycel's replay of the same runs takes 11–25 min.
+Mycel's replay of all twelve runs takes under 5 minutes with 4 jobs
+(the slowest, Infocom 2006 with gateways, about 3 minutes).
 
 ## 3. Results: store-and-forward on real contact traces
 
@@ -183,37 +186,37 @@ messages only.
 | cambridge | SprayAndWait | 8.8 % | 196 | 9 | 7.07 | 1.57 |
 | cambridge | MaxProp | 9.4 % | 837 | 14 | 10.41 | 1.76 |
 | cambridge | DirectDelivery | 7.2 % | 354 | 38 | 0.00 | 1.00 |
-| cambridge | **Mycel** | 9.4 % | 4499 | 1395 | 0.19 | 1.15 |
+| cambridge | **Mycel** | 14.8 % | 3206 | 254 | 5.14 | 1.67 |
 | infocom2005 | Epidemic | 7.6 % | 1669 | 415 | 247.28 | 5.03 |
 | infocom2005 | Prophet | 12.1 % | 2032 | 864 | 165.23 | 2.88 |
 | infocom2005 | SprayAndWait | 16.9 % | 1272 | 494 | 8.71 | 1.92 |
 | infocom2005 | MaxProp | 20.4 % | 2045 | 435 | 66.04 | 3.33 |
 | infocom2005 | DirectDelivery | 16.7 % | 2809 | 1953 | 0.00 | 1.00 |
-| infocom2005 | **Mycel** | 22.0 % | 7148 | 6370 | 0.43 | 1.17 |
+| infocom2005 | **Mycel** | 32.1 % | 3480 | 1106 | 7.09 | 3.05 |
 | infocom2006 | Epidemic | 8.7 % | 2227 | 499 | 1116.39 | 7.75 |
 | infocom2006 | Prophet | 18.5 % | 4104 | 1938 | 529.20 | 3.55 |
 | infocom2006 | SprayAndWait | 25.9 % | 2290 | 858 | 8.94 | 1.98 |
 | infocom2006 | MaxProp | 38.0 % | 2351 | 312 | 202.77 | 4.33 |
 | infocom2006 | DirectDelivery | 20.2 % | 5093 | 3625 | 0.00 | 1.00 |
-| infocom2006 | **Mycel** | 28.9 % | 5066 | 2339 | 5.98 | 3.57 |
+| infocom2006 | **Mycel** | 57.0 % | 2672 | 489 | 7.27 | 4.39 |
 | infocom2006-gw | Epidemic | 10.8 % | 2307 | 357 | 1343.12 | 6.40 |
 | infocom2006-gw | Prophet | 18.4 % | 3430 | 1108 | 758.99 | 3.07 |
 | infocom2006-gw | SprayAndWait | 31.0 % | 2175 | 554 | 7.50 | 1.92 |
 | infocom2006-gw | MaxProp | 40.3 % | 2092 | 234 | 276.98 | 3.92 |
 | infocom2006-gw | DirectDelivery | 22.7 % | 4507 | 2618 | 0.00 | 1.00 |
-| infocom2006-gw | **Mycel** | 40.8 % | 4481 | 1533 | 7.25 | 4.42 |
+| infocom2006-gw | **Mycel** | 58.3 % | 1887 | 200 | 5.35 | 3.65 |
 | helsinki | Epidemic | 20.1 % | 3221 | 2417 | 98.75 | 4.39 |
 | helsinki | Prophet | 21.6 % | 3864 | 2861 | 70.58 | 2.96 |
 | helsinki | SprayAndWait | 44.5 % | 3012 | 2452 | 6.57 | 1.98 |
 | helsinki | MaxProp | 47.4 % | 5927 | 4662 | 31.80 | 1.69 |
 | helsinki | DirectDelivery | 31.7 % | 6586 | 5713 | 0.00 | 1.00 |
-| helsinki | **Mycel** | 30.4 % | 7617 | 6891 | 6.08 | 1.75 |
+| helsinki | **Mycel** | 62.9 % | 5096 | 3731 | 4.67 | 1.91 |
 | helsinki-gw | Epidemic | 18.7 % | 3245 | 2596 | 189.78 | 4.82 |
 | helsinki-gw | Prophet | 22.4 % | 3839 | 2850 | 131.00 | 3.54 |
 | helsinki-gw | SprayAndWait | 46.1 % | 3028 | 2466 | 6.37 | 1.98 |
 | helsinki-gw | MaxProp | 51.2 % | 5748 | 4527 | 35.64 | 1.76 |
 | helsinki-gw | DirectDelivery | 31.9 % | 6544 | 5666 | 0.00 | 1.00 |
-| helsinki-gw | **Mycel** | 31.9 % | 7709 | 7272 | 6.32 | 1.69 |
+| helsinki-gw | **Mycel** | 37.2 % | 3199 | 2806 | 19.39 | 2.72 |
 
 **Chat workload** (1–10 kB, TTL 24 h)
 
@@ -224,36 +227,36 @@ messages only.
 | cambridge | SprayAndWait | 45.3 % | 29274 | 25438 | 3.37 | 1.79 |
 | cambridge | MaxProp | 51.5 % | 30009 | 26723 | 6.02 | 2.34 |
 | cambridge | DirectDelivery | 33.8 % | 29458 | 25956 | 0.00 | 1.00 |
-| cambridge | **Mycel** | 45.9 % | 29798 | 26501 | 4.69 | 2.43 |
+| cambridge | **Mycel** | 50.6 % | 30377 | 27499 | 5.11 | 2.48 |
 | infocom2005 | Epidemic | 72.5 % | 24863 | 21303 | 145.25 | 3.61 |
 | infocom2005 | Prophet | 68.5 % | 22207 | 17712 | 144.78 | 2.69 |
 | infocom2005 | SprayAndWait | 81.0 % | 22966 | 18020 | 3.19 | 1.99 |
 | infocom2005 | MaxProp | 84.2 % | 21379 | 16543 | 36.83 | 3.44 |
 | infocom2005 | DirectDelivery | 68.3 % | 26974 | 22954 | 0.00 | 1.00 |
-| infocom2005 | **Mycel** | 82.5 % | 22320 | 17393 | 7.19 | 3.90 |
+| infocom2005 | **Mycel** | 84.1 % | 21475 | 16642 | 16.18 | 3.51 |
 | infocom2006 | Epidemic | 64.1 % | 18881 | 12729 | 678.02 | 5.38 |
 | infocom2006 | Prophet | 65.7 % | 15019 | 7769 | 601.98 | 3.47 |
 | infocom2006 | SprayAndWait | 74.3 % | 17050 | 8733 | 3.54 | 2.08 |
 | infocom2006 | MaxProp | 83.2 % | 8830 | 2751 | 215.40 | 5.04 |
 | infocom2006 | DirectDelivery | 51.5 % | 27721 | 22743 | 0.00 | 1.00 |
-| infocom2006 | **Mycel** | 82.9 % | 8898 | 2661 | 6.24 | 4.35 |
+| infocom2006 | **Mycel** | 83.2 % | 7837 | 2281 | 18.31 | 4.30 |
 | infocom2006-gw | Epidemic | 63.7 % | 17969 | 12068 | 833.47 | 4.79 |
 | infocom2006-gw | Prophet | 65.4 % | 14474 | 6793 | 701.60 | 3.34 |
 | infocom2006-gw | SprayAndWait | 76.6 % | 15819 | 7169 | 3.37 | 2.04 |
 | infocom2006-gw | DirectDelivery | 54.0 % | 26338 | 20466 | 0.00 | 1.00 |
-| infocom2006-gw | **Mycel** | 84.4 % | 6820 | 1478 | 4.02 | 3.93 |
+| infocom2006-gw | **Mycel** | 84.4 % | 6697 | 1455 | 11.09 | 4.13 |
 | helsinki | Epidemic | 87.8 % | 1652 | 1191 | 182.80 | 3.69 |
 | helsinki | Prophet | 90.4 % | 1866 | 1579 | 155.60 | 2.67 |
 | helsinki | SprayAndWait | 91.9 % | 3411 | 2214 | 3.22 | 2.02 |
 | helsinki | MaxProp | 98.1 % | 972 | 855 | 90.43 | 3.97 |
 | helsinki | DirectDelivery | 63.3 % | 8028 | 5383 | 0.00 | 1.00 |
-| helsinki | **Mycel** | 87.7 % | 4388 | 3116 | 17.82 | 5.02 |
+| helsinki | **Mycel** | 97.2 % | 1374 | 1173 | 26.12 | 3.24 |
 | helsinki-gw | Epidemic | 87.5 % | 1587 | 1133 | 251.90 | 3.87 |
 | helsinki-gw | Prophet | 89.6 % | 1851 | 1528 | 222.11 | 2.86 |
 | helsinki-gw | SprayAndWait | 92.0 % | 3366 | 2185 | 3.21 | 2.03 |
 | helsinki-gw | MaxProp | 98.1 % | 930 | 805 | 102.13 | 4.24 |
 | helsinki-gw | DirectDelivery | 63.3 % | 8027 | 5383 | 0.00 | 1.00 |
-| helsinki-gw | **Mycel** | 90.7 % | 3755 | 2548 | 12.54 | 4.50 |
+| helsinki-gw | **Mycel** | 96.0 % | 1898 | 1408 | 37.31 | 3.77 |
 
 - Infocom 2006 chat with gateways has no MaxProp row: it hadn't finished
   after 2 h 23 min, so it was stopped. The same run without gateways took
@@ -265,7 +268,7 @@ messages only.
 **Latency over delivered messages flatters routers that drop messages.**
 In `heavy`, a 5 MB buffer holds 5–10 messages. The ONE's routers drop the
 oldest when full, so the only messages they deliver are the ones whose
-destination turned up soon after. Mycel's medians count messages that
+destination turned up soon after. Mycel's medians count more messages that
 waited hours and still arrived. The fair comparison is the share of *all*
 created messages delivered within a time:
 
@@ -276,64 +279,64 @@ created messages delivered within a time:
 | cambridge | heavy | SprayAndWait | 5.5 % | 7.9 % | 8.8 % |
 | cambridge | heavy | MaxProp | 5.8 % | 7.8 % | 8.8 % |
 | cambridge | heavy | DirectDelivery | 3.8 % | 5.8 % | 7.2 % |
-| cambridge | heavy | **Mycel** | 2.9 % | 4.0 % | 5.7 % |
+| cambridge | heavy | **Mycel** | 5.9 % | 8.4 % | 10.6 % |
 | cambridge | chat | Epidemic | 4.3 % | 6.4 % | 10.1 % |
 | cambridge | chat | Prophet | 4.2 % | 7.0 % | 10.9 % |
 | cambridge | chat | SprayAndWait | 5.5 % | 7.7 % | 11.2 % |
 | cambridge | chat | MaxProp | 5.8 % | 8.4 % | 11.9 % |
 | cambridge | chat | DirectDelivery | 3.8 % | 5.8 % | 8.2 % |
-| cambridge | chat | **Mycel** | 5.9 % | 8.2 % | 11.1 % |
+| cambridge | chat | **Mycel** | 5.9 % | 8.3 % | 11.5 % |
 | infocom2005 | heavy | Epidemic | 1.9 % | 4.2 % | 6.4 % |
 | infocom2005 | heavy | Prophet | 2.2 % | 5.5 % | 9.6 % |
 | infocom2005 | heavy | SprayAndWait | 4.3 % | 9.0 % | 15.2 % |
 | infocom2005 | heavy | MaxProp | 4.9 % | 11.1 % | 16.8 % |
 | infocom2005 | heavy | DirectDelivery | 2.1 % | 4.8 % | 11.3 % |
-| infocom2005 | heavy | **Mycel** | 1.6 % | 3.1 % | 7.7 % |
+| infocom2005 | heavy | **Mycel** | 6.8 % | 13.4 % | 22.1 % |
 | infocom2005 | chat | Epidemic | 2.1 % | 4.8 % | 13.6 % |
 | infocom2005 | chat | Prophet | 2.4 % | 6.2 % | 16.9 % |
 | infocom2005 | chat | SprayAndWait | 4.9 % | 9.5 % | 20.6 % |
 | infocom2005 | chat | MaxProp | 6.9 % | 13.7 % | 24.6 % |
 | infocom2005 | chat | DirectDelivery | 2.5 % | 5.0 % | 12.0 % |
-| infocom2005 | chat | **Mycel** | 7.6 % | 13.2 % | 23.3 % |
+| infocom2005 | chat | **Mycel** | 7.6 % | 14.0 % | 24.4 % |
 | infocom2006 | heavy | Epidemic | 1.6 % | 4.6 % | 6.9 % |
 | infocom2006 | heavy | Prophet | 1.8 % | 5.8 % | 11.3 % |
 | infocom2006 | heavy | SprayAndWait | 5.4 % | 11.4 % | 20.4 % |
 | infocom2006 | heavy | MaxProp | 7.3 % | 22.4 % | 30.0 % |
 | infocom2006 | heavy | DirectDelivery | 2.1 % | 5.0 % | 10.1 % |
-| infocom2006 | heavy | **Mycel** | 6.8 % | 10.9 % | 16.1 % |
-| infocom2006 | chat | **Mycel** | 20.6 % | 30.3 % | 44.8 % |
+| infocom2006 | heavy | **Mycel** | 19.6 % | 29.9 % | 43.0 % |
+| infocom2006 | chat | **Mycel** | 20.7 % | 31.1 % | 46.9 % |
 | infocom2006-gw | heavy | Epidemic | 2.7 % | 6.2 % | 8.7 % |
 | infocom2006-gw | heavy | Prophet | 3.1 % | 7.7 % | 12.5 % |
 | infocom2006-gw | heavy | SprayAndWait | 9.6 % | 15.9 % | 24.6 % |
 | infocom2006-gw | heavy | MaxProp | 9.1 % | 25.6 % | 33.0 % |
 | infocom2006-gw | heavy | DirectDelivery | 4.8 % | 7.6 % | 12.6 % |
-| infocom2006-gw | heavy | **Mycel** | 10.1 % | 16.8 % | 24.8 % |
+| infocom2006-gw | heavy | **Mycel** | 25.2 % | 35.2 % | 48.2 % |
 | infocom2006-gw | chat | DirectDelivery | 5.2 % | 8.2 % | 13.4 % |
-| infocom2006-gw | chat | **Mycel** | 25.5 % | 35.5 % | 51.3 % |
+| infocom2006-gw | chat | **Mycel** | 25.4 % | 35.6 % | 51.6 % |
 | helsinki | heavy | Epidemic | 0.1 % | 1.7 % | 13.0 % |
 | helsinki | heavy | Prophet | 0.1 % | 2.2 % | 12.4 % |
 | helsinki | heavy | SprayAndWait | 0.1 % | 3.4 % | 30.5 % |
 | helsinki | heavy | MaxProp | 0.1 % | 1.9 % | 18.9 % |
 | helsinki | heavy | DirectDelivery | 0.1 % | 1.9 % | 11.6 % |
-| helsinki | heavy | **Mycel** | 0.0 % | 0.6 % | 8.2 % |
+| helsinki | heavy | **Mycel** | 0.1 % | 2.7 % | 30.5 % |
 | helsinki | chat | Epidemic | 0.6 % | 15.8 % | 79.6 % |
 | helsinki | chat | Prophet | 0.6 % | 12.4 % | 81.1 % |
 | helsinki | chat | SprayAndWait | 0.8 % | 14.7 % | 62.2 % |
 | helsinki | chat | MaxProp | 0.8 % | 28.0 % | 98.0 % |
 | helsinki | chat | DirectDelivery | 0.4 % | 5.1 % | 24.2 % |
-| helsinki | chat | **Mycel** | 0.5 % | 7.3 % | 49.7 % |
+| helsinki | chat | **Mycel** | 0.5 % | 18.4 % | 94.4 % |
 | helsinki-gw | heavy | Epidemic | 0.1 % | 2.0 % | 11.7 % |
 | helsinki-gw | heavy | Prophet | 0.3 % | 2.4 % | 13.1 % |
 | helsinki-gw | heavy | SprayAndWait | 0.6 % | 4.2 % | 31.3 % |
 | helsinki-gw | heavy | MaxProp | 0.5 % | 2.6 % | 21.4 % |
 | helsinki-gw | heavy | DirectDelivery | 0.3 % | 2.1 % | 11.9 % |
-| helsinki-gw | heavy | **Mycel** | 0.3 % | 1.1 % | 8.7 % |
+| helsinki-gw | heavy | **Mycel** | 0.6 % | 3.1 % | 24.3 % |
 | helsinki-gw | chat | Epidemic | 1.2 % | 19.1 % | 79.4 % |
 | helsinki-gw | chat | Prophet | 0.9 % | 13.4 % | 81.1 % |
 | helsinki-gw | chat | SprayAndWait | 1.3 % | 15.4 % | 62.7 % |
 | helsinki-gw | chat | MaxProp | 1.5 % | 31.6 % | 98.1 % |
 | helsinki-gw | chat | DirectDelivery | 0.6 % | 5.1 % | 24.2 % |
-| helsinki-gw | chat | **Mycel** | 0.8 % | 10.2 % | 59.6 % |
+| helsinki-gw | chat | **Mycel** | 1.0 % | 14.6 % | 87.7 % |
 
 The ONE's chat runs on Infocom 2006 predate the per-message report, so
 only Mycel (and Direct Delivery with gateways) have rows there.
@@ -393,18 +396,18 @@ hop by hop.
 
 ## 5. What it shows
 
-- **Frugal.** At 0.2–18 relays per delivered message (overhead), Mycel's
-  carrier comes close to routers that send 5–35× more:
-  - Infocom 2006 chat: 82.9% at overhead 6, against MaxProp's 83.2% at
-    215.
-  - Infocom 2005 chat: 82.5% at 7, against MaxProp's 84.2% at 37.
-- **Gateways help Mycel and barely help The ONE's routers.** Adding the
-  17 static gateways to Infocom 2006:
-  - heavy: Mycel goes from 28.9% to 40.8%; MaxProp from 38.0% to 40.3%;
-  - chat: Mycel's median falls from 2,661 s to 1,478 s.
-
-  The ONE's routers don't know those devices have the internet. Mycel's
-  default route and internet gradient do.
+- **Frugal and now fast.** Mycel's overhead is 4.7–37 relays per
+  delivered message, against 6–1,343 for The ONE's routers, and it
+  delivers more:
+  - Infocom 2006 heavy: 57.0% (43.0% within an hour) at overhead 7, against
+    MaxProp's 38.0% (30.0%) at 203.
+  - Infocom 2006 chat: 83.2% at overhead 18, against MaxProp's 83.2% at 215.
+- **Gateways help Mycel and barely help The ONE's routers** on the
+  conference trace. Adding the 17 static gateways to Infocom 2006 heavy
+  takes Mycel's median from 489 s to 200 s; MaxProp goes from 38.0% to
+  40.3%. The ONE's routers don't know those devices have the internet.
+  Mycel's default route and internet gradient do. With fast-moving
+  gateways (Helsinki's trams) the gradient costs Mycel instead (§6.5).
 - **Live routes are what the router really does.** On Infocom 2006,
   `route-check` shows the real `Router` following a working multi-hop
   route 94.1% of the time one exists. Those hops count in the delivered
@@ -415,12 +418,13 @@ hop by hop.
 
 ## 6. Where Mycel loses, why, and the fix
 
-Every fix below was measured, not just proposed. `bench/mycel-bench/src/carrier_fixed.rs`
-is a copy of the real carrier with each fix behind a switch, and
-`bench/ablation.py` runs the switches one at a time on the same traces.
-With all switches off, the copy reproduces the real carrier's numbers
-exactly (checked on every trace). Nothing in `crates/mycel-net` has been
-changed yet.
+**All of this is now applied** to the real carrier (`mesh/dtn.rs`) and
+the node's protocol (`mesh/mod.rs`); §6.5 has the results and the choice
+of defaults. §6.1–6.4 keep the diagnosis as it was made: an experimental
+copy of the carrier with each fix behind a switch, measured one at a time
+on the same traces (`bench/results/ablation/`, the historical record).
+The copy is retired; the policy choices that remain are `DtnConfig`
+knobs, measured with `bench/ablation.py` into `bench/results/knobs/`.
 
 ### 6.1 Big messages: refusals livelock the links (the heavy workload)
 
@@ -463,23 +467,35 @@ receiver after it has crossed the link:
    the whole transfer. In the replay this shows up as deliveries after the
    TTL.
 
-**Fixes**, as switches in `carrier_fixed.rs`:
+**Fixes** (switches in the experimental copy; how they were applied is
+in each item):
 - **`free`** (causes 1 and 2): summaries say how much room is left. The
   planner doesn't send to a neighbour without room for the bundle, unless
   that neighbour is the destination. A refusal marks the neighbour as full
   until its next summary. In `mesh/mod.rs` the same idea becomes an offer
   before the payload: send (id, size, copies, expiry) and wait for
   accept or refuse. BPv7 custody signalling does the same.
+  *Applied:* `Carrier::offered` answers take (from an offset), duplicate
+  or refuse before any payload; summaries carry `free` and `evictable`
+  (soonest-expiring carried bundles, relative times); a refusal for lack
+  of room stops offers to that neighbour until its next summary.
 - **`own`** (cause 3): a device's own bundles use their own quota, not the
-  space it lends to others.
+  space it lends to others. *Applied* (by the simulator work first).
 - **`expiry`** (cause 4): a carrier expires a bundle at `created + lifetime`.
   On the real node that means converting through `wall_ms()`, with a bound
   on clock skew, or using a BPv7 Bundle Age block, which needs no clocks.
+  *Applied:* `Carrier::set_clock` gives the carrier its wall-clock
+  offset; a bundle expires at `created + lifetime`, and never later than
+  one lifetime after it arrived, whatever the source's clock says.
 - **`resume`**: an interrupted transfer keeps the bytes that arrived, and
   the next attempt to the same device sends only the rest. Mycel's file
   transfers already work this way (`.part` + `.ranges`), and BPv7 calls it
   reactive fragmentation. Splitting bundles at 256 KiB, as the real node
-  does, gets part of the benefit.
+  does, gets part of the benefit. *Applied:* `Carrier::keep_partial`
+  keeps a cut transfer's bytes for 5 minutes (at most a quarter of the
+  store, two bundles' worth per source), and the next offer of that
+  bundle, from any carrier, is answered from that offset; the id is
+  checked when the last byte arrives.
 
 ### 6.2 Short contacts: Helsinki
 
@@ -597,7 +613,8 @@ which favours messages young enough to still arrive soon.
 **Fix: `evict`.** When the store is full, drop the carried bundles that
 expire soonest, never one of the device's own, to make room for one that
 expires later. If its source is over its share, its own older bundles go
-first.
+first. *Applied*, including the per-source order; nothing is dropped
+unless that makes room.
 - For senders to avoid sending what would be refused, a summary also
   lists the receiver's soonest-expiring carried bundles (expiry, size; up
   to 32).
@@ -621,68 +638,63 @@ It costs total delivery wherever stores overflow:
 That trade is a policy choice. Fresh-first suits chat, keep-everything
 suits files, so it could be a per-bundle class.
 
-### 6.5 Results of the fixes
+### 6.5 Results on the real carrier, and the defaults
 
-Heavy workload, every trace. "Best ONE" rows are The ONE's best router by
-total delivery and, where different, by delivery within an hour. Mycel
-rows add fixes cumulatively. `all` = `own,free,expiry,resume`. The full
-grid, chat included, is in `bench/results/ablation/ablation.md`.
+Every row is the real carrier (`dtn-replay --knobs`), with the mechanics
+above always on. The variants differ in policy only: how copies spread
+(`spray`) and what the single copy's gradient measures (`gradient`).
+`bench/results/knobs/knobs.md` has the full grid, chat and per-variant
+offer and cut counts included.
 
-| Trace | Router or Mycel variant | Delivered | ≤ 1 min | ≤ 10 min | ≤ 1 h | Overhead | Refused |
-|---|---|---:|---:|---:|---:|---:|---:|
-| cambridge | best ONE by delivery: MaxProp | 9.4 % | 5.8 % | 7.8 % | 8.8 % | 10.4 | – |
-| cambridge | best ONE within 1 h: SprayAndWait | 8.8 % | 5.5 % | 7.9 % | 8.8 % | 7.1 | – |
-| cambridge | Mycel today | 9.4 % | 2.9 % | 4.0 % | 5.7 % | 0.2 | 152,573 |
-| cambridge | Mycel + own, free, expiry | 16.3 % | 4.6 % | 6.5 % | 9.3 % | 1.7 | 451 |
-| cambridge | Mycel + resume (= all) | 16.4 % | 4.6 % | 6.5 % | 9.4 % | 1.7 | 470 |
-| cambridge | Mycel all + evict | 14.5 % | 5.8 % | 8.3 % | 10.8 % | 4.4 | 275 |
-| cambridge | Mycel all + spray + evict | 14.2 % | 5.9 % | 8.5 % | 10.6 % | 5.7 | 240 |
-| cambridge | Mycel all + spray + evict + inet | 14.7 % | 5.9 % | 8.4 % | 10.7 % | 5.2 | 220 |
-| cambridge | Mycel all + spray + evict, no gradient | 14.7 % | 5.8 % | 8.4 % | 10.7 % | 5.2 | 217 |
-| infocom2005 | best ONE by delivery: MaxProp | 20.4 % | 4.9 % | 11.1 % | 16.8 % | 66.0 | – |
-| infocom2005 | Mycel today | 22.0 % | 1.6 % | 3.1 % | 7.7 % | 0.4 | 437,303 |
-| infocom2005 | Mycel + own, free, expiry | 35.8 % | 3.0 % | 6.5 % | 15.1 % | 3.3 | 1,952 |
-| infocom2005 | Mycel + resume (= all) | 35.8 % | 3.1 % | 6.6 % | 15.3 % | 3.2 | 1,891 |
-| infocom2005 | Mycel all + evict | 29.9 % | 6.7 % | 13.0 % | 21.7 % | 7.3 | 294 |
-| infocom2005 | Mycel all + spray + evict | 28.4 % | 6.8 % | 13.7 % | 21.7 % | 9.5 | 315 |
-| infocom2005 | Mycel all + spray + evict + inet | 31.7 % | 6.8 % | 13.3 % | 22.0 % | 7.4 | 266 |
-| infocom2005 | Mycel all + spray + evict, no gradient | 31.6 % | 6.8 % | 13.3 % | 22.1 % | 7.5 | 268 |
-| infocom2006 | best ONE by delivery: MaxProp | 38.1 % | 7.3 % | 22.4 % | 30.0 % | 202.8 | – |
-| infocom2006 | Mycel today | 28.9 % | 6.8 % | 10.9 % | 16.1 % | 6.0 | 1,344,330 |
-| infocom2006 | Mycel + own, free, expiry | 51.2 % | 14.8 % | 22.0 % | 30.3 % | 6.4 | 3,883 |
-| infocom2006 | Mycel + resume (= all) | 51.1 % | 14.9 % | 22.1 % | 30.3 % | 6.3 | 3,846 |
-| infocom2006 | Mycel all + evict | 55.6 % | 19.4 % | 29.6 % | 43.0 % | 6.7 | 798 |
-| infocom2006 | Mycel all + spray + evict | 54.4 % | 19.6 % | 30.2 % | 43.1 % | 8.7 | 857 |
-| infocom2006 | Mycel all + spray + evict + inet | 56.8 % | 19.5 % | 29.9 % | 42.9 % | 7.6 | 568 |
-| infocom2006-gw | best ONE by delivery: MaxProp | 40.3 % | 9.1 % | 25.6 % | 33.0 % | 277.0 | – |
-| infocom2006-gw | Mycel today | 40.9 % | 10.1 % | 16.8 % | 24.8 % | 7.3 | 848,249 |
-| infocom2006-gw | Mycel + own, free, expiry | 57.6 % | 16.9 % | 24.9 % | 35.2 % | 5.6 | 2,690 |
-| infocom2006-gw | Mycel + resume (= all) | 57.4 % | 16.9 % | 24.9 % | 35.1 % | 5.6 | 2,782 |
-| infocom2006-gw | Mycel all + evict | 58.0 % | 25.3 % | 35.1 % | 47.9 % | 4.4 | 267 |
-| infocom2006-gw | Mycel all + spray + evict | 57.8 % | 25.0 % | 35.2 % | 47.6 % | 7.7 | 389 |
-| infocom2006-gw | Mycel all + spray + evict + inet | 58.1 % | 25.0 % | 35.2 % | 47.7 % | 7.6 | 368 |
-| helsinki | best ONE by delivery: MaxProp | 47.4 % | 0.1 % | 1.9 % | 18.9 % | 31.8 | – |
-| helsinki | best ONE within 1 h: SprayAndWait | 44.6 % | 0.1 % | 3.4 % | 30.5 % | 6.6 | – |
-| helsinki | Mycel today | 30.4 % | 0.0 % | 0.6 % | 8.2 % | 6.1 | 13,974 |
-| helsinki | Mycel + own, free, expiry | 49.5 % | 0.1 % | 0.9 % | 10.8 % | 10.9 | 17 |
-| helsinki | Mycel + resume (= all) | 66.3 % | 0.1 % | 1.2 % | 15.2 % | 9.3 | 19 |
-| helsinki | Mycel all + evict | 49.3 % | 0.1 % | 1.1 % | 15.3 % | 13.9 | 8 |
-| helsinki | Mycel all + spray + evict | 41.7 % | 0.1 % | 1.6 % | 23.1 % | 20.5 | 6 |
-| helsinki | Mycel all + spray + evict + inet | 73.1 % | 0.1 % | 2.8 % | 34.6 % | 4.0 | 0 |
-| helsinki | Mycel all + spray + evict, no gradient | 73.0 % | 0.1 % | 2.8 % | 34.5 % | 4.0 | 0 |
-| helsinki-gw | best ONE by delivery: MaxProp | 51.2 % | 0.5 % | 2.6 % | 21.4 % | 35.6 | – |
-| helsinki-gw | best ONE within 1 h: SprayAndWait | 46.1 % | 0.6 % | 4.2 % | 31.3 % | 6.4 | – |
-| helsinki-gw | Mycel today | 31.9 % | 0.3 % | 1.1 % | 8.7 % | 6.3 | 12,091 |
-| helsinki-gw | Mycel + own, free, expiry | 47.1 % | 0.3 % | 1.5 % | 12.3 % | 10.3 | 53 |
-| helsinki-gw | Mycel + resume (= all) | 63.1 % | 0.3 % | 1.9 % | 15.3 % | 8.4 | 43 |
-| helsinki-gw | Mycel all + evict | 42.8 % | 0.5 % | 2.4 % | 19.1 % | 14.6 | 16 |
-| helsinki-gw | Mycel all + spray + evict | 37.8 % | 0.4 % | 2.7 % | 23.0 % | 22.8 | 15 |
-| helsinki-gw | Mycel all + spray + evict + inet | 39.6 % | 0.6 % | 3.3 % | 25.1 % | 19.8 | 30 |
-| helsinki-gw | Mycel all + spray + evict, no gradient | 63.4 % | 0.4 % | 3.5 % | 31.4 % | 6.2 | 20 |
+| Trace | Default: spray-first, internet gradient | Spray-and-Focus, max(P(dst), P(internet)) (the simulator's first choice) | Spray-first, max(P(dst), P(internet)) | Spray-first, no gradient | 4 copies whatever the size | No resume |
+|---|---|---|---|---|---|---|
+| cambridge heavy | **14.8 %** / 10.6 % | 14.2 % / 10.7 % | 14.3 % / 10.6 % | 14.8 % / 10.6 % | 14.8 % / 10.6 % | 14.8 % / 10.6 % |
+| infocom2005 heavy | **32.1 %** / 22.1 % | 28.1 % / 21.6 % | 28.3 % / 21.6 % | 32.1 % / 22.1 % | 32.1 % / 22.1 % | 32.1 % / 22.1 % |
+| infocom2006 heavy | **57.0 %** / 43.0 % | 54.5 % / 43.1 % | 55.0 % / 43.4 % | 57.0 % / 43.0 % | 57.0 % / 43.0 % | 57.0 % / 43.0 % |
+| infocom2006-gw heavy | **58.3 %** / 48.2 % | 58.3 % / 48.1 % | 58.4 % / 48.2 % | 58.3 % / 48.1 % | 58.3 % / 48.2 % | 58.4 % / 48.3 % |
+| helsinki heavy | **62.9 %** / 30.5 % | 39.5 % / 16.9 % | 34.6 % / 19.4 % | 62.9 % / 30.5 % | 62.9 % / 30.5 % | 58.1 % / 25.7 % |
+| helsinki-gw heavy | 37.2 % / 24.3 % | 35.3 % / 20.2 % | 35.0 % / 21.4 % | **55.0 %** / 28.9 % | 37.2 % / 24.3 % | 35.9 % / 21.2 % |
+| helsinki chat | **97.2 %** / 94.4 % | 94.5 % / 79.4 % | 96.3 % / 89.2 % | 97.2 % / 94.4 % | 91.3 % / 60.7 % | 97.2 % / 94.4 % |
+| helsinki-gw chat | 96.0 % / 87.7 % | 95.3 % / 83.0 % | 95.0 % / 86.1 % | 95.7 % / 88.6 % | 92.4 % / 68.7 % | 96.0 % / 87.7 % |
+| infocom2006 chat | 83.2 % / 46.9 % | 83.3 % / 46.5 % | 83.3 % / 47.2 % | 83.2 % / 46.9 % | 83.0 % / 45.8 % | 83.2 % / 46.9 % |
 
-On the chat workload, the four bug fixes change nothing: a 5 MB store
-holds hundreds of chat bundles, so nothing is refused. What matters there
-is spray-first and the copy budget (§6.3).
+Cells are delivered / delivered within an hour, as shares of all messages
+created. Without gateways, "internet gradient" and "no gradient" are the
+same thing (nobody has the internet), and spray-first and fallback (spray
+only when no neighbour is clearly better) coincide.
+
+**The defaults, and why:**
+- **Spray-first** (`Spray::First`): while a bundle has copies to spare,
+  half go to the likeliest neighbour without one, better than us or not.
+  It wins or ties everywhere. Spray-and-Focus, which the simulator work had
+  chosen, only sprays to neighbours no worse than us; on Helsinki, where
+  movement has no social structure, that keeps copies where they are
+  (39.5% against 62.9% heavy, 79% against 94% of chat within an hour).
+- **The single copy follows predictability toward the internet only**
+  (`Gradient::Internet`; for the destination itself once the internet has
+  proved not to reach it). Following predictability for the destination
+  costs 2–4 points of heavy delivery on the conference traces and 28 on
+  Helsinki. Following nothing ties on the conference traces and wins on
+  Helsinki with gateways (55.0% against 37.2%), but loses 13 points in the
+  simulator's disaster zone (77% against 90% within 3 h, mean of 5 seeds,
+  `docs/SIMULATION.md`), and getting a message out of a partition toward
+  the internet is what the gradient is for (`docs/ROUTING.md` §7.2). The
+  trams are the worst case for it: fast-moving gateways with tiny stores.
+- **Copies by size** (`copies_small` 32 at 16 KiB or less, `copies` 4 at
+  256 KiB or more, geometric in between): chat within an hour on Helsinki
+  goes from 60.7% to 94.4% (with gateways 68.7% to 87.7%), at 3–8× the
+  transmissions. Heavy bundles keep 4 copies. On the conference traces
+  more copies change little.
+- **Resume** is worth 5 points of heavy delivery on Helsinki (2.4 s median
+  contacts) and nothing where contacts are long.
+
+To reproduce one cell:
+
+```sh
+./target/replay/dtn-replay --contacts bench/traces/out/helsinki.csv \
+  --messages bench/traces/out/helsinki-chat-msgs.csv --ttl-min 1440 \
+  --knobs spray=focus,gradient=both --latencies /tmp/lat.csv
+```
 
 ### 6.6 LoRa-class radios
 
@@ -719,3 +731,6 @@ glue around a peer session.
   routers only see them as well connected.
 - Mycel is run with signatures off (closures that return true). Its CPU
   cost is not part of these numbers.
+- Offers cost no link time in the replay. On a real link each is a round
+  trip (tens of milliseconds over BLE); Mycel makes 1.0–1.5 offers per
+  transfer it starts (`offers` and `started` in each run's output).

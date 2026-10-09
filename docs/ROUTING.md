@@ -95,7 +95,7 @@ we built, and why.
 |---|---|---|
 | **Bundle Protocol v7** (RFC 9171); `bp7` 0.9 (CBOR encoding), `dtn7-rs` 0.18 (daemon with TCP/HTTP convergence layers) | Bundles with lifetime, source/destination endpoint ids, status reports. Custody transfer was split out of BPv7 into separate work. | **Ideas reused**: lifetime, hop-by-hop custody, status reports become our signed delivery receipts. **Code rejected for now.** `dtn7` is a daemon with its own convergence layers and routing, not an embeddable core. BPSec would duplicate our envelope signatures and encryption. Our payloads are already signed, encrypted and content-addressed Mycel envelopes. A bp7 encoding of our bundles is a cheap interop step later. |
 | **PRoPHET** (RFC 6693) | *Delivery predictability* P(a,b): raised on each encounter, aged over time, transitive through intermediaries. Forward to nodes with higher P. | **Adopted** (§7.2). The virtual destination "the internet" lets copies climb toward connectivity. |
-| **Spray-and-Wait** (Spyropoulos et al., 2005) | L copies, binary spray, then wait for direct delivery. | **Adopted as Spray-and-Focus** (same authors, 2007): the copies are sprayed (to the likeliest neighbours), then a single copy follows the gradient. |
+| **Spray-and-Wait** (Spyropoulos et al., 2005) | L copies, binary spray, then wait for direct delivery. | **Adopted, steered**: the copies are sprayed first, each to the likeliest neighbour without one; then a single copy follows the gradient toward the internet (as in Spray-and-Focus, same authors, 2007). L depends on the bundle's size. |
 | **MaxProp** (Burgess et al., 2006) | Priority by path likelihood; flooded acks clear buffers. | **Idea reused**: signed receipts flood among carriers and free their copies. |
 | **RAPID** (Balasubramanian et al., 2007) | Replication as utility optimisation using a metadata channel. | **Rejected**: heavy metadata for marginal gains at our scale. |
 
@@ -225,24 +225,34 @@ Data that must arrive later (sync envelopes, message requests) travels as
    gateway, the internet hop to the destination's gateways, and the far
    mesh route. The device at the break holds it until the next segment
    appears.
-3. **Store and carry.** With no forward progress possible, it waits and
-   moves only toward devices with better **delivery predictability**
-   (PRoPHET). Each device keeps P(x) for destinations x and for the
-   virtual destination *internet*. Devices with the internet have
-   P(internet) = 1. Encounters raise P, time ages it, and it is transitive
-   through neighbours. A copy moves to a neighbour whose utility,
-   max(P(dst), P(internet)), is higher by a margin, so a Bluetooth phone's
-   message climbs toward the first device with the internet.
-4. **Spray-and-Focus** (Spyropoulos, Psounis and Raghavendra, 2007): a
-   bundle starts with a few copies (default 4). While a device holds more
-   than one, it hands half to the neighbour with the best predictability
-   that has none, even if that neighbour is no better than itself (but
-   not to a clearly worse one: on conference contact traces that wasted
-   copies and contact time). A single copy moves only along the gradient.
-   Devices with the internet don't spray (copies should end up there)
-   unless the internet has proved not to reach the destination. (Spraying only when nobody
-   knew anything left a bundle stuck when its holder and a passer-by
-   ranked the same: the `disaster-live` simulation's stranger mule.)
+3. **Spray.** A bundle starts with several copies: 32 for 16 KiB or
+   less (chat), falling geometrically to 4 at 256 KiB. While a device
+   holds more than one, it hands half to the likeliest neighbour that has
+   none, better than itself or not (binary Spray-and-Wait, steered by
+   predictability). Devices with the internet don't spray: copies should
+   end up there, unless the internet has proved not to reach the
+   destination.
+4. **Store and carry.** A single copy waits and moves, with custody, only
+   to a neighbour with a clearly better **delivery predictability**
+   (PRoPHET) for **the internet**. Each device keeps P(x) for destinations
+   x and for the virtual destination *internet*. Devices with the internet
+   have P(internet) = 1. Encounters raise P, time ages it, and it is
+   transitive through neighbours. So a Bluetooth phone's message climbs
+   toward the first device with the internet. Once a device with the
+   internet has found the destination isn't on it, the copy follows
+   predictability for the destination instead.
+
+   How this was chosen (`docs/BENCHMARKS.md` §6.5, `docs/SIMULATION.md`
+   §4): spray-first wins or ties on every trace; Spray-and-Focus (spray
+   only to neighbours no worse than us) kept copies where they were on
+   traces without social structure (Helsinki: 39.5% against 62.9%).
+   Following P(destination), as plain PRoPHET does, cost 2–28 points of
+   delivery. Following nothing ties on conference traces but loses 13
+   points in the simulated disaster zone, where the internet is a few
+   partitions away; it wins only where the gateways are fast-moving trams
+   with tiny stores. 32 copies for chat take delivery within an hour on
+   Helsinki from 61% to 94%. The policies are `DtnConfig` knobs
+   (`spray`, `gradient`, `copies`, `copies_small`).
 
 ### 7.3 Carriers' limits
 
@@ -324,7 +334,7 @@ where it works:
 | Mesh as a transport | **Iroh custom transport** (ours: `mesh/mod.rs`) |
 | Local routing | **Our sans-IO core** (`mesh/core.rs`). Ideas from Babel, B.A.T.M.A.N., OLSR and fisheye. No Rust library routes opaque QUIC packets by Ed25519 key over arbitrary links. |
 | Global lookup | **pkarr records** (`iroh-dns`), the n0 relay via Iroh's `PkarrRelayClient`, and the **Mainline DHT** via `n0-mainline` |
-| Store-and-forward | **Our sans-IO carrier** (`mesh/dtn.rs`): PRoPHET + custody + Spray-and-Focus + receipts. bp7 encoding later, for interop. |
+| Store-and-forward | **Our sans-IO carrier** (`mesh/dtn.rs`): steered spraying + a PRoPHET gradient toward the internet + custody + offers, resume and receipts. bp7 encoding later, for interop. |
 | Broadcast (later) | **iroh-gossip**, for group presence, not routing |
 
 ## 10. What the tests measure
@@ -359,4 +369,4 @@ where it works:
 - **Overhead per device** with fisheye and flood reduction: −55 % at 25 devices, −68 % at 50, −75 % at 100 (`overhead_per_device_large_meshes`, ignored by default, runs 200 and 400).
 - **Gateways** (QUIC, in-process): a Bluetooth-only device three BLE hops from its gateway syncs with one behind another gateway; the first sync took 0.58 s. A test-tone call along that route had 84 ms RTT and 0 % loss.
 - **Two gateways:** 2.0× one path's throughput. When one is lost, the longest pause on the other is 0.8–2.6 s: data in flight leaves a hole in the stream until the dead path's loss detection gives up.
-- **Store-and-forward:** gradient routing with Spray-and-Focus gets the first copy to the internet in 28 min (mean of 40 traces, 4 clusters in a chain; 35 min when it sprayed only with no information at all). Spray-and-Wait mostly never gets there within 24 h. A real data mule delivered 1 s after meeting the destination.
+- **Store-and-forward:** spraying 4 copies, then a single copy following the gradient toward the internet, gets the first copy to the internet in 28 min (mean of 40 traces, 4 clusters in a chain). The same 4 copies with no gradient (Spray-and-Wait) don't get there within 12 h. A real data mule delivered 1 s after meeting the destination. Against The ONE's routers on real contact traces, see `docs/BENCHMARKS.md`.

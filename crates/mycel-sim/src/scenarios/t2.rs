@@ -945,8 +945,8 @@ fn disaster_dtn(o: Opts) -> ScenarioResult {
         headline(&mut r, &x.m);
     }
     expect(&mut r, &o, true);
-    if o.candidate == Candidate::Global && cand.m.delivery_ratio < 0.8 {
-        r.expect_fail("FINDING for GLOBAL (mesh/dtn.rs): utility = max(P(dst), P(internet)) sends camp-to-camp bundles, whose destinations have no record and no internet, up to the one satellite gateway, where they sit; and toward() asks to dial such destinations on every plan (see `dials`), with no backoff. Weight P(internet) by whether the destination has a record (or is reachable over the internet at all), and back off failed dials");
+    if o.candidate == Candidate::Global && cand.m.copies_per_msg > 8.0 {
+        r.expect_fail("FINDING (docs/SIMULATION.md §4, the carrier's copies): every custody hand-off counts as a copy here, and a single copy climbing the internet gradient changes hands many times as people move (17 per message with no gradient, 35 with it, for 13 points more delivery); 2 kB bundles also start with 32 copies, chosen for chat delivery speed (docs/BENCHMARKS.md §6.5). The target was set for 8-copy Spray-and-Wait");
     }
     r.note("Epidemic is the delivery-time lower bound for flooding DTN at the price of a copy on nearly every device. Spray-and-wait caps copies at 8 and waits for a carrier to meet the destination. The gradient (stand-in) moves a few copies toward whoever most recently had a way to the internet: the satellite terminal and the rescuers who pass it.");
     r
