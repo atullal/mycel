@@ -1,0 +1,22 @@
+Message stats for scenario infocom2006-heavy-copies-4
+sim_time: 337478.0000
+created: 11250
+started: 53795
+relayed: 53034
+aborted: 533
+offers: 57081
+refused: 1070
+duplicates: 2220
+delivered: 6412
+delivered_after_ttl: 0
+delivery_prob: 0.5700
+overhead_ratio: 7.2711
+latency_avg: 2671.8240
+latency_med: 489.1000
+hopcount_avg: 4.3919
+hopcount_med: 4
+transfers_by_reason: deliver 6474 route 30199 gradient 0 spray 17122
+carrier: expired 5107 cleared_by_receipt 4762 refused 1070 accepted 46004 evicted 8824 resumed 140
+refused_by: {"expired": 4, "store full": 1066}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 4, spray: First, gradient: Internet, carry: true }, resume true
+(98 devices, 284612 contact events, 103.0 s)

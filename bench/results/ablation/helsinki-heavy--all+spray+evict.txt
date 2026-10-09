@@ -1,0 +1,19 @@
+Message stats for scenario helsinki-heavy-all,spray,evict
+sim_time: 43195.6000
+created: 1441
+started: 32587
+relayed: 12910
+aborted: 19670
+refused: 6
+delivered: 601
+delivered_after_ttl: 0
+delivery_prob: 0.4171
+overhead_ratio: 20.4809
+latency_avg: 3794.1845
+latency_med: 3336.7000
+hopcount_avg: 2.9517
+hopcount_med: 3
+transfers_by_reason: deliver 1312 route 39 gradient 21547 spray 9689
+carrier: expired 9 cleared_by_receipt 1221 refused 6 accepted 12293
+refused_by: {"store full": 6}
+# (126 devices, 63286 contact events, 7.0 s)

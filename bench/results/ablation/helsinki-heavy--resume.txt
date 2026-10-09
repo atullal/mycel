@@ -1,0 +1,18 @@
+Message stats for scenario helsinki-heavy-resume
+sim_time: 43195.6000
+created: 1441
+started: 41001
+relayed: 4122
+aborted: 21329
+refused: 15550
+delivered: 624
+delivered_after_ttl: 69
+delivery_prob: 0.4330
+overhead_ratio: 5.6058
+latency_avg: 8071.9038
+latency_med: 7799.4000
+hopcount_avg: 1.9423
+hopcount_med: 1
+transfers_by_reason: deliver 1378 route 34 gradient 39438 spray 151
+carrier: expired 425 cleared_by_receipt 932 refused 15550 accepted 3428
+# (126 devices, 63286 contact events, 6.7 s)

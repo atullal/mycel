@@ -1,0 +1,19 @@
+Message stats for scenario infocom2005-chat-all,spray,evict,inet
+sim_time: 254210.0000
+created: 8474
+started: 47602
+relayed: 47602
+aborted: 0
+refused: 0
+delivered: 6989
+delivered_after_ttl: 0
+delivery_prob: 0.8248
+overhead_ratio: 5.8110
+latency_avg: 21857.4766
+latency_med: 16947.3000
+hopcount_avg: 3.4208
+hopcount_med: 3
+transfers_by_reason: deliver 7349 route 21465 gradient 0 spray 18788
+carrier: expired 2690 cleared_by_receipt 11559 refused 0 accepted 36802
+refused_by: {}
+# (41 devices, 33476 contact events, 105.9 s)

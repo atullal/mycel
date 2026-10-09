@@ -1,0 +1,18 @@
+Message stats for scenario helsinki-gw-heavy-own
+sim_time: 43195.6000
+created: 1441
+started: 35779
+relayed: 6008
+aborted: 21617
+refused: 8152
+delivered: 518
+delivered_after_ttl: 101
+delivery_prob: 0.3595
+overhead_ratio: 10.5985
+latency_avg: 7838.9431
+latency_med: 7498.9000
+hopcount_avg: 2.0058
+hopcount_med: 1
+transfers_by_reason: deliver 1903 route 4880 gradient 28967 spray 29
+carrier: expired 414 cleared_by_receipt 898 refused 8152 accepted 5388
+# (126 devices, 61986 contact events, 14.2 s)

@@ -718,6 +718,8 @@ impl Driver {
             ids: w.ids,
             receipts: w.receipts.into_iter().map(|(id, dst, sig)| dtn::Receipt { id, dst, sig }).collect(),
             preds: w.preds,
+            free: w.free,
+            evictable: w.evictable,
         };
         let now = self.now();
         if let Some(c) = &self.carrier {
@@ -726,6 +728,9 @@ impl Driver {
         Ok(())
     }
 
+    /// A neighbour offers a bundle: answer before any payload crosses
+    /// the link, then take the payload (from where an earlier transfer was
+    /// cut, if one was).
     async fn on_bundle_stream(
         self: Arc<Self>,
         from: SignPk,
@@ -733,21 +738,61 @@ impl Driver {
         mut rx: iroh::endpoint::RecvStream,
     ) -> Result<()> {
         let Some(c) = &self.carrier else { return Ok(()) };
-        let max = c.lock().config().max_bundle + 1024;
-        let bytes = rx.read_to_end(max).await?;
-        let Some((&K_BUNDLE, body)) = bytes.split_first() else { return Ok(()) };
-        let w: WireBundle = postcard::from_bytes(body)?;
-        let b = dtn::Bundle {
-            id: bundle_id(&w.src, &w.dst, &w.payload),
+        let head = read_frame(&mut rx, MAX_OFFER).await?;
+        let Some((&K_OFFER, body)) = head.split_first() else { return Ok(()) };
+        let w: WireOffer = postcard::from_bytes(body)?;
+        let o = dtn::Offer {
+            id: w.id,
             src: w.src,
             dst: w.dst,
+            size: w.size,
             created: w.created,
             lifetime: w.lifetime,
-            payload: Bytes::from(w.payload),
+            copies: w.copies,
             sig: w.sig,
         };
+        let answer = {
+            let mut c = c.lock();
+            c.set_clock(self.now(), wall_ms());
+            c.offered(from, &o, self.now(), verify_offer)
+        };
+        write_frame(&mut tx, &postcard::to_allocvec(&WireAnswer::from(answer))?).await?;
+        let dtn::Answer::Take { from: at } = answer else {
+            tx.finish()?;
+            return Ok(());
+        };
+        // the payload from `at`: keep what arrives even if the link drops
+        let mut payload = c.lock().partial(&o.id).map_or_else(Vec::new, |p| p.to_vec());
+        payload.truncate(at as usize);
+        if payload.len() as u64 != at {
+            return Ok(()); // dropped meanwhile: the next offer starts over
+        }
+        let want = o.size as usize;
+        let cut = loop {
+            match rx.read_chunk(want.saturating_sub(payload.len()).max(1)).await {
+                Ok(Some(chunk)) if payload.len() + chunk.len() <= want => payload.extend_from_slice(&chunk),
+                Ok(Some(_)) => return Ok(()), // more than offered: not that bundle
+                Ok(None) => break false,
+                Err(_) => break true,
+            }
+        };
+        if cut || payload.len() < want {
+            if payload.len() as u64 > at {
+                c.lock().keep_partial(o.id, o.src, Bytes::from(payload), self.now());
+            }
+            return Ok(());
+        }
+        let b = dtn::Bundle {
+            id: o.id,
+            src: o.src,
+            dst: o.dst,
+            created: o.created,
+            lifetime: o.lifetime,
+            payload: Bytes::from(payload),
+            sig: o.sig,
+        };
         let now = self.now();
-        let got = c.lock().accept(from, b, w.copies, now, verify_bundle);
+        let got = c.lock().accept(from, b, o.copies, now, verify_bundle);
         let ok = !matches!(got, dtn::Accepted::Refused(_));
         tx.write_all(&[ok as u8]).await?;
         tx.finish()?;
@@ -767,7 +812,11 @@ impl Driver {
         let now = self.now();
         let internet = self.router.lock().internet();
         let neighbours: Vec<SignPk> = self.router.lock().neighbours().into_iter().map(|(k, _)| k).collect();
-        c.lock().set_internet(internet);
+        {
+            let mut c = c.lock();
+            c.set_internet(internet);
+            c.set_clock(now, wall_ms());
+        }
         // summaries: on a new neighbour at once, then every few seconds
         let due: Vec<SignPk> = {
             let mut last = self.last_summary.lock();
@@ -789,6 +838,8 @@ impl Driver {
                 ids: s.ids,
                 receipts: s.receipts.into_iter().map(|r| (r.id, r.dst, r.sig)).collect(),
                 preds: s.preds,
+                free: s.free,
+                evictable: s.evictable,
             };
             if let Ok(body) = postcard::to_allocvec(&wire) {
                 let mut msg = vec![K_SUMMARY];
@@ -836,9 +887,14 @@ impl Driver {
             };
             let me = self.clone();
             self.keep(tokio::spawn(async move {
-                let ok = send_bundle(&conn, &b, t.copies).await.unwrap_or(false);
+                let sent = send_bundle(&conn, &b, t.copies).await.unwrap_or(Sent::Failed);
                 if let Some(c) = &me.carrier {
-                    c.lock().transferred(t.to, t.id, t.copies, ok, me.now());
+                    let mut c = c.lock();
+                    match sent {
+                        Sent::Took => c.transferred(t.to, t.id, t.copies, true, me.now()),
+                        Sent::Failed => c.transferred(t.to, t.id, t.copies, false, me.now()),
+                        Sent::Refused(full) => c.refused(t.to, t.id, full, me.now()),
+                    }
                 }
             }));
         }
@@ -949,7 +1005,11 @@ impl Mesh {
         let (inbox, rx) = mpsc::channel(INBOX);
         let me = keys.sign_pk();
         let directory = opts.directory.clone();
-        let carrier = opts.store_and_forward.clone().map(|c| Mutex::new(dtn::Carrier::new(me, c)));
+        let carrier = opts.store_and_forward.clone().map(|c| {
+            let mut c = dtn::Carrier::new(me, c);
+            c.set_clock(0, wall_ms());
+            Mutex::new(c)
+        });
         let mut router = Router::new(me, opts.config());
         router.set_internet(opts.internet.unwrap_or(false));
         let d = Arc::new(Driver {
@@ -1168,20 +1228,41 @@ impl ProtocolHandler for MeshProtocol {
 const BUNDLE_CTX: &str = "mycel/v0/dtn-bundle";
 const RECEIPT_CTX: &str = "mycel/v0/dtn-receipt";
 const K_SUMMARY: u8 = 1;
-const K_BUNDLE: u8 = 2;
+const K_OFFER: u8 = 3;
 const MAX_SUMMARY: usize = 256 * 1024;
+const MAX_OFFER: usize = 1024;
 const SUMMARY_EVERY: Duration = Duration::from_secs(5);
 const DTN_EVERY: Duration = Duration::from_secs(1);
 
+/// A bundle offered before its payload.
 #[derive(Serialize, Deserialize)]
-struct WireBundle {
+struct WireOffer {
+    id: Hash32,
     src: SignPk,
     dst: SignPk,
+    size: u64,
     created: u64,
     lifetime: u64,
-    payload: Vec<u8>,
     sig: mycel_crypto::Sig,
     copies: u8,
+}
+
+#[derive(Serialize, Deserialize)]
+enum WireAnswer {
+    Take(u64),
+    Duplicate,
+    /// Refused; `true` if for lack of room.
+    Refuse(bool),
+}
+
+impl From<dtn::Answer> for WireAnswer {
+    fn from(a: dtn::Answer) -> Self {
+        match a {
+            dtn::Answer::Take { from } => WireAnswer::Take(from),
+            dtn::Answer::Duplicate => WireAnswer::Duplicate,
+            dtn::Answer::Refuse(why) => WireAnswer::Refuse(why == "store full"),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1189,6 +1270,9 @@ struct WireSummary {
     ids: Vec<Hash32>,
     receipts: Vec<(Hash32, SignPk, mycel_crypto::Sig)>,
     preds: Vec<(SignPk, f32)>,
+    free: u64,
+    /// (ms until it expires, size) of what could make way.
+    evictable: Vec<(u64, u64)>,
 }
 
 /// A bundle's id: the same data for the same destination is the same bundle.
@@ -1208,24 +1292,65 @@ fn verify_receipt(r: &dtn::Receipt) -> bool {
     r.dst.verify(RECEIPT_CTX, &[&r.id.0], &r.sig).is_ok()
 }
 
-/// Hand a bundle over a hop connection; `true` once the neighbour took it.
-async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8) -> Result<bool> {
-    let wire = WireBundle {
+fn verify_offer(o: &dtn::Offer) -> bool {
+    o.src.verify(BUNDLE_CTX, &[&o.id.0, &o.created.to_be_bytes(), &o.lifetime.to_be_bytes()], &o.sig).is_ok()
+        && o.created.saturating_add(o.lifetime) > wall_ms()
+}
+
+/// How handing a bundle on went.
+enum Sent {
+    /// The neighbour has it (or had it).
+    Took,
+    /// It didn't get there (the link, a timeout): try again later.
+    Failed,
+    /// The neighbour said no; `true` if for lack of room.
+    Refused(bool),
+}
+
+/// Hand a bundle over a hop connection: offer it, and send the payload
+/// (the rest of it, if an earlier transfer was cut) only if it is wanted.
+async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8) -> Result<Sent> {
+    let offer = WireOffer {
+        id: b.id,
         src: b.src,
         dst: b.dst,
+        size: b.payload.len() as u64,
         created: b.created,
         lifetime: b.lifetime,
-        payload: b.payload.to_vec(),
         sig: b.sig,
         copies,
     };
-    let mut msg = vec![K_BUNDLE];
-    msg.extend_from_slice(&postcard::to_allocvec(&wire)?);
+    let mut msg = vec![K_OFFER];
+    msg.extend_from_slice(&postcard::to_allocvec(&offer)?);
     let (mut tx, mut rx) = conn.open_bi().await?;
-    tx.write_all(&msg).await?;
+    write_frame(&mut tx, &msg).await?;
+    let answer = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut rx, 64)).await??;
+    let at = match postcard::from_bytes::<WireAnswer>(&answer)? {
+        WireAnswer::Duplicate => return Ok(Sent::Took),
+        WireAnswer::Refuse(full) => return Ok(Sent::Refused(full)),
+        WireAnswer::Take(at) => (at as usize).min(b.payload.len()),
+    };
+    tx.write_all(&b.payload[at..]).await?;
     tx.finish()?;
     let ack = tokio::time::timeout(Duration::from_secs(30), rx.read_to_end(1)).await??;
-    Ok(ack.first() == Some(&1))
+    Ok(if ack.first() == Some(&1) { Sent::Took } else { Sent::Refused(false) })
+}
+
+/// A length-prefixed frame on a stream that goes on after it.
+async fn write_frame(tx: &mut iroh::endpoint::SendStream, body: &[u8]) -> Result<()> {
+    tx.write_all(&(body.len() as u32).to_be_bytes()).await?;
+    tx.write_all(body).await?;
+    Ok(())
+}
+
+async fn read_frame(rx: &mut iroh::endpoint::RecvStream, max: usize) -> Result<Vec<u8>> {
+    let mut len = [0u8; 4];
+    rx.read_exact(&mut len).await?;
+    let len = u32::from_be_bytes(len) as usize;
+    anyhow::ensure!(len <= max, "frame of {len} bytes");
+    let mut body = vec![0u8; len];
+    rx.read_exact(&mut body).await?;
+    Ok(body)
 }
 
 /// An Iroh address lookup: for a device beyond our mesh, one mesh address

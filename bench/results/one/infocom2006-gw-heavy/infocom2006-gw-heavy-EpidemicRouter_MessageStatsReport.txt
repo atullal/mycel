@@ -1,0 +1,20 @@
+Message stats for scenario infocom2006-gw-heavy-EpidemicRouter
+sim_time: 337479.0000
+created: 11250
+started: 1657522
+relayed: 1641176
+aborted: 16338
+dropped: 1650585
+removed: 0
+delivered: 1221
+delivery_prob: 0.1085
+response_prob: 0.0000
+overhead_ratio: 1343.1245
+latency_avg: 2307.2042
+latency_med: 356.6000
+hopcount_avg: 6.3964
+hopcount_med: 3
+buffertime_avg: 119.8771
+buffertime_med: 22.0000
+rtt_avg: NaN
+rtt_med: NaN

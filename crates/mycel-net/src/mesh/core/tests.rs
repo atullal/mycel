@@ -517,6 +517,42 @@ fn frames_wait_for_a_lookup_and_a_dial_bounded() {
     assert!(outs.iter().any(|o| matches!(o, Out::Hangup(k) if *k == key(50))));
 }
 
+/// A failed dial isn't retried on every packet: it backs off (doubling),
+/// and meanwhile `toward` says the internet doesn't reach the target, so a
+/// carrier holding a bundle for it can look for a mesh carrier instead.
+#[test]
+fn failed_dials_back_off() {
+    let mut r = Router::new(key(1), Config::default());
+    r.set_internet(true);
+    let dials = |r: &mut Router| {
+        let mut outs = Vec::new();
+        r.drain(&mut outs);
+        outs.iter().filter(|o| matches!(o, Out::Dial(k) if *k == key(50))).count()
+    };
+    r.send(key(50), key(50), Bytes::from_static(b"x"), false, 0);
+    r.on_resolved(key(50), None, 10); // no record: dial it directly
+    assert_eq!(dials(&mut r), 1);
+    r.dial_failed(key(50), 100);
+    for t in [200, 500, 1_000, 2_000] {
+        r.send(key(50), key(50), Bytes::from_static(b"x"), false, t);
+        assert_eq!(r.toward(&key(50), t), Toward::Unreachable);
+    }
+    assert_eq!(dials(&mut r), 0, "backing off for 2 s");
+    assert!(r.stats().dropped_backoff >= 4);
+    r.send(key(50), key(50), Bytes::from_static(b"x"), false, 2_200);
+    assert_eq!(dials(&mut r), 1, "then once more");
+    r.dial_failed(key(50), 2_300);
+    r.send(key(50), key(50), Bytes::from_static(b"x"), false, 5_000);
+    assert_eq!(dials(&mut r), 0, "now 4 s");
+    r.send(key(50), key(50), Bytes::from_static(b"x"), false, 6_400);
+    assert_eq!(dials(&mut r), 1);
+    // a connection that works clears it
+    r.hop_up(key(50), 6_500);
+    r.hop_down(key(50), 7_000);
+    r.send(key(50), key(50), Bytes::from_static(b"x"), false, 7_100);
+    assert_eq!(dials(&mut r), 1);
+}
+
 #[test]
 fn relay_budgets_hold() {
     let cfg = Config { relay_rate_per_neighbour: 1000, relay_rate_total: 1500, ..Config::default() };

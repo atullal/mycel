@@ -1,0 +1,22 @@
+Message stats for scenario infocom2005-chat-focus-both
+sim_time: 254210.0000
+created: 8474
+started: 126452
+relayed: 126452
+aborted: 0
+offers: 146816
+refused: 0
+duplicates: 20364
+delivered: 7127
+delivered_after_ttl: 0
+delivery_prob: 0.8410
+overhead_ratio: 16.7427
+latency_avg: 21456.1317
+latency_med: 16630.7000
+hopcount_avg: 3.5190
+hopcount_med: 3
+transfers_by_reason: deliver 7127 route 13925 gradient 18487 spray 86913
+carrier: expired 15100 cleared_by_receipt 63297 refused 0 accepted 119325 evicted 0 resumed 0
+refused_by: {}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: Focus, gradient: Both, carry: true }, resume true
+(41 devices, 33476 contact events, 43.2 s)

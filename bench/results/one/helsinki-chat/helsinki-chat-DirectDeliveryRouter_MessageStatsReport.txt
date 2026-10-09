@@ -1,0 +1,20 @@
+Message stats for scenario helsinki-chat-DirectDeliveryRouter
+sim_time: 43196.0000
+created: 1444
+started: 914
+relayed: 914
+aborted: 0
+dropped: 0
+removed: 0
+delivered: 914
+delivery_prob: 0.6330
+response_prob: 0.0000
+overhead_ratio: 0.0000
+latency_avg: 8028.2393
+latency_med: 5382.6000
+hopcount_avg: 1.0000
+hopcount_med: 1
+buffertime_avg: NaN
+buffertime_med: NaN
+rtt_avg: NaN
+rtt_med: NaN

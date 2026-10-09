@@ -1,0 +1,18 @@
+Message stats for scenario cambridge-heavy-own,free
+sim_time: 455609.0000
+created: 15184
+started: 4612
+relayed: 4330
+aborted: 32
+refused: 238
+delivered: 2317
+delivered_after_ttl: 119
+delivery_prob: 0.1526
+overhead_ratio: 0.8688
+latency_avg: 4776.8726
+latency_med: 1800.8000
+hopcount_avg: 1.3319
+hopcount_med: 1
+transfers_by_reason: deliver 2462 route 970 gradient 554 spray 626
+carrier: expired 12861 cleared_by_receipt 278 refused 238 accepted 1861
+# (12 devices, 5228 contact events, 17.0 s)

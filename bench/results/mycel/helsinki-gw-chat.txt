@@ -1,0 +1,22 @@
+Message stats for scenario helsinki-gw-chat-Mycel
+sim_time: 43195.6000
+created: 1444
+started: 53092
+relayed: 53092
+aborted: 0
+offers: 53418
+refused: 0
+duplicates: 326
+delivered: 1386
+delivered_after_ttl: 0
+delivery_prob: 0.9598
+overhead_ratio: 37.3059
+latency_avg: 1898.2562
+latency_med: 1407.8000
+hopcount_avg: 3.7691
+hopcount_med: 4
+transfers_by_reason: deliver 1386 route 4581 gradient 20656 spray 26469
+carrier: expired 0 cleared_by_receipt 25340 refused 0 accepted 51706 evicted 0 resumed 0
+refused_by: {}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Internet, carry: true }, resume true
+(126 devices, 61986 contact events, 3.5 s)
