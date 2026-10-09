@@ -264,15 +264,37 @@ fn open_main_window(app: &AppHandle) -> tauri::Result<()> {
     let Some(config) = app.config().app.windows.iter().find(|w| w.label == "main").cloned() else {
         return Ok(());
     };
-    let window = tauri::WebviewWindowBuilder::from_config(app, &config)?.build()?;
+    let builder = tauri::WebviewWindowBuilder::from_config(app, &config)?;
+    // Windows and Linux: the page captures the camera itself for calls
+    // (the SDK's webcam.ts), and only once someone turns their camera on.
+    // The system's own camera setting still applies.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let builder = builder.on_permission_request(|_, kind| match kind {
+        tauri::webview::PermissionKind::Camera => tauri::webview::PermissionResponse::Allow,
+        _ => tauri::webview::PermissionResponse::Default,
+    });
+    let window = builder.build()?;
     #[cfg(target_os = "ios")]
     edge_to_edge(&window);
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(target_os = "linux")]
+    enable_camera_capture(&window);
+    #[cfg(not(any(target_os = "ios", target_os = "linux")))]
     let _ = window;
     if let Some(rt) = app.try_state::<Rt>() {
         set_window_title(app, &rt.profile().name);
     }
     Ok(())
+}
+
+/// WebKitGTK leaves `getUserMedia` out unless its media-stream setting is on.
+#[cfg(target_os = "linux")]
+fn enable_camera_capture(window: &tauri::WebviewWindow) {
+    let _ = window.with_webview(|wv| {
+        use webkit2gtk::{SettingsExt, WebViewExt};
+        if let Some(settings) = WebViewExt::settings(&wv.inner()) {
+            settings.set_enable_media_stream(true);
+        }
+    });
 }
 
 /// Android: swiping Mycel away from recents destroys its activity, not the

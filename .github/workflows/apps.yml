@@ -83,6 +83,18 @@ jobs:
             kill "$pid"; return 1
           }
           attempt plain || attempt no-gpu WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1
+      # Can WebKitGTK send video the way the app does (camera, WebCodecs
+      # H.264)? There's no camera here: WebKit's mock capture device. First
+      # with what the WebKitGTK package brings, then with GStreamer's extra
+      # encoders, to see which a desktop needs. Reports only.
+      - name: Video probe (WebKitGTK)
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y python3-gi gir1.2-webkit2-4.1
+          xvfb-run -a python3 scripts/ci/video-probe-gtk.py && exit 0
+          echo "== again with GStreamer's openh264 and x264 encoders"
+          sudo apt-get install -y gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+          xvfb-run -a python3 scripts/ci/video-probe-gtk.py
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -141,6 +153,29 @@ jobs:
           if (-not (Select-String -Path "$env:MYCEL_DATA_DIR\mycel.log" -Pattern "mycel-host: data dir" -Quiet)) { exit 1 }
           if ($p.HasExited) { Write-Error "Mycel exited with code $($p.ExitCode)"; exit 1 }
           Stop-Process -Id $p.Id
+      # Can WebView2's engine send video the way the app does (camera,
+      # WebCodecs H.264)? Headless Edge with Chromium's fake camera; the
+      # page's title carries the result (read from the DevTools list).
+      # Reports only.
+      - name: Video probe (Edge, the engine under WebView2)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+          $page = "file:///" + ((Resolve-Path scripts\ci\video-probe.html).Path -replace '\\', '/')
+          Start-Process $edge -ArgumentList @("--headless=new", "--remote-debugging-port=9333",
+            "--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream",
+            "--user-data-dir=$env:RUNNER_TEMP\edge-probe", $page)
+          $found = $null
+          for ($i = 0; $i -lt 60 -and -not $found; $i++) {
+            Start-Sleep 1
+            try { $found = Invoke-RestMethod http://127.0.0.1:9333/json/list | Where-Object { $_.title -like "probe *" } | Select-Object -First 1 } catch {}
+          }
+          Stop-Process -Name msedge -Force -ErrorAction SilentlyContinue
+          if (-not $found) { Write-Error "no result from the probe page"; exit 1 }
+          $result = [System.Net.WebUtility]::HtmlDecode($found.title).Substring(6)  # the list escapes titles
+          $result
+          if (-not ($result | ConvertFrom-Json).ok) { exit 1 }
       - uses: actions/upload-artifact@v4
         if: always()
         with:

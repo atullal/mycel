@@ -1,0 +1,38 @@
+# UI tests for the iOS app (not part of the app): `xcodegen generate` here,
+# then see docs/PLATFORMS.md. The Host app only exists because Xcode wants a
+# target app; the tests drive the installed Mycel (dev.mycel.host).
+name: MycelUITests
+options:
+  bundleIdPrefix: dev.mycel.uitests
+  deploymentTarget:
+    iOS: "16.4"
+targets:
+  Host:
+    type: application
+    platform: iOS
+    sources: [Host]
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: dev.mycel.uitests.host
+        CODE_SIGNING_ALLOWED: NO
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+  MycelUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [Tests]
+    dependencies:
+      - target: Host
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: NO
+        TEST_TARGET_NAME: Host
+schemes:
+  MycelUITests:
+    build:
+      targets:
+        Host: all
+        MycelUITests: [test]
+    test:
+      targets: [MycelUITests]

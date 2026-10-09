@@ -51,7 +51,9 @@ cargo test --workspace --exclude mycel-host   # Rust tests (~300)
 cargo clippy --workspace --all-targets        # kept clean
 ```
 
-Native apps (details in [docs/PLATFORMS.md](docs/PLATFORMS.md)):
+Ready-made test builds for every platform are on the
+[releases page](https://github.com/atullal/mycel/releases) (the newest `dev-*`
+pre-release). To build them yourself (details in [docs/PLATFORMS.md](docs/PLATFORMS.md)):
 
 | Platform | Build | Output in `dist-release/` |
 |---|---|---|

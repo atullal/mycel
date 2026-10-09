@@ -19,9 +19,10 @@ builds.
 | Peer-to-peer Wi-Fi with no network (AWDL) | yes | on, untested³ | not yet (Wi-Fi Direct) | no | Wi-Fi Direct code, off by default |
 | Bluetooth LE link | yes | on, untested³ | not yet | not yet | BlueZ, never run on hardware |
 | Voice calls | echo cancelled | echo cancelled | echo cancelled⁴ | no echo cancellation⁵ | no echo cancellation⁵ |
-| Sending video | yes | on, untested³ | not yet | not yet | not yet |
+| Sending video | yes | on, untested³ | yes⁷ | yes, untested⁷ | untested⁷ |
 | Opening a received file | default app | share sheet | "Open with" | default app | default app |
-| Keeps running in the background | yes | no⁶ | partly⁶ | yes | yes |
+| Keeps running in the background | yes | during calls⁶ | yes⁶ | yes | yes |
+| Notifications (new messages, incoming calls)⁸ | yes | yes, while running | yes | yes | yes |
 
 1. iOS asks for Local Network access the first time; without it, only internet
    paths work.
@@ -34,17 +35,40 @@ builds.
    foreground.
 4. AAudio's voice-communication input preset (`crates/mycel-call/src/android.rs`).
 5. Plain devices through `cpal`: use headphones, or the far end hears itself.
-6. Phones suspend apps in the background, so messages arrive when Mycel is
-   opened again (or through a keeper, or store-and-forward on other devices).
-   Push notifications would need a server, which Mycel doesn't have.
+6. **Android:** a foreground service (`MycelService`, a quiet "Mycel is
+   connected" notification) keeps the runtime running with the app in the
+   background or swiped away from recents; opening it again gets a new
+   window on the same runtime. Tested on the emulator. **iPhone and iPad:**
+   iOS suspends apps. Calls carry on in the background (background audio),
+   and going to the background asks iOS for its usual grace period so sends
+   finish. After that, messages arrive when Mycel is opened again, or
+   through a keeper or store-and-forward on other devices. Waking a
+   suspended iPhone needs Apple's push service, which needs a server; Mycel
+   has none.
+7. Android, Windows and Linux have no VideoToolbox, so the web view captures
+   the camera (`getUserMedia`) and encodes H.264 with WebCodecs, in hardware
+   where the platform has it, and the runtime sends those frames like a
+   Mac's (`crates/mycel-video/src/web.rs`, `packages/sdk/src/webcam.ts`).
+   Tested on the Android 14 emulator against a desktop peer: video both
+   ways, and the phone's frames decode with ffmpeg (720×1280, Constrained
+   Baseline). Windows' WebView2 has the same Chromium APIs; it hasn't been
+   tried with a camera. On Linux the app turns on WebKitGTK's camera
+   capture, but encoding needs a WebKitGTK with WebCodecs H.264 (it depends
+   on the version and its GStreamer plugins): untested. Where the web view
+   can't capture or encode, the call stays voice-only from that side and
+   still shows the other side's video.
+8. Shown when nobody is looking: the window isn't focused, the app is in
+   the background, or (Android) it was swiped away. Tested on the Android
+   emulator. Android uses its own notification from `MycelService`; the
+   others use Tauri's notification plugin.
 
-"Not yet" means the app builds and runs there without that feature. Calls on
-those devices still receive the other side's video if the web view can decode
-H.264 (WebCodecs).
+"Not yet" means the app builds and runs there without that feature.
 
 The on-screen keyboard: on Android the page shrinks above it and the tab bar
-hides (tested). On iPhone the app follows the visual viewport the same way,
-which still needs a check on a device.
+hides. iOS slides the page under the keyboard instead of shrinking it, so the
+app sizes itself to the visible part and moves there. Both are tested: Android
+by hand on the emulator, iPhone with a UI test on the Simulator's on-screen
+keyboard (below).
 
 ## Building
 
@@ -105,15 +129,19 @@ phone and open it (allow "Install unknown apps" for the app you open it from).
 
 The Gradle project is `apps/host/src-tauri/gen/android` (from
 `cargo tauri android init`, then edited): `MainActivity.kt` (multicast lock,
-system-bar insets for the page, "Open with"), `AndroidManifest.xml`
-(permissions) and `app/build.gradle.kts` (signing).
+system-bar and keyboard insets for the page, "Open with", a window for a
+reopened activity), `MycelService.kt` (the foreground service and
+notifications), `AndroidManifest.xml` (permissions) and
+`app/build.gradle.kts` (signing). Tauri's Android IPC can't carry raw bytes,
+so files and video frames cross it as base64 (`invokeBytes` in the SDK).
 
 ### Windows
 
 Windows 10 or later. The CI job builds an NSIS installer (`Mycel_<v>_x64-setup.exe`)
 and an MSI. Both are unsigned, so SmartScreen warns: More info > Run anyway.
 Windows Firewall asks the first time Mycel listens; allow private networks for
-LAN discovery. To build on a Windows machine:
+LAN discovery. Video calls need the camera allowed for desktop apps
+(Settings > Privacy & security > Camera). To build on a Windows machine:
 `npm install && cd apps/host && cargo tauri build`.
 
 ### Linux
@@ -135,6 +163,22 @@ workflow (`libwebkit2gtk-4.1-dev`, `libdbus-1-dev`, `libasound2-dev`, …) and r
   `window.__TAURI_INTERNALS__.invoke(...)` in the page.
 - **A desktop peer to talk to:** `mycel serve --data /tmp/peer --http 127.0.0.1:7788`,
   then `mycel call <command> '<json>' --http 127.0.0.1:7788 --data /tmp/peer`.
+  `MYCEL_AUDIO=test MYCEL_VIDEO=test` give it a tone and a test pattern
+  instead of the Mac's microphone and camera.
+- **Android settings:** apps get no environment variables, so
+  `adb shell setprop debug.mycel.<name> <value>` stands in for `MYCEL_<NAME>`
+  (`audio`, `video_debug`, `net`, `links`, `mesh`, `ble_log`), read when the
+  app starts.
+- **iPhone UI test:** `apps/host/ios-uitests` drives the installed app with
+  XCUITest: it opens a conversation, types on the on-screen keyboard and
+  checks the header and composer stay in view. It needs a conversation with
+  a contact (default "Desk Test", or set `TEST_RUNNER_MYCEL_CONTACT`):
+
+  ```sh
+  cd apps/host/ios-uitests && xcodegen generate
+  xcodebuild test -project MycelUITests.xcodeproj -scheme MycelUITests \
+    -destination 'platform=iOS Simulator,name=iPhone 18 Pro'
+  ```
 
 ## Platform notes for contributors
 

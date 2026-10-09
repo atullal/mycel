@@ -1,0 +1,73 @@
+<!doctype html>
+<!--
+  Can this web view send video the way the app does (packages/sdk/src/webcam.ts)?
+  Captures the camera, encodes H.264 with WebCodecs and counts what comes out.
+  CI loads it in WebKitGTK with mock capture devices (scripts/ci/video-probe-gtk.py)
+  and in headless Edge with a fake camera (Chromium, as in WebView2). The result
+  goes to the title and the body as JSON.
+-->
+<meta charset="utf-8" />
+<title>running</title>
+<body>running</body>
+<script>
+  (async () => {
+    const r = {
+      userAgent: navigator.userAgent,
+      getUserMedia: typeof navigator.mediaDevices?.getUserMedia,
+      VideoEncoder: typeof VideoEncoder,
+      MediaStreamTrackProcessor: typeof MediaStreamTrackProcessor,
+    };
+    const done = (extra) => {
+      Object.assign(r, extra);
+      const s = JSON.stringify(r);
+      document.title = "probe " + s;
+      document.body.textContent = s;
+    };
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { width: 640, height: 360 } });
+      const track = stream.getVideoTracks()[0];
+      r.camera = track.label || "unnamed";
+      const chunks = [];
+      let description = 0;
+      let error = null;
+      const enc = new VideoEncoder({
+        output: (c, meta) => {
+          chunks.push(c.type);
+          const d = meta?.decoderConfig?.description;
+          if (d) description = d.byteLength;
+        },
+        error: (e) => (error = e.message),
+      });
+      // as webcam.ts: hardware first, then whatever the web view has
+      let config = null;
+      for (const hw of ["prefer-hardware", "no-preference"]) {
+        const c = { codec: "avc1.42E01F", width: 640, height: 360, bitrate: 500000, framerate: 30, latencyMode: "realtime", hardwareAcceleration: hw, avc: { format: "avc" } };
+        const s = await VideoEncoder.isConfigSupported(c).catch(() => ({ supported: false }));
+        if (s.supported) {
+          config = c;
+          break;
+        }
+      }
+      if (!config) return done({ encoder: "no H.264 encoder" });
+      r.hardware = config.hardwareAcceleration;
+      enc.configure(config);
+      const video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.srcObject = stream;
+      await video.play();
+      for (let i = 0; i < 30; i++) {
+        await new Promise((ok) => setTimeout(ok, 33));
+        if (video.videoWidth === 0) continue;
+        const f = new VideoFrame(video, { timestamp: i * 33333 });
+        enc.encode(f, { keyFrame: i === 0 });
+        f.close();
+      }
+      await enc.flush();
+      track.stop();
+      done({ frames: chunks.length, keyframes: chunks.filter((t) => t === "key").length, avcC: description, error, ok: chunks.length > 0 && description > 0 && !error });
+    } catch (e) {
+      done({ error: String(e && e.message ? e.message : e) });
+    }
+  })();
+</script>
