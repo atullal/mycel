@@ -125,6 +125,12 @@ pub struct MeshOptions {
     /// Store-and-forward ([`dtn`]): carry bundles for others and send ours
     /// through carriers when no live path exists; `None` = off.
     pub store_and_forward: Option<dtn::DtnConfig>,
+    /// Hop connections we open to devices in range, at most (others open
+    /// theirs to us: about twice this in all, in a crowd). A Bluetooth radio holds ~10
+    /// connections, and each costs keep-alives and a share of every
+    /// announcement; in a crowd, a few well-spread neighbours route as well
+    /// as all of them (docs/SIMULATION.md §4, finding 1).
+    pub max_neighbours: usize,
 }
 
 impl Default for MeshOptions {
@@ -143,6 +149,7 @@ impl Default for MeshOptions {
             internet: None,
             directory: None,
             store_and_forward: Some(dtn::DtnConfig::default()),
+            max_neighbours: 6,
         }
     }
 }
@@ -199,6 +206,16 @@ fn wall_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
+/// A stable pseudo-random order of `peer` for `me` (FNV-1a over both keys).
+fn rank(me: &SignPk, peer: &SignPk) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in me.0.iter().chain(peer.0.iter()) {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
+}
+
 fn to_sign_pk(id: &iroh::EndpointId) -> SignPk {
     SignPk(*id.as_bytes())
 }
@@ -215,13 +232,24 @@ struct Hop {
     /// Largest datagram buffer space seen = the buffer's size.
     dgram_cap: usize,
     dialing: bool,
+    /// We opened it (it counts toward `max_neighbours`).
+    dialed_by_us: bool,
     next_dial: Instant,
     failures: u32,
 }
 
 impl Hop {
     fn new(now: Instant) -> Self {
-        Hop { direct: false, direct_since: now, conn: None, dgram_cap: 0, dialing: false, next_dial: now, failures: 0 }
+        Hop {
+            direct: false,
+            direct_since: now,
+            conn: None,
+            dgram_cap: 0,
+            dialing: false,
+            dialed_by_us: false,
+            next_dial: now,
+            failures: 0,
+        }
     }
 
     fn live(&self) -> Option<&Connection> {
@@ -445,6 +473,7 @@ impl Driver {
                 old.close(0u32.into(), b"duplicate");
             }
             h.conn = Some(conn.clone());
+            h.dialed_by_us = conn.side().is_client();
             h.dgram_cap = conn.datagram_send_buffer_space();
             h.failures = 0;
         }
@@ -506,11 +535,27 @@ impl Driver {
         let mut todo = Vec::new();
         {
             let mut hops = self.hops.lock();
-            for (pk, h) in hops.iter_mut() {
-                let ours = self.me < *pk || now.duration_since(h.direct_since) >= DIAL_DEFER;
-                if h.direct && h.live().is_none() && !h.dialing && now >= h.next_dial && ours {
+            // at most `max_neighbours` we dialed: each device prefers its own
+            // pseudo-random subset of those in range, so the hops spread out
+            let mut ours_up = hops.values().filter(|h| h.direct && h.dialed_by_us && (h.live().is_some() || h.dialing)).count();
+            let mut want: Vec<(u64, SignPk)> = hops
+                .iter()
+                .filter(|(pk, h)| {
+                    let ours = self.me < **pk || now.duration_since(h.direct_since) >= DIAL_DEFER;
+                    h.direct && h.live().is_none() && !h.dialing && now >= h.next_dial && ours
+                })
+                .map(|(pk, _)| (rank(&self.me, pk), *pk))
+                .collect();
+            want.sort_unstable();
+            for (_, pk) in want {
+                if ours_up >= self.opts.max_neighbours.max(1) {
+                    break;
+                }
+                if let Some(h) = hops.get_mut(&pk) {
                     h.dialing = true;
-                    todo.push(*pk);
+                    h.dialed_by_us = true;
+                    ours_up += 1;
+                    todo.push(pk);
                 }
             }
         }
@@ -526,6 +571,7 @@ impl Driver {
                     let mut hops = me.hops.lock();
                     if let Some(h) = hops.get_mut(&pk) {
                         h.dialing = false;
+                        h.dialed_by_us = ok;
                         if !ok {
                             h.failures += 1;
                             h.next_dial = Instant::now() + Duration::from_secs((1u64 << h.failures.min(5)).min(30));

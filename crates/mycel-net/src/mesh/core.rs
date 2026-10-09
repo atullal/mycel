@@ -110,6 +110,10 @@ pub const FAR_EVERY: u64 = 8;
 const DENSE: usize = 8;
 /// ... skip a rebroadcast that this many neighbours already made as well.
 const REDUNDANT: usize = 3;
+/// A device greets at most one new neighbour with its routes this often
+/// (the others get its own announcement): in a crowd everyone meets 15
+/// devices at once, and one table is enough to join.
+const GREET_GAP: Time = 4_000;
 /// Seqno requests per origin at most this often; how far they travel.
 const SEQREQ_GAP: Time = 1_000;
 const SEQREQ_HOPS: u8 = 8;
@@ -584,6 +588,7 @@ pub struct Router {
     originated: u64,
     next_announce: Time,
     last_forced: Option<Time>,
+    last_greet: Option<Time>,
     force_full: bool,
     next_id: u32,
     stats: Stats,
@@ -648,6 +653,7 @@ impl Router {
             originated: 0,
             next_announce: 0,
             last_forced: None,
+            last_greet: None,
             force_full: false,
             next_id: 0,
             stats: Stats::default(),
@@ -824,16 +830,18 @@ impl Router {
         self.release(peer, now);
     }
 
-    /// Tell a new direct neighbour our current routes ([`Config::greet`]),
+    /// Tell a new direct neighbour our current routes ([`Config::greet`];
+    /// one neighbour per [`GREET_GAP`]),
     /// as a periodic rebroadcast would: newest seqno, our cost, within each
     /// announcement's scope. What is new to it travels on from there; what
     /// its other neighbours already have stops at it (it has forwarded that
     /// seqno). Advertising updates our feasibility distances, as in
     /// `flush_announcements`.
     fn greet(&mut self, peer: SignPk, now: Time) {
-        if self.cfg.greet == Greet::Own || !self.cfg.relay {
+        if self.cfg.greet == Greet::Own || !self.cfg.relay || self.last_greet.is_some_and(|t| now.saturating_sub(t) < GREET_GAP) {
             return;
         }
+        self.last_greet = Some(now);
         let mut keys: Vec<SignPk> = self.origins.keys().filter(|k| **k != peer).copied().collect();
         keys.sort();
         for origin in keys {
