@@ -32,8 +32,11 @@ pub struct T2Metrics {
     pub optimality: Summary,
     /// Seconds from send to the receipt (or a call's answer) at the sender.
     pub round_trip_s: Summary,
-    /// Copies of each message that existed (1 = no duplication).
+    /// Copies of each message that came to exist (1 = no duplication).
     pub copies_per_msg: f64,
+    /// Carrier-to-carrier hand-offs per message (replicas and custody moves).
+    #[serde(default)]
+    pub handoffs_per_msg: f64,
     /// Control (announcements, summaries, receipts) per device per second.
     pub ctrl_bytes_per_node_s: f64,
     pub ctrl_frames_per_node_s: f64,
@@ -67,6 +70,7 @@ pub fn metrics<R: Router>(sim: &Sim<R>, model: &str, wall_s: f64, only: Option<&
         .collect();
     let rt: Vec<f64> = msgs.iter().filter_map(|m| Some((m.receipt? - m.sent) as f64 / SEC as f64)).collect();
     let copies = if msgs.is_empty() { 0.0 } else { msgs.iter().map(|m| m.copies as f64).sum::<f64>() / msgs.len() as f64 };
+    let handoffs = if msgs.is_empty() { 0.0 } else { msgs.iter().map(|m| m.handoffs as f64).sum::<f64>() / msgs.len() as f64 };
     let ctrl_b: u64 = sim.core.counters.iter().map(|c| c.ctrl_bytes).sum();
     let ctrl_f: u64 = sim.core.counters.iter().map(|c| c.ctrl_frames).sum();
     let relay: Vec<f64> = sim.core.counters.iter().map(|c| c.relay_bytes as f64).filter(|b| *b > 0.0).collect();
@@ -86,6 +90,7 @@ pub fn metrics<R: Router>(sim: &Sim<R>, model: &str, wall_s: f64, only: Option<&
         optimality: Summary::of(&opt),
         round_trip_s: Summary::of(&rt),
         copies_per_msg: copies,
+        handoffs_per_msg: handoffs,
         ctrl_bytes_per_node_s: ctrl_b as f64 / n.max(1) as f64 / secs.max(1e-9),
         ctrl_frames_per_node_s: ctrl_f as f64 / n.max(1) as f64 / secs.max(1e-9),
         relay_jain: jain(&relay),

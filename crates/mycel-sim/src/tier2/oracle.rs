@@ -10,12 +10,23 @@
 //! between two devices is the same model the engine uses (access + fibre
 //! over the great circle, or via the relays when NAT forbids direct).
 //! Queueing and contention are ignored: the oracle is a lower bound.
+//!
+//! A message of several packets can be pipelined: its first packets move on
+//! while later ones are still arriving, which beats moving it whole hop by
+//! hop. For those the bound is the fastest single packet plus the rest of
+//! the message at the most the destination can take in at once (all its
+//! radios and the fastest internet access together), never more than the
+//! hop-by-hop time.
 
 use crate::stats::Map;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap};
 
-use super::engine::{NodeId, Router, Sim, Time, hop_time};
+use super::engine::{NodeId, Router, SEC, Sim, Time, hop_time};
+use crate::models::Access;
+
+/// One packet's payload: messages this small can't be pipelined.
+pub const ONE_PACKET: u32 = 1200;
 
 /// Adjacency built once from the contact plan.
 pub struct Oracle {
@@ -121,13 +132,32 @@ impl Oracle {
         self.inet[u as usize].iter().find(|(_, e)| *e > t).map(|(s, _)| t.max(*s))
     }
 
+    /// The most bytes per second `dst` can receive: every radio at once,
+    /// plus the fastest internet access there is if it has internet.
+    fn max_rate_into<R: Router>(&self, sim: &Sim<R>, dst: NodeId) -> u64 {
+        let spec = sim.core.spec(dst);
+        let radios: u64 = spec.radios.iter().map(|t| t.rate()).sum();
+        radios + spec.inet.map_or(0, |_| Access::Fibre.uplink())
+    }
+
+    /// The bound for a message of `size` (see the module docs).
+    pub fn optimal<R: Router>(&self, sim: &Sim<R>, src: NodeId, dst: NodeId, t0: Time, size: u32) -> Option<Time> {
+        let whole = self.earliest(sim, src, dst, t0, size)?;
+        if size <= ONE_PACKET {
+            return Some(whole);
+        }
+        let first = self.earliest(sim, src, dst, t0, ONE_PACKET).unwrap_or(whole);
+        let rest = (size - ONE_PACKET) as u64 * SEC / self.max_rate_into(sim, dst).max(1);
+        Some(whole.min(first + rest))
+    }
+
     /// Fill `optimal` for every message (or for `sample` of them).
     pub fn annotate<R: Router>(&self, sim: &mut Sim<R>, sample: Option<usize>) {
         let n = sim.core.msgs.len();
         let step = sample.map_or(1, |s| (n / s.max(1)).max(1));
         for i in (0..n).step_by(step) {
             let m = sim.core.msgs[i].clone();
-            let opt = self.earliest(sim, m.src, m.dst, m.sent, m.size);
+            let opt = self.optimal(sim, m.src, m.dst, m.sent, m.size);
             sim.core.msgs[i].optimal = opt;
             sim.core.msgs[i].checked = true;
         }
