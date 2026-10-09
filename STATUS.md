@@ -1,6 +1,6 @@
 # Mycel: where things stand
 
-*Last updated: 2026-10-09, 2:00 am ET. This is a snapshot for collaborators. The
+*Last updated: 2026-10-09, 4:45 am ET. This is a snapshot for collaborators. The
 design docs in `docs/` are the source of truth.*
 
 ## TL;DR
@@ -14,7 +14,7 @@ design docs in `docs/` are the source of truth.*
   - **global routing**: gateways, lookup by key through the Mainline DHT, and store-and-forward for strangers.
 - A test build is on the [dev-2026-10-08 pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-08).
 - The world-scale **network simulator** and the **benchmarks** against established open-source routers are finished. They're merged on the branch `integrate-sim-bench`, not on `main` yet.
-- **Carrier fixes done** (on `integrate-sim-bench`): Mycel now beats the best established router on most benchmark traces. **In progress:** fixes for the simulator's open findings. A second test build follows, expected early morning on 2026-10-09.
+- **Carrier fixes and most simulator findings done** (on `integrate-sim-bench`): Mycel now matches or beats the best established router on every heavy benchmark trace. Routing overhead is down ~8×, and a crash and a memory leak are fixed. **In progress:** a last round of fixes. The second test build follows, expected mid-morning on 2026-10-09.
 
 ## Try it
 
@@ -137,18 +137,32 @@ Still losing: Helsinki with tram gateways (37.2% against 51.2%).
 **Wire format changed:** the bundle offer and summary fields are new, so
 everyone needs the new build.
 
-### Now: the simulator's open findings (two agents in parallel)
+### Simulator findings: mostly fixed (on `integrate-sim-bench`)
 
-- **Routing overhead:** Babel-style timing, a control-traffic budget per link,
-  signatures sent once, and relay selection or a neighbour cap. The targets:
-  under 1 KB/s of control traffic per device at global scale, and 99% of
-  pairs routed. This should also fix the conference hall and the US–EU call.
-- **Stability:**
-  - the QUIC-library panic, so one bad connection can't crash the app;
-  - memory growth as devices walk around;
-  - copy accounting in the disaster scenario;
-  - Helsinki with tram gateways;
-  - measurement fixes in the simulator.
+- **Routing overhead.** Announcements now go out every 16 s instead of every
+  2 s, with immediate updates on change. New neighbours are greeted with our
+  routes, and each device opens at most 6 hop connections. The hop limit is 10.
+  - 2,000 Bluetooth phones: 67% → **8%** of the radio, 85% → **100%** routed.
+  - 300 phones: 99% of pairs routed in 1.1 s; before, never.
+  - US–EU call over Bluetooth hops: 0% audio loss.
+- **Crash.** A late QUIC handshake packet could abort the whole app. That's
+  fixed in a vendored, patched `noq-proto`, and any connection-level panic now
+  closes only that connection.
+- **Memory.** An iroh-patch bug re-queued paths on every retry. Memory is now
+  flat at ~100 MB for 30 walking nodes, where it peaked at 30 GB before.
+- **Helsinki with tram gateways** is no longer a loss: 52.7% against MaxProp's
+  51.2%. The gradient now weighs a neighbour's free room.
+- **Disaster zone** passes at 87%. The simulator's oracle and copy metrics were
+  corrected.
+
+### Now: last round (two agents)
+
+- **Carrier summaries** are now most of the control traffic: 8 KB/s per device
+  at global scale. They'll carry only what the forwarding policy uses, as deltas.
+- **Repeat messages at global scale** are slower than first ones: the first
+  send is lost on a stale internet hop.
+- **Conference hall:** Bluetooth queue drops, slow on some seeds.
+- **Internet-shutdown call:** connects, but the test tone isn't heard.
 
 ### Then
 
