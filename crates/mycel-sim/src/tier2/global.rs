@@ -136,6 +136,9 @@ pub struct Global {
     /// Bytes held for others: peak and time-weighted sum (for the average).
     pub buffer_peak: u64,
     pub buffer_area: f64,
+    /// Control bytes sent, by kind: routing (announcements, seqno
+    /// requests), carrier (summaries, offers, answers, acks), dials, other.
+    pub ctrl_by_kind: [u64; 4],
     buffer_at: Time,
     buffer_now: u64,
 }
@@ -191,6 +194,7 @@ impl Global {
             bundle_lifetime_ms: 24 * 3600 * 1000,
             buffer_peak: 0,
             buffer_area: 0.0,
+            ctrl_by_kind: [0; 4],
             buffer_at: 0,
             buffer_now: 0,
         }
@@ -288,6 +292,15 @@ impl Global {
     fn send_to(&mut self, cx: &mut Cx<Frame>, to: NodeId, f: Frame, msg: Option<MsgId>) -> bool {
         let size = Self::size(&f);
         let control = Self::is_control(&f);
+        if control {
+            let kind = match &f {
+                Frame::Ann(_) | Frame::Req(_) => 0,
+                Frame::Summary(_) | Frame::Offer(_) | Frame::Answer { .. } | Frame::BundleAck { .. } => 1,
+                Frame::Dial | Frame::DialAck | Frame::Hangup => 2,
+                _ => 3,
+            };
+            self.ctrl_by_kind[kind] += size as u64;
+        }
         if cx.radios_to(to).is_some() {
             cx.send_radio(to, f, size, control, msg)
         } else {

@@ -275,10 +275,10 @@ fn conference(o: Opts) -> ScenarioResult {
         let bs = ble.stats();
         let drops = bs.dropped_queue as f64 / bs.packets_sent.max(1) as f64;
         if drops > 0.1 && !r.slos.iter().all(|x| x.pass) {
-            r.expect_fail("FINDING for GLOBAL: in a dense crowd, mesh announcements saturate Bluetooth (unicast to every neighbour every 2 s, no neighbour cap), so BLE-only pairs wait seconds; see flood-scaling");
+            r.expect_fail("FINDING (docs/SIMULATION.md §4, finding 1): Bluetooth transmit queues overflow in bursts (QUIC handshakes and syncs at 40 kB/s behind a 250 ms queue), dropping ~23% of BLE packets whatever the announcement period, greeting or neighbour cap; the slowest of 10 messages then waits for retransmissions");
         }
         r.note(format!("Bluetooth medium: {} packets sent, {} dropped at full transmit queues ({:.1}%).", bs.packets_sent, bs.dropped_queue, 100.0 * bs.dropped_queue as f64 / bs.packets_sent.max(1) as f64));
-        r.note("Every device in radio range becomes a mesh neighbour with its own hop connection, so connections grow with the square of the crowd's density. Real BLE radios hold ~10 connections; the node's mesh driver has no neighbour cap yet (finding).");
+        r.note("Each device opens hop connections to at most 6 devices in range (its own pseudo-random pick, so they spread out); others open theirs to it, ~11 in all here. Real BLE radios hold ~10 connections.");
         finish(&mut r, t0, n, rss0, cpu0);
         r.metrics = json!({"hop_connections": hop, "ble_packets": ble.stats().packets_sent, "awdl_packets": awdl.stats().packets_sent, "ble_queue_drops": ble.stats().dropped_queue});
         lab.shutdown().await;

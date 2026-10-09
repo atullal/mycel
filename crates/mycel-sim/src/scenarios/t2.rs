@@ -99,6 +99,9 @@ impl Plan {
 pub struct GCfg {
     pub announce_every_ms: u64,
     pub fisheye: bool,
+    /// With fisheye: the full scope every this many periods.
+    pub far_every: u64,
+    pub max_hops: u8,
     pub flood_reduction: bool,
     /// GLOBAL's store-and-forward carrier on top of routing.
     pub dtn: bool,
@@ -107,7 +110,7 @@ pub struct GCfg {
 impl Default for GCfg {
     fn default() -> Self {
         let c = Config::default();
-        GCfg { announce_every_ms: c.announce_every, fisheye: c.fisheye, flood_reduction: c.flood_reduction, dtn: true }
+        GCfg { announce_every_ms: c.announce_every, fisheye: c.fisheye, far_every: c.far_every, max_hops: c.max_hops, flood_reduction: c.flood_reduction, dtn: true }
     }
 }
 
@@ -115,6 +118,13 @@ impl GCfg {
     /// Routing only (no store-and-forward).
     pub fn routing() -> GCfg {
         GCfg { dtn: false, ..GCfg::default() }
+    }
+
+    /// The core's announcement settings before finding 1 (docs/SIMULATION.md
+    /// §4): every 2 s, the full scope (8 hops) every 4th, flood reduction on.
+    /// (New neighbours are greeted either way.)
+    pub fn before() -> GCfg {
+        GCfg { announce_every_ms: 2_000, far_every: 4, max_hops: 8, flood_reduction: true, ..GCfg::routing() }
     }
 }
 
@@ -145,10 +155,11 @@ impl Model {
             Model::Global(g) if *g == GCfg::default() => "global core + DTN".into(),
             Model::Global(g) if *g == GCfg::routing() => "global core (routing only)".into(),
             Model::Global(g) => format!(
-                "global core{} (every {} s, fisheye {}, flood reduction {})",
+                "global core{} (every {} s, fisheye {} (full scope every {}), flood reduction {})",
                 if g.dtn { " + DTN" } else { "" },
                 g.announce_every_ms / 1000,
                 if g.fisheye { "on" } else { "off" },
+                g.far_every,
                 if g.flood_reduction { "on" } else { "off" }
             ),
             Model::Main => "main (mesh before GLOBAL)".into(),
@@ -190,16 +201,24 @@ fn go<R: Router>(
     Run { m, extra: extra(&sim) }
 }
 
+/// The core's settings for a scenario, with `MYCEL_CORE` knobs on top (e.g.
+/// `MYCEL_CORE=every=8000,greet=all`; see `Config::tune`).
 fn global_cfg(g: GCfg, seed: u64, i: NodeId) -> Config {
-    Config {
+    let mut c = Config {
         announce_every: g.announce_every_ms,
         fisheye: g.fisheye,
+        far_every: g.far_every,
+        max_hops: g.max_hops,
         flood_reduction: g.flood_reduction,
         seed: seed.wrapping_mul(0x9e37_79b9) ^ (i as u64 + 1),
         // signatures are stubbed (always valid): the cache only costs memory
         verified_max: 64,
         ..Config::default()
+    };
+    if let Ok(k) = std::env::var("MYCEL_CORE") {
+        c.tune(&k).expect("MYCEL_CORE");
     }
+    c
 }
 
 fn mycel_extra(sim: &Sim<Mycel>) -> serde_json::Value {
@@ -261,7 +280,11 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                     }
                     let mut d = mycel_net::mesh::dtn::DtnStats::default();
                     let (mut peak, mut avg) = (0u64, 0.0f64);
+                    let mut kinds = [0u64; 4];
                     for r in &sim.routers {
+                        for (k, b) in kinds.iter_mut().zip(r.ctrl_by_kind) {
+                            *k += b;
+                        }
                         if let Some(c) = &r.dtn {
                             let s = c.stats();
                             d.originated += s.originated;
@@ -276,6 +299,7 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                         avg += r.buffer_area / sim.now.max(1) as f64;
                     }
                     let n = sim.routers.len().max(1) as f64;
+                    let secs = (sim.now as f64 / SEC as f64).max(1e-9);
                     json!({"loops": sh.loops.get(), "announcements_sent": t.announcements_sent,
                            "announcements_received": t.announcements_received, "announcements_limited": t.announcements_limited,
                            "announcements_stale": t.announcements_stale, "announcements_suppressed": t.announcements_suppressed,
@@ -286,7 +310,10 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                            "routes_up": sh.routes_up.get(), "routes_down": sh.routes_down.get(),
                            "dtn_originated": d.originated, "dtn_accepted": d.accepted, "dtn_delivered": d.delivered, "dtn_handed_on": d.handed_on,
                            "dtn_expired": d.expired, "dtn_cleared_by_receipt": d.cleared_by_receipt, "dtn_refused": d.refused,
-                           "buffer_peak_bytes": peak, "buffer_avg_bytes": avg / n})
+                           "buffer_peak_bytes": peak, "buffer_avg_bytes": avg / n,
+                           "control_b_s_per_device": {
+                               "routing": kinds[0] as f64 / n / secs, "carrier": kinds[1] as f64 / n / secs,
+                               "dials": kinds[2] as f64 / n / secs, "other": kinds[3] as f64 / n / secs}})
                 },
             )
         }
@@ -722,11 +749,6 @@ fn convergence(o: Opts) -> ScenarioResult {
     r.at_most("route length vs shortest (hops)", c.stretch, 1.5, "×");
     if o.candidate == Candidate::Main {
         r.expect_fail(NEEDS_GLOBAL);
-    } else if (gr.cold_99.is_none() || gr.reconv_99.is_none()) && gr.ctrl_b_s > 0.1 * Tech::Ble.rate() as f64 {
-        // the same cause as flood-scaling's: Bluetooth hops can't carry the announcements
-        r.expect_fail(
-            "FINDING for GLOBAL: announcements overload Bluetooth. Phones whose peer-to-peer radios differ (AWDL vs Wi-Fi Direct) share only BLE (40 kB/s); every rebroadcast is unicast to every neighbour every 2 s, so a BLE radio with several such neighbours is busy past capacity, announcements arrive late, and routes expire and come back (91–98% of pairs routed, never 99%). See flood-scaling",
-        );
     }
     r.headline(format!(
         "global core: 99% routed in {}, 100% in {}, {} loops, re-converged in {}, stretch {:.2}×",
@@ -754,10 +776,16 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
     let mut r = ScenarioResult::new("flood-scaling", "Announcement overhead vs size; fisheye and flood reduction", 2, o.seed, o.scale);
     let sizes: Vec<usize> = if o.scale >= 1.0 { vec![250, 500, 1000, 2000] } else { vec![o.n(250, 60)] };
     let ble = Tech::Ble.rate() as f64;
-    // (fisheye, flood reduction, announcement period ms)
-    let variants = [(true, true, 2_000), (true, false, 2_000), (false, true, 2_000), (false, false, 2_000), (true, true, 10_000)];
+    let now = GCfg::routing();
+    let variants = [
+        ("now", now),
+        ("now, flood reduction on", GCfg { flood_reduction: true, ..now }),
+        ("now, fisheye off", GCfg { fisheye: false, ..now }),
+        ("before (every 2 s, full scope of 8 hops every 4th, reduction on)", GCfg::before()),
+    ];
     let mut rows = Vec::new();
     let mut cand_worst = 0.0f64;
+    let mut cand_cov = 1.0f64;
     let mut main_worst = 0.0f64;
     for &n in &sizes {
         // Bluetooth-only phones, one per 900 m² outdoors: ~12 neighbours each
@@ -766,33 +794,40 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
             s.radios = Techs::of(&[Tech::Ble]);
         }
         let mut line = format!("N={n}:");
-        for (fe, fr, every) in variants {
-            let g = GCfg { fisheye: fe, flood_reduction: fr, announce_every_ms: every, dtn: false };
+        for (label, g) in variants {
+            // steady state: after one full fisheye cycle (cold start is
+            // reported apart), over the next cycle (at least 32 s)
+            let cycle = g.announce_every_ms * if g.fisheye { g.far_every.max(1) } else { 1 } * MS;
+            let warm = cycle.max(10 * SEC);
+            let window = cycle.max(32 * SEC);
             let shared = Rc::new(Shared::default());
             let t = Instant::now();
             let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Global::new(i, global_cfg(g, o.seed, i), shared.clone()));
             sim.start();
-            sim.run(40 * SEC);
+            sim.run(warm);
+            let ctrl = |sim: &Sim<Global>| sim.core.counters.iter().map(|c| c.ctrl_bytes).sum::<u64>();
+            let cold = ctrl(&sim);
+            sim.run(warm + window);
+            let steady = (ctrl(&sim) - cold) as f64 / n as f64 / (window as f64 / SEC as f64);
+            let cold = cold as f64 / n as f64 / (warm as f64 / SEC as f64);
             let wall = t.elapsed().as_secs_f64();
-            let m = metrics(&sim, &Model::Global(g).name(), wall, None);
             let mut rng = Rng::new(o.seed);
             let pairs = pairs_within(&sim, n, 8, 200, &mut rng, None);
             let ok = pairs.iter().filter(|(a, b, _)| matches!(walk(&sim, *a, *b, 16), Walk::Reached(_))).count();
             let cov = ok as f64 / pairs.len().max(1) as f64;
-            let share = m.ctrl_bytes_per_node_s / ble;
-            if g == GCfg::routing() {
+            let share = steady / ble;
+            if label == "now" {
                 cand_worst = cand_worst.max(share);
+                cand_cov = cand_cov.min(cov);
             }
             line.push_str(&format!(
-                " [every {} s, fisheye {} / reduction {}: {} B/s per device ({:.1}% of BLE), {:.0}% routed]",
-                every / 1000,
-                if fe { "on" } else { "off" },
-                if fr { "on" } else { "off" },
-                fmt(m.ctrl_bytes_per_node_s),
+                " [{label}: {} B/s per device ({:.1}% of BLE), first cycle {} B/s, {:.0}% routed]",
+                fmt(steady),
                 100.0 * share,
+                fmt(cold),
                 100.0 * cov
             ));
-            rows.push(json!({"n": n, "every_ms": every, "fisheye": fe, "flood_reduction": fr, "ctrl_bytes_per_node_s": m.ctrl_bytes_per_node_s, "ble_share": share, "coverage": cov, "wall_s": wall}));
+            rows.push(json!({"n": n, "variant": label, "every_ms": g.announce_every_ms, "far_every": g.far_every, "fisheye": g.fisheye, "flood_reduction": g.flood_reduction, "ctrl_bytes_per_node_s": steady, "first_cycle_bytes_per_node_s": cold, "ble_share": share, "coverage": cov, "wall_s": wall}));
         }
         let cfg = Rc::new(Cfg::main());
         let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Mycel::new(i, cfg.clone(), Role::Honest));
@@ -807,14 +842,13 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
     }
     let worst = if o.candidate == Candidate::Main { main_worst } else { cand_worst };
     r.at_most("announcement traffic at the largest N, as a share of one BLE radio", 100.0 * worst, 10.0, "%");
+    if o.candidate == Candidate::Global {
+        r.at_least("pairs within 8 hops routed, every N", 100.0 * cand_cov, 95.0, "%");
+    }
     r.headline(format!("largest N: global core {:.1}% of BLE, main {:.1}%", 100.0 * cand_worst, 100.0 * main_worst));
-    r.note("Bluetooth-only phones (one per 900 m², ~12 neighbours each). Each device originates one ~120-byte announcement per period and sends each rebroadcast to each neighbour (hop connections are unicast). With fisheye, 3 periods in 4 flood only 2 hops. With flood reduction, a device with ≥ 8 neighbours skips a rebroadcast it heard 3 equal copies of. Main floods every announcement 8 hops every 2 s, so its traffic grows with the devices within 8 hops.");
-    match o.candidate {
-        Candidate::Main if main_worst > 0.10 => r.expect_fail(NEEDS_GLOBAL),
-        Candidate::Global if cand_worst > 0.10 => r.expect_fail(
-            "FINDING for GLOBAL: every rebroadcast is unicast to every neighbour every 2 s, so announcement traffic ~ origins in scope × neighbours × 120 B per period; on Bluetooth a longer period (see the 10 s row), batching announcements per neighbour, or MPR-style relay selection is needed",
-        ),
-        _ => {}
+    r.note("Bluetooth-only phones (one per 900 m², ~12 neighbours each). Each device originates one ~120-byte announcement per period and sends each rebroadcast to each neighbour that hasn't sent it the same one (hop connections are unicast). With fisheye, only every few periods floods the full scope; the others flood 2 hops. Traffic is measured in steady state, over one full fisheye cycle after a first one (whose cost, everyone starting at once, is shown apart). Flood reduction (a device with ≥ 8 neighbours skips a rebroadcast it heard 3 equal copies of) assumes broadcast radios: over unicast hops, the 3 copies reached their senders' neighbours, not ours, and coverage falls. Main floods every announcement 8 hops every 2 s.");
+    if o.candidate == Candidate::Main && main_worst > 0.10 {
+        r.expect_fail(NEEDS_GLOBAL);
     }
     r.metrics = serde_json::Value::Array(rows);
     r
@@ -1010,6 +1044,11 @@ fn global_scale(o: Opts) -> ScenarioResult {
     let (cand, _) = compare(&mut r, &o, &w, &plan, until, Some(200), refs);
     hold(&mut r, &cand.m, 0.95, 10.0, 5.0);
     r.at_most("control traffic per device", cand.m.ctrl_bytes_per_node_s, 1000.0, "B/s");
+    let kind = |k: &str| cand.extra.get("control_b_s_per_device").and_then(|v| v.get(k)).and_then(|v| v.as_f64());
+    if let (Some(routing), Some(carrier)) = (kind("routing"), kind("carrier")) {
+        r.at_most("of which routing (announcements, seqno requests)", routing, 1000.0, "B/s");
+        r.note(format!("Control traffic per device: routing {routing:.0} B/s, store-and-forward carrier {carrier:.0} B/s (summaries with up to 64 predictabilities to every neighbour every 10 s; docs/SIMULATION.md §4)."));
+    }
     expect(&mut r, &o, false);
     let inet = w.specs.iter().filter(|s| s.inet.is_some()).count();
     r.headline(format!("{n} devices, {:.0}% with internet; {} events in {:.0} s wall", 100.0 * inet as f64 / n as f64, cand.m.events, cand.m.wall_s));
