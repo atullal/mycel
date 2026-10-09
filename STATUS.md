@@ -1,6 +1,6 @@
 # Mycel: where things stand
 
-*Last updated: 2026-10-08, 6:30 pm ET. This is a snapshot for collaborators. The
+*Last updated: 2026-10-08, 8:45 pm ET. This is a snapshot for collaborators. The
 design docs in `docs/` are the source of truth.*
 
 ## TL;DR
@@ -13,8 +13,8 @@ design docs in `docs/` are the source of truth.*
   - multi-hop mesh relaying;
   - **global routing**: gateways, lookup by key through the Mainline DHT, and store-and-forward for strangers.
 - A test build is on the [dev-2026-10-08 pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-08).
-- **In progress** on two `wip/` branches: a world-scale **network simulator**, and **benchmarks** against established open-source routers. They found real bugs, and fixes are under way.
-- When those land, a second test build follows, expected late on 2026-10-08.
+- The world-scale **network simulator** and the **benchmarks** against established open-source routers are finished. They're merged on the branch `integrate-sim-bench`, not on `main` yet.
+- **In progress:** fixing the store-and-forward carrier where the benchmarks showed it losing. A second test build follows, expected after midnight on 2026-10-09.
 
 ## Try it
 
@@ -57,78 +57,79 @@ reach the internet. Mailboxes and signed receipts round this out. Code:
 
 ## In progress right now
 
-Two Claude Code agents are working in parallel on separate branches. Both
-branches are pushed as backups. **Don't build on `wip/*`**: they'll be merged
-into `main` and deleted.
+The simulator and benchmarks are done. Both are merged on `integrate-sim-bench`,
+which is pushed but **not to build on**: it lands on `main` with the carrier fixes
+below. The old `wip/sim` and `wip/bench` branches will be deleted then.
 
-### 1. Simulator (`wip/sim` → `crates/mycel-sim`, `docs/SIMULATION.md`)
+### Simulator (`crates/mycel-sim`, `docs/SIMULATION.md`): done
 
-The simulator tests Mycel on every kind of network at global scale. It has two tiers:
+The simulator tests Mycel on every kind of network at global scale:
+- **Tier 1** runs real Mycel nodes over emulated radios and an internet with
+  real latency. About 500 nodes fit on one Mac.
+- **Tier 2** drives the real routing core and carrier for 10,000+ virtual
+  devices in virtual time. Every delivery is compared against the fastest one
+  that was physically possible, and against simple baseline routers.
 
-- **Tier 1, emulation.** Real Mycel nodes (crypto, QUIC, mesh, sync, calls)
-  run over emulated radios (`mycel_net::emu::EmuNet`). The emulation covers
-  position and range, throughput, delay and jitter, shared airtime, loss, NAT and
-  relays, and an internet with latency from great-circle distance. About 500 nodes
-  fit on one Mac.
-- **Tier 2, discrete-event simulation.** The real routing core and carrier drive
-  10,000–100,000 virtual devices in 24 cities on 6 continents, with mobility,
-  churn and real contact traces.
-  - Every delivery is compared against an **oracle**: the fastest delivery that
-    was physically possible. This measures "did it use the fastest path?".
-  - The same scenarios also run simple baseline routers for comparison.
-- **Scenarios** include:
-  - café, office, apartment Wi-Fi mesh, conference hall;
-  - an 8+ hop Bluetooth city block, internet shutdown, disaster zone with data mules, rural road;
-  - **US to Europe between Bluetooth-only phones**;
-  - gateway choice, partial routes with custody;
-  - 100k devices, 30% churn, attacks, multipath, and mixed radios in one room.
+26 scenarios at full size: **17 pass**, 4 fail by design (each tied to an open
+finding), 4 fail and 1 wasn't run. Highlights:
+- US to Europe between Bluetooth-only phones: messages pass. A call over the
+  same route loses too much audio.
+- 10,000 devices with 30% of them leaving and joining every minute: 100%
+  delivered.
+- Disaster zone: a stranger carrying a message now delivers it, in 50 s.
 
-**Found and fixed so far** (committed on `wip/sim`, not on `main` yet):
-- **Speed:** recomputing routes is now incremental, 25× faster at scale.
-- **Carrier:**
-  - Spray-and-Focus;
-  - deliveries before relays;
-  - drop-oldest when the buffer is full;
-  - forgetting neighbours that are gone.
-- **Node:** dial backoff, and slow syncs handed off as bundles.
+**Fixed along the way:**
+- Route recomputation is incremental: 25× faster at scale, same results.
+- Failed dials back off.
+- The carrier sprays copies (Spray-and-Focus), delivers before relaying, and
+  drops the oldest when full.
+- Slow syncs are handed to the carrier as bundles.
 
-**Being worked on:**
-- a stranger carrying a message never delivered it in the disaster scenario;
-- Bluetooth queue drops in the 300-person conference hall;
-- route convergence at full size.
+**Open findings** (details in SIMULATION.md §4):
+1. **Route announcements overload Bluetooth** at conference density and at
+   global scale. This is the main problem, and the fix is a protocol choice
+   still to make.
+2. A panic in the QUIC library at 300 nodes under memory pressure.
+3. Memory growth in the internet-shutdown scenario.
+4. Delivery on real conference traces and in the disaster zone is below
+   target. The carrier fixes below address it.
 
-### 2. Benchmarks (`wip/bench` → `bench/`, `docs/BENCHMARKS.md`)
+### Benchmarks (`bench/`, `docs/BENCHMARKS.md`): done
 
-These run established open-source tools on identical inputs, so we aren't
-grading our own homework:
+Mycel's carrier ran against The ONE's five standard routers on real Bluetooth
+contact traces (CRAWDAD Infocom 2005/2006, Cambridge) and ONE's Helsinki city
+scenario. Meshtasticator compared it with Meshtastic-style flooding.
+- **Mycel today** matches or beats the best ONE router on Cambridge,
+  Infocom 2005 and Infocom 2006 with gateways. It loses on Infocom 2006 and
+  on every Helsinki run. It always sends far fewer copies.
+- **Measured on an experimental copy of the carrier**, the fixes below take
+  Mycel past the best ONE router on every heavy-workload trace except Helsinki
+  with gateways. For example, Infocom 2006 goes from 28.9% delivered to 56.8%,
+  against 38.0%, and Helsinki from 30.4% to 73.1%, against 47.4%. On Helsinki
+  chat, 32 copies bring it to 97.2%, against MaxProp's 98.1% at a third of the
+  traffic.
+- **Against Meshtastic-style flooding:** Mycel delivers 98–100% of direct
+  messages against 39–73%. Its route announcements don't fit a LoRa radio's
+  capacity, though, so LoRa would need a different routing mode.
 
-- **The ONE**, the standard DTN simulator. Its Epidemic, PRoPHET,
-  Spray-and-Wait, MaxProp and Direct Delivery routers run against Mycel's carrier
-  on **real Bluetooth contact traces**: CRAWDAD Haggle, from the Infocom 2005 and
-  2006 conferences and Cambridge, plus ONE's Helsinki city scenario. There are two
-  workloads, ONE's standard heavy one and a chat-like one.
-  - The CRAWDAD data's licence forbids redistribution, so it's gitignored.
-    `bench/fetch.sh` downloads it.
-- **Meshtasticator** compares Meshtastic's flood routing with Mycel's routing on
-  the same layouts.
-- **Linux-only tools** have ready-to-run scripts in `bench/linux/` for when we
-  use the Linux machine: Shadow, Mininet-WiFi against the reference
-  B.A.T.M.A.N./OLSR/Babel daemons, and CORE/EMANE.
+### Now: carrier fixes (one agent, own branch)
 
-**Interim results** (measured on the carrier before the fixes above):
-- **Copies:** Mycel makes far fewer copies than Epidemic or PRoPHET.
-- **Delivery:** Mycel is competitive, and best on Infocom 2005's heavy workload.
-- **Losses** being diagnosed, with fixes being tested:
-  - *Delay on heavy workloads:* on Cambridge, half of Mycel's deliveries took
-    over 23 minutes, against 9–42 s for ONE's routers.
-  - *Delivery on Helsinki:* 26%, against 44–48% for Spray-and-Wait and MaxProp.
+1. Offer a bundle before sending it, so a full receiver refuses in one round
+   trip instead of after the whole payload. Summaries advertise free space.
+2. Resume interrupted bundle transfers: the median Helsinki contact lasts 2.4 s.
+3. Expire bundles at creation + lifetime, not restarting at every hop.
+4. Spray copies first, and choose the single-copy gradient by evidence from
+   both harnesses.
+5. 32 copies for small (chat-sized) bundles, falling to 4 for large ones.
+
+These change the bundle protocol, so **everyone needs the new build** to carry
+messages for each other.
 
 ### Then
 
-1. Merge both into `main`.
-2. Apply the benchmark fixes and re-run the comparisons.
-3. Run the full test suite twice, plus clippy.
-4. Publish a new universal DMG as the next pre-release.
+1. Re-run the benchmarks and the affected simulations on the real code.
+2. Run the full test suite twice, plus clippy, then merge into `main`.
+3. Publish a new universal DMG as the next pre-release.
 
 ## Known issues and open questions
 
@@ -144,6 +145,11 @@ grading our own homework:
   available for that and for Shadow and Mininet-WiFi.
 - **Flaky speed tests.** Tests that measure speed can flake under heavy machine
   load. They now run one at a time within each test binary.
+- **Three local-discovery tests fail on the main dev Mac** (`lan_discovery_via_mdns`,
+  `one_path_per_interface`, `sync_over_an_interface_with_ip_off`). macOS has
+  denied that terminal Local Network access, so this is the environment, not the
+  code. If you see "No route to host" to LAN addresses from your terminal,
+  allow it in System Settings > Privacy & Security > Local Network.
 - **Not audited.** The trust layer needs an external cryptographic review
   before anyone relies on it.
 
