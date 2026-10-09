@@ -649,3 +649,72 @@ fn room_aware_gradient_prefers_room() {
     assert_eq!(pick("room=on"), key(2));
     assert!(DtnConfig::default().room_aware);
 }
+
+/// Summaries say what changed, when it changed: everything at first
+/// contact, then only bundles taken since, nothing while nothing changes,
+/// everything held every `SUMMARY_FULL`. With the internet gradient,
+/// destination predictabilities travel only in full summaries (for
+/// PRoPHET's transitivity); deltas carry the internet's (at 2,000 devices,
+/// 64 predictabilities to every neighbour every 10 s were 8 kB/s per device).
+#[test]
+fn summaries_say_what_changed_and_only_what_the_gradient_uses() {
+    let mut c = Carrier::new(key(0), DtnConfig::default());
+    for p in 1..=5 {
+        c.encounter(key(p), 0);
+    }
+    let nb = [key(9)];
+    let s = c.summaries(0, &nb);
+    assert_eq!(s.len(), 1);
+    assert!(s[0].1.full);
+    assert_eq!(s[0].1.preds.len(), 5, "a full summary: destinations too");
+    assert!(c.summaries(5_000, &nb).is_empty(), "nothing changed, nothing to say");
+    c.encounter(key(6), 5_000);
+    assert!(c.summaries(5_000, &nb).is_empty(), "a destination's predictability waits for the next full summary");
+    let (x, y) = (bundle(key(0), key(5), 1, 3_600_000), bundle(key(0), key(6), 2, 3_600_000));
+    c.originate(x.clone(), 5_000).unwrap();
+    let s = c.summaries(5_000, &nb);
+    assert_eq!((s[0].1.full, s[0].1.ids.clone()), (false, vec![x.id]), "only what is new");
+    assert!(s[0].1.preds.iter().all(|(k, _)| *k == INTERNET), "{:?}", s[0].1.preds);
+    c.originate(y.clone(), 5_500).unwrap();
+    assert!(c.summaries(6_000, &nb).is_empty(), "at most every SUMMARY_GAP");
+    let s = c.summaries(5_000 + SUMMARY_GAP, &nb);
+    assert_eq!(s[0].1.ids, vec![y.id]);
+    let s = c.summaries(SUMMARY_FULL, &nb);
+    assert!(s[0].1.full && s[0].1.ids.len() == 2, "everything, every SUMMARY_FULL");
+    c.new_contact(key(9));
+    assert!(c.summaries(SUMMARY_FULL + 1, &nb)[0].1.full, "a new hop connection hears everything");
+    // the other side: a full summary replaces what we knew, a delta adds
+    let mut d = Carrier::new(key(9), DtnConfig::default());
+    d.on_summary(key(0), Summary { full: true, ids: vec![x.id], ..Summary::default() }, 0, |_| true);
+    d.on_summary(key(0), Summary { ids: vec![y.id], ..Summary::default() }, 1, |_| true);
+    assert_eq!(d.nb_has[&key(0)].len(), 2);
+    d.on_summary(key(0), Summary { full: true, ids: vec![y.id], ..Summary::default() }, 2, |_| true);
+    assert_eq!(d.nb_has[&key(0)].len(), 1);
+}
+
+/// With the internet gradient, a carrier holding a bundle the internet
+/// can't deliver asks neighbours for their predictability for its
+/// destination (`wants`); their next summary answers, and the single copy
+/// moves to the one that has met the destination.
+#[test]
+fn wants_bring_destination_predictabilities() {
+    let (a, b, dst) = (key(1), key(2), key(7));
+    let mut ca = Carrier::new(a, DtnConfig::default());
+    let mut cb = Carrier::new(b, DtnConfig::default());
+    // they meet; then b meets the destination (its full summary is past)
+    let (_, first) = cb.summaries(0, &[a]).pop().expect("first contact");
+    ca.on_summary(b, first, 0, |_| true);
+    cb.encounter(dst, 0);
+    assert!(cb.summaries(SUMMARY_GAP, &[a]).is_empty(), "nobody asked: it waits for the next full summary");
+    let x = bundle(key(3), dst, 1, 3_600_000);
+    assert_eq!(ca.accept(key(3), x, 1, 0, |_| true), Accepted::Stored);
+    assert!(ca.plan(0, |_| Toward::Unreachable, &[b]).is_empty(), "nobody known better yet");
+    let (_, sa) = ca.summaries(0, &[b]).pop().expect("first contact");
+    assert_eq!(sa.wants, vec![dst]);
+    cb.on_summary(a, sa, 0, |_| true);
+    let (_, sb) = cb.summaries(2 * SUMMARY_GAP, &[a]).pop().expect("a want is news");
+    assert!(!sb.full && sb.preds.iter().any(|(k, p)| *k == dst && *p > 0.5), "{sb:?}");
+    ca.on_summary(b, sb, 2 * SUMMARY_GAP, |_| true);
+    let plan = ca.plan(2 * SUMMARY_GAP, |_| Toward::Unreachable, &[b]);
+    assert_eq!(plan.iter().map(|t| (t.to, t.why)).collect::<Vec<_>>(), vec![(b, Why::Gradient)]);
+}
