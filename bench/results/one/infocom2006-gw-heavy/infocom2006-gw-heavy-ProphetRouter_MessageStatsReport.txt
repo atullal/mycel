@@ -1,0 +1,20 @@
+Message stats for scenario infocom2006-gw-heavy-ProphetRouter
+sim_time: 337479.0000
+created: 11250
+started: 1593119
+relayed: 1575466
+aborted: 17645
+dropped: 1583988
+removed: 0
+delivered: 2073
+delivery_prob: 0.1843
+response_prob: 0.0000
+overhead_ratio: 758.9932
+latency_avg: 3430.0969
+latency_med: 1107.5000
+hopcount_avg: 3.0690
+hopcount_med: 3
+buffertime_avg: 115.3898
+buffertime_med: 20.0000
+rtt_avg: NaN
+rtt_med: NaN

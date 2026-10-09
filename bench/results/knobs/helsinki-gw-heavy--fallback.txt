@@ -1,0 +1,22 @@
+Message stats for scenario helsinki-gw-heavy-fallback
+sim_time: 43195.6000
+created: 1441
+started: 29258
+relayed: 10877
+aborted: 18380
+offers: 29299
+refused: 23
+duplicates: 18
+delivered: 552
+delivered_after_ttl: 0
+delivery_prob: 0.3831
+overhead_ratio: 18.7047
+latency_avg: 3392.8389
+latency_med: 2822.8000
+hopcount_avg: 2.7156
+hopcount_med: 2
+transfers_by_reason: deliver 1398 route 3983 gradient 16166 spray 7711
+carrier: expired 19 cleared_by_receipt 1031 refused 23 accepted 10324 evicted 2985 resumed 1923
+refused_by: {"store full": 23}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: Fallback, gradient: Internet, carry: true }, resume true
+(126 devices, 61986 contact events, 2.5 s)

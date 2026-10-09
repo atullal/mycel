@@ -1,0 +1,19 @@
+Message stats for scenario infocom2006-heavy-all,fallback,evict
+sim_time: 337478.0000
+created: 11250
+started: 61548
+relayed: 59427
+aborted: 527
+refused: 841
+delivered: 6120
+delivered_after_ttl: 0
+delivery_prob: 0.5440
+overhead_ratio: 8.7103
+latency_avg: 2219.1055
+latency_med: 377.6000
+hopcount_avg: 4.4905
+hopcount_med: 4
+transfers_by_reason: deliver 6199 route 28584 gradient 12822 spray 13943
+carrier: expired 4669 cleared_by_receipt 5570 refused 841 accepted 51233
+refused_by: {"store full": 841}
+# (98 devices, 284612 contact events, 425.7 s)

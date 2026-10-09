@@ -1,0 +1,18 @@
+Message stats for scenario helsinki-gw-heavy-all,spray
+sim_time: 43195.6000
+created: 1441
+started: 24059
+relayed: 10173
+aborted: 13832
+refused: 49
+delivered: 1086
+delivered_after_ttl: 0
+delivery_prob: 0.7536
+overhead_ratio: 8.3674
+latency_avg: 6502.3472
+latency_med: 5711.6000
+hopcount_avg: 2.8048
+hopcount_med: 2
+transfers_by_reason: deliver 2040 route 959 gradient 12628 spray 8432
+carrier: expired 336 cleared_by_receipt 2863 refused 49 accepted 9045
+# (126 devices, 61986 contact events, 14.3 s)

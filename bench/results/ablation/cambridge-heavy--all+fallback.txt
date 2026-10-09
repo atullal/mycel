@@ -1,0 +1,19 @@
+Message stats for scenario cambridge-heavy-all,fallback
+sim_time: 455609.0000
+created: 15184
+started: 7212
+relayed: 6646
+aborted: 39
+refused: 514
+delivered: 2401
+delivered_after_ttl: 0
+delivery_prob: 0.1581
+overhead_ratio: 1.7680
+latency_avg: 4999.0022
+latency_med: 2236.1000
+hopcount_avg: 1.3882
+hopcount_med: 1
+transfers_by_reason: deliver 2423 route 988 gradient 722 spray 3079
+carrier: expired 15025 cleared_by_receipt 484 refused 514 accepted 4167
+refused_by: {"expired": 1, "store full": 513}
+# (12 devices, 5228 contact events, 27.4 s)

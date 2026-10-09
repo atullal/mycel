@@ -1,0 +1,13 @@
+# External tools, raw datasets and regenerable intermediates (bench/fetch.sh, bench/run.py)
+/external
+/data
+/traces/out
+/one/gen
+results/helsinki-capture/
+results/meshtasticator/*.json
+results/one/*/run.log
+results/*.log
+# per-message latencies (regenerable; the summaries keep the numbers)
+results/*/*-lat.csv
+results/one/*/*_DeliveredMessagesReport.txt
+__pycache__/

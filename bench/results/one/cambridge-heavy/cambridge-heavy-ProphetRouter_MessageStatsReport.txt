@@ -1,0 +1,20 @@
+Message stats for scenario cambridge-heavy-ProphetRouter
+sim_time: 455610.0000
+created: 15184
+started: 43487
+relayed: 43131
+aborted: 356
+dropped: 57041
+removed: 0
+delivered: 1199
+delivery_prob: 0.0790
+response_prob: 0.0000
+overhead_ratio: 34.9725
+latency_avg: 292.7339
+latency_med: 38.5000
+hopcount_avg: 1.6981
+hopcount_med: 1
+buffertime_avg: 586.8534
+buffertime_med: 59.7000
+rtt_avg: NaN
+rtt_med: NaN

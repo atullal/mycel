@@ -1,0 +1,18 @@
+Message stats for scenario infocom2005-heavy-real
+sim_time: 254210.0000
+created: 8467
+started: 443137
+relayed: 2664
+aborted: 2800
+refused: 437303
+delivered: 1859
+delivered_after_ttl: 43
+delivery_prob: 0.2196
+overhead_ratio: 0.4330
+latency_avg: 7147.5174
+latency_med: 6369.9000
+hopcount_avg: 1.1705
+hopcount_med: 1
+transfers_by_reason: deliver 1924 route 86361 gradient 129017 spray 225835
+carrier: expired 6220 cleared_by_receipt 112 refused 437303 accepted 742
+# (41 devices, 33476 contact events, 46.5 s)
