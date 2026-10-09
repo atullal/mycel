@@ -4,10 +4,28 @@
 //! docs/SIMULATION.md); the heavier CI runs here are `#[ignore]`d:
 //! `cargo test -p mycel-sim -- --ignored`.
 
+use std::sync::RwLock;
+
 use mycel_sim::report::Status;
 use mycel_sim::scenarios::{self, Candidate, Opts};
 
+/// Tier-1 scenarios measure latency on the wall clock, so each runs alone:
+/// never beside another one or the CPU-heavy tier-2 runs.
+static WALL_CLOCK: RwLock<()> = RwLock::new(());
+
+/// A tier-2 scenario (virtual time): any number at once.
 fn check(name: &str, scale: f64) {
+    let _shared = WALL_CLOCK.read().unwrap_or_else(|e| e.into_inner());
+    run(name, scale);
+}
+
+/// A tier-1 scenario (real nodes, real time): alone.
+fn check_live(name: &str, scale: f64) {
+    let _alone = WALL_CLOCK.write().unwrap_or_else(|e| e.into_inner());
+    run(name, scale);
+}
+
+fn run(name: &str, scale: f64) {
     let s = scenarios::find(name).expect("scenario");
     let mut r = (s.run)(Opts { seed: 1, scale, candidate: Candidate::Global });
     r.finish();
@@ -93,81 +111,81 @@ fn churn() {
 
 #[test]
 fn cafe() {
-    check("cafe", 0.1);
+    check_live("cafe", 0.1);
 }
 
 #[test]
 fn mixed_room() {
-    check("mixed-room", 0.1);
+    check_live("mixed-room", 0.1);
 }
 
 #[test]
 fn city_block() {
-    check("city-block", 0.1);
+    check_live("city-block", 0.1);
 }
 
 #[test]
 #[ignore = "real time: ~1 min"]
 fn nat_relay() {
-    check("nat-relay", 0.1);
+    check_live("nat-relay", 0.1);
 }
 
 #[test]
 #[ignore = "real time"]
 fn office() {
-    check("office", 0.1);
+    check_live("office", 0.1);
 }
 
 #[test]
 #[ignore = "real time"]
 fn apartment() {
-    check("apartment-80211s", 0.1);
+    check_live("apartment-80211s", 0.1);
 }
 
 #[test]
 #[ignore = "real time"]
 fn multipath() {
-    check("multipath", 0.1);
+    check_live("multipath", 0.1);
 }
 
 #[test]
 #[ignore = "real time"]
 fn rural_line() {
-    check("rural-line", 0.1);
+    check_live("rural-line", 0.1);
 }
 
 #[test]
 #[ignore = "real time"]
 fn us_eu_live() {
-    check("us-eu-live", 0.1);
+    check_live("us-eu-live", 0.1);
 }
 
 #[test]
 #[ignore = "real time"]
 fn adversarial_live() {
-    check("adversarial-live", 0.1);
+    check_live("adversarial-live", 0.1);
 }
 
 #[test]
 #[ignore = "real time, ~1 min"]
 fn disaster_live() {
-    check("disaster-live", 0.1);
+    check_live("disaster-live", 0.1);
 }
 
 #[test]
 #[ignore = "real time"]
 fn shutdown() {
-    check("shutdown", 0.1);
+    check_live("shutdown", 0.1);
 }
 
 #[test]
 #[ignore = "real time"]
 fn conference() {
-    check("conference", 0.1);
+    check_live("conference", 0.1);
 }
 
 #[test]
 #[ignore = "real time"]
 fn scale_ceiling() {
-    check("scale-ceiling", 0.1);
+    check_live("scale-ceiling", 0.1);
 }
