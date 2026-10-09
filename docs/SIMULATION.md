@@ -129,7 +129,7 @@ machine it measured 500 nodes in 1.2 GB (§1).
 | `partial-route` | 2 | full *(carrier)* | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.5 s; sender-holds 100% p50 98.2 s · gap 300 m: global core + DTN 100%; stand-in custody 0% p50 0 s; sender-holds 0% p50 0 s | 0 s |
 | `disaster-dtn` | 2 | full *(stability)* | ✅ | global core + DTN: 87% delivered (mean of seeds 1–5: 90%), p95 5917 s, optimality p50/p95/p99 1.00/4.65/5.04× · 27.4 replicas, 32.5 hand-offs per message (budget 32, fixed 11) · PRoPHET 58%, spray-and-wait (L=8) 32%, epidemic 100% | 32 s |
 | `mailbox` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
-| `global-scale` | 2 | 2,002 devices (0.02) *(stability)* | ❌ | global core + DTN: 100% delivered, p95 1.64 s · first contact p95 0.741 s (≤ 3 s ✓), optimality p95 12.9× · warm p95 1.69 s, optimality p95 36.5×<br>✗ warm: optimality p95: 36.5 × (target ≤ 5.00 ×); ✗ control traffic per device: 11888 B/s (target ≤ 1000 B/s) | 162 s |
+| `global-scale` | 2 | 2,002 devices (0.02) *(stability, routing)* | ❌ | global core + DTN: 100% delivered, p95 1.64 s · first contact p95 0.741 s (≤ 3 s ✓), optimality p95 12.9× · warm p95 1.69 s, optimality p95 32.2× · control 8,470 B/s per device: routing 465 (was 3,768), carrier 8,004<br>✗ warm: optimality p95: 32.2 × (target ≤ 5.00 ×); ✗ control traffic per device: 8470 B/s (target ≤ 1000 B/s) | 81 s |
 | `churn` | 2 | 1,001 devices (scale 0.1) *(carrier, routing)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.93/12.6/17.1×; routing traffic 2,659 → 470 B/s per device (full size before the carrier fixes: 100%, p95 65.2 s) | 75 s |
 | `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 15.0 s, optimality p50/p95/p99 32.7/718/2015× · global core + DTN: clean 100%, attacked 100%, Sybil gateway 100% | 980 s |
 | `trace-replay` | 2 | full *(stability)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible, p50 4.8 s, p95 1212 s, optimality p50/p95/p99 1.23/5.27/13.2× (pipelining-aware oracle, fixed 12), overhead 4.37 hand-offs per delivery · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 103 s |
@@ -343,8 +343,9 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
 
 1. **Bluetooth control traffic: what is left after fixed 14.**
    - **Carrier summaries.** At 2,002 devices in `global-scale`, the
-     store-and-forward carrier's summaries cost 5,605 B/s per device
-     (4,540 in `churn`), against 467 B/s for routing. Each summary lists up
+     store-and-forward carrier costs 8,004 B/s per device (5,605 before
+     the second message per pair; 4,540 in `churn`), against 465 B/s for
+     routing. Each summary lists up
      to 64 predictabilities (36 bytes each) and goes to every neighbour
      every 10 s. Directions: send what changed, fewer or quantized
      predictabilities, a longer period. `global-scale`'s 1 KB/s target
@@ -373,13 +374,23 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    giver keeps what it thinks it didn't give. Merged copies are also
    re-split. Repro: `MYCEL_DTN=copies_small=8 mycel-sim disaster-dtn`.
 4. **`global-scale` warm pairs are not faster** (2,002 devices, scale
-   0.02). Each pair now sends a second message a minute after the first:
+   0.02). Each pair sends a second message a minute after the first:
    - first contact: p95 0.741 s (target ≤ 3 s, passes), optimality p95
      12.9×, paying a record lookup and a dial the oracle doesn't model;
-   - warm: p50 0.483 s but p95 1.69 s, optimality p95 36.5× (target 5×).
-   A cached route or record goes stale within a minute and some second
-   messages ride it. This is routing state, outside the carrier. Control
-   traffic is 11.9 KB per second per device (finding 1).
+   - warm: p50 0.484 s but p95 1.69 s, optimality p95 32.2× (target 5×).
+
+   Every slow warm message (latency > 1 s, ~40 of 195) is between two
+   devices **both on the internet**, in different areas, and takes
+   *exactly* its pair's first-contact latency + 1.0 s: the first
+   transmission is lost, and the retransmission after the 1 s timeout
+   looks the destination up and dials it again, as the first message did.
+   It isn't a cache timing out: with the second message 30 s or 90 s
+   later, or records cached 10 s instead of 60 s, the tail is the same
+   (p95 1.51–1.54 s, p99 45×). So the internet hop the sender still
+   holds a minute later doesn't carry the packet, and the sender learns
+   that only by losing it. Next: trace one pair through the tier-2
+   driver's dial, hop and hang-up handling (`tier2/global.rs`).
+   Repro: `mycel-sim global-scale --scale 0.02`.
 5. **Spray policy.** Spray-and-Focus (copies only to neighbours no worse
    than us) replaced spraying only on zero knowledge and moved
    `disaster-dtn` from 38% to 60%. Spray-first (copies to the likeliest
