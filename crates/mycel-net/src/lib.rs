@@ -73,6 +73,8 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 /// carry it may be gone by then.
 const BUNDLE_AFTER: Duration = Duration::from_secs(10);
 const PERIODIC_SYNC: Duration = Duration::from_secs(15);
+/// How long shutting down waits for peers to acknowledge the close.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const ONLINE_WINDOW: Duration = Duration::from_secs(45);
 /// Changes are pushed this long after they happen (coalescing a burst). Short:
 /// a sync is one stream on a pooled connection, no handshake.
@@ -1358,7 +1360,13 @@ impl Node {
             l.stop();
         }
         self.inner.pool.shutdown();
-        self.router.shutdown().await?;
+        // Closing sends every peer a CONNECTION_CLOSE at once, then waits
+        // for them to acknowledge it, up to 3 probe timeouts per connection.
+        // Over a slow radio, or to peers already gone, that is seconds:
+        // don't hold up quitting for it.
+        if let Ok(r) = tokio::time::timeout(SHUTDOWN_GRACE, self.router.shutdown()).await {
+            r?;
+        }
         Ok(())
     }
 }

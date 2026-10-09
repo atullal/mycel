@@ -521,10 +521,16 @@ impl Lab {
         None
     }
 
+    /// Every node at once: a node's close waits for its peers to
+    /// acknowledge (or time out), so one after another is minutes.
     pub async fn shutdown(self) {
+        let mut all = tokio::task::JoinSet::new();
         for d in self.devs {
-            let _ = d.node.shutdown().await;
+            all.spawn(async move {
+                let _ = d.node.shutdown().await;
+            });
         }
+        while all.join_next().await.is_some() {}
     }
 }
 
