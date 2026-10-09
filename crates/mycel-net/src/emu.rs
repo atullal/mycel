@@ -24,6 +24,17 @@
 //! single-hop rate. Not modelled: collisions, hidden terminals, rate
 //! adaptation, fading (loss is i.i.d.).
 //!
+//! Per-link queues (`peer_queue`, Bluetooth LE): instead of one FIFO
+//! radio queue bounded by `max_queue`, every link from a device to a peer
+//! has its own drop-tail queue of `peer_queue` bytes, and the radio's rate
+//! is shared between the links with something queued, at either end. That
+//! is how a BLE device sends: one L2CAP channel per peer, each with Mycel's
+//! own bounded queue (`mycel_link_ble::OUT_QUEUE_BYTES`, 16 KiB, dropping
+//! new packets when full), and a controller that serves its connections in
+//! turn, one connection event each (Bluetooth Core 5.4, Vol 6, Part B,
+//! §4.5.1). A burst to one peer then fills that peer's queue only; it
+//! doesn't delay or drop what goes to the others.
+//!
 //! Discovery: a *discoverable* medium reports neighbours to each node's
 //! link (`LinkEvent::Found`/`Lost`), as Bluetooth, AWDL or mDNS do. The
 //! internet isn't discoverable: nobody learns every device on the internet,
@@ -109,6 +120,10 @@ pub struct Medium {
     pub shared_channel: bool,
     /// A transmit queue longer than this drops packets.
     pub max_queue: Duration,
+    /// Bytes queued per link (sender → peer) before new packets are dropped,
+    /// with the rate shared between busy links; `None` = one FIFO radio
+    /// queue bounded by `max_queue`. See the module docs.
+    pub peer_queue: Option<usize>,
     /// Reports neighbours to the nodes' links (radios, LAN discovery).
     pub discoverable: bool,
 }
@@ -127,6 +142,7 @@ impl Medium {
             half_duplex: false,
             shared_channel: false,
             max_queue: Duration::from_millis(250),
+            peer_queue: None,
             discoverable: true,
         }
     }
@@ -207,6 +223,9 @@ struct State {
     fifo: HashMap<(SignPk, SignPk), Instant>,
     /// One in-order delivery queue per (from, to).
     queues: HashMap<(SignPk, SignPk), mpsc::UnboundedSender<(Instant, Packet)>>,
+    /// With `peer_queue`: per sender, per peer, the packets still on the air
+    /// or queued, as (done sending, bytes).
+    links: HashMap<SignPk, HashMap<SignPk, std::collections::VecDeque<(Instant, usize)>>>,
 }
 
 impl State {
@@ -263,7 +282,7 @@ impl EmuNet {
         EmuNet {
             id: TRANSPORT_TEST_BASE + n,
             medium: Arc::new(medium),
-            st: Arc::new(Mutex::new(State { members: HashMap::new(), pair: None, rng: seed | 1, up: true, fifo: HashMap::new(), queues: HashMap::new() })),
+            st: Arc::new(Mutex::new(State { members: HashMap::new(), pair: None, rng: seed | 1, up: true, fifo: HashMap::new(), queues: HashMap::new(), links: HashMap::new() })),
             counters: Arc::default(),
         }
     }
@@ -403,7 +422,31 @@ impl EmuNet {
         let shape = st.shape(from, to);
         let airtime = m.rate.map_or(Duration::ZERO, |r| Duration::from_secs_f64(len as f64 * shape.rate_div / r as f64));
         let mut start = now;
-        if m.rate.is_some() {
+        if let (Some(cap), Some(_)) = (m.peer_queue, m.rate) {
+            let q = st.links.entry(*from).or_default().entry(*to).or_default();
+            // forget what's done sending
+            while q.front().is_some_and(|(t, _)| *t <= now) {
+                q.pop_front();
+            }
+            let queued: usize = q.iter().map(|(_, n)| n).sum();
+            if !q.is_empty() && queued + len > cap {
+                bump(&c.dropped_queue, 1);
+                return None;
+            }
+            let last = q.back().map(|(t, _)| *t);
+            // the radios at both ends share their time between busy links
+            let busy = |q: &std::collections::VecDeque<(Instant, usize)>| q.back().is_some_and(|(t, _)| *t > now);
+            let out = st.links.get(from).map_or(0, |l| l.iter().filter(|(k, q)| *k != to && busy(q)).count());
+            let inc = st.links.iter().filter(|(k, l)| *k != from && l.get(to).is_some_and(busy)).count();
+            let share = 1 + out.max(inc);
+            if let Some(t) = last {
+                start = start.max(t);
+            }
+            let done = start + airtime * share as u32;
+            st.links.entry(*from).or_default().entry(*to).or_default().push_back((done, len));
+            // arrival below counts airtime once: the sharing is in `start`
+            start = done - airtime;
+        } else if m.rate.is_some() {
             let busy = |k: &SignPk, st: &State| st.members.get(k).and_then(|x| x.busy_until).filter(|b| *b > now);
             if let Some(b) = busy(from, &st) {
                 start = start.max(b);
@@ -720,6 +763,30 @@ mod tests {
         let (_, d3) = net.schedule(&c, &b, 100).unwrap();
         assert_eq!(d3, Duration::from_millis(300));
         assert!(net.schedule(&a, &c, 10).is_none(), "out of range");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peer_queues_share_the_radio() {
+        // 1000 B/s, 300-byte queue per link (Bluetooth LE: one per L2CAP channel)
+        let mut m = Medium::ideal(PathKind::Bluetooth);
+        m.rate = Some(1000);
+        m.half_duplex = true;
+        m.peer_queue = Some(300);
+        let net = EmuNet::new(3, m, 1);
+        let (a, b, c) = (key(1), key(2), key(3));
+        for k in [a, b, c] {
+            net.link(k, Pos::new(0.0, 0.0));
+        }
+        // a burst to b fills b's queue only
+        let (_, d1) = net.schedule(&a, &b, 100).unwrap();
+        assert_eq!(d1, Duration::from_millis(100));
+        assert!(net.schedule(&a, &b, 100).is_some());
+        assert!(net.schedule(&a, &b, 100).is_some());
+        assert!(net.schedule(&a, &b, 100).is_none(), "b's queue is full");
+        // c's link isn't: its packet goes out at half the rate beside b's
+        let (_, d2) = net.schedule(&a, &c, 100).unwrap();
+        assert_eq!(d2, Duration::from_millis(200));
+        assert_eq!(net.stats().dropped_queue, 1);
     }
 
     #[tokio::test(start_paused = true)]

@@ -218,7 +218,15 @@ impl Tech {
         m.range = self.range(env);
         m.half_duplex = self.half_duplex();
         m.shared_channel = self.shared_channel();
+        m.peer_queue = self.peer_queue();
         m
+    }
+
+    /// Bluetooth LE queues per peer: one L2CAP channel each, with the real
+    /// link's drop-tail queue of `mycel_link_ble::OUT_QUEUE_BYTES` (16 KiB),
+    /// and the controller serving connections in turn.
+    pub fn peer_queue(self) -> Option<usize> {
+        matches!(self, Tech::Ble).then_some(16 * 1024)
     }
 }
 
