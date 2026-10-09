@@ -1,6 +1,6 @@
 # Mycel: where things stand
 
-*Last updated: 2026-10-08, 8:45 pm ET. This is a snapshot for collaborators. The
+*Last updated: 2026-10-09, 2:00 am ET. This is a snapshot for collaborators. The
 design docs in `docs/` are the source of truth.*
 
 ## TL;DR
@@ -14,7 +14,7 @@ design docs in `docs/` are the source of truth.*
   - **global routing**: gateways, lookup by key through the Mainline DHT, and store-and-forward for strangers.
 - A test build is on the [dev-2026-10-08 pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-08).
 - The world-scale **network simulator** and the **benchmarks** against established open-source routers are finished. They're merged on the branch `integrate-sim-bench`, not on `main` yet.
-- **In progress:** fixing the store-and-forward carrier where the benchmarks showed it losing. A second test build follows, expected after midnight on 2026-10-09.
+- **Carrier fixes done** (on `integrate-sim-bench`): Mycel now beats the best established router on most benchmark traces. **In progress:** fixes for the simulator's open findings. A second test build follows, expected early morning on 2026-10-09.
 
 ## Try it
 
@@ -112,18 +112,43 @@ scenario. Meshtasticator compared it with Meshtastic-style flooding.
   messages against 39–73%. Its route announcements don't fit a LoRa radio's
   capacity, though, so LoRa would need a different routing mode.
 
-### Now: carrier fixes (one agent, own branch)
+### Carrier fixes: done (on `integrate-sim-bench`)
 
-1. Offer a bundle before sending it, so a full receiver refuses in one round
-   trip instead of after the whole payload. Summaries advertise free space.
-2. Resume interrupted bundle transfers: the median Helsinki contact lasts 2.4 s.
-3. Expire bundles at creation + lifetime, not restarting at every hop.
-4. Spray copies first, and choose the single-copy gradient by evidence from
-   both harnesses.
-5. 32 copies for small (chat-sized) bundles, falling to 4 for large ones.
+- **Offer before payload:** a receiver accepts, resumes or refuses from the
+  signed header, before any bytes move. Summaries advertise free space.
+- **Interrupted transfers resume**, from any carrier, for 5 minutes.
+- **Lifetimes count from creation**, not from each hop.
+- **Spray first:** copies go out before the single-copy gradient, which now
+  climbs toward the internet only.
+- **32 copies for chat-sized bundles**, falling to 4 at 256 KiB.
+- **Two copy-accounting bugs fixed:** one custody copy could become two, and
+  partial summaries caused millions of duplicate offers.
 
-These change the bundle protocol, so **everyone needs the new build** to carry
-messages for each other.
+Benchmarks on the real code (delivered; best ONE router in brackets):
+- Infocom 2006 heavy: 28.9% → **57.0%** (38.0%)
+- Helsinki heavy: 30.4% → **62.9%** (47.4%)
+- Helsinki chat: 87.7% → **97.2%** (98.1%), at a third of MaxProp's traffic
+
+Simulator: `disaster-dtn` goes from 60% to 87%. Real Infocom traces go from
+13% to 28% (2005) and from 31% to 51% (2006).
+
+Still losing: Helsinki with tram gateways (37.2% against 51.2%).
+
+**Wire format changed:** the bundle offer and summary fields are new, so
+everyone needs the new build.
+
+### Now: the simulator's open findings (two agents in parallel)
+
+- **Routing overhead:** Babel-style timing, a control-traffic budget per link,
+  signatures sent once, and relay selection or a neighbour cap. The targets:
+  under 1 KB/s of control traffic per device at global scale, and 99% of
+  pairs routed. This should also fix the conference hall and the US–EU call.
+- **Stability:**
+  - the QUIC-library panic, so one bad connection can't crash the app;
+  - memory growth as devices walk around;
+  - copy accounting in the disaster scenario;
+  - Helsinki with tram gateways;
+  - measurement fixes in the simulator.
 
 ### Then
 
