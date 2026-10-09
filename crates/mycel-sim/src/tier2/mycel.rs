@@ -631,7 +631,11 @@ impl Mycel {
                     c.copies = give;
                     let size = c.size + HDR;
                     let control = c.receipt;
-                    cx.copied(d.msg);
+                    // handing on the last copy moves it; only a split makes one
+                    if d.copies > 1 {
+                        cx.copied(d.msg);
+                    }
+                    cx.handed(d.msg);
                     cx.send_radio(nb, Frame::Data(c), size, control, Some(d.msg));
                     d.copies -= give;
                 }

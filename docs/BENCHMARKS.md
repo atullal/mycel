@@ -31,9 +31,9 @@ the share of *all* messages created that arrived within an hour.
 | cambridge | heavy | MaxProp 9.4 % | 8.8 % | 10.4 | 9.4 % | 5.7 % | **14.8 %** | **10.6 %** | 5.1 |
 | infocom2005 | heavy | MaxProp 20.4 % | 16.8 % | 66.0 | 22.0 % | 7.7 % | **32.1 %** | **22.1 %** | 7.1 |
 | infocom2006 | heavy | MaxProp 38.0 % | 30.0 % | 202.8 | 28.9 % | 16.1 % | **57.0 %** | **43.0 %** | 7.3 |
-| infocom2006-gw | heavy | MaxProp 40.3 % | 33.0 % | 277.0 | 40.9 % | 24.8 % | **58.3 %** | **48.2 %** | 5.3 |
+| infocom2006-gw | heavy | MaxProp 40.3 % | 33.0 % | 277.0 | 40.9 % | 24.8 % | **58.5 %** | **48.2 %** | 5.3 |
 | helsinki | heavy | MaxProp 47.4 % (Spray-and-Wait: 30.5 % ≤ 1 h) | 18.9 % | 31.8 | 30.4 % | 8.2 % | **62.9 %** | 30.5 % | 4.7 |
-| helsinki-gw | heavy | MaxProp 51.2 % (Spray-and-Wait: 31.3 % ≤ 1 h) | 21.4 % | 35.6 | 31.9 % | 8.7 % | 37.2 % | 24.3 % | 19.4 |
+| helsinki-gw | heavy | MaxProp 51.2 % (Spray-and-Wait: 31.3 % ≤ 1 h) | 21.4 % | 35.6 | 31.9 % | 8.7 % | **52.7 %** | 27.7 % | 9.7 |
 | cambridge | chat | MaxProp 51.5 % | 11.9 % | 6.0 | 45.9 % | 11.1 % | 50.6 % | 11.5 % | 5.1 |
 | infocom2005 | chat | MaxProp 84.2 % | 24.6 % | 36.8 | 82.5 % | 23.3 % | 84.1 % | 24.4 % | 16.2 |
 | infocom2006 | chat | MaxProp 83.2 % | – | 215.4 | 82.9 % | 44.8 % | 83.2 % | 46.9 % | 18.3 |
@@ -52,13 +52,16 @@ the share of *all* messages created that arrived within an hour.
   Infocom 2006 with gateways. On Helsinki, 32 copies for small bundles
   take delivery within an hour from 50% to 94%; MaxProp still gets 98%
   there by copying to everyone (overhead 90 against 26).
-- **Remaining loss: Helsinki with gateways, heavy.** The single copy
-  climbs toward the 6 tram gateways, which move fast (contacts of seconds)
-  and have 5 MB stores: transfers to them are cut and their stores fill.
-  Without the internet gradient Mycel delivers 55.0% there, above MaxProp's
-  51.2%, but the gradient is worth 13 points of delivery in the
-  simulator's disaster zone, where the internet is a few partitions away
-  (§6.5). Real gateways are mostly static, with 64 MiB stores.
+- **Helsinki with gateways, heavy: now ahead on delivery**, at 52.7%
+  against MaxProp's 51.2%, with half the transmissions of before (overhead
+  9.7, was 19.4).
+  - The single copy used to climb toward the 6 tram gateways, which move
+    fast (contacts of seconds) and have 5 MB stores, so transfers to them
+    were cut and their stores filled: 37.2%.
+  - The gradient now discounts a neighbour that can take fewer than 4
+    more bundles of the size (`room_aware`, §6.5).
+  - Spray-and-Wait still gets more there within an hour: 31.3% against
+    27.7%.
 - **Local routing against Meshtastic's flooding.** Mycel's routes deliver
   98–100% of direct messages, against 39–73% for flooding, with 2–3 data
   transmissions against 6–16. Its announcements don't fit a LoRa channel
@@ -204,7 +207,7 @@ messages only.
 | infocom2006-gw | SprayAndWait | 31.0 % | 2175 | 554 | 7.50 | 1.92 |
 | infocom2006-gw | MaxProp | 40.3 % | 2092 | 234 | 276.98 | 3.92 |
 | infocom2006-gw | DirectDelivery | 22.7 % | 4507 | 2618 | 0.00 | 1.00 |
-| infocom2006-gw | **Mycel** | 58.3 % | 1887 | 200 | 5.35 | 3.65 |
+| infocom2006-gw | **Mycel** | 58.5 % | 1910 | 206 | 5.33 | 3.66 |
 | helsinki | Epidemic | 20.1 % | 3221 | 2417 | 98.75 | 4.39 |
 | helsinki | Prophet | 21.6 % | 3864 | 2861 | 70.58 | 2.96 |
 | helsinki | SprayAndWait | 44.5 % | 3012 | 2452 | 6.57 | 1.98 |
@@ -216,7 +219,7 @@ messages only.
 | helsinki-gw | SprayAndWait | 46.1 % | 3028 | 2466 | 6.37 | 1.98 |
 | helsinki-gw | MaxProp | 51.2 % | 5748 | 4527 | 35.64 | 1.76 |
 | helsinki-gw | DirectDelivery | 31.9 % | 6544 | 5666 | 0.00 | 1.00 |
-| helsinki-gw | **Mycel** | 37.2 % | 3199 | 2806 | 19.39 | 2.72 |
+| helsinki-gw | **Mycel** | 52.7 % | 4666 | 3404 | 9.70 | 2.46 |
 
 **Chat workload** (1–10 kB, TTL 24 h)
 
@@ -330,7 +333,7 @@ created messages delivered within a time:
 | helsinki-gw | heavy | SprayAndWait | 0.6 % | 4.2 % | 31.3 % |
 | helsinki-gw | heavy | MaxProp | 0.5 % | 2.6 % | 21.4 % |
 | helsinki-gw | heavy | DirectDelivery | 0.3 % | 2.1 % | 11.9 % |
-| helsinki-gw | heavy | **Mycel** | 0.6 % | 3.1 % | 24.3 % |
+| helsinki-gw | heavy | **Mycel** | 0.4 % | 3.0 % | 27.7 % |
 | helsinki-gw | chat | Epidemic | 1.2 % | 19.1 % | 79.4 % |
 | helsinki-gw | chat | Prophet | 0.9 % | 13.4 % | 81.1 % |
 | helsinki-gw | chat | SprayAndWait | 1.3 % | 15.4 % | 62.7 % |
@@ -680,6 +683,18 @@ only when no neighbour is clearly better) coincide.
   `docs/SIMULATION.md`), and getting a message out of a partition toward
   the internet is what the gradient is for (`docs/ROUTING.md` §7.2). The
   trams are the worst case for it: fast-moving gateways with tiny stores.
+- **The gradient weighs room** (`room_aware`, on; `room=on|off`). A
+  neighbour whose summary shows free room for fewer than 4 more bundles of
+  this size counts in proportion: its utility is multiplied by
+  free / (4 × size).
+  - Helsinki with gateways, heavy: 37.2% → 52.7% delivered, 24.3% → 27.7%
+    within an hour, and overhead 19.4 → 9.7.
+  - Infocom 2006 with gateways, heavy: 58.3% → 58.5%.
+  - Every other trace and workload: identical. Without gateways, the
+    internet gradient has nothing to climb.
+  - `disaster-dtn` in the simulator: identical (stores never fill there).
+  - The rows above are with it on. The table's Helsinki-gw default column
+    (37.2%) was before it.
 - **Copies by size** (`copies_small` 32 at 16 KiB or less, `copies` 4 at
   256 KiB or more, geometric in between): chat within an hour on Helsinki
   goes from 60.7% to 94.4% (with gateways 68.7% to 87.7%), at 3–8× the

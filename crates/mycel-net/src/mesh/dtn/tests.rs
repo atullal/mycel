@@ -623,3 +623,29 @@ fn copies_in_flight_are_not_given_twice() {
     c.transferred(key(1), x.id, 1, false, 2_000);
     assert_eq!(c.plan(2_000, |_| Toward::Hop(key(2)), &[key(2)]).len(), 1, "free again once that failed");
 }
+
+/// `room=on`: of two neighbours equally close to the internet, the
+/// gradient prefers the one with room for several more bundles like this
+/// over one that could take only this one (Helsinki's tram gateways,
+/// docs/BENCHMARKS.md §6.5).
+#[test]
+fn room_aware_gradient_prefers_room() {
+    let pick = |knobs: &str| {
+        let mut cfg = DtnConfig { copies: 1, copies_small: 1, ..DtnConfig::default() };
+        cfg.tune(knobs).unwrap();
+        let mut c = Carrier::new(key(0), cfg);
+        let x = bundle(key(0), key(9), 1, 3_600_000);
+        c.originate(x, 0).unwrap();
+        for (nb, free) in [(1u32, 1_000u64), (2, 1_000_000)] {
+            let s = Summary { preds: vec![(INTERNET, 1.0)], free, ..Summary::default() };
+            c.on_summary(key(nb), s, 0, |_| true);
+        }
+        // key(1) wins ties on key order, so only room can make it key(2)
+        let plan = c.plan(1_000, |_| Toward::Nowhere, &[key(1), key(2)]);
+        assert_eq!(plan.len(), 1);
+        plan[0].to
+    };
+    assert_eq!(pick("room=off"), key(1));
+    assert_eq!(pick("room=on"), key(2));
+    assert!(DtnConfig::default().room_aware);
+}

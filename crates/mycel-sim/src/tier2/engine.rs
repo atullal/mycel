@@ -190,8 +190,14 @@ pub struct MsgRecord {
     pub size: u32,
     pub sent: Time,
     pub delivered: Option<Time>,
-    /// Copies of it that existed anywhere (custody, DTN replicas).
+    /// Copies of it that came to exist: the sender's, plus every replica a
+    /// carrier made by handing on some of its copies and keeping the rest.
+    /// Moving the only copy (custody) creates none.
     pub copies: u32,
+    /// Times it was handed to another carrier (replicas and custody moves):
+    /// transmissions between carriers, The ONE's "relayed".
+    #[serde(default)]
+    pub handoffs: u32,
     /// The fastest feasible arrival (filled by the oracle).
     pub optimal: Option<Time>,
     /// The oracle looked at it (all messages, or a sample).
@@ -432,6 +438,13 @@ impl<F> Cx<'_, F> {
     pub fn copied(&mut self, msg: MsgId) {
         if let Some(r) = self.world.msgs.get_mut(msg as usize) {
             r.copies += 1;
+        }
+    }
+
+    /// A carrier took `msg` from another (a replica or a custody move).
+    pub fn handed(&mut self, msg: MsgId) {
+        if let Some(r) = self.world.msgs.get_mut(msg as usize) {
+            r.handoffs += 1;
         }
     }
 

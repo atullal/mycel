@@ -81,7 +81,7 @@ pub enum Frame {
     Offer(Offer),
     Answer { id: Hash32, copies: u8, answer: Answer },
     Bundle(Bundle, u8),
-    BundleAck { id: Hash32, copies: u8, ok: bool },
+    BundleAck { id: Hash32, copies: u8, ok: bool, stored: bool },
     Summary(Rc<DtnSummary>),
 }
 
@@ -590,22 +590,22 @@ impl Router for Global {
             Frame::Bundle(b, copies) => {
                 let id = b.id;
                 let msg = bundle_msg(&id);
-                let ok = match self.dtn.as_mut().map(|c| c.accept(fpk, b, copies, now, |_| true)) {
+                let (ok, stored) = match self.dtn.as_mut().map(|c| c.accept(fpk, b, copies, now, |_| true)) {
                     Some(Accepted::ForMe(b)) => {
                         cx.delivered(msg);
                         if let Some(c) = self.dtn.as_mut() {
                             c.add_receipt(Receipt { id: b.id, dst: self.pk, sig: Sig([0; 64]) });
                         }
-                        true
+                        (true, false)
                     }
                     Some(Accepted::Stored) => {
-                        cx.copied(msg);
-                        true
+                        cx.handed(msg);
+                        (true, true)
                     }
-                    Some(Accepted::Duplicate) => true,
-                    Some(Accepted::Refused(_)) | None => false,
+                    Some(Accepted::Duplicate) => (true, false),
+                    Some(Accepted::Refused(_)) | None => (false, false),
                 };
-                self.send_to(cx, from, Frame::BundleAck { id, copies, ok }, None);
+                self.send_to(cx, from, Frame::BundleAck { id, copies, ok, stored }, None);
                 self.dtn_plan(cx);
             }
             Frame::Offer(o) => {
@@ -632,9 +632,14 @@ impl Router for Global {
                 }
                 self.note_buffer(cx);
             }
-            Frame::BundleAck { id, copies, ok } => {
+            Frame::BundleAck { id, copies, ok, stored } => {
                 if let Some(c) = self.dtn.as_mut() {
                     c.transferred(fpk, id, copies, ok, now);
+                    // a new replica only if we kept some copies; handing on
+                    // the last one moves it (custody)
+                    if stored && c.holds(&id) {
+                        cx.copied(bundle_msg(&id));
+                    }
                 }
                 self.note_buffer(cx);
             }

@@ -196,7 +196,11 @@ impl Dtn {
                 self.drop_msg(old);
             }
             self.used += size;
+            // these baselines replicate (or spray a share): every hand-off
+            // leaves the giver a copy, except spray-and-wait's final one to
+            // the destination, which is a delivery
             cx.copied(msg);
+            cx.handed(msg);
         }
         self.held.insert(msg, h);
         self.order.push_back(msg);

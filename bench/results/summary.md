@@ -26,7 +26,7 @@
 | infocom2006-gw | SprayAndWait | 31.0 % | 2175 | 554 | 7.50 | 1.92 |
 | infocom2006-gw | MaxProp | 40.3 % | 2092 | 234 | 276.98 | 3.92 |
 | infocom2006-gw | DirectDelivery | 22.7 % | 4507 | 2618 | 0.00 | 1.00 |
-| infocom2006-gw | **Mycel** | 58.3 % | 1887 | 200 | 5.35 | 3.65 |
+| infocom2006-gw | **Mycel** | 58.5 % | 1910 | 206 | 5.33 | 3.66 |
 | helsinki | Epidemic | 20.1 % | 3221 | 2417 | 98.75 | 4.39 |
 | helsinki | Prophet | 21.6 % | 3864 | 2861 | 70.58 | 2.96 |
 | helsinki | SprayAndWait | 44.5 % | 3012 | 2452 | 6.57 | 1.98 |
@@ -38,7 +38,7 @@
 | helsinki-gw | SprayAndWait | 46.1 % | 3028 | 2466 | 6.37 | 1.98 |
 | helsinki-gw | MaxProp | 51.2 % | 5748 | 4527 | 35.64 | 1.76 |
 | helsinki-gw | DirectDelivery | 31.9 % | 6544 | 5666 | 0.00 | 1.00 |
-| helsinki-gw | **Mycel** | 37.2 % | 3199 | 2806 | 19.39 | 2.72 |
+| helsinki-gw | **Mycel** | 52.7 % | 4666 | 3404 | 9.70 | 2.46 |
 
 ### Workload: chat
 
@@ -140,7 +140,7 @@
 | helsinki-gw | heavy | SprayAndWait | 0.6 % | 4.2 % | 31.3 % |
 | helsinki-gw | heavy | MaxProp | 0.5 % | 2.6 % | 21.4 % |
 | helsinki-gw | heavy | DirectDelivery | 0.3 % | 2.1 % | 11.9 % |
-| helsinki-gw | heavy | **Mycel** | 0.6 % | 3.1 % | 24.3 % |
+| helsinki-gw | heavy | **Mycel** | 0.4 % | 3.0 % | 27.7 % |
 | helsinki-gw | chat | Epidemic | 1.2 % | 19.1 % | 79.4 % |
 | helsinki-gw | chat | Prophet | 0.9 % | 13.4 % | 81.1 % |
 | helsinki-gw | chat | SprayAndWait | 1.3 % | 15.4 % | 62.7 % |
