@@ -320,7 +320,9 @@ impl Inner {
                     return;
                 }
                 let kind = PathKind::of_custom_addr(&addr);
-                self.link_addrs.lock().entry(peer).or_default().insert(addr);
+                if self.link_addrs.lock().entry(peer).or_default().insert(addr.clone()) {
+                    self.open_on_live_connections(peer, addr);
+                }
                 let mut peers = self.peers.lock();
                 let p = peers.entry(peer).or_default();
                 let newly = p.links.insert(kind);
@@ -375,6 +377,18 @@ impl Inner {
             .get(&peer)
             .is_some_and(|p| p.nearby || p.links.iter().any(|k| *k != PathKind::Mesh));
         mesh.set_direct(peer, direct);
+    }
+
+    /// A link or mesh route found after a connection to `peer` came up: Iroh
+    /// looks addresses up only while it has no working path, so tell it, and
+    /// it opens the new one as a path on the live connections (a second mesh
+    /// route aggregates, a new radio is ready to fail over to).
+    fn open_on_live_connections(&self, peer: SignPk, addr: link::CustomAddr) {
+        let Ok(id) = to_endpoint_id(&peer) else { return };
+        let endpoint = self.endpoint.clone();
+        tokio::spawn(async move {
+            endpoint.add_remote_addrs(EndpointAddr::from_parts(id, [iroh::TransportAddr::Custom(addr)])).await;
+        });
     }
 
     fn publish_link_addrs(&self, peer: SignPk) {

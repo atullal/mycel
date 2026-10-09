@@ -1670,6 +1670,19 @@ impl Endpoint {
         self.inner.network_change().await;
     }
 
+    /// MYCEL PATCH: tells the endpoint about new addresses for a remote it
+    /// already has state for (a live connection, or one being set up), for
+    /// example a link or mesh route found after the connection came up.
+    /// Custom-transport addresses are opened as paths on its live
+    /// connections. For a remote without state this does nothing: Address
+    /// Lookup supplies addresses when a connection is first made.
+    pub async fn add_remote_addrs(&self, addr: EndpointAddr) {
+        if self.is_closed() {
+            return;
+        }
+        self.inner.add_remote_addrs(addr).await;
+    }
+
     // # Methods to update internal state.
 
     /// Sets the initial user-defined data to be published in Address Lookups for this endpoint.

@@ -318,6 +318,17 @@ impl RemoteMap {
             .await
     }
 
+    /// MYCEL PATCH: new addresses for a remote that already has an actor (a
+    /// connection, or one being set up). Its actor opens custom-transport
+    /// ones as paths on its live connections. A remote without an actor is
+    /// left alone, so learning mesh routes to many devices costs nothing.
+    pub(super) fn add_remote_addrs(&mut self, addr: EndpointAddr) {
+        let EndpointAddr { id, addrs } = addr;
+        if let Some(sender) = self.senders.read_only().get(&id) {
+            sender.try_send(RemoteStateMessage::AddAddrs(addrs)).ok();
+        }
+    }
+
     pub(super) async fn add_connection(
         &mut self,
         remote: EndpointId,

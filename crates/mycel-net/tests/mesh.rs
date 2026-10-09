@@ -151,6 +151,28 @@ async fn shared(a: &Node, c: &Node) -> mycel_trust::SpaceId {
     space
 }
 
+/// A route that appears after a connection is up becomes a path on it:
+/// Iroh looks a peer's addresses up only while it has no working path, so
+/// the node hands it new ones (`Endpoint::add_remote_addrs`). Before that,
+/// a second route found a moment after connecting was never used.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_found_later_joins_the_live_connection() {
+    let (ab, bc, ad, dc) = (edge(20), edge(21), edge(22), edge(23));
+    let a = device("a", &[&ab, &ad], fast()).await;
+    let _b = device("b", &[&ab, &bc], fast()).await;
+    let c = device("c", &[&bc, &dc], fast()).await;
+    mesh_route(&a, &c).await;
+    let conn = a.connect(c.id(), BULK).await.unwrap();
+    push(&conn, 10_000).await;
+    let mesh_paths = |conn: &Connection| conn.paths().iter().filter(|p| PathKind::of(p.remote_addr()) == PathKind::Mesh).count();
+    assert_eq!(mesh_paths(&conn), 1, "one route so far: {}", path_report(&conn));
+
+    // D comes into range of both: a second route, after the connection
+    let _d = device("d", &[&ad, &dc], fast()).await;
+    eventually("a path over the new route", 20, || mesh_paths(&conn) >= 2).await;
+    push(&conn, 10_000).await;
+}
+
 fn path_report(conn: &Connection) -> String {
     conn.paths()
         .iter()

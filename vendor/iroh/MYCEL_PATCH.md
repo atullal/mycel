@@ -62,6 +62,26 @@ Changes (all in `src/socket/remote_map/remote_state.rs`, marked `MYCEL PATCH`):
      connections. Memory stays flat with the fix and grows ~4 MB a second
      without it.
 
+6. **Addresses found after a connection is up reach it**
+   (`Endpoint::add_remote_addrs`; `ActorMessage::AddRemoteAddrs`,
+   `RemoteMap::add_remote_addrs`, `RemoteStateMessage::AddAddrs`).
+   - Patch 2 opens custom addresses that Address Lookup returns. But a remote
+     runs Address Lookup only while it has no selected path, so a link or
+     mesh route found after the connection came up was never opened on it.
+     Mycel's `MemoryLookup` is pull-based and nothing pulled.
+   - Seen as `two_routes_aggregate_and_fail_over` failing ~35% of runs: when
+     the second mesh route was announced a moment after `connect`, the
+     connection kept one path.
+   - The new method hands a remote's actor addresses directly. It inserts
+     them, then queues every custom address to open on the live
+     connections, as patch 2 does. It starts no Address Lookup, and it does
+     nothing for a remote without an actor. Learning mesh routes to many
+     devices therefore costs nothing until one of them is connected.
+   - Mycel calls it whenever a link or mesh route adds an address
+     (`Inner::open_on_live_connections`).
+   - Covered by `crates/mycel-net/tests/mesh.rs`
+     (`a_route_found_later_joins_the_live_connection`).
+
 Path *selection* policy lives in Mycel: `mycel_net::link::MycelPathSelector`
 picks the selected path and which other paths join the aggregate.
 

@@ -1289,6 +1289,15 @@ impl EndpointInner {
             .ok();
     }
 
+    /// MYCEL PATCH: new addresses for a remote this endpoint already talks to
+    /// (see [`crate::Endpoint::add_remote_addrs`]).
+    pub(crate) async fn add_remote_addrs(&self, addr: EndpointAddr) {
+        self.actor_sender
+            .send(ActorMessage::AddRemoteAddrs(addr))
+            .await
+            .ok();
+    }
+
     #[cfg(all(test, with_crypto_provider))]
     async fn force_network_change(&self, is_major: bool) {
         self.actor_sender
@@ -1388,6 +1397,9 @@ enum ActorMessage {
     ),
     /// Re-evaluate direct addresses, e.g. after configured external addresses changed.
     DirectAddrRefresh,
+    /// MYCEL PATCH: addresses for a remote that already has state here.
+    #[debug("AddRemoteAddrs(..)")]
+    AddRemoteAddrs(EndpointAddr),
     #[cfg(all(test, with_crypto_provider))]
     ForceNetworkChange(bool),
 }
@@ -1782,6 +1794,9 @@ impl Actor {
             }
             ActorMessage::AddConnection(remote, conn, tx) => {
                 self.remote_map.add_connection(remote, conn, tx).await;
+            }
+            ActorMessage::AddRemoteAddrs(addr) => {
+                self.remote_map.add_remote_addrs(addr);
             }
             ActorMessage::DirectAddrRefresh => {
                 #[cfg(not(wasm_browser))]
