@@ -57,11 +57,17 @@ jobs:
           attempt() {
             local dir="$RUNNER_TEMP/smoke-$1"; shift
             env MYCEL_DATA_DIR="$dir" "$@" target/release/mycel-host > "$dir.out" 2>&1 &
-            local pid=$!
-            for _ in $(seq 40); do
+            local pid=$! started=$SECONDS
+            for i in $(seq 40); do
               grep -qs "mycel-host: data dir" "$dir/mycel.log" && break
+              if [ "$i" = 8 ]; then
+                # Not started yet: what is it waiting for? (Once.)
+                echo "== not started after 8 s; threads:"
+                sudo gdb -p "$pid" -batch -ex "thread apply all bt 25" 2>/dev/null | grep -E "^(#|Thread)" | head -120
+              fi
               sleep 1
             done
+            echo "== runtime opened after $((SECONDS - started)) s"
             sleep 10
             import -window root "$RUNNER_TEMP/mycel-linux.png" || true
             echo "== output"; cat "$dir.out"; echo "== mycel.log"; cat "$dir/mycel.log" 2>/dev/null || true

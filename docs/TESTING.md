@@ -232,4 +232,6 @@ automation tools don't support Xcode 27 yet).
 | Attachments from a desktop peer (PNG + text file) | Android | both arrive; the photo downloads and shows inline; the text file opens in the system viewer through the FileProvider ("Open with") |
 | Voice call setup | Android | system microphone prompt on the first call, then the desktop peer rings; hang-up shows "missed" there (no audio device in the emulator) |
 | Bluetooth / peer-to-peer Wi-Fi without the hardware | iPhone simulator | Bluetooth reports "Unsupported" and the app carries on |
-| Core tests on Linux and Windows | GitHub Actions (`apps.yml`) | first run: runtime, sync, trust, net, links pass; Apple-only video tests now skipped there; timing tests run optimised |
+| Core tests on Linux and Windows | GitHub Actions (`apps.yml`), optimised build | Linux: all pass. Windows: 265 of 267; the 2 failures rank emulated links by speed (timer granularity suspected). Apple-only video tests skipped there |
+| Linux and Windows apps launch | GitHub Actions smoke test | runtime opens, app still running after the wait, UI renders (WebKitGTK, WebView2 screenshots). Linux took ~25 s to open on the bare runner |
+| Rules engine at every optimisation level | `mycel-rules` tests at opt-level 2 | stack overflow with wasmi's tail-call dispatch; fixed with portable dispatch, same fuel (56603 for a 16 KiB message) |

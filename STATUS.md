@@ -48,8 +48,8 @@ How to build and install each one: [docs/PLATFORMS.md](docs/PLATFORMS.md).
 | macOS | as before (universal DMG) |
 | iPhone, iPad | Runs on the iOS 27 Simulator (iPhone and iPad layouts). Messages to and from a desktop peer work. On devices it needs an Apple ID in Xcode to sign (`scripts/package-ios.sh --install`). Voice calls use Apple's voice processing. Peer-to-peer Wi-Fi, Bluetooth and the camera now share the Mac code, but haven't run on an iPhone yet. |
 | Android 9+ | Signed release APK (`scripts/package-android.sh`). Tested on the Android 14 emulator: messages in both directions through the real UI, the on-screen keyboard, and profile and contact codes. Voice calls use the phone's echo canceller. No Bluetooth, Wi-Fi Direct or camera yet. |
-| Windows 10+ | NSIS installer and MSI built by GitHub Actions. Not run on a Windows machine yet. |
-| Linux | deb, rpm and AppImage built by GitHub Actions. Not run on a Linux desktop yet. |
+| Windows 10+ | NSIS installer and MSI built by GitHub Actions. CI launches the app on a Windows runner: the runtime opens and the UI renders in WebView2 (screenshot artifact). Not tried on a desktop PC yet. |
+| Linux | deb, rpm and AppImage built by GitHub Actions. CI launches the app under a virtual display: the runtime opens and the UI renders in WebKitGTK (screenshot artifact). On that bare CI machine it took about 25 s to open (likely a desktop D-Bus service timing out; being checked). Not tried on a Linux desktop yet. |
 
 ## Where to read
 
@@ -135,14 +135,28 @@ largest size this Mac runs. That's up to 100 seats for the conference and
 
 ## Known issues and open questions
 
+- **Fixed on 2026-10-09: rules engine stack overflow.** wasmi's tail-call
+  dispatch, which it picks in optimised builds, overflowed a 2 MiB thread
+  stack while validating chat messages at opt-level 2 on every platform we
+  tried. Release builds happened to pass. Mycel now uses wasmi's portable
+  (loop) dispatch everywhere, with identical fuel accounting. Builds made
+  before this commit (including the dev-2026-10-09 DMG) still have the
+  risky dispatch, though their release optimisation level passed the
+  tests.
+
 - **New platforms, first builds:**
-  - Windows and Linux builds have only passed CI so far.
+  - Windows and Linux builds have only run on CI machines so far.
   - iPhone peer-to-peer Wi-Fi, Bluetooth and the camera are untested on
     hardware.
   - The on-screen keyboard is checked on Android but not on an iPhone yet.
   - Phones suspend Mycel in the background. Messages arrive when it's opened
     again, or through a keeper or store-and-forward.
   - Sending video works from Apple devices only.
+  - Core tests on CI: Linux all pass. Windows 265 of 267 pass. The two
+    failures (`two_links_add_up`, `sync_over_links_and_fall_back_to_bluetooth`)
+    rank emulated links by measured speed. The suspect is Windows' coarse
+    default timer (about 15.6 ms) skewing the emulated links' pacing. Not
+    yet confirmed.
 
 - **Bluetooth between two real Macs.** The link connects without pairing, but
   in one test session one laptop kept hanging up after 5–10 s and stopped
