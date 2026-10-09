@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Measures the carrier fixes proposed in docs/BENCHMARKS.md §6, one at a time,
-on the same traces and workloads as bench/run.py (run that first: it makes
-the inputs). Each variant is `dtn-replay --carrier fixed --fixes <list>`
-(bench/mycel-bench/src/carrier_fixed.rs); `real` is the carrier in
-crates/mycel-net/src/mesh/dtn.rs.
+"""Measures the real carrier's policy knobs (`DtnConfig::tune`, docs/BENCHMARKS.md
+§6) one variant at a time, on the same traces and workloads as bench/run.py
+(run that first: it makes the inputs). Each variant is a set of dtn-replay
+flags; `default` is the carrier as shipped.
 
-  cargo build --release -p mycel-bench
+  cargo build --profile replay -p mycel-bench
   bench/ablation.py                      # the default grid below
-  bench/ablation.py --only helsinki --workloads heavy --variants real all
-  bench/ablation.py --summary-only --only cambridge infocom2005 infocom2006 infocom2006-gw helsinki helsinki-gw \
-      --workloads heavy chat         # results/ablation/ablation.md from what has run
+  bench/ablation.py --only helsinki --workloads heavy --variants default focus-both
+  bench/ablation.py --summary-only       # results/knobs/knobs.md from what has run
+
+results/ablation/ is the historical record of the first round, measured on
+an experimental copy of the carrier before the fixes were applied.
 
 MYCEL_REPLAY=<path> runs another dtn-replay build.
 """
@@ -23,15 +24,24 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import run as bench  # noqa: E402
 
-OUT = os.path.join(bench.RESULTS, "ablation")
-VARIANTS = ["real", "own", "free", "expiry", "resume", "own,free", "own,free,expiry", "all", "all,spray",
-            "all,evict", "all,fallback", "all,fallback,evict", "all,spray,evict", "all,spray,evict,inet", "all,spray,nograd", "all,spray,evict,nograd"]
-SCENARIOS = ["cambridge", "infocom2005", "helsinki", "helsinki-gw"]
+OUT = os.path.join(bench.RESULTS, "knobs")
+VARIANTS = {
+    "default": [],
+    # the simulator's first carrier changes: Spray-and-Focus, max(P(dst), P(internet))
+    "focus-both": ["--knobs", "spray=focus,gradient=both"],
+    "fallback": ["--knobs", "spray=fallback"],
+    "first-both": ["--knobs", "gradient=both"],
+    "first-destination": ["--knobs", "gradient=destination"],
+    "first-off": ["--knobs", "gradient=off"],
+    "copies-4": ["--copies", "4"],
+    "no-resume": ["--no-resume"],
+}
+SCENARIOS = list(bench.SCENARIOS)
 
 
 def one(scen, wl, variant, force):
     name = f"{scen}-{wl}"
-    out = os.path.join(OUT, f"{name}--{variant.replace(',', '+')}.txt")
+    out = os.path.join(OUT, f"{name}--{variant}.txt")
     if os.path.exists(out) and not force:
         return out
     _, _, gws = bench.SCENARIOS[scen]
@@ -40,11 +50,9 @@ def one(scen, wl, variant, force):
     cmd = [bench.REPLAY, "--contacts", os.path.join(bench.OUT, f"{trace}.csv"),
            "--messages", os.path.join(bench.OUT, f"{trace}-{wl}-msgs.csv"),
            "--ttl-min", str(ttl), "--label", f"{name}-{variant}",
-           "--latencies", out.replace(".txt", "-lat.csv")]
+           "--latencies", out.replace(".txt", "-lat.csv")] + VARIANTS[variant]
     if gws:
         cmd += ["--gateways", gws]
-    if variant != "real":
-        cmd += ["--carrier", "fixed", "--fixes", variant]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(f"{name} {variant}: {r.stderr[-2000:]}")
@@ -60,8 +68,8 @@ def within(lat_csv, secs):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--only", nargs="*", default=SCENARIOS)
-    p.add_argument("--workloads", nargs="*", default=["heavy"])
-    p.add_argument("--variants", nargs="*", default=VARIANTS)
+    p.add_argument("--workloads", nargs="*", default=list(bench.WORKLOADS))
+    p.add_argument("--variants", nargs="*", default=list(VARIANTS))
     p.add_argument("--jobs", type=int, default=2)
     p.add_argument("--force", action="store_true")
     p.add_argument("--summary-only", action="store_true")
@@ -73,21 +81,21 @@ def main():
             for fu in cf.as_completed([ex.submit(one, *j, a.force) for j in jobs]):
                 print("done", os.path.basename(fu.result()), flush=True)
     secs = [60, 600, 3600]
-    lines = ["| Scenario | Variant | Delivered | Median (s) | ≤ 1 min | ≤ 10 min | ≤ 1 h | Started | Refused | Aborted |",
-             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|"]
+    lines = ["| Scenario | Variant | Delivered | Median (s) | ≤ 1 min | ≤ 10 min | ≤ 1 h | Overhead | Offers | Refused | Cut |",
+             "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|"]
     for s in a.only:
         for w in a.workloads:
             for v in a.variants:
-                f = os.path.join(OUT, f"{s}-{w}--{v.replace(',', '+')}.txt")
+                f = os.path.join(OUT, f"{s}-{w}--{v}.txt")
                 if not os.path.exists(f):
                     continue
                 st = bench.parse_stats(f)
                 w1, w10, w60 = within(f.replace(".txt", "-lat.csv"), secs)
                 lines.append(f"| {s}-{w} | {v} | {100 * float(st['delivery_prob']):.1f} % | "
                              f"{float(st['latency_med']):.0f} | {w1:.1f} % | {w10:.1f} % | {w60:.1f} % | "
-                             f"{st['started']} | {st['refused']} | {st['aborted']} |")
+                             f"{float(st['overhead_ratio']):.1f} | {st['offers']} | {st['refused']} | {st['aborted']} |")
     table = "\n".join(lines) + "\n"
-    open(os.path.join(OUT, "ablation.md"), "w").write(table)
+    open(os.path.join(OUT, "knobs.md"), "w").write(table)
     print(table)
 
 

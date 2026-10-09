@@ -7,7 +7,7 @@
 //! - **Links, exactly as The ONE's `ActiveRouter` does**: a contact is a link
 //!   of `--speed` bytes/s. A device takes part in one transfer at a time (as
 //!   sender or receiver). A transfer completes after `size / speed` if the
-//!   contact lasts that long, else it's aborted. Completions are applied at
+//!   contact lasts that long, else it's cut. Completions are applied at
 //!   their exact time, before a contact goes down (The ONE updates every
 //!   host at every event). Deliveries go first.
 //! - **The router's live routes** (`Router::toward`): a breadth-first search
@@ -17,34 +17,36 @@
 //!   without the internet that can reach a gateway sends bundles it has no
 //!   route for toward the nearest one (the default route).
 //! - **The driver** (`mesh/mod.rs`): `encounter` when a contact comes up,
-//!   summaries on a new contact and every 5 s, `plan` every second.
+//!   summaries on a new contact and every 5 s, `plan` every second. Each
+//!   bundle is **offered** first and the payload sent only if the receiver
+//!   takes it, as the node does; an offer costs no link time here (a round
+//!   trip, against seconds of payload). A device tries its planned
+//!   transfers in order until one is taken.
+//! - **Resume**: a cut transfer leaves its bytes with the receiver
+//!   (`Carrier::keep_partial`), and the next offer of that bundle, from
+//!   anyone, sends only the rest. `--no-resume` turns that off (The ONE's
+//!   routers can't resume).
 //!
-//! `--carrier fixed --fixes own,free,expiry,resume,spray,evict,inet` runs the
-//! experimental copy in `carrier_fixed.rs` instead, with the proposed fixes
-//! switched on one at a time (docs/BENCHMARKS.md §6). `resume` is modelled
-//! here: an interrupted transfer keeps the bytes that arrived, and the next
-//! transfer of that bundle to that device only sends the rest.
+//! `--knobs spray=focus,gradient=both,...` sets carrier knobs
+//! (`DtnConfig::tune`); `--copies N` gives every bundle N copies whatever
+//! its size.
 //!
-//! Besides ONE's statistics it prints transfers by reason, the carriers'
-//! counters and `refused_by` (why receivers refused); `--latencies` writes
-//! every message's latency, for "delivered within" comparisons.
+//! Besides ONE's statistics it prints transfers by reason, offers, the
+//! carriers' counters and `refused_by` (why receivers refused); `--latencies`
+//! writes every message's latency, for "delivered within" comparisons.
 //!
 //! Usage:
 //!   dtn-replay --contacts c.csv --messages m.csv [--gateways 0-16]
 //!              [--speed 250000] [--buffer 5000000] [--ttl-min 300]
-//!              [--copies 4] [--end <s>] [--label name]
-//!              [--carrier real|fixed] [--fixes all,spray,evict,inet,...]
-//!              [--latencies out.csv] [--step-ms 1000]
+//!              [--copies N] [--knobs k=v,...] [--no-resume] [--end <s>]
+//!              [--label name] [--latencies out.csv] [--step-ms 1000]
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use bytes::Bytes;
 use mycel_crypto::{Hash32, Sig, SignPk};
 use mycel_net::mesh::core::{Time, Toward};
-use mycel_net::mesh::dtn::{self, Accepted, Bundle, DtnConfig, DtnStats, Receipt, Why};
-
-mod carrier_fixed;
-use carrier_fixed::Fixes;
+use mycel_net::mesh::dtn::{Accepted, Answer, Bundle, Carrier, DtnConfig, Offer, Receipt, Why};
 
 /// Payload bytes: bundles only need the right length.
 static ZERO: [u8; 4 << 20] = [0; 4 << 20];
@@ -68,119 +70,15 @@ struct Args {
     speed: u64,
     buffer: u64,
     ttl_ms: Time,
-    copies: u8,
+    copies: Option<u8>,
+    knobs: String,
+    resume: bool,
     end: Option<f64>,
     max_hops: usize,
     label: String,
-    fixed: bool,
-    fixes: Fixes,
     latencies: Option<String>,
     /// How often the carrier plans (the real driver: every second).
     step: Time,
-}
-
-/// The carrier API the replay drives: the real one, or the patched copy.
-trait Carry {
-    type Summary;
-    fn has_any(&self) -> bool;
-    fn set_internet(&mut self, on: bool);
-    fn encounter(&mut self, peer: SignPk, now: Time);
-    fn originate(&mut self, b: Bundle, now: Time) -> Result<(), &'static str>;
-    fn accept(&mut self, from: SignPk, b: Bundle, copies: u8, now: Time) -> Accepted;
-    fn summary(&self, now: Time) -> Self::Summary;
-    fn on_summary(&mut self, from: SignPk, s: Self::Summary, now: Time);
-    fn add_receipt(&mut self, r: Receipt);
-    fn plan(&mut self, now: Time, toward: impl FnMut(&SignPk) -> Toward, nbs: &[SignPk]) -> Vec<dtn::Transfer>;
-    fn transferred(&mut self, to: SignPk, id: Hash32, copies: u8, ok: bool, refused: bool, now: Time);
-    fn tick(&mut self, now: Time);
-    fn bundle(&self, id: &Hash32) -> Option<&Bundle>;
-    fn stats(&self) -> DtnStats;
-}
-
-impl Carry for dtn::Carrier {
-    type Summary = dtn::Summary;
-    fn has_any(&self) -> bool {
-        !self.held().is_empty()
-    }
-    fn set_internet(&mut self, on: bool) {
-        dtn::Carrier::set_internet(self, on)
-    }
-    fn encounter(&mut self, peer: SignPk, now: Time) {
-        dtn::Carrier::encounter(self, peer, now)
-    }
-    fn originate(&mut self, b: Bundle, now: Time) -> Result<(), &'static str> {
-        dtn::Carrier::originate(self, b, now)
-    }
-    fn accept(&mut self, from: SignPk, b: Bundle, copies: u8, now: Time) -> Accepted {
-        dtn::Carrier::accept(self, from, b, copies, now, |_| true)
-    }
-    fn summary(&self, now: Time) -> dtn::Summary {
-        dtn::Carrier::summary(self, now)
-    }
-    fn on_summary(&mut self, from: SignPk, s: dtn::Summary, now: Time) {
-        dtn::Carrier::on_summary(self, from, s, now, |_| true)
-    }
-    fn add_receipt(&mut self, r: Receipt) {
-        dtn::Carrier::add_receipt(self, r)
-    }
-    fn plan(&mut self, now: Time, toward: impl FnMut(&SignPk) -> Toward, nbs: &[SignPk]) -> Vec<dtn::Transfer> {
-        dtn::Carrier::plan(self, now, toward, nbs)
-    }
-    fn transferred(&mut self, to: SignPk, id: Hash32, copies: u8, ok: bool, _refused: bool, now: Time) {
-        dtn::Carrier::transferred(self, to, id, copies, ok, now)
-    }
-    fn tick(&mut self, now: Time) {
-        dtn::Carrier::tick(self, now)
-    }
-    fn bundle(&self, id: &Hash32) -> Option<&Bundle> {
-        dtn::Carrier::bundle(self, id)
-    }
-    fn stats(&self) -> DtnStats {
-        dtn::Carrier::stats(self)
-    }
-}
-
-impl Carry for carrier_fixed::Carrier {
-    type Summary = carrier_fixed::FixedSummary;
-    fn has_any(&self) -> bool {
-        carrier_fixed::Carrier::has_any(self)
-    }
-    fn set_internet(&mut self, on: bool) {
-        carrier_fixed::Carrier::set_internet(self, on)
-    }
-    fn encounter(&mut self, peer: SignPk, now: Time) {
-        carrier_fixed::Carrier::encounter(self, peer, now)
-    }
-    fn originate(&mut self, b: Bundle, now: Time) -> Result<(), &'static str> {
-        carrier_fixed::Carrier::originate(self, b, now)
-    }
-    fn accept(&mut self, from: SignPk, b: Bundle, copies: u8, now: Time) -> Accepted {
-        carrier_fixed::Carrier::accept(self, from, b, copies, now)
-    }
-    fn summary(&self, now: Time) -> carrier_fixed::FixedSummary {
-        carrier_fixed::Carrier::summary(self, now)
-    }
-    fn on_summary(&mut self, from: SignPk, s: carrier_fixed::FixedSummary, now: Time) {
-        carrier_fixed::Carrier::on_summary(self, from, s, now)
-    }
-    fn add_receipt(&mut self, r: Receipt) {
-        carrier_fixed::Carrier::add_receipt(self, r)
-    }
-    fn plan(&mut self, now: Time, toward: impl FnMut(&SignPk) -> Toward, nbs: &[SignPk]) -> Vec<dtn::Transfer> {
-        carrier_fixed::Carrier::plan(self, now, toward, nbs)
-    }
-    fn transferred(&mut self, to: SignPk, id: Hash32, copies: u8, ok: bool, refused: bool, now: Time) {
-        carrier_fixed::Carrier::transferred(self, to, id, copies, ok, refused, now)
-    }
-    fn tick(&mut self, now: Time) {
-        carrier_fixed::Carrier::tick(self, now)
-    }
-    fn bundle(&self, id: &Hash32) -> Option<&Bundle> {
-        carrier_fixed::Carrier::bundle(self, id)
-    }
-    fn stats(&self) -> DtnStats {
-        carrier_fixed::Carrier::stats(self)
-    }
 }
 
 fn parse_ranges(s: &str) -> BTreeSet<usize> {
@@ -204,17 +102,21 @@ fn args() -> Args {
         speed: 250_000,
         buffer: 5_000_000,
         ttl_ms: 300 * 60_000,
-        copies: 4,
+        copies: None,
+        knobs: String::new(),
+        resume: true,
         end: None,
         max_hops: 8,
         label: "mycel".into(),
-        fixed: false,
-        fixes: Fixes::default(),
         latencies: None,
         step: 1_000,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
+        if flag == "--no-resume" {
+            a.resume = false;
+            continue;
+        }
         let mut v = || it.next().unwrap_or_else(|| panic!("{flag} needs a value"));
         match flag.as_str() {
             "--contacts" => a.contacts = v(),
@@ -223,18 +125,11 @@ fn args() -> Args {
             "--speed" => a.speed = v().parse().unwrap(),
             "--buffer" => a.buffer = v().parse().unwrap(),
             "--ttl-min" => a.ttl_ms = v().parse::<u64>().unwrap() * 60_000,
-            "--copies" => a.copies = v().parse().unwrap(),
+            "--copies" => a.copies = Some(v().parse().unwrap()),
+            "--knobs" => a.knobs = v(),
             "--end" => a.end = Some(v().parse().unwrap()),
             "--max-hops" => a.max_hops = v().parse().unwrap(),
             "--label" => a.label = v(),
-            "--carrier" => {
-                a.fixed = match v().as_str() {
-                    "real" => false,
-                    "fixed" => true,
-                    other => panic!("--carrier real|fixed, not {other}"),
-                }
-            }
-            "--fixes" => a.fixes = Fixes::parse(&v()),
             "--latencies" => a.latencies = Some(v()),
             "--step-ms" => a.step = v().parse().unwrap(),
             other => panic!("unknown flag {other}"),
@@ -300,7 +195,11 @@ struct Transfer {
     from: usize,
     to: usize,
     id: Hash32,
+    src: SignPk,
     copies: u8,
+    /// Bytes the receiver had before this transfer (a resume).
+    have: u64,
+    size: u64,
     started: Time,
     done_at: Time,
 }
@@ -310,17 +209,24 @@ struct Counters {
     started: u64,
     relayed: u64,
     aborted: u64,
+    offers: u64,
     refused: u64,
+    duplicates: u64,
     refused_why: std::collections::BTreeMap<&'static str, u64>,
     by_why: [u64; 4],
 }
 
-struct Sim<C: Carry> {
-    a: Args,
-    n: usize,
-    nodes: Vec<C>,
+/// Who is in contact with whom right now, and who has the internet.
+struct Net {
     adj: Vec<BTreeSet<usize>>,
     internet: Vec<bool>,
+}
+
+struct Sim {
+    a: Args,
+    n: usize,
+    nodes: Vec<Carrier>,
+    net: Net,
     busy: Vec<bool>,
     active: Vec<Transfer>,
     last_summary: HashMap<(usize, usize), Time>,
@@ -328,38 +234,46 @@ struct Sim<C: Carry> {
     meta: HashMap<Hash32, (usize, Time)>,
     delivered: HashMap<Hash32, (Time, u32)>,
     hops: HashMap<(usize, Hash32), u32>,
-    /// Bytes of a bundle a device already has from interrupted transfers
-    /// (the `resume` fix).
-    partial: HashMap<(usize, Hash32), u64>,
     c: Counters,
 }
 
-impl<C: Carry> Sim<C> {
+fn rank(w: Why) -> usize {
+    match w {
+        Why::Deliver => 0,
+        Why::Route => 1,
+        Why::Gradient => 2,
+        Why::Spray => 3,
+    }
+}
+
+impl Sim {
     fn neighbours(&self, i: usize) -> Vec<usize> {
-        let mut v: Vec<usize> = self.adj[i].iter().copied().collect();
-        if self.internet[i] {
-            v.extend(self.a.gateways.iter().copied().filter(|g| *g != i && !self.adj[i].contains(g)));
+        let mut v: Vec<usize> = self.net.adj[i].iter().copied().collect();
+        if self.net.internet[i] {
+            v.extend(self.a.gateways.iter().copied().filter(|g| *g != i && !self.net.adj[i].contains(g)));
         }
         v
     }
 
     /// First hops from `i` toward every device reachable now, and toward the
     /// nearest gateway.
-    fn routes_from(&self, i: usize) -> (Vec<Option<usize>>, Option<usize>) {
-        let mut first: Vec<Option<usize>> = vec![None; self.n];
-        let mut depth = vec![usize::MAX; self.n];
+    fn routes_from(net: &Net, a: &Args, i: usize) -> (Vec<Option<usize>>, Option<usize>) {
+        let n = net.adj.len();
+        let mut first: Vec<Option<usize>> = vec![None; n];
+        let mut depth = vec![usize::MAX; n];
         let mut q = VecDeque::new();
         depth[i] = 0;
         q.push_back(i);
         let mut nearest_gw = None;
         while let Some(x) = q.pop_front() {
-            if x != i && self.internet[x] && nearest_gw.is_none() {
+            if x != i && net.internet[x] && nearest_gw.is_none() {
                 nearest_gw = first[x];
             }
-            if depth[x] >= self.a.max_hops {
+            if depth[x] >= a.max_hops {
                 continue;
             }
-            for y in self.neighbours(x) {
+            let gws = net.internet[x].then_some(&a.gateways).into_iter().flatten();
+            for &y in net.adj[x].iter().chain(gws) {
                 if depth[y] == usize::MAX {
                     depth[y] = depth[x] + 1;
                     first[y] = if x == i { Some(y) } else { first[x] };
@@ -367,18 +281,24 @@ impl<C: Carry> Sim<C> {
                 }
             }
         }
-        (first, if self.internet[i] { None } else { nearest_gw })
+        (first, if net.internet[i] { None } else { nearest_gw })
+    }
+
+    fn refuse(&mut self, from: usize, to: usize, id: Hash32, why: &'static str, t: Time) {
+        self.c.refused += 1;
+        *self.c.refused_why.entry(why).or_default() += 1;
+        self.nodes[from].refused(key(to), id, why == "store full", t);
     }
 
     fn contact(&mut self, t: Time, up: bool, a: usize, b: usize) {
         if up {
-            self.adj[a].insert(b);
-            self.adj[b].insert(a);
+            self.net.adj[a].insert(b);
+            self.net.adj[b].insert(a);
             self.nodes[a].encounter(key(b), t);
             self.nodes[b].encounter(key(a), t);
         } else {
-            self.adj[a].remove(&b);
-            self.adj[b].remove(&a);
+            self.net.adj[a].remove(&b);
+            self.net.adj[b].remove(&a);
             self.last_summary.remove(&(a, b));
             self.last_summary.remove(&(b, a));
             let (mut keep, mut cut) = (Vec::new(), Vec::new());
@@ -393,11 +313,14 @@ impl<C: Carry> Sim<C> {
             for tr in cut {
                 self.busy[tr.from] = false;
                 self.busy[tr.to] = false;
-                if self.a.fixes.resume {
-                    let got = t.saturating_sub(tr.started) * self.a.speed / 1000;
-                    *self.partial.entry((tr.to, tr.id)).or_default() += got;
+                if self.a.resume {
+                    // what arrived stays with the receiver, as on the node
+                    let got = (tr.have + t.saturating_sub(tr.started) * self.a.speed / 1000).min(tr.size);
+                    if got > tr.have {
+                        self.nodes[tr.to].keep_partial(tr.id, tr.src, Bytes::from_static(&ZERO[..got as usize]), t);
+                    }
                 }
-                self.nodes[tr.from].transferred(key(tr.to), tr.id, tr.copies, false, false, t);
+                self.nodes[tr.from].transferred(key(tr.to), tr.id, tr.copies, false, t);
                 self.c.aborted += 1;
             }
         }
@@ -411,44 +334,39 @@ impl<C: Carry> Sim<C> {
             self.busy[tr.to] = false;
             let Some(b) = self.nodes[tr.from].bundle(&tr.id).cloned() else {
                 // expired or cleared by a receipt mid-transfer
-                self.nodes[tr.from].transferred(key(tr.to), tr.id, tr.copies, false, false, t);
+                self.nodes[tr.from].transferred(key(tr.to), tr.id, tr.copies, false, t);
                 continue;
             };
-            self.partial.remove(&(tr.to, tr.id));
             let h = self.hops.get(&(tr.from, tr.id)).copied().unwrap_or(0) + 1;
-            let mut refused = false;
-            let ok = match self.nodes[tr.to].accept(key(tr.from), b, tr.copies, t) {
+            match self.nodes[tr.to].accept(key(tr.from), b, tr.copies, t, |_| true) {
                 Accepted::ForMe(b) => {
                     self.delivered.entry(b.id).or_insert((t, h));
                     self.nodes[tr.to].add_receipt(Receipt { id: b.id, dst: b.dst, sig: Sig([0; 64]) });
-                    true
                 }
                 Accepted::Stored => {
                     self.hops.insert((tr.to, tr.id), h);
-                    true
                 }
-                Accepted::Duplicate => true,
+                Accepted::Duplicate => {}
                 Accepted::Refused(why) => {
-                    self.c.refused += 1;
-                    *self.c.refused_why.entry(why).or_default() += 1;
-                    refused = true;
-                    false
+                    // room went between the offer and the end of the payload
+                    self.refuse(tr.from, tr.to, tr.id, why, t);
+                    continue;
                 }
-            };
-            if ok {
-                self.c.relayed += 1;
             }
-            self.nodes[tr.from].transferred(key(tr.to), tr.id, tr.copies, ok, refused, t);
+            self.c.relayed += 1;
+            self.nodes[tr.from].transferred(key(tr.to), tr.id, tr.copies, true, t);
         }
     }
 
     fn summaries(&mut self, t: Time) {
         for i in 0..self.n {
+            // one summary per device per step, to every neighbour it's due for
+            let mut s = None;
             for j in self.neighbours(i) {
                 let due = self.last_summary.get(&(i, j)).is_none_or(|at| t.saturating_sub(*at) >= SUMMARY_EVERY);
                 if due {
-                    let s = self.nodes[i].summary(t);
-                    self.nodes[j].on_summary(key(i), s, t);
+                    let s = s.get_or_insert_with(|| self.nodes[i].summary(t)).clone();
+                    self.nodes[j].on_summary(key(i), s, t, |_| true);
                     self.last_summary.insert((i, j), t);
                 }
             }
@@ -461,45 +379,66 @@ impl<C: Carry> Sim<C> {
                 continue;
             }
             let nbs = self.neighbours(i);
-            if nbs.is_empty() {
+            // nothing can start (and planning changes nothing) if every neighbour is busy
+            if nbs.iter().all(|j| self.busy[*j]) {
                 continue;
             }
             let keys: Vec<SignPk> = nbs.iter().map(|j| key(*j)).collect();
-            let (first, gw) = self.routes_from(i);
-            let plan = self.nodes[i].plan(
-                t,
-                |dst| match first.get(idx(dst)).copied().flatten().or(gw) {
-                    Some(n) => Toward::Hop(key(n)),
-                    None => Toward::Nowhere,
-                },
-                &keys,
-            );
-            let rank = |w: Why| match w {
-                Why::Deliver => 0,
-                Why::Route => 1,
-                Why::Gradient => 2,
-                Why::Spray => 3,
+            // routes only if a bundle needs them (most are for a neighbour, or none)
+            let mut routes = None;
+            let mut plan = {
+                let (net, a, routes) = (&self.net, &self.a, &mut routes);
+                self.nodes[i].plan(
+                    t,
+                    |dst| {
+                        let (first, gw) = routes.get_or_insert_with(|| Sim::routes_from(net, a, i));
+                        match first.get(idx(dst)).copied().flatten().or(*gw) {
+                            Some(n) => Toward::Hop(key(n)),
+                            None => Toward::Nowhere,
+                        }
+                    },
+                    &keys,
+                )
             };
-            let pick = plan
-                .iter()
-                .enumerate()
-                .filter(|(_, tr)| !self.busy[idx(&tr.to)])
-                .min_by_key(|(k, tr)| (rank(tr.why), *k))
-                .map(|(k, _)| k);
-            for (k, tr) in plan.into_iter().enumerate() {
-                if Some(k) != pick {
-                    self.nodes[i].transferred(tr.to, tr.id, tr.copies, false, false, t);
+            plan.sort_by_key(|tr| rank(tr.why));
+            // offer in order until one is taken; the rest wait for the next plan
+            let mut started = false;
+            for tr in plan {
+                let to = idx(&tr.to);
+                if started || self.busy[to] {
+                    self.nodes[i].transferred(tr.to, tr.id, tr.copies, false, t);
                     continue;
                 }
-                let to = idx(&tr.to);
-                let size = self.nodes[i].bundle(&tr.id).map_or(0, |b| b.payload.len()) as u64;
-                let have = self.partial.get(&(to, tr.id)).copied().unwrap_or(0).min(size);
-                let dur = ((size - have) * 1000).div_ceil(self.a.speed).max(1);
-                self.busy[i] = true;
-                self.busy[to] = true;
-                self.c.started += 1;
-                self.c.by_why[rank(tr.why)] += 1;
-                self.active.push(Transfer { from: i, to, id: tr.id, copies: tr.copies, started: t, done_at: t + dur });
+                let Some(b) = self.nodes[i].bundle(&tr.id) else { continue };
+                let offer = Offer::of(b, tr.copies);
+                self.c.offers += 1;
+                match self.nodes[to].offered(key(i), &offer, t, |_| true) {
+                    Answer::Refuse(why) => self.refuse(i, to, tr.id, why, t),
+                    Answer::Duplicate => {
+                        self.c.duplicates += 1;
+                        self.nodes[i].transferred(tr.to, tr.id, tr.copies, true, t);
+                    }
+                    Answer::Take { from } => {
+                        let from = if self.a.resume { from } else { 0 };
+                        let dur = ((offer.size - from) * 1000).div_ceil(self.a.speed).max(1);
+                        self.busy[i] = true;
+                        self.busy[to] = true;
+                        self.c.started += 1;
+                        self.c.by_why[rank(tr.why)] += 1;
+                        self.active.push(Transfer {
+                            from: i,
+                            to,
+                            id: tr.id,
+                            src: offer.src,
+                            copies: tr.copies,
+                            have: from,
+                            size: offer.size,
+                            started: t,
+                            done_at: t + dur,
+                        });
+                        started = true;
+                    }
+                }
             }
         }
     }
@@ -507,44 +446,38 @@ impl<C: Carry> Sim<C> {
 
 fn main() {
     let a = args();
-    if a.fixed {
-        let fixes = a.fixes;
-        run(a, |me, cfg| carrier_fixed::Carrier::new(me, cfg, fixes));
-    } else {
-        run(a, dtn::Carrier::new);
-    }
-}
-
-fn run<C: Carry>(a: Args, make: impl Fn(SignPk, DtnConfig) -> C) {
     let (events, n_trace, trace_end) = read_contacts(&a.contacts, &a.gateways);
     let msgs = read_messages(&a.messages);
     let n = n_trace.max(msgs.iter().map(|m| m.src.max(m.dst) + 1).max().unwrap_or(0));
     let end = a.end.map_or(trace_end, |s| (s * 1000.0) as Time);
-    let cfg = DtnConfig {
+    let mut cfg = DtnConfig {
         capacity: a.buffer,
         max_bundle: ZERO.len(),
         per_source: a.buffer,
         max_lifetime: 7 * 24 * 3_600_000,
-        copies: a.copies,
-        carry: true,
+        ..DtnConfig::default()
     };
+    if let Some(c) = a.copies {
+        cfg.copies = c;
+        cfg.copies_small = c;
+    }
+    cfg.tune(&a.knobs).unwrap_or_else(|e| panic!("--knobs: {e}"));
+    eprintln!("carrier: {cfg:?}, resume {}", a.resume);
     let mut sim = Sim {
         n,
-        nodes: (0..n).map(|i| make(key(i), cfg.clone())).collect(),
-        adj: vec![BTreeSet::new(); n],
-        internet: (0..n).map(|i| a.gateways.contains(&i)).collect(),
+        nodes: (0..n).map(|i| Carrier::new(key(i), cfg.clone())).collect(),
+        net: Net { adj: vec![BTreeSet::new(); n], internet: (0..n).map(|i| a.gateways.contains(&i)).collect() },
         busy: vec![false; n],
         active: Vec::new(),
         last_summary: HashMap::new(),
         meta: HashMap::new(),
         delivered: HashMap::new(),
         hops: HashMap::new(),
-        partial: HashMap::new(),
         c: Counters::default(),
         a,
     };
     for i in 0..n {
-        let on = sim.internet[i];
+        let on = sim.net.internet[i];
         sim.nodes[i].set_internet(on);
     }
     let (mut ei, mut mi) = (0, 0);
@@ -563,6 +496,7 @@ fn run<C: Carry>(a: Args, make: impl Fn(SignPk, DtnConfig) -> C) {
         while mi < msgs.len() && msgs[mi].at <= t {
             let m = &msgs[mi];
             let id = bundle_id(mi);
+            // `created` on the carriers' clock (they keep no wall-clock offset)
             let b = Bundle {
                 id,
                 src: key(m.src),
@@ -623,12 +557,14 @@ fn run<C: Carry>(a: Args, make: impl Fn(SignPk, DtnConfig) -> C) {
     let delivered = lat.len();
     let mean = |v: &[f64]| if v.is_empty() { f64::NAN } else { v.iter().sum::<f64>() / v.len() as f64 };
     let med = |v: &[f64]| if v.is_empty() { f64::NAN } else { v[v.len() / 2] };
-    let stats = sim.nodes.iter().fold([0u64; 4], |mut acc, c| {
+    let stats = sim.nodes.iter().fold([0u64; 6], |mut acc, c| {
         let s = c.stats();
         acc[0] += s.expired;
         acc[1] += s.cleared_by_receipt;
         acc[2] += s.refused;
         acc[3] += s.accepted;
+        acc[4] += s.evicted;
+        acc[5] += s.resumed;
         acc
     });
     println!("Message stats for scenario {}", sim.a.label);
@@ -637,7 +573,9 @@ fn run<C: Carry>(a: Args, make: impl Fn(SignPk, DtnConfig) -> C) {
     println!("started: {}", sim.c.started);
     println!("relayed: {}", sim.c.relayed);
     println!("aborted: {}", sim.c.aborted);
+    println!("offers: {}", sim.c.offers);
     println!("refused: {}", sim.c.refused);
+    println!("duplicates: {}", sim.c.duplicates);
     println!("delivered: {delivered}");
     println!("delivered_after_ttl: {late}");
     println!("delivery_prob: {:.4}", delivered as f64 / created as f64);
@@ -653,7 +591,10 @@ fn run<C: Carry>(a: Args, make: impl Fn(SignPk, DtnConfig) -> C) {
         "transfers_by_reason: deliver {} route {} gradient {} spray {}",
         sim.c.by_why[0], sim.c.by_why[1], sim.c.by_why[2], sim.c.by_why[3]
     );
-    println!("carrier: expired {} cleared_by_receipt {} refused {} accepted {}", stats[0], stats[1], stats[2], stats[3]);
+    println!(
+        "carrier: expired {} cleared_by_receipt {} refused {} accepted {} evicted {} resumed {}",
+        stats[0], stats[1], stats[2], stats[3], stats[4], stats[5]
+    );
     println!("refused_by: {:?}", sim.c.refused_why);
     eprintln!("({} devices, {} contact events, {:.1} s)", n, events.len(), wall.elapsed().as_secs_f64());
 }

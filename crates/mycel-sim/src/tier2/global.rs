@@ -42,7 +42,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use mycel_crypto::{Sig, SignPk};
 use mycel_crypto::Hash32;
 use mycel_net::mesh::core::{self as mc, Announce, Config, Out, SeqReq};
-use mycel_net::mesh::dtn::{Accepted, Bundle, Carrier, DtnConfig, Receipt, Summary as DtnSummary};
+use mycel_net::mesh::dtn::{Accepted, Answer, Bundle, Carrier, DtnConfig, Offer, Receipt, Summary as DtnSummary};
 
 use super::engine::{Cx, MS, MsgId, NodeId, Over, Router, SEC, Techs, Time};
 use super::mycel::Role;
@@ -76,7 +76,10 @@ pub enum Frame {
     Dial,
     DialAck,
     Hangup,
-    /// Store-and-forward: a bundle with `copies` copies (custody if all).
+    /// Store-and-forward: a bundle offered before its payload, the
+    /// answer, then the bundle with `copies` copies (custody if all).
+    Offer(Offer),
+    Answer { id: Hash32, copies: u8, answer: Answer },
     Bundle(Bundle, u8),
     BundleAck { id: Hash32, copies: u8, ok: bool },
     Summary(Rc<DtnSummary>),
@@ -195,7 +198,10 @@ impl Global {
 
     /// Turn on store-and-forward.
     pub fn with_dtn(mut self, cfg: DtnConfig) -> Global {
-        self.dtn = Some(Carrier::new(self.pk, cfg));
+        let mut c = Carrier::new(self.pk, cfg);
+        // bundles' `created` is a wall clock: WALL_MS at our time 0
+        c.set_clock(0, WALL_MS);
+        self.dtn = Some(c);
         self
     }
 
@@ -217,14 +223,15 @@ impl Global {
         c.set_internet(cx.has_inet());
         let nbs: Vec<SignPk> = core.neighbours().into_iter().map(|(k, _)| k).collect();
         let plan = c.plan(now, |d| core.toward(d, now), &nbs);
-        let sends: Vec<(NodeId, Bundle, u8)> =
-            plan.into_iter().filter_map(|t| c.bundle(&t.id).cloned().map(|b| (node(&t.to), b, t.copies))).collect();
-        for (to, b, copies) in sends {
-            let msg = bundle_msg(&b.id);
-            if !self.send_to(cx, to, Frame::Bundle(b.clone(), copies), Some(msg)) {
+        // offered first, as the node does: the payload follows a "take"
+        let offers: Vec<(NodeId, Offer)> =
+            plan.into_iter().filter_map(|t| c.bundle(&t.id).map(|b| (node(&t.to), Offer::of(b, t.copies)))).collect();
+        for (to, o) in offers {
+            let (id, copies) = (o.id, o.copies);
+            if !self.send_to(cx, to, Frame::Offer(o), None) {
                 let now = Self::ms(cx);
                 if let Some(c) = self.dtn.as_mut() {
-                    c.transferred(key(to), b.id, copies, false, now);
+                    c.transferred(key(to), id, copies, false, now);
                 }
             }
         }
@@ -473,9 +480,11 @@ impl Router for Global {
             Frame::Direct(p) => p.len() as u32 + 20,
             Frame::Dial | Frame::DialAck => HANDSHAKE,
             Frame::Hangup => 50,
-            Frame::Bundle(b, _) => b.payload.len() as u32 + 200,
+            Frame::Offer(_) => 200,
+            Frame::Answer { .. } => 60,
+            Frame::Bundle(b, _) => b.payload.len() as u32 + 80,
             Frame::BundleAck { .. } => 80,
-            Frame::Summary(s) => (8 + 32 * s.ids.len() + 96 * s.receipts.len() + 36 * s.preds.len()) as u32,
+            Frame::Summary(s) => (16 + 32 * s.ids.len() + 96 * s.receipts.len() + 36 * s.preds.len() + 16 * s.evictable.len()) as u32,
         }
     }
 
@@ -585,6 +594,30 @@ impl Router for Global {
                 };
                 self.send_to(cx, from, Frame::BundleAck { id, copies, ok }, None);
                 self.dtn_plan(cx);
+            }
+            Frame::Offer(o) => {
+                let answer = self.dtn.as_mut().map_or(Answer::Refuse("not carrying"), |c| c.offered(fpk, &o, now, |_| true));
+                self.send_to(cx, from, Frame::Answer { id: o.id, copies: o.copies, answer }, None);
+            }
+            Frame::Answer { id, copies, answer } => {
+                let Some(c) = self.dtn.as_mut() else { return };
+                match answer {
+                    Answer::Take { .. } => match c.bundle(&id).cloned() {
+                        // (frames arrive whole here: nothing to resume)
+                        Some(b) => {
+                            let msg = bundle_msg(&id);
+                            if !self.send_to(cx, from, Frame::Bundle(b, copies), Some(msg))
+                                && let Some(c) = self.dtn.as_mut()
+                            {
+                                c.transferred(fpk, id, copies, false, now);
+                            }
+                        }
+                        None => c.transferred(fpk, id, copies, false, now),
+                    },
+                    Answer::Duplicate => c.transferred(fpk, id, copies, true, now),
+                    Answer::Refuse(why) => c.refused(fpk, id, why == "store full", now),
+                }
+                self.note_buffer(cx);
             }
             Frame::BundleAck { id, copies, ok } => {
                 if let Some(c) = self.dtn.as_mut() {
@@ -732,6 +765,11 @@ impl Router for Global {
             Frame::Bundle(b, copies) => {
                 if let Some(c) = self.dtn.as_mut() {
                     c.transferred(key(to), b.id, copies, false, now);
+                }
+            }
+            Frame::Offer(o) => {
+                if let Some(c) = self.dtn.as_mut() {
+                    c.transferred(key(to), o.id, o.copies, false, now);
                 }
             }
             _ => {}

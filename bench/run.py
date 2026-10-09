@@ -4,7 +4,7 @@ contact traces and message workloads (docs/BENCHMARKS.md).
 
   bench/fetch.sh                 # tools and traces (once)
   bench/one/one.sh build         # compile The ONE (once)
-  cargo build --release -p mycel-bench
+  cargo build --profile replay -p mycel-bench   # (speed-optimised; --release works too)
   bench/run.py                   # everything below, skipping what exists
   bench/run.py --only cambridge  # one scenario
   bench/run.py --force           # redo all runs
@@ -29,7 +29,9 @@ CONVERT = [sys.executable, os.path.join(HERE, "traces", "convert.py")]
 OUT = os.path.join(HERE, "traces", "out")
 RESULTS = os.path.join(HERE, "results")
 GEN = os.path.join(HERE, "one", "gen")
-REPLAY = os.environ.get("MYCEL_REPLAY", os.path.join(ROOT, "target", "release", "dtn-replay"))
+REPLAY = os.environ.get("MYCEL_REPLAY") or next(
+    (p for p in (os.path.join(ROOT, "target", d, "dtn-replay") for d in ("replay", "release")) if os.path.exists(p)),
+    os.path.join(ROOT, "target", "release", "dtn-replay"))
 
 ROUTERS = ["EpidemicRouter", "ProphetRouter", "SprayAndWaitRouter", "MaxPropRouter", "DirectDeliveryRouter"]
 

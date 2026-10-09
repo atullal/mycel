@@ -232,7 +232,7 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                 |i, _| {
                     let mut r = Global::new(i, global_cfg(g, seed, i), shared.clone());
                     if g.dtn {
-                        r = r.with_dtn(plan.dtn.clone().unwrap_or_default());
+                        r = r.with_dtn(dtn_cfg(plan));
                         r.bundle_lifetime_ms = plan.bundle_lifetime_ms.unwrap_or(24 * 3600 * 1000);
                     }
                     r.role = plan.role(i);
@@ -1124,6 +1124,16 @@ fn adversarial(o: Opts) -> ScenarioResult {
 /// A world for a contact trace: one device per trace node, far apart (no
 /// links from geometry), every contact a trace event over The ONE's
 /// default Bluetooth interface (250 kB/s).
+/// The scenario's carrier settings, with `MYCEL_DTN` knobs on top (e.g.
+/// `MYCEL_DTN=spray=focus,gradient=both`; see `DtnConfig::tune`).
+fn dtn_cfg(plan: &Plan) -> mycel_net::mesh::dtn::DtnConfig {
+    let mut cfg = plan.dtn.clone().unwrap_or_default();
+    if let Ok(k) = std::env::var("MYCEL_DTN") {
+        cfg.tune(&k).expect("MYCEL_DTN");
+    }
+    cfg
+}
+
 fn trace_world(t: &crate::traces::Trace) -> (World, Vec<(Time, Action)>) {
     let w = World {
         areas: vec![Area { latlon: (52.2, 0.12), env: Env::Indoor }],
@@ -1151,7 +1161,7 @@ fn trace_replay(o: Opts) -> ScenarioResult {
             }
         },
         Err(_) => {
-            r.note("No MYCEL_TRACE set: using a synthetic trace of the same shape (scripts/traces/fetch-crawdad.sh gets the real Haggle traces with a free IEEE DataPort account). Numbers below are for the synthetic trace.");
+            r.note("No MYCEL_TRACE set: using a synthetic trace of the same shape (bench/fetch.sh traces gets the real Haggle traces into bench/data/). Numbers below are for the synthetic trace.");
             crate::traces::synthetic(o.n(40, 12), (o.n(72, 12) as Time) * 3600 * SEC, o.seed)
         }
     };
@@ -1176,7 +1186,7 @@ fn trace_replay(o: Opts) -> ScenarioResult {
         per_source: 5 << 20,
         max_lifetime: ttl / MS,
         copies: 6,
-        carry: true,
+        ..mycel_net::mesh::dtn::DtnConfig::default()
     });
     plan.bundle_lifetime_ms = Some(ttl / MS);
     let until = trace.duration;

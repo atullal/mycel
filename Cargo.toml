@@ -46,6 +46,16 @@ lto = true
 opt-level = "s"
 strip = true
 
+# The benchmark replays (bench/mycel-bench) are compute-bound: speed, not
+# size, and symbols for profiling. `cargo build --profile replay -p mycel-bench`
+[profile.replay]
+inherits = "release"
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = false
+debug = "line-tables-only"
+
 # Iroh 1.3 with one change: custom-transport addresses (peer-to-peer Wi-Fi,
 # Bluetooth) are opened as backup paths on every connection, so a live
 # connection can move to them when its path dies; and several paths can be
