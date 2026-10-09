@@ -1,0 +1,20 @@
+Message stats for scenario helsinki-gw-heavy-MaxPropRouter
+sim_time: 43196.0000
+created: 1441
+started: 53442
+relayed: 27040
+aborted: 26399
+dropped: 23772
+removed: 3351
+delivered: 738
+delivery_prob: 0.5121
+response_prob: 0.0000
+overhead_ratio: 35.6396
+latency_avg: 5748.4392
+latency_med: 4527.1000
+hopcount_avg: 1.7575
+hopcount_med: 2
+buffertime_avg: 844.0908
+buffertime_med: 28.3000
+rtt_avg: NaN
+rtt_med: NaN

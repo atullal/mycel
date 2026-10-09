@@ -1,0 +1,18 @@
+Message stats for scenario helsinki-gw-chat-Mycel
+sim_time: 43195.6000
+created: 1444
+started: 17738
+relayed: 17738
+aborted: 0
+refused: 0
+delivered: 1310
+delivered_after_ttl: 0
+delivery_prob: 0.9072
+overhead_ratio: 12.5405
+latency_avg: 3755.2665
+latency_med: 2547.7000
+hopcount_avg: 4.4969
+hopcount_med: 4
+transfers_by_reason: deliver 1313 route 3342 gradient 13070 spray 13
+carrier: expired 0 cleared_by_receipt 2583 refused 0 accepted 16234
+# (126 devices, 61986 contact events, 19.8 s)

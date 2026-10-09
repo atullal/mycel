@@ -1,0 +1,19 @@
+Message stats for scenario helsinki-gw-chat-all,fallback
+sim_time: 43195.6000
+created: 1444
+started: 22128
+relayed: 22128
+aborted: 0
+refused: 0
+delivered: 1327
+delivered_after_ttl: 0
+delivery_prob: 0.9190
+overhead_ratio: 15.6752
+latency_avg: 3520.7705
+latency_med: 2258.7000
+hopcount_avg: 4.9932
+hopcount_med: 4
+transfers_by_reason: deliver 1334 route 3484 gradient 14388 spray 2922
+carrier: expired 0 cleared_by_receipt 3624 refused 0 accepted 20346
+refused_by: {}
+# (126 devices, 61986 contact events, 19.4 s)

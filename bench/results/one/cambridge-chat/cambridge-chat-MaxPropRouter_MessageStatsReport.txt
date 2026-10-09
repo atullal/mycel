@@ -1,0 +1,20 @@
+Message stats for scenario cambridge-chat-MaxPropRouter
+sim_time: 455610.0000
+created: 15173
+started: 54873
+relayed: 54845
+aborted: 28
+dropped: 17204
+removed: 41224
+delivered: 7808
+delivery_prob: 0.5146
+response_prob: 0.0000
+overhead_ratio: 6.0242
+latency_avg: 30008.5608
+latency_med: 26723.3000
+hopcount_avg: 2.3429
+hopcount_med: 2
+buffertime_avg: 27948.7403
+buffertime_med: 9102.0000
+rtt_avg: NaN
+rtt_med: NaN

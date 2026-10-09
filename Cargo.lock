@@ -3573,6 +3573,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mycel-bench"
+version = "0.0.1"
+dependencies = [
+ "bytes",
+ "mycel-crypto",
+ "mycel-net",
+ "serde_json",
+]
+
+[[package]]
 name = "mycel-call"
 version = "0.0.1"
 dependencies = [

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*", "apps/host/src-tauri"]
+members = ["crates/*", "apps/host/src-tauri", "bench/mycel-bench"]
 
 [workspace.package]
 edition = "2024"

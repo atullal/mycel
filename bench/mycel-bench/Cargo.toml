@@ -1,0 +1,24 @@
+[package]
+name = "mycel-bench"
+version = "0.0.1"
+edition = "2024"
+publish = false
+description = "Replays external benchmark inputs (contact traces, Meshtasticator topologies) through Mycel's sans-IO routing and store-and-forward cores."
+
+[[bin]]
+name = "dtn-replay"
+path = "src/dtn_replay.rs"
+
+[[bin]]
+name = "mesh-routing"
+path = "src/mesh_routing.rs"
+
+[[bin]]
+name = "route-check"
+path = "src/route_check.rs"
+
+[dependencies]
+bytes = "1.12"
+serde_json = "1.0.151"
+mycel-crypto = { version = "0.1.0", path = "../../crates/mycel-crypto" }
+mycel-net = { version = "0.1.0", path = "../../crates/mycel-net" }

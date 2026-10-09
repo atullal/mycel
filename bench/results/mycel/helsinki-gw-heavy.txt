@@ -1,0 +1,18 @@
+Message stats for scenario helsinki-gw-heavy-Mycel
+sim_time: 43195.6000
+created: 1441
+started: 37187
+relayed: 3369
+aborted: 21724
+refused: 12091
+delivered: 460
+delivered_after_ttl: 68
+delivery_prob: 0.3192
+overhead_ratio: 6.3239
+latency_avg: 7709.4293
+latency_med: 7272.4000
+hopcount_avg: 1.6870
+hopcount_med: 1
+transfers_by_reason: deliver 1601 route 4993 gradient 30564 spray 29
+carrier: expired 542 cleared_by_receipt 575 refused 12091 accepted 2841
+# (126 devices, 61986 contact events, 15.2 s)

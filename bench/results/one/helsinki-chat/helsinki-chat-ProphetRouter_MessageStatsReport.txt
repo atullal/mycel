@@ -1,0 +1,20 @@
+Message stats for scenario helsinki-chat-ProphetRouter
+sim_time: 43196.0000
+created: 1444
+started: 205052
+relayed: 204362
+aborted: 690
+dropped: 91860
+removed: 0
+delivered: 1305
+delivery_prob: 0.9037
+response_prob: 0.0000
+overhead_ratio: 155.5992
+latency_avg: 1866.1609
+latency_med: 1578.6000
+hopcount_avg: 2.6674
+hopcount_med: 3
+buffertime_avg: 18242.6984
+buffertime_med: 18944.0000
+rtt_avg: NaN
+rtt_med: NaN

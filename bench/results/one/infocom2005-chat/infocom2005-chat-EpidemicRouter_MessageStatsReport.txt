@@ -1,0 +1,20 @@
+Message stats for scenario infocom2005-chat-EpidemicRouter
+sim_time: 254211.0000
+created: 8474
+started: 899149
+relayed: 898278
+aborted: 871
+dropped: 869507
+removed: 0
+delivered: 6142
+delivery_prob: 0.7248
+response_prob: 0.0000
+overhead_ratio: 145.2517
+latency_avg: 24863.0471
+latency_med: 21302.9000
+hopcount_avg: 3.6071
+hopcount_med: 3
+buffertime_avg: 6426.7111
+buffertime_med: 2730.0000
+rtt_avg: NaN
+rtt_med: NaN

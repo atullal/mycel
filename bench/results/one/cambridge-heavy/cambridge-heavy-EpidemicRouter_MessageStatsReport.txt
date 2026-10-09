@@ -1,0 +1,20 @@
+Message stats for scenario cambridge-heavy-EpidemicRouter
+sim_time: 455610.0000
+created: 15184
+started: 48759
+relayed: 48408
+aborted: 351
+dropped: 62535
+removed: 0
+delivered: 977
+delivery_prob: 0.0643
+response_prob: 0.0000
+overhead_ratio: 48.5476
+latency_avg: 320.1048
+latency_med: 29.5000
+hopcount_avg: 2.2569
+hopcount_med: 1
+buffertime_avg: 544.8990
+buffertime_med: 127.0000
+rtt_avg: NaN
+rtt_med: NaN
