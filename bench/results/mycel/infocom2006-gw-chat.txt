@@ -18,5 +18,5 @@ hopcount_med: 4
 transfers_by_reason: deliver 9489 route 81427 gradient 3784 spray 20060
 carrier: expired 1351 cleared_by_receipt 12177 refused 0 accepted 105271 evicted 0 resumed 0
 refused_by: {}
-# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Internet, carry: true }, resume true
-(98 devices, 272552 contact events, 225.7 s)
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Internet, room_aware: true, carry: true }, resume true
+(98 devices, 272552 contact events, 242.8 s)

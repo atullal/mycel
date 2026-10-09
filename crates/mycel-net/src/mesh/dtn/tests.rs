@@ -647,4 +647,5 @@ fn room_aware_gradient_prefers_room() {
     };
     assert_eq!(pick("room=off"), key(1));
     assert_eq!(pick("room=on"), key(2));
+    assert!(DtnConfig::default().room_aware);
 }
