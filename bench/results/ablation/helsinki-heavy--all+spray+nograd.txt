@@ -1,0 +1,18 @@
+Message stats for scenario helsinki-heavy-all,spray,nograd
+sim_time: 43195.6000
+created: 1441
+started: 13780
+relayed: 5179
+aborted: 8597
+refused: 3
+delivered: 1118
+delivered_after_ttl: 0
+delivery_prob: 0.7759
+overhead_ratio: 3.6324
+latency_avg: 5657.4582
+latency_med: 4498.1000
+hopcount_avg: 1.9848
+hopcount_med: 2
+transfers_by_reason: deliver 2128 route 40 gradient 0 spray 11612
+carrier: expired 297 cleared_by_receipt 3125 refused 3 accepted 4056
+# (126 devices, 63286 contact events, 7.9 s)

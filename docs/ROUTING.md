@@ -95,7 +95,7 @@ we built, and why.
 |---|---|---|
 | **Bundle Protocol v7** (RFC 9171); `bp7` 0.9 (CBOR encoding), `dtn7-rs` 0.18 (daemon with TCP/HTTP convergence layers) | Bundles with lifetime, source/destination endpoint ids, status reports. Custody transfer was split out of BPv7 into separate work. | **Ideas reused**: lifetime, hop-by-hop custody, status reports become our signed delivery receipts. **Code rejected for now.** `dtn7` is a daemon with its own convergence layers and routing, not an embeddable core. BPSec would duplicate our envelope signatures and encryption. Our payloads are already signed, encrypted and content-addressed Mycel envelopes. A bp7 encoding of our bundles is a cheap interop step later. |
 | **PRoPHET** (RFC 6693) | *Delivery predictability* P(a,b): raised on each encounter, aged over time, transitive through intermediaries. Forward to nodes with higher P. | **Adopted** (§7.2). The virtual destination "the internet" lets copies climb toward connectivity. |
-| **Spray-and-Wait** (Spyropoulos et al., 2005) | L copies, binary spray, then wait for direct delivery. | **Adopted as the fallback** for destinations nobody has information about. |
+| **Spray-and-Wait** (Spyropoulos et al., 2005) | L copies, binary spray, then wait for direct delivery. | **Adopted, steered**: the copies are sprayed first, each to the likeliest neighbour without one; then a single copy follows the gradient toward the internet (as in Spray-and-Focus, same authors, 2007). L depends on the bundle's size. |
 | **MaxProp** (Burgess et al., 2006) | Priority by path likelihood; flooded acks clear buffers. | **Idea reused**: signed receipts flood among carriers and free their copies. |
 | **RAPID** (Balasubramanian et al., 2007) | Replication as utility optimisation using a metadata channel. | **Rejected**: heavy metadata for marginal gains at our scale. |
 
@@ -214,7 +214,10 @@ Data that must arrive later (sync envelopes, message requests) travels as
 
 1. **Live route.** If the destination is reachable now, by any mix of
    mesh, gateways and internet, the live QUIC sync does it. No bundle is
-   needed.
+   needed. A sync that isn't through within 10 s is also handed to
+   carriers (it keeps trying live): a stale connection to a device that
+   moved away only times out after 60 s, and the passer-by who could have
+   carried the bundle may be gone by then.
 2. **Partial route.** If part of the way is up, the bundle moves as far as
    it can *now*, hop by hop with **custody**. Each hop takes
    responsibility and the previous one deletes its copy on an
@@ -222,16 +225,34 @@ Data that must arrive later (sync envelopes, message requests) travels as
    gateway, the internet hop to the destination's gateways, and the far
    mesh route. The device at the break holds it until the next segment
    appears.
-3. **Store and carry.** With no forward progress possible, it waits and
-   moves only toward devices with better **delivery predictability**
-   (PRoPHET). Each device keeps P(x) for destinations x and for the
-   virtual destination *internet*. Devices with the internet have
-   P(internet) = 1. Encounters raise P, time ages it, and it is transitive
-   through neighbours. A copy moves to a neighbour whose utility,
-   max(P(dst), P(internet)), is higher by a margin, so a Bluetooth phone's
-   message climbs toward the first device with the internet.
-4. **Spray-and-Wait** when nobody knows anything about the destination:
-   a few copies (default 4), binary spray, then direct delivery only.
+3. **Spray.** A bundle starts with several copies: 32 for 16 KiB or
+   less (chat), falling geometrically to 4 at 256 KiB. While a device
+   holds more than one, it hands half to the likeliest neighbour that has
+   none, better than itself or not (binary Spray-and-Wait, steered by
+   predictability). Devices with the internet don't spray: copies should
+   end up there, unless the internet has proved not to reach the
+   destination.
+4. **Store and carry.** A single copy waits and moves, with custody, only
+   to a neighbour with a clearly better **delivery predictability**
+   (PRoPHET) for **the internet**. Each device keeps P(x) for destinations
+   x and for the virtual destination *internet*. Devices with the internet
+   have P(internet) = 1. Encounters raise P, time ages it, and it is
+   transitive through neighbours. So a Bluetooth phone's message climbs
+   toward the first device with the internet. Once a device with the
+   internet has found the destination isn't on it, the copy follows
+   predictability for the destination instead.
+
+   How this was chosen (`docs/BENCHMARKS.md` §6.5, `docs/SIMULATION.md`
+   §4): spray-first wins or ties on every trace; Spray-and-Focus (spray
+   only to neighbours no worse than us) kept copies where they were on
+   traces without social structure (Helsinki: 39.5% against 62.9%).
+   Following P(destination), as plain PRoPHET does, cost 2–28 points of
+   delivery. Following nothing ties on conference traces but loses 13
+   points in the simulated disaster zone, where the internet is a few
+   partitions away; it wins only where the gateways are fast-moving trams
+   with tiny stores. 32 copies for chat take delivery within an hour on
+   Helsinki from 61% to 94%. The policies are `DtnConfig` knobs
+   (`spray`, `gradient`, `copies`, `copies_small`).
 
 ### 7.3 Carriers' limits
 
@@ -239,9 +260,45 @@ A bundle is an already-signed, already-encrypted batch of Mycel envelopes
 addressed to a key. Its header (id, source, destination, creation time,
 lifetime, copies) is signed by the source.
 - **What carriers learn:** destination key, size and timing; never content.
-- **Per-carrier limits:** a 64 MiB store, a 256 KiB maximum bundle, a 4 MiB
+- **Per-carrier limits:** a 64 MiB store for others' bundles (a device's
+  own bundles don't count against it), a 256 KiB maximum bundle, a 4 MiB
   share per source, and lifetimes up to 7 days.
+- **Lifetimes run from creation.** A carrier expires a bundle at its
+  source's `created + lifetime` (converted through its own wall clock), not
+  a fresh lifetime at each hop, and never later than one lifetime from
+  when it arrived, whatever the source's clock says.
+- **When the store is full:** a carried bundle expiring sooner makes room
+  for a fresher one, soonest first (drop-oldest, the best queueing policy
+  in Lindgren and Phanse, 2006); if the bundle's source is over its share,
+  its own older bundles go first. A bundle that would expire before
+  everything carried is refused. A device's own bundles are never dropped
+  for others'.
+- **Offer first.** A bundle is offered (its signed header and size) before
+  any payload crosses the link; the receiver answers take, duplicate or
+  refuse. A refusal costs a round trip, not the transfer. Summaries say how
+  much room a carrier has left and what could make way (its soonest-expiring
+  bundles), so neighbours don't offer what would be refused, and a refusal
+  for lack of room stops offers to that carrier until its next summary.
+  (Sending the whole payload and refusing at the end turned 95–99% of the
+  link time on conference traces into refused transfers, retried every
+  second: `docs/BENCHMARKS.md` §6.1.)
+- **Resume.** A transfer cut short (the median Helsinki contact lasts
+  2.4 s) leaves its bytes with the receiver for 5 minutes, bounded to a
+  quarter of its store. The next offer of that bundle, from any carrier,
+  resumes where it stopped: the id is the hash of the content, checked
+  when the last byte arrives.
+- **Copies in flight** aren't given again: a single copy on its way to
+  one neighbour isn't also offered to another.
 - **Rate limits:** per neighbour and per source.
+- **Hand-off order:** deliveries first, then live routes, the gradient,
+  and spraying last: contacts end, and a 1 MB spray queued ahead of a
+  delivery can cost the delivery.
+- **Forgetting:** what a neighbour last told us (its predictabilities and
+  bundle ids) is dropped 10 minutes after we last heard from it.
+- **Dials:** a failed internet dial backs off (2 s, doubling to 60 s). A
+  device with the internet whose dial to a destination without a record
+  fails learns that the internet doesn't reach it (`Toward::Unreachable`)
+  and carries its bundles by predictability for the destination alone.
 
 ### 7.4 Mailboxes and receipts
 
@@ -277,7 +334,7 @@ where it works:
 | Mesh as a transport | **Iroh custom transport** (ours: `mesh/mod.rs`) |
 | Local routing | **Our sans-IO core** (`mesh/core.rs`). Ideas from Babel, B.A.T.M.A.N., OLSR and fisheye. No Rust library routes opaque QUIC packets by Ed25519 key over arbitrary links. |
 | Global lookup | **pkarr records** (`iroh-dns`), the n0 relay via Iroh's `PkarrRelayClient`, and the **Mainline DHT** via `n0-mainline` |
-| Store-and-forward | **Our sans-IO carrier** (`mesh/dtn.rs`): PRoPHET + custody + Spray-and-Wait + receipts. bp7 encoding later, for interop. |
+| Store-and-forward | **Our sans-IO carrier** (`mesh/dtn.rs`): steered spraying + a PRoPHET gradient toward the internet + custody + offers, resume and receipts. bp7 encoding later, for interop. |
 | Broadcast (later) | **iroh-gossip**, for group presence, not routing |
 
 ## 10. What the tests measure
@@ -312,4 +369,4 @@ where it works:
 - **Overhead per device** with fisheye and flood reduction: −55 % at 25 devices, −68 % at 50, −75 % at 100 (`overhead_per_device_large_meshes`, ignored by default, runs 200 and 400).
 - **Gateways** (QUIC, in-process): a Bluetooth-only device three BLE hops from its gateway syncs with one behind another gateway; the first sync took 0.58 s. A test-tone call along that route had 84 ms RTT and 0 % loss.
 - **Two gateways:** 2.0× one path's throughput. When one is lost, the longest pause on the other is 0.8–2.6 s: data in flight leaves a hole in the stream until the dead path's loss detection gives up.
-- **Store-and-forward:** gradient routing gets the first copy to the internet in 35 min (mean of 40 traces, 4 clusters in a chain). Spray-and-Wait mostly never gets there within 24 h. A real data mule delivered 1 s after meeting the destination.
+- **Store-and-forward:** spraying 4 copies, then a single copy following the gradient toward the internet, gets the first copy to the internet in 28 min (mean of 40 traces, 4 clusters in a chain). The same 4 copies with no gradient (Spray-and-Wait) don't get there within 12 h. A real data mule delivered 1 s after meeting the destination. Against The ONE's routers on real contact traces, see `docs/BENCHMARKS.md`.

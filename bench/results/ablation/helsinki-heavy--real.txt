@@ -1,0 +1,18 @@
+Message stats for scenario helsinki-heavy-real
+sim_time: 43195.6000
+created: 1441
+started: 39773
+relayed: 3099
+aborted: 22699
+refused: 13974
+delivered: 438
+delivered_after_ttl: 62
+delivery_prob: 0.3040
+overhead_ratio: 6.0753
+latency_avg: 7616.5600
+latency_med: 6890.9000
+hopcount_avg: 1.7466
+hopcount_med: 1
+transfers_by_reason: deliver 1574 route 29 gradient 38018 spray 152
+carrier: expired 647 cleared_by_receipt 582 refused 13974 accepted 2599
+# (126 devices, 63286 contact events, 6.2 s)

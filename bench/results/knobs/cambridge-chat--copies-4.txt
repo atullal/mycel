@@ -1,0 +1,22 @@
+Message stats for scenario cambridge-chat-copies-4
+sim_time: 455609.0000
+created: 15173
+started: 33099
+relayed: 33099
+aborted: 0
+offers: 35420
+refused: 0
+duplicates: 2321
+delivered: 7424
+delivered_after_ttl: 1
+delivery_prob: 0.4893
+overhead_ratio: 3.4584
+latency_avg: 30580.9272
+latency_med: 28028.1000
+hopcount_avg: 2.2942
+hopcount_med: 2
+transfers_by_reason: deliver 7425 route 7000 gradient 0 spray 18674
+carrier: expired 12721 cleared_by_receipt 8319 refused 0 accepted 25674 evicted 0 resumed 0
+refused_by: {}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 4, spray: First, gradient: Internet, carry: true }, resume true
+(12 devices, 5228 contact events, 10.4 s)

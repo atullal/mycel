@@ -1,0 +1,20 @@
+Message stats for scenario infocom2006-gw-heavy-MaxPropRouter
+sim_time: 337479.0000
+created: 11250
+started: 1276117
+relayed: 1260064
+aborted: 16051
+dropped: 1141426
+removed: 124730
+delivered: 4533
+delivery_prob: 0.4029
+response_prob: 0.0000
+overhead_ratio: 276.9757
+latency_avg: 2092.1659
+latency_med: 234.0000
+hopcount_avg: 3.9239
+hopcount_med: 3
+buffertime_avg: 147.3884
+buffertime_med: 4.0000
+rtt_avg: NaN
+rtt_med: NaN

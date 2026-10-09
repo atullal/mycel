@@ -1,0 +1,22 @@
+Message stats for scenario cambridge-heavy-Mycel
+sim_time: 455609.0000
+created: 15184
+started: 13857
+relayed: 13749
+aborted: 102
+offers: 14494
+refused: 396
+duplicates: 241
+delivered: 2241
+delivered_after_ttl: 0
+delivery_prob: 0.1476
+overhead_ratio: 5.1352
+latency_avg: 3206.2370
+latency_med: 253.5000
+hopcount_avg: 1.6747
+hopcount_med: 1
+transfers_by_reason: deliver 2269 route 2053 gradient 0 spray 9535
+carrier: expired 12097 cleared_by_receipt 632 refused 396 accepted 11468 evicted 8966 resumed 43
+refused_by: {"store full": 396}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Internet, carry: true }, resume true
+(12 devices, 5228 contact events, 2.5 s)

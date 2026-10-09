@@ -1,0 +1,19 @@
+Message stats for scenario infocom2005-chat-all,fallback
+sim_time: 254210.0000
+created: 8474
+started: 62567
+relayed: 62567
+aborted: 0
+refused: 0
+delivered: 7017
+delivered_after_ttl: 0
+delivery_prob: 0.8281
+overhead_ratio: 7.9165
+latency_avg: 21860.6305
+latency_med: 17082.8000
+hopcount_avg: 4.0030
+hopcount_med: 4
+transfers_by_reason: deliver 7286 route 19061 gradient 20993 spray 15227
+carrier: expired 2543 cleared_by_receipt 11639 refused 0 accepted 51228
+refused_by: {}
+# (41 devices, 33476 contact events, 104.9 s)

@@ -1,0 +1,19 @@
+Message stats for scenario helsinki-gw-heavy-all,spray,evict,nograd
+sim_time: 43195.6000
+created: 1441
+started: 16580
+relayed: 6603
+aborted: 9951
+refused: 20
+delivered: 913
+delivered_after_ttl: 0
+delivery_prob: 0.6336
+overhead_ratio: 6.2322
+latency_avg: 4882.4717
+latency_med: 3651.1000
+hopcount_avg: 2.0307
+hopcount_med: 2
+transfers_by_reason: deliver 1748 route 3901 gradient 0 spray 10931
+carrier: expired 151 cleared_by_receipt 1869 refused 20 accepted 5572
+refused_by: {"store full": 20}
+# (126 devices, 61986 contact events, 25.3 s)

@@ -1,0 +1,22 @@
+Message stats for scenario cambridge-chat-focus-both
+sim_time: 455609.0000
+created: 15173
+started: 47383
+relayed: 47383
+aborted: 0
+offers: 69125
+refused: 0
+duplicates: 21742
+delivered: 7686
+delivered_after_ttl: 1
+delivery_prob: 0.5066
+overhead_ratio: 5.1648
+latency_avg: 30428.4270
+latency_med: 27539.4000
+hopcount_avg: 2.4761
+hopcount_med: 2
+transfers_by_reason: deliver 7687 route 4078 gradient 4969 spray 30649
+carrier: expired 19029 cleared_by_receipt 16270 refused 0 accepted 39696 evicted 0 resumed 0
+refused_by: {}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: Focus, gradient: Both, carry: true }, resume true
+(12 devices, 5228 contact events, 12.3 s)

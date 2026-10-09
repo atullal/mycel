@@ -1,0 +1,18 @@
+Message stats for scenario helsinki-chat-all,spray
+sim_time: 43195.6000
+created: 1444
+started: 27054
+relayed: 27054
+aborted: 0
+refused: 0
+delivered: 1297
+delivered_after_ttl: 0
+delivery_prob: 0.8982
+overhead_ratio: 19.8589
+latency_avg: 3921.5632
+latency_med: 2640.3000
+hopcount_avg: 5.5883
+hopcount_med: 5
+transfers_by_reason: deliver 1297 route 24 gradient 21462 spray 4271
+carrier: expired 0 cleared_by_receipt 3746 refused 0 accepted 25728
+# (126 devices, 63286 contact events, 6.6 s)

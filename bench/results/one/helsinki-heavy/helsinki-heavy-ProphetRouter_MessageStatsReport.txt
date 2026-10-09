@@ -1,0 +1,20 @@
+Message stats for scenario helsinki-heavy-ProphetRouter
+sim_time: 43196.0000
+created: 1441
+started: 47382
+relayed: 22261
+aborted: 25121
+dropped: 22648
+removed: 0
+delivered: 311
+delivery_prob: 0.2158
+response_prob: 0.0000
+overhead_ratio: 70.5788
+latency_avg: 3863.9302
+latency_med: 2861.2000
+hopcount_avg: 2.9646
+hopcount_med: 3
+buffertime_avg: 1239.4540
+buffertime_med: 839.0000
+rtt_avg: NaN
+rtt_med: NaN

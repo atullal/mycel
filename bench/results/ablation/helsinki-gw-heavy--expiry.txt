@@ -1,0 +1,18 @@
+Message stats for scenario helsinki-gw-heavy-expiry
+sim_time: 43195.6000
+created: 1441
+started: 36347
+relayed: 4304
+aborted: 21547
+refused: 10489
+delivered: 520
+delivered_after_ttl: 0
+delivery_prob: 0.3609
+overhead_ratio: 7.2769
+latency_avg: 8161.5048
+latency_med: 7762.1000
+hopcount_avg: 1.8692
+hopcount_med: 1
+transfers_by_reason: deliver 1541 route 5007 gradient 29770 spray 29
+carrier: expired 1160 cleared_by_receipt 651 refused 10489 accepted 3784
+# (126 devices, 61986 contact events, 13.0 s)

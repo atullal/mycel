@@ -1,0 +1,19 @@
+Message stats for scenario helsinki-chat-all,fallback
+sim_time: 43195.6000
+created: 1444
+started: 27478
+relayed: 27478
+aborted: 0
+refused: 0
+delivered: 1282
+delivered_after_ttl: 0
+delivery_prob: 0.8878
+overhead_ratio: 20.4337
+latency_avg: 3957.6542
+latency_med: 2692.5000
+hopcount_avg: 5.6685
+hopcount_med: 5
+transfers_by_reason: deliver 1282 route 34 gradient 23033 spray 3129
+carrier: expired 0 cleared_by_receipt 3699 refused 0 accepted 26173
+refused_by: {}
+# (126 devices, 63286 contact events, 6.3 s)

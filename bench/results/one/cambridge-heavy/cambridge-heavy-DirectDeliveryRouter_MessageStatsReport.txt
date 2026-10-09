@@ -1,0 +1,20 @@
+Message stats for scenario cambridge-heavy-DirectDeliveryRouter
+sim_time: 455610.0000
+created: 15184
+started: 1104
+relayed: 1097
+aborted: 7
+dropped: 15110
+removed: 0
+delivered: 1097
+delivery_prob: 0.0722
+response_prob: 0.0000
+overhead_ratio: 0.0000
+latency_avg: 353.5671
+latency_med: 38.1000
+hopcount_avg: 1.0000
+hopcount_med: 1
+buffertime_avg: 2209.3477
+buffertime_med: 2098.9000
+rtt_avg: NaN
+rtt_med: NaN

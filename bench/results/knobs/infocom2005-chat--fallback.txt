@@ -1,0 +1,22 @@
+Message stats for scenario infocom2005-chat-fallback
+sim_time: 254210.0000
+created: 8474
+started: 122425
+relayed: 122425
+aborted: 0
+offers: 143682
+refused: 0
+duplicates: 21257
+delivered: 7125
+delivered_after_ttl: 0
+delivery_prob: 0.8408
+overhead_ratio: 16.1825
+latency_avg: 21474.7339
+latency_med: 16641.9000
+hopcount_avg: 3.5054
+hopcount_med: 3
+transfers_by_reason: deliver 7125 route 14322 gradient 0 spray 100978
+carrier: expired 15691 cleared_by_receipt 67855 refused 0 accepted 115300 evicted 0 resumed 0
+refused_by: {}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: Fallback, gradient: Internet, carry: true }, resume true
+(41 devices, 33476 contact events, 42.7 s)

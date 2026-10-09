@@ -1,0 +1,20 @@
+Message stats for scenario helsinki-chat-MaxPropRouter
+sim_time: 43196.0000
+created: 1444
+started: 130187
+relayed: 129559
+aborted: 628
+dropped: 0
+removed: 126758
+delivered: 1417
+delivery_prob: 0.9813
+response_prob: 0.0000
+overhead_ratio: 90.4319
+latency_avg: 971.5466
+latency_med: 854.6000
+hopcount_avg: 3.9718
+hopcount_med: 4
+buffertime_avg: 860.7591
+buffertime_med: 728.4000
+rtt_avg: NaN
+rtt_med: NaN
