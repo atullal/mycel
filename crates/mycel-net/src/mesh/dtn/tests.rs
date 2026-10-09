@@ -36,6 +36,8 @@ struct World {
     now: Time,
     delivered: Vec<(usize, Hash32, Time)>,
     transfers: Vec<(usize, usize, Why)>,
+    /// Offers refused.
+    refusals: usize,
 }
 
 impl World {
@@ -47,6 +49,7 @@ impl World {
             now: 0,
             delivered: vec![],
             transfers: vec![],
+            refusals: 0,
         }
     }
 
@@ -101,20 +104,34 @@ impl World {
                 let j = self.idx(&t.to);
                 let reachable = self.contacts[i].contains(&j) || self.routes.values().any(|v| *v == j);
                 let b = self.nodes[i].bundle(&t.id).cloned();
-                let ok = match (reachable, b) {
-                    (true, Some(b)) => match self.nodes[j].accept(key(i as u32), b, t.copies, now, |_| true) {
-                        Accepted::ForMe(b) => {
-                            self.delivered.push((j, b.id, now));
-                            let r = Receipt { id: b.id, dst: b.dst, sig: Sig([0; 64]) };
-                            self.nodes[j].add_receipt(r);
-                            true
-                        }
-                        Accepted::Stored | Accepted::Duplicate => true,
-                        Accepted::Refused(_) => false,
-                    },
-                    _ => false,
-                };
                 self.transfers.push((i, j, t.why));
+                let (true, Some(b)) = (reachable, b) else {
+                    self.nodes[i].transferred(t.to, t.id, t.copies, false, now);
+                    continue;
+                };
+                // offered first, as the node does; the payload only if taken
+                match self.nodes[j].offered(key(i as u32), &Offer::of(&b, t.copies), now, |_| true) {
+                    Answer::Refuse(why) => {
+                        self.refusals += 1;
+                        self.nodes[i].refused(t.to, t.id, why == "store full", now);
+                        continue;
+                    }
+                    Answer::Duplicate => {
+                        self.nodes[i].transferred(t.to, t.id, t.copies, true, now);
+                        continue;
+                    }
+                    Answer::Take { .. } => {}
+                }
+                let ok = match self.nodes[j].accept(key(i as u32), b, t.copies, now, |_| true) {
+                    Accepted::ForMe(b) => {
+                        self.delivered.push((j, b.id, now));
+                        let r = Receipt { id: b.id, dst: b.dst, sig: Sig([0; 64]) };
+                        self.nodes[j].add_receipt(r);
+                        true
+                    }
+                    Accepted::Stored | Accepted::Duplicate => true,
+                    Accepted::Refused(_) => false,
+                };
                 self.nodes[i].transferred(t.to, t.id, t.copies, ok, now);
             }
         }
@@ -193,7 +210,7 @@ fn a_passer_by_as_good_as_the_holder_gets_a_copy() {
     w.meet(a, mule);
     let x = bundle(key(a as u32), key(b as u32), 4, 3_600_000);
     w.nodes[a].originate(x.clone(), w.now).unwrap();
-    let (pa, pm) = (w.nodes[a].utility(&key(b as u32), w.now), w.nodes[mule].utility(&key(b as u32), w.now));
+    let (pa, pm) = (w.nodes[a].utility(&key(b as u32), true, w.now), w.nodes[mule].utility(&key(b as u32), true, w.now));
     assert!((pa - pm).abs() < MARGIN, "equally placed: {pa} vs {pm}");
     w.step(1_000);
     assert!(w.nodes[mule].holds(&x.id), "the passer-by carries a copy");
@@ -316,17 +333,24 @@ fn budgets_signatures_and_lifetimes() {
 }
 
 /// Partitioned clusters in a chain, the first with internet devices; a message from the
-/// farthest cluster for someone beyond the internet. Gradient routing
-/// (PRoPHET toward the internet) against Spray-and-Wait with the same 4
-/// copies, over many random traces: mean delay until a copy reaches a
-/// device with the internet.
+/// farthest cluster for someone beyond the internet. Spray-first with the
+/// gradient toward the internet for single copies, against plain binary
+/// Spray-and-Wait with the same 4 copies, over many random traces: mean
+/// delay until a copy reaches a device with the internet.
 #[test]
 fn gradient_beats_spray_and_wait() {
     const CLUSTERS: usize = 4;
     const PER: usize = 10;
     const N: usize = CLUSTERS * PER;
     let run = |gradient: bool, seed: u64| -> Option<Time> {
-        let mut w = World::new(N + 1, |_| DtnConfig::default());
+        // 4 copies sprayed first either way; the gradient (or not) moves single copies
+        let cfg = DtnConfig {
+            copies: 4,
+            copies_small: 4,
+            gradient: if gradient { Gradient::Internet } else { Gradient::Off },
+            ..DtnConfig::default()
+        };
+        let mut w = World::new(N + 1, |_| cfg.clone());
         let far = key(N as u32); // the destination, beyond the internet
         for i in 0..2 {
             w.nodes[i].set_internet(true); // two devices in cluster 0
@@ -367,16 +391,11 @@ fn gradient_beats_spray_and_wait() {
         let mut b = bundle(key(src as u32), far, 77, 24 * 3_600_000);
         b.created = w.now;
         let start = w.now;
-        if !gradient {
-            // Spray-and-Wait: no predictabilities at all
-            for c in &mut w.nodes {
-                c.pred.clear();
-            }
-        }
         w.nodes[src].originate(b.clone(), w.now).unwrap();
-        for _ in 0..24 * 60 {
+        for _ in 0..12 * 60 {
             contacts(&mut w, &mut rnd);
             if !gradient {
+                // unused with the gradient off; dropping them only saves time
                 for c in &mut w.nodes {
                     c.pred.clear();
                     c.nb_pred.clear();
@@ -393,7 +412,7 @@ fn gradient_beats_spray_and_wait() {
     for gradient in [true, false] {
         let mut delays = vec![];
         for seed in 1..=40 {
-            delays.push(run(gradient, seed).map(|t| t as f64 / 60_000.0).unwrap_or(24.0 * 60.0));
+            delays.push(run(gradient, seed).map(|t| t as f64 / 60_000.0).unwrap_or(12.0 * 60.0));
         }
         delays.sort_by(f64::total_cmp);
         let mean = delays.iter().sum::<f64>() / delays.len() as f64;
@@ -402,8 +421,205 @@ fn gradient_beats_spray_and_wait() {
     for (g, mean, median) in &rows {
         eprintln!(
             "{}: mean {mean:.0} min, median {median:.0} min to reach the internet (40 traces)",
-            if *g { "gradient (PRoPHET toward the internet)" } else { "Spray-and-Wait (L = 4)" }
+            if *g { "spray, then the gradient toward the internet" } else { "Spray-and-Wait (L = 4)" }
         );
     }
     assert!(rows[0].1 < rows[1].1, "gradient beats spray on mean delay: {rows:?}");
+}
+
+/// A carried bundle expires at its source's `created + lifetime`, not a
+/// fresh lifetime at every hop; a source clock ahead of ours can't stretch it.
+#[test]
+fn lifetimes_run_from_creation_not_per_hop() {
+    let mut c = Carrier::new(key(1), DtnConfig::default());
+    // our wall clock reads 1_000_000 at our time 0
+    c.set_clock(0, 1_000_000);
+    let mut b = bundle(key(2), key(3), 1, 60_000);
+    b.created = 1_000_000 - 50_000; // made 50 s ago: 10 s left
+    assert_eq!(c.accept(key(2), b.clone(), 1, 0, |_| true), Accepted::Stored);
+    c.tick(9_999);
+    assert!(c.holds(&b.id));
+    c.tick(10_000);
+    assert!(!c.holds(&b.id), "expired 60 s after creation, not 60 s after it reached us");
+    // already past its lifetime: refused, before any payload
+    let mut old = bundle(key(2), key(3), 2, 60_000);
+    old.created = 1_000_000 - 70_000;
+    assert_eq!(c.offered(key(2), &Offer::of(&old, 1), 0, |_| true), Answer::Refuse("expired"));
+    // a source clock an hour ahead: still at most its lifetime from now
+    let mut ahead = bundle(key(2), key(3), 3, 60_000);
+    ahead.created = 1_000_000 + 3_600_000;
+    assert_eq!(c.accept(key(2), ahead.clone(), 1, 0, |_| true), Accepted::Stored);
+    c.tick(60_000);
+    assert!(!c.holds(&ahead.id));
+}
+
+/// Offers are answered before any payload: a full store refuses (and the
+/// sender stops offering it anything until its next summary), a bundle
+/// already held is a duplicate that still takes the copies, and the
+/// destination always takes its own.
+#[test]
+fn offers_are_refused_before_the_payload() {
+    let cfg = DtnConfig { capacity: 2_000, per_source: 2_000, ..DtnConfig::default() };
+    let mut w = World::new(3, |_| cfg.clone());
+    let (s, r, d) = (0, 1, 2);
+    // the relay is full of bundles that outlive anything the source sends
+    for n in 0..2 {
+        let x = bundle(key(9), key(8), 100 + n, 7_200_000);
+        assert_eq!(w.nodes[r].accept(key(9), x, 1, 0, |_| true), Accepted::Stored);
+    }
+    let x = bundle(key(s as u32), key(d as u32), 1, 3_600_000);
+    let o = Offer::of(&x, 2);
+    assert_eq!(w.nodes[r].offered(key(s as u32), &o, 0, |_| true), Answer::Refuse("store full"));
+    assert!(!w.nodes[r].holds(&x.id), "nothing stored");
+    // through the planner: refused once, then not offered again
+    w.nodes[s].originate(x.clone(), 0).unwrap();
+    w.meet(s, r);
+    w.step(1_000);
+    let offers = |w: &World| w.transfers.iter().filter(|t| (t.0, t.1) == (s, r)).count();
+    assert_eq!(w.refusals, 0, "its summary said it was full, so nothing was offered");
+    assert_eq!(offers(&w), 0);
+    // a bundle it holds already: duplicate, copies added
+    let y = bundle(key(9), key(8), 100, 7_200_000);
+    assert_eq!(w.nodes[r].offered(key(s as u32), &Offer::of(&y, 3), 0, |_| true), Answer::Duplicate);
+    // the destination takes its own whatever its room
+    let mut c = Carrier::new(key(d as u32), DtnConfig { capacity: 0, carry: false, ..DtnConfig::default() });
+    assert_eq!(c.offered(key(s as u32), &o, 0, |_| true), Answer::Take { from: 0 });
+    // and a bad signature is refused up front
+    assert_eq!(c.offered(key(s as u32), &o, 0, |_| false), Answer::Refuse("bad signature"));
+}
+
+/// Without a summary yet, an offer is refused; the refusal marks the
+/// neighbour full until it says otherwise.
+#[test]
+fn a_refusal_marks_the_neighbour_full_until_its_next_summary() {
+    let mut c = Carrier::new(key(0), DtnConfig::default());
+    let x = bundle(key(0), key(5), 1, 3_600_000);
+    let y = bundle(key(0), key(6), 2, 3_600_000);
+    c.originate(x.clone(), 0).unwrap();
+    c.originate(y.clone(), 0).unwrap();
+    let nb = [key(1)];
+    let plan = c.plan(0, |_| Toward::Nowhere, &nb);
+    assert_eq!(plan.len(), 2, "both offered (sprayed)");
+    c.refused(key(1), x.id, true, 0);
+    c.transferred(key(1), y.id, 1, false, 0);
+    assert!(c.plan(1_000, |_| Toward::Nowhere, &nb).is_empty(), "full: nothing offered");
+    // its summary says it has room again
+    let room = Summary { free: 1 << 20, ..Summary::default() };
+    c.on_summary(key(1), room, 2_000, |_| true);
+    assert_eq!(c.plan(2_000, |_| Toward::Nowhere, &nb).len(), 2);
+}
+
+/// A transfer cut short keeps its bytes with the receiver; the next offer
+/// of that bundle, from anyone, resumes where it stopped. Kept bytes are
+/// bounded and expire.
+#[test]
+fn cut_transfers_resume() {
+    let cfg = DtnConfig { capacity: 8_000, max_bundle: 2_000, ..DtnConfig::default() };
+    let mut c = Carrier::new(key(1), cfg);
+    let x = bundle(key(2), key(3), 1, 3_600_000);
+    assert_eq!(c.offered(key(4), &Offer::of(&x, 1), 0, |_| true), Answer::Take { from: 0 });
+    c.keep_partial(x.id, x.src, x.payload.slice(..600), 0);
+    // another neighbour with the same bundle: the rest only
+    assert_eq!(c.offered(key(5), &Offer::of(&x, 1), 1_000, |_| true), Answer::Take { from: 600 });
+    assert_eq!(c.partial(&x.id).map(|p| p.len()), Some(600));
+    assert_eq!(c.stats().resumed, 1);
+    assert_eq!(c.accept(key(5), x.clone(), 1, 1_000, |_| true), Accepted::Stored);
+    assert!(c.partial(&x.id).is_none(), "complete: the partial copy goes");
+    // bounded: a quarter of capacity (2,000 bytes) in all, oldest first
+    let ys: Vec<Bundle> = (10..14).map(|n| bundle(key(7), key(3), n, 3_600_000)).collect();
+    for (k, y) in ys.iter().enumerate() {
+        c.keep_partial(y.id, key(20 + k as u32), y.payload.slice(..900), k as Time);
+    }
+    let kept: Vec<bool> = ys.iter().map(|y| c.partial(&y.id).is_some()).collect();
+    assert_eq!(kept, vec![false, false, true, true]);
+    // and kept a few minutes only
+    c.tick(5 * 60_000 + 3);
+    assert!(ys.iter().all(|y| c.partial(&y.id).is_none()));
+}
+
+/// A source over its share makes way with its own older bundles first,
+/// rather than being refused or pushing out other sources'.
+#[test]
+fn a_source_over_its_share_makes_way_with_its_own() {
+    let cfg = DtnConfig { capacity: 10_000, per_source: 2_000, ..DtnConfig::default() };
+    let mut c = Carrier::new(key(0), cfg);
+    let other = bundle(key(2), key(9), 1, 10_000);
+    let a1 = bundle(key(1), key(9), 2, 20_000);
+    let a2 = bundle(key(1), key(9), 3, 30_000);
+    for b in [&other, &a1, &a2] {
+        assert_eq!(c.accept(key(5), b.clone(), 1, 0, |_| true), Accepted::Stored);
+    }
+    let a3 = bundle(key(1), key(9), 4, 40_000);
+    assert_eq!(c.accept(key(5), a3.clone(), 1, 0, |_| true), Accepted::Stored);
+    assert!(!c.holds(&a1.id) && c.holds(&a2.id) && c.holds(&a3.id) && c.holds(&other.id));
+    // one expiring before all of its own is still refused
+    let a0 = bundle(key(1), key(9), 5, 5_000);
+    assert_eq!(c.accept(key(5), a0, 1, 0, |_| true), Accepted::Refused("source over its share"));
+}
+
+/// Small bundles get more copies than big ones.
+#[test]
+fn copies_by_size() {
+    let cfg = DtnConfig::default();
+    assert_eq!(cfg.copies_for(200), 32);
+    assert_eq!(cfg.copies_for(16 << 10), 32);
+    assert_eq!(cfg.copies_for(256 << 10), 4);
+    assert_eq!(cfg.copies_for(1 << 20), 4);
+    let mid: Vec<u8> = [32 << 10, 64 << 10, 128 << 10].iter().map(|s| cfg.copies_for(*s)).collect();
+    assert!(mid.windows(2).all(|w| w[0] > w[1]) && mid[0] < 32 && mid[2] > 4, "{mid:?}");
+    let mut c = Carrier::new(key(0), cfg);
+    let x = bundle(key(0), key(1), 1, 60_000);
+    c.originate(x.clone(), 0).unwrap();
+    let plan = c.plan(0, |_| Toward::Nowhere, &[key(2)]);
+    assert_eq!(plan[0].copies, 16, "half of 32 sprayed");
+}
+
+/// Spray modes: spray-first gives copies to a neighbour worse than us;
+/// Spray-and-Focus only to one no worse; `tune` sets them.
+#[test]
+fn spray_modes() {
+    let run = |knobs: &str| {
+        let mut cfg = DtnConfig::default();
+        cfg.tune(knobs).unwrap();
+        let mut w = World::new(3, |_| cfg.clone());
+        let (a, worse, b) = (0, 1, 2);
+        // a has met b (the destination); `worse` never has
+        w.meet(a, b);
+        w.step(1_000);
+        w.apart();
+        w.meet(a, worse);
+        let x = bundle(key(a as u32), key(b as u32), 1, 3_600_000);
+        w.nodes[a].originate(x.clone(), w.now).unwrap();
+        w.step(1_000);
+        w.nodes[worse].holds(&x.id)
+    };
+    assert!(run("spray=first,gradient=destination"));
+    assert!(run("spray=fallback,gradient=destination"));
+    assert!(!run("spray=focus,gradient=destination"));
+    assert!(DtnConfig::default().tune("spray=sideways").is_err());
+}
+
+/// Copies on their way to one neighbour (an offer or transfer can take
+/// seconds) aren't planned again for another: a single copy in custody
+/// doesn't become two.
+#[test]
+fn copies_in_flight_are_not_given_twice() {
+    let cfg = DtnConfig { copies: 4, copies_small: 4, ..DtnConfig::default() };
+    let mut c = Carrier::new(key(0), cfg);
+    let x = bundle(key(0), key(9), 1, 3_600_000);
+    c.originate(x.clone(), 0).unwrap();
+    let first = c.plan(0, |_| Toward::Nowhere, &[key(1)]);
+    assert_eq!(first.iter().map(|t| (t.to, t.copies)).collect::<Vec<_>>(), vec![(key(1), 2)]);
+    // still under way: of the 2 left, 1 for the next neighbour
+    let second = c.plan(1_000, |_| Toward::Nowhere, &[key(1), key(2)]);
+    assert_eq!(second.iter().map(|t| (t.to, t.copies)).collect::<Vec<_>>(), vec![(key(2), 1)]);
+    // the last copy is ours to keep while the others are in flight
+    assert!(c.plan(2_000, |_| Toward::Nowhere, &[key(1), key(2), key(3)]).is_empty());
+    // custody: a route hop takes every free copy, and nothing is left meanwhile
+    let mut c = Carrier::new(key(0), DtnConfig::default());
+    c.accept(key(5), x.clone(), 1, 0, |_| true);
+    assert_eq!(c.plan(0, |_| Toward::Hop(key(1)), &[key(1)]).len(), 1);
+    assert!(c.plan(1_000, |_| Toward::Hop(key(2)), &[key(1), key(2)]).is_empty(), "one copy, already under way");
+    c.transferred(key(1), x.id, 1, false, 2_000);
+    assert_eq!(c.plan(2_000, |_| Toward::Hop(key(2)), &[key(2)]).len(), 1, "free again once that failed");
 }

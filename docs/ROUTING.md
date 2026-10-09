@@ -253,10 +253,32 @@ lifetime, copies) is signed by the source.
 - **Per-carrier limits:** a 64 MiB store for others' bundles (a device's
   own bundles don't count against it), a 256 KiB maximum bundle, a 4 MiB
   share per source, and lifetimes up to 7 days.
+- **Lifetimes run from creation.** A carrier expires a bundle at its
+  source's `created + lifetime` (converted through its own wall clock), not
+  a fresh lifetime at each hop, and never later than one lifetime from
+  when it arrived, whatever the source's clock says.
 - **When the store is full:** a carried bundle expiring sooner makes room
   for a fresher one, soonest first (drop-oldest, the best queueing policy
-  in Lindgren and Phanse, 2006); a bundle older than everything carried is
-  refused. A device's own bundles are never dropped for others'.
+  in Lindgren and Phanse, 2006); if the bundle's source is over its share,
+  its own older bundles go first. A bundle that would expire before
+  everything carried is refused. A device's own bundles are never dropped
+  for others'.
+- **Offer first.** A bundle is offered (its signed header and size) before
+  any payload crosses the link; the receiver answers take, duplicate or
+  refuse. A refusal costs a round trip, not the transfer. Summaries say how
+  much room a carrier has left and what could make way (its soonest-expiring
+  bundles), so neighbours don't offer what would be refused, and a refusal
+  for lack of room stops offers to that carrier until its next summary.
+  (Sending the whole payload and refusing at the end turned 95–99% of the
+  link time on conference traces into refused transfers, retried every
+  second: `docs/BENCHMARKS.md` §6.1.)
+- **Resume.** A transfer cut short (the median Helsinki contact lasts
+  2.4 s) leaves its bytes with the receiver for 5 minutes, bounded to a
+  quarter of its store. The next offer of that bundle, from any carrier,
+  resumes where it stopped: the id is the hash of the content, checked
+  when the last byte arrives.
+- **Copies in flight** aren't given again: a single copy on its way to
+  one neighbour isn't also offered to another.
 - **Rate limits:** per neighbour and per source.
 - **Hand-off order:** deliveries first, then live routes, the gradient,
   and spraying last: contacts end, and a 1 MB spray queued ahead of a
