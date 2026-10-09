@@ -1,0 +1,22 @@
+Message stats for scenario infocom2006-gw-chat-first-both
+sim_time: 337478.0000
+created: 11245
+started: 116416
+relayed: 116416
+aborted: 0
+offers: 123763
+refused: 0
+duplicates: 7347
+delivered: 9488
+delivered_after_ttl: 0
+delivery_prob: 0.8438
+overhead_ratio: 11.2698
+latency_avg: 6695.6451
+latency_med: 1454.6000
+hopcount_avg: 4.1243
+hopcount_med: 4
+transfers_by_reason: deliver 9488 route 82937 gradient 3845 spray 20146
+carrier: expired 1364 cleared_by_receipt 12217 refused 0 accepted 106928 evicted 0 resumed 0
+refused_by: {}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Both, carry: true }, resume true
+(98 devices, 272552 contact events, 226.1 s)

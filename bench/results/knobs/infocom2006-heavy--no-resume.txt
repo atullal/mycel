@@ -1,0 +1,22 @@
+Message stats for scenario infocom2006-heavy-no-resume
+sim_time: 337478.0000
+created: 11250
+started: 53785
+relayed: 53025
+aborted: 541
+offers: 57077
+refused: 1076
+duplicates: 2219
+delivered: 6411
+delivered_after_ttl: 0
+delivery_prob: 0.5699
+overhead_ratio: 7.2709
+latency_avg: 2666.5043
+latency_med: 489.1000
+hopcount_avg: 4.3949
+hopcount_med: 4
+transfers_by_reason: deliver 6479 route 30191 gradient 0 spray 17115
+carrier: expired 5106 cleared_by_receipt 4754 refused 1076 accepted 45993 evicted 8825 resumed 0
+refused_by: {"expired": 3, "store full": 1073}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Internet, carry: true }, resume false
+(98 devices, 284612 contact events, 102.1 s)

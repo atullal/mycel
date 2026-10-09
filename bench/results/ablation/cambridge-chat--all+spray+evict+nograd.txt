@@ -1,0 +1,19 @@
+Message stats for scenario cambridge-chat-all,spray,evict,nograd
+sim_time: 455609.0000
+created: 15173
+started: 39296
+relayed: 39296
+aborted: 0
+refused: 0
+delivered: 7344
+delivered_after_ttl: 0
+delivery_prob: 0.4840
+overhead_ratio: 4.3508
+latency_avg: 30490.4277
+latency_med: 27792.7000
+hopcount_avg: 2.3175
+hopcount_med: 2
+transfers_by_reason: deliver 7584 route 8581 gradient 0 spray 23131
+carrier: expired 13470 cleared_by_receipt 8000 refused 0 accepted 26240
+refused_by: {}
+# (12 devices, 5228 contact events, 34.9 s)

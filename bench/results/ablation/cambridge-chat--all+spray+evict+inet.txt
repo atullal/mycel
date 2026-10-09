@@ -1,0 +1,19 @@
+Message stats for scenario cambridge-chat-all,spray,evict,inet
+sim_time: 455609.0000
+created: 15173
+started: 39436
+relayed: 39436
+aborted: 0
+refused: 0
+delivered: 7352
+delivered_after_ttl: 0
+delivery_prob: 0.4845
+overhead_ratio: 4.3640
+latency_avg: 30559.6214
+latency_med: 27880.7000
+hopcount_avg: 2.3229
+hopcount_med: 2
+transfers_by_reason: deliver 7613 route 8785 gradient 0 spray 23038
+carrier: expired 13455 cleared_by_receipt 7954 refused 0 accepted 26412
+refused_by: {}
+# (12 devices, 5228 contact events, 90.0 s)

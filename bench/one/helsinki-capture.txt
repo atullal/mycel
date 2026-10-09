@@ -1,0 +1,13 @@
+# Records the contacts of ONE's default Helsinki scenario (default_settings.txt,
+# which ONE always loads first) so every simulator can replay them.
+#
+# One change: tram group 4's second, 10 MB/s interface is off, so every
+# contact is a 250 kB/s Bluetooth contact (ConnectivityONEReport doesn't record
+# which interface a contact used, so a replay couldn't reproduce it).
+Scenario.name = helsinki-capture
+Group4.nrofInterfaces = 1
+Group.router = PassiveRouter
+Events.nrof = 0
+Report.nrofReports = 1
+Report.report1 = ConnectivityONEReport
+Report.reportDir = ../../results/helsinki-capture

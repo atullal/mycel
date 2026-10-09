@@ -1,0 +1,19 @@
+Message stats for scenario cambridge-heavy-all,fallback,evict
+sim_time: 455609.0000
+created: 15184
+started: 14824
+relayed: 14393
+aborted: 111
+refused: 268
+delivered: 2143
+delivered_after_ttl: 0
+delivery_prob: 0.1411
+overhead_ratio: 5.7163
+latency_avg: 2893.9122
+latency_med: 202.3000
+hopcount_avg: 1.7046
+hopcount_med: 1
+transfers_by_reason: deliver 2163 route 1938 gradient 2121 spray 8602
+carrier: expired 11808 cleared_by_receipt 701 refused 268 accepted 12001
+refused_by: {"store full": 268}
+# (12 devices, 5228 contact events, 22.9 s)

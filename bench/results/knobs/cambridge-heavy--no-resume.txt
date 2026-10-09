@@ -1,0 +1,22 @@
+Message stats for scenario cambridge-heavy-no-resume
+sim_time: 455609.0000
+created: 15184
+started: 13840
+relayed: 13728
+aborted: 105
+offers: 14477
+refused: 395
+duplicates: 242
+delivered: 2240
+delivered_after_ttl: 0
+delivery_prob: 0.1475
+overhead_ratio: 5.1286
+latency_avg: 3198.0388
+latency_med: 253.5000
+hopcount_avg: 1.6741
+hopcount_med: 1
+transfers_by_reason: deliver 2267 route 2047 gradient 0 spray 9526
+carrier: expired 12096 cleared_by_receipt 629 refused 395 accepted 11448 evicted 8958 resumed 0
+refused_by: {"store full": 395}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Internet, carry: true }, resume false
+(12 devices, 5228 contact events, 2.9 s)

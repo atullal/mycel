@@ -266,6 +266,36 @@ impl Net {
     pub fn has_route(&self, from: usize, to: usize) -> bool {
         self.nodes[from].next_hop_local(&self.k(to), self.now).is_some()
     }
+
+    /// Following next hops from `from` reaches `to`.
+    pub fn routed(&self, from: usize, to: usize) -> bool {
+        let mut at = from;
+        for _ in 0..16 {
+            match self.nodes[at].next_hop_local(&self.k(to), self.now) {
+                Some(n) if self.index[&n] == to => return true,
+                Some(n) => at = self.index[&n],
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// Radio hops between two devices (breadth-first over the links).
+    pub fn hops(&self, from: usize, to: usize) -> Option<usize> {
+        let mut dist = vec![usize::MAX; self.nodes.len()];
+        let mut q = std::collections::VecDeque::from([from]);
+        dist[from] = 0;
+        while let Some(u) = q.pop_front() {
+            for &(a, b) in &self.links {
+                let v = if a == u { b } else if b == u { a } else { continue };
+                if dist[v] == usize::MAX {
+                    dist[v] = dist[u] + 1;
+                    q.push_back(v);
+                }
+            }
+        }
+        (dist[to] != usize::MAX).then_some(dist[to])
+    }
 }
 
 /// A random geometric graph: `n` devices in a square, linked within `range`.
@@ -517,6 +547,42 @@ fn frames_wait_for_a_lookup_and_a_dial_bounded() {
     assert!(outs.iter().any(|o| matches!(o, Out::Hangup(k) if *k == key(50))));
 }
 
+/// A failed dial isn't retried on every packet: it backs off (doubling),
+/// and meanwhile `toward` says the internet doesn't reach the target, so a
+/// carrier holding a bundle for it can look for a mesh carrier instead.
+#[test]
+fn failed_dials_back_off() {
+    let mut r = Router::new(key(1), Config::default());
+    r.set_internet(true);
+    let dials = |r: &mut Router| {
+        let mut outs = Vec::new();
+        r.drain(&mut outs);
+        outs.iter().filter(|o| matches!(o, Out::Dial(k) if *k == key(50))).count()
+    };
+    r.send(key(50), key(50), Bytes::from_static(b"x"), false, 0);
+    r.on_resolved(key(50), None, 10); // no record: dial it directly
+    assert_eq!(dials(&mut r), 1);
+    r.dial_failed(key(50), 100);
+    for t in [200, 500, 1_000, 2_000] {
+        r.send(key(50), key(50), Bytes::from_static(b"x"), false, t);
+        assert_eq!(r.toward(&key(50), t), Toward::Unreachable);
+    }
+    assert_eq!(dials(&mut r), 0, "backing off for 2 s");
+    assert!(r.stats().dropped_backoff >= 4);
+    r.send(key(50), key(50), Bytes::from_static(b"x"), false, 2_200);
+    assert_eq!(dials(&mut r), 1, "then once more");
+    r.dial_failed(key(50), 2_300);
+    r.send(key(50), key(50), Bytes::from_static(b"x"), false, 5_000);
+    assert_eq!(dials(&mut r), 0, "now 4 s");
+    r.send(key(50), key(50), Bytes::from_static(b"x"), false, 6_400);
+    assert_eq!(dials(&mut r), 1);
+    // a connection that works clears it
+    r.hop_up(key(50), 6_500);
+    r.hop_down(key(50), 7_000);
+    r.send(key(50), key(50), Bytes::from_static(b"x"), false, 7_100);
+    assert_eq!(dials(&mut r), 1);
+}
+
 #[test]
 fn relay_budgets_hold() {
     let cfg = Config { relay_rate_per_neighbour: 1000, relay_rate_total: 1500, ..Config::default() };
@@ -576,6 +642,101 @@ fn convergence_time_to_learn_new_routes() {
         "learn: 2-hop neighbours across the new link after {t_near:?} ms; all routes up to 8 hops after {t_all:?} ms (period 500 ms)"
     );
     assert!(t_all.is_some_and(|t| t <= 4 * 500 * 2), "{t_all:?}");
+}
+
+/// Babel-like timing (16 s periods): a device meeting a mesh learns its
+/// neighbours' routes from the greeting and announces itself to the full
+/// scope at once, so nobody waits for a period.
+#[test]
+fn new_neighbours_are_greeted_and_lone_devices_announce_fully() {
+    for greet in [Greet::Near, Greet::Own] {
+        let mut net = Net::new(7, |i| Config { announce_every: 16_000, greet, seed: i as u64 + 1, ..Config::default() });
+        for i in 0..5 {
+            net.link(i, i + 1);
+        }
+        // node 6 is alone for a while: its announcements reach nobody, and
+        // the latest ones are near-scope (fisheye)
+        net.run(100_000);
+        assert!(net.has_route(0, 5) && net.has_route(5, 0));
+        net.link(6, 5);
+        let start = net.now;
+        let (mut t_far, mut t_near) = (None, None);
+        net.until(16_000, |n| {
+            if t_far.is_none() && n.has_route(0, 6) {
+                t_far = Some(n.now - start);
+            }
+            if t_near.is_none() && n.has_route(6, 4) {
+                t_near = Some(n.now - start);
+            }
+            t_far.is_some() && t_near.is_some()
+        });
+        eprintln!("greet {greet:?}: 5 hops away learns the newcomer in {t_far:?} ms, the newcomer learns 2 hops away in {t_near:?} ms");
+        assert!(t_far.is_some_and(|t| t <= 600), "a lone device's first neighbour: full scope at once ({t_far:?})");
+        match greet {
+            Greet::Near => assert!(t_near.is_some_and(|t| t <= 100), "{t_near:?}"),
+            _ => assert!(t_near.is_none_or(|t| t > 1_000), "without a greeting it waits for a period ({t_near:?})"),
+        }
+        assert_eq!(net.loops_toward(6), 0);
+        assert_eq!(net.loops_toward(0), 0);
+    }
+}
+
+/// A device announcing every 10 ms (a storm) reaches its neighbours; relays
+/// pass on at most one of its seqnos per 250 ms.
+#[test]
+fn an_announcement_storm_stops_at_the_first_relays() {
+    let mut net = Net::new(3, |i| Config { announce_every: 16_000, seed: i as u64 + 1, ..Config::default() });
+    net.link(0, 1);
+    net.link(1, 2);
+    net.run(1_000);
+    let received = |n: &Net| n.nodes[2].stats().announcements_received;
+    let before = received(&net);
+    for _ in 0..200 {
+        let now = net.now;
+        let r = &mut net.nodes[0];
+        let o = r.next_announce(WALL + now);
+        let a = Announce { hops: 0, cost: 0, origin: r.me(), seq: o.seq, flags: o.flags, scope: o.scope, uplink: o.uplink, name: Arc::from(""), sig: Sig([0; 64]) };
+        r.originate(a, now);
+        net.effects(0);
+        net.run(10);
+    }
+    net.run(200);
+    let through = received(&net) - before;
+    eprintln!("storm: 200 announcements in 2 s, {through} reached 2 hops away");
+    assert!(through <= 10, "{through}");
+    assert!(net.nodes[1].stats().announcements_limited > 0);
+    assert!(net.has_route(2, 0), "the storming device stays reachable");
+}
+
+/// Over unicast hops, the broadcast-style flood reduction (skip a
+/// rebroadcast after hearing 3 equal copies) leaves devices out: those
+/// copies reached their senders' neighbours, not ours. Off by default.
+#[test]
+fn flood_reduction_is_off_and_floods_reach_everyone() {
+    assert!(!Config::default().flood_reduction);
+    let edges = geometric(60, 100.0, 24.0, 7);
+    let coverage = |reduction: bool| {
+        let mut net = Net::new(60, |i| Config { announce_every: 500, flood_reduction: reduction, seed: i as u64 + 1, ..Config::default() });
+        for (a, b) in &edges {
+            net.link(*a, *b);
+        }
+        net.run(3_000);
+        let mut ok = 0;
+        let mut all = 0;
+        for a in 0..60 {
+            for b in 0..60 {
+                if a != b && net.hops(a, b).is_some_and(|h| h <= 6) {
+                    all += 1;
+                    ok += net.routed(a, b) as usize;
+                }
+            }
+        }
+        ok as f64 / all as f64
+    };
+    let (off, on) = (coverage(false), coverage(true));
+    eprintln!("pairs within 8 hops routed after 3 s: reduction off {:.1}%, on {:.1}%", 100.0 * off, 100.0 * on);
+    assert!(off >= 0.99, "{off}");
+    assert!(off >= on);
 }
 
 /// A link in the middle of a line dies: with retractions, nobody keeps

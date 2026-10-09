@@ -1,0 +1,20 @@
+Message stats for scenario helsinki-gw-heavy-SprayAndWaitRouter
+sim_time: 43196.0000
+created: 1441
+started: 13556
+relayed: 4895
+aborted: 8660
+dropped: 4967
+removed: 0
+delivered: 664
+delivery_prob: 0.4608
+response_prob: 0.0000
+overhead_ratio: 6.3720
+latency_avg: 3028.3286
+latency_med: 2466.4000
+hopcount_avg: 1.9849
+hopcount_med: 2
+buffertime_avg: 5035.5326
+buffertime_med: 4670.6000
+rtt_avg: NaN
+rtt_med: NaN

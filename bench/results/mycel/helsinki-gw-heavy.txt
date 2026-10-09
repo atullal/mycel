@@ -1,0 +1,22 @@
+Message stats for scenario helsinki-gw-heavy-Mycel
+sim_time: 43195.6000
+created: 1441
+started: 22464
+relayed: 8130
+aborted: 14333
+offers: 22507
+refused: 13
+duplicates: 30
+delivered: 760
+delivered_after_ttl: 0
+delivery_prob: 0.5274
+overhead_ratio: 9.6974
+latency_avg: 4666.1589
+latency_med: 3403.8000
+hopcount_avg: 2.4618
+hopcount_med: 2
+transfers_by_reason: deliver 1894 route 4472 gradient 5526 spray 10572
+carrier: expired 186 cleared_by_receipt 1614 refused 13 accepted 7369 evicted 1903 resumed 1640
+refused_by: {"store full": 13}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Internet, room_aware: true, carry: true }, resume true
+(126 devices, 61986 contact events, 3.4 s)

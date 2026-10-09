@@ -1,0 +1,19 @@
+Message stats for scenario helsinki-gw-chat-all,spray,evict,inet
+sim_time: 43195.6000
+created: 1444
+started: 19717
+relayed: 19717
+aborted: 0
+refused: 0
+delivered: 1339
+delivered_after_ttl: 0
+delivery_prob: 0.9273
+overhead_ratio: 13.7252
+latency_avg: 3157.9250
+latency_med: 1987.0000
+hopcount_avg: 4.5414
+hopcount_med: 4
+transfers_by_reason: deliver 1344 route 3251 gradient 10652 spray 4470
+carrier: expired 0 cleared_by_receipt 3685 refused 0 accepted 17942
+refused_by: {}
+# (126 devices, 61986 contact events, 39.1 s)

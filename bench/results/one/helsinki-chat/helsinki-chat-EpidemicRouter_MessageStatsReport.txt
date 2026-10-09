@@ -1,0 +1,20 @@
+Message stats for scenario helsinki-chat-EpidemicRouter
+sim_time: 43196.0000
+created: 1444
+started: 233943
+relayed: 233060
+aborted: 883
+dropped: 120719
+removed: 0
+delivered: 1268
+delivery_prob: 0.8781
+response_prob: 0.0000
+overhead_ratio: 182.8013
+latency_avg: 1652.2006
+latency_med: 1190.7000
+hopcount_avg: 3.6948
+hopcount_med: 3
+buffertime_avg: 19123.0977
+buffertime_med: 20362.8000
+rtt_avg: NaN
+rtt_med: NaN

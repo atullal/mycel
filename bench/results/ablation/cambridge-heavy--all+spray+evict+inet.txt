@@ -1,0 +1,19 @@
+Message stats for scenario cambridge-heavy-all,spray,evict,inet
+sim_time: 455609.0000
+created: 15184
+started: 14180
+relayed: 13811
+aborted: 99
+refused: 220
+delivered: 2225
+delivered_after_ttl: 0
+delivery_prob: 0.1465
+overhead_ratio: 5.2072
+latency_avg: 3117.8576
+latency_med: 243.9000
+hopcount_avg: 1.6867
+hopcount_med: 1
+transfers_by_reason: deliver 2256 route 2200 gradient 0 spray 9724
+carrier: expired 12105 cleared_by_receipt 689 refused 220 accepted 11365
+refused_by: {"expired": 1, "store full": 219}
+# (12 devices, 5228 contact events, 13.0 s)

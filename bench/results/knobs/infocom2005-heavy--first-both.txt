@@ -1,0 +1,22 @@
+Message stats for scenario infocom2005-heavy-first-both
+sim_time: 254210.0000
+created: 8467
+started: 24885
+relayed: 24629
+aborted: 202
+offers: 26454
+refused: 543
+duplicates: 1026
+delivered: 2393
+delivered_after_ttl: 0
+delivery_prob: 0.2826
+overhead_ratio: 9.2921
+latency_avg: 2708.3107
+latency_med: 655.2000
+hopcount_avg: 3.2992
+hopcount_med: 3
+transfers_by_reason: deliver 2408 route 6035 gradient 4274 spray 12168
+carrier: expired 5084 cleared_by_receipt 2069 refused 543 accepted 22063 evicted 9617 resumed 55
+refused_by: {"source over its share": 2, "store full": 541}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Both, carry: true }, resume true
+(41 devices, 33476 contact events, 11.0 s)

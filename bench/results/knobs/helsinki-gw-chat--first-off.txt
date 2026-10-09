@@ -1,0 +1,22 @@
+Message stats for scenario helsinki-gw-chat-first-off
+sim_time: 43195.6000
+created: 1444
+started: 34591
+relayed: 34591
+aborted: 0
+offers: 34923
+refused: 0
+duplicates: 332
+delivered: 1382
+delivered_after_ttl: 0
+delivery_prob: 0.9571
+overhead_ratio: 24.0297
+latency_avg: 1714.7434
+latency_med: 1190.1000
+hopcount_avg: 3.3430
+hopcount_med: 3
+transfers_by_reason: deliver 1382 route 4586 gradient 0 spray 28623
+carrier: expired 0 cleared_by_receipt 27558 refused 0 accepted 33209 evicted 0 resumed 0
+refused_by: {}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Off, carry: true }, resume true
+(126 devices, 61986 contact events, 2.9 s)

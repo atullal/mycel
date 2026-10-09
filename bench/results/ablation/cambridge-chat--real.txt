@@ -1,0 +1,18 @@
+Message stats for scenario cambridge-chat-real
+sim_time: 455609.0000
+created: 15173
+started: 41651
+relayed: 39634
+aborted: 0
+refused: 2017
+delivered: 6969
+delivered_after_ttl: 464
+delivery_prob: 0.4593
+overhead_ratio: 4.6872
+latency_avg: 29798.1961
+latency_med: 26501.4000
+hopcount_avg: 2.4285
+hopcount_med: 2
+transfers_by_reason: deliver 7620 route 7708 gradient 10909 spray 15414
+carrier: expired 11683 cleared_by_receipt 6492 refused 2017 accepted 28352
+# (12 devices, 5228 contact events, 93.0 s)
