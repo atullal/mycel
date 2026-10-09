@@ -275,7 +275,7 @@ fn conference(o: Opts) -> ScenarioResult {
         let bs = ble.stats();
         let drops = bs.dropped_queue as f64 / bs.packets_sent.max(1) as f64;
         if drops > 0.1 && !r.slos.iter().all(|x| x.pass) {
-            r.expect_fail("FINDING (docs/SIMULATION.md §4, finding 1): Bluetooth transmit queues overflow in bursts (QUIC handshakes and syncs at 40 kB/s behind a 250 ms queue), dropping ~23% of BLE packets whatever the announcement period, greeting or neighbour cap; the slowest of 10 messages then waits for retransmissions");
+            r.expect_fail("FINDING (docs/SIMULATION.md §4, fixed 15): with MYCEL_SIM_BLE_QUEUE=radio (one 250 ms queue for the whole radio, not one 16 KiB queue per peer as the real BLE link has), bursts to one peer drop everyone's packets (~23%); the slowest of 10 messages then waits for retransmissions");
         }
         r.note(format!("Bluetooth medium: {} packets sent, {} dropped at full transmit queues ({:.1}%).", bs.packets_sent, bs.dropped_queue, 100.0 * bs.dropped_queue as f64 / bs.packets_sent.max(1) as f64));
         r.note("Each device opens hop connections to at most 6 devices in range (its own pseudo-random pick, so they spread out); others open theirs to it, ~11 in all here. Real BLE radios hold ~10 connections.");
