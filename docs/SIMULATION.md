@@ -288,11 +288,12 @@ it hears another rebroadcast). All have a FIFO-drop buffer and a TTL.
 **Real contact traces.** `traces.rs` reads CRAWDAD cambridge/haggle
 (`contacts.ExpN.dat`: Intel, Cambridge, Infocom 2005/2006; Cambridge city
 per-node files) and a generic CSV (e.g. NUS Bluetooth via
-`scripts/traces/nus_to_csv.py`). Licence: both are on IEEE DataPort, free
-account required, "cite, don't re-identify, don't re-share", so they are not
-in the repository: `scripts/traces/fetch-crawdad.sh <downloaded archive>`
-puts them in `target/data/traces/`, then
-`MYCEL_TRACE=target/data/traces/contacts.Exp6.dat cargo run --release -p mycel-sim -- trace-replay`.
+`bench/traces/nus_to_csv.py`). Licence: "cite, don't re-identify, don't
+re-share", so they are not in the repository. `bench/fetch.sh traces` puts
+the Haggle contact files in `bench/data/` (the same files the benchmarks
+replay), and `bench/fetch.sh dataport <archives>` unpacks the full IEEE
+DataPort archives (free account) into `bench/data/dataport/`. Then
+`MYCEL_TRACE=bench/data/infocom2006/contacts.Exp6.dat cargo run --release -p mycel-sim -- trace-replay`.
 Without them, `trace-replay` uses a synthetic trace with the same shape
 (heavy-tailed Pareto α 0.6 inter-contacts, as Chaintreau et al. measured on
 these traces), and says so. Workload: The ONE's default settings (a message
@@ -364,9 +365,9 @@ does), so usefulness falls through redundancy, not loss.
 day of global pings (19–20 July 2020, 246 servers, 2.9 M rows; credit:
 WonderNetwork, ["A day in the life of the internet"](https://wonderproxy.com/blog/a-day-in-the-life-of-the-internet/)).
 Their terms ask for credit and a link and give no redistribution licence, so
-the data isn't committed: `scripts/sim/fetch-wondernetwork.sh` downloads it to
-`target/data/`; `cargo run --release -p mycel-sim -- fit-latency` fits our
-model against it; `MYCEL_PINGS=target/data/wondernetwork` makes tier 2 use the
+the data isn't committed: `bench/fetch.sh latency` downloads it to
+`bench/data/wondernetwork/`; `cargo run --release -p mycel-sim -- fit-latency` fits our
+model against it; `MYCEL_PINGS=bench/data/wondernetwork` makes tier 2 use the
 measured RTT between the servers nearest each device instead of the model.
 Fit over 29,889 server pairs ≥ 200 km apart (derived statistics only):
 
@@ -388,35 +389,31 @@ scenarios use) within 10%, and underestimates the median pair by ~30%: use
 
 ## 6. To run on Linux (Docker or a Linux machine)
 
-Ready-made configs and scripts are in `scripts/sim/`. Except for The ONE,
-which runs here (the bench work ran it: `docs/BENCHMARKS.md`), they need
-Linux kernels, root or Docker, so they haven't run yet.
+The external tools have one home, `bench/` (`docs/BENCHMARKS.md`); what
+needs Linux is in `bench/linux/` with its own README, and hasn't run yet.
+What each adds to this simulator:
 
-- **The ONE** on the same traces (runs anywhere Java 8+ does):
-  `MYCEL_TRACE=… cargo run --release -p mycel-sim -- export-one` writes The ONE
-  connection events; `scripts/sim/the-one/haggle_settings.txt` runs Epidemic,
-  PRoPHET, SprayAndWait and MaxProp on them with the identical workload
-  (`./one.sh -b 4 …`), reporting MessageStats and BufferOccupancy for a one to
-  one comparison with `trace-replay`.
+- **The ONE** (runs anywhere Java does; already run, `docs/BENCHMARKS.md`
+  §3): its routers on the same CRAWDAD traces through `bench/run.py`.
+  `mycel-sim export-trace` writes any trace this simulator reads (the
+  synthetic one included) as the benchmarks' contacts CSV, which
+  `bench/traces/convert.py` turns into a workload and The ONE's events.
 - **Shadow** (real Mycel CLI processes, real syscalls, simulated network):
-  `scripts/sim/shadow/make-graph.py` builds a GML world graph (cities, fibre
-  latency or `--measured` WonderNetwork RTTs) and
-  `scripts/sim/shadow/mycel.yaml` runs `mycel serve` on hosts; a traffic driver
-  through the local API is the missing piece. Covers the IP side at scale
-  with the real binary.
+  `bench/linux/shadow/make_config.py` builds the world graph with this
+  simulator's fibre model, or WonderNetwork's measured RTTs with
+  `--measured`. A traffic driver through the local API is the missing
+  piece. It covers the IP side at scale with the real binary.
 - **Mininet-WiFi** (mac80211_hwsim, real 802.11 MAC, kernels' routing):
-  `scripts/sim/mininet-wifi/mesh_compare.py --proto batman_adv|olsrd|babeld|mycel`
-  builds the same ad-hoc line as `city-block` four times and measures ping and
-  iperf3 end to end, comparing Mycel's mesh with batman-adv, olsrd and babeld
-  on identical topologies, with collisions and rate adaptation EmuNet lacks.
-- **CORE / EMANE**: the same topologies with EMANE's 802.11abg and TDMA radio
-  models (and its LTE model) for PHY-level realism; build the scenario from
-  `mesh_compare.py`'s positions and run `mycel serve` in each node's
-  namespace.
-- **quic-network-simulator** (`scripts/sim/quic-netsim/README.md`): an
-  endpoint image for Mycel's QUIC so the ns-3-based interop scenarios
-  (handshake loss, blackholes, rebinding, migration, drop and corruption
-  rates) can run against it and against quinn/quiche.
+  `bench/linux/mininet_wifi_mesh.py --proto batman_adv|olsrd|babeld|mycel`
+  builds an ad-hoc line (`--spacing 40` is `city-block`'s) and compares
+  Mycel's mesh with batman-adv, olsrd and babeld on identical topologies,
+  with collisions and rate adaptation EmuNet lacks.
+- **CORE / EMANE**: the same topologies with EMANE's 802.11abg, TDMA and LTE
+  radio models for PHY-level realism.
+- **quic-network-simulator**: an endpoint image for Mycel's QUIC so the
+  ns-3-based interop scenarios (handshake loss, blackholes, rebinding,
+  migration, drop and corruption rates) run against it and against
+  quinn/quiche.
 
 ## 7. Wiring other routing cores
 

@@ -15,7 +15,8 @@ use mycel_sim::scenarios::{self, Candidate, Opts};
 #[command(about = "Mycel network simulation: real-world scenarios, scale and routing")]
 struct Args {
     /// A scenario name (or several, comma-separated), `all`, `t1`, `t2`,
-    /// `list`, `merge`, or `export-one` (write MYCEL_TRACE as The ONE events).
+    /// `list`, `merge`, `fit-latency`, or `export-trace` (write MYCEL_TRACE,
+    /// or the synthetic trace, as the benchmarks' contacts CSV).
     what: String,
     /// For `merge`: directories holding a `results.json` each.
     dirs: Vec<PathBuf>,
@@ -35,20 +36,20 @@ struct Args {
 fn main() -> anyhow::Result<()> {
     let a = Args::parse();
     let all = scenarios::all();
-    if a.what == "export-one" {
-        // the trace in MYCEL_TRACE (or the synthetic stand-in) as The ONE connection events
+    if a.what == "export-trace" {
+        // the trace in MYCEL_TRACE (or the synthetic stand-in) for bench/ (The ONE, dtn-replay)
         let t = match std::env::var("MYCEL_TRACE") {
             Ok(p) => mycel_sim::traces::load(std::path::Path::new(&p))?,
             Err(_) => mycel_sim::traces::synthetic(40, 72 * 3600 * mycel_sim::tier2::SEC, a.seed),
         };
         std::fs::create_dir_all(&a.out)?;
-        let path = a.out.join("one-events.txt");
-        mycel_sim::traces::export_one(&t, &path)?;
+        let path = a.out.join("contacts.csv");
+        mycel_sim::traces::export_csv(&t, &path)?;
         eprintln!("{}: {} devices, {} contacts → {}", t.name, t.nodes, t.contacts.len(), path.display());
         return Ok(());
     }
     if a.what == "fit-latency" {
-        let dir = std::env::var("MYCEL_PINGS").unwrap_or_else(|_| "target/data/wondernetwork".into());
+        let dir = std::env::var("MYCEL_PINGS").unwrap_or_else(|_| "bench/data/wondernetwork".into());
         let m = mycel_sim::latency::Measured::load(std::path::Path::new(&dir))?;
         let f = mycel_sim::latency::fit(&m);
         std::fs::create_dir_all(&a.out)?;

@@ -5,7 +5,7 @@
 //! <https://wonderproxy.com/blog/a-day-in-the-life-of-the-internet/>.
 //!
 //! The data isn't in the repository (no redistribution licence is given):
-//! `scripts/sim/fetch-wondernetwork.sh` downloads it into `target/data/`.
+//! `bench/fetch.sh latency` downloads it into `bench/data/wondernetwork/`.
 //! With it, [`Measured::load`] gives a city-pair RTT table, [`fit`] checks
 //! the fibre model in [`crate::models`] against it, and the tier-2 engine
 //! uses measured RTTs between the servers nearest each device (plus the
@@ -57,7 +57,7 @@ impl Measured {
     /// Load `servers.csv` and `pings.csv` from `dir`.
     pub fn load(dir: &Path) -> Result<Measured> {
         let servers: Vec<Server> = std::fs::read_to_string(dir.join("servers.csv"))
-            .with_context(|| format!("{}/servers.csv (run scripts/sim/fetch-wondernetwork.sh)", dir.display()))?
+            .with_context(|| format!("{}/servers.csv (run bench/fetch.sh latency)", dir.display()))?
             .lines()
             .skip(1)
             .filter_map(|l| {

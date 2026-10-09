@@ -10,11 +10,12 @@
 //! - **Cambridge city** (same dataset): a directory of `N.dat` files, each
 //!   the sightings by iMote N: seen id, first, last (Unix seconds).
 //! - **Generic CSV**: `a,b,start,end` in seconds (e.g. the NUS Bluetooth
-//!   trace converted from its SQL dump; see `scripts/traces/`).
+//!   trace converted from its SQL dump by `bench/traces/nus_to_csv.py`).
 //!
 //! The data isn't redistributable (CRAWDAD's terms: register, cite, don't
-//! re-share), so it isn't in the repository: `scripts/traces/fetch-crawdad.sh`
-//! explains how to get it with a free IEEE DataPort account. Without it,
+//! re-share), so it isn't in the repository: `bench/fetch.sh traces` downloads
+//! the Haggle contact files into `bench/data/`, and `bench/fetch.sh dataport
+//! <archives>` unpacks the full IEEE DataPort archives (free account). Without it,
 //! [`synthetic`] makes a trace with the same statistical shape (heavy-tailed
 //! inter-contact times, short contacts) so the pipeline runs anywhere.
 //!
@@ -172,17 +173,15 @@ pub fn synthetic(nodes: usize, duration: Time, seed: u64) -> Trace {
     Trace { name: format!("synthetic ({nodes} devices)"), nodes, contacts, duration }
 }
 
-/// Write the trace as The ONE's connection events (`StandardEventsReader`):
-/// `<time> CONN <a> <b> up|down`, time in seconds.
-pub fn export_one(t: &Trace, path: &Path) -> Result<()> {
-    let mut ev: Vec<(Time, String)> = Vec::new();
+/// Write the trace as the benchmarks' contacts CSV (`t_start,t_end,a,b`,
+/// seconds), the input `bench/traces/convert.py` turns into a workload and
+/// The ONE's events, and `dtn-replay` replays (docs/BENCHMARKS.md).
+pub fn export_csv(t: &Trace, path: &Path) -> Result<()> {
+    let mut body = String::from("t_start,t_end,a,b\n");
     for (s, e, a, b) in &t.contacts {
-        ev.push((*s, format!("{} CONN {a} {b} up", *s as f64 / SEC as f64)));
-        ev.push((*e, format!("{} CONN {a} {b} down", *e as f64 / SEC as f64)));
+        body += &format!("{},{},{a},{b}\n", *s as f64 / SEC as f64, *e as f64 / SEC as f64);
     }
-    ev.sort_by_key(|x| x.0);
-    let body: Vec<String> = ev.into_iter().map(|x| x.1).collect();
-    std::fs::write(path, body.join("\n") + "\n")?;
+    std::fs::write(path, body)?;
     Ok(())
 }
 
@@ -201,9 +200,9 @@ mod tests {
         assert_eq!(t.nodes, 3, "external device dropped");
         assert_eq!(t.contacts[0], (0, 160 * SEC, 0, 1), "both sides merged into one contact");
         assert_eq!(t.contacts.len(), 2);
-        let one = dir.join("one.txt");
-        export_one(&t, &one).unwrap();
-        assert!(std::fs::read_to_string(&one).unwrap().starts_with("0 CONN 0 1 up"));
+        let csv = dir.join("contacts.csv");
+        export_csv(&t, &csv).unwrap();
+        assert!(std::fs::read_to_string(&csv).unwrap().starts_with("t_start,t_end,a,b\n0,160,0,1\n"));
     }
 
     #[test]
