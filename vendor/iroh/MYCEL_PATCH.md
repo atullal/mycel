@@ -47,6 +47,21 @@ Changes (all in `src/socket/remote_map/remote_state.rs`, marked `MYCEL PATCH`):
      when a path opens or closes, so the Available set follows RTT, loss
      and rate.
 
+5. **Each path to open is queued once** (`State::queue_open_paths`).
+   - When a path can't be opened yet (`RemoteCidsExhausted` or
+     `MaxPathIdReached`), upstream queues its address for a retry in
+     333 ms, once per connection that failed. Every lookup result (patch 2)
+     also re-adds every custom address.
+   - With several connections to one remote, the queue multiplied with each
+     retry. Mycel has several: the pooled connection, calls and other
+     protocols. More links than the 8 path IDs per connection is easy for a
+     device on the move.
+   - In the 30-walker `shutdown` simulation that peaked at 30 GB, with one
+     core busy re-trying. Now an address already queued isn't queued again.
+   - Covered by `crates/mycel-net/tests/path_queue.rs`: 16 links and 4
+     connections. Memory stays flat with the fix and grows ~4 MB a second
+     without it.
+
 Path *selection* policy lives in Mycel: `mycel_net::link::MycelPathSelector`
 picks the selected path and which other paths join the aggregate.
 

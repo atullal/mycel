@@ -1,0 +1,19 @@
+Message stats for scenario helsinki-gw-heavy-all,fallback
+sim_time: 43195.6000
+created: 1441
+started: 23323
+relayed: 9742
+aborted: 13516
+refused: 61
+delivered: 1051
+delivered_after_ttl: 0
+delivery_prob: 0.7294
+overhead_ratio: 8.2693
+latency_avg: 6738.0204
+latency_med: 5894.2000
+hopcount_avg: 2.6565
+hopcount_med: 2
+transfers_by_reason: deliver 2025 route 889 gradient 13273 spray 7136
+carrier: expired 383 cleared_by_receipt 2729 refused 61 accepted 8654
+refused_by: {"store full": 61}
+# (126 devices, 61986 contact events, 13.3 s)

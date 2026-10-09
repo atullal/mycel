@@ -1,0 +1,19 @@
+Message stats for scenario infocom2005-heavy-all,spray,evict,inet
+sim_time: 254210.0000
+created: 8467
+started: 23381
+relayed: 22653
+aborted: 209
+refused: 266
+delivered: 2682
+delivered_after_ttl: 0
+delivery_prob: 0.3168
+overhead_ratio: 7.4463
+latency_avg: 3414.2093
+latency_med: 1063.6000
+hopcount_avg: 3.0589
+hopcount_med: 3
+transfers_by_reason: deliver 2743 route 7997 gradient 0 spray 12641
+carrier: expired 5319 cleared_by_receipt 2469 refused 266 accepted 19072
+refused_by: {"store full": 266}
+# (41 devices, 33476 contact events, 47.3 s)

@@ -1,0 +1,18 @@
+Message stats for scenario infocom2005-heavy-own,free,expiry
+sim_time: 254210.0000
+created: 8467
+started: 15108
+relayed: 13022
+aborted: 85
+refused: 1952
+delivered: 3035
+delivered_after_ttl: 0
+delivery_prob: 0.3585
+overhead_ratio: 3.2906
+latency_avg: 6157.8412
+latency_med: 4811.6000
+hopcount_avg: 2.1384
+hopcount_med: 2
+transfers_by_reason: deliver 3058 route 3905 gradient 3732 spray 4413
+carrier: expired 8533 cleared_by_receipt 2067 refused 1952 accepted 9756
+# (41 devices, 33476 contact events, 44.4 s)

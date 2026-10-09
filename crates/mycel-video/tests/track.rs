@@ -18,6 +18,10 @@ use tokio::sync::{broadcast, mpsc};
 
 const ALPN: &[u8] = b"test/video";
 
+/// These tests measure frame rates and share the hardware encoder, so they
+/// run one at a time: side by side they starve each other.
+static MEASURING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Side {
     node: Arc<Node>,
     incoming: mpsc::UnboundedReceiver<Connection>,
@@ -171,6 +175,7 @@ fn assert_in_order_from(seen: &Mutex<Seen>, from: usize) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn video_both_ways_over_ip() {
+    let _measuring = MEASURING.lock().await;
     let p = pair(true, &[], Some(PathKind::Network)).await;
     let at_bob = watch(p.b_ui.subscribe(), UiSource::Remote);
     let at_alice = watch(p.a_ui.subscribe(), UiSource::Remote);
@@ -224,6 +229,7 @@ async fn video_both_ways_over_ip() {
 /// recovers within a fraction of a second, never decoding a broken picture.
 #[tokio::test(flavor = "multi_thread")]
 async fn recovers_from_lost_frames_with_keyframes() {
+    let _measuring = MEASURING.lock().await;
     let p = pair(true, &[], Some(PathKind::Network)).await;
     let at_bob = watch(p.b_ui.subscribe(), UiSource::Remote);
     camera(&p.a, true).await;
@@ -257,6 +263,7 @@ async fn recovers_from_lost_frames_with_keyframes() {
 /// down to fit, frames keep coming in order, and delay stays bounded.
 #[tokio::test(flavor = "multi_thread")]
 async fn adapts_to_a_slow_link() {
+    let _measuring = MEASURING.lock().await;
     let wifi = MemNet::new(7, PathKind::PeerWifi);
     // ~400 kbit/s
     wifi.set_rate_limit(Some(50_000));

@@ -1,0 +1,20 @@
+Message stats for scenario infocom2006-gw-chat-SprayAndWaitRouter
+sim_time: 337479.0000
+created: 11245
+started: 37637
+relayed: 37611
+aborted: 26
+dropped: 31229
+removed: 0
+delivered: 8615
+delivery_prob: 0.7661
+response_prob: 0.0000
+overhead_ratio: 3.3658
+latency_avg: 15818.8046
+latency_med: 7168.8000
+hopcount_avg: 2.0397
+hopcount_med: 2
+buffertime_avg: 83569.6900
+buffertime_med: 86352.6000
+rtt_avg: NaN
+rtt_med: NaN

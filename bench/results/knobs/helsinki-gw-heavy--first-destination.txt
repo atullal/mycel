@@ -1,0 +1,22 @@
+Message stats for scenario helsinki-gw-heavy-first-destination
+sim_time: 43195.6000
+created: 1441
+started: 33847
+relayed: 13625
+aborted: 20220
+offers: 34096
+refused: 70
+duplicates: 179
+delivered: 507
+delivered_after_ttl: 0
+delivery_prob: 0.3518
+overhead_ratio: 25.8738
+latency_avg: 3695.5075
+latency_med: 3081.8000
+hopcount_avg: 2.9586
+hopcount_med: 3
+transfers_by_reason: deliver 1346 route 4328 gradient 19651 spray 8522
+carrier: expired 11 cleared_by_receipt 998 refused 70 accepted 13115 evicted 3294 resumed 2085
+refused_by: {"store full": 70}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Destination, carry: true }, resume true
+(126 devices, 61986 contact events, 2.5 s)

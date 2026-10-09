@@ -1,0 +1,22 @@
+Message stats for scenario helsinki-gw-heavy-copies-4
+sim_time: 43195.6000
+created: 1441
+started: 29404
+relayed: 10927
+aborted: 18476
+offers: 29450
+refused: 25
+duplicates: 21
+delivered: 536
+delivered_after_ttl: 0
+delivery_prob: 0.3720
+overhead_ratio: 19.3862
+latency_avg: 3198.6409
+latency_med: 2806.5000
+hopcount_avg: 2.7239
+hopcount_med: 3
+transfers_by_reason: deliver 1339 route 4058 gradient 14600 spray 9407
+carrier: expired 20 cleared_by_receipt 1053 refused 25 accepted 10390 evicted 2974 resumed 1945
+refused_by: {"store full": 25}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 4, spray: First, gradient: Internet, carry: true }, resume true
+(126 devices, 61986 contact events, 2.5 s)

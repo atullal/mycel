@@ -1,0 +1,22 @@
+Message stats for scenario helsinki-heavy-focus-both
+sim_time: 43195.6000
+created: 1441
+started: 30914
+relayed: 11318
+aborted: 19593
+offers: 30928
+refused: 5
+duplicates: 9
+delivered: 569
+delivered_after_ttl: 0
+delivery_prob: 0.3949
+overhead_ratio: 18.8910
+latency_avg: 4923.4053
+latency_med: 4260.8000
+hopcount_avg: 2.6186
+hopcount_med: 2
+transfers_by_reason: deliver 1646 route 38 gradient 25716 spray 3514
+carrier: expired 44 cleared_by_receipt 1049 refused 5 accepted 10749 evicted 2695 resumed 2001
+refused_by: {"store full": 5}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: Focus, gradient: Both, carry: true }, resume true
+(126 devices, 63286 contact events, 1.4 s)

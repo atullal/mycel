@@ -1,0 +1,18 @@
+Message stats for scenario infocom2005-chat-own,free,expiry
+sim_time: 254210.0000
+created: 8474
+started: 55852
+relayed: 55852
+aborted: 0
+refused: 0
+delivered: 6993
+delivered_after_ttl: 0
+delivery_prob: 0.8252
+overhead_ratio: 6.9868
+latency_avg: 22330.8122
+latency_med: 17393.2000
+hopcount_avg: 3.8836
+hopcount_med: 4
+transfers_by_reason: deliver 7215 route 18111 gradient 20268 spray 10258
+carrier: expired 2533 cleared_by_receipt 9601 refused 0 accepted 45338
+# (41 devices, 33476 contact events, 100.2 s)
