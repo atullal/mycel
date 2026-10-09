@@ -62,7 +62,7 @@ routing core + carrier), `main` (the mesh before GLOBAL, modelled), or
 
 | Medium | Goodput | Latency (+ jitter) | Range in/out | Source |
 |---|---|---|---|---|
-| BLE L2CAP CoC | 40 kB/s | 15 ms + 15 | 20 / 60 m | Bluetooth Core 5.x; Apple WWDC17 (L2CAP CoC); Gomez et al., Sensors 2012 |
+| BLE L2CAP CoC | 40 kB/s per radio, shared by the links with data queued; a 16 KiB drop-tail queue per peer | 15 ms + 15 | 20 / 60 m | Bluetooth Core 5.x (connection events served in turn: 5.4 Vol 6 Part B §4.5.1); Apple WWDC17 (L2CAP CoC); Gomez et al., Sensors 2012; queue = `mycel_link_ble::OUT_QUEUE_BYTES` |
 | AWDL | 12 MB/s | 2 ms + 20 (channel hopping) | 50 / 100 m | Stute et al., MobiCom 2018 |
 | Wi-Fi Direct | 8 MB/s | 3 ms + 5 | 50 / 150 m | Wi-Fi P2P spec; measured 50–150 Mbit/s |
 | Wi-Fi LAN (AP) | 15 MB/s shared | 3 ms + 5 | 40 / 100 m | busy 802.11ac BSS |
@@ -112,16 +112,16 @@ machine it measured 500 nodes in 1.2 GB (§1).
 | `cafe` | 1 | full | ✅ | messages: 100% delivered, p50 0.032 s, p95 0.039 s, optimality p50/p95/p99 5.77/7.00/7.22× · call: setup 0.051 s, loss 0.0%, latency 101 ms, path Some(Network) | 18 s |
 | `office` | 1 | full | ✅ | messages: 100% delivered, p50 0.032 s, p95 0.034 s, optimality p50/p95/p99 6.00/59.3/60.6× | 10 s |
 | `apartment-80211s` | 1 | full | ✅ | messages: 100% delivered, p50 0.083 s, p95 0.095 s, optimality p50/p95/p99 5.63/6.98/6.98× · bulk: next flat 8.2 MB/s, 7 flats away 2.2 MB/s | 10 s |
-| `conference` | 1 | 24 seats (scale 0.1; 100 didn't finish, 300 crashed) *(routing)* | ⏳ | messages: 100% delivered, p50 0.462 s, p95 6.39 s, optimality p50/p95/p99 5.66/170/170× (before finding 1's fixes: 80% delivered, p95 3.36 s)<br>✗ messages: latency p95: 6.39 s (target ≤ 3.00 s) | 108 s |
-| `city-block` | 1 | full | ✅ | 8 hops: 100% delivered, p50 0.957 s, p95 1.01 s, optimality p50/p95/p99 3.19/3.38/3.38× · 9 hops: not delivered (max_hops = 8) | 70 s |
-| `shutdown` | 1 | full *(stability)* | ✅ | messages (connected at the time): 80% delivered, p50 1.58 s, p95 9.39 s, optimality p50/p95/p99 42.1/189/394× · call: setup 1.46 s over Bluetooth, tone not heard (open 11) · memory +106 MB for 30 nodes, flat (was 30 GB peak, fixed 10) | 502 s |
-| `disaster-live` | 1 | full *(carrier)* | ✅ | member mule: 49 s; stranger mule: 49 s (it never arrived before fixed 2) | 62 s |
-| `rural-line` | 1 | full | ✅ | messages: 100% delivered, p50 0.114 s, p95 0.130 s, optimality p50/p95/p99 5.67/6.78/6.78× · bulk: next house 6.6 MB/s, 5 hops 0.59 MB/s | 20 s |
-| `us-eu-live` | 1 | full *(routing)* | ✅ | messages: 100% delivered, p50 0.745 s, p95 0.880 s, optimality p50/p95/p99 3.94/4.66/4.66× · call: setup 1.68 s, loss 0.0%, latency 722 ms, path Some(Mesh) (on the loaded machine before: loss 66.7%) | 53 s |
+| `conference` | 1 | 24 seats (scale 0.08), seeds 1–5; 30 and 100 seats, seed 1 *(tier 1; 300 not rerun)* | ✅ | 24 seats: messages 100% delivered every seed, p95 0.20 / 1.19 / 0.89 / 0.48 / 0.60 s; 0 Bluetooth packets dropped (was 15–25%, p95 up to 8.2 s, fixed 15) · 30 seats: 100%, p95 0.411 s · 100 seats (a seat hears ~49, 12 hop connections each): 100%, p50 0.463 s, p95 1.10 s, 26 of 169,243 Bluetooth packets dropped, +272 MB (2.7 MB per node; 100 seats didn't finish in 30 min before) | 15–20 s (24), 38 s (100) |
+| `city-block` | 1 | full | ✅ | 8 hops: 100% delivered, p50 0.973 s, p95 0.978 s, optimality p50/p95/p99 3.24/3.26/3.26× · 9 hops: delivered (max_hops = 10) | 24 s |
+| `shutdown` | 1 | full, seeds 1–4 *(tier 1)* | ✅ | messages (connected at the time): 100 / 90 / 100 / 100% delivered, p95 0.59 / 0.78 / 0.76 / 6.97 s · call between two walkers: heard every seed, loss 0.0%, setup 0.58–1.02 s, over the mesh or Bluetooth (fixed 15) · memory +69–87 MB for 30 nodes | 49–123 s (was 502 s, fixed 16) |
+| `disaster-live` | 1 | full *(carrier)* | ✅ | member mule: 49 s; stranger mule: 50 s (it never arrived before fixed 2) | 60 s |
+| `rural-line` | 1 | full | ✅ | messages: 100% delivered, p50 0.100 s, p95 0.120 s, optimality p50/p95/p99 5.73/6.87/6.87× · bulk: next house 6.7 MB/s, 5 hops 0.70 MB/s | 18 s |
+| `us-eu-live` | 1 | full *(routing)* | ✅ | messages: 100% delivered, p50 0.788 s, p95 0.805 s, optimality p50/p95/p99 4.17/4.26/4.26× · call: setup 1.63 s, loss 0.0%, latency 435 ms, path Some(Mesh) | 20 s |
 | `nat-relay` | 1 | full | ✅ | messages: 100% delivered, p50 0.233 s, p95 0.488 s, optimality p50/p95/p99 3.32/4.57/4.80× · during the relay outage: 100% delivered, p50 0.263 s, p95 0.772 s, optimality p50/p95/p99 3.32/6.39/130× | 23 s |
-| `adversarial-live` | 1 | full | ✅ | messages past a black hole and a storm: 100% delivered, p50 1.87 s, p95 4.01 s, optimality p50/p95/p99 24.9/53.5/53.5× | 46 s |
-| `multipath` | 1 | full | ✅ | 3 links 8.0 MB/s, 1 link 2.9 MB/s (2.78×) | 21 s |
-| `mixed-room` | 1 | full | ✅ | Ethernet→Some(Ethernet), Wi-Fi Direct→Some(WifiDirect), UWB→Some(Uwb), Bluetooth LE→Some(Bluetooth) | 30 s |
+| `adversarial-live` | 1 | full | ✅ | messages past a black hole and a storm: 100% delivered, p50 0.275 s, p95 0.308 s, optimality p50/p95/p99 3.66/4.11/4.11× | 16 s |
+| `multipath` | 1 | full | ✅ | 3 links 8.0 MB/s, 1 link 2.9 MB/s (2.76×) | 21 s |
+| `mixed-room` | 1 | full | ✅ | Ethernet→Some(Ethernet), Wi-Fi Direct→Some(WifiDirect), UWB→Some(Uwb), Bluetooth LE→Some(Bluetooth) | 26 s |
 | `us-eu` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 0.799 s, optimality p50/p95/p99 1.29/2.29/4.19× | 1 s |
 | `gateway-choice` | 2 | full *(stability)* | ✅ | global core + DTN: 100% delivered, p95 1.12 s, optimality p50/p95/p99 6.29/9.06/9.18× (100 KB and 1 MB messages now against the pipelining bound) · 100% of relayed bytes via the far fibre gateway | 0 s |
 | `routing-convergence` | 2 | full *(routing)* | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never | 15 s |
@@ -333,11 +333,52 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    - `us-eu-live`: passes (call loss 0%), but that scenario sets its own
      1 s period; the 66.7% loss was most likely the overloaded machine.
    - `conference` (24 seats): 80% → 100% delivered; p95 still over 3 s
-     (open finding 1).
+     until fixed 15.
 
    Tests: `new_neighbours_are_greeted_and_lone_devices_announce_fully`,
    `flood_reduction_is_off_and_floods_reach_everyone` (`mesh/core/tests.rs`),
    `announcements_batch_into_datagrams` (`mesh/wire.rs`).
+
+15. **The emulator's Bluetooth model queued a whole radio in one FIFO**
+   (was open 1's `conference` latency and open 11). `EmuNet` gave each
+   radio one transmit queue bounded at 250 ms (10 KB at 40 kB/s) for all
+   its peers, so a burst to one peer (a QUIC handshake, a sync) dropped
+   packets to every other peer: 15–25% of Bluetooth packets in
+   `conference`, whatever the announcement settings. The real link isn't
+   like that: `mycel-link-ble` opens one L2CAP channel per peer, each with
+   its own 16 KiB drop-tail queue (`OUT_QUEUE_BYTES`), and the controller
+   serves its connections in turn, one connection event each (Bluetooth
+   Core 5.4, Vol 6, Part B, §4.5.1).
+   - Fix: `Medium::peer_queue` gives each link its own byte-bounded queue
+     and shares the radio's rate between the links with data queued at
+     either end; `Tech::Ble` uses 16 KiB (`crates/mycel-net/src/emu.rs`,
+     test `peer_queues_share_the_radio`). `MYCEL_SIM_BLE_QUEUE=radio`
+     brings back the old model for comparison.
+   - `conference`, 24 seats, seeds 1–5: Bluetooth drops 15–25% → 0%, p95
+     1.4–8.2 s → 0.20–1.19 s (target 3 s); 30 seats: p95 0.41 s; 100
+     seats: p95 1.10 s in 38 s of wall time (it didn't finish in 30 min
+     before, with the path-queue leak of fixed 10).
+   - `shutdown`, full size, seed 1: old model p95 10.2 s and the call
+     never rang; now p95 0.59 s and the tone is heard (seeds 1–4: heard
+     every time, loss 0%, over the mesh or straight over Bluetooth).
+   - Every other Bluetooth scenario passes at full size with it
+     (`city-block`, `rural-line`, `us-eu-live`, `disaster-live`,
+     `mixed-room`, `adversarial-live`, `multipath`).
+   - No change was needed in the node: with the real queueing, a burst to
+     one neighbour no longer costs the others, and nothing is dropped.
+     Limit: the real controller's total throughput falls somewhat with
+     many connections (more connection-event overhead); 40 kB/s for the
+     whole radio is already about a third of one good L2CAP link.
+16. **Shutting the lab down took minutes.** A node's endpoint close
+   waits for every peer to acknowledge CONNECTION_CLOSE, up to 3 probe
+   timeouts per connection; to peers on a slow radio or already gone,
+   that is seconds per node, and the lab closed nodes one after another
+   (30 walkers: ~4 minutes; a 24-seat conference: 70 s).
+   - Fix: the lab closes every node at once, and `Node::shutdown` waits
+     at most 2 s (`SHUTDOWN_GRACE`) for the acks; the close frames still go
+     out at once. Quitting the app no longer hangs on a slow radio either.
+   - `shutdown` at full size: 502 s → 49–123 s wall; `conference` 24
+     seats: 96 s → 15–20 s.
 
 ### Open (with evidence)
 
@@ -350,13 +391,7 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
      every 10 s. Directions: send what changed, fewer or quantized
      predictabilities, a longer period. `global-scale`'s 1 KB/s target
      fails on this alone; routing has its own line in the report.
-   - **`conference` latency** (24 seats): 100% delivered, but the slowest
-     of 10 messages takes 6–7 s (target 3 s). About 23% of Bluetooth
-     packets are dropped at full 250 ms transmit queues whatever the
-     announcement period, greeting or neighbour cap (measured with each
-     changed). QUIC handshakes and syncs arrive in bursts larger than
-     the queue at 40 kB/s. Directions: pace hop-connection handshakes,
-     larger queues, fewer path keep-alives on Bluetooth.
+   - *(`conference` latency: fixed 15, the emulator's Bluetooth queue.)*
 
    Repro: `mycel-sim global-scale --scale 0.02`, `mycel-sim conference
    --scale 0.1`. Old routing settings for comparison:
@@ -409,11 +444,12 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    announcement period, so the loss was most likely CPU starvation, not
    announcements. Watch it on the next loaded run.
 10. *(fixed 12: the oracle's bound for multi-packet messages)*
-11. **`shutdown`'s call between two walkers set up (1.5 s, over
-   Bluetooth) but the tone wasn't heard** in its 3 s window at full size.
-   Messages: 80% of those connected at the time, p95 9.4 s. The radio is
-   shared with announcements (finding 1). Shutting down 30 nodes took
-   ~4 minutes after the scenario ended.
+11. *(fixed 15 and 16: `shutdown`'s call and messages were the emulator's
+   one-queue Bluetooth model; its slow teardown was sequential closes.)*
+   Still worth watching: at seed 4 one message of 20 took 7.0 s, at seed
+   2 one wasn't delivered within 20 s. The walkers separate mid-delivery
+   (1.4 m/s, 60 m Bluetooth range); both are within the 80% / 10 s
+   targets.
 
 ## 5. Benchmarks against external baselines
 
