@@ -38,8 +38,26 @@ use crate::models::{Access, Env, FIBRE_US_PER_KM, Nat, PATH_INFLATION, Tech, bac
 use crate::stats::Summary;
 
 /// Run a tier-1 scenario on its own multi-threaded runtime.
+/// `MYCEL_SIM_MEMLOG=<secs>` logs memory and live tasks to stderr that often.
 pub fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime").block_on(f)
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("runtime");
+    let every = std::env::var("MYCEL_SIM_MEMLOG").ok().and_then(|s| s.parse::<u64>().ok());
+    let log = every.map(|secs| {
+        rt.spawn(async move {
+            let t0 = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(secs.max(1))).await;
+                let (mb, _) = resources();
+                let tasks = tokio::runtime::Handle::current().metrics().num_alive_tasks();
+                eprintln!("memlog t={:>5.0}s memory {mb:>7.0} MB tasks {tasks}", t0.elapsed().as_secs_f64());
+            }
+        })
+    });
+    let out = rt.block_on(f);
+    if let Some(log) = log {
+        log.abort();
+    }
+    out
 }
 
 /// A medium of `tech` in `env`, in transport slot `slot` (0..16).
@@ -529,15 +547,42 @@ pub fn summarize(ds: &[Delivery]) -> (f64, Summary, Summary) {
     (ratio, Summary::of(&lat), Summary::of(&opt))
 }
 
-/// Resident memory (MB) and CPU time (s) of this process.
+/// Memory (MB) and CPU time (s) of this process. Memory is the physical
+/// footprint on macOS (what Activity Monitor shows): resident size leaves
+/// out compressed and swapped pages, so under memory pressure it reads far
+/// too low. Elsewhere, resident size.
 pub fn resources() -> (f64, f64) {
-    let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output();
-    let rss = out.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok()).unwrap_or(0.0) / 1024.0;
+    let rss = footprint_bytes().map_or_else(
+        || {
+            let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output();
+            out.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok()).unwrap_or(0.0) / 1024.0
+        },
+        |b| b as f64 / (1024.0 * 1024.0),
+    );
     let mut u: libc::rusage = unsafe { std::mem::zeroed() };
     // SAFETY: getrusage fills the struct we pass.
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
     let cpu = u.ru_utime.tv_sec as f64 + u.ru_utime.tv_usec as f64 / 1e6 + u.ru_stime.tv_sec as f64 + u.ru_stime.tv_usec as f64 / 1e6;
     (rss, cpu)
+}
+
+#[cfg(target_os = "macos")]
+fn footprint_bytes() -> Option<u64> {
+    let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+    // SAFETY: proc_pid_rusage fills a rusage_info_v2 for RUSAGE_INFO_V2.
+    let ok = unsafe {
+        libc::proc_pid_rusage(
+            std::process::id() as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            &mut info as *mut libc::rusage_info_v2 as *mut libc::rusage_info_t,
+        )
+    } == 0;
+    ok.then_some(info.ri_phys_footprint)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn footprint_bytes() -> Option<u64> {
+    None
 }
 
 /// A position for a device `i` of `n` spread evenly on a `w` × `h` floor.

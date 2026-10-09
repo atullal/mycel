@@ -934,7 +934,7 @@ impl State {
         self.paths.insert_multiple(addrs.into_iter(), Source::App);
         self.paths.resolve_remote(tx);
         if custom {
-            self.pending_open_paths.extend(self.custom_addrs());
+            self.queue_open_paths(self.custom_addrs());
             self.scheduled_open_path.get_or_insert_with(Instant::now);
         }
         // Start Address Lookup if we have no selected path.
@@ -1001,7 +1001,7 @@ impl State {
                     // MYCEL PATCH: custom paths found after the connection
                     // was set up get opened on it (via the scheduled-open queue).
                     if custom {
-                        self.pending_open_paths.extend(self.custom_addrs());
+                        self.queue_open_paths(self.custom_addrs());
                         self.scheduled_open_path.get_or_insert_with(Instant::now);
                     }
                 }
@@ -1150,7 +1150,7 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_4tuple.clone());
+                        self.queue_open_paths([open_4tuple.clone()]);
                         trace!(?open_4tuple, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
@@ -1169,6 +1169,20 @@ impl State {
             PathStatus::Available
         } else {
             PathStatus::Backup
+        }
+    }
+
+    /// MYCEL PATCH: queue paths to open, each once. Upstream re-queued an
+    /// address once per connection that couldn't open it yet (no CIDs), so
+    /// with several connections to one remote the queue multiplied every
+    /// 333 ms retry, and lookups re-added every custom address each time:
+    /// tens of GB and a busy core within minutes for devices on the move
+    /// (docs/SIMULATION.md §4, `shutdown`).
+    fn queue_open_paths(&mut self, addrs: impl IntoIterator<Item = transports::FourTuple>) {
+        for addr in addrs {
+            if !self.pending_open_paths.contains(&addr) {
+                self.pending_open_paths.push_back(addr);
+            }
         }
     }
 
