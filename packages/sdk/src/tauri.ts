@@ -14,8 +14,42 @@ export function isTauri(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+/**
+ * True in the iPhone, iPad and Android apps. There the native file dialog
+ * hands back content:// URIs or temporary copies instead of paths, and an
+ * app can't relaunch itself. (iPad web views say "Macintosh"; touch gives
+ * them away.)
+ */
+export function isMobile(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent;
+  return /Android|iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+}
+
+/** The system's photo / file picker, through a hidden file input. */
+function chooseFiles(): Promise<File[]> {
+  return new Promise((resolve) => {
+    const input = document.createElement("input");
+    input.type = "file";
+    input.multiple = true;
+    input.style.display = "none";
+    const done = (files: File[]) => {
+      input.remove();
+      resolve(files);
+    };
+    input.addEventListener("change", () => done(Array.from(input.files ?? [])));
+    input.addEventListener("cancel", () => done([]));
+    document.body.append(input);
+    input.click();
+  });
+}
+
 const tauriFiles: FileHost = {
   async pick() {
+    if (isMobile()) {
+      const files = await chooseFiles();
+      return files.length ? tauriFiles.stage!(files) : [];
+    }
     const picked = await openDialog({ multiple: true, directory: false, title: "Attach files" });
     if (picked == null) return [];
     return Array.isArray(picked) ? picked : [picked];
@@ -24,7 +58,9 @@ const tauriFiles: FileHost = {
     return convertFileSrc(path);
   },
   async open(path) {
-    await openPath(path);
+    // Phones: the share sheet / "Open with" (the host's `open_file`).
+    if (isMobile()) await invoke("open_file", { path });
+    else await openPath(path);
   },
   async stage(files) {
     const paths: string[] = [];

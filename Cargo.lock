@@ -3322,9 +3322,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.190"
+version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78"
+checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "libdbus-sys"
@@ -3590,11 +3590,14 @@ dependencies = [
  "block2",
  "bytes",
  "cpal",
+ "jni 0.21.1",
  "mycel-crypto",
  "mycel-net",
  "mycel-sync",
  "mycel-trust",
  "mycel-video",
+ "ndk",
+ "ndk-context",
  "objc2",
  "objc2-audio-toolbox",
  "objc2-core-audio-types",
@@ -3643,8 +3646,13 @@ dependencies = [
 name = "mycel-host"
 version = "0.1.0"
 dependencies = [
+ "jni 0.21.1",
  "libc",
  "mycel-node",
+ "objc2",
+ "objc2-core-foundation",
+ "objc2-foundation",
+ "objc2-ui-kit",
  "serde",
  "serde_json",
  "tauri",
@@ -3652,6 +3660,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "tokio",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3761,6 +3770,7 @@ dependencies = [
  "chacha20poly1305",
  "data-encoding",
  "hex",
+ "libc",
  "mycel-call",
  "mycel-crypto",
  "mycel-kit-chat",
@@ -6209,8 +6219,6 @@ dependencies = [
 [[package]]
 name = "swift-rs"
 version = "1.0.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e45c444e496845d3f2a351146bff59aae4975b2280238df1dfaa0c7d1846f38e"
 dependencies = [
  "base64 0.21.7",
  "serde",

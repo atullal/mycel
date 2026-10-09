@@ -9,6 +9,8 @@ publish = false
 [lib]
 name = "mycel_host"
 path = "src/lib.rs"
+# staticlib for the iOS app, cdylib for Android, rlib for the desktop binary.
+crate-type = ["staticlib", "cdylib", "rlib"]
 
 [[bin]]
 name = "mycel-host"
@@ -24,5 +26,22 @@ tauri-plugin-dialog = "2"
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-libc = "0.2"
+# libc 0.2.190 declares the routing-socket constants and `in6_ifreq` for macOS
+# only, which breaks Iroh's `netwatch` and `netdev` on iOS. Stay below it until
+# they stop relying on those items there.
+libc = ">=0.2.189, <0.2.190"
 tokio = { version = "1", features = ["sync"] }
+
+# The device's name for a new profile, and the share sheet for attachments.
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2 = "0.6"
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
+objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-foundation", "UIActivityViewController", "UIDevice", "UIPopoverPresentationController", "UIPresentationController", "UIResponder", "UIView", "UIViewController"] }
+
+# Calls into MainActivity (opening attachments).
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }

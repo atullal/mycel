@@ -80,6 +80,13 @@ pub fn restart_app(app: tauri::AppHandle) {
     app.restart();
 }
 
+/// Open a downloaded attachment: the share sheet on iPhone and iPad, an
+/// "Open with" chooser on Android, the default app on a computer.
+#[tauri::command]
+pub async fn open_file(app: AppHandle, rt: State<'_, Rt>, path: String) -> Res<()> {
+    crate::open_file::open(&app, rt.data_dir(), &path)
+}
+
 // ---------------------------------------------------------------- messaging
 
 #[tauri::command]

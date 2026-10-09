@@ -113,12 +113,12 @@ pub fn zip_dir(dir: &Path, out: &Path) -> Result<()> {
 fn add_to_zip<W: Write + io::Seek>(zip: &mut zip::ZipWriter<W>, path: &Path, rel: &str) -> Result<()> {
     use zip::{CompressionMethod, write::SimpleFileOptions};
     let meta = std::fs::symlink_metadata(path).map_err(|e| read_error(path, e))?;
-    let mut opts = SimpleFileOptions::default();
+    let opts = SimpleFileOptions::default();
     #[cfg(unix)]
-    {
+    let opts = {
         use std::os::unix::fs::PermissionsExt;
-        opts = opts.unix_permissions(meta.permissions().mode() & 0o7777);
-    }
+        opts.unix_permissions(meta.permissions().mode() & 0o7777)
+    };
     let ft = meta.file_type();
     if ft.is_symlink() {
         let target = std::fs::read_link(path).map_err(|e| read_error(path, e))?;

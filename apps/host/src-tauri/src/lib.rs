@@ -16,11 +16,12 @@
 //! - `MYCEL_NAME`: display name to use when creating a new profile.
 
 mod commands;
+mod open_file;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use mycel_node::Runtime;
+use mycel_node::{Runtime, RuntimeOptions};
 use mycel_node::api::{Event, NetworkMode};
 use tauri::{AppHandle, Emitter, Manager, RunEvent};
 use tokio::sync::broadcast::error::RecvError;
@@ -142,25 +143,79 @@ fn allow_attachment_files(app: &tauri::App, data_dir: &std::path::Path) -> Resul
     .map_err(|e| format!("cannot allow opening attachments: {e}"))
 }
 
-/// Opened from Finder there's no terminal, so stderr (where the runtime and
-/// the peer-to-peer Wi-Fi / Bluetooth links log) goes nowhere. Send it to
-/// `<data dir>/mycel.log` instead (the previous run is kept as `mycel.log.1`).
+/// Opened from Finder or the Start menu, or on a phone, there's no terminal,
+/// so stderr (where the runtime and the peer-to-peer Wi-Fi / Bluetooth links
+/// log) goes nowhere. Send it to `<data dir>/mycel.log` instead (the previous
+/// run is kept as `mycel.log.1`).
 fn log_to_file(data_dir: &std::path::Path) {
-    use std::os::fd::AsRawFd;
-    // SAFETY: isatty only inspects the descriptor.
-    if unsafe { libc::isatty(2) } == 1 {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
         return;
     }
     let path = data_dir.join("mycel.log");
     let _ = std::fs::rename(&path, data_dir.join("mycel.log.1"));
     if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        // SAFETY: dup2 onto stderr; `file` stays open until dup2 has copied it.
-        unsafe { libc::dup2(file.as_raw_fd(), 2) };
+        redirect_stderr(file);
     }
     if std::env::var_os("MYCEL_BLE_LOG").is_none() {
         // SAFETY: called during startup, before other threads read the environment.
         unsafe { std::env::set_var("MYCEL_BLE_LOG", "1") };
     }
+}
+
+#[cfg(unix)]
+fn redirect_stderr(file: std::fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: dup2 onto stderr; `file` stays open until dup2 has copied it.
+    unsafe { libc::dup2(file.as_raw_fd(), 2) };
+}
+
+#[cfg(windows)]
+fn redirect_stderr(file: std::fs::File) {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+    // Rust's stderr looks the handle up on every write. The handle is leaked
+    // on purpose: it stays stderr until the app exits.
+    // SAFETY: SetStdHandle with a valid, open file handle.
+    unsafe { SetStdHandle(STD_ERROR_HANDLE, file.into_raw_handle()) };
+}
+
+/// The name a new profile starts with on iOS and iPadOS ("iPhone", or the
+/// name the user gave the device where iOS shares it). UIKit only answers on
+/// the main thread, where Tauri runs `setup`; elsewhere the runtime picks.
+#[cfg(target_os = "ios")]
+fn device_name() -> Option<String> {
+    let mtm = objc2::MainThreadMarker::new()?;
+    let name = objc2_ui_kit::UIDevice::currentDevice(mtm).name().to_string();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+#[cfg(not(target_os = "ios"))]
+fn device_name() -> Option<String> {
+    None
+}
+
+/// iPhone and iPad: let the page run under the status bar and home indicator
+/// and pad itself (viewport-fit=cover and env(safe-area-inset-*) in the
+/// CSS); by default WKWebView insets it and paints the bars white. And no
+/// rubber-band bounce of the whole app.
+#[cfg(target_os = "ios")]
+fn edge_to_edge(window: &tauri::WebviewWindow) {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyObject, Bool};
+    let _ = window.with_webview(|webview| {
+        // SAFETY: Tauri hands out the live WKWebView; -scrollView returns its
+        // UIScrollView, and both setters take plain values
+        // (UIScrollViewContentInsetAdjustmentNever = 2).
+        unsafe {
+            let Some(wk) = (webview.inner() as *mut AnyObject).as_ref() else { return };
+            let scroll: *mut AnyObject = msg_send![wk, scrollView];
+            let Some(scroll) = scroll.as_ref() else { return };
+            let _: () = msg_send![scroll, setContentInsetAdjustmentBehavior: 2isize];
+            let _: () = msg_send![scroll, setBounces: Bool::NO];
+        }
+    });
 }
 
 /// Open the runtime and wire it to the app.
@@ -180,7 +235,14 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
         .ok()
         .filter(|n| !n.trim().is_empty());
 
-    let runtime: Rt = tauri::async_runtime::block_on(Runtime::open(&data_dir, mode, name))
+    let runtime: Rt = tauri::async_runtime::block_on(Runtime::open_with(RuntimeOptions {
+        data_dir: data_dir.clone(),
+        mode,
+        name,
+        default_name: device_name(),
+        keeper: false,
+        port: 0,
+    }))
         .map_err(|e| {
             let hint = if e.to_string().contains("already open") {
                 "\n\nAnother copy of Mycel is already using this data folder. Quit it first, or give this copy its own folder with MYCEL_DATA_DIR."
@@ -192,9 +254,7 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
 
     allow_attachment_files(app, &data_dir)?;
 
-    let handle = app.handle().clone();
-    set_window_title(&handle, &runtime.profile().name);
-    forward_events(handle, runtime.clone());
+    forward_events(app.handle().clone(), runtime.clone());
     app.manage(runtime);
 
     eprintln!(
@@ -220,13 +280,31 @@ fn fail_to_start(app: &AppHandle, msg: String) {
         .show(move |_| handle.exit(1));
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            match start(app) {
-                Ok(()) => {}
+            let started = start(app);
+            // The window (`"create": false` in tauri.conf.json) opens only
+            // now, once the runtime is managed: a page that loads faster than
+            // the runtime opens (as on phones) would otherwise get "state not
+            // managed" from its first commands. It opens on failure too, so
+            // phones have a window to show the error on.
+            let config = app.config().app.windows.iter().find(|w| w.label == "main").cloned();
+            if let Some(config) = config {
+                let window = tauri::WebviewWindowBuilder::from_config(app.handle(), &config)?.build()?;
+                #[cfg(target_os = "ios")]
+                edge_to_edge(&window);
+                #[cfg(not(target_os = "ios"))]
+                let _ = window;
+            }
+            match started {
+                Ok(()) => {
+                    let name = app.state::<Rt>().profile().name;
+                    set_window_title(app.handle(), &name);
+                }
                 // Returning an error from setup makes Tauri panic (a native
                 // app then just "quits unexpectedly"). Say what went wrong.
                 Err(msg) => fail_to_start(app.handle(), msg),
@@ -244,6 +322,7 @@ pub fn run() {
             commands::network_status,
             commands::set_network_mode,
             commands::restart_app,
+            commands::open_file,
             commands::list_conversations,
             commands::get_conversation,
             commands::create_conversation,

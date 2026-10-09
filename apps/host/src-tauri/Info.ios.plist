@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the iOS / iPadOS app's Info.plist by `cargo tauri ios build`.
+     (Info.plist next to this file is the macOS one.) iOS asks before an app
+     uses the local network, the microphone, the camera or Bluetooth, and
+     shows these reasons in the prompt. NSBonjourServices must list every
+     Bonjour type Mycel browses, or iOS hides those peers from it. -->
+<plist version="1.0">
+<dict>
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Mycel finds people running Mycel nearby, on the same Wi-Fi or directly over peer-to-peer Wi-Fi, and sends them your encrypted messages directly, with no internet or server.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_mycel._udp</string>
+    <string>_mycel-p2p._udp</string>
+  </array>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Mycel uses the microphone only during voice calls you place or answer. Your voice goes end-to-end encrypted, directly to the person you're talking to.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Mycel uses the camera only during video calls, when you turn it on, or to take a photo you choose to send. It goes end-to-end encrypted, directly to the person you're talking to.</string>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>Mycel uses Bluetooth to reach nearby phones and computers running Mycel when there is no Wi-Fi, and sends them your end-to-end encrypted messages directly.</string>
+  <key>NSPhotoLibraryUsageDescription</key>
+  <string>Mycel reads the photos and videos you choose to send.</string>
+</dict>
+</plist>

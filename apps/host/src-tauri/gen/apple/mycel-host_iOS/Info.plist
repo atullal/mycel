@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchStoryboardName</key>
+	<string>LaunchScreen</string>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+		<string>metal</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Mycel finds people running Mycel nearby, on the same Wi-Fi or directly over peer-to-peer Wi-Fi, and sends them your encrypted messages directly, with no internet or server.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Mycel reads files you choose to attach from your Desktop so it can encrypt and send them.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Mycel reads files you choose to attach from your Documents folder so it can encrypt and send them.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Mycel reads files you choose to attach from your Downloads folder so it can encrypt and send them.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Mycel uses the microphone only during voice calls you place or answer. Your voice goes end-to-end encrypted, directly to the person you&apos;re talking to.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Mycel uses the camera only during video calls, when you turn it on, or to take a photo you choose to send. It goes end-to-end encrypted, directly to the person you&apos;re talking to.</string>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Mycel uses Bluetooth to reach nearby phones and computers running Mycel when there is no Wi-Fi, and sends them your end-to-end encrypted messages directly.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_mycel._udp</string>
+		<string>_mycel-p2p._udp</string>
+	</array>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Mycel reads the photos and videos you choose to send.</string>
+</dict>
+</plist>

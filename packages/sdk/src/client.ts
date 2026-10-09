@@ -21,6 +21,24 @@ import type {
   Profile,
 } from "./types.ts";
 
+/**
+ * Android only lets an app's screen ask for the microphone, so the native
+ * runtime can't. The web view can: getUserMedia brings up the system prompt
+ * (MainActivity's web view turns it into the app's permission), and the call
+ * audio then runs natively. If the user says no, the runtime's error says
+ * where to allow it.
+ */
+async function askForMicrophone(transport: Transport): Promise<void> {
+  if (transport.kind !== "tauri" || typeof navigator === "undefined") return;
+  if (!/Android/.test(navigator.userAgent) || !navigator.mediaDevices?.getUserMedia) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    for (const track of stream.getTracks()) track.stop();
+  } catch {
+    /* denied or dismissed: start_call explains */
+  }
+}
+
 export interface MessagesOptions {
   /** Return at most this many messages (the newest ones before `before`). */
   limit?: number;
@@ -249,9 +267,12 @@ export function createMycel(transport: Transport): Mycel {
         call("decline_request", opts.block ? { id, block: true } : { id }).then(done),
     },
     calls: {
-      start: (conversation, opts) => call("start_call", { conversation, video: opts?.video ?? false }),
-      accept: (id, opts) => call("accept_call", { call: id, video: opts?.video ?? false }),
-      join: (id, opts) => call("accept_call", { call: id, video: opts?.video ?? false }),
+      start: (conversation, opts) =>
+        askForMicrophone(transport).then(() => call("start_call", { conversation, video: opts?.video ?? false })),
+      accept: (id, opts) =>
+        askForMicrophone(transport).then(() => call("accept_call", { call: id, video: opts?.video ?? false })),
+      join: (id, opts) =>
+        askForMicrophone(transport).then(() => call("accept_call", { call: id, video: opts?.video ?? false })),
       setCamera: (id, on) => call("set_camera", { call: id, on }),
       requestKeyframe: (id) => call("video_keyframe", { call: id }).then(done),
       onVideo: (handler) => {

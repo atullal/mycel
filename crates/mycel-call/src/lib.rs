@@ -31,7 +31,9 @@ pub mod engine;
 pub mod frame;
 pub mod jitter;
 pub mod level;
-#[cfg(target_os = "macos")]
+#[cfg(target_os = "android")]
+pub mod android;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod mac;
 mod manager;
 pub mod proto;

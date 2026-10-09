@@ -16,6 +16,7 @@ async fn open(dir: &std::path::Path, name: &str, port: u16, keeper: bool) -> Arc
         data_dir: dir.to_path_buf(),
         mode: NetworkMode::Local,
         name: Some(name.into()),
+        default_name: None,
         keeper,
         port,
     })

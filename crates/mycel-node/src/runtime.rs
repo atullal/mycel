@@ -73,6 +73,9 @@ pub struct RuntimeOptions {
     pub data_dir: PathBuf,
     pub mode: NetworkMode,
     pub name: Option<String>,
+    /// The name a brand-new profile gets when `name` is `None` (instead of
+    /// the computer's name). Ignored once the profile has a name.
+    pub default_name: Option<String>,
     /// Keeper: accept every space we're added to, never post, just relay.
     pub keeper: bool,
     pub port: u16,
@@ -235,10 +238,37 @@ fn default_device_name() -> String {
             return n.chars().take(64).collect();
         }
     }
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|h| !h.is_empty())
+    #[cfg(target_os = "android")]
+    if let Some(model) = android_property("ro.product.model") {
+        return model.chars().take(64).collect();
+    }
+    // Windows sets COMPUTERNAME; Linux desktops rarely export HOSTNAME to apps.
+    let env_name = |var: &str| std::env::var(var).ok().map(|h| h.trim().to_string()).filter(|h| !h.is_empty());
+    env_name("COMPUTERNAME")
+        .or_else(|| env_name("HOSTNAME"))
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty() && h != "localhost")
+        })
+        .map(|n| n.chars().take(64).collect())
         .unwrap_or_else(|| "Mycel user".into())
+}
+
+/// An Android system property such as `ro.product.model` ("Pixel 7").
+#[cfg(target_os = "android")]
+fn android_property(name: &str) -> Option<String> {
+    let key = std::ffi::CString::new(name).ok()?;
+    let mut value = [0 as std::ffi::c_char; 92]; // PROP_VALUE_MAX
+    // SAFETY: the key is NUL-terminated and the buffer has PROP_VALUE_MAX bytes.
+    let n = unsafe { libc::__system_property_get(key.as_ptr(), value.as_mut_ptr()) };
+    if n <= 0 {
+        return None;
+    }
+    // SAFETY: __system_property_get NUL-terminates what it wrote.
+    let s = unsafe { std::ffi::CStr::from_ptr(value.as_ptr()) }.to_string_lossy().trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 fn guess_mime(name: &str) -> &'static str {
@@ -349,6 +379,7 @@ impl Runtime {
             data_dir: data_dir.as_ref().to_path_buf(),
             mode,
             name,
+            default_name: None,
             keeper: false,
             port: 0,
         })
@@ -369,7 +400,11 @@ impl Runtime {
             }
             (None, Some(n)) => n,
             (None, None) => {
-                if opts.keeper { "Keeper".to_string() } else { default_device_name() }
+                if opts.keeper {
+                    "Keeper".to_string()
+                } else {
+                    opts.default_name.unwrap_or_else(default_device_name)
+                }
             }
         };
         let contacts: BTreeMap<SignPk, StoredContact> = store
