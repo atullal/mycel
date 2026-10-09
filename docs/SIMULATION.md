@@ -127,12 +127,12 @@ machine it measured 500 nodes in 1.2 GB (§1).
 | `routing-convergence` | 2 | full *(routing)* | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never | 15 s |
 | `flood-scaling` | 2 | full *(routing)* | ✅ | largest N: global core 8.4% of BLE in steady state, 100% of pairs routed (before: 67.0%, 85% routed), main 136.1% | 839 s |
 | `partial-route` | 2 | full *(carrier)* | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.5 s; sender-holds 100% p50 98.2 s · gap 300 m: global core + DTN 100%; stand-in custody 0% p50 0 s; sender-holds 0% p50 0 s | 0 s |
-| `disaster-dtn` | 2 | full *(stability)* | ✅ | global core + DTN: 87% delivered (mean of seeds 1–5: 90%), p95 5917 s, optimality p50/p95/p99 1.00/4.65/5.04× · 27.4 replicas, 32.5 hand-offs per message (budget 32, fixed 11) · PRoPHET 58%, spray-and-wait (L=8) 32%, epidemic 100% | 32 s |
+| `disaster-dtn` | 2 | full *(control)* | ❌ | seed 1: global core + DTN 60% delivered, p95 7220 s, optimality p50/p95/p99 1.01/4.62/4.65× · 18.3 replicas, 25.6 hand-offs per message (budget 32) · PRoPHET 58%, spray-and-wait (L=8) 32%, epidemic 100% · **mean of seeds 1–12: 80.3%** (before fixed 15: 88.8%); seed-to-seed 60–92%, and 7 meaningless bytes per summary move the 12-seed mean to 86.2% (open 7) · CI size (0.1) 100%<br>✗ delivery within 3 h: 60% (target ≥ 80%) | 32 s |
 | `mailbox` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
-| `global-scale` | 2 | 2,002 devices (0.02) *(stability, routing)* | ❌ | global core + DTN: 100% delivered, p95 1.64 s · first contact p95 0.741 s (≤ 3 s ✓), optimality p95 12.9× · warm p95 1.69 s, optimality p95 32.2× · control 8,470 B/s per device: routing 465 (was 3,768), carrier 8,004<br>✗ warm: optimality p95: 32.2 × (target ≤ 5.00 ×); ✗ control traffic per device: 8470 B/s (target ≤ 1000 B/s) | 81 s |
-| `churn` | 2 | 1,001 devices (scale 0.1) *(carrier, routing)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.93/12.6/17.1×; routing traffic 2,659 → 470 B/s per device (full size before the carrier fixes: 100%, p95 65.2 s) | 75 s |
+| `global-scale` | 2 | 2,002 devices (0.02) *(control)* | ✅ | global core + DTN: 100% delivered, p95 0.690 s · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.130 s, p95 0.286 s, optimality p95 4.45× (was 32.2×, fixed 16) · control 727 B/s per device (was 8,470): routing 470, carrier 257 (was 8,004, fixed 15) | 14 s |
+| `churn` | 2 | 1,001 devices (scale 0.1) *(control)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.6/17.1×; control 707 B/s per device: routing 2,659 → 471, carrier 4,540 → 264 (full size before the carrier fixes: 100%, p95 65.2 s) | 10 s |
 | `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 15.0 s, optimality p50/p95/p99 32.7/718/2015× · global core + DTN: clean 100%, attacked 100%, Sybil gateway 100% | 980 s |
-| `trace-replay` | 2 | full *(stability)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible, p50 4.8 s, p95 1212 s, optimality p50/p95/p99 1.23/5.27/13.2× (pipelining-aware oracle, fixed 12), overhead 4.37 hand-offs per delivery · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 103 s |
+| `trace-replay` | 2 | full *(control)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible, p50 4.7 s, p95 1259 s, optimality p50/p95/p99 1.22/8.38/18.0× (pipelining-aware oracle, fixed 12; 10.1× at 54cc562 after the routing changes), overhead 3.15 · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 103 s |
 | `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 53%, 68%, 83%, 92%, 93% | 0 s |
 
 ## 4. Findings
@@ -338,18 +338,59 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    Tests: `new_neighbours_are_greeted_and_lone_devices_announce_fully`,
    `flood_reduction_is_off_and_floods_reach_everyone` (`mesh/core/tests.rs`),
    `announcements_batch_into_datagrams` (`mesh/wire.rs`).
+15. **Carrier summaries went to every neighbour every 10 s, whole** (was
+   open 1, first bullet). Each listed everything held, the latest 256
+   receipts and up to 64 predictabilities (36 B each), whether anything had
+   changed or not: 8,004 B/s per device at 2,002 devices in
+   `global-scale`, 4,540 in `churn`. `Carrier::summaries` now decides per
+   neighbour (docs/ROUTING.md §7):
+   - everything at first contact (`new_contact`) and every 60 s;
+   - between those, only what changed, at most every 2 s: bundles taken
+     and receipts learnt since, room, and the predictabilities the
+     gradient uses. With the internet gradient that is P(internet), plus
+     P(destination) for destinations a neighbour asks for (`wants`: it
+     holds bundles for them that the internet can't deliver);
+   - nothing if nothing changed. A summary whose stream failed (or, in
+     the simulator, that didn't arrive) resets the neighbour to a full one.
+
+   Full summaries keep the 64 most useful predictabilities: PRoPHET's
+   transitivity needs destination predictabilities to travel hop by hop,
+   and the internet gradient falls back on them for destinations the
+   internet doesn't reach; `wants` alone answers only one hop away. (The
+   `disaster-dtn` numbers can't separate these variants: open 12.)
+
+   Measured (seed 1): `global-scale` carrier 8,004 → 257 B/s, total control
+   8,470 → 727 B/s (target 1,000: passes); `churn` carrier 4,540 → 264 B/s,
+   delivery and latency unchanged; `mailbox`, `partial-route` and synthetic
+   `trace-replay` unchanged; the bench's forwarding is unchanged (it sends
+   full summaries; Cambridge rerun identical). For `disaster-dtn`, see
+   open 12. A full summary every 120 s instead of 60 s would halve what is
+   left (279 → 156 B/s at 300 s) but cost `disaster-dtn` ~5 points of
+   12-seed mean, within the noise of open 12.
+   Tests: `summaries_say_what_changed_and_only_what_the_gradient_uses`,
+   `wants_bring_destination_predictabilities` (`mesh/dtn/tests.rs`).
+16. **Warm messages between two devices with the internet lost their
+   first packet** (was open 4: `global-scale` warm optimality p95 32.2×).
+   A simulator artefact, not a node bug. The tier-2 driver sent app data
+   through the routing core unless the peer was in radio range. Two devices
+   with the internet reach each other by dialling an internet hop, which
+   makes the peer a core neighbour, and the core refuses data for a
+   neighbour ("a direct path always wins"). So the first message got
+   through on the dial, and the second, a minute later over the hop still
+   up, was dropped. The destination's acks were dropped the same way. The
+   1 s retransmission went out after the hop had idled out, and looked up
+   and dialled again: first-contact latency + 1 s. Traced on the pair
+   688 → 447 (seed 1): 447's ack refused at 120.559 s, 688's retry at
+   121.000 s. In the node, two devices with the internet talk over Iroh's
+   own direct connection, pooled for `POOL_IDLE` (60 s), not through
+   the mesh. The driver now does the same: data goes direct over the
+   internet while a connection is warm (any packet within 60 s, or an
+   internet hop up). Warm: p95 1.69 → 0.286 s, optimality p95 32.2 →
+   4.45× (target 5×); first contact unchanged (p95 0.741 s).
 
 ### Open (with evidence)
 
-1. **Bluetooth control traffic: what is left after fixed 14.**
-   - **Carrier summaries.** At 2,002 devices in `global-scale`, the
-     store-and-forward carrier costs 8,004 B/s per device (5,605 before
-     the second message per pair; 4,540 in `churn`), against 465 B/s for
-     routing. Each summary lists up
-     to 64 predictabilities (36 bytes each) and goes to every neighbour
-     every 10 s. Directions: send what changed, fewer or quantized
-     predictabilities, a longer period. `global-scale`'s 1 KB/s target
-     fails on this alone; routing has its own line in the report.
+1. **Bluetooth control traffic: what is left after fixed 14 and 15.**
    - **`conference` latency** (24 seats): 100% delivered, but the slowest
      of 10 messages takes 6–7 s (target 3 s). About 23% of Bluetooth
      packets are dropped at full 250 ms transmit queues whatever the
@@ -373,24 +414,7 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    ack is lost when a contact ends leaves copies on both sides, since the
    giver keeps what it thinks it didn't give. Merged copies are also
    re-split. Repro: `MYCEL_DTN=copies_small=8 mycel-sim disaster-dtn`.
-4. **`global-scale` warm pairs are not faster** (2,002 devices, scale
-   0.02). Each pair sends a second message a minute after the first:
-   - first contact: p95 0.741 s (target ≤ 3 s, passes), optimality p95
-     12.9×, paying a record lookup and a dial the oracle doesn't model;
-   - warm: p50 0.484 s but p95 1.69 s, optimality p95 32.2× (target 5×).
-
-   Every slow warm message (latency > 1 s, ~40 of 195) is between two
-   devices **both on the internet**, in different areas, and takes
-   *exactly* its pair's first-contact latency + 1.0 s: the first
-   transmission is lost, and the retransmission after the 1 s timeout
-   looks the destination up and dials it again, as the first message did.
-   It isn't a cache timing out: with the second message 30 s or 90 s
-   later, or records cached 10 s instead of 60 s, the tail is the same
-   (p95 1.51–1.54 s, p99 45×). So the internet hop the sender still
-   holds a minute later doesn't carry the packet, and the sender learns
-   that only by losing it. Next: trace one pair through the tier-2
-   driver's dial, hop and hang-up handling (`tier2/global.rs`).
-   Repro: `mycel-sim global-scale --scale 0.02`.
+4. *(fixed 16: warm messages, a simulator artefact)*
 5. **Spray policy.** Spray-and-Focus (copies only to neighbours no worse
    than us) replaced spraying only on zero knowledge and moved
    `disaster-dtn` from 38% to 60%. Spray-first (copies to the likeliest
@@ -414,6 +438,23 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    Messages: 80% of those connected at the time, p95 9.4 s. The radio is
    shared with announcements (finding 1). Shutting down 30 nodes took
    ~4 minutes after the scenario ended.
+12. **`disaster-dtn` swings with timing, seed to seed and change to
+   change.** At full size, seed 1 delivers 60% (target 80%) since fixed 15;
+   other seeds give 72–92%, and the mean over seeds 1–12 is 80.3%. At
+   54cc562, before fixed 15, the same seeds averaged 88.8% (seed 1: 97%).
+   But the difference tracks timing, not what carriers know:
+   - instrumented, not one receipt was missed: every receipt a device
+     learnt from a summary, it learnt from the first summary that carried
+     it; repeating the latest receipts in every full summary added nothing
+     a receiver didn't know, yet moved the 12-seed mean to 87.0%;
+   - adding 7 meaningless bytes to every summary (only airtime changes)
+     moved it to 86.2%, and 200 bytes to 81.7%.
+   So the 12-seed mean has a noise floor of about ±3–6 points here. The
+   scenario judges one seed at full size, which is not enough to rank
+   carrier changes. Next: judge it on the mean of 12+ seeds, and find
+   which interaction (contact starts, offers queued behind summaries on
+   Bluetooth) makes the outcome this sensitive. CI size (0.1) delivers
+   100%. Repro: `mycel-sim disaster-dtn --seed N` for N in 1..12.
 
 ## 5. Benchmarks against external baselines
 
