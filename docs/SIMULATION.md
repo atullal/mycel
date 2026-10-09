@@ -112,7 +112,7 @@ machine it measured 500 nodes in 1.2 GB (§1).
 | `apartment-80211s` | 1 | full | ✅ | messages: 100% delivered, p50 0.083 s, p95 0.095 s, optimality p50/p95/p99 5.63/6.98/6.98× · bulk: next flat 8.2 MB/s, 7 flats away 2.2 MB/s | 10 s |
 | `conference` | 1 | 24 seats (scale 0.1; 100 didn't finish, 300 crashed) | ⏳ | messages: 80% delivered, p50 0.853 s, p95 3.36 s, optimality p50/p95/p99 22.7/89.5/89.5×<br>✗ messages: delivery: 80.0 % (target ≥ 95.0 %); ✗ messages: latency p95: 3.36 s (target ≤ 3.00 s) | 180 s |
 | `city-block` | 1 | full | ✅ | 8 hops: 100% delivered, p50 0.957 s, p95 1.01 s, optimality p50/p95/p99 3.19/3.38/3.38× · 9 hops: not delivered (max_hops = 8) | 70 s |
-| `shutdown` | 1 | 15 walkers (scale 0.5; full size before: +4.8 GB, see finding 8) *(carrier)* | ✅ | messages (connected at the time): 100% delivered, p50 0.231 s, p95 0.359 s, optimality p50/p95/p99 3.63/5.42/5.42× · call between two walkers: setup 0.698 s, heard, loss 4.4%, path Mesh | 106 s |
+| `shutdown` | 1 | full *(stability)* | ✅ | messages (connected at the time): 80% delivered, p50 1.58 s, p95 9.39 s, optimality p50/p95/p99 42.1/189/394× · call: setup 1.46 s over Bluetooth, tone not heard (open 11) · memory +106 MB for 30 nodes, flat (was 30 GB peak, fixed 10) | 502 s |
 | `disaster-live` | 1 | full *(carrier)* | ✅ | member mule: 49 s; stranger mule: 49 s (it never arrived before fixed 2) | 62 s |
 | `rural-line` | 1 | full | ✅ | messages: 100% delivered, p50 0.114 s, p95 0.130 s, optimality p50/p95/p99 5.67/6.78/6.78× · bulk: next house 6.6 MB/s, 5 hops 0.59 MB/s | 20 s |
 | `us-eu-live` | 1 | full | ⏳ | messages: 100% delivered, p50 0.814 s, p95 1.40 s, optimality p50/p95/p99 4.31/7.43/7.43× · call: setup 1.79 s, loss 66.7%, latency 175 ms, path None<br>✗ call: audio loss: 66.7 % (target ≤ 5.00 %) | 63 s |
@@ -121,16 +121,16 @@ machine it measured 500 nodes in 1.2 GB (§1).
 | `multipath` | 1 | full | ✅ | 3 links 8.0 MB/s, 1 link 2.9 MB/s (2.78×) | 21 s |
 | `mixed-room` | 1 | full | ✅ | Ethernet→Some(Ethernet), Wi-Fi Direct→Some(WifiDirect), UWB→Some(Uwb), Bluetooth LE→Some(Bluetooth) | 30 s |
 | `us-eu` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 0.799 s, optimality p50/p95/p99 1.29/2.29/4.19× | 1 s |
-| `gateway-choice` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 1.12 s, optimality p50/p95/p99 2.49/6.41/6.50× · 100% of relayed bytes via the far fibre gateway | 0 s |
+| `gateway-choice` | 2 | full *(stability)* | ✅ | global core + DTN: 100% delivered, p95 1.12 s, optimality p50/p95/p99 6.29/9.06/9.18× (100 KB and 1 MB messages now against the pipelining bound) · 100% of relayed bytes via the far fibre gateway | 0 s |
 | `routing-convergence` | 2 | full | ⏳ | global core: 99% routed in never, 100% in never, 0 loops, re-converged in never, stretch 1.06× · main: 99% in never, 0 loops, re-converged in never<br>✗ cold start: 99% of pairs within 8 hops routed: ∞ s (target ≤ 12.0 s); ✗ after the busiest device fails: 99% routed again: ∞ s (target ≤ 8.00 s) | 39 s |
 | `flood-scaling` | 2 | full | ⏳ | largest N: global core 76.9% of BLE, main 136.1%<br>✗ announcement traffic at the largest N, as a share of one BLE radio: 76.9 % (target ≤ 10.0 %) | 1344 s |
 | `partial-route` | 2 | full *(carrier)* | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.5 s; sender-holds 100% p50 98.2 s · gap 300 m: global core + DTN 100%; stand-in custody 0% p50 0 s; sender-holds 0% p50 0 s | 0 s |
-| `disaster-dtn` | 2 | full *(carrier)* | ⏳ | global core + DTN: 87% delivered (mean of seeds 1–5: 90%), p95 5917 s, optimality p50/p95/p99 1.00/3.93/5.04× · PRoPHET 58%, spray-and-wait (L=8) 32%, epidemic 100%<br>✗ copies per message: 33.5 (target ≤ 8.00): expected, open finding 3 | 31 s |
+| `disaster-dtn` | 2 | full *(stability)* | ✅ | global core + DTN: 87% delivered (mean of seeds 1–5: 90%), p95 5917 s, optimality p50/p95/p99 1.00/4.65/5.04× · 27.4 replicas, 32.5 hand-offs per message (budget 32, fixed 11) · PRoPHET 58%, spray-and-wait (L=8) 32%, epidemic 100% | 32 s |
 | `mailbox` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
-| `global-scale` | 2 | 10,003 devices (0.1) | ❌ | global core + DTN: 100% delivered, p95 0.819 s, optimality p50/p95/p99 6.12/12.9/19.2× · 10003 devices, 71% with internet; 673610627 events in 1982 s wall<br>✗ optimality p95 (achieved / fastest feasible): 12.9 × (target ≤ 5.00 ×); ✗ control traffic per device: 6051 B/s (target ≤ 1000 B/s) | 2682 s |
+| `global-scale` | 2 | 2,002 devices (0.02) *(stability)* | ❌ | global core + DTN: 100% delivered, p95 1.64 s · first contact p95 0.741 s (≤ 3 s ✓), optimality p95 12.9× · warm p95 1.69 s, optimality p95 36.5×<br>✗ warm: optimality p95: 36.5 × (target ≤ 5.00 ×); ✗ control traffic per device: 11888 B/s (target ≤ 1000 B/s) | 162 s |
 | `churn` | 2 | 1,001 devices (scale 0.1) *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.5/17.1× (full size before the carrier fixes: 100%, p95 65.2 s) | 98 s |
 | `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 15.0 s, optimality p50/p95/p99 32.7/718/2015× · global core + DTN: clean 100%, attacked 100%, Sybil gateway 100% | 980 s |
-| `trace-replay` | 2 | full *(carrier)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible, p50 4.8 s, p95 1212 s, optimality p50/p95/p99 0.630/1.38/2.70× · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5) | 106 s |
+| `trace-replay` | 2 | full *(stability)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible, p50 4.8 s, p95 1212 s, optimality p50/p95/p99 1.23/5.27/13.2× (pipelining-aware oracle, fixed 12), overhead 4.37 hand-offs per delivery · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 103 s |
 | `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 53%, 68%, 83%, 92%, 93% | 0 s |
 
 ## 4. Findings
@@ -233,6 +233,65 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    - `a_source_over_its_share_makes_way_with_its_own`;
    - `copies_by_size`, `spray_modes`;
    - `copies_in_flight_are_not_given_twice`.
+9. **A panic in the QUIC stack killed the whole process** (was open 7).
+   `conference` at 300 real nodes aborted in `noq-proto` 1.3.0,
+   `discard_space`, with "PathId::ZERO is alive while Initial/Handshake
+   spaces exist". Cause:
+   - A multipath client is Established one round trip before HANDSHAKE_DONE.
+   - noq sends HANDSHAKE_DONE and the server's path CIDs in different
+     packets. If the first is lost, the client opens path 1 anyway; path 0
+     is then abandoned and discarded, and the retransmitted HANDSHAKE_DONE
+     arrives on path 1.
+   - The panic poisoned the connection's lock. Stream handles lock it in
+     `Drop`, so unwinding panicked again and aborted.
+   - Fix (vendored noq and noq-proto, `vendor/noq-proto/MYCEL_PATCH.md`):
+     the late HANDSHAKE_DONE skips the cleanup of a path that is gone. The
+     driver now turns any state-machine panic into closing that one
+     connection with INTERNAL_ERROR, and a poisoned lock is recovered.
+   - Tests:
+     - `late_handshake_done_after_path_zero_discarded` reproduces the exact
+       upstream panic (mod.rs:4172).
+     - `driver_panic_closes_only_that_connection`: upstream aborts with
+       SIGABRT; patched, the connection closes and a new one works.
+   - Draft upstream report: `vendor/noq-proto/UPSTREAM_ISSUE.md`. Not
+     filed: it is probably remotely triggerable.
+   - The 300-seat `conference` wasn't rerun (it needs ~36 GB).
+10. **Walking devices grew memory without bound** (was open 8). `shutdown`
+   peaked at 30 GB of physical footprint (resident size read +4.8 GB:
+   under memory pressure it leaves out compressed and swapped pages).
+   - `sample` showed one core spinning in Iroh's path-open retry queue.
+   - When a path can't be opened yet (no CIDs, or path IDs used up), Iroh
+     re-queued the address once per connection to that peer. Every lookup
+     re-added every custom address.
+   - With Mycel's several connections per peer and more links than a
+     connection's 8 path IDs, the queue multiplied every 333 ms.
+   - Fix: each address is queued once (`vendor/iroh/MYCEL_PATCH.md` §5).
+   - After: full-size `shutdown` passes with memory flat at ~100 MB (+106 MB
+     for 30 nodes, 3.5 MB each) over 500 s.
+   - `crates/mycel-net/tests/path_queue.rs` (16 links, 4 connections) grows
+     <2 MB in 10 s; without the fix, 21 MB in 5 s.
+   - `tier1::resources()` now reads the physical footprint on macOS.
+     `MYCEL_SIM_MEMLOG=<secs>` logs memory and tasks during a run, and
+     `examples/mem_walk.rs` tracks memory for N walking nodes.
+11. **Copies counted custody moves** (was open 3).
+   - `copies/msg` now counts replicas: a carrier kept some copies while it
+     handed others on. `hand-offs/msg` counts every carrier-to-carrier
+     transfer, The ONE's "relayed"; trace-replay's overhead ratio uses it.
+   - `disaster-dtn`, seed 1: 27.4 replicas and 32.5 hand-offs per message.
+     Spray-first with 32 copies for 2 kB bundles makes most of them.
+   - The target is now the carrier's copy budget for that size (32), not
+     Spray-and-Wait's 8. With 8 copies delivery falls at seeds 1–3, from
+     87/93/85% to 85/85/60%. It passes.
+   - Open: an 8-copy budget still showed 32.7 replicas (finding 3 below).
+12. **The oracle wasn't a lower bound for multi-packet messages** (was
+   open 10). The bound for those is now the fastest single packet, plus
+   the rest at the most the destination can take in at once (all its
+   radios and the fastest access), and never above the hop-by-hop time.
+   Synthetic `trace-replay` optimality p50 went from 0.630 to 1.23. No
+   ratio is below 1 any more.
+13. **Neighbours' predictability tables** are sorted vectors, half the
+   size of the hash maps (was part of open 6). They hold the same values.
+   Not remeasured at 10k devices.
 
 ### Open (with evidence)
 
@@ -270,19 +329,19 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    (51.2% against 38.6%). Following predictability for the destination
    rather than the internet speeds the median (782 s) but delivers less
    (23.6%). Repro: `MYCEL_TRACE=bench/data/infocom2005/contacts.Exp3.dat mycel-sim trace-replay`.
-3. **`disaster-dtn`: many copies per message** (34 at seed 1, against a
-   target of 8 set for Spray-and-Wait; delivery now 87–93%). The metric
-   counts every custody hand-off, and a single copy climbing the internet
-   gradient changes hands many times as people move: 17 per message with
-   no gradient, 35 with it, for 13 points more delivery. Small bundles
-   also start with 32 copies, chosen for chat speed
-   (`docs/BENCHMARKS.md` §6.5); with 4 the count is still 22. A hand-off
-   only to a neighbour better by a wider margin, or a hand-off budget per
-   bundle, would cut it; both trade delivery.
-4. **`global-scale` optimality p95 is 12.9×** (target 5×). Messages to
-   new peers pay a record lookup (~2 × access + 150 ms) and a dial; the
-   oracle has neither. A target per "first contact" vs "warm connection"
-   would say more. Delivery is 100%, p95 0.8 s.
+3. **Replicas can exceed the copy budget.** With `copies_small=8`,
+   `disaster-dtn` made 32.7 replicas per message (seed 1). A hand-off whose
+   ack is lost when a contact ends leaves copies on both sides, since the
+   giver keeps what it thinks it didn't give. Merged copies are also
+   re-split. Repro: `MYCEL_DTN=copies_small=8 mycel-sim disaster-dtn`.
+4. **`global-scale` warm pairs are not faster** (2,002 devices, scale
+   0.02). Each pair now sends a second message a minute after the first:
+   - first contact: p95 0.741 s (target ≤ 3 s, passes), optimality p95
+     12.9×, paying a record lookup and a dial the oracle doesn't model;
+   - warm: p50 0.483 s but p95 1.69 s, optimality p95 36.5× (target 5×).
+   A cached route or record goes stale within a minute and some second
+   messages ride it. This is routing state, outside the carrier. Control
+   traffic is 11.9 KB per second per device (finding 1).
 5. **Spray policy.** Spray-and-Focus (copies only to neighbours no worse
    than us) replaced spraying only on zero knowledge and moved
    `disaster-dtn` from 38% to 60%. Spray-first (copies to the likeliest
@@ -291,33 +350,20 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    fixes, and on The ONE's Helsinki trace 62.9% against 39.5%
    (`docs/BENCHMARKS.md` §6.5).
 6. **Tier-2 memory is ~200 KB per device** at 10k, mostly routing state
-   for ~80 origins (route entries, `heard` lists) and neighbours'
-   64-entry predictability maps. A sorted `Vec` instead of a `HashMap` for
-   the latter would roughly halve it.
-7. **A panic in the QUIC stack kills the process under load.**
-   `conference` at full size (300 real nodes, 36 GB footprint, swapping)
-   aborted. `noq-proto` 1.3.0 `connection/mod.rs:4172`
-   (`discard_space`) expects "PathId::ZERO is alive while
-   Initial/Handshake spaces exist". Path 0 was gone before the handshake
-   finished. The panic poisoned noq's mutex, and a panic while unwinding
-   aborted the process. In the app that means one bad connection crashes
-   the node. It may relate to Mycel's iroh patch opening backup paths
-   during the handshake (`vendor/iroh/MYCEL_PATCH.md`); worth a minimal
-   repro upstream. At 100 seats, spawning didn't finish in 30 min; 24
-   seats ran.
-8. **Memory grows with walking devices in tier 1.** `shutdown` at full
-   size (30 walking nodes, 373 s): +4.8 GB, 159 MB per node, against
-   1 MB per node for 12 nodes over 46 s. Messages took p95 14.4 s and the
-   call couldn't join. Not yet known whether the emulator (per-pair
-   delivery queues and tasks) or the node (connections remade as devices
-   move) holds it. Repro: `mycel-sim shutdown`, watching RSS.
+   for ~80 origins (route entries, `heard` lists). The neighbours'
+   predictability tables are halved (fixed 13).
+7. *(fixed 9: the QUIC panic)*
+8. *(fixed 10: memory with walking devices)*
 9. **`us-eu-live`'s call lost 66.7% of its audio** at full size on the
    loaded machine (0% at CI size earlier). Real-time audio over three
    emulated BLE hops shares the radio with announcements (finding 1).
    Messages: 100%, p95 1.4 s.
-10. **The oracle is a lower bound only for single-packet messages.** It
-   moves a whole message per hop. For 0.5–1 MB messages a pipelined live
-   path beats it, giving ratios below 1 in `trace-replay`.
+10. *(fixed 12: the oracle's bound for multi-packet messages)*
+11. **`shutdown`'s call between two walkers set up (1.5 s, over
+   Bluetooth) but the tone wasn't heard** in its 3 s window at full size.
+   Messages: 80% of those connected at the time, p95 9.4 s. The radio is
+   shared with announcements (finding 1). Shutting down 30 nodes took
+   ~4 minutes after the scenario ended.
 
 ## 5. Benchmarks against external baselines
 
