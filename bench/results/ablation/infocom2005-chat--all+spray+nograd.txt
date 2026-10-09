@@ -1,0 +1,18 @@
+Message stats for scenario infocom2005-chat-all,spray,nograd
+sim_time: 254210.0000
+created: 8474
+started: 47540
+relayed: 47540
+aborted: 0
+refused: 0
+delivered: 6994
+delivered_after_ttl: 0
+delivery_prob: 0.8253
+overhead_ratio: 5.7973
+latency_avg: 21836.5524
+latency_med: 16951.5000
+hopcount_avg: 3.4354
+hopcount_med: 3
+transfers_by_reason: deliver 7359 route 21340 gradient 0 spray 18841
+carrier: expired 2700 cleared_by_receipt 11622 refused 0 accepted 36738
+# (41 devices, 33476 contact events, 65.9 s)

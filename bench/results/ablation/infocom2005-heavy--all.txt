@@ -1,0 +1,18 @@
+Message stats for scenario infocom2005-heavy-all
+sim_time: 254210.0000
+created: 8467
+started: 14854
+relayed: 12839
+aborted: 80
+refused: 1891
+delivered: 3027
+delivered_after_ttl: 0
+delivery_prob: 0.3575
+overhead_ratio: 3.2415
+latency_avg: 6135.7774
+latency_med: 4720.9000
+hopcount_avg: 2.1034
+hopcount_med: 2
+transfers_by_reason: deliver 3045 route 3771 gradient 3642 spray 4396
+carrier: expired 8554 cleared_by_receipt 2030 refused 1891 accepted 9587
+# (41 devices, 33476 contact events, 45.5 s)

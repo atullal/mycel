@@ -248,7 +248,13 @@ async fn video_call_both_ways_over_ip() {
 
     // Bob turns his camera on mid-call
     bob.calls.set_camera(&id, true).await.unwrap();
-    tokio::time::sleep(Duration::from_secs(4)).await;
+    // his video starts low and steps up (each step a keyframe burst that
+    // skips a frame or two); under load that takes a few seconds longer
+    eventually("alice sees bob's video at full rate", 15, || {
+        let a = alice.call(&id)?;
+        (a.video.recv_width == 1280 && fps(&alice_sees, 1.0) > 25.0).then_some(())
+    })
+    .await;
     let (a, b) = (alice.call(&id).unwrap(), bob.call(&id).unwrap());
     eprintln!(
         "video call over IP: alice→bob {}x{} {:.1} fps {} kbit/s, latency {} ms; bob→alice {}x{} {:.1} fps; audio rtt {} ms, lost {}",
@@ -470,6 +476,7 @@ fn watch_people(rx: broadcast::Receiver<UiFrame>) -> PerPerson {
 /// stream (a tile), each in order, and every participant's video shows.
 #[tokio::test(flavor = "multi_thread")]
 async fn group_video_call_of_three() {
+    let _measuring = MEASURING.lock().await;
     let alice = device("alice", TestSource::Sine { hz: 440.0, amp: 0.5 }, true, &[]).await;
     let bob = device("bob", TestSource::Sine { hz: 550.0, amp: 0.5 }, true, &[]).await;
     let carol = device("carol", TestSource::Sine { hz: 660.0, amp: 0.5 }, true, &[]).await;

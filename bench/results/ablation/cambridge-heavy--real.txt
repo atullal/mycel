@@ -1,0 +1,18 @@
+Message stats for scenario cambridge-heavy-real
+sim_time: 455609.0000
+created: 15184
+started: 155359
+relayed: 1700
+aborted: 601
+refused: 152573
+delivered: 1424
+delivered_after_ttl: 0
+delivery_prob: 0.0938
+overhead_ratio: 0.1938
+latency_avg: 4498.5077
+latency_med: 1394.9000
+hopcount_avg: 1.1510
+hopcount_med: 1
+transfers_by_reason: deliver 1429 route 30188 gradient 31570 spray 92172
+carrier: expired 13185 cleared_by_receipt 19 refused 152573 accepted 271
+# (12 devices, 5228 contact events, 13.5 s)

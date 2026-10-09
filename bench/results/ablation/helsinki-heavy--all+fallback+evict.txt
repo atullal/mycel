@@ -1,0 +1,19 @@
+Message stats for scenario helsinki-heavy-all,fallback,evict
+sim_time: 43195.6000
+created: 1441
+started: 32545
+relayed: 12866
+aborted: 19663
+refused: 14
+delivered: 599
+delivered_after_ttl: 0
+delivery_prob: 0.4157
+overhead_ratio: 20.4791
+latency_avg: 3683.4514
+latency_med: 3199.6000
+hopcount_avg: 2.9082
+hopcount_med: 3
+transfers_by_reason: deliver 1311 route 36 gradient 23730 spray 7468
+carrier: expired 9 cleared_by_receipt 1280 refused 14 accepted 12255
+refused_by: {"store full": 14}
+# (126 devices, 63286 contact events, 6.0 s)

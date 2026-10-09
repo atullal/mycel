@@ -1,0 +1,20 @@
+Message stats for scenario cambridge-heavy-SprayAndWaitRouter
+sim_time: 455610.0000
+created: 15184
+started: 10816
+relayed: 10753
+aborted: 63
+dropped: 24530
+removed: 0
+delivered: 1332
+delivery_prob: 0.0877
+response_prob: 0.0000
+overhead_ratio: 7.0728
+latency_avg: 195.6988
+latency_med: 9.4000
+hopcount_avg: 1.5743
+hopcount_med: 1
+buffertime_avg: 1370.6174
+buffertime_med: 1136.1000
+rtt_avg: NaN
+rtt_med: NaN

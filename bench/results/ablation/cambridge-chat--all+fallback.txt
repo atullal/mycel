@@ -1,0 +1,19 @@
+Message stats for scenario cambridge-chat-all,fallback
+sim_time: 455609.0000
+created: 15173
+started: 50878
+relayed: 50878
+aborted: 0
+refused: 0
+delivered: 7299
+delivered_after_ttl: 0
+delivery_prob: 0.4811
+overhead_ratio: 5.9705
+latency_avg: 30346.0800
+latency_med: 27332.5000
+hopcount_avg: 2.5447
+hopcount_med: 2
+transfers_by_reason: deliver 7493 route 7868 gradient 14287 spray 21230
+carrier: expired 13132 cleared_by_receipt 8060 refused 0 accepted 35559
+refused_by: {}
+# (12 devices, 5228 contact events, 145.7 s)

@@ -1,0 +1,20 @@
+Message stats for scenario infocom2006-gw-chat-ProphetRouter
+sim_time: 337479.0000
+created: 11245
+started: 5177414
+relayed: 5168295
+aborted: 9112
+dropped: 5119105
+removed: 0
+delivered: 7356
+delivery_prob: 0.6542
+response_prob: 0.0000
+overhead_ratio: 701.5958
+latency_avg: 14474.4705
+latency_med: 6792.9000
+hopcount_avg: 3.3414
+hopcount_med: 3
+buffertime_avg: 3880.8988
+buffertime_med: 1281.0000
+rtt_avg: NaN
+rtt_med: NaN

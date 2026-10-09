@@ -1,0 +1,22 @@
+Message stats for scenario cambridge-heavy-first-destination
+sim_time: 455609.0000
+created: 15184
+started: 14476
+relayed: 14364
+aborted: 104
+offers: 15246
+refused: 497
+duplicates: 273
+delivered: 2174
+delivered_after_ttl: 0
+delivery_prob: 0.1432
+overhead_ratio: 5.6072
+latency_avg: 2990.9443
+latency_med: 212.8000
+hopcount_avg: 1.7116
+hopcount_med: 1
+transfers_by_reason: deliver 2198 route 1878 gradient 909 spray 9491
+carrier: expired 11789 cleared_by_receipt 643 refused 497 accepted 12147 evicted 9254 resumed 47
+refused_by: {"store full": 497}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Destination, carry: true }, resume true
+(12 devices, 5228 contact events, 2.2 s)

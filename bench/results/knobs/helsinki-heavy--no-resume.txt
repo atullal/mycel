@@ -1,0 +1,22 @@
+Message stats for scenario helsinki-heavy-no-resume
+sim_time: 43195.6000
+created: 1441
+started: 16440
+relayed: 5063
+aborted: 11376
+offers: 16468
+refused: 0
+duplicates: 28
+delivered: 837
+delivered_after_ttl: 0
+delivery_prob: 0.5808
+overhead_ratio: 5.0490
+latency_avg: 5464.1370
+latency_med: 4231.5000
+hopcount_avg: 1.8913
+hopcount_med: 2
+transfers_by_reason: deliver 2497 route 77 gradient 0 spray 13866
+carrier: expired 353 cleared_by_receipt 1941 refused 0 accepted 4226 evicted 1526 resumed 0
+refused_by: {}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Internet, carry: true }, resume false
+(126 devices, 63286 contact events, 1.4 s)

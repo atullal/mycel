@@ -1,0 +1,20 @@
+Message stats for scenario cambridge-chat-ProphetRouter
+sim_time: 455610.0000
+created: 15173
+started: 148889
+relayed: 148864
+aborted: 25
+dropped: 153622
+removed: 0
+delivered: 6751
+delivery_prob: 0.4449
+response_prob: 0.0000
+overhead_ratio: 21.0507
+latency_avg: 28728.5314
+latency_med: 24597.8000
+hopcount_avg: 2.2324
+hopcount_med: 2
+buffertime_avg: 16652.1215
+buffertime_med: 2540.0000
+rtt_avg: NaN
+rtt_med: NaN

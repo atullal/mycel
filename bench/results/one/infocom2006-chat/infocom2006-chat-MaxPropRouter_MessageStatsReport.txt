@@ -1,0 +1,20 @@
+Message stats for scenario infocom2006-chat-MaxPropRouter
+sim_time: 337479.0000
+created: 11245
+started: 2032355
+relayed: 2025110
+aborted: 7245
+dropped: 28836
+removed: 1961772
+delivered: 9358
+delivery_prob: 0.8322
+response_prob: 0.0000
+overhead_ratio: 215.4041
+latency_avg: 8829.6508
+latency_med: 2751.3000
+hopcount_avg: 5.0380
+hopcount_med: 5
+buffertime_avg: 2618.9975
+buffertime_med: 63.0000
+rtt_avg: NaN
+rtt_med: NaN

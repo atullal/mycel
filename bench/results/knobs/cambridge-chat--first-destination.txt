@@ -1,0 +1,22 @@
+Message stats for scenario cambridge-chat-first-destination
+sim_time: 455609.0000
+created: 15173
+started: 48314
+relayed: 48314
+aborted: 0
+offers: 71528
+refused: 0
+duplicates: 23214
+delivered: 7691
+delivered_after_ttl: 1
+delivery_prob: 0.5069
+overhead_ratio: 5.2819
+latency_avg: 30374.2510
+latency_med: 27491.6000
+hopcount_avg: 2.4878
+hopcount_med: 2
+transfers_by_reason: deliver 7692 route 4042 gradient 589 spray 35991
+carrier: expired 19233 cleared_by_receipt 16809 refused 0 accepted 40622 evicted 0 resumed 0
+refused_by: {}
+# carrier: DtnConfig { capacity: 5000000, max_bundle: 4194304, per_source: 5000000, max_lifetime: 604800000, copies: 4, copies_small: 32, spray: First, gradient: Destination, carry: true }, resume true
+(12 devices, 5228 contact events, 17.1 s)

@@ -1,0 +1,18 @@
+Message stats for scenario infocom2005-heavy-all,spray,nograd
+sim_time: 254210.0000
+created: 8467
+started: 13300
+relayed: 11150
+aborted: 62
+refused: 2054
+delivered: 2945
+delivered_after_ttl: 0
+delivery_prob: 0.3478
+overhead_ratio: 2.7861
+latency_avg: 6623.6938
+latency_med: 5551.9000
+hopcount_avg: 1.6292
+hopcount_med: 1
+transfers_by_reason: deliver 2963 route 2071 gradient 0 spray 8266
+carrier: expired 9475 cleared_by_receipt 2131 refused 2054 accepted 8019
+# (41 devices, 33476 contact events, 52.3 s)

@@ -397,6 +397,9 @@ impl RemoteStateActor {
             RemoteStateMessage::NetworkChange { is_major } => {
                 self.handle_msg_network_change(is_major);
             }
+            RemoteStateMessage::AddAddrs(addrs) => {
+                self.state.handle_msg_add_addrs(addrs);
+            }
         }
     }
 
@@ -934,11 +937,22 @@ impl State {
         self.paths.insert_multiple(addrs.into_iter(), Source::App);
         self.paths.resolve_remote(tx);
         if custom {
-            self.pending_open_paths.extend(self.custom_addrs());
+            self.queue_open_paths(self.custom_addrs());
             self.scheduled_open_path.get_or_insert_with(Instant::now);
         }
         // Start Address Lookup if we have no selected path.
         self.trigger_address_lookup();
+    }
+
+    /// MYCEL PATCH: handles [`RemoteStateMessage::AddAddrs`].
+    fn handle_msg_add_addrs(&mut self, addrs: BTreeSet<TransportAddr>) {
+        let addrs: Vec<_> = to_transports_addr(self.endpoint_id, addrs).collect();
+        let custom = addrs.iter().any(|a| matches!(a, transports::Addr::Custom(_)));
+        self.paths.insert_multiple(addrs.into_iter(), Source::App);
+        if custom {
+            self.queue_open_paths(self.custom_addrs());
+            self.scheduled_open_path.get_or_insert_with(Instant::now);
+        }
     }
 
     /// Triggers Address Lookup for the remote endpoint, if needed.
@@ -1001,7 +1015,7 @@ impl State {
                     // MYCEL PATCH: custom paths found after the connection
                     // was set up get opened on it (via the scheduled-open queue).
                     if custom {
-                        self.pending_open_paths.extend(self.custom_addrs());
+                        self.queue_open_paths(self.custom_addrs());
                         self.scheduled_open_path.get_or_insert_with(Instant::now);
                     }
                 }
@@ -1150,7 +1164,7 @@ impl State {
                     | Some(Err(PathError::MaxPathIdReached)) => {
                         self.scheduled_open_path =
                             Some(Instant::now() + Duration::from_millis(333));
-                        self.pending_open_paths.push_back(open_4tuple.clone());
+                        self.queue_open_paths([open_4tuple.clone()]);
                         trace!(?open_4tuple, ?ret, "scheduling open_path");
                     }
                     _ => warn!(?ret, "Opening path failed"),
@@ -1169,6 +1183,20 @@ impl State {
             PathStatus::Available
         } else {
             PathStatus::Backup
+        }
+    }
+
+    /// MYCEL PATCH: queue paths to open, each once. Upstream re-queued an
+    /// address once per connection that couldn't open it yet (no CIDs), so
+    /// with several connections to one remote the queue multiplied every
+    /// 333 ms retry, and lookups re-added every custom address each time:
+    /// tens of GB and a busy core within minutes for devices on the move
+    /// (docs/SIMULATION.md §4, `shutdown`).
+    fn queue_open_paths(&mut self, addrs: impl IntoIterator<Item = transports::FourTuple>) {
+        for addr in addrs {
+            if !self.pending_open_paths.contains(&addr) {
+                self.pending_open_paths.push_back(addr);
+            }
         }
     }
 
@@ -1295,6 +1323,12 @@ pub(crate) enum RemoteStateMessage {
     RemoteInfo(oneshot::Sender<RemoteInfo>),
     /// The network status has changed in some way
     NetworkChange { is_major: bool },
+    /// MYCEL PATCH: addresses learned for this remote after its connection
+    /// was set up (a new link or mesh route). Custom-transport ones are
+    /// opened as paths on every live connection. Unlike `ResolveRemote` this
+    /// starts no Address Lookup and answers nobody.
+    #[debug("AddAddrs(..)")]
+    AddAddrs(BTreeSet<TransportAddr>),
 }
 
 /// Information about a holepunch attempt.

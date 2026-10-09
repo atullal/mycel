@@ -12,9 +12,12 @@
 //! - **Local routes**: distance vector over signed originator announcements
 //!   (B.A.T.M.A.N.), made loop-free *during* convergence by Babel's
 //!   feasibility condition, with retractions and seqno requests on loss,
-//!   fisheye scoping (2 hops every period, the full scope every 4th) and
-//!   flood reduction. Up to `routes` routes per destination (distinct first
-//!   hops) are offered to QUIC as separate paths.
+//!   and Babel's timing: a long period (16 s), with what changes sent at
+//!   once (retractions, seqno requests, a lone device's first neighbour)
+//!   and a new neighbour greeted with our routes. Fisheye scoping: 2 hops
+//!   every period, the full scope every 8th. Up to `routes` routes per
+//!   destination (distinct first hops) are offered to QUIC as separate
+//!   paths.
 //! - **Gateways**: a device with the internet that relays for others sets
 //!   [`F_GATEWAY`] and its uplink cost in its (signed) announcements. A
 //!   device *without* the internet keeps a **default route** to the gateway
@@ -65,7 +68,8 @@
 //! waypoint (the source's choice of first relay or gateway, which is what
 //! makes each route a distinct QUIC path), then toward `dst`.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
@@ -99,20 +103,32 @@ pub const MAX_CLOCK_SKEW_MS: u64 = 10 * 60 * 1000;
 /// Fisheye: every period an origin announces to this many hops ...
 pub const NEAR_SCOPE: u8 = 2;
 /// ... and to its full scope every this many periods (far routes refresh,
-/// and expire, this much slower).
-pub const FAR_EVERY: u64 = 4;
-/// Flood reduction: with this many direct neighbours or more ...
+/// and expire, this much slower; [`Config::far_every`]).
+pub const FAR_EVERY: u64 = 8;
+/// Flood reduction (off by default: it assumes broadcast radios): with
+/// this many direct neighbours or more ...
 const DENSE: usize = 8;
 /// ... skip a rebroadcast that this many neighbours already made as well.
 const REDUNDANT: usize = 3;
+/// A device greets one new neighbour with its routes at most this often;
+/// the others wait their turn and then get only what they haven't heard
+/// meanwhile. In a crowd everyone meets 15 devices at once, and one table
+/// is enough to join.
+const GREET_GAP: Time = 4_000;
 /// Seqno requests per origin at most this often; how far they travel.
 const SEQREQ_GAP: Time = 1_000;
 const SEQREQ_HOPS: u8 = 8;
 /// An origin answers a seqno request at most this often.
 const FORCED_GAP: Time = 500;
+/// A relay floods one origin's new seqnos at most this often: a storming
+/// device reaches its neighbours, not the mesh. (Origins announce every
+/// ~16 s, or on request at most every [`FORCED_GAP`].)
+const ORIGIN_GAP: Time = 250;
 const REASM_TIMEOUT: Time = 2_000;
 const REASM_MAX: usize = 256;
 const VERIFIED_MAX: usize = 4096;
+/// Changed origins remembered before `tick` redoes all of them instead.
+const DIRTY_MAX: usize = 1024;
 /// Frames waiting for a lookup or an internet dial: per key, keys, and how long.
 const PENDING_FRAMES: usize = 32;
 const PENDING_KEYS: usize = 256;
@@ -124,6 +140,10 @@ const NO_RECORD_TTL: Time = 20_000;
 pub const INTERNET_IDLE: Time = 60_000;
 /// A dial that hasn't come back after this long has failed.
 const DIAL_GIVE_UP: Time = 15_000;
+/// After a failed dial, the peer isn't dialled again for this long,
+/// doubling with each failure up to the maximum.
+const DIAL_BACKOFF_MIN: Time = 2_000;
+const DIAL_BACKOFF_MAX: Time = 60_000;
 /// A device without the internet republishes its record this often (and
 /// when its gateways change, at most every [`REACH_MIN_GAP`]).
 pub const REACH_REFRESH: Time = 10 * 60_000;
@@ -155,6 +175,20 @@ impl Hasher for Fnv {
 pub type Map<K, V> = HashMap<K, V, BuildHasherDefault<Fnv>>;
 pub type Set<K> = HashSet<K, BuildHasherDefault<Fnv>>;
 
+/// What a new direct neighbour is told at once, besides our own
+/// announcement. Babel sends a new neighbour a full update instead of
+/// letting it wait for the next periodic one; with long periods that is
+/// what keeps discovery fast when devices meet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Greet {
+    /// Only our own announcement.
+    Own,
+    /// Our routes to direct neighbours (2 hops for it) and to gateways.
+    Near,
+    /// Every route it may hear (each within its announcement's scope).
+    All,
+}
+
 /// How a device takes part.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -166,13 +200,25 @@ pub struct Config {
     pub relay_rate_total: u64,
     /// Routes (QUIC paths, through distinct neighbours) kept per destination.
     pub routes: usize,
-    /// Hops a frame or an announcement may travel.
+    /// Hops a frame or an announcement may travel. Routes follow the
+    /// cheapest path, which can be a hop or two longer than the fewest
+    /// hops: 10 covers devices 8 radio hops away.
     pub max_hops: u8,
-    /// How often this device announces itself (ms).
+    /// How often this device announces itself (ms). Routes don't depend on
+    /// it to notice a lost link (hop connections time out in seconds and
+    /// trigger retractions), only to refresh: Babel's 16 s.
     pub announce_every: Time,
     /// Fisheye scoping (off: every announcement floods the full scope).
     pub fisheye: bool,
-    /// Flood reduction in dense neighbourhoods.
+    /// With fisheye: announce to the full scope every this many periods
+    /// (far routes refresh, and expire, this much slower).
+    pub far_every: u64,
+    /// What a new direct neighbour is sent at once.
+    pub greet: Greet,
+    /// Flood reduction in dense neighbourhoods: skip a rebroadcast heard 3
+    /// times. Made for broadcast radios, where those 3 copies reached our
+    /// neighbours too; over unicast hops they reached theirs, and devices
+    /// get left out (docs/SIMULATION.md §4, finding 1). Off by default.
     pub flood_reduction: bool,
     /// With the internet: relay between it and the mesh for others.
     pub gateway: bool,
@@ -184,6 +230,10 @@ pub struct Config {
     pub max_internet_hops: usize,
     /// Reachability records a gateway publishes for others.
     pub max_records: usize,
+    /// Announcement signatures remembered as checked (an (origin, seqno)
+    /// is verified once). A simulator with stubbed signatures keeps this
+    /// small: it is most of a router's memory.
+    pub verified_max: usize,
     /// Seed for jitter (deterministic simulations).
     pub seed: u64,
 }
@@ -195,17 +245,48 @@ impl Default for Config {
             relay_rate_per_neighbour: 1 << 20,
             relay_rate_total: 4 << 20,
             routes: 3,
-            max_hops: 8,
-            announce_every: 2_000,
+            max_hops: 10,
+            announce_every: 16_000,
             fisheye: true,
-            flood_reduction: true,
+            far_every: FAR_EVERY,
+            greet: Greet::All,
+            flood_reduction: false,
             gateway: true,
             gateway_rate: 2 << 20,
             gateways: 2,
             max_internet_hops: 256,
             max_records: 1024,
+            verified_max: VERIFIED_MAX,
             seed: 0x6d79_6365_6c21,
         }
+    }
+}
+
+impl Config {
+    /// Settings from `key=value` pairs, for simulations and benchmarks:
+    /// `every` (ms), `far` (periods), `hops`, `greet` (own, near, all), `fisheye`
+    /// and `reduction` (on, off).
+    pub fn tune(&mut self, s: &str) -> Result<(), String> {
+        let on = |kv: &str, v: &str| match v {
+            "on" => Ok(true),
+            "off" => Ok(false),
+            _ => Err(format!("{kv}: on or off")),
+        };
+        for kv in s.split(',').map(str::trim).filter(|x| !x.is_empty()) {
+            let (k, v) = kv.split_once('=').ok_or_else(|| format!("{kv}: expected key=value"))?;
+            match (k, v) {
+                ("every", n) => self.announce_every = n.parse().map_err(|e| format!("{kv}: {e}"))?,
+                ("far", n) => self.far_every = n.parse().map_err(|e| format!("{kv}: {e}"))?,
+                ("hops", n) => self.max_hops = n.parse().map_err(|e| format!("{kv}: {e}"))?,
+                ("greet", "own") => self.greet = Greet::Own,
+                ("greet", "near") => self.greet = Greet::Near,
+                ("greet", "all") => self.greet = Greet::All,
+                ("fisheye", v) => self.fisheye = on(kv, v)?,
+                ("reduction", v) => self.flood_reduction = on(kv, v)?,
+                _ => return Err(format!("{kv}: unknown knob")),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -300,7 +381,7 @@ pub struct Stats {
     pub announcements_forged: u64,
     /// Too far from our clock, or older than what we have.
     pub announcements_stale: u64,
-    /// Over a neighbour's announcement rate.
+    /// Over a neighbour's announcement rate, or an origin's flood rate.
     pub announcements_limited: u64,
     /// Rebroadcasts skipped as redundant (flood reduction).
     pub announcements_suppressed: u64,
@@ -327,6 +408,8 @@ pub struct Stats {
     pub dropped_too_big: u64,
     pub dropped_not_relaying: u64,
     pub dropped_pending: u64,
+    /// Frames dropped because their next hop's dial failed recently.
+    pub dropped_backoff: u64,
     pub hop_connections: u64,
 }
 
@@ -404,8 +487,10 @@ struct Origin {
     /// The newest announcement itself (passed on with our cost added).
     latest: Announce,
     via: Vec<(SignPk, Via)>,
-    /// Newest sequence number we have passed on (or decided not to).
+    /// Newest sequence number we have passed on (or decided not to), and
+    /// when we last did.
     forwarded: u64,
+    flooded: Option<Time>,
     /// When to pass on the newest one.
     pending: Option<Time>,
     /// Feasibility distance: the (seq, cost) we last advertised.
@@ -457,6 +542,8 @@ enum Next {
     /// Queue under this key (a lookup or a dial is under way).
     Wait(SignPk),
     Drop,
+    /// The peer to dial failed recently (backing off).
+    Unreachable,
 }
 
 /// Where data for a destination can go *now* (custody transfer).
@@ -468,7 +555,14 @@ pub enum Toward {
     Soon,
     /// No forward progress possible right now.
     Nowhere,
+    /// Not over the internet either: it has no reachability record and
+    /// dialling it failed (it isn't on the internet). Only the mesh, or
+    /// someone carrying it there, can get it there.
+    Unreachable,
 }
+
+/// Gateways to publish: with our mesh cost to each, and their sorted keys.
+type GatewayPick = (Vec<(SignPk, u32)>, Vec<SignPk>);
 
 /// One device's router. See the module docs.
 pub struct Router {
@@ -489,6 +583,8 @@ pub struct Router {
     resolving: Set<SignPk>,
     dialing: Map<SignPk, Time>,
     pending: Map<SignPk, Pending>,
+    /// Peers whose dial failed: (not before, current backoff).
+    backoff: Map<SignPk, (Time, Time)>,
     my_gateways: Vec<SignPk>,
     reach_due: Time,
     last_reach: Option<Time>,
@@ -499,10 +595,40 @@ pub struct Router {
     originated: u64,
     next_announce: Time,
     last_forced: Option<Time>,
+    last_greet: Option<Time>,
+    /// New direct neighbours waiting to be greeted, in order.
+    greet_q: VecDeque<SignPk>,
     force_full: bool,
     next_id: u32,
     stats: Stats,
     out: Vec<Out>,
+    // Incremental housekeeping: `tick` runs every 10–20 ms, so it only
+    // revisits what changed. Each is exact (the same result as a full scan
+    // every tick), never a sampling.
+    /// Origins whose pending rebroadcast is due at that time (stale entries
+    /// are skipped when popped).
+    flush_q: BinaryHeap<Reverse<(Time, SignPk)>>,
+    /// No route expires before this (a lower bound; exact after a scan).
+    next_expiry: Time,
+    /// No origin can be forgotten before this unless `gc_check` is set.
+    next_gc: Time,
+    gc_check: bool,
+    /// Nothing in `reasm`, `pending`, `reach`, `dialing`, `records` or the
+    /// idle internet hops times out before this (a lower bound).
+    next_sweep: Time,
+    /// Origins whose routes may have changed since the last `publish`.
+    dirty: Vec<SignPk>,
+    all_dirty: bool,
+    /// `gateway_routes` kept per gateway: (total, mesh, first hop), for the
+    /// origins not in `gw_dirty`; valid while no route can have expired
+    /// (`next_expiry`).
+    gw_table: Map<SignPk, (u32, u32, SignPk)>,
+    gw_dirty: Vec<SignPk>,
+    gw_all_dirty: bool,
+    /// `gw_table` sorted as `gateway_routes` sorts (None: rebuild).
+    gw_sorted: Option<Vec<(SignPk, u32, u32, SignPk)>>,
+    /// What `choose_gateways` picks from `gw_sorted`.
+    gw_pick: Option<GatewayPick>,
 }
 
 impl Router {
@@ -526,6 +652,7 @@ impl Router {
             resolving: Set::default(),
             dialing: Map::default(),
             pending: Map::default(),
+            backoff: Map::default(),
             my_gateways: Vec::new(),
             reach_due: 0,
             last_reach: None,
@@ -535,12 +662,61 @@ impl Router {
             originated: 0,
             next_announce: 0,
             last_forced: None,
+            last_greet: None,
+            greet_q: VecDeque::new(),
             force_full: false,
             next_id: 0,
             stats: Stats::default(),
             out: Vec::new(),
+            flush_q: BinaryHeap::new(),
+            next_expiry: 0,
+            next_gc: 0,
+            gc_check: false,
+            next_sweep: Time::MAX,
+            dirty: Vec::new(),
+            all_dirty: true,
+            gw_table: Map::default(),
+            gw_dirty: Vec::new(),
+            gw_all_dirty: true,
+            gw_sorted: None,
+            gw_pick: None,
             cfg,
         }
+    }
+
+    /// `origin`'s routes (or its gateway status) may have changed.
+    fn touch(&mut self, origin: SignPk) {
+        // past a bound, redoing everything is as cheap (and the lists of a
+        // device that never asks for gateways don't grow)
+        if !self.all_dirty {
+            if self.dirty.len() >= DIRTY_MAX {
+                self.all_dirty = true;
+                self.dirty.clear();
+            } else {
+                self.dirty.push(origin);
+            }
+        }
+        if !self.gw_all_dirty {
+            if self.gw_dirty.len() >= DIRTY_MAX {
+                self.gw_all_dirty = true;
+                self.gw_dirty.clear();
+            } else {
+                self.gw_dirty.push(origin);
+            }
+        }
+    }
+
+    /// A direct neighbour changed: any route may have.
+    fn touch_all(&mut self) {
+        self.all_dirty = true;
+        self.dirty.clear();
+        self.gw_all_dirty = true;
+        self.gw_dirty.clear();
+    }
+
+    /// When a route heard at `at` over `hops` expires.
+    fn expires(&self, at: Time, hops: u8) -> Time {
+        at + self.cfg.announce_every * 7 / 2 * self.scale(hops)
     }
 
     pub fn me(&self) -> SignPk {
@@ -563,13 +739,13 @@ impl Router {
 
     /// Far routes (beyond the near scope) refresh, and expire, this much slower.
     fn scale(&self, hops: u8) -> u64 {
-        if self.cfg.fisheye && hops > NEAR_SCOPE { FAR_EVERY } else { 1 }
+        if self.cfg.fisheye && hops > NEAR_SCOPE { self.cfg.far_every.max(1) } else { 1 }
     }
 
     /// How long an origin without routes is remembered (its feasibility
     /// distance keeps stale announcements from forming loops meanwhile).
     fn gc_after(&self) -> Time {
-        self.cfg.announce_every * 3 * FAR_EVERY * 2
+        self.cfg.announce_every * 3 * self.cfg.far_every.max(1) * 2
     }
 
     /// A via's seqno is recent enough, and it was heard recently enough.
@@ -617,11 +793,16 @@ impl Router {
             self.nbs.entry(peer).or_insert_with(|| Nb::new(cfg, now)).direct = true;
             // a peer in range is reached directly, never through gateways
             self.reach.remove(&peer);
+            self.touch_all();
         } else if let Some(n) = self.nbs.get_mut(&peer) {
             n.direct = false;
             if !n.up {
                 self.nbs.remove(&peer);
+            } else {
+                // an internet hop now: it may go idle
+                self.next_sweep = self.next_sweep.min(n.last_used + INTERNET_IDLE);
             }
+            self.touch_all();
             self.lost_neighbour(peer, now);
         }
     }
@@ -635,20 +816,93 @@ impl Router {
         n.up = true;
         n.last_used = now;
         let direct = n.direct;
+        self.next_sweep = self.next_sweep.min(now + INTERNET_IDLE);
+        if direct {
+            self.touch_all();
+        } else {
+            self.touch(peer); // it is a neighbour now
+        }
         self.stats.hop_connections += 1;
         self.dialing.remove(&peer);
-        if direct && let Some(a) = self.own.clone() {
-            self.stats.announcements_sent += 1;
-            self.out.push(Out::Announce { to: peer, ann: a });
+        self.backoff.remove(&peer);
+        if direct {
+            if self.direct_up().all(|k| k == peer) {
+                // our first neighbour: announce to the full scope now (what
+                // we announced alone reached nobody)
+                self.next_announce = self.next_announce.min(now);
+                self.force_full = true;
+            } else if let Some(a) = self.own.clone() {
+                self.stats.announcements_sent += 1;
+                self.out.push(Out::Announce { to: peer, ann: a });
+            }
+            if self.cfg.greet != Greet::Own && self.cfg.relay && !self.greet_q.contains(&peer) {
+                self.greet_q.push_back(peer);
+            }
+            self.greet_next(now);
         }
         self.release(peer, now);
+    }
+
+    /// Greet the next new neighbour waiting, if [`GREET_GAP`] has passed
+    /// since the last greeting that told anyone anything.
+    fn greet_next(&mut self, now: Time) {
+        while self.last_greet.is_none_or(|t| now.saturating_sub(t) >= GREET_GAP) {
+            let Some(peer) = self.greet_q.pop_front() else { return };
+            if self.nbs.get(&peer).is_some_and(|n| n.up && n.direct) && self.greet(peer, now) > 0 {
+                self.last_greet = Some(now);
+            }
+        }
+    }
+
+    /// Tell a new direct neighbour our current routes ([`Config::greet`])
+    /// that it hasn't sent us itself, as a periodic rebroadcast would:
+    /// newest seqno, our cost, within each announcement's scope. What is
+    /// new to it travels on from there; what its other neighbours already
+    /// have stops at it (it has forwarded that seqno). Advertising updates
+    /// our feasibility distances, as in `flush_announcements`. Returns the
+    /// routes sent.
+    fn greet(&mut self, peer: SignPk, now: Time) -> usize {
+        let mut sent = 0;
+        let mut keys: Vec<SignPk> = self.origins.keys().filter(|k| **k != peer).copied().collect();
+        keys.sort();
+        for origin in keys {
+            // never back where it came from
+            let Some((_, via)) = self.best_route(&origin, now).filter(|(n, _)| *n != peer) else { continue };
+            let max_hops = self.cfg.max_hops;
+            let near = self.cfg.greet == Greet::Near;
+            let Some(o) = self.origins.get_mut(&origin) else { continue };
+            let gateway = o.latest.flags & F_GATEWAY != 0;
+            if via.seq != o.newest
+                || via.hops >= o.latest.scope.min(max_hops)
+                || (near && via.hops >= NEAR_SCOPE && !gateway)
+                || o.heard.iter().any(|(k, _)| *k == peer)
+            {
+                continue;
+            }
+            let mut a = o.latest.clone();
+            a.hops = via.hops;
+            a.cost = via.cost;
+            o.fd = match o.fd {
+                Some((s, c)) if s == o.newest => Some((s, c.min(via.cost))),
+                _ => Some((o.newest, via.cost)),
+            };
+            o.retracted = false;
+            self.stats.announcements_sent += 1;
+            self.out.push(Out::Announce { to: peer, ann: a });
+            sent += 1;
+        }
+        sent
     }
 
     pub fn hop_down(&mut self, peer: SignPk, now: Time) {
         let Some(n) = self.nbs.get_mut(&peer) else { return };
         n.up = false;
-        if !n.direct {
+        let direct = n.direct;
+        if !direct {
             self.nbs.remove(&peer);
+            self.touch(peer);
+        } else {
+            self.touch_all();
         }
         if let Some(p) = self.pending.remove(&peer) {
             self.stats.dropped_pending += p.frames.len() as u64;
@@ -670,16 +924,24 @@ impl Router {
             .collect();
         let mut affected = affected;
         affected.sort();
+        if !affected.is_empty() {
+            self.gc_check = true;
+        }
         for origin in affected {
+            self.touch(origin);
             self.after_loss(origin, Some(peer), now);
         }
     }
 
-    pub fn dial_failed(&mut self, peer: SignPk, _now: Time) {
+    pub fn dial_failed(&mut self, peer: SignPk, now: Time) {
         self.dialing.remove(&peer);
         if let Some(p) = self.pending.remove(&peer) {
             self.stats.dropped_pending += p.frames.len() as u64;
         }
+        // don't hammer it: back off, doubling
+        let wait = self.backoff.get(&peer).map_or(DIAL_BACKOFF_MIN, |(_, w)| (w * 2).min(DIAL_BACKOFF_MAX));
+        self.backoff.insert(peer, (now + wait, wait));
+        self.next_sweep = self.next_sweep.min(now + wait + DIAL_BACKOFF_MAX);
     }
 
     /// Measured hop cost in 0.1 ms units (smoothed here).
@@ -720,7 +982,7 @@ impl Router {
     /// and our uplink cost.
     pub fn next_announce(&mut self, wall: u64) -> Origination {
         self.seq = wall.max(self.seq + 1);
-        let full = !self.cfg.fisheye || self.originated.is_multiple_of(FAR_EVERY) || self.force_full;
+        let full = !self.cfg.fisheye || self.originated.is_multiple_of(self.cfg.far_every.max(1)) || self.force_full;
         self.force_full = false;
         self.originated += 1;
         let scope = if full { self.cfg.max_hops } else { NEAR_SCOPE.min(self.cfg.max_hops) };
@@ -773,7 +1035,7 @@ impl Router {
             self.stats.announcements_stale += 1;
             return;
         }
-        let far_window = self.cfg.announce_every * 3 * FAR_EVERY;
+        let far_window = self.cfg.announce_every * 3 * self.cfg.far_every.max(1);
         if self.origins.get(&a.origin).is_some_and(|o| a.seq + far_window < o.newest) {
             self.stats.announcements_stale += 1;
             return;
@@ -783,7 +1045,7 @@ impl Router {
                 self.stats.announcements_forged += 1;
                 return;
             }
-            if self.verified.len() >= VERIFIED_MAX {
+            if self.verified.len() >= self.cfg.verified_max {
                 self.verified.clear();
             }
             self.verified.insert((a.origin, a.seq));
@@ -800,11 +1062,17 @@ impl Router {
         let relay = self.cfg.relay;
         let forward_scope = a.scope.min(self.cfg.max_hops);
         let (seq, adv) = (a.seq, a.cost);
+        let origin = a.origin;
+        // before the update: it may stop being a gateway
+        self.touch(origin);
+        let expires = self.expires(now, hops);
+        self.next_expiry = self.next_expiry.min(expires);
         let o = self.origins.entry(a.origin).or_insert_with(|| Origin {
             newest: 0,
             latest: a.clone(),
             via: Vec::new(),
             forwarded: 0,
+            flooded: None,
             pending: None,
             fd: None,
             heard: Vec::new(),
@@ -834,10 +1102,19 @@ impl Router {
             o.retracted = false;
         }
         if relay && seq == o.newest && seq > o.forwarded && o.pending.is_none() && hops < forward_scope {
-            // wait a little to hear the cheapest copy (and other relays'),
-            // and desynchronize
-            o.pending = Some(now + jitter);
+            if o.flooded.is_some_and(|t| now.saturating_sub(t) < ORIGIN_GAP) {
+                // an announcement storm: the route stands, the flood stops here
+                o.forwarded = seq;
+                self.stats.announcements_limited += 1;
+            } else {
+                // wait a little to hear the cheapest copy (and other relays'),
+                // and desynchronize
+                o.pending = Some(now + jitter);
+                self.flush_q.push(Reverse((now + jitter, origin)));
+            }
         }
+        // after: it may have become one
+        self.touch(origin);
     }
 
     /// `from` no longer routes to `origin` (as of `seq`).
@@ -846,6 +1123,8 @@ impl Router {
         let before = o.via.len();
         o.via.retain(|(n, v)| !(*n == from && v.seq <= seq));
         if o.via.len() != before {
+            self.gc_check |= o.via.is_empty();
+            self.touch(origin);
             self.after_loss(origin, Some(from), now);
         }
     }
@@ -930,17 +1209,32 @@ impl Router {
     /// yet (not back where it came from); not at all in a dense
     /// neighbourhood where enough others already did.
     fn flush_announcements(&mut self, now: Time) {
-        let mut due: Vec<SignPk> =
-            self.origins.iter().filter(|(_, o)| o.pending.is_some_and(|t| t <= now)).map(|(k, _)| *k).collect();
+        let mut due: Vec<SignPk> = Vec::new();
+        while let Some(&Reverse((t, k))) = self.flush_q.peek() {
+            if t > now {
+                break;
+            }
+            self.flush_q.pop();
+            if self.origins.get(&k).is_some_and(|o| o.pending.is_some_and(|t| t <= now)) {
+                due.push(k);
+            }
+        }
+        if due.is_empty() {
+            return;
+        }
         due.sort();
+        due.dedup();
         let direct: Vec<SignPk> = self.direct_up().collect();
         let dense = self.cfg.flood_reduction && direct.len() >= DENSE;
         for origin in due {
             let best = self.best_route(&origin, now);
+            self.touch(origin); // its feasibility distance may change
             let Some(o) = self.origins.get_mut(&origin) else { continue };
             o.pending = None;
+            self.gc_check |= o.via.is_empty();
             let newest = o.newest;
             o.forwarded = newest;
+            o.flooded = Some(now);
             let Some((_, via)) = best.filter(|(_, v)| v.seq == newest) else { continue };
             if dense && o.heard.iter().filter(|(_, adv)| *adv <= via.cost).count() >= REDUNDANT {
                 self.stats.announcements_suppressed += 1;
@@ -983,8 +1277,25 @@ impl Router {
         v
     }
 
+    /// The cheapest of [`Self::routes`] not through `except`, without
+    /// building the list (it's the first such entry of the sorted list:
+    /// keys are unique per neighbour).
+    fn best_route_except(&self, origin: &SignPk, except: Option<&SignPk>, now: Time) -> Option<(SignPk, Via)> {
+        let o = self.origins.get(origin)?;
+        o.via
+            .iter()
+            .filter(|(n, via)| {
+                Some(n) != except
+                    && o.feasible(via)
+                    && self.fresh(o, via, now)
+                    && self.nbs.get(n).is_some_and(|n| n.up && n.direct)
+            })
+            .min_by_key(|(n, via)| (via.cost, n.0))
+            .copied()
+    }
+
     fn best_route(&self, origin: &SignPk, now: Time) -> Option<(SignPk, Via)> {
-        self.routes(origin, now).into_iter().next()
+        self.best_route_except(origin, None, now)
     }
 
     /// The neighbour toward `dst` inside the mesh (no gateways, no internet).
@@ -998,16 +1309,52 @@ impl Router {
     /// Gateways reachable through the mesh: (gateway, total cost = mesh +
     /// uplink, mesh cost, first hop), cheapest total first.
     fn gateway_routes(&self, now: Time) -> Vec<(SignPk, u32, u32, SignPk)> {
-        let mut v: Vec<(SignPk, u32, u32, SignPk)> = self
-            .origins
-            .iter()
-            .filter(|(_, o)| o.latest.flags & F_GATEWAY != 0)
-            .filter_map(|(g, o)| {
-                self.best_route(g, now).map(|(n, via)| (*g, via.cost.saturating_add(o.latest.uplink), via.cost, n))
-            })
-            .collect();
+        let mut v: Vec<(SignPk, u32, u32, SignPk)> =
+            self.origins.keys().filter_map(|g| self.gateway_route(g, now).map(|(t, m, n)| (*g, t, m, n))).collect();
         v.sort_by_key(|(g, total, _, _)| (*total, g.0));
         v
+    }
+
+    /// `g`'s entry in [`Self::gateway_routes`]: (total, mesh, first hop).
+    fn gateway_route(&self, g: &SignPk, now: Time) -> Option<(u32, u32, SignPk)> {
+        let o = self.origins.get(g).filter(|o| o.latest.flags & F_GATEWAY != 0)?;
+        self.best_route(g, now).map(|(n, via)| (via.cost.saturating_add(o.latest.uplink), via.cost, n))
+    }
+
+    /// [`Self::gateway_routes`], reusing the last answer while it holds:
+    /// no gateway's routes changed and no route can have expired since.
+    fn gateway_routes_cached(&mut self, now: Time) -> &[(SignPk, u32, u32, SignPk)] {
+        if now >= self.next_expiry || self.gw_all_dirty {
+            // a route may have gone stale since the table was made: redo it all
+            self.gw_all_dirty = false;
+            self.gw_dirty.clear();
+            self.gw_table = self.origins.keys().filter_map(|g| self.gateway_route(g, now).map(|r| (*g, r))).collect();
+            self.gw_sorted = None;
+            self.gw_pick = None;
+        } else if !self.gw_dirty.is_empty() {
+            let mut dirty = std::mem::take(&mut self.gw_dirty);
+            dirty.sort();
+            dirty.dedup();
+            for g in &dirty {
+                let new = self.gateway_route(g, now);
+                if new != self.gw_table.get(g).copied() {
+                    match new {
+                        Some(r) => self.gw_table.insert(*g, r),
+                        None => self.gw_table.remove(g),
+                    };
+                    self.gw_sorted = None;
+                    self.gw_pick = None;
+                }
+            }
+            self.gw_dirty = dirty;
+            self.gw_dirty.clear();
+        }
+        if self.gw_sorted.is_none() {
+            let mut v: Vec<(SignPk, u32, u32, SignPk)> = self.gw_table.iter().map(|(g, (t, m, n))| (*g, *t, *m, *n)).collect();
+            v.sort_by_key(|(g, total, _, _)| (*total, g.0));
+            self.gw_sorted = Some(v);
+        }
+        self.gw_sorted.as_deref().unwrap_or_default()
     }
 
     /// Gateways we'd publish in our record, with our mesh cost to each: the
@@ -1015,16 +1362,20 @@ impl Router {
     /// at most `gateways` of them.
     pub fn gateways_with_cost(&self, now: Time) -> Vec<(SignPk, u32)> {
         let all = self.gateway_routes(now);
-        let want = self.cfg.gateways.max(1);
+        Self::pick_gateways(&all, self.cfg.gateways)
+    }
+
+    fn pick_gateways(all: &[(SignPk, u32, u32, SignPk)], gateways: usize) -> Vec<(SignPk, u32)> {
+        let want = gateways.max(1);
         let mut pick: Vec<(SignPk, u32)> = Vec::new();
         let mut hops: Vec<SignPk> = Vec::new();
-        for (g, _, mesh, first) in &all {
+        for (g, _, mesh, first) in all {
             if pick.len() < want && !hops.contains(first) {
                 pick.push((*g, *mesh));
                 hops.push(*first);
             }
         }
-        for (g, _, mesh, _) in &all {
+        for (g, _, mesh, _) in all {
             if pick.len() < want && !pick.iter().any(|(k, _)| k == g) {
                 pick.push((*g, *mesh));
             }
@@ -1063,31 +1414,62 @@ impl Router {
         self.origins.get(dst)?.via.iter().find(|(k, _)| k == via).map(|(_, v)| v.hops)
     }
 
+    /// The routes offered for `origin` now, given what was offered before
+    /// (`None`: none). Idempotent: with nothing changed, the answer is what
+    /// is already offered (incumbents only get cheaper), so `publish` only
+    /// revisits origins that changed.
+    fn offer(&self, origin: &SignPk, now: Time) -> Option<Vec<SignPk>> {
+        if *origin == self.me || self.is_neighbour(origin) {
+            return None;
+        }
+        let current = self.published.get(origin);
+        let mut routes = self.routes(origin, now);
+        let best = routes.first().map(|(_, v)| v.cost)?;
+        let limit = best.saturating_mul(ROUTE_COST_FACTOR).saturating_add(ROUTE_COST_SLACK);
+        routes.retain(|(_, v)| v.cost <= limit);
+        let sticky = |n: &SignPk, c: u32| {
+            if current.is_some_and(|ws| ws.contains(n)) { (c as u64 * STICKY_PERCENT as u64 / 100) as u32 } else { c }
+        };
+        routes.sort_by_key(|(n, v)| (sticky(n, v.cost), n.0));
+        routes.truncate(self.cfg.routes.max(1));
+        Some(routes.into_iter().map(|(n, _)| n).collect())
+    }
+
     /// Recompute the routes offered per destination; report the changes.
     fn publish(&mut self, now: Time) {
-        let mut want: Map<SignPk, Vec<SignPk>> = Map::default();
-        for origin in self.origins.keys() {
-            if *origin == self.me || self.is_neighbour(origin) {
-                continue;
-            }
-            let current = self.published.get(origin);
-            let mut routes = self.routes(origin, now);
-            let Some(best) = routes.first().map(|(_, v)| v.cost) else { continue };
-            let limit = best.saturating_mul(ROUTE_COST_FACTOR).saturating_add(ROUTE_COST_SLACK);
-            routes.retain(|(_, v)| v.cost <= limit);
-            let sticky = |n: &SignPk, c: u32| {
-                if current.is_some_and(|ws| ws.contains(n)) { (c as u64 * STICKY_PERCENT as u64 / 100) as u32 } else { c }
-            };
-            routes.sort_by_key(|(n, v)| (sticky(n, v.cost), n.0));
-            routes.truncate(self.cfg.routes.max(1));
-            want.insert(*origin, routes.into_iter().map(|(n, _)| n).collect());
+        let mut keys: Vec<SignPk> = if self.all_dirty {
+            self.origins.keys().chain(self.published.keys()).copied().collect()
+        } else {
+            std::mem::take(&mut self.dirty)
+        };
+        self.all_dirty = false;
+        self.dirty.clear();
+        if keys.is_empty() {
+            return;
         }
+        keys.sort();
+        keys.dedup();
         let mut downs: Vec<(SignPk, SignPk)> = Vec::new();
-        for (dst, ws) in &self.published {
-            let keep = want.get(dst);
-            for w in ws {
-                if keep.is_none_or(|k| !k.contains(w)) {
-                    downs.push((*dst, *w));
+        let mut ups: Vec<(SignPk, SignPk)> = Vec::new();
+        for dst in keys {
+            let want = self.offer(&dst, now);
+            let had = self.published.get(&dst);
+            for w in had.into_iter().flatten() {
+                if want.as_ref().is_none_or(|k| !k.contains(w)) {
+                    downs.push((dst, *w));
+                }
+            }
+            for w in want.iter().flatten() {
+                if had.is_none_or(|h| !h.contains(w)) {
+                    ups.push((dst, *w));
+                }
+            }
+            match want {
+                Some(w) => {
+                    self.published.insert(dst, w);
+                }
+                None => {
+                    self.published.remove(&dst);
                 }
             }
         }
@@ -1095,21 +1477,11 @@ impl Router {
         for (dst, via) in downs {
             self.out.push(Out::RouteDown { dst, via });
         }
-        let mut ups: Vec<(SignPk, SignPk)> = Vec::new();
-        for (dst, ws) in &want {
-            let had = self.published.get(dst);
-            for w in ws {
-                if had.is_none_or(|h| !h.contains(w)) {
-                    ups.push((*dst, *w));
-                }
-            }
-        }
         ups.sort();
         for (dst, via) in ups {
             let name = self.origins.get(&dst).map(|o| o.latest.name.clone()).unwrap_or_else(|| Arc::from(""));
             self.out.push(Out::RouteUp { dst, via, name });
         }
-        self.published = want;
     }
 
     // ───────────── data ─────────────
@@ -1176,7 +1548,7 @@ impl Router {
         match self.next_hop(&target, from.as_ref(), now) {
             Next::Via(next) => self.forward(f, from, next, now),
             Next::Wait(key) => self.park(key, f, from, now),
-            Next::Drop => self.stats.dropped_no_route += 1,
+            Next::Drop | Next::Unreachable => self.stats.dropped_no_route += 1,
         }
     }
 
@@ -1186,7 +1558,7 @@ impl Router {
             return Next::Via(*target);
         }
         // 2. a mesh route
-        if let Some((n, _)) = self.routes(target, now).into_iter().find(|(n, _)| Some(n) != from) {
+        if let Some((n, _)) = self.best_route_except(target, from, now) {
             return Next::Via(n);
         }
         let from_internet = from.is_some_and(|f| self.is_internet_hop(f));
@@ -1218,7 +1590,11 @@ impl Router {
                         })
                         .min();
                     match best {
-                        Some((_, g)) => self.dial_or_wait(g, now),
+                        // its gateway backing off: hold on, it has a way in
+                        Some((_, g)) => match self.dial_or_wait(g, now) {
+                            Next::Unreachable => Next::Drop,
+                            n => n,
+                        },
                         None => Next::Drop,
                     }
                 }
@@ -1233,8 +1609,9 @@ impl Router {
         } else {
             // 4. no internet: the default route, to the gateway with the
             // lowest total cost
-            match self.gateway_routes(now).into_iter().find(|(g, _, _, n)| Some(n) != from && Some(g) != from) {
-                Some((_, _, _, first)) => Next::Via(first),
+            let first = self.gateway_routes_cached(now).iter().find(|(g, _, _, n)| Some(n) != from && Some(g) != from).map(|r| r.3);
+            match first {
+                Some(first) => Next::Via(first),
                 None => Next::Drop,
             }
         }
@@ -1251,6 +1628,7 @@ impl Router {
             Next::Via(n) => Toward::Hop(n),
             Next::Wait(_) => Toward::Soon,
             Next::Drop => Toward::Nowhere,
+            Next::Unreachable => Toward::Unreachable,
         }
     }
 
@@ -1258,12 +1636,17 @@ impl Router {
         if self.nbs.get(&peer).is_some_and(|n| n.up) {
             return Next::Via(peer);
         }
+        if self.backoff.get(&peer).is_some_and(|(at, _)| now < *at) {
+            self.stats.dropped_backoff += 1;
+            return Next::Unreachable;
+        }
         if !self.dialing.contains_key(&peer) {
             let open = self.nbs.values().filter(|n| n.internet()).count() + self.dialing.len();
             if open >= self.cfg.max_internet_hops {
                 return Next::Drop;
             }
             self.dialing.insert(peer, now);
+            self.next_sweep = self.next_sweep.min(now + DIAL_GIVE_UP);
             self.stats.dials += 1;
             self.out.push(Out::Dial(peer));
         }
@@ -1275,6 +1658,7 @@ impl Router {
             self.stats.dropped_pending += 1;
             return;
         }
+        self.next_sweep = self.next_sweep.min(now + PENDING_TIMEOUT);
         let p = self.pending.entry(key).or_insert_with(|| Pending { frames: VecDeque::new(), since: now });
         if p.frames.len() >= PENDING_FRAMES {
             p.frames.pop_front(); // the oldest is likeliest retransmitted already
@@ -1335,6 +1719,7 @@ impl Router {
         if !self.reasm.contains_key(&key) && self.reasm.len() >= REASM_MAX {
             return;
         }
+        self.next_sweep = self.next_sweep.min(now + REASM_TIMEOUT);
         let r = self.reasm.entry(key).or_insert_with(|| Reasm {
             buf: vec![0; f.total as usize],
             got: 0,
@@ -1374,6 +1759,7 @@ impl Router {
         gws.truncate(8);
         let ttl = if found { REACH_TTL } else { NO_RECORD_TTL };
         self.reach.insert(target, Reach { gateways: gws, until: now + ttl });
+        self.next_sweep = self.next_sweep.min(now + ttl);
         self.release(target, now);
     }
 
@@ -1386,6 +1772,7 @@ impl Router {
         };
         if ok {
             self.records.insert(origin, now);
+            self.next_sweep = self.next_sweep.min(now + REACH_REFRESH * 2);
         } else {
             self.stats.records_refused += 1;
         }
@@ -1396,26 +1783,64 @@ impl Router {
 
     pub fn tick(&mut self, now: Time) {
         self.flush_announcements(now);
+        if !self.greet_q.is_empty() {
+            self.greet_next(now);
+        }
         // routes that went silent: forget them, retracting what that costs us
-        let mut silent: Vec<SignPk> = Vec::new();
-        let timeout = self.cfg.announce_every * 7 / 2;
-        let fisheye = self.cfg.fisheye;
-        for (k, o) in self.origins.iter_mut() {
-            let before = o.via.len();
-            o.via.retain(|(_, v)| {
-                let scale = if fisheye && v.hops > NEAR_SCOPE { FAR_EVERY } else { 1 };
-                now.saturating_sub(v.at) < timeout * scale
-            });
-            if o.via.len() != before {
-                silent.push(*k);
+        if now >= self.next_expiry {
+            let mut silent: Vec<SignPk> = Vec::new();
+            let timeout = self.cfg.announce_every * 7 / 2;
+            let fisheye = self.cfg.fisheye;
+            let far_every = self.cfg.far_every.max(1);
+            let mut next = Time::MAX;
+            for (k, o) in self.origins.iter_mut() {
+                let before = o.via.len();
+                o.via.retain(|(_, v)| {
+                    let scale = if fisheye && v.hops > NEAR_SCOPE { far_every } else { 1 };
+                    let keep = now.saturating_sub(v.at) < timeout * scale;
+                    if keep {
+                        next = next.min(v.at + timeout * scale);
+                    }
+                    keep
+                });
+                if o.via.len() != before {
+                    silent.push(*k);
+                    self.gc_check |= o.via.is_empty();
+                }
+            }
+            self.next_expiry = next;
+            silent.sort();
+            for k in silent {
+                self.touch(k);
+                self.after_loss(k, None, now);
             }
         }
-        silent.sort();
-        for k in silent {
-            self.after_loss(k, None, now);
-        }
         let gc = self.gc_after();
-        self.origins.retain(|_, o| !o.via.is_empty() || o.pending.is_some() || now.saturating_sub(o.seen) < gc);
+        if self.gc_check || now >= self.next_gc {
+            let mut gone: Vec<SignPk> = Vec::new();
+            self.origins.retain(|k, o| {
+                let keep = !o.via.is_empty() || o.pending.is_some() || now.saturating_sub(o.seen) < gc;
+                if !keep {
+                    gone.push(*k);
+                }
+                keep
+            });
+            for k in gone {
+                self.touch(k);
+            }
+            self.next_gc = self.origins.values().filter(|o| o.via.is_empty() && o.pending.is_none()).map(|o| o.seen + gc).min().unwrap_or(Time::MAX);
+            self.gc_check = false;
+        }
+        if now >= self.next_sweep {
+            self.sweep(now);
+        }
+        self.publish(now);
+        self.choose_gateways(now);
+    }
+
+    /// Time-outs: half-assembled frames, parked frames, lookup answers,
+    /// dials, records, idle internet hops. Then the next time one is due.
+    fn sweep(&mut self, now: Time) {
         self.reasm.retain(|_, r| now.saturating_sub(r.at) < REASM_TIMEOUT);
         let mut expired = 0;
         self.pending.retain(|_, p| {
@@ -1439,8 +1864,17 @@ impl Router {
             }
         }
         self.records.retain(|_, t| now.saturating_sub(*t) < REACH_REFRESH * 2);
-        self.publish(now);
-        self.choose_gateways(now);
+        // a long-quiet peer starts again from the minimum backoff
+        self.backoff.retain(|_, (at, _)| now < *at + DIAL_BACKOFF_MAX);
+        let mut next = Time::MAX;
+        next = self.reasm.values().map(|r| r.at + REASM_TIMEOUT).fold(next, Time::min);
+        next = self.pending.values().map(|p| p.since + PENDING_TIMEOUT).fold(next, Time::min);
+        next = self.reach.values().map(|r| r.until).fold(next, Time::min);
+        next = self.dialing.values().map(|t| t + DIAL_GIVE_UP).fold(next, Time::min);
+        next = self.records.values().map(|t| t + REACH_REFRESH * 2).fold(next, Time::min);
+        next = self.backoff.values().map(|(at, _)| at + DIAL_BACKOFF_MAX).fold(next, Time::min);
+        next = self.nbs.values().filter(|n| n.internet()).map(|n| n.last_used + INTERNET_IDLE).fold(next, Time::min);
+        self.next_sweep = next;
     }
 
     /// Without the internet: keep a record naming our gateways published.
@@ -1449,12 +1883,12 @@ impl Router {
             self.my_gateways.clear();
             return;
         }
-        let with_cost = self.gateways_with_cost(now);
-        let mut g: Vec<SignPk> = with_cost.iter().map(|(k, _)| *k).collect();
-        g.sort();
-        let changed = g != self.my_gateways;
+        self.gateway_pick(now);
+        let Some((with_cost, g)) = &self.gw_pick else { return };
+        let changed = *g != self.my_gateways;
         let gap_ok = self.last_reach.is_none_or(|t| now.saturating_sub(t) >= REACH_MIN_GAP);
         if !g.is_empty() && gap_ok && (changed || now >= self.reach_due) {
+            let (with_cost, g) = (with_cost.clone(), g.clone());
             self.out.push(Out::PublishReach { gateways: with_cost });
             self.last_reach = Some(now);
             self.reach_due = now + REACH_REFRESH;
@@ -1462,6 +1896,19 @@ impl Router {
         } else if g.is_empty() {
             self.my_gateways.clear();
         }
+    }
+
+    /// The gateways to publish (with cost, and their sorted keys).
+    fn gateway_pick(&mut self, now: Time) -> (&Vec<(SignPk, u32)>, &Vec<SignPk>) {
+        self.gateway_routes_cached(now);
+        if self.gw_pick.is_none() {
+            let with_cost = Self::pick_gateways(self.gw_sorted.as_deref().unwrap_or_default(), self.cfg.gateways);
+            let mut g: Vec<SignPk> = with_cost.iter().map(|(k, _)| *k).collect();
+            g.sort();
+            self.gw_pick = Some((with_cost, g));
+        }
+        let (w, g) = self.gw_pick.as_ref().expect("just made");
+        (w, g)
     }
 }
 

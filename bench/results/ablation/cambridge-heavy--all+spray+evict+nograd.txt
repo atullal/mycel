@@ -1,0 +1,19 @@
+Message stats for scenario cambridge-heavy-all,spray,evict,nograd
+sim_time: 455609.0000
+created: 15184
+started: 14177
+relayed: 13808
+aborted: 107
+refused: 217
+delivered: 2237
+delivered_after_ttl: 0
+delivery_prob: 0.1473
+overhead_ratio: 5.1726
+latency_avg: 3129.7144
+latency_med: 251.2000
+hopcount_avg: 1.6822
+hopcount_med: 1
+transfers_by_reason: deliver 2264 route 2152 gradient 0 spray 9761
+carrier: expired 12089 cleared_by_receipt 699 refused 217 accepted 11356
+refused_by: {"store full": 217}
+# (12 devices, 5228 contact events, 9.6 s)

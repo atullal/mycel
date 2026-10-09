@@ -13,6 +13,8 @@ const OGM_CTX: &str = "mycel/v1/mesh-announce";
 pub(crate) const T_OGM: u8 = 1;
 pub(crate) const T_DATA: u8 = 2;
 pub(crate) const T_SEQREQ: u8 = 3;
+/// Several announcements for one neighbour in one datagram.
+pub(crate) const T_OGMS: u8 = 4;
 /// Data frame header: type, ttl, flags, dst, src, waypoint, id, offset, total.
 pub const DATA_HDR: usize = 3 + 32 * 3 + 4 + 2 + 2;
 const F_REACHED: u8 = 1;
@@ -140,6 +142,50 @@ pub fn decode_announce(b: &[u8]) -> Option<Announce> {
     Some(Announce { hops, cost, origin, seq, flags, scope, uplink, name: Arc::from(name), sig })
 }
 
+/// The encoded length of the announcement starting at `b[0]`, if whole.
+fn announce_len(b: &[u8]) -> Option<usize> {
+    let n = *b.get(OGM_FIXED - 1)? as usize;
+    let len = OGM_FIXED + n + 64;
+    (b.first() == Some(&T_OGM) && n <= MAX_NAME && b.len() >= len).then_some(len)
+}
+
+/// Announcements for one neighbour, packed into as few datagrams of at
+/// most `max` bytes as they fit in (one per datagram if `max` is small).
+/// Each QUIC packet on a hop costs ~40 bytes of headers and, on Bluetooth,
+/// a connection event: a tick's worth of rebroadcasts or a new neighbour's
+/// greeting goes in one or two.
+pub fn encode_announces(anns: &[Announce], max: usize) -> Vec<Bytes> {
+    let mut out = Vec::new();
+    let mut cur = BytesMut::new();
+    for a in anns {
+        let e = encode_announce(a);
+        if !cur.is_empty() && cur.len() + e.len() > max {
+            out.push(std::mem::take(&mut cur).freeze());
+        }
+        if cur.is_empty() {
+            cur.put_u8(T_OGMS);
+        }
+        cur.put_slice(&e);
+    }
+    if !cur.is_empty() {
+        out.push(cur.freeze());
+    }
+    out
+}
+
+/// The announcements in a [`T_OGMS`] datagram (none if any is malformed).
+pub fn decode_announces(b: &[u8]) -> Vec<Announce> {
+    let mut out = Vec::new();
+    let Some((&T_OGMS, mut rest)) = b.split_first() else { return out };
+    while !rest.is_empty() {
+        let Some(len) = announce_len(rest) else { return Vec::new() };
+        let Some(a) = decode_announce(&rest[..len]) else { return Vec::new() };
+        out.push(a);
+        rest = &rest[len..];
+    }
+    out
+}
+
 pub fn encode_seqreq(r: &SeqReq) -> Bytes {
     let mut b = BytesMut::with_capacity(1 + 32 + 8 + 1);
     b.put_u8(T_SEQREQ);
@@ -242,6 +288,32 @@ mod tests {
         assert!(!verify_announce(&cheaper), "so is the uplink cost");
         let r = SeqReq { origin: k.sign_pk(), seq: 42, hops: 3 };
         assert_eq!(decode_seqreq(&encode_seqreq(&r)), Some(r));
+    }
+
+    #[test]
+    fn announcements_batch_into_datagrams() {
+        let anns: Vec<Announce> = (0..20)
+            .map(|i| {
+                let k = DeviceKeys::generate();
+                let o = Origination { seq: 1_700_000_000_000 + i, flags: 0, scope: 8, uplink: 0 };
+                let mut a = sign_announce(&k, o, &"n".repeat(i as usize % 9));
+                a.hops = (i % 7) as u8;
+                a.cost = 100 * i as u32;
+                a
+            })
+            .collect();
+        let grams = encode_announces(&anns, 1100);
+        assert!(grams.len() > 1 && grams.len() < 5, "{} datagrams", grams.len());
+        assert!(grams.iter().all(|g| g.len() <= 1100));
+        let back: Vec<Announce> = grams.iter().flat_map(|g| decode_announces(g)).collect();
+        assert_eq!(back, anns);
+        assert!(back.iter().all(verify_announce));
+        // too small for two: one per datagram, still decodable
+        assert_eq!(encode_announces(&anns[..3], 10).len(), 3);
+        // a truncated batch is dropped whole
+        let g = &grams[0];
+        assert!(decode_announces(&g[..g.len() - 1]).is_empty());
+        assert!(encode_announces(&[], 1100).is_empty());
     }
 
     #[test]

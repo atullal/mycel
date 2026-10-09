@@ -1,0 +1,20 @@
+Message stats for scenario infocom2005-heavy-DirectDeliveryRouter
+sim_time: 254211.0000
+created: 8467
+started: 1419
+relayed: 1416
+aborted: 3
+dropped: 8214
+removed: 0
+delivered: 1416
+delivery_prob: 0.1672
+response_prob: 0.0000
+overhead_ratio: 0.0000
+latency_avg: 2809.0276
+latency_med: 1952.6000
+hopcount_avg: 1.0000
+hopcount_med: 1
+buffertime_avg: 7406.6769
+buffertime_med: 6961.3000
+rtt_avg: NaN
+rtt_med: NaN
