@@ -127,7 +127,7 @@ machine it measured 500 nodes in 1.2 GB (§1).
 | `routing-convergence` | 2 | full *(routing)* | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never | 15 s |
 | `flood-scaling` | 2 | full *(routing)* | ✅ | largest N: global core 8.4% of BLE in steady state, 100% of pairs routed (before: 67.0%, 85% routed), main 136.1% | 839 s |
 | `partial-route` | 2 | full *(carrier)* | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.5 s; sender-holds 100% p50 98.2 s · gap 300 m: global core + DTN 100%; stand-in custody 0% p50 0 s; sender-holds 0% p50 0 s | 0 s |
-| `disaster-dtn` | 2 | full *(control)* | ❌ | seed 1: global core + DTN 60% delivered, p95 7220 s, optimality p50/p95/p99 1.01/4.62/4.65× · 18.3 replicas, 25.6 hand-offs per message (budget 32) · PRoPHET 58%, spray-and-wait (L=8) 32%, epidemic 100% · **mean of seeds 1–12: 80.3%** (before fixed 17: 88.8%); seed-to-seed 60–92%, and 7 meaningless bytes per summary move the 12-seed mean to 86.2% (open 12) · CI size (0.1) 100%<br>✗ delivery within 3 h: 60% (target ≥ 80%) | 32 s |
+| `disaster-dtn` | 2 | full, judged on seeds 1–12 *(control)* | ✅ | **global core + DTN: mean 80.3% delivered** (target ≥ 80%; per seed 60–92%; seeds 13–24 mean 86.6%; open 12) · seed 1: 60%, p95 7220 s, optimality p50/p95/p99 1.01/4.62/4.65×, 18.3 replicas and 25.6 hand-offs per message (budget 32) · PRoPHET 58%, spray-and-wait (L=8) 32%, epidemic 100% (seed 1) · CI size (0.1): 100% | 55 s |
 | `mailbox` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
 | `global-scale` | 2 | 2,002 devices (0.02) *(control)* | ✅ | global core + DTN: 100% delivered, p95 0.690 s · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.130 s, p95 0.286 s, optimality p95 4.45× (was 32.2×, fixed 18) · control 727 B/s per device (was 8,470): routing 470, carrier 257 (was 8,004, fixed 17) | 14 s |
 | `churn` | 2 | 1,001 devices (scale 0.1) *(control)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.6/17.1×; control 707 B/s per device: routing 2,659 → 471, carrier 4,540 → 264 (full size before the carrier fixes: 100%, p95 65.2 s) | 10 s |
@@ -478,22 +478,31 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    (1.4 m/s, 60 m Bluetooth range); both are within the 80% / 10 s
    targets.
 12. **`disaster-dtn` swings with timing, seed to seed and change to
-   change.** At full size, seed 1 delivers 60% (target 80%) since fixed 17;
-   other seeds give 72–92%, and the mean over seeds 1–12 is 80.3%. At
-   54cc562, before fixed 17, the same seeds averaged 88.8% (seed 1: 97%).
-   But the difference tracks timing, not what carriers know:
-   - instrumented, not one receipt was missed: every receipt a device
-     learnt from a summary, it learnt from the first summary that carried
-     it; repeating the latest receipts in every full summary added nothing
-     a receiver didn't know, yet moved the 12-seed mean to 87.0%;
-   - adding 7 meaningless bytes to every summary (only airtime changes)
-     moved it to 86.2%, and 200 bytes to 81.7%.
-   So the 12-seed mean has a noise floor of about ±3–6 points here. The
-   scenario judges one seed at full size, which is not enough to rank
-   carrier changes. Next: judge it on the mean of 12+ seeds, and find
-   which interaction (contact starts, offers queued behind summaries on
-   Bluetooth) makes the outcome this sensitive. CI size (0.1) delivers
-   100%. Repro: `mycel-sim disaster-dtn --seed N` for N in 1..12.
+   change.** Full size, since fixed 17, seeds 1–12: 60, 90, 82, 73, 92,
+   82, 83, 88, 67, 85, 72, 90% (mean 80.3%); seeds 13–24: mean 86.6%
+   (63–98%), so 83.5% over 24 seeds. At 54cc562, before fixed 17, seeds
+   1–12 averaged 88.8%. What I could tie it to:
+   - **Not what carriers know.** Instrumented, not one receipt was
+     missed: every receipt a device learnt from a summary, it learnt from
+     the first summary that carried it. Repeating the latest receipts in
+     every full summary told receivers nothing new, yet moved the 12-seed
+     mean to 87.0%.
+   - **Timing alone moves it.** 7 meaningless bytes per summary moved the
+     12-seed mean to 86.2%, 200 bytes to 81.7%. Its noise floor is about
+     ±3–6 points.
+   - **Not offers queued behind summaries.** Offers, answers, bundles and
+     their acks wait 7–11 ms on average for the radio (max 0.9–1.9 s;
+     seeds 1 and 9), and none was lost to a link breaking. Contacts here
+     last minutes. Giving them priority over summaries (summaries use only
+     airtime they leave, as a lower-priority QUIC stream would) cut the
+     mean wait to 6.9–9.0 ms. It gave 86.8% on seeds 1–12, but 87.3%
+     against 86.6% on seeds 13–24, so it is noise; not adopted.
+
+   The full scenario is now judged on the mean of 12 seeds (≥ 80%), with
+   the per-seed spread in its notes. The CI size (0.1, one seed) delivers
+   100%. Still open: which interaction makes single runs this sensitive.
+   Repro: `mycel-sim disaster-dtn` (runs seeds 1–12),
+   `mycel-sim disaster-dtn --seed 13` (13–24).
 
 ## 5. Benchmarks against external baselines
 
