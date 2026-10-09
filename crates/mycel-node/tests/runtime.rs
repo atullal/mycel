@@ -691,10 +691,11 @@ async fn group_call_between_runtimes() {
             }
         }
     }
-    // Each person's path is known once that connection has an RTT sample;
-    // under load that can trail the audio by a moment.
+    // Each person's path is known once that connection has selected a path;
+    // under load (a build running alongside) that can trail the audio by
+    // several seconds.
     let mut st = json!(null);
-    for _ in 0..50 {
+    for _ in 0..150 {
         st = dispatch(&bob, "call_status", json!({})).await.unwrap();
         if st[0]["participants"].as_array().is_some_and(|ps| ps.iter().all(|p| p["path"] == "network")) {
             break;

@@ -54,14 +54,26 @@ function followIOSKeyboard() {
   const ios = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
   if (!vv || !ios) return;
   const root = document.documentElement;
+  // The height with no keyboard. (WKWebView shrinks innerHeight with the
+  // keyboard too, so it can't be the yardstick while typing.)
+  let full = window.innerHeight;
+  const typing = () => {
+    const el = document.activeElement as HTMLElement | null;
+    return !!el && (el.tagName === "TEXTAREA" || el.tagName === "INPUT" || el.isContentEditable);
+  };
   const update = () => {
-    const open = vv.height < window.innerHeight - 120;
+    if (!typing()) full = window.innerHeight; // rotation, split view
+    const open = typing() && vv.height < full - 120;
     root.classList.toggle("keyboard-open", open);
+    // iOS pans the visual viewport over the page instead of resizing it:
+    // size the app to what's visible and move it to where that is.
+    const app = document.getElementById("root");
     root.style.height = open ? `${vv.height}px` : "";
-    if (open) window.scrollTo(0, 0);
+    if (app) app.style.transform = open && vv.offsetTop > 0 ? `translateY(${vv.offsetTop}px)` : "";
+    if (!open && window.scrollY !== 0) window.scrollTo(0, 0);
   };
   vv.addEventListener("resize", update);
-  vv.addEventListener("scroll", () => {
-    if (root.classList.contains("keyboard-open")) window.scrollTo(0, 0);
-  });
+  vv.addEventListener("scroll", update);
+  window.addEventListener("focusin", update);
+  window.addEventListener("focusout", () => setTimeout(update, 50));
 }

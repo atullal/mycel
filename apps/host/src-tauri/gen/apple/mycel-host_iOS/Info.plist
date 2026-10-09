@@ -61,5 +61,9 @@
 	</array>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Mycel reads the photos and videos you choose to send.</string>
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>audio</string>
+	</array>
 </dict>
 </plist>
