@@ -182,6 +182,10 @@ pub struct DtnConfig {
     pub copies_small: u8,
     pub spray: Spray,
     pub gradient: Gradient,
+    /// The gradient discounts a neighbour by how few more bundles of this
+    /// size its free room takes (fewer than [`ROOM_HEADROOM`]): a full
+    /// gateway draws bundles it can only hold briefly.
+    pub room_aware: bool,
     /// Carry bundles for others at all.
     pub carry: bool,
 }
@@ -197,6 +201,7 @@ impl Default for DtnConfig {
             copies_small: 32,
             spray: Spray::First,
             gradient: Gradient::Internet,
+            room_aware: false,
             carry: true,
         }
     }
@@ -219,7 +224,7 @@ impl DtnConfig {
 
     /// Set knobs from `key=value,...` (`spray=first|fallback|focus`,
     /// `gradient=internet|both|destination|off`, `copies=N`,
-    /// `copies_small=N`), for experiments.
+    /// `copies_small=N`, `room=on|off`), for experiments.
     pub fn tune(&mut self, s: &str) -> Result<(), String> {
         for kv in s.split(',').map(str::trim).filter(|x| !x.is_empty()) {
             let (k, v) = kv.split_once('=').ok_or_else(|| format!("{kv}: expected key=value"))?;
@@ -233,6 +238,8 @@ impl DtnConfig {
                 ("gradient", "off") => self.gradient = Gradient::Off,
                 ("copies", n) => self.copies = n.parse().map_err(|e| format!("{kv}: {e}"))?,
                 ("copies_small", n) => self.copies_small = n.parse().map_err(|e| format!("{kv}: {e}"))?,
+                ("room", "on") => self.room_aware = true,
+                ("room", "off") => self.room_aware = false,
                 _ => return Err(format!("{kv}: unknown knob")),
             }
         }
@@ -392,6 +399,12 @@ impl Room {
         self.free + self.evictable.iter().filter(|(u, _)| *u < until).map(|(_, s)| s).sum::<u64>() >= size
     }
 
+    /// How much a neighbour this full counts for a bundle of `size`: 1 with
+    /// room for [`ROOM_HEADROOM`] more, less below that.
+    fn weight(&self, size: u64) -> f64 {
+        (self.free as f64 / (ROOM_HEADROOM * size.max(1)) as f64).min(1.0)
+    }
+
     fn take(&mut self, size: u64) {
         let f = self.free.min(size);
         self.free -= f;
@@ -402,21 +415,33 @@ impl Room {
     }
 }
 
+/// See [`DtnConfig::room_aware`].
+const ROOM_HEADROOM: u64 = 4;
+
 /// What a neighbour told us, for one plan.
 struct Nb<'a> {
     k: SignPk,
     has: Option<&'a Set<Hash32>>,
     refused: Option<&'a Set<Hash32>>,
     room: Option<&'a Room>,
-    pred: Option<&'a Map<SignPk, f64>>,
+    pred: Option<&'a NbPreds>,
 }
 
 /// A neighbour's utility for `dst` by `gradient`, from its predictability
 /// table, counting the internet only if it leads to `dst` (`inet`).
-fn utility_in(gradient: Gradient, table: Option<&Map<SignPk, f64>>, dst: &SignPk, inet: bool) -> f64 {
+/// A neighbour's predictabilities from its last summary, sorted by key: a
+/// device remembers one per neighbour, and at 64 entries a sorted `Vec` is
+/// half the size of a hash map (docs/SIMULATION.md §4).
+type NbPreds = Vec<(SignPk, f32)>;
+
+fn nb_p(t: &NbPreds, x: &SignPk) -> f64 {
+    t.binary_search_by(|(k, _)| k.cmp(x)).map_or(0.0, |i| t[i].1 as f64)
+}
+
+fn utility_in(gradient: Gradient, table: Option<&NbPreds>, dst: &SignPk, inet: bool) -> f64 {
     table.map_or(0.0, |t| {
-        let d = || t.get(dst).copied().unwrap_or(0.0);
-        let i = || if inet { t.get(&INTERNET).copied().unwrap_or(0.0) } else { 0.0 };
+        let d = || nb_p(t, dst);
+        let i = || if inet { nb_p(t, &INTERNET) } else { 0.0 };
         match gradient {
             Gradient::Internet if inet => i(),
             Gradient::Internet | Gradient::Destination => d(),
@@ -448,7 +473,7 @@ pub struct Carrier {
     /// Our delivery predictabilities and when each was last aged.
     pred: Map<SignPk, (f64, Time)>,
     /// Neighbours' last summaries: their predictabilities, ids and room.
-    nb_pred: Map<SignPk, Map<SignPk, f64>>,
+    nb_pred: Map<SignPk, NbPreds>,
     nb_has: Map<SignPk, Set<Hash32>>,
     nb_room: Map<SignPk, Room>,
     /// Bundles a neighbour refused, not offered again before its next summary.
@@ -880,10 +905,10 @@ impl Carrier {
             }
         }
         let p_from = self.p(&from, now);
-        let mut table: Map<SignPk, f64> = Map::default();
+        let mut table: NbPreds = Vec::with_capacity(s.preds.len().min(SUMMARY_PREDS));
         for (x, px) in s.preds.into_iter().take(SUMMARY_PREDS) {
             let px = (px as f64).clamp(0.0, 1.0);
-            table.insert(x, px);
+            table.push((x, px as f32));
             if x == self.me {
                 continue;
             }
@@ -893,6 +918,10 @@ impl Carrier {
                 self.set_p(x, via, now);
             }
         }
+        // sorted for lookups; of repeated keys the last counts, as before
+        table.reverse();
+        table.sort_by(|a, b| a.0.cmp(&b.0));
+        table.dedup_by_key(|(k, _)| *k);
         self.nb_pred.insert(from, table);
     }
 
@@ -962,10 +991,15 @@ impl Carrier {
                         let inet = t == Toward::Nowhere;
                         let mine = self.utility(&dst, inet, now);
                         // the likeliest neighbour without it at least `min` useful
+                        let room_aware = self.cfg.room_aware;
                         let best = |min: f64, strict: bool| {
                             nbs.iter()
                                 .filter(free)
-                                .map(|n| (utility_in(self.cfg.gradient, n.pred, &dst, inet), n.k))
+                                .map(|n| {
+                                    let u = utility_in(self.cfg.gradient, n.pred, &dst, inet);
+                                    let w = if room_aware { n.room.map_or(1.0, |r| r.weight(size)) } else { 1.0 };
+                                    (u * w, n.k)
+                                })
                                 .filter(|(u, _)| if strict { *u > min } else { *u >= min })
                                 .max_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)))
                                 .map(|(_, n)| n)
