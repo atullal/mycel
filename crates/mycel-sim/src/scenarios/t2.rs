@@ -209,8 +209,11 @@ fn go<R: Router>(
 
 /// (src, dst, sent) of each message sent after an earlier one between the
 /// same pair had been delivered.
+/// (sent, delivered) of every message between one pair.
+type PairSends = Vec<(Time, Option<Time>)>;
+
 fn warm_messages(msgs: &[crate::tier2::engine::MsgRecord]) -> std::collections::HashSet<(NodeId, NodeId, Time)> {
-    let mut by_pair: Map<(NodeId, NodeId), Vec<(Time, Option<Time>)>> = Map::default();
+    let mut by_pair: Map<(NodeId, NodeId), PairSends> = Map::default();
     for r in msgs {
         by_pair.entry((r.src, r.dst)).or_default().push((r.sent, r.delivered));
     }

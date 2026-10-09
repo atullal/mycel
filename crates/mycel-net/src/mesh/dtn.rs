@@ -920,7 +920,7 @@ impl Carrier {
         }
         // sorted for lookups; of repeated keys the last counts, as before
         table.reverse();
-        table.sort_by(|a, b| a.0.cmp(&b.0));
+        table.sort_by_key(|x| x.0);
         table.dedup_by_key(|(k, _)| *k);
         self.nb_pred.insert(from, table);
     }
