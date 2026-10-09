@@ -305,8 +305,8 @@ fn city_block(o: Opts) -> ScenarioResult {
         judge(&mut r, "8 hops", &d8, 1.0, 5.0);
         let (d9, _) = probe(&mut lab, &[(0, 9)], 1, Duration::from_millis(300), Duration::from_secs(20)).await;
         let ok9 = d9.iter().any(|d| d.latency.is_some());
-        r.headline(format!("9 hops: {}", if ok9 { "delivered" } else { "not delivered (max_hops = 8)" }));
-        r.note("The mesh's TTL (max_hops = 8) bounds a chain at 8 radio hops: devices 9+ hops apart need a gateway or store-and-forward.");
+        r.headline(format!("9 hops: {}", if ok9 { "delivered" } else { "not delivered" }));
+        r.note("The mesh's TTL (max_hops = 10) bounds a chain at 10 radio hops (routes follow the cheapest path, which can be a hop or two longer than the fewest): devices further apart need a gateway or store-and-forward.");
         finish(&mut r, t0, n, rss0, cpu0);
         lab.shutdown().await;
     });

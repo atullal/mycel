@@ -110,15 +110,20 @@ pub const FAR_EVERY: u64 = 8;
 const DENSE: usize = 8;
 /// ... skip a rebroadcast that this many neighbours already made as well.
 const REDUNDANT: usize = 3;
-/// A device greets at most one new neighbour with its routes this often
-/// (the others get its own announcement): in a crowd everyone meets 15
-/// devices at once, and one table is enough to join.
+/// A device greets one new neighbour with its routes at most this often;
+/// the others wait their turn and then get only what they haven't heard
+/// meanwhile. In a crowd everyone meets 15 devices at once, and one table
+/// is enough to join.
 const GREET_GAP: Time = 4_000;
 /// Seqno requests per origin at most this often; how far they travel.
 const SEQREQ_GAP: Time = 1_000;
 const SEQREQ_HOPS: u8 = 8;
 /// An origin answers a seqno request at most this often.
 const FORCED_GAP: Time = 500;
+/// A relay floods one origin's new seqnos at most this often: a storming
+/// device reaches its neighbours, not the mesh. (Origins announce every
+/// ~16 s, or on request at most every [`FORCED_GAP`].)
+const ORIGIN_GAP: Time = 250;
 const REASM_TIMEOUT: Time = 2_000;
 const REASM_MAX: usize = 256;
 const VERIFIED_MAX: usize = 4096;
@@ -376,7 +381,7 @@ pub struct Stats {
     pub announcements_forged: u64,
     /// Too far from our clock, or older than what we have.
     pub announcements_stale: u64,
-    /// Over a neighbour's announcement rate.
+    /// Over a neighbour's announcement rate, or an origin's flood rate.
     pub announcements_limited: u64,
     /// Rebroadcasts skipped as redundant (flood reduction).
     pub announcements_suppressed: u64,
@@ -482,8 +487,10 @@ struct Origin {
     /// The newest announcement itself (passed on with our cost added).
     latest: Announce,
     via: Vec<(SignPk, Via)>,
-    /// Newest sequence number we have passed on (or decided not to).
+    /// Newest sequence number we have passed on (or decided not to), and
+    /// when we last did.
     forwarded: u64,
+    flooded: Option<Time>,
     /// When to pass on the newest one.
     pending: Option<Time>,
     /// Feasibility distance: the (seq, cost) we last advertised.
@@ -589,6 +596,8 @@ pub struct Router {
     next_announce: Time,
     last_forced: Option<Time>,
     last_greet: Option<Time>,
+    /// New direct neighbours waiting to be greeted, in order.
+    greet_q: VecDeque<SignPk>,
     force_full: bool,
     next_id: u32,
     stats: Stats,
@@ -654,6 +663,7 @@ impl Router {
             next_announce: 0,
             last_forced: None,
             last_greet: None,
+            greet_q: VecDeque::new(),
             force_full: false,
             next_id: 0,
             stats: Stats::default(),
@@ -825,23 +835,34 @@ impl Router {
                 self.stats.announcements_sent += 1;
                 self.out.push(Out::Announce { to: peer, ann: a });
             }
-            self.greet(peer, now);
+            if self.cfg.greet != Greet::Own && self.cfg.relay && !self.greet_q.contains(&peer) {
+                self.greet_q.push_back(peer);
+            }
+            self.greet_next(now);
         }
         self.release(peer, now);
     }
 
-    /// Tell a new direct neighbour our current routes ([`Config::greet`];
-    /// one neighbour per [`GREET_GAP`]),
-    /// as a periodic rebroadcast would: newest seqno, our cost, within each
-    /// announcement's scope. What is new to it travels on from there; what
-    /// its other neighbours already have stops at it (it has forwarded that
-    /// seqno). Advertising updates our feasibility distances, as in
-    /// `flush_announcements`.
-    fn greet(&mut self, peer: SignPk, now: Time) {
-        if self.cfg.greet == Greet::Own || !self.cfg.relay || self.last_greet.is_some_and(|t| now.saturating_sub(t) < GREET_GAP) {
-            return;
+    /// Greet the next new neighbour waiting, if [`GREET_GAP`] has passed
+    /// since the last greeting that told anyone anything.
+    fn greet_next(&mut self, now: Time) {
+        while !self.last_greet.is_some_and(|t| now.saturating_sub(t) < GREET_GAP) {
+            let Some(peer) = self.greet_q.pop_front() else { return };
+            if self.nbs.get(&peer).is_some_and(|n| n.up && n.direct) && self.greet(peer, now) > 0 {
+                self.last_greet = Some(now);
+            }
         }
-        self.last_greet = Some(now);
+    }
+
+    /// Tell a new direct neighbour our current routes ([`Config::greet`])
+    /// that it hasn't sent us itself, as a periodic rebroadcast would:
+    /// newest seqno, our cost, within each announcement's scope. What is
+    /// new to it travels on from there; what its other neighbours already
+    /// have stops at it (it has forwarded that seqno). Advertising updates
+    /// our feasibility distances, as in `flush_announcements`. Returns the
+    /// routes sent.
+    fn greet(&mut self, peer: SignPk, now: Time) -> usize {
+        let mut sent = 0;
         let mut keys: Vec<SignPk> = self.origins.keys().filter(|k| **k != peer).copied().collect();
         keys.sort();
         for origin in keys {
@@ -868,7 +889,9 @@ impl Router {
             o.retracted = false;
             self.stats.announcements_sent += 1;
             self.out.push(Out::Announce { to: peer, ann: a });
+            sent += 1;
         }
+        sent
     }
 
     pub fn hop_down(&mut self, peer: SignPk, now: Time) {
@@ -1049,6 +1072,7 @@ impl Router {
             latest: a.clone(),
             via: Vec::new(),
             forwarded: 0,
+            flooded: None,
             pending: None,
             fd: None,
             heard: Vec::new(),
@@ -1078,10 +1102,16 @@ impl Router {
             o.retracted = false;
         }
         if relay && seq == o.newest && seq > o.forwarded && o.pending.is_none() && hops < forward_scope {
-            // wait a little to hear the cheapest copy (and other relays'),
-            // and desynchronize
-            o.pending = Some(now + jitter);
-            self.flush_q.push(Reverse((now + jitter, origin)));
+            if o.flooded.is_some_and(|t| now.saturating_sub(t) < ORIGIN_GAP) {
+                // an announcement storm: the route stands, the flood stops here
+                o.forwarded = seq;
+                self.stats.announcements_limited += 1;
+            } else {
+                // wait a little to hear the cheapest copy (and other relays'),
+                // and desynchronize
+                o.pending = Some(now + jitter);
+                self.flush_q.push(Reverse((now + jitter, origin)));
+            }
         }
         // after: it may have become one
         self.touch(origin);
@@ -1204,6 +1234,7 @@ impl Router {
             self.gc_check |= o.via.is_empty();
             let newest = o.newest;
             o.forwarded = newest;
+            o.flooded = Some(now);
             let Some((_, via)) = best.filter(|(_, v)| v.seq == newest) else { continue };
             if dense && o.heard.iter().filter(|(_, adv)| *adv <= via.cost).count() >= REDUNDANT {
                 self.stats.announcements_suppressed += 1;
@@ -1752,6 +1783,9 @@ impl Router {
 
     pub fn tick(&mut self, now: Time) {
         self.flush_announcements(now);
+        if !self.greet_q.is_empty() {
+            self.greet_next(now);
+        }
         // routes that went silent: forget them, retracting what that costs us
         if now >= self.next_expiry {
             let mut silent: Vec<SignPk> = Vec::new();

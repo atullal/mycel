@@ -681,6 +681,33 @@ fn new_neighbours_are_greeted_and_lone_devices_announce_fully() {
     }
 }
 
+/// A device announcing every 10 ms (a storm) reaches its neighbours; relays
+/// pass on at most one of its seqnos per 250 ms.
+#[test]
+fn an_announcement_storm_stops_at_the_first_relays() {
+    let mut net = Net::new(3, |i| Config { announce_every: 16_000, seed: i as u64 + 1, ..Config::default() });
+    net.link(0, 1);
+    net.link(1, 2);
+    net.run(1_000);
+    let received = |n: &Net| n.nodes[2].stats().announcements_received;
+    let before = received(&net);
+    for _ in 0..200 {
+        let now = net.now;
+        let r = &mut net.nodes[0];
+        let o = r.next_announce(WALL + now);
+        let a = Announce { hops: 0, cost: 0, origin: r.me(), seq: o.seq, flags: o.flags, scope: o.scope, uplink: o.uplink, name: Arc::from(""), sig: Sig([0; 64]) };
+        r.originate(a, now);
+        net.effects(0);
+        net.run(10);
+    }
+    net.run(200);
+    let through = received(&net) - before;
+    eprintln!("storm: 200 announcements in 2 s, {through} reached 2 hops away");
+    assert!(through <= 10, "{through}");
+    assert!(net.nodes[1].stats().announcements_limited > 0);
+    assert!(net.has_route(2, 0), "the storming device stays reachable");
+}
+
 /// Over unicast hops, the broadcast-style flood reduction (skip a
 /// rebroadcast after hearing 3 equal copies) leaves devices out: those
 /// copies reached their senders' neighbours, not ours. Off by default.

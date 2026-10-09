@@ -654,7 +654,9 @@ impl Router for Global {
         match token & 0xff {
             T_HOUSE => {
                 if self.role == Role::Replayer && self.old.len() >= 100 {
-                    let old: Vec<Announce> = self.old.drain(..50).collect();
+                    // recordings an hour old (seqnos are the origin's wall clock;
+                    // signatures are stubbed here, a real recording keeps its own)
+                    let old: Vec<Announce> = self.old.drain(..50).map(|a| Announce { seq: a.seq.saturating_sub(3_600_000), ..a }).collect();
                     for nb in cx.neighbours() {
                         for a in &old {
                             self.send_to(cx, nb.0, Frame::Ann(a.clone()), None);
