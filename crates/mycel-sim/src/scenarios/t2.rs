@@ -964,6 +964,9 @@ fn partial_route(o: Opts) -> ScenarioResult {
 
 // ───────────────────────────── disaster-dtn ─────────────────────────────
 
+/// Seeds the full `disaster-dtn` is judged on (the mean of their deliveries).
+const DISASTER_SEEDS: u64 = 12;
+
 fn disaster_world(o: &Opts) -> (World, Vec<(NodeId, NodeId)>) {
     let mut rng = Rng::new(o.seed ^ 0xd15a);
     let mut w = World {
@@ -1008,15 +1011,42 @@ fn disaster_world(o: &Opts) -> (World, Vec<(NodeId, NodeId)>) {
 
 fn disaster_dtn(o: Opts) -> ScenarioResult {
     let mut r = ScenarioResult::new("disaster-dtn", "Disaster zone: gradient DTN vs spray-and-wait vs epidemic", 2, o.seed, o.scale);
+    let plan_for = |pairs: &[(NodeId, NodeId)]| {
+        let mut plan = Plan::default();
+        for (k, (s, d)) in pairs.iter().enumerate() {
+            plan.sends.push((5 * MIN + k as Time * 30 * SEC, *s, *d, 2000, false));
+        }
+        plan
+    };
     let (w, pairs) = disaster_world(&o);
-    let mut plan = Plan::default();
-    for (k, (s, d)) in pairs.iter().enumerate() {
-        plan.sends.push((5 * MIN + k as Time * 30 * SEC, *s, *d, 2000, false));
-    }
+    let plan = plan_for(&pairs);
     let until = 3 * HOUR;
     let (cand, others) = compare(&mut r, &o, &w, &plan, until, None, &[Model::Main, Model::StandIn, Model::Prophet, Model::Spray(8), Model::Epidemic, Model::Flood(7)]);
     let epi = others.iter().find(|x| x.m.model == "epidemic").map(|x| x.m.clone()).unwrap_or_default();
-    r.at_least("delivery within 3 h (of feasible)", 100.0 * cand.m.delivery_ratio, 80.0, "%");
+    if o.scale >= 1.0 {
+        // One run swings by tens of points with timing alone (seed to seed,
+        // or a few bytes more per summary: docs/SIMULATION.md §4, open 12),
+        // so the full scenario is judged on the mean of 12 seeds (worlds and
+        // runs), the given seed first.
+        let mut per_seed = vec![100.0 * cand.m.delivery_ratio];
+        for k in 1..DISASTER_SEEDS {
+            let ok = Opts { seed: o.seed + k, ..o };
+            let (w, pairs) = disaster_world(&ok);
+            per_seed.push(100.0 * run(Model::of(o.candidate), &w, &plan_for(&pairs), ok.seed, until, None).m.delivery_ratio);
+        }
+        let mean = per_seed.iter().sum::<f64>() / per_seed.len() as f64;
+        let (lo, hi) = per_seed.iter().fold((f64::INFINITY, 0.0f64), |(l, h), x| (l.min(*x), h.max(*x)));
+        r.at_least(&format!("delivery within 3 h (of feasible), mean of seeds {}–{}", o.seed, o.seed + DISASTER_SEEDS - 1), mean, 80.0, "%");
+        r.note(format!(
+            "{} delivery by seed {}–{}: {} (mean {mean:.1}%, min {lo:.0}%, max {hi:.0}%).",
+            cand.m.model,
+            o.seed,
+            o.seed + DISASTER_SEEDS - 1,
+            per_seed.iter().map(|x| format!("{x:.0}%")).collect::<Vec<_>>().join(", ")
+        ));
+    } else {
+        r.at_least("delivery within 3 h (of feasible)", 100.0 * cand.m.delivery_ratio, 80.0, "%");
+    }
     // replicas, not hand-offs: moving the only copy (custody) makes none.
     // The bound is the carrier's own copy budget for 2 kB bundles (32, set
     // for chat speed: docs/BENCHMARKS.md §6.3); 8 copies deliver less here
