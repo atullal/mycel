@@ -97,7 +97,9 @@ expected (reason in the report: a known gap or a finding), ❌ fail.
 The scenarios ran as separate processes and were joined with
 `mycel-sim merge`. The rows marked *(carrier)* were rerun on 9 October
 with the store-and-forward fixes from the benchmarks (§4, fixed 8), on a
-less loaded machine. The Mac was heavily loaded throughout: another agent's
+less loaded machine. The rows marked *(routing)* were rerun on 9 October
+with finding 1's fixes (§4, fixed 9), at a load average of ~9. The Mac was
+heavily loaded throughout the first runs: another agent's
 Java simulations, a host build and other apps, a load average of ~20 on
 18 cores, and 8 of 9 GB swap in use. Wall times are pessimistic, and the
 real-time tier-1 latencies (calls especially) carry that load. The ONE
@@ -110,25 +112,25 @@ machine it measured 500 nodes in 1.2 GB (§1).
 | `cafe` | 1 | full | ✅ | messages: 100% delivered, p50 0.032 s, p95 0.039 s, optimality p50/p95/p99 5.77/7.00/7.22× · call: setup 0.051 s, loss 0.0%, latency 101 ms, path Some(Network) | 18 s |
 | `office` | 1 | full | ✅ | messages: 100% delivered, p50 0.032 s, p95 0.034 s, optimality p50/p95/p99 6.00/59.3/60.6× | 10 s |
 | `apartment-80211s` | 1 | full | ✅ | messages: 100% delivered, p50 0.083 s, p95 0.095 s, optimality p50/p95/p99 5.63/6.98/6.98× · bulk: next flat 8.2 MB/s, 7 flats away 2.2 MB/s | 10 s |
-| `conference` | 1 | 24 seats (scale 0.1; 100 didn't finish, 300 crashed) | ⏳ | messages: 80% delivered, p50 0.853 s, p95 3.36 s, optimality p50/p95/p99 22.7/89.5/89.5×<br>✗ messages: delivery: 80.0 % (target ≥ 95.0 %); ✗ messages: latency p95: 3.36 s (target ≤ 3.00 s) | 180 s |
+| `conference` | 1 | 24 seats (scale 0.1; 100 didn't finish, 300 crashed) *(routing)* | ⏳ | messages: 100% delivered, p50 0.462 s, p95 6.39 s, optimality p50/p95/p99 5.66/170/170× (before finding 1's fixes: 80% delivered, p95 3.36 s)<br>✗ messages: latency p95: 6.39 s (target ≤ 3.00 s) | 108 s |
 | `city-block` | 1 | full | ✅ | 8 hops: 100% delivered, p50 0.957 s, p95 1.01 s, optimality p50/p95/p99 3.19/3.38/3.38× · 9 hops: not delivered (max_hops = 8) | 70 s |
 | `shutdown` | 1 | 15 walkers (scale 0.5; full size before: +4.8 GB, see finding 8) *(carrier)* | ✅ | messages (connected at the time): 100% delivered, p50 0.231 s, p95 0.359 s, optimality p50/p95/p99 3.63/5.42/5.42× · call between two walkers: setup 0.698 s, heard, loss 4.4%, path Mesh | 106 s |
 | `disaster-live` | 1 | full *(carrier)* | ✅ | member mule: 49 s; stranger mule: 49 s (it never arrived before fixed 2) | 62 s |
 | `rural-line` | 1 | full | ✅ | messages: 100% delivered, p50 0.114 s, p95 0.130 s, optimality p50/p95/p99 5.67/6.78/6.78× · bulk: next house 6.6 MB/s, 5 hops 0.59 MB/s | 20 s |
-| `us-eu-live` | 1 | full | ⏳ | messages: 100% delivered, p50 0.814 s, p95 1.40 s, optimality p50/p95/p99 4.31/7.43/7.43× · call: setup 1.79 s, loss 66.7%, latency 175 ms, path None<br>✗ call: audio loss: 66.7 % (target ≤ 5.00 %) | 63 s |
+| `us-eu-live` | 1 | full *(routing)* | ✅ | messages: 100% delivered, p50 0.745 s, p95 0.880 s, optimality p50/p95/p99 3.94/4.66/4.66× · call: setup 1.68 s, loss 0.0%, latency 722 ms, path Some(Mesh) (on the loaded machine before: loss 66.7%) | 53 s |
 | `nat-relay` | 1 | full | ✅ | messages: 100% delivered, p50 0.233 s, p95 0.488 s, optimality p50/p95/p99 3.32/4.57/4.80× · during the relay outage: 100% delivered, p50 0.263 s, p95 0.772 s, optimality p50/p95/p99 3.32/6.39/130× | 23 s |
 | `adversarial-live` | 1 | full | ✅ | messages past a black hole and a storm: 100% delivered, p50 1.87 s, p95 4.01 s, optimality p50/p95/p99 24.9/53.5/53.5× | 46 s |
 | `multipath` | 1 | full | ✅ | 3 links 8.0 MB/s, 1 link 2.9 MB/s (2.78×) | 21 s |
 | `mixed-room` | 1 | full | ✅ | Ethernet→Some(Ethernet), Wi-Fi Direct→Some(WifiDirect), UWB→Some(Uwb), Bluetooth LE→Some(Bluetooth) | 30 s |
 | `us-eu` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 0.799 s, optimality p50/p95/p99 1.29/2.29/4.19× | 1 s |
 | `gateway-choice` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 1.12 s, optimality p50/p95/p99 2.49/6.41/6.50× · 100% of relayed bytes via the far fibre gateway | 0 s |
-| `routing-convergence` | 2 | full | ⏳ | global core: 99% routed in never, 100% in never, 0 loops, re-converged in never, stretch 1.06× · main: 99% in never, 0 loops, re-converged in never<br>✗ cold start: 99% of pairs within 8 hops routed: ∞ s (target ≤ 12.0 s); ✗ after the busiest device fails: 99% routed again: ∞ s (target ≤ 8.00 s) | 39 s |
-| `flood-scaling` | 2 | full | ⏳ | largest N: global core 76.9% of BLE, main 136.1%<br>✗ announcement traffic at the largest N, as a share of one BLE radio: 76.9 % (target ≤ 10.0 %) | 1344 s |
+| `routing-convergence` | 2 | full *(routing)* | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never | 15 s |
+| `flood-scaling` | 2 | full *(routing)* | ✅ | largest N: global core 8.4% of BLE in steady state, 100% of pairs routed (before: 67.0%, 85% routed), main 136.1% | 839 s |
 | `partial-route` | 2 | full *(carrier)* | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.5 s; sender-holds 100% p50 98.2 s · gap 300 m: global core + DTN 100%; stand-in custody 0% p50 0 s; sender-holds 0% p50 0 s | 0 s |
 | `disaster-dtn` | 2 | full *(carrier)* | ⏳ | global core + DTN: 87% delivered (mean of seeds 1–5: 90%), p95 5917 s, optimality p50/p95/p99 1.00/3.93/5.04× · PRoPHET 58%, spray-and-wait (L=8) 32%, epidemic 100%<br>✗ copies per message: 33.5 (target ≤ 8.00): expected, open finding 3 | 31 s |
 | `mailbox` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
-| `global-scale` | 2 | 10,003 devices (0.1) | ❌ | global core + DTN: 100% delivered, p95 0.819 s, optimality p50/p95/p99 6.12/12.9/19.2× · 10003 devices, 71% with internet; 673610627 events in 1982 s wall<br>✗ optimality p95 (achieved / fastest feasible): 12.9 × (target ≤ 5.00 ×); ✗ control traffic per device: 6051 B/s (target ≤ 1000 B/s) | 2682 s |
-| `churn` | 2 | 1,001 devices (scale 0.1) *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.5/17.1× (full size before the carrier fixes: 100%, p95 65.2 s) | 98 s |
+| `global-scale` | 2 | 10,003 devices (0.1) | ❌ | global core + DTN: 100% delivered, p95 0.819 s, optimality p50/p95/p99 6.12/12.9/19.2× · 10003 devices, 71% with internet; 673610627 events in 1982 s wall. *(routing, at 2,002 devices: routing traffic 3,768 → 467 B/s per device; the carrier's summaries are the other 5,605 B/s; 140 M → 29 M events)*<br>✗ optimality p95 (achieved / fastest feasible): 12.9 × (target ≤ 5.00 ×); ✗ control traffic per device: 6051 B/s (target ≤ 1000 B/s) | 2682 s |
+| `churn` | 2 | 1,001 devices (scale 0.1) *(carrier, routing)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.93/12.6/17.1×; routing traffic 2,659 → 470 B/s per device (full size before the carrier fixes: 100%, p95 65.2 s) | 75 s |
 | `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 15.0 s, optimality p50/p95/p99 32.7/718/2015× · global core + DTN: clean 100%, attacked 100%, Sybil gateway 100% | 980 s |
 | `trace-replay` | 2 | full *(carrier)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible, p50 4.8 s, p95 1212 s, optimality p50/p95/p99 0.630/1.38/2.70× · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5) | 106 s |
 | `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 53%, 68%, 83%, 92%, 93% | 0 s |
@@ -234,35 +236,71 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    - `copies_by_size`, `spray_modes`;
    - `copies_in_flight_are_not_given_twice`.
 
+9. **Announcements no longer overload Bluetooth** (was open finding 1).
+   Every device re-flooded a signed ~120-byte announcement every 2 s,
+   unicast to every neighbour. Measured with `MYCEL_CORE` knobs
+   (`Config::tune`), then changed in `mesh/core.rs` and the node:
+   - **Babel's timing.** The period is 16 s, not 2 s; the full scope
+     every 8th period, not every 4th. Lost links never waited for the
+     period (hop connections time out in seconds and trigger retractions
+     and seqno requests), so it only refreshes. What changes goes out at
+     once: a new neighbour is greeted with our routes (one per 4 s, for
+     crowds), and a device's first neighbour gets a full-scope
+     announcement.
+   - **Flood reduction off.** Skipping a rebroadcast after hearing 3
+     copies assumes broadcast radios; over unicast hops it left 9% of
+     pairs unrouted (`routing-convergence`: 91% with it, 99% without, at
+     16 s).
+   - **10 hops, not 8.** Routes follow the cheapest path, which can be a
+     hop or two longer than the fewest hops. Every unrouted pair left in
+     `flood-scaling` and `routing-convergence` was exactly 8 radio hops
+     apart with no announcement received: 97% → 100% of pairs.
+   - **Batched announcements** (one datagram per neighbour per tick) and
+     **at most 6 hop connections opened per device** in range (others
+     open theirs: ~11 in all in the conference, from 15; 37% fewer
+     Bluetooth packets).
+
+   Before → after, seed 1:
+   - `routing-convergence` (300 phones): 99% of pairs routed never → in
+     1.1 s; after the hub fails, re-converged never → 0.1 s; 0 loops;
+     control 18.6 → 6.2 kB/s per device, cold start included.
+   - `flood-scaling`, 2,000 Bluetooth-only phones, steady state: 26.8 →
+     3.4 kB/s per device (67% → 8.4% of a BLE radio), 85% → 100% of pairs
+     routed (§5).
+   - `global-scale` at 2,002 devices: routing traffic 3,768 → 467 B/s per
+     device; the simulation runs 6× faster (140 M → 29 M events).
+   - `churn` at 1,001 devices: routing traffic 2,659 → 470 B/s, delivery
+     and latency unchanged (100%, p95 61.2 s).
+   - `us-eu-live`: passes (call loss 0%), but that scenario sets its own
+     1 s period; the 66.7% loss was most likely the overloaded machine.
+   - `conference` (24 seats): 80% → 100% delivered; p95 still over 3 s
+     (open finding 1).
+
+   Tests: `new_neighbours_are_greeted_and_lone_devices_announce_fully`,
+   `flood_reduction_is_off_and_floods_reach_everyone` (`mesh/core/tests.rs`),
+   `announcements_batch_into_datagrams` (`mesh/wire.rs`).
+
 ### Open (with evidence)
 
-1. **Announcements overload Bluetooth: the top finding.** Every
-   rebroadcast is unicast to every neighbour every 2 s, so a device sends
-   about origins in scope × neighbours × ~120 B per period:
-   - `global-scale` (neighbourhoods of 80): 6.1 KB/s per device at 10k and
-     9.4 KB/s at 2k, against a 1 KB/s target.
-   - `routing-convergence` at full size (300 phones): 18.6 KB/s per device.
-     Phones whose peer-to-peer radios differ (AWDL vs Wi-Fi Direct) share
-     only BLE (40 kB/s). Saturated, those links deliver announcements late,
-     routes expire and return, and routing sits at 91–98% of pairs, never
-     99%. The mesh before GLOBAL does worse: 183 KB/s, ~92%.
-   - `flood-scaling`: see the table in §5.
-   - `conference` (tier 1, 24 seats): BLE queues drop packets; 80% of
-     messages delivered, p95 3.4 s (targets 95%, 3 s).
+1. **Bluetooth control traffic: what is left after fixed 9.**
+   - **Carrier summaries.** At 2,002 devices in `global-scale`, the
+     store-and-forward carrier's summaries cost 5,605 B/s per device
+     (4,540 in `churn`), against 467 B/s for routing. Each summary lists up
+     to 64 predictabilities (36 bytes each) and goes to every neighbour
+     every 10 s. Directions: send what changed, fewer or quantized
+     predictabilities, a longer period. `global-scale`'s 1 KB/s target
+     fails on this alone; routing has its own line in the report.
+   - **`conference` latency** (24 seats): 100% delivered, but the slowest
+     of 10 messages takes 6–7 s (target 3 s). About 23% of Bluetooth
+     packets are dropped at full 250 ms transmit queues whatever the
+     announcement period, greeting or neighbour cap (measured with each
+     changed). QUIC handshakes and syncs arrive in bursts larger than
+     the queue at 40 kB/s. Directions: pace hop-connection handshakes,
+     larger queues, fewer path keep-alives on Bluetooth.
 
-   Directions, all trade-offs between convergence and overhead, so
-   GLOBAL's call:
-   - Babel's timing: 4 s hellos, 16 s updates, with triggered updates and
-     retractions already in place.
-   - A byte budget per hop derived from its measured cost.
-   - Sending an (origin, seqno)'s 64-byte signature once, pulled on
-     demand.
-   - OLSR-style relay selection.
-   - A cap on mesh neighbours in the node (a real BLE radio holds ~10
-     connections).
-
-   Repro: `mycel-sim routing-convergence`, `mycel-sim flood-scaling`,
-   `mycel-sim global-scale --scale 0.02`.
+   Repro: `mycel-sim global-scale --scale 0.02`, `mycel-sim conference
+   --scale 0.1`. Old routing settings for comparison:
+   `MYCEL_CORE=every=2000,far=4,hops=8,reduction=on,greet=own`.
 2. **On Infocom 2005 the carrier still trails PRoPHET slightly** (§5):
    27.9% of messages against 30.7%, at a third of its median latency
    (1,349 s against 4,371 s) and a seventh of its overhead (8.7 against
@@ -312,9 +350,10 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    delivery queues and tasks) or the node (connections remade as devices
    move) holds it. Repro: `mycel-sim shutdown`, watching RSS.
 9. **`us-eu-live`'s call lost 66.7% of its audio** at full size on the
-   loaded machine (0% at CI size earlier). Real-time audio over three
-   emulated BLE hops shares the radio with announcements (finding 1).
-   Messages: 100%, p95 1.4 s.
+   loaded machine (0% at CI size earlier). On 9 October at a load of ~9:
+   0% loss, messages p95 0.88 s. The scenario sets its own 1 s
+   announcement period, so the loss was most likely CPU starvation, not
+   announcements. Watch it on the next loaded run.
 10. **The oracle is a lower bound only for single-packet messages.** It
    moves a whole message per hop. For 0.5–1 MB messages a pipelined live
    path beats it, giving ratios below 1 in `trace-replay`.
@@ -392,16 +431,16 @@ neighbourhood:
 
 100 BLE devices outdoors, one per 625 m² (~18 in range); one broadcast from a random device, averaged over runs. Reach rises with the hop limit and levels off, while each extra hop adds redundant transmissions: Meshtasticator's published shape, and why Meshtastic defaults to 3.
 
-**Announcement overhead vs mesh size** (`flood-scaling`, full size: Bluetooth-only phones, one per 900 m², ~12 neighbours, 40 s): control bytes per device per second, as a share of one BLE radio (40 kB/s), and the share of sampled pairs within 8 hops that have a route.
+**Announcement overhead vs mesh size** (`flood-scaling`, full size: Bluetooth-only phones, one per 900 m², ~12 neighbours). Control bytes per device per second in steady state (over one full fisheye cycle after a first one), as a share of one BLE radio (40 kB/s), and the share of sampled pairs within 8 hops that have a route. In brackets: the first cycle, everyone starting at once.
 
-| Devices | GLOBAL core (fisheye + reduction, 2 s) | fisheye only | neither | every 10 s | Mesh before GLOBAL |
+| Devices | Now (16 s, full scope of 10 hops every 8th) | Now + flood reduction | Now, fisheye off | Before (2 s, 8 hops every 4th, flood reduction) | Mesh before GLOBAL (40 s) |
 |---:|---:|---:|---:|---:|---:|
-| 250 | 21.7 kB/s (54%), 92% routed | 23.0 kB/s (58%), 94% routed | 44.2 kB/s (111%), 59% routed | 7.0 kB/s (18%), 88% routed | 48.0 kB/s (120%) |
-| 500 | 25.7 kB/s (64%), 89% routed | 26.8 kB/s (67%), 90% routed | 51.9 kB/s (130%), 50% routed | 8.7 kB/s (22%), 91% routed | 49.6 kB/s (124%) |
-| 1,000 | 27.3 kB/s (68%), 92% routed | 28.3 kB/s (71%), 90% routed | 55.3 kB/s (138%), 42% routed | 9.2 kB/s (23%), 86% routed | 52.2 kB/s (131%) |
-| 2,000 | 30.8 kB/s (77%), 84% routed | 31.8 kB/s (79%), 88% routed | 61.0 kB/s (153%), 36% routed | 10.6 kB/s (26%), 84% routed | 54.4 kB/s (136%) |
+| 250 | 2.5 kB/s (6.3%) [3.5], 100% routed | 2.0 kB/s (4.9%), 100% | 9.4 kB/s (23%), 100% | 18.3 kB/s (46%) [30.4], 92% | 48.0 kB/s (120%) |
+| 500 | 2.8 kB/s (7.0%) [4.3], 100% | 2.3 kB/s (5.8%), 100% | 12.2 kB/s (31%), 100% | 22.1 kB/s (55%) [35.4], 90% | 49.6 kB/s (124%) |
+| 1,000 | 3.1 kB/s (7.7%) [4.9], 100% | 2.5 kB/s (6.3%), 100% | 13.4 kB/s (34%), 100% | 23.4 kB/s (59%) [37.1], 92% | 52.2 kB/s (131%) |
+| 2,000 | 3.4 kB/s (8.4%) [5.8], 100% | 2.8 kB/s (6.9%), 100% | 15.7 kB/s (39%), 100% | 26.8 kB/s (67%) [41.2], 85% | 54.4 kB/s (136%) |
 
-Fisheye halves the traffic and is what keeps routes; flood reduction barely matters at ~12 neighbours. Even a 10 s period costs a quarter of a BLE radio at 2,000 devices: open finding 1.
+Fisheye cuts traffic 4–5×. Flood reduction would save another 18% here, where every device sees every flood from several sides, but it leaves pairs unrouted in sparser meshes (`routing-convergence`), so it stays off. All variants greet new neighbours. Traffic grows slowly with N: the near scope costs the same at any size; the full scope reaches more devices.
 
 Qualitative only: this model has no collisions (Meshtasticator's LoRa model
 does), so usefulness falls through redundancy, not loss.

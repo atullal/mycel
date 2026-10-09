@@ -62,7 +62,7 @@ we built, and why.
 | **B.A.T.M.A.N. IV** | Each node floods an *originator message* (OGM) with a sequence number; neighbours rebroadcast the best copy once; each node keeps only "best next hop per originator", ranked by TQ (packet-loss based). | No topology database. Self-healing, tiny state. Proven in Freifunk meshes. | Flooding cost O(N) per node per period. The TQ metric ignores throughput. Loops are possible transiently (bounded by seqno windows). Kernel C code. | **Idea reused** (our base design: signed OGMs, rebroadcast once per seqno, best-next-hop state). Code rejected. |
 | **B.A.T.M.A.N. V** | Separates neighbour discovery (ELP) from OGMv2; metric = throughput. | Throughput-aware metric. | Same flooding scale. | **Idea reused**: our hop cost is measured RTT + a throughput term. |
 | **Babel** (RFC 8966) | Distance vector with per-source seqnos and the *feasibility condition*. A route is usable only if `(seqno newer)` or `(same seqno, metric < feasibility distance)`. Triggered updates, retractions (metric ∞), seqno requests to recover from starvation. | **Loop-free at all times, even during convergence**, not only via TTL. Fast reaction to link loss (retraction). Designed for mixed wired/wireless. | Unauthenticated by default (RFC 8967 adds MAC). C reference implementation. | **Ideas reused**: feasibility condition, retractions, triggered updates, seqno requests (§6). Code rejected. |
-| **OLSRv2** (RFC 7181) | Link-state. HELLOs give 2-hop neighbourhoods; *multipoint relays* (MPRs) are the minimal neighbour set covering all 2-hop neighbours, and only MPRs forward floods. Topology control messages give everyone the full graph. | MPRs cut flooding drastically in dense networks. | Full topology at every node: memory and CPU grow with N², and it's heavy for phones. HELLOs carry neighbour lists (privacy, size). | **Idea reused in reduced form**: flood reduction without 2-hop state (§6.5). Full link-state rejected. |
+| **OLSRv2** (RFC 7181) | Link-state. HELLOs give 2-hop neighbourhoods; *multipoint relays* (MPRs) are the minimal neighbour set covering all 2-hop neighbours, and only MPRs forward floods. Topology control messages give everyone the full graph. | MPRs cut flooding drastically in dense networks. | Full topology at every node: memory and CPU grow with N², and it's heavy for phones. HELLOs carry neighbour lists (privacy, size). | **Idea tried in reduced form**: flood reduction without 2-hop state, now off, since over unicast hops it leaves devices out (§6.9). Full link-state rejected. |
 | **AODV** (RFC 3561) / **DSR** (RFC 4728) | Reactive: flood a route request when you need a route; the reply sets up state. | No overhead when idle. | First-packet latency of a full flood; a flood *per destination*; routes break silently under mobility. Chat presence wants routes ready. | **Rejected** as the primary scheme. The on-demand idea survives as seqno requests and global record lookups. |
 | **Fisheye state routing** | Update frequency falls with distance: near nodes are accurate, far nodes coarse; packets get more precise routes as they approach. | Cuts overhead roughly from O(N) to O(near) per period. | Far routes are staler. | **Idea reused**: announcement *scope* (§6.4). |
 
@@ -104,14 +104,17 @@ we built, and why.
 Route tables are **distributed and partial**. Each device keeps, per
 origin within its scope, the neighbours that announced it, with cost,
 hops and sequence number, plus one *feasibility distance*. Nobody has a
-global table. They are synced by signed announcements: periodic ones,
-plus *triggered* updates when something breaks.
+global table. They are synced by signed announcements: periodic ones
+every 16 s (Babel's update interval), plus *triggered* updates when
+something changes.
 
 1. **Announcements** (`Announce`, signed by the origin over origin, seqno,
    flags, scope, uplink cost and name). Relays add `hops` and `cost`
    (unsigned, as in B.A.T.M.A.N. and Babel). Each relay rebroadcasts the
    best copy of each seqno once, after a 10–50 ms jitter, never back where
-   it came from.
+   it came from. Announcements for one neighbour leave in one datagram
+   (`T_OGMS`), saving a QUIC packet's ~40 bytes of headers, and on
+   Bluetooth a connection event, per announcement.
 2. **Cost** = Σ per hop (smoothed RTT in 0.1 ms units + 2 ms per hop). The
    driver feeds each hop connection's measured RTT, plus a throughput term
    (time to move 64 KiB at the hop's cwnd/RTT rate). So BLE, AWDL and
@@ -147,23 +150,46 @@ plus *triggered* updates when something breaks.
    (rate-limited). Recovery takes about an RTT, not up to an announcement
    period.
 7. **Fisheye scope.** Every period an origin announces with scope 2 hops.
-   Every 4th period it uses the full scope (8). Nearby routes refresh every
-   period; far ones every 4 periods, with timeouts scaled to match. Each
+   Every 8th period it uses the full scope (10 hops). Nearby routes refresh
+   every 16 s; far ones every 128 s, with timeouts scaled to match. Each
    device originates the same number of announcements, but each one floods
-   a 2-hop neighbourhood instead of the whole mesh 3 times out of 4.
-8. **Flood reduction** (OLSR's MPR goal, without its 2-hop state):
-   - A device never rebroadcasts to a neighbour that already sent it that
-     seqno, since that neighbour has it.
-   - In a dense neighbourhood (≥ 8 direct neighbours) it skips the
-     rebroadcast entirely if, during its jitter, it heard the same seqno
-     from ≥ 3 neighbours at a cost no worse than its own (Trickle's
-     redundancy constant). A partition-bridging device usually doesn't hear
-     3 equal copies, so it still forwards.
-9. **Failover without waiting for routing.** Up to 3 routes per
-   destination are open QUIC paths at once. When one breaks, noq stops
-   using it after missed path pings (~1 s keep-alive, 5 s idle) or on
-   loss, and traffic continues on the others. Routing convergence only
-   decides which routes to *add*. Measured in `tests/mesh.rs`.
+   a 2-hop neighbourhood instead of the whole mesh 7 times out of 8. The
+   scope is 10 hops, not 8, because routes follow the cheapest path, which
+   can be a hop or two longer than the fewest hops: with 8, devices 8 radio
+   hops away were missed (3% of pairs in `flood-scaling`).
+8. **Babel's timing, not B.A.T.M.A.N.'s.** The period was 2 s, as in
+   B.A.T.M.A.N., because routes used to expire to notice a loss. They
+   don't need to: a hop connection notices a lost link within seconds
+   (1.5 s keep-alives, 5 s idle) and triggers retractions and seqno
+   requests (items 5–6). So the period only refreshes, and Babel's 16 s
+   does. What changes goes out at once:
+   - retractions and seqno requests, as before;
+   - a device's first neighbour gets a full-scope announcement at once
+     (what it announced alone reached nobody);
+   - a new neighbour is **greeted** with our routes (Babel's full update
+     to a new neighbour), each within its announcement's scope, so meeting
+     a mesh doesn't wait for a period. In a crowd everyone meets 15
+     devices at once and one table is enough, so a device greets at most
+     one new neighbour per 4 s; the others get its own announcement.
+9. **No broadcast-style flood reduction.** A device never rebroadcasts to
+   a neighbour that already sent it that seqno, since that neighbour has
+   it. The Trickle-style rule (in a dense neighbourhood, skip the
+   rebroadcast after hearing 3 equal copies) is off by default: it
+   assumes broadcast radios, where those 3 copies reached our neighbours
+   too. Over unicast hop connections they reached *their* neighbours, and
+   9% of pairs were left without a route after a flood
+   (`routing-convergence`). OLSR's MPRs would need 2-hop state.
+10. **At most 6 hop connections opened per device.** A device opens hop
+    connections to at most 6 devices in range, each its own pseudo-random
+    pick so they spread out; others open theirs to it (about 11 in all in a
+    crowd). A Bluetooth radio holds ~10 connections, and each costs
+    keep-alives and a share of every announcement. Direct traffic between
+    two devices in range doesn't need one: it uses the link itself.
+11. **Failover without waiting for routing.** Up to 3 routes per
+    destination are open QUIC paths at once. When one breaks, noq stops
+    using it after missed path pings (~1 s keep-alive, 5 s idle) or on
+    loss, and traffic continues on the others. Routing convergence only
+    decides which routes to *add*. Measured in `tests/mesh.rs`.
 
 ## 7. Beyond one mesh
 
@@ -366,7 +392,7 @@ where it works:
   - a dead route is unused 25 ms after the link drops (retraction);
   - a cut ring heals in 0.6 s (seqno request).
 - **Loops:** zero frame loops and zero route loops, checked at every step through 60 link flaps in a 30-device mesh with traffic.
-- **Overhead per device** with fisheye and flood reduction: −55 % at 25 devices, −68 % at 50, −75 % at 100 (`overhead_per_device_large_meshes`, ignored by default, runs 200 and 400).
+- **Overhead per device** (`mycel-sim flood-scaling`, Bluetooth-only phones with ~12 neighbours, steady state): 3.4 kB/s at 2,000 devices, 8.4% of a BLE radio, with every pair within 8 hops routed. With the old timing (2 s, full scope of 8 hops every 4th, flood reduction): 26.8 kB/s (67%), 85% routed. Fisheye alone cuts traffic 4–5× (`docs/SIMULATION.md` §5). In `global-scale` (2,002 devices in neighbourhoods of 80) routing costs 467 B/s per device, down from 3,768.
 - **Gateways** (QUIC, in-process): a Bluetooth-only device three BLE hops from its gateway syncs with one behind another gateway; the first sync took 0.58 s. A test-tone call along that route had 84 ms RTT and 0 % loss.
 - **Two gateways:** 2.0× one path's throughput. When one is lost, the longest pause on the other is 0.8–2.6 s: data in flight leaves a hole in the stream until the dead path's loss detection gives up.
 - **Store-and-forward:** spraying 4 copies, then a single copy following the gradient toward the internet, gets the first copy to the internet in 28 min (mean of 40 traces, 4 clusters in a chain). The same 4 copies with no gradient (Spray-and-Wait) don't get there within 12 h. A real data mule delivered 1 s after meeting the destination. Against The ONE's routers on real contact traces, see `docs/BENCHMARKS.md`.
