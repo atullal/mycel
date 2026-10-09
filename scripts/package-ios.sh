@@ -40,13 +40,14 @@ VERSION="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$ROOT/apps/host/src-tau
 OUT="$ROOT/dist-release"
 APPLE="$ROOT/apps/host/src-tauri/gen/apple"
 mkdir -p "$OUT"
+# Tauri moves the archived app into build/<arch>/ and fails if an older one
+# is there ("Directory not empty"), or leaves the older one in place.
+rm -rf "$APPLE/build"
 
 if [ "$MODE" = simulator ]; then
   rustup target add aarch64-apple-ios-sim >/dev/null
   (cd apps/host && cargo tauri ios build --target aarch64-sim)
-  # Tauri leaves a stale copy in gen/apple/build on rebuilds; Xcode's own
-  # product is always current.
-  APP="$(ls -td "$HOME"/Library/Developer/Xcode/DerivedData/mycel-host-*/Build/Products/release-iphonesimulator/Mycel.app 2>/dev/null | head -1)"
+  APP="$APPLE/build/arm64-sim/Mycel.app"
   [ -d "$APP" ] || { echo "no Simulator build found" >&2; exit 1; }
   rm -rf "$OUT/ios-simulator/Mycel.app" && mkdir -p "$OUT/ios-simulator"
   ditto "$APP" "$OUT/ios-simulator/Mycel.app"

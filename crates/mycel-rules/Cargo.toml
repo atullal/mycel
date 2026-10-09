@@ -10,7 +10,13 @@ mycel-rules-abi = { version = "0.1.0", path = "../mycel-rules-abi" }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2.0.21"
 # Pinned exactly: validation rules and the fuel cost model are part of consensus.
-wasmi = { version = "=2.0.0", default-features = false, features = ["std", "validate", "auto-dispatch"] }
+# portable-dispatch: always the loop interpreter. With auto-dispatch,
+# optimised builds (opt-level s/2/3) switch to tail-call dispatch, which
+# grows the native stack wherever LLVM doesn't turn a handler's call into a
+# real tail call: the chat rules overflowed a 2 MiB thread stack at
+# opt-level 2 on x86_64 (Linux, Windows) and aarch64 (macOS), i.e. a peer's
+# message could abort the app depending on how it was compiled.
+wasmi = { version = "=2.0.0", default-features = false, features = ["std", "validate", "portable-dispatch"] }
 
 [dev-dependencies]
 mycel-rules-abi = { version = "0.1.0", path = "../mycel-rules-abi", features = ["chat"] }

@@ -44,20 +44,38 @@ jobs:
         working-directory: apps/host
         run: npx --yes "$TAURI_CLI" build --bundles deb,rpm,appimage
       # Start the app on a virtual display: the runtime must open and the
-      # app must still be running 25 s later. The screenshot shows the UI.
+      # app must still be running afterwards. The screenshot shows the UI.
+      # If it hangs, every thread's stack is printed; a second try turns off
+      # WebKit's GPU paths (DMA-BUF, compositing), which GPU-less machines
+      # sometimes need.
       - name: Smoke test
         run: |
-          sudo apt-get install -y xvfb imagemagick
-          export MYCEL_DATA_DIR="$RUNNER_TEMP/mycel-smoke" DISPLAY=:99
+          sudo apt-get install -y xvfb imagemagick gdb
+          export DISPLAY=:99
           Xvfb :99 -screen 0 1280x860x24 &
           sleep 2
-          target/release/mycel-host > "$RUNNER_TEMP/smoke.out" 2>&1 &
-          sleep 25
-          import -window root "$RUNNER_TEMP/mycel-linux.png" || true
-          cat "$MYCEL_DATA_DIR/mycel.log" || cat "$RUNNER_TEMP/smoke.out"
-          grep -q "mycel-host: data dir" "$MYCEL_DATA_DIR/mycel.log"
-          pgrep -f target/release/mycel-host
-          pkill -f target/release/mycel-host || true
+          attempt() {
+            local dir="$RUNNER_TEMP/smoke-$1"; shift
+            env MYCEL_DATA_DIR="$dir" "$@" target/release/mycel-host > "$dir.out" 2>&1 &
+            local pid=$!
+            for _ in $(seq 40); do
+              grep -qs "mycel-host: data dir" "$dir/mycel.log" && break
+              sleep 1
+            done
+            sleep 10
+            import -window root "$RUNNER_TEMP/mycel-linux.png" || true
+            echo "== output"; cat "$dir.out"; echo "== mycel.log"; cat "$dir/mycel.log" 2>/dev/null || true
+            if ! kill -0 "$pid" 2>/dev/null; then
+              wait "$pid"; echo "== exited with status $?"; return 1
+            fi
+            if grep -qs "mycel-host: data dir" "$dir/mycel.log"; then
+              kill "$pid"; return 0
+            fi
+            echo "== still starting after 50 s; threads:"
+            sudo gdb -p "$pid" -batch -ex "thread apply all bt 25" 2>/dev/null | grep -E "^(#|Thread)" | head -200
+            kill "$pid"; return 1
+          }
+          attempt plain || attempt no-gpu WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1
       - uses: actions/upload-artifact@v4
         if: always()
         with:
