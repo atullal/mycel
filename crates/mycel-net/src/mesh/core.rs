@@ -846,7 +846,7 @@ impl Router {
     /// Greet the next new neighbour waiting, if [`GREET_GAP`] has passed
     /// since the last greeting that told anyone anything.
     fn greet_next(&mut self, now: Time) {
-        while !self.last_greet.is_some_and(|t| now.saturating_sub(t) < GREET_GAP) {
+        while self.last_greet.is_none_or(|t| now.saturating_sub(t) >= GREET_GAP) {
             let Some(peer) = self.greet_q.pop_front() else { return };
             if self.nbs.get(&peer).is_some_and(|n| n.up && n.direct) && self.greet(peer, now) > 0 {
                 self.last_greet = Some(now);
