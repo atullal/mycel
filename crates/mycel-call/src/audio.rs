@@ -60,11 +60,21 @@ pub trait AudioIo: Send + Sync + 'static {
     }
 }
 
+#[cfg(target_os = "macos")]
 pub const MIC_DENIED: &str = "Mycel isn't allowed to use the microphone. Allow it in System Settings > Privacy & Security > Microphone, then call again.";
+#[cfg(target_os = "ios")]
+pub const MIC_DENIED: &str = "Mycel isn't allowed to use the microphone. Turn it on in Settings > Mycel, then call again.";
+#[cfg(target_os = "android")]
+pub const MIC_DENIED: &str = "Mycel isn't allowed to use the microphone. Allow it in Settings > Apps > Mycel > Permissions, then call again.";
+#[cfg(windows)]
+pub const MIC_DENIED: &str = "Mycel isn't allowed to use the microphone. Allow it in Settings > Privacy & security > Microphone, then call again.";
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android", windows)))]
+pub const MIC_DENIED: &str = "Mycel can't use the microphone. Check that one is connected and that Mycel may use it, then call again.";
 
 /// The audio backend for this device. `MYCEL_AUDIO` picks it:
-/// - unset / `auto`: Apple voice processing with echo cancellation on macOS
-///   (falling back to plain devices), plain devices elsewhere
+/// - unset / `auto`: Apple voice processing with echo cancellation on macOS,
+///   iOS and iPadOS (falling back to plain devices), the phone's call audio
+///   with echo cancellation on Android, plain devices elsewhere
 /// - `device`: plain default input/output devices (no echo cancellation)
 /// - `test` / `test:<hz>`: a sine tone in, nothing played (headless testing)
 /// - `test:bursts[:<hz>]`: tone bursts in; measures the echo coming back
@@ -86,11 +96,15 @@ pub fn default_audio() -> Arc<dyn AudioIo> {
     if want == "device" || want == "cpal" {
         return Arc::new(DeviceAudio);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         Arc::new(crate::mac::VoiceProcessingAudio)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "android")]
+    {
+        Arc::new(crate::android::VoiceCallAudio)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
     {
         Arc::new(DeviceAudio)
     }
@@ -309,7 +323,7 @@ impl AudioIo for DeviceAudio {
     }
 
     fn prepare(&self) -> Result<()> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         crate::mac::ensure_mic_permission()?;
         Ok(())
     }

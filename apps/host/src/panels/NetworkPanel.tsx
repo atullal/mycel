@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useContacts, useMycel, useNearby, useNetwork, useProfile } from "@mycel/sdk/react";
-import type { LinkStatus, NetworkMode, NetworkStatus, PathKind, PeerPaths } from "@mycel/sdk";
+import { isMobile, type LinkStatus, type NetworkMode, type NetworkStatus, type PathKind, type PeerPaths } from "@mycel/sdk";
 import { initials, toneFor } from "./common.tsx";
 
 const MODE: Record<NetworkMode, { name: string; text: string }> = {
@@ -185,7 +185,9 @@ function ModeSwitch({ status }: { status: NetworkStatus }) {
       {pending && (
         <div className="p-restart">
           <span>Restart Mycel to switch to “{MODE[status.nextMode].name}”.</span>
-          {native ? (
+          {native && isMobile() ? (
+            <span className="p-help">Close Mycel (swipe it away in the app switcher), then open it again.</span>
+          ) : native ? (
             <button className="h-btn h-btn-primary h-btn-small" onClick={() => void mycel.network.restart()}>
               Restart now
             </button>

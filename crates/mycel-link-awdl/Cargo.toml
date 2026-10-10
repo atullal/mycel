@@ -13,9 +13,9 @@ mycel-net = { version = "0.1.0", path = "../mycel-net" }
 parking_lot = "0.12.5"
 tokio = { version = "1.53.2", features = ["sync"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 block2 = "0.6.2"
-libc = "0.2.190"
+libc = "0.2.189"
 
 [dev-dependencies]
 mycel-sync = { version = "0.1.0", path = "../mycel-sync" }

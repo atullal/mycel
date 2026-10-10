@@ -5,6 +5,9 @@
   grid-template-columns: 76px minmax(0, 1fr);
   height: 100%;
   background: var(--bg);
+  /* Phones and tablets: the page runs under the status bar, notch and home
+     indicator (viewport-fit=cover); keep the app itself out of them. */
+  padding: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left);
 }
 
 /* ---------------------------------------------------------------- rail */
@@ -859,12 +862,14 @@
   .host {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) auto;
+    /* the bottom bar pads itself above the home indicator */
+    padding-bottom: 0;
   }
   .rail {
     grid-row: 2;
     flex-direction: row;
     justify-content: space-around;
-    padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+    padding: 6px 8px calc(6px + var(--safe-bottom));
     gap: 0;
   }
   .rail-mark,
@@ -896,5 +901,9 @@
   .stage {
     margin: 0;
     border-radius: 0;
+  }
+  /* the on-screen keyboard is up: give its room to the conversation */
+  .keyboard-open .rail {
+    display: none;
   }
 }

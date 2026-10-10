@@ -10,7 +10,11 @@ export function toneFor(id: string) {
 }
 
 export function initials(name: string) {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
+  // Words that start with a letter, ignoring "(M5)"-style suffixes, so a
+  // device name like "iPad Pro 11-inch (M5)" gives "IP".
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  const lettered = name.replace(/\([^)]*\)/g, " ").trim().split(/\s+/).filter((w) => /^\p{L}/u.test(w));
+  const parts = lettered.length ? lettered : words;
   if (parts.length === 0) return "?";
   if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase();
   return (parts[0]![0]! + parts[parts.length - 1]![0]!).toUpperCase();

@@ -1,6 +1,10 @@
 //! Video between two real nodes (real QUIC) with test-pattern sources: the
 //! receiver decodes every frame in Rust and reads the frame counter back
 //! out of the pixels.
+//!
+//! Apple only: encoding and decoding need VideoToolbox (elsewhere video is
+//! still a stub that refuses to start).
+#![cfg(any(target_os = "macos", target_os = "ios"))]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

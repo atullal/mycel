@@ -113,12 +113,12 @@ pub fn zip_dir(dir: &Path, out: &Path) -> Result<()> {
 fn add_to_zip<W: Write + io::Seek>(zip: &mut zip::ZipWriter<W>, path: &Path, rel: &str) -> Result<()> {
     use zip::{CompressionMethod, write::SimpleFileOptions};
     let meta = std::fs::symlink_metadata(path).map_err(|e| read_error(path, e))?;
-    let mut opts = SimpleFileOptions::default();
+    let opts = SimpleFileOptions::default();
     #[cfg(unix)]
-    {
+    let opts = {
         use std::os::unix::fs::PermissionsExt;
-        opts = opts.unix_permissions(meta.permissions().mode() & 0o7777);
-    }
+        opts.unix_permissions(meta.permissions().mode() & 0o7777)
+    };
     let ft = meta.file_type();
     if ft.is_symlink() {
         let target = std::fs::read_link(path).map_err(|e| read_error(path, e))?;
@@ -275,9 +275,11 @@ mod tests {
     fn read_errors_explain_themselves() {
         let e = read_error(Path::new("/x/y"), io::Error::from(io::ErrorKind::NotFound));
         assert!(format!("{e:#}").starts_with("can't find /x/y"));
-        let e = read_error(Path::new("/x/y"), io::Error::from_raw_os_error(1));
+        // EPERM on Unix, ERROR_ACCESS_DENIED on Windows
+        let (code, os_says) = if cfg!(windows) { (5, "access is denied") } else { (1, "not permitted") };
+        let e = read_error(Path::new("/x/y"), io::Error::from_raw_os_error(code));
         let s = format!("{e:#}");
-        assert!(s.contains("/x/y") && s.to_lowercase().contains("not permitted"), "{s}");
+        assert!(s.contains("/x/y") && s.to_lowercase().contains(os_says), "{s}");
         #[cfg(target_os = "macos")]
         assert!(s.contains("Privacy & Security"), "{s}");
     }

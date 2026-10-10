@@ -93,7 +93,9 @@ export function encodeVideoFrame(f: VideoFrameData): ArrayBuffer {
 export function codecString(avcc: Uint8Array): string {
   if (avcc.length < 4) return "avc1.42e01f";
   const h = (n: number) => n.toString(16).padStart(2, "0");
-  return `avc1.${h(avcc[1]!)}${h(avcc[2]!)}${h(avcc[3]!)}`;
+  // The constraint byte's two low bits are reserved (zero); some encoders
+  // (Chrome's software H.264) set them, and decoders then reject the string.
+  return `avc1.${h(avcc[1]!)}${h(avcc[2]! & 0xfc)}${h(avcc[3]!)}`;
 }
 
 /** This webview can decode the runtime's video (WebCodecs, Safari 16.4+). */

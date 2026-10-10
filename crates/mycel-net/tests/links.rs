@@ -16,6 +16,11 @@ use mycel_sync::{
 use mycel_trust::Role;
 use serde_json::json;
 
+/// These tests time emulated radios (path choice, failover, timeouts): side
+/// by side on a small machine they starve each other of CPU and timers (seen
+/// on 4-core Windows runners), so they run one at a time.
+static RADIOS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     for _ in 0..300 {
         if f() {
@@ -38,6 +43,7 @@ async fn link_node(name: &str, nets: &[&MemNet]) -> Node {
 /// one, and keep syncing over Bluetooth once peer-to-peer Wi-Fi is cut.
 #[tokio::test(flavor = "multi_thread")]
 async fn sync_over_links_and_fall_back_to_bluetooth() {
+    let _radios = RADIOS.lock().await;
     let wifi = MemNet::new(0, PathKind::PeerWifi);
     let bt = MemNet::new(0, PathKind::Bluetooth);
     let alice = link_node("alice", &[&wifi, &bt]).await;
@@ -117,6 +123,7 @@ impl mycel_net::iroh::protocol::ProtocolHandler for Sink {
 /// peer-to-peer Wi-Fi finishes over Bluetooth, without reconnecting.
 #[tokio::test(flavor = "multi_thread")]
 async fn live_connection_moves_to_another_link() {
+    let _radios = RADIOS.lock().await;
     let wifi = MemNet::new(1, PathKind::PeerWifi);
     let bt = MemNet::new(1, PathKind::Bluetooth);
     let (ka, kb) = (DeviceKeys::generate(), DeviceKeys::generate());

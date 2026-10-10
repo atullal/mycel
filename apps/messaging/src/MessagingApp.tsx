@@ -80,6 +80,30 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
     writeLast(id);
   }, []);
 
+  // Phones (and narrow windows) show either the list or one conversation:
+  // one history entry while a conversation is open lets Android's back
+  // button (and a browser's) return to the list instead of leaving the app.
+  const historyEntry = useRef(false);
+  useEffect(() => {
+    if (selected && !historyEntry.current) {
+      historyEntry.current = true;
+      history.pushState({ mycelConversation: true }, "");
+    } else if (!selected && historyEntry.current) {
+      // closed in the app (the back arrow): drop the entry too
+      historyEntry.current = false;
+      history.back();
+    }
+  }, [selected]);
+  useEffect(() => {
+    const onPop = () => {
+      if (!historyEntry.current) return;
+      historyEntry.current = false;
+      select(null);
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [select]);
+
   const current = conversations.find((c) => c.id === selected) ?? null;
   const currentCall = current
     ? (calls.find((c) => c.conversation === current.id && (isLive(c) || c.state === "joinable")) ?? null)

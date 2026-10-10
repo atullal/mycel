@@ -1,4 +1,4 @@
-//! CoreBluetooth backend (macOS; iOS would share most of it).
+//! CoreBluetooth backend (macOS and iOS / iPadOS).
 //!
 //! Threads:
 //! - a private serial dispatch queue ("Q") owns every CoreBluetooth object

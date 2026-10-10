@@ -13,7 +13,7 @@ path = "src/main.rs"
 anyhow = "1.0.104"
 bytes = "1.12"
 clap = { version = "4.6.7", features = ["derive"] }
-libc = "0.2.190"
+libc = "0.2.189"
 mycel-call = { version = "0.0.1", path = "../mycel-call" }
 mycel-crypto = { version = "0.1.0", path = "../mycel-crypto" }
 mycel-net = { version = "0.1.0", path = "../mycel-net" }

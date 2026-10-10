@@ -2,6 +2,7 @@
 //! Linux and the link-layer type on macOS), and diffing two snapshots.
 
 use std::collections::BTreeMap;
+#[cfg(unix)]
 use std::net::Ipv6Addr;
 
 use crate::classify::{Hw, IfaceInfo};
@@ -92,6 +93,7 @@ pub fn list() -> Vec<IfaceInfo> {
 }
 
 /// macOS embeds a link-local address's scope in its second 16-bit word.
+#[cfg(unix)]
 fn unscoped(ip: Ipv6Addr) -> Ipv6Addr {
     let mut s = ip.segments();
     if ip.is_unicast_link_local() {
@@ -219,6 +221,7 @@ mod tests {
         assert_eq!(hw_of_arphrd(772, "", false), Hw::Loopback);
     }
 
+    #[cfg(unix)]
     #[test]
     fn strips_macos_embedded_scope() {
         let ip: Ipv6Addr = "fe80:4::1c2a:3bff:fe4d:5e6f".parse().unwrap();

@@ -1,4 +1,4 @@
-//! The macOS implementation: Network.framework listener + browser + UDP
+//! The Apple implementation (macOS, iOS, iPadOS): Network.framework listener + browser + UDP
 //! connections, bridged to Iroh's poll-based custom transport.
 //!
 //! Threading: every Network.framework callback runs on one serial dispatch

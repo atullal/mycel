@@ -16,13 +16,15 @@
 //! - `MYCEL_NAME`: display name to use when creating a new profile.
 
 mod commands;
+mod notify;
+mod open_file;
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use mycel_node::Runtime;
+use mycel_node::{Runtime, RuntimeOptions};
 use mycel_node::api::{Event, NetworkMode};
-use tauri::{AppHandle, Emitter, Manager, RunEvent};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tokio::sync::broadcast::error::RecvError;
 
 /// Tauri event carrying one runtime `Event` to the webview.
@@ -50,8 +52,9 @@ pub(crate) fn set_window_title(app: &AppHandle, name: &str) {
     }
 }
 
-/// Forward runtime events to the webview until the runtime shuts down.
-fn forward_events(app: AppHandle, runtime: Rt) {
+/// Forward runtime events to the webview until the runtime shuts down, and
+/// turn new messages and calls into notifications while nobody's looking.
+fn forward_events(app: AppHandle, runtime: Rt, notifier: Arc<notify::Notifier>) {
     // Subscribe before spawning so nothing emitted after startup is missed.
     let mut rx = runtime.subscribe();
     tauri::async_runtime::spawn(async move {
@@ -60,6 +63,11 @@ fn forward_events(app: AppHandle, runtime: Rt) {
                 Ok(event) => {
                     if let Err(e) = app.emit(EVENT, &event) {
                         eprintln!("mycel-host: failed to emit event: {e}");
+                    }
+                    // A notification problem must never stop the events.
+                    let notify = std::panic::AssertUnwindSafe(|| notifier.on_event(&app, &runtime, &event));
+                    if std::panic::catch_unwind(notify).is_err() {
+                        eprintln!("mycel-host: notifying about an event failed");
                     }
                 }
                 Err(RecvError::Lagged(skipped)) => {
@@ -142,20 +150,19 @@ fn allow_attachment_files(app: &tauri::App, data_dir: &std::path::Path) -> Resul
     .map_err(|e| format!("cannot allow opening attachments: {e}"))
 }
 
-/// Opened from Finder there's no terminal, so stderr (where the runtime and
-/// the peer-to-peer Wi-Fi / Bluetooth links log) goes nowhere. Send it to
-/// `<data dir>/mycel.log` instead (the previous run is kept as `mycel.log.1`).
+/// Opened from Finder or the Start menu, or on a phone, there's no terminal,
+/// so stderr (where the runtime and the peer-to-peer Wi-Fi / Bluetooth links
+/// log) goes nowhere. Send it to `<data dir>/mycel.log` instead (the previous
+/// run is kept as `mycel.log.1`).
 fn log_to_file(data_dir: &std::path::Path) {
-    use std::os::fd::AsRawFd;
-    // SAFETY: isatty only inspects the descriptor.
-    if unsafe { libc::isatty(2) } == 1 {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal() {
         return;
     }
     let path = data_dir.join("mycel.log");
     let _ = std::fs::rename(&path, data_dir.join("mycel.log.1"));
     if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        // SAFETY: dup2 onto stderr; `file` stays open until dup2 has copied it.
-        unsafe { libc::dup2(file.as_raw_fd(), 2) };
+        redirect_stderr(file);
     }
     if std::env::var_os("MYCEL_BLE_LOG").is_none() {
         // SAFETY: called during startup, before other threads read the environment.
@@ -163,8 +170,184 @@ fn log_to_file(data_dir: &std::path::Path) {
     }
 }
 
+#[cfg(unix)]
+fn redirect_stderr(file: std::fs::File) {
+    use std::os::fd::AsRawFd;
+    // SAFETY: dup2 onto stderr; `file` stays open until dup2 has copied it.
+    unsafe { libc::dup2(file.as_raw_fd(), 2) };
+}
+
+#[cfg(windows)]
+fn redirect_stderr(file: std::fs::File) {
+    use std::os::windows::io::IntoRawHandle;
+    use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, SetStdHandle};
+    // Rust's stderr looks the handle up on every write. The handle is leaked
+    // on purpose: it stays stderr until the app exits.
+    // SAFETY: SetStdHandle with a valid, open file handle.
+    unsafe { SetStdHandle(STD_ERROR_HANDLE, file.into_raw_handle()) };
+}
+
+/// The name a new profile starts with on iOS and iPadOS ("iPhone", or the
+/// name the user gave the device where iOS shares it). UIKit only answers on
+/// the main thread, where Tauri runs `setup`; elsewhere the runtime picks.
+#[cfg(target_os = "ios")]
+fn device_name() -> Option<String> {
+    let mtm = objc2::MainThreadMarker::new()?;
+    let name = objc2_ui_kit::UIDevice::currentDevice(mtm).name().to_string();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+#[cfg(not(target_os = "ios"))]
+fn device_name() -> Option<String> {
+    None
+}
+
+/// iPhone and iPad: let the page run under the status bar and home indicator
+/// and pad itself (viewport-fit=cover and env(safe-area-inset-*) in the
+/// CSS); by default WKWebView insets it and paints the bars white. And no
+/// rubber-band bounce of the whole app.
+#[cfg(target_os = "ios")]
+fn edge_to_edge(window: &tauri::WebviewWindow) {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyObject, Bool};
+    let _ = window.with_webview(|webview| {
+        // SAFETY: Tauri hands out the live WKWebView; -scrollView returns its
+        // UIScrollView, and both setters take plain values
+        // (UIScrollViewContentInsetAdjustmentNever = 2).
+        unsafe {
+            let Some(wk) = (webview.inner() as *mut AnyObject).as_ref() else { return };
+            let scroll: *mut AnyObject = msg_send![wk, scrollView];
+            let Some(scroll) = scroll.as_ref() else { return };
+            let _: () = msg_send![scroll, setContentInsetAdjustmentBehavior: 2isize];
+            let _: () = msg_send![scroll, setBounces: Bool::NO];
+        }
+    });
+}
+
+/// iPhone and iPad: going to the background, ask iOS for the time it allows
+/// (about 30 s) so a message sent just before the phone locks still goes
+/// out. iOS ends the task when the time is up; we end it a little earlier.
+#[cfg(target_os = "ios")]
+fn finish_in_background(handle: &AppHandle) {
+    use objc2::msg_send;
+    use objc2::runtime::{AnyClass, AnyObject};
+    fn shared_app() -> Option<&'static AnyObject> {
+        let cls = AnyClass::get(c"UIApplication")?;
+        // SAFETY: +sharedApplication returns the app singleton (main thread).
+        let app: *mut AnyObject = unsafe { msg_send![cls, sharedApplication] };
+        // SAFETY: the singleton lives as long as the process.
+        unsafe { app.as_ref() }
+    }
+    let Some(app) = shared_app() else { return };
+    let none: *mut AnyObject = std::ptr::null_mut();
+    // SAFETY: on the main thread (Tauri's event loop); a nil expiration
+    // handler is allowed; returns an NSUInteger task id.
+    let task: usize = unsafe { msg_send![app, beginBackgroundTaskWithExpirationHandler: none] };
+    if task == 0 {
+        return; // UIBackgroundTaskInvalid
+    }
+    let handle = handle.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(25));
+        let _ = handle.run_on_main_thread(move || {
+            if let Some(app) = shared_app() {
+                // SAFETY: ends the task begun above, on the main thread.
+                let _: () = unsafe { msg_send![app, endBackgroundTask: task] };
+            }
+        });
+    });
+}
+
+/// The main window, from tauri.conf.json (`"create": false` there: see `run`).
+fn open_main_window(app: &AppHandle) -> tauri::Result<()> {
+    let Some(config) = app.config().app.windows.iter().find(|w| w.label == "main").cloned() else {
+        return Ok(());
+    };
+    let builder = tauri::WebviewWindowBuilder::from_config(app, &config)?;
+    // Windows and Linux: the page captures the camera itself for calls
+    // (the SDK's webcam.ts), and only once someone turns their camera on.
+    // The system's own camera setting still applies.
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let builder = builder.on_permission_request(|_, kind| match kind {
+        tauri::webview::PermissionKind::Camera => tauri::webview::PermissionResponse::Allow,
+        _ => tauri::webview::PermissionResponse::Default,
+    });
+    let window = builder.build()?;
+    #[cfg(target_os = "ios")]
+    edge_to_edge(&window);
+    #[cfg(target_os = "linux")]
+    enable_camera_capture(&window);
+    #[cfg(not(any(target_os = "ios", target_os = "linux")))]
+    let _ = window;
+    if let Some(rt) = app.try_state::<Rt>() {
+        set_window_title(app, &rt.profile().name);
+    }
+    Ok(())
+}
+
+/// WebKitGTK leaves `getUserMedia` out unless its media-stream setting is on.
+#[cfg(target_os = "linux")]
+fn enable_camera_capture(window: &tauri::WebviewWindow) {
+    let _ = window.with_webview(|wv| {
+        use webkit2gtk::{SettingsExt, WebViewExt};
+        if let Some(settings) = WebViewExt::settings(&wv.inner()) {
+            settings.set_enable_media_stream(true);
+        }
+    });
+}
+
+/// Android: swiping Mycel away from recents destroys its activity, not the
+/// app. MycelService keeps the process, so the runtime keeps receiving; when
+/// the app is opened again, MainActivity.onCreate calls this to give the new
+/// activity a window (tao binds it to the activity that has none).
+#[cfg(target_os = "android")]
+static APP: std::sync::OnceLock<AppHandle> = std::sync::OnceLock::new();
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mycel_host_MainActivity_onActivityReady(
+    _env: jni::JNIEnv,
+    _activity: jni::objects::JObject,
+) {
+    let Some(app) = APP.get() else { return }; // the first activity: setup opens it
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if handle.get_webview_window("main").is_none()
+            && let Err(e) = open_main_window(&handle)
+        {
+            eprintln!("mycel-host: can't reopen the window: {e}");
+        }
+    });
+}
+
+/// Android apps get no environment. For testing, `debug.mycel.<name>`
+/// system properties (`adb shell setprop debug.mycel.audio test`) stand in
+/// for the `MYCEL_<NAME>` variables documented at the top of this file and
+/// in the crates (`MYCEL_AUDIO`, `MYCEL_VIDEO_DEBUG`, `MYCEL_NET`, ...).
+#[cfg(target_os = "android")]
+fn env_from_properties() {
+    for name in ["AUDIO", "VIDEO_DEBUG", "NET", "LINKS", "MESH", "BLE_LOG"] {
+        let var = format!("MYCEL_{name}");
+        if std::env::var_os(&var).is_some() {
+            continue;
+        }
+        let Ok(key) = std::ffi::CString::new(format!("debug.mycel.{}", name.to_ascii_lowercase())) else { continue };
+        let mut value = [0 as std::ffi::c_char; 92]; // PROP_VALUE_MAX
+        // SAFETY: a NUL-terminated key and a PROP_VALUE_MAX buffer.
+        if unsafe { libc::__system_property_get(key.as_ptr(), value.as_mut_ptr()) } > 0 {
+            // SAFETY: NUL-terminated by __system_property_get.
+            let v = unsafe { std::ffi::CStr::from_ptr(value.as_ptr()) }.to_string_lossy().into_owned();
+            // SAFETY: during startup, before the runtime's threads read the environment.
+            unsafe { std::env::set_var(&var, v) };
+        }
+    }
+}
+
 /// Open the runtime and wire it to the app.
 fn start(app: &mut tauri::App) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    env_from_properties();
     let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => app
@@ -180,7 +363,14 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
         .ok()
         .filter(|n| !n.trim().is_empty());
 
-    let runtime: Rt = tauri::async_runtime::block_on(Runtime::open(&data_dir, mode, name))
+    let runtime: Rt = tauri::async_runtime::block_on(Runtime::open_with(RuntimeOptions {
+        data_dir: data_dir.clone(),
+        mode,
+        name,
+        default_name: device_name(),
+        keeper: false,
+        port: 0,
+    }))
         .map_err(|e| {
             let hint = if e.to_string().contains("already open") {
                 "\n\nAnother copy of Mycel is already using this data folder. Quit it first, or give this copy its own folder with MYCEL_DATA_DIR."
@@ -192,9 +382,9 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
 
     allow_attachment_files(app, &data_dir)?;
 
-    let handle = app.handle().clone();
-    set_window_title(&handle, &runtime.profile().name);
-    forward_events(handle, runtime.clone());
+    let notifier = Arc::new(notify::Notifier::new(&runtime));
+    forward_events(app.handle().clone(), runtime.clone(), notifier.clone());
+    app.manage(notifier);
     app.manage(runtime);
 
     eprintln!(
@@ -220,13 +410,27 @@ fn fail_to_start(app: &AppHandle, msg: String) {
         .show(move |_| handle.exit(1));
 }
 
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            match start(app) {
-                Ok(()) => {}
+            let started = start(app);
+            // The window (`"create": false` in tauri.conf.json) opens only
+            // now, once the runtime is managed: a page that loads faster than
+            // the runtime opens (as on phones) would otherwise get "state not
+            // managed" from its first commands. It opens on failure too, so
+            // phones have a window to show the error on.
+            open_main_window(app.handle())?;
+            #[cfg(target_os = "android")]
+            let _ = APP.set(app.handle().clone());
+            match started {
+                Ok(()) => {
+                    let name = app.state::<Rt>().profile().name;
+                    set_window_title(app.handle(), &name);
+                }
                 // Returning an error from setup makes Tauri panic (a native
                 // app then just "quits unexpectedly"). Say what went wrong.
                 Err(msg) => fail_to_start(app.handle(), msg),
@@ -244,6 +448,7 @@ pub fn run() {
             commands::network_status,
             commands::set_network_mode,
             commands::restart_app,
+            commands::open_file,
             commands::list_conversations,
             commands::get_conversation,
             commands::create_conversation,
@@ -271,11 +476,41 @@ pub fn run() {
             commands::set_camera,
             commands::video_keyframe,
             commands::video_subscribe,
+            commands::video_targets,
+            commands::video_push,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build the Mycel host");
 
     app.run(|app, event| {
+        // Whether anyone is looking, for notifications.
+        // Android: the window goes when the activity does (swiped away from
+        // recents); keep the app and its runtime (see `onActivityReady`).
+        #[cfg(target_os = "android")]
+        if let RunEvent::ExitRequested { api, code: None, .. } = &event {
+            api.prevent_exit();
+        }
+        let away = match &event {
+            RunEvent::WindowEvent { label, event, .. } if label == "main" => match event {
+                WindowEvent::Focused(focused) => Some(!focused),
+                WindowEvent::Destroyed => Some(true),
+                #[cfg(mobile)]
+                WindowEvent::Suspended => Some(true),
+                #[cfg(mobile)]
+                WindowEvent::Resumed => Some(false),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(away) = away
+            && let Some(notifier) = app.try_state::<Arc<notify::Notifier>>()
+        {
+            notifier.set_away(away);
+        }
+        #[cfg(target_os = "ios")]
+        if let RunEvent::WindowEvent { event: WindowEvent::Suspended, .. } = &event {
+            finish_in_background(app);
+        }
         if let RunEvent::Exit = event
             && let Some(runtime) = app.try_state::<Rt>()
         {

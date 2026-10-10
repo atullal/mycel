@@ -10,6 +10,7 @@ Peer-to-peer, end-to-end encrypted, fully distributed apps. **No trusted server.
 - Routing (local mesh, gateways, global reach, store-and-forward): [docs/ROUTING.md](docs/ROUTING.md)
 - Testing and evidence: [docs/TESTING.md](docs/TESTING.md)
 - Two-laptop guide: [docs/TWO_LAPTOPS.md](docs/TWO_LAPTOPS.md)
+- Building for macOS, iPhone/iPad, Android, Windows and Linux, and what works where: [docs/PLATFORMS.md](docs/PLATFORMS.md)
 
 ```
 crates/
@@ -30,8 +31,10 @@ crates/
 rules/             rule modules written in Rust, compiled to WASM (`rules/build.sh`)
 packages/sdk       @mycel/sdk (TypeScript: types, transports, React hooks)
 apps/messaging     the Messaging app (React, SDK only)
-apps/host          the Mycel Host (Tauri 2 shell + web UI)
-vendor/iroh        Iroh 1.3 with Mycel's multipath patch (vendor/iroh/MYCEL_PATCH.md)
+apps/host          the Mycel Host (Tauri 2 shell + web UI); src-tauri/gen/{apple,android}
+                   are the iPhone/iPad Xcode and Android Gradle projects
+vendor/            Iroh 1.3 with Mycel's multipath patch, noq-proto with a crash fix,
+                   swift-rs with an Xcode 27 link fix (each has a MYCEL_PATCH.md)
 ```
 
 ## Quick start
@@ -48,9 +51,19 @@ cargo test --workspace --exclude mycel-host   # Rust tests (~300)
 cargo clippy --workspace --all-targets        # kept clean
 ```
 
-Native app: `scripts/package-mac.sh --universal` builds `dist-release/Mycel_*_universal.dmg`
-(runs on Apple silicon and Intel; unsigned, see [docs/TWO_LAPTOPS.md](docs/TWO_LAPTOPS.md)
-for opening it). Builds are tested against each other only at the same version:
-install the same build on every device you test with.
+Ready-made test builds for every platform are on the
+[releases page](https://github.com/atullal/mycel/releases) (the newest `dev-*`
+pre-release). To build them yourself (details in [docs/PLATFORMS.md](docs/PLATFORMS.md)):
+
+| Platform | Build | Output in `dist-release/` |
+|---|---|---|
+| macOS (Apple silicon + Intel) | `scripts/package-mac.sh --universal` | `Mycel_*_universal.dmg` |
+| iPhone and iPad | `scripts/package-ios.sh` (`--install`, `--simulator`) | `Mycel_*_ios.ipa` |
+| Android 9+ | `scripts/package-android.sh` | `Mycel_*_android.apk` |
+| Windows, Linux | GitHub Actions, `.github/workflows/apps.yml` | run artifacts (`gh run download`) |
+
+None are store-signed yet; see [docs/TWO_LAPTOPS.md](docs/TWO_LAPTOPS.md) for opening the
+Mac app. Builds are tested against each other only at the same version: install the
+same build on every device you test with.
 
 > **Not audited.** Don't trust Mycel with real secrets until the trust layer has an external cryptographic review.

@@ -73,6 +73,9 @@ pub struct RuntimeOptions {
     pub data_dir: PathBuf,
     pub mode: NetworkMode,
     pub name: Option<String>,
+    /// The name a brand-new profile gets when `name` is `None` (instead of
+    /// the computer's name). Ignored once the profile has a name.
+    pub default_name: Option<String>,
     /// Keeper: accept every space we're added to, never post, just relay.
     pub keeper: bool,
     pub port: u16,
@@ -235,10 +238,37 @@ fn default_device_name() -> String {
             return n.chars().take(64).collect();
         }
     }
-    std::env::var("HOSTNAME")
-        .ok()
-        .filter(|h| !h.is_empty())
+    #[cfg(target_os = "android")]
+    if let Some(model) = android_property("ro.product.model") {
+        return model.chars().take(64).collect();
+    }
+    // Windows sets COMPUTERNAME; Linux desktops rarely export HOSTNAME to apps.
+    let env_name = |var: &str| std::env::var(var).ok().map(|h| h.trim().to_string()).filter(|h| !h.is_empty());
+    env_name("COMPUTERNAME")
+        .or_else(|| env_name("HOSTNAME"))
+        .or_else(|| {
+            std::fs::read_to_string("/etc/hostname")
+                .ok()
+                .map(|h| h.trim().to_string())
+                .filter(|h| !h.is_empty() && h != "localhost")
+        })
+        .map(|n| n.chars().take(64).collect())
         .unwrap_or_else(|| "Mycel user".into())
+}
+
+/// An Android system property such as `ro.product.model` ("Pixel 7").
+#[cfg(target_os = "android")]
+fn android_property(name: &str) -> Option<String> {
+    let key = std::ffi::CString::new(name).ok()?;
+    let mut value = [0 as std::ffi::c_char; 92]; // PROP_VALUE_MAX
+    // SAFETY: the key is NUL-terminated and the buffer has PROP_VALUE_MAX bytes.
+    let n = unsafe { libc::__system_property_get(key.as_ptr(), value.as_mut_ptr()) };
+    if n <= 0 {
+        return None;
+    }
+    // SAFETY: __system_property_get NUL-terminates what it wrote.
+    let s = unsafe { std::ffi::CStr::from_ptr(value.as_ptr()) }.to_string_lossy().trim().to_string();
+    (!s.is_empty()).then_some(s)
 }
 
 fn guess_mime(name: &str) -> &'static str {
@@ -349,6 +379,7 @@ impl Runtime {
             data_dir: data_dir.as_ref().to_path_buf(),
             mode,
             name,
+            default_name: None,
             keeper: false,
             port: 0,
         })
@@ -369,7 +400,11 @@ impl Runtime {
             }
             (None, Some(n)) => n,
             (None, None) => {
-                if opts.keeper { "Keeper".to_string() } else { default_device_name() }
+                if opts.keeper {
+                    "Keeper".to_string()
+                } else {
+                    opts.default_name.unwrap_or_else(default_device_name)
+                }
             }
         };
         let contacts: BTreeMap<SignPk, StoredContact> = store
@@ -1017,16 +1052,7 @@ impl Runtime {
                 if done < total && s.back().is_some_and(|&(t, _)| now.duration_since(t) < PROGRESS_EVERY) {
                     return;
                 }
-                if s.back().is_some_and(|&(_, d)| done < d) {
-                    s.clear(); // restarted from scratch
-                }
-                s.push_back((now, done));
-                while s.len() > 2 && s.front().is_some_and(|&(t, _)| now.duration_since(t) > RATE_WINDOW) {
-                    s.pop_front();
-                }
-                let (t0, d0) = s[0];
-                let secs = now.duration_since(t0).as_secs_f64();
-                if secs > 0.0 { ((done - d0) as f64 / secs) as u64 } else { 0 }
+                sample_rate(&mut s, now, done)
             };
             let _ = events.send(Event::TransferProgress { direction, id: id.clone(), done, total, rate });
         })
@@ -1448,8 +1474,8 @@ impl Runtime {
     }
 
     /// The app's video decoder needs a fresh start: keyframes, please.
-    pub fn video_keyframe(&self, call: String) -> Result<()> {
-        self.calls.video_keyframe(&call)
+    pub fn video_keyframe(&self, call: String, source: Option<String>) -> Result<()> {
+        self.calls.video_keyframe(&call, source.as_deref())
     }
 
     /// Encoded video frames for the app to decode and show: every call's
@@ -1549,6 +1575,27 @@ fn _assert_send_sync() {
     let _ = HashMap::<u8, u8>::new();
 }
 
+/// Add a progress sample (`done` bytes at `now`) and return the speed in
+/// bytes per second over the last [`RATE_WINDOW`].
+fn sample_rate(s: &mut std::collections::VecDeque<(Instant, u64)>, now: Instant, done: u64) -> u64 {
+    if s.back().is_some_and(|&(_, d)| done < d) {
+        s.clear(); // restarted from scratch
+    }
+    // Only samples that moved: completion can be reported more than once (by
+    // each source, then after the file is checked and synced, which can take
+    // seconds), and a window holding only "all done" samples said 0 B/s for
+    // a finished transfer.
+    if s.back().is_none_or(|&(_, d)| done > d) {
+        s.push_back((now, done));
+    }
+    while s.len() > 2 && s.front().is_some_and(|&(t, _)| now.duration_since(t) > RATE_WINDOW) {
+        s.pop_front();
+    }
+    let ((t0, d0), (t1, d1)) = (s[0], s[s.len() - 1]);
+    let secs = t1.duration_since(t0).as_secs_f64();
+    if secs > 0.0 { ((d1 - d0) as f64 / secs) as u64 } else { 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::sanitize_file_name as s;
@@ -1574,5 +1621,20 @@ mod tests {
         assert_eq!(s("Photo 1 (final).PNG"), "Photo 1 (final).PNG");
         assert_eq!(s("résumé.pdf"), "résumé.pdf");
         assert_eq!(s("../../x.plist"), "x.plist");
+    }
+
+    /// 100 MB in 2 s, then "done" again 5 s later (the file was being
+    /// checked): still 50 MB/s, not 0.
+    #[test]
+    fn a_late_repeat_of_done_keeps_the_speed() {
+        use super::{Duration, Instant, sample_rate};
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut s = Default::default();
+        for i in 0..=8u64 {
+            sample_rate(&mut s, at(i * 250), i * 12_500_000);
+        }
+        let rate = sample_rate(&mut s, at(7_000), 100_000_000);
+        assert_eq!(rate, 50_000_000);
     }
 }

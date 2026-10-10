@@ -2,14 +2,21 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "The host window: core IPC and events, the native file picker for attachments, and opening downloaded attachments (only under the data dir's files/ folder; lib.rs adds the actual data dir at runtime when MYCEL_DATA_DIR overrides it). Mycel's own commands are allowed by default.",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "core:window:allow-set-title",
     "dialog:allow-open",
+    "notification:default",
     {
       "identifier": "opener:allow-open-path",
-      "allow": [{ "path": "$APPDATA/files/**" }]
+      "allow": [
+        {
+          "path": "$APPDATA/files/**"
+        }
+      ]
     }
   ]
 }

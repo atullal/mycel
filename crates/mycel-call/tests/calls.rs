@@ -18,7 +18,7 @@ use mycel_net::link::{MemNet, PathKind};
 /// Alice calls Bob and Bob answers; returns the call id once both are talking.
 pub async fn connect_call(alice: &Device, bob: &Device, space: Hash32) -> String {
     let out = alice.calls.start(space).await.unwrap();
-    assert_eq!(out.state, CallPhase::Connecting);
+    assert_eq!(out.state, CallPhase::Connecting, "{out:?}");
     let ring = eventually("bob's device rings", 15, || bob.incoming().filter(|r| r.id == out.id)).await;
     assert_eq!(ring.conversation, space.to_string());
     assert_eq!(ring.peer, alice.hex());

@@ -2,6 +2,10 @@
 //! test pattern in place of microphones and cameras: video both ways on a
 //! fast path, video and audio sharing a slow link (audio must not suffer),
 //! and video pausing when the call moves to Bluetooth.
+//!
+//! Apple only: encoding and decoding need VideoToolbox (elsewhere video is
+//! still a stub that refuses to start).
+#![cfg(any(target_os = "macos", target_os = "ios"))]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

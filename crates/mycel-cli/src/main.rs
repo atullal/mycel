@@ -128,6 +128,7 @@ async fn open(dev: &DeviceArgs, keeper: bool) -> Result<Arc<Runtime>> {
         data_dir,
         mode,
         name: dev.name.clone(),
+        default_name: None,
         keeper,
         port: dev.port,
     })
@@ -144,6 +145,7 @@ async fn main() -> Result<()> {
                 data_dir: expand(&data),
                 mode: NetworkMode::Local,
                 name: None,
+                default_name: None,
                 keeper: false,
                 port: 0,
             })

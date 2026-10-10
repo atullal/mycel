@@ -1,8 +1,10 @@
 //! Mycel link over Apple peer-to-peer Wi-Fi (AWDL — what AirDrop uses): two
-//! Macs exchange QUIC packets with no shared Wi-Fi network, as long as Wi-Fi
-//! is switched on.
+//! Macs, iPhones or iPads exchange QUIC packets with no shared Wi-Fi network,
+//! as long as Wi-Fi is switched on.
 //!
-//! How (macOS): Network.framework, the only supported way onto AWDL.
+//! How (macOS and iOS): Network.framework, the only supported way onto AWDL.
+//! (iOS needs `_mycel-p2p._udp` in NSBonjourServices and Local Network
+//! permission.)
 //! * A UDP `nw_listener` with peer-to-peer enabled advertises the Bonjour
 //!   service [`wire::SERVICE_TYPE`]; its TXT record carries the device key
 //!   and display name.
@@ -31,7 +33,7 @@ use mycel_net::Link;
 
 pub mod wire;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 mod macos;
 
 /// Env var: allow any interface, not just peer-to-peer Wi-Fi (single-Mac tests).
@@ -50,11 +52,11 @@ pub fn link(me: SignPk, name: &str) -> Arc<dyn Link> {
 /// [`link`] with the interface restriction chosen explicitly:
 /// `any_interface = true` also uses loopback / ordinary networks (tests).
 pub fn link_with(me: SignPk, name: &str, any_interface: bool) -> Arc<dyn Link> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
     {
         macos::AwdlLink::create(me, name, any_interface)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
     {
         let _ = (me, name, any_interface);
         Arc::new(unavailable::Unavailable)
@@ -63,7 +65,7 @@ pub fn link_with(me: SignPk, name: &str, any_interface: bool) -> Arc<dyn Link> {
 
 /// The link on platforms without AWDL. Compiled everywhere so it is
 /// type-checked and tested on macOS too.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(any(target_os = "macos", target_os = "ios"), allow(dead_code))]
 mod unavailable {
     use std::io;
     use std::sync::Arc;

@@ -263,20 +263,31 @@ impl H264Encoder {
             set(kVTCompressionPropertyKey_MaxKeyFrameInterval, cf(&*int(fps as i64 * 10)));
             set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, cf(&*num(10.0)));
             set(kVTCompressionPropertyKey_ExpectedFrameRate, cf(&*int(fps as i64)));
-            let mut hw: CFTypeRef = null();
-            let rc = VTSessionCopyProperty(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, null(), &mut hw);
-            if std::env::var_os("MYCEL_VIDEO_DEBUG").is_some() {
-                eprintln!("[video] hardware query: rc {rc} value {}", if hw.is_null() { "none" } else if hw == kCFBooleanTrue { "true" } else { "false" });
+            #[cfg(target_os = "macos")]
+            {
+                let mut hw: CFTypeRef = null();
+                let rc = VTSessionCopyProperty(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, null(), &mut hw);
+                if std::env::var_os("MYCEL_VIDEO_DEBUG").is_some() {
+                    eprintln!("[video] hardware query: rc {rc} value {}", if hw.is_null() { "none" } else if hw == kCFBooleanTrue { "true" } else { "false" });
+                }
+                if rc == 0 && !hw.is_null() {
+                    enc.hardware = Some(hw == kCFBooleanTrue);
+                    CFRelease(hw);
+                }
             }
-            if rc == 0 && !hw.is_null() {
-                enc.hardware = Some(hw == kCFBooleanTrue);
-                CFRelease(hw);
+            #[cfg(target_os = "ios")]
+            {
+                enc.hardware = Some(true);
             }
             VTCompressionSessionPrepareToEncodeFrames(session);
         }
         enc.set_bitrate(bitrate);
         Ok(enc)
     }
+
+    /// Only a source that encodes itself (`web`) can change size in place;
+    /// the track re-creates this encoder instead.
+    pub fn retarget(&mut self, _width: u32, _height: u32, _fps: u32) {}
 
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)

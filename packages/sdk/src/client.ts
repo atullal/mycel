@@ -21,6 +21,24 @@ import type {
   Profile,
 } from "./types.ts";
 
+/**
+ * Android only lets an app's screen ask for the microphone, so the native
+ * runtime can't. The web view can: getUserMedia brings up the system prompt
+ * (MainActivity's web view turns it into the app's permission), and the call
+ * audio then runs natively. If the user says no, the runtime's error says
+ * where to allow it.
+ */
+async function askForMicrophone(transport: Transport): Promise<void> {
+  if (transport.kind !== "tauri" || typeof navigator === "undefined") return;
+  if (!/Android/.test(navigator.userAgent) || !navigator.mediaDevices?.getUserMedia) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    for (const track of stream.getTracks()) track.stop();
+  } catch {
+    /* denied or dismissed: start_call explains */
+  }
+}
+
 export interface MessagesOptions {
   /** Return at most this many messages (the newest ones before `before`). */
   limit?: number;
@@ -135,8 +153,11 @@ export interface Mycel {
      * prompt; if they say no it rejects, and `video.error` says where to allow it.
      */
     setCamera(call: CallId, on: boolean): Promise<CallInfo>;
-    /** `video_keyframe`: our video decoders lost their place; get fresh keyframes. */
-    requestKeyframe(call: CallId): Promise<void>;
+    /**
+     * `video_keyframe`: a video decoder lost its place; get a fresh keyframe
+     * for the self-view (`"local"`), from the others (`"remote"`), or both.
+     */
+    requestKeyframe(call: CallId, source?: "local" | "remote"): Promise<void>;
     /**
      * Encoded video frames as they arrive: everyone's video (one stream per
      * person, `frame.peer` says whose) and our self-view. Decode them with
@@ -249,11 +270,14 @@ export function createMycel(transport: Transport): Mycel {
         call("decline_request", opts.block ? { id, block: true } : { id }).then(done),
     },
     calls: {
-      start: (conversation, opts) => call("start_call", { conversation, video: opts?.video ?? false }),
-      accept: (id, opts) => call("accept_call", { call: id, video: opts?.video ?? false }),
-      join: (id, opts) => call("accept_call", { call: id, video: opts?.video ?? false }),
+      start: (conversation, opts) =>
+        askForMicrophone(transport).then(() => call("start_call", { conversation, video: opts?.video ?? false })),
+      accept: (id, opts) =>
+        askForMicrophone(transport).then(() => call("accept_call", { call: id, video: opts?.video ?? false })),
+      join: (id, opts) =>
+        askForMicrophone(transport).then(() => call("accept_call", { call: id, video: opts?.video ?? false })),
       setCamera: (id, on) => call("set_camera", { call: id, on }),
-      requestKeyframe: (id) => call("video_keyframe", { call: id }).then(done),
+      requestKeyframe: (id, source) => call("video_keyframe", source ? { call: id, source } : { call: id }).then(done),
       onVideo: (handler) => {
         videoHandlers.add(handler);
         if (!stopVideo && transport.video) {

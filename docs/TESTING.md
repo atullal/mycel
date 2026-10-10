@@ -213,3 +213,32 @@ Re-run: `head -c 1073741824 /dev/urandom > /tmp/big.bin; python3 scripts/net-ben
 
 Run them with output: `cargo test -p mycel-net mesh -- --nocapture`, `cargo test -p mycel-net --test global -- --nocapture`.
 
+
+## Phones and the other platforms (2026-10-09)
+
+Simulators on this Mac, a desktop peer from `mycel serve`. Android was driven
+through its real UI with `adb shell input`, plus Chrome DevTools on the debug
+build. The iOS Simulator was checked from screenshots and the app's log, and
+the on-screen keyboard with an XCUITest (`apps/host/ios-uitests`; third-party
+tap tools don't support Xcode 27 yet).
+
+| Test | Where | Result |
+|---|---|---|
+| App starts, runtime opens, profile named after the device | iPhone 18 Pro and iPad Pro 11" simulators (iOS 27), Pixel 7 emulator (Android 14) | ok ("iPhone 18 Pro", "iPad Pro 11-inch (M5)", "Android SDK built for arm64") |
+| Layout under the status bar / notch / home indicator / navigation bar | same | phone layout edge to edge; iPad two-pane layout |
+| Desktop peer → phone: message request arrives | iPhone simulator (found over mDNS), Android release APK (contact code, emulator behind NAT) | ok, a few seconds |
+| Phone → desktop: add contact, send, reply | Android (DevTools, then the real UI) | ok both ways; replied through the on-screen keyboard |
+| On-screen keyboard | Android | page shrinks above the keyboard, composer stays in sight, tab bar hides while typing |
+| On-screen keyboard | iPhone 18 Pro simulator, XCUITest | before the fix the header scrolled off the top (iOS slides the page under the keyboard and shrinks `innerHeight` too, so the old check never saw the keyboard). After: header on screen, composer just above the keyboard's bar, also after sending; the message arrives at the desktop peer |
+| Back button | Android | closes the keyboard, then returns from a conversation to the list; from the list it leaves the app |
+| Attachments from a desktop peer (PNG + text file) | Android | both arrive; the photo downloads and shows inline; the text file opens in the system viewer through the FileProvider ("Open with") |
+| Voice call setup | Android | system microphone prompt on the first call, then the desktop peer rings; hang-up shows "missed" there (no audio device in the emulator) |
+| In the background and swiped away | Android | the foreground service keeps the runtime running; messages from the desktop peer arrive and show a notification, also after swiping Mycel away; reopening shows them; no notification while Mycel is in front |
+| Video call, both ways | Android emulator (virtual camera) ↔ desktop peer (`MYCEL_VIDEO=test`) | phone shows the desktop's 720p at ~30 fps; desktop receives the phone's 720×1280. The phone's frames, captured from the desktop's video stream, decode with ffmpeg (Constrained Baseline, no errors). Self-view draws the camera directly. The emulator's software codec is slow, so it sends ~10–20 fps |
+| Keyframes from the phone | same, counted in 12–15 s captures at the desktop | before: 36 of 59 frames were keyframes (the encoder re-configured as the bitrate moved, frames were pushed out of order, and self-view refreshes reached the peer). After: 2 of 118 (one asked for); otherwise one every 10 s |
+| Sending a file from the phone | Android (staged in two pieces, base64 over IPC) | arrives intact at the desktop peer. Before: Tauri's Android IPC dropped raw request bodies, so attachments from Android failed |
+| Bluetooth / peer-to-peer Wi-Fi without the hardware | iPhone simulator | Bluetooth reports "Unsupported" and the app carries on |
+| Core tests on Linux and Windows | GitHub Actions (`apps.yml`), optimised build | Linux: all pass. Windows before the fixes: 2–3 failures in tests that time emulated links. A diagnostic job measured a 1 ms sleep at 14.4 ms by default and 2.4 ms with `fine_timers`, and the failing tests passing every time alone. With path debug on, one failure turned out to be a real path-selection bug (a busy link's own queue handed traffic to a 30× slower one), now fixed; the radio-timing tests now run one at a time. Apple-only video tests skipped there |
+| Sending video from Linux and Windows web views, no camera | GitHub Actions, `scripts/ci/video-probe.html` (capture, then WebCodecs H.264 as `webcam.ts` does) | Edge 153 with a fake camera: 30 frames, avcC, software encoder (no GPU). WebKitGTK 2.50.4 (Ubuntu 22.04) and 2.52.6 (24.04) with WebKit's mock camera: no H.264 encoder until GStreamer's x264 or openh264 is installed; then frames straight from the camera `<video>` fail ("Encoding failed") while synthetic frames and the camera drawn on a canvas encode, so the app now goes through a canvas: 30 frames, avcC |
+| Linux and Windows apps launch | GitHub Actions smoke test | runtime opens, app still running after the wait, UI renders (WebKitGTK, WebView2 screenshots). Linux took ~25 s to open on the bare runner: GTK's `g_application_register` waits on a desktop D-Bus service that isn't there (thread dump), before Mycel's code runs |
+| Rules engine at every optimisation level | `mycel-rules` tests at opt-level 2 | stack overflow with wasmi's tail-call dispatch; fixed with portable dispatch, same fuel (56603 for a 16 KiB message) |

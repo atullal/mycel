@@ -65,6 +65,16 @@ impl Watcher {
     }
 }
 
+// <linux/rtnetlink.h> multicast groups (libc has them for Linux, not Android).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const RTMGRP_LINK: u32 = 0x1;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const RTMGRP_IPV4_IFADDR: u32 = 0x10;
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const RTMGRP_IPV6_IFADDR: u32 = 0x100;
+
+/// On Android 11+ the sandbox may refuse the bind; the caller then relies on
+/// the periodic rescan.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn open() -> io::Result<libc::c_int> {
     // SAFETY: plain socket(2) / bind(2) calls on a zeroed sockaddr_nl.
@@ -75,7 +85,7 @@ fn open() -> io::Result<libc::c_int> {
         }
         let mut sa: libc::sockaddr_nl = std::mem::zeroed();
         sa.nl_family = libc::AF_NETLINK as libc::sa_family_t;
-        sa.nl_groups = (libc::RTMGRP_LINK | libc::RTMGRP_IPV4_IFADDR | libc::RTMGRP_IPV6_IFADDR) as u32;
+        sa.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
         let len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
         if libc::bind(fd, (&sa as *const libc::sockaddr_nl).cast(), len) < 0 {
             let e = io::Error::last_os_error();
