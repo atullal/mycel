@@ -3,7 +3,8 @@
   Can this web view send video the way the app does (packages/sdk/src/webcam.ts)?
   Captures the camera, encodes H.264 with WebCodecs and counts what comes out.
   CI loads it in WebKitGTK with mock capture devices (scripts/ci/video-probe-gtk.py)
-  and in headless Edge with a fake camera (Chromium, as in WebView2). The result
+  and in headless Edge with a fake camera (scripts/ci/video-probe-chromium.mjs;
+  Chromium, as in WebView2). The result
   goes to the title and the body as JSON.
 -->
 <meta charset="utf-8" />

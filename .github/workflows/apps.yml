@@ -150,26 +150,10 @@ jobs:
           if ($p.HasExited) { Write-Error "Mycel exited with code $($p.ExitCode)"; exit 1 }
           Stop-Process -Id $p.Id
       # Can WebView2's engine send video the way the app does (camera,
-      # WebCodecs H.264)? Headless Edge with Chromium's fake camera; the
-      # page's title carries the result (read from the DevTools list).
+      # WebCodecs H.264)? Headless Edge with Chromium's fake camera.
       - name: Video probe (Edge, the engine under WebView2)
-        shell: pwsh
-        run: |
-          $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
-          $page = "file:///" + ((Resolve-Path scripts\ci\video-probe.html).Path -replace '\\', '/')
-          Start-Process $edge -ArgumentList @("--headless=new", "--remote-debugging-port=9333",
-            "--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream",
-            "--user-data-dir=$env:RUNNER_TEMP\edge-probe", $page)
-          $found = $null
-          for ($i = 0; $i -lt 60 -and -not $found; $i++) {
-            Start-Sleep 1
-            try { $found = Invoke-RestMethod http://127.0.0.1:9333/json/list | Where-Object { $_.title -like "probe *" } | Select-Object -First 1 } catch {}
-          }
-          Stop-Process -Name msedge -Force -ErrorAction SilentlyContinue
-          if (-not $found) { Write-Error "no result from the probe page"; exit 1 }
-          $result = [System.Net.WebUtility]::HtmlDecode($found.title).Substring(6)  # the list escapes titles
-          $result
-          if (-not ($result | ConvertFrom-Json).ok) { exit 1 }
+        shell: bash
+        run: node scripts/ci/video-probe-chromium.mjs "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
