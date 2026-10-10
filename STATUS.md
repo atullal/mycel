@@ -173,6 +173,10 @@ largest size this Mac runs. That's up to 100 seats for the conference and
     speed, link failover, and a free-port collision between runtime tests).
     CI now retries a failed test twice and flags one that then passes as a
     "Flaky test" warning on the run; one that fails three times fails it.
+    On Windows, call glare and the final-speed check failed the first pass
+    in two runs in a row (passing on retry): worth a look. Once, LAN
+    discovery over mDNS failed all three tries on one Windows runner and
+    passed on a fresh one (the runner's network, it seems).
 
 - **Bluetooth between two real Macs.** The link connects without pairing, but
   in one test session one laptop kept hanging up after 5–10 s and stopped
