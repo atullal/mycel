@@ -19,7 +19,7 @@ builds.
 | Peer-to-peer Wi-Fi with no network (AWDL) | yes | on, untested³ | not yet (Wi-Fi Direct) | no | Wi-Fi Direct code, off by default |
 | Bluetooth LE link | yes | on, untested³ | not yet | not yet | BlueZ, never run on hardware |
 | Voice calls | echo cancelled | echo cancelled | echo cancelled⁴ | no echo cancellation⁵ | no echo cancellation⁵ |
-| Sending video | yes | on, untested³ | yes⁷ | yes, untested⁷ | untested⁷ |
+| Sending video | yes | on, untested³ | yes⁷ | yes⁷ | yes, with GStreamer's H.264 encoders⁷ |
 | Opening a received file | default app | share sheet | "Open with" | default app | default app |
 | Keeps running in the background | yes | during calls⁶ | yes⁶ | yes | yes |
 | Notifications (new messages, incoming calls)⁸ | yes | yes, while running | yes | yes | yes |
@@ -51,12 +51,16 @@ builds.
    Mac's (`crates/mycel-video/src/web.rs`, `packages/sdk/src/webcam.ts`).
    Tested on the Android 14 emulator against a desktop peer: video both
    ways, and the phone's frames decode with ffmpeg (720×1280, Constrained
-   Baseline). Windows' WebView2 has the same Chromium APIs; it hasn't been
-   tried with a camera. On Linux the app turns on WebKitGTK's camera
-   capture, but encoding needs a WebKitGTK with WebCodecs H.264 (it depends
-   on the version and its GStreamer plugins): untested. Where the web view
-   can't capture or encode, the call stays voice-only from that side and
-   still shows the other side's video.
+   Baseline). Windows and Linux are checked in CI without a camera
+   (`scripts/ci/video-probe.html`): headless Edge, the engine under
+   WebView2, with Chromium's fake camera, and WebKitGTK 2.50 and 2.52 with
+   WebKit's mock camera both capture and encode. On Linux the app turns on
+   WebKitGTK's camera capture, and encodes through a canvas (WebKitGTK fails
+   on frames taken straight from a camera); H.264 needs GStreamer's x264 or
+   openh264 encoder (`gstreamer1.0-plugins-ugly` or `-bad`, which the deb
+   and rpm recommend). Neither has been tried with a real camera. Where the
+   web view can't capture or encode, the camera turns off and the call
+   stays voice-only from that side; it still shows the other side's video.
 8. Shown when nobody is looking: the window isn't focused, the app is in
    the background, or (Android) it was swiped away. Tested on the Android
    emulator. Android uses its own notification from `MycelService`; the

@@ -53,6 +53,8 @@ export class WebCamera {
   private timer: number | null = null;
   /** No hardware encoder for this config (emulators, some PCs): let the web view pick. */
   private noHardware = false;
+  /** The encoder failed with no-preference too: this web view can't encode H.264. */
+  private cantEncode = false;
   private configuredAt = 0;
   private lastKeyAt = 0;
   /** Pushes go one after another, in encode order (a reordered frame breaks H.264's chain). */
@@ -74,7 +76,8 @@ export class WebCamera {
     if (this.native) return;
     if (call.state !== "ended" && call.video.camera === "on") this.wanted.add(call.id);
     else this.wanted.delete(call.id);
-    if (this.wanted.size > 0 && !this.running && !this.starting) void this.start();
+    if (this.wanted.size > 0 && !this.running && !this.starting && !this.cantEncode) void this.start();
+    else if (this.wanted.size > 0 && this.cantEncode && call.video.camera === "on") void invoke("set_camera", { call: call.id, on: false }).catch(() => {});
     else if (this.wanted.size === 0 && this.running) this.stop();
   }
 
@@ -121,20 +124,42 @@ export class WebCamera {
         reader.releaseLock();
       })();
     } else {
-      // WebKitGTK: draw from a <video> at the target frame rate.
+      // WebKitGTK: draw from a <video> at the target frame rate, through a
+      // canvas: its encoder fails on frames taken straight from a camera
+      // <video> ("Encoding failed", WebKitGTK 2.50 and 2.52) but encodes the
+      // same picture from a canvas (scripts/ci/video-probe.html checks).
       const video = document.createElement("video");
       video.muted = true;
       video.playsInline = true;
       video.srcObject = this.stream;
       await video.play().catch(() => {});
       this.video = video;
+      const canvas = document.createElement("canvas");
+      const ctx = canvas.getContext("2d");
       const tick = () => {
         if (!this.running) return;
-        if (video.videoWidth > 0) this.frame(new VideoFrame(video, { timestamp: wallUs() }));
+        if (video.videoWidth > 0 && ctx && this.targets) {
+          const [w, h] = this.fit(video.videoWidth, video.videoHeight, this.targets);
+          if (canvas.width !== w || canvas.height !== h) [canvas.width, canvas.height] = [w, h];
+          ctx.drawImage(video, 0, 0, w, h);
+          this.frame(new VideoFrame(canvas, { timestamp: wallUs() }));
+        }
         this.timer = window.setTimeout(tick, 1000 / Math.max(1, this.targets?.fps ?? 15));
       };
       tick();
     }
+  }
+
+  /**
+   * Neither the hardware nor the software encoder produced a frame (seen
+   * with WebKitGTK when its GStreamer H.264 encoder fails): stop, and turn
+   * the camera off so the call shows as voice-only from this side.
+   */
+  private giveUp() {
+    console.warn("[mycel] this web view can't encode H.264 video; turning the camera off");
+    this.cantEncode = true;
+    this.stop();
+    for (const id of this.wanted) void invoke("set_camera", { call: id, on: false }).catch(() => {});
   }
 
   private stop() {
@@ -187,15 +212,20 @@ export class WebCamera {
     }
   }
 
-  /** The encoder for this frame size and the current targets (re-configured when they move). */
-  private ensureEncoder(fw: number, fh: number, t: Targets): VideoEncoder | null {
-    // Fit the camera's picture into the target box, keeping its shape
-    // (a portrait phone camera gets a portrait box).
+  /**
+   * The camera's picture fitted into the target box, keeping its shape (a
+   * portrait phone camera gets a portrait box).
+   */
+  private fit(fw: number, fh: number, t: Targets): [number, number] {
     const portrait = fh > fw;
     const [bw, bh] = portrait ? [t.height, t.width] : [t.width, t.height];
     const scale = Math.min(1, bw / fw, bh / fh);
-    const width = even(fw * scale);
-    const height = even(fh * scale);
+    return [even(fw * scale), even(fh * scale)];
+  }
+
+  /** The encoder for this frame size and the current targets (re-configured when they move). */
+  private ensureEncoder(fw: number, fh: number, t: Targets): VideoEncoder | null {
+    const [width, height] = this.fit(fw, fh, t);
     // Re-configuring can make the encoder start over with a keyframe, so only
     // for a new size, or a clearly different bitrate at most every 2 s (the
     // rate controller nudges it all the time). The frame rate is paced above.
@@ -210,6 +240,7 @@ export class WebCamera {
         error: (e) => {
           console.warn("[mycel] video encoder:", e.message);
           if (this.config?.hardwareAcceleration === "prefer-hardware") this.noHardware = true;
+          else if (this.stats.encoded === 0) this.giveUp();
           this.encoder = null;
           this.config = null;
           this.inFlight = [];

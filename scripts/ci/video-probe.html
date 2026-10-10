@@ -32,8 +32,12 @@
       video.playsInline = true;
       video.srcObject = stream;
       await video.play();
+      const canvas = document.createElement("canvas");
+      [canvas.width, canvas.height] = [640, 360];
+      const ctx = canvas.getContext("2d");
       // as webcam.ts: hardware first; if that's refused or fails, whatever
       // the web view has
+      Object.assign(attempt, { canvas, ctx });
       r.attempts = [];
       for (const hw of ["prefer-hardware", "no-preference"]) {
         const a = await attempt(video, hw);
@@ -47,6 +51,7 @@
     }
 
     async function attempt(video, hw) {
+      const { canvas, ctx } = attempt;
       const config = { codec: "avc1.42E01F", width: 640, height: 360, bitrate: 500000, framerate: 30, latencyMode: "realtime", hardwareAcceleration: hw, avc: { format: "avc" } };
       const s = await VideoEncoder.isConfigSupported(config).catch(() => ({ supported: false }));
       if (!s.supported) return { hw, supported: false };
@@ -68,7 +73,14 @@
           await new Promise((ok) => setTimeout(ok, 33));
           if (enc.state !== "configured") break;
           if (video.videoWidth === 0) continue;
-          const f = new VideoFrame(video, { timestamp: i * 33333 });
+          // as webcam.ts: Chromium encodes frames from the <video>; WebKitGTK
+          // only through a canvas
+          let source = video;
+          if (!("MediaStreamTrackProcessor" in window)) {
+            ctx.drawImage(video, 0, 0, 640, 360);
+            source = canvas;
+          }
+          const f = new VideoFrame(source, { timestamp: i * 33333 });
           try {
             enc.encode(f, { keyFrame: n === 0 });
             n++;

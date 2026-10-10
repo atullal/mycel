@@ -84,16 +84,12 @@ jobs:
           }
           attempt plain || attempt no-gpu WEBKIT_DISABLE_DMABUF_RENDERER=1 WEBKIT_DISABLE_COMPOSITING_MODE=1
       # Can WebKitGTK send video the way the app does (camera, WebCodecs
-      # H.264)? There's no camera here: WebKit's mock capture device. First
-      # with what the WebKitGTK package brings, then with GStreamer's extra
-      # encoders, to see which a desktop needs. Reports only.
+      # H.264)? There's no camera here: WebKit's mock capture device. With
+      # the GStreamer encoders the deb and rpm recommend (without them
+      # WebKitGTK has no H.264 encoder).
       - name: Video probe (WebKitGTK)
-        continue-on-error: true
         run: |
-          sudo apt-get install -y python3-gi gir1.2-webkit2-4.1
-          xvfb-run -a python3 scripts/ci/video-probe-gtk.py && exit 0
-          echo "== again with GStreamer's openh264 and x264 encoders"
-          sudo apt-get install -y gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
+          sudo apt-get install -y python3-gi gir1.2-webkit2-4.1 gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
           xvfb-run -a python3 scripts/ci/video-probe-gtk.py
       - uses: actions/upload-artifact@v4
         if: always()
@@ -156,9 +152,7 @@ jobs:
       # Can WebView2's engine send video the way the app does (camera,
       # WebCodecs H.264)? Headless Edge with Chromium's fake camera; the
       # page's title carries the result (read from the DevTools list).
-      # Reports only.
       - name: Video probe (Edge, the engine under WebView2)
-        continue-on-error: true
         shell: pwsh
         run: |
           $edge = "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
@@ -217,11 +211,19 @@ jobs:
       # are Unix dev tools; the host app is covered by the builds above.)
       # Optimised: some tests time real work (sync ingest, multipath
       # throughput) and a debug build on a small runner misses their bars.
+      # Even so, a different timing test misses its deadline in each run on
+      # these machines (each passes in others): failed tests are retried
+      # twice, and one that passes on a retry shows as a "Flaky test"
+      # warning on the run (scripts/ci/retry-failed.py).
       - name: Test
         shell: bash
         env:
           CARGO_PROFILE_DEV_OPT_LEVEL: "2"
         run: |
+          set -o pipefail
           cargo test --no-fail-fast \
             -p mycel-crypto -p mycel-trust -p mycel-sync -p mycel-rules -p mycel-kit-chat \
-            -p mycel-net -p mycel-link-iface -p mycel-link-ble -p mycel-call -p mycel-video -p mycel-node
+            -p mycel-net -p mycel-link-iface -p mycel-link-ble -p mycel-call -p mycel-video -p mycel-node \
+            2>&1 | tee "$RUNNER_TEMP/test.log" && exit 0
+          echo "== retrying the failed tests"
+          "$(command -v python3 || command -v python)" scripts/ci/retry-failed.py "$RUNNER_TEMP/test.log"

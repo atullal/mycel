@@ -1,6 +1,6 @@
 # Mycel: where things stand
 
-*Last updated: 2026-10-09, 2:30 pm ET. This is a snapshot for collaborators. The
+*Last updated: 2026-10-09, evening ET. This is a snapshot for collaborators. The
 design docs in `docs/` are the source of truth.*
 
 ## TL;DR
@@ -21,14 +21,21 @@ design docs in `docs/` are the source of truth.*
 - **New in the afternoon of 2026-10-09: apps for iPhone and iPad, Android,
   Windows and Linux** next to the Mac app. Same UI and runtime everywhere;
   what works on which platform is in [docs/PLATFORMS.md](docs/PLATFORMS.md).
-- Test build: the [dev-2026-10-09 pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-09).
-  **Its wire format changed, so every device needs this build.**
+  Since then: video from Android, Windows and Linux (the web view captures
+  and encodes); Android keeps running in the background; notifications;
+  iPhone calls continue in the background; the iPhone keyboard fix.
+- Test builds for every platform: the
+  [dev-2026-10-09-apps pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-09-apps).
+  **Every device needs a build from the same release.**
 
 ## Try it
 
-1. Download `Mycel_0.1.0_universal.dmg` from the
-   [pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-09).
-   It runs on Apple silicon and Intel Macs.
+1. Download the file for your device from the
+   [pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-09-apps):
+   `Mycel_0.1.0_universal.dmg` for a Mac (Apple silicon and Intel), the
+   `.apk` for Android, the Windows installer, or the Linux `.deb`, `.rpm` or
+   `.AppImage`. iPhones and iPads need a signed build (see
+   [docs/PLATFORMS.md](docs/PLATFORMS.md)).
 2. The app is unsigned. On first launch, right-click **Mycel > Open**. If macOS
    says it is "damaged", run `xattr -dr com.apple.quarantine /Applications/Mycel.app`.
 3. **Every device you test with needs the same build.** The store-and-forward
@@ -46,10 +53,10 @@ How to build and install each one: [docs/PLATFORMS.md](docs/PLATFORMS.md).
 | Platform | State |
 |---|---|
 | macOS | as before (universal DMG) |
-| iPhone, iPad | Runs on the iOS 27 Simulator (iPhone and iPad layouts). Messages to and from a desktop peer work. On devices it needs an Apple ID in Xcode to sign (`scripts/package-ios.sh --install`). Voice calls use Apple's voice processing. Peer-to-peer Wi-Fi, Bluetooth and the camera now share the Mac code, but haven't run on an iPhone yet. |
-| Android 9+ | Signed release APK (`scripts/package-android.sh`). Tested on the Android 14 emulator: messages in both directions through the real UI, the on-screen keyboard, and profile and contact codes. Voice calls use the phone's echo canceller. No Bluetooth, Wi-Fi Direct or camera yet. |
-| Windows 10+ | NSIS installer and MSI built by GitHub Actions. CI launches the app on a Windows runner: the runtime opens and the UI renders in WebView2 (screenshot artifact). Not tried on a desktop PC yet. |
-| Linux | deb, rpm and AppImage built by GitHub Actions. CI launches the app under a virtual display: the runtime opens and the UI renders in WebKitGTK (screenshot artifact). On that bare CI machine it takes about 25 s to open: GTK's application startup waits for desktop D-Bus services the runner doesn't have (seen in a stack dump, before any Mycel code runs). Desktop sessions provide them. Not tried on a Linux desktop yet. |
+| iPhone, iPad | Runs on the iOS 27 Simulator (iPhone and iPad layouts). Messages to and from a desktop peer work; the on-screen keyboard is checked with a UI test. Calls continue in the background. On devices it needs an Apple developer account in Xcode to sign (`scripts/package-ios.sh --install`). Voice calls use Apple's voice processing. Peer-to-peer Wi-Fi, Bluetooth and the camera share the Mac code, but haven't run on an iPhone yet. |
+| Android 9+ | Signed release APK (`scripts/package-android.sh`). Tested on the Android 14 emulator: messages both ways through the real UI, the on-screen keyboard, attachments both ways, notifications, running in the background and after being swiped away, and video calls both ways. Voice calls use the phone's echo canceller. No Bluetooth or Wi-Fi Direct yet. |
+| Windows 10+ | NSIS installer and MSI built by GitHub Actions. CI launches the app on a Windows runner: the runtime opens and the UI renders in WebView2 (screenshot artifact). Video: its web view engine (Edge, with a fake camera) captures and encodes H.264 in CI; not tried with a real camera. Not tried on a desktop PC yet. |
+| Linux | deb, rpm and AppImage built by GitHub Actions. CI launches the app under a virtual display: the runtime opens and the UI renders in WebKitGTK (screenshot artifact). Video: WebKitGTK (2.50 and 2.52, mock camera) captures and encodes H.264 in CI, through a canvas and with GStreamer's encoders, which the packages recommend; not tried with a real camera. On that bare CI machine it takes about 25 s to open: GTK's application startup waits for desktop D-Bus services the runner doesn't have (seen in a stack dump, before any Mycel code runs). Desktop sessions provide them. Not tried on a Linux desktop yet. |
 
 ## Where to read
 
@@ -148,15 +155,24 @@ largest size this Mac runs. That's up to 100 seats for the conference and
   - Windows and Linux builds have only run on CI machines so far.
   - iPhone peer-to-peer Wi-Fi, Bluetooth and the camera are untested on
     hardware.
-  - The on-screen keyboard is checked on Android but not on an iPhone yet.
-  - Phones suspend Mycel in the background. Messages arrive when it's opened
-    again, or through a keeper or store-and-forward.
-  - Sending video works from Apple devices only.
-  - Core tests on CI: Linux all pass. Windows 265 of 267 pass. The two
-    failures (`two_links_add_up`, `sync_over_links_and_fall_back_to_bluetooth`)
-    rank emulated links by measured speed. The suspect is Windows' coarse
-    default timer (about 15.6 ms) skewing the emulated links' pacing. Not
-    yet confirmed.
+  - A suspended iPhone doesn't wake for new messages: they arrive when
+    Mycel is opened again, or through a keeper or store-and-forward. Waking
+    it needs Apple's push service, which needs a server. (Android keeps
+    running in the background; iPhone calls continue in the background.)
+  - **Fixed on 2026-10-09: the Windows test failures.** Measured on the
+    runner: a 1 ms sleep took 14.4 ms with Windows' default timer, 2.4 ms
+    with the 1 ms timer Mycel now asks for (`tests/timers.rs` checks it).
+    Chasing the rest found a real path-selection bug on every platform: a
+    bulk transfer's own queue could hand the primary path to an idle link
+    30× slower (a busy path's RTT now counts only up to where it's called
+    saturated). Tests that time emulated radios now run one at a time per
+    test binary, as the speed tests already did.
+  - Even so, on the small CI machines a different timing test misses its
+    deadline in each run, and each passes in other runs and on its own
+    (seen: the four-hop Bluetooth connect, call glare, a transfer's final
+    speed, link failover, and a free-port collision between runtime tests).
+    CI now retries a failed test twice and flags one that then passes as a
+    "Flaky test" warning on the run; one that fails three times fails it.
 
 - **Bluetooth between two real Macs.** The link connects without pairing, but
   in one test session one laptop kept hanging up after 5–10 s and stopped
