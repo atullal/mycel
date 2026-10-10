@@ -176,8 +176,8 @@ largest size this Mac runs. That's up to 100 seats for the conference and
     The final-speed check failed the first pass on Windows three runs in a
     row: a real bug, now fixed (a finished transfer could report 0 B/s
     when its completion was reported twice with a slow file check in
-    between). Call glare failed the first pass in two of three Windows runs
-    (passing on retry): worth a look. Once, LAN
+    between). Call glare (`both_call_at_once_become_one_call`) failed the first
+    pass in three of four Windows runs, passing on retry: worth a look. Once, LAN
     discovery over mDNS failed all three tries on one Windows runner and
     passed on a fresh one (the runner's network, it seems).
 
