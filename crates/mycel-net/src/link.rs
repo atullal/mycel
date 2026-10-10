@@ -388,7 +388,14 @@ impl PathHealth {
     }
 
     /// Time a [`REF_BYTES`] exchange takes on this path, in nanoseconds.
+    /// While the path is busy with our traffic, its RTT mostly measures the
+    /// queue we built, and the capacity already prices that in (it drops
+    /// towards what a saturated path delivers): counting the queue again
+    /// made a bulk transfer's own queue hand the selection to an idle,
+    /// unmeasured path many times slower. So a busy path's RTT counts up to
+    /// where it would be called saturated.
     fn cost(&self, rtt: Duration) -> i128 {
+        let rtt = if self.rate >= BUSY_MIN { rtt.min(self.base_rtt * 2 + QUEUE_SLACK) } else { rtt };
         cost(rtt, self.capacity)
     }
 }

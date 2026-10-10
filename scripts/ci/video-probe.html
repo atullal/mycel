@@ -27,6 +27,29 @@
       const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { width: 640, height: 360 } });
       const track = stream.getVideoTracks()[0];
       r.camera = track.label || "unnamed";
+      const video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.srcObject = stream;
+      await video.play();
+      // as webcam.ts: hardware first; if that's refused or fails, whatever
+      // the web view has
+      r.attempts = [];
+      for (const hw of ["prefer-hardware", "no-preference"]) {
+        const a = await attempt(video, hw);
+        r.attempts.push(a);
+        if (a.ok) break;
+      }
+      track.stop();
+      done({ ok: r.attempts.some((a) => a.ok) });
+    } catch (e) {
+      done({ error: String(e && e.message ? e.message : e) });
+    }
+
+    async function attempt(video, hw) {
+      const config = { codec: "avc1.42E01F", width: 640, height: 360, bitrate: 500000, framerate: 30, latencyMode: "realtime", hardwareAcceleration: hw, avc: { format: "avc" } };
+      const s = await VideoEncoder.isConfigSupported(config).catch(() => ({ supported: false }));
+      if (!s.supported) return { hw, supported: false };
       const chunks = [];
       let description = 0;
       let error = null;
@@ -38,36 +61,28 @@
         },
         error: (e) => (error = e.message),
       });
-      // as webcam.ts: hardware first, then whatever the web view has
-      let config = null;
-      for (const hw of ["prefer-hardware", "no-preference"]) {
-        const c = { codec: "avc1.42E01F", width: 640, height: 360, bitrate: 500000, framerate: 30, latencyMode: "realtime", hardwareAcceleration: hw, avc: { format: "avc" } };
-        const s = await VideoEncoder.isConfigSupported(c).catch(() => ({ supported: false }));
-        if (s.supported) {
-          config = c;
-          break;
+      try {
+        enc.configure(config);
+        let n = 0;
+        for (let i = 0; i < 40 && n < 30; i++) {
+          await new Promise((ok) => setTimeout(ok, 33));
+          if (enc.state !== "configured") break;
+          if (video.videoWidth === 0) continue;
+          const f = new VideoFrame(video, { timestamp: i * 33333 });
+          try {
+            enc.encode(f, { keyFrame: n === 0 });
+            n++;
+          } finally {
+            f.close();
+          }
         }
+        if (enc.state === "configured") await enc.flush();
+      } catch (e) {
+        error = error || String(e && e.message ? e.message : e);
       }
-      if (!config) return done({ encoder: "no H.264 encoder" });
-      r.hardware = config.hardwareAcceleration;
-      enc.configure(config);
-      const video = document.createElement("video");
-      video.muted = true;
-      video.playsInline = true;
-      video.srcObject = stream;
-      await video.play();
-      for (let i = 0; i < 30; i++) {
-        await new Promise((ok) => setTimeout(ok, 33));
-        if (video.videoWidth === 0) continue;
-        const f = new VideoFrame(video, { timestamp: i * 33333 });
-        enc.encode(f, { keyFrame: i === 0 });
-        f.close();
-      }
-      await enc.flush();
-      track.stop();
-      done({ frames: chunks.length, keyframes: chunks.filter((t) => t === "key").length, avcC: description, error, ok: chunks.length > 0 && description > 0 && !error });
-    } catch (e) {
-      done({ error: String(e && e.message ? e.message : e) });
+      if (enc.state !== "closed") enc.close();
+      const keyframes = chunks.filter((t) => t === "key").length;
+      return { hw, frames: chunks.length, keyframes, avcC: description, error, ok: chunks.length > 0 && description > 0 && !error };
     }
   })();
 </script>

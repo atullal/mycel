@@ -21,6 +21,11 @@ use mycel_trust::Role;
 use serde_json::json;
 use tokio::sync::mpsc;
 
+/// These tests time emulated radios (path choice, failover, timeouts): side
+/// by side on a small machine they starve each other of CPU and timers (seen
+/// on 4-core Windows runners), so they run one at a time.
+static RADIOS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 const BULK: &[u8] = b"test/global-bulk";
 
 async fn eventually(what: &str, secs: u64, mut f: impl FnMut() -> bool) {
@@ -100,6 +105,7 @@ async fn has_record(dir: &MemDirectory, node: &Node) -> bool {
 /// end to end, with nothing in between able to read it.
 #[tokio::test(flavor = "multi_thread")]
 async fn bluetooth_us_to_bluetooth_eu_through_two_gateways() {
+    let _radios = RADIOS.lock().await;
     let dir = MemDirectory::new();
     let (e1, e2, e3, e4) = (ble(1), ble(2), ble(3), ble(4));
     let us = device("us-phone", &[&e1], false, &dir).await;
@@ -168,6 +174,7 @@ async fn bluetooth_us_to_bluetooth_eu_through_two_gateways() {
 /// survives losing one.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_gateways_are_two_paths_and_fail_over() {
+    let _radios = RADIOS.lock().await;
     let dir = MemDirectory::new();
     let (e1, e2) = (ble(5), ble(6));
     for e in [&e1, &e2] {
@@ -273,6 +280,7 @@ async fn device_with_keys(keys: Arc<DeviceKeys>, name: &str, radios: &[&MemNet],
 /// real life, seconds here. A short-lived bundle expires at the mule.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_data_mule_carries_a_message_across_partitions() {
+    let _radios = RADIOS.lock().await;
     let dir = MemDirectory::new();
     let (here, there) = (ble(7), ble(8));
     let a = device("a", &[&here], false, &dir).await;
