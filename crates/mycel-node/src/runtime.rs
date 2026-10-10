@@ -1052,16 +1052,7 @@ impl Runtime {
                 if done < total && s.back().is_some_and(|&(t, _)| now.duration_since(t) < PROGRESS_EVERY) {
                     return;
                 }
-                if s.back().is_some_and(|&(_, d)| done < d) {
-                    s.clear(); // restarted from scratch
-                }
-                s.push_back((now, done));
-                while s.len() > 2 && s.front().is_some_and(|&(t, _)| now.duration_since(t) > RATE_WINDOW) {
-                    s.pop_front();
-                }
-                let (t0, d0) = s[0];
-                let secs = now.duration_since(t0).as_secs_f64();
-                if secs > 0.0 { ((done - d0) as f64 / secs) as u64 } else { 0 }
+                sample_rate(&mut s, now, done)
             };
             let _ = events.send(Event::TransferProgress { direction, id: id.clone(), done, total, rate });
         })
@@ -1584,6 +1575,27 @@ fn _assert_send_sync() {
     let _ = HashMap::<u8, u8>::new();
 }
 
+/// Add a progress sample (`done` bytes at `now`) and return the speed in
+/// bytes per second over the last [`RATE_WINDOW`].
+fn sample_rate(s: &mut std::collections::VecDeque<(Instant, u64)>, now: Instant, done: u64) -> u64 {
+    if s.back().is_some_and(|&(_, d)| done < d) {
+        s.clear(); // restarted from scratch
+    }
+    // Only samples that moved: completion can be reported more than once (by
+    // each source, then after the file is checked and synced, which can take
+    // seconds), and a window holding only "all done" samples said 0 B/s for
+    // a finished transfer.
+    if s.back().is_none_or(|&(_, d)| done > d) {
+        s.push_back((now, done));
+    }
+    while s.len() > 2 && s.front().is_some_and(|&(t, _)| now.duration_since(t) > RATE_WINDOW) {
+        s.pop_front();
+    }
+    let ((t0, d0), (t1, d1)) = (s[0], s[s.len() - 1]);
+    let secs = t1.duration_since(t0).as_secs_f64();
+    if secs > 0.0 { ((d1 - d0) as f64 / secs) as u64 } else { 0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::sanitize_file_name as s;
@@ -1609,5 +1621,20 @@ mod tests {
         assert_eq!(s("Photo 1 (final).PNG"), "Photo 1 (final).PNG");
         assert_eq!(s("résumé.pdf"), "résumé.pdf");
         assert_eq!(s("../../x.plist"), "x.plist");
+    }
+
+    /// 100 MB in 2 s, then "done" again 5 s later (the file was being
+    /// checked): still 50 MB/s, not 0.
+    #[test]
+    fn a_late_repeat_of_done_keeps_the_speed() {
+        use super::{Duration, Instant, sample_rate};
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut s = Default::default();
+        for i in 0..=8u64 {
+            sample_rate(&mut s, at(i * 250), i * 12_500_000);
+        }
+        let rate = sample_rate(&mut s, at(7_000), 100_000_000);
+        assert_eq!(rate, 50_000_000);
     }
 }
