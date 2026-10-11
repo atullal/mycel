@@ -280,14 +280,19 @@ const MessageRow = memo(function MessageRow({
               )}
               {m.isMine &&
                 (confirmDelete ? (
-                  <button
-                    className="mx-act mx-act-danger is-confirm"
-                    onClick={() => void act(mycel.chat.delete(m.conversation, m.id))}
-                    onBlur={() => setConfirmDelete(false)}
-                    autoFocus
-                  >
-                    Delete for everyone
-                  </button>
+                  <>
+                    <button
+                      className="mx-act mx-act-danger is-confirm"
+                      onClick={() => void act(mycel.chat.delete(m.conversation, m.id))}
+                      onBlur={() => setConfirmDelete(false)}
+                      autoFocus
+                    >
+                      Delete for everyone
+                    </button>
+                    <button className="mx-act" onClick={() => setConfirmDelete(false)} aria-label="Cancel deletion">
+                      Cancel
+                    </button>
+                  </>
                 ) : (
                   <button className="mx-act mx-act-danger" onClick={() => setConfirmDelete(true)} aria-label="Delete" title="Delete">
                     <Icon.Trash size={17} />
