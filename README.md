@@ -51,6 +51,9 @@ cargo test --workspace --exclude mycel-host   # Rust tests (~300)
 cargo clippy --workspace --all-targets        # kept clean
 ```
 
+`mycel serve` serves the built web UI in your browser; the native Tauri app is
+optional for this workflow.
+
 Ready-made test builds for every platform are on the
 [releases page](https://github.com/atullal/mycel/releases) (the newest `dev-*`
 pre-release). To build them yourself (details in [docs/PLATFORMS.md](docs/PLATFORMS.md)):
