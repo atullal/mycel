@@ -15,6 +15,7 @@ pub struct Resolution {
     /// Strict ancestors of each op, by topo index.
     anc: Vec<BitSet>,
     valid: BitSet,
+    pub(crate) heads: Vec<OpId>,
     /// Winning revocation ops.
     pub winners: Vec<OpId>,
     pub state: MemberState,
@@ -154,12 +155,19 @@ pub(crate) fn resolve(ops: &HashMap<OpId, SignedOp>) -> Resolution {
         let failed: Vec<usize> = winners.iter().copied().filter(|&w| !valid.get(w)).collect();
         if failed.is_empty() {
             let state = replay(ops, &order, &index, &anc, &valid);
+            let mut covered = BitSet::new(n);
+            for i in valid.iter() {
+                covered.union_with(&anc[i]);
+            }
+            let mut heads: Vec<_> = valid.iter().filter(|&i| !covered.get(i)).map(|i| order[i]).collect();
+            heads.sort();
             return Resolution {
                 winners: winners.iter().map(|&w| order[w]).collect(),
                 order,
                 index,
                 anc,
                 valid,
+                heads,
                 state,
             };
         }

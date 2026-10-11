@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow, bail};
 use mycel_crypto::Hash32;
 use mycel_sync::{Envelope, Store};
 use mycel_trust::{SignedOp, SpaceId};
@@ -26,10 +26,22 @@ enum Write {
     Kv(String, Option<Vec<u8>>),
 }
 
+#[derive(Default)]
+struct Pending {
+    queue: Vec<Write>,
+    closed: bool,
+    // Store callbacks cannot return errors. Keep failures sticky so that every
+    // subsequent barrier/read reports them instead of claiming durability.
+    error: Option<String>,
+}
+
 struct Shared {
-    queue: Mutex<Vec<Write>>,
+    pending: Mutex<Pending>,
     cv: Condvar,
-    closed: Mutex<bool>,
+    // Held from before draining the queue through transaction completion.
+    commit_gate: Mutex<()>,
+    #[cfg(test)]
+    fail_next_commit: std::sync::atomic::AtomicBool,
 }
 
 /// Everything stored for one space: its ops (incl. genesis) and envelopes.
@@ -45,7 +57,7 @@ fn key(space: &SpaceId, id: &Hash32) -> Vec<u8> {
     [space.0.as_slice(), id.0.as_slice()].concat()
 }
 
-fn commit(db: &Database, batch: Vec<Write>) -> Result<()> {
+fn commit(db: &Database, batch: &[Write]) -> Result<()> {
     if batch.is_empty() {
         return Ok(());
     }
@@ -75,56 +87,130 @@ fn commit(db: &Database, batch: Vec<Write>) -> Result<()> {
     Ok(())
 }
 
+fn commit_pending(db: &Database, shared: &Shared, extra: Vec<Write>) -> Result<()> {
+    let _gate = shared.commit_gate.lock().unwrap();
+    let batch = {
+        let mut pending = shared.pending.lock().unwrap();
+        if let Some(error) = &pending.error {
+            bail!("storage durability failed: {error}");
+        }
+        if pending.closed && !extra.is_empty() {
+            bail!("storage is closed");
+        }
+        pending.queue.extend(extra);
+        std::mem::take(&mut pending.queue)
+    };
+    #[cfg(test)]
+    let outcome = if shared
+        .fail_next_commit
+        .swap(false, std::sync::atomic::Ordering::SeqCst)
+    {
+        Err(anyhow!("injected commit failure"))
+    } else {
+        commit(db, &batch)
+    };
+    #[cfg(not(test))]
+    let outcome = commit(db, &batch);
+    if let Err(error) = outcome {
+        let mut pending = shared.pending.lock().unwrap();
+        // Retain the failed batch before later writes for diagnosis. A sticky
+        // error disallows retries because transaction outcome can be uncertain.
+        let later = std::mem::replace(&mut pending.queue, batch);
+        pending.queue.extend(later);
+        pending.error = Some(format!("{error:#}"));
+        shared.cv.notify_all();
+        return Err(error);
+    }
+    Ok(())
+}
+
 impl DbStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<Self>> {
         let db = Arc::new(Database::create(path)?);
         // make sure tables exist
-        commit(&db, vec![Write::Kv("__init".into(), Some(vec![]))])?;
+        commit(&db, &[Write::Kv("__init".into(), Some(vec![]))])?;
         let shared = Arc::new(Shared {
-            queue: Mutex::new(Vec::new()),
+            pending: Mutex::new(Pending::default()),
             cv: Condvar::new(),
-            closed: Mutex::new(false),
+            commit_gate: Mutex::new(()),
+            #[cfg(test)]
+            fail_next_commit: std::sync::atomic::AtomicBool::new(false),
         });
         let (db2, sh2) = (db.clone(), shared.clone());
         let flusher = std::thread::spawn(move || {
             loop {
-                let batch = {
-                    let q = sh2.queue.lock().unwrap();
-                    let (mut q, _) = sh2
+                {
+                    let p = sh2.pending.lock().unwrap();
+                    let (p, _) = sh2
                         .cv
-                        .wait_timeout_while(q, Duration::from_millis(100), |q| q.is_empty())
+                        .wait_timeout_while(p, Duration::from_millis(100), |p| {
+                            p.queue.is_empty() && !p.closed && p.error.is_none()
+                        })
                         .unwrap();
-                    std::mem::take(&mut *q)
-                };
-                if let Err(e) = commit(&db2, batch) {
-                    eprintln!("mycel: storage write failed: {e}");
+                    if p.error.is_some() || (p.closed && p.queue.is_empty()) {
+                        return;
+                    }
                 }
-                if *sh2.closed.lock().unwrap() && sh2.queue.lock().unwrap().is_empty() {
+                if commit_pending(&db2, &sh2, Vec::new()).is_err() {
+                    // The failure is retained and surfaced by every barrier/read.
                     return;
                 }
             }
         });
-        Ok(Arc::new(DbStore { db, shared, flusher: Mutex::new(Some(flusher)) }))
+        Ok(Arc::new(DbStore {
+            db,
+            shared,
+            flusher: Mutex::new(Some(flusher)),
+        }))
     }
 
     fn enqueue(&self, w: Write) {
-        self.shared.queue.lock().unwrap().push(w);
+        let mut pending = self.shared.pending.lock().unwrap();
+        if pending.closed {
+            pending
+                .error
+                .get_or_insert_with(|| "storage is closed".into());
+        } else {
+            pending.queue.push(w);
+        }
         self.shared.cv.notify_one();
     }
 
-    /// Commit everything queued so far, synchronously.
+    /// Barrier covering every write enqueued before this call, including any
+    /// batch already drained by the background flusher.
     pub fn flush(&self) -> Result<()> {
-        let batch = std::mem::take(&mut *self.shared.queue.lock().unwrap());
-        commit(&self.db, batch)
+        commit_pending(&self.db, &self.shared, Vec::new())
+    }
+
+    /// Apply a group of key-value changes in one durable transaction. Prior
+    /// buffered writes are included. Callers must publish in-memory security
+    /// changes only after this succeeds.
+    pub fn kv_batch_durable(&self, entries: Vec<(String, Option<Vec<u8>>)>) -> Result<()> {
+        let writes = entries.into_iter().map(|(k, v)| Write::Kv(k, v)).collect();
+        commit_pending(&self.db, &self.shared, writes)
     }
 
     pub fn close(&self) -> Result<()> {
-        *self.shared.closed.lock().unwrap() = true;
+        self.shared.pending.lock().unwrap().closed = true;
         self.shared.cv.notify_all();
         if let Some(h) = self.flusher.lock().unwrap().take() {
-            let _ = h.join();
+            h.join().map_err(|_| anyhow!("storage flusher panicked"))?;
         }
         self.flush()
+    }
+
+    /// Absence is allowed; malformed persisted security state is an error.
+    pub fn kv_decode<T: serde::de::DeserializeOwned>(&self, k: &str) -> Result<Option<T>> {
+        self.kv_get(k)?
+            .map(|bytes| {
+                let (value, rest) = postcard::take_from_bytes(&bytes)
+                    .with_context(|| format!("corrupt persisted {k}"))?;
+                if !rest.is_empty() {
+                    bail!("corrupt persisted {k}: trailing bytes");
+                }
+                Ok(value)
+            })
+            .transpose()
     }
 
     pub fn kv_get(&self, k: &str) -> Result<Option<Vec<u8>>> {
@@ -147,20 +233,31 @@ impl DbStore {
         self.flush()?;
         let txn = self.db.begin_read()?;
         let mut out: HashMap<SpaceId, StoredSpace> = HashMap::new();
-        let space_of = |k: &[u8]| Hash32(k[..32].try_into().unwrap());
+        let space_of = |k: &[u8]| -> Result<Hash32> {
+            if k.len() != 64 {
+                bail!("corrupt stored record key");
+            }
+            Ok(Hash32(k[..32].try_into().expect("checked key length")))
+        };
         for row in txn.open_table(OPS)?.iter()? {
             let (k, v) = row?;
-            if let Ok(op) = postcard::from_bytes::<SignedOp>(v.value()) {
-                out.entry(space_of(k.value())).or_default().0.push(op);
-            }
+            let op = postcard::from_bytes::<SignedOp>(v.value())
+                .context("corrupt stored membership operation")?;
+            out.entry(space_of(k.value())?).or_default().0.push(op);
         }
         for row in txn.open_table(ENVS)?.iter()? {
             let (k, v) = row?;
-            if let Ok(env) = postcard::from_bytes::<Envelope>(v.value()) {
-                out.entry(space_of(k.value())).or_default().1.push(env);
-            }
+            let env =
+                postcard::from_bytes::<Envelope>(v.value()).context("corrupt stored envelope")?;
+            out.entry(space_of(k.value())?).or_default().1.push(env);
         }
         Ok(out)
+    }
+}
+
+impl Drop for DbStore {
+    fn drop(&mut self) {
+        let _ = self.close();
     }
 }
 
@@ -173,5 +270,135 @@ impl Store for DbStore {
     fn put_envelope(&self, space: &SpaceId, env: &Envelope) {
         let v = postcard::to_allocvec(env).expect("encodes");
         self.enqueue(Write::Env(key(space, &env.id()), v));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_store() -> (std::path::PathBuf, Arc<DbStore>) {
+        let path = std::env::temp_dir().join(format!(
+            "mycel-store-security-{}.redb",
+            hex::encode(mycel_crypto::random::<16>())
+        ));
+        let store = DbStore::open(&path).unwrap();
+        (path, store)
+    }
+
+    #[test]
+    fn corrupt_security_records_are_errors_and_absence_is_distinct() {
+        let (path, store) = test_store();
+        assert!(store.kv_decode::<Vec<u64>>("blocked").unwrap().is_none());
+        store
+            .kv_batch_durable(vec![("blocked".into(), Some(vec![255]))])
+            .unwrap();
+        assert!(store.kv_decode::<Vec<u64>>("blocked").is_err());
+        store
+            .kv_batch_durable(vec![("blocked".into(), Some(vec![0, 1]))])
+            .unwrap();
+        assert!(
+            store.kv_decode::<Vec<u64>>("blocked").is_err(),
+            "trailing bytes are corruption"
+        );
+        store.close().unwrap();
+        drop(store);
+        fs_cleanup(path);
+    }
+
+    #[test]
+    fn failed_commit_is_retained_and_every_barrier_stays_failed() {
+        let (path, store) = test_store();
+        store
+            .shared
+            .fail_next_commit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            store
+                .kv_batch_durable(vec![("request".into(), Some(vec![1]))])
+                .is_err()
+        );
+        assert_eq!(store.shared.pending.lock().unwrap().queue.len(), 1);
+        assert!(store.flush().is_err());
+        assert!(store.kv_get("request").is_err());
+        assert!(store.close().is_err());
+        drop(store);
+        fs_cleanup(path);
+    }
+
+    #[test]
+    fn flush_waits_for_inflight_commit_before_claiming_success() {
+        let (path, store) = test_store();
+        // Model a background batch already drained under the commit gate.
+        let gate = store.shared.commit_gate.lock().unwrap();
+        let batch = vec![Write::Kv("inflight".into(), Some(vec![7]))];
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let other = store.clone();
+        let waiter = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx.send(other.flush().is_ok()).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        commit(&store.db, &batch).unwrap();
+        drop(gate);
+        assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        waiter.join().unwrap();
+        assert_eq!(store.kv_get("inflight").unwrap(), Some(vec![7]));
+        store.close().unwrap();
+        drop(store);
+        fs_cleanup(path);
+    }
+
+    #[test]
+    fn atomic_security_batch_survives_reopen() {
+        let (path, store) = test_store();
+        store.kv_put("requests", vec![1]);
+        store
+            .kv_batch_durable(vec![
+                ("requests".into(), None),
+                ("hidden".into(), Some(vec![2])),
+            ])
+            .unwrap();
+        store.close().unwrap();
+        drop(store);
+        let reopened = DbStore::open(&path).unwrap();
+        assert_eq!(reopened.kv_get("requests").unwrap(), None);
+        assert_eq!(reopened.kv_get("hidden").unwrap(), Some(vec![2]));
+        reopened.close().unwrap();
+        drop(reopened);
+        fs_cleanup(path);
+    }
+
+    #[tokio::test]
+    async fn corrupt_space_startup_releases_profile_and_database() {
+        let dir = std::env::temp_dir().join(format!(
+            "mycel-corrupt-startup-{}-{}", std::process::id(), mycel_crypto::random_u64()
+        ));
+        let runtime = crate::Runtime::open(&dir, crate::api::NetworkMode::Local, None).await.unwrap();
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        {
+            let db = Database::create(dir.join("mycel.redb")).unwrap();
+            let transaction = db.begin_write().unwrap();
+            {
+                let mut ops = transaction.open_table(OPS).unwrap();
+                ops.insert(&[0u8; 64][..], &[255u8][..]).unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        assert!(crate::Runtime::open(&dir, crate::api::NetworkMode::Local, None).await.is_err());
+        // Detached network tasks would retain the store and its database lock.
+        let lease = crate::identity::ProfileLock::acquire(&dir).unwrap();
+        let store = DbStore::open(dir.join("mycel.redb")).unwrap();
+        store.close().unwrap();
+        drop(store);
+        drop(lease);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn fs_cleanup(path: std::path::PathBuf) {
+        let _ = std::fs::remove_file(path);
     }
 }

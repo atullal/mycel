@@ -891,3 +891,68 @@ fn overhead_per_device_against_mesh_size() {
 fn overhead_per_device_large_meshes() {
     overhead(&[(200, 11.5), (400, 8.2)]);
 }
+
+#[test]
+fn security_verified_cache_binds_every_signed_field() {
+    use crate::mesh::wire::{sign_announce, verify_announce};
+    let owner = mycel_crypto::DeviceKeys::generate();
+    for field in 0..7 {
+        let mut router = Router::new(key(1), Config::default());
+        let neighbour = key(2);
+        router.set_direct(neighbour, true, 0);
+        router.hop_up(neighbour, 0);
+        let mut ann = sign_announce(&owner, Origination { seq: WALL, flags: 0, scope: 8, uplink: 0 }, "original");
+        ann.cost = INFINITY;
+        router.on_announce(neighbour, ann.clone(), 0, WALL, verify_announce);
+        ann.cost = 0;
+        match field {
+            0 => ann.name = Arc::from("forged"),
+            1 => ann.flags = F_GATEWAY,
+            2 => ann.scope = 7,
+            3 => ann.uplink = 1,
+            4 => ann.sig.0[0] ^= 1,
+            5 => ann.seq += 1,
+            _ => ann.origin = mycel_crypto::DeviceKeys::generate().sign_pk(),
+        }
+        assert!(!verify_announce(&ann));
+        let origin = ann.origin;
+        router.on_announce(neighbour, ann, 1, WALL, verify_announce);
+        assert!(router.origin_name(&origin).is_none(), "field {field} bypassed verification");
+        assert_eq!(router.stats().announcements_forged, 1);
+    }
+}
+
+#[test]
+fn security_verified_cache_allows_forwarded_hops_and_cost() {
+    use crate::mesh::wire::{sign_announce, verify_announce};
+    let owner = mycel_crypto::DeviceKeys::generate();
+    let mut router = Router::new(key(1), Config::default());
+    let neighbour = key(2);
+    router.set_direct(neighbour, true, 0);
+    router.hop_up(neighbour, 0);
+    let mut ann = sign_announce(&owner, Origination { seq: WALL, flags: 0, scope: 8, uplink: 0 }, "original");
+    ann.cost = INFINITY;
+    router.on_announce(neighbour, ann.clone(), 0, WALL, verify_announce);
+    ann.cost = 123;
+    ann.hops = 2;
+    assert!(verify_announce(&ann));
+    router.on_announce(neighbour, ann, 1, WALL, |_| panic!("same signed announcement reverified"));
+    assert_eq!(router.origin_name(&owner.sign_pk()).as_deref(), Some("original"));
+}
+
+#[test]
+fn security_verified_cache_stays_bounded_and_can_be_disabled() {
+    use crate::mesh::wire::{sign_announce, verify_announce};
+    for limit in [0, 1, 2] {
+        let owner = mycel_crypto::DeviceKeys::generate();
+        let mut router = Router::new(key(1), Config { verified_max: limit, ..Config::default() });
+        let neighbour = key(2);
+        router.set_direct(neighbour, true, 0);
+        router.hop_up(neighbour, 0);
+        for i in 0..5 {
+            let ann = sign_announce(&owner, Origination { seq: WALL + i, flags: 0, scope: 8, uplink: 0 }, "original");
+            router.on_announce(neighbour, ann, i, WALL, verify_announce);
+            assert!(router.verified.len() <= limit);
+        }
+    }
+}

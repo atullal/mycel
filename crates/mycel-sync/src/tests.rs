@@ -356,3 +356,347 @@ fn doc_equivocation_resolves_identically_everywhere() {
     c.ingest_envelope(e1).unwrap();
     assert_eq!(a.doc_json(&doc), c.doc_json(&doc), "same winner regardless of order");
 }
+
+#[test]
+fn invalid_membership_fanout_does_not_block_sealing() {
+    let (mut a, reader, rk) = pair(Role::Reader);
+    let target = dev();
+    let ops = (0..65).map(|nonce| mycel_trust::SignedOp::sign(&rk, mycel_trust::Op {
+        space: Some(a.space_id()), parents: reader.graph.heads(), author: rk.sign_pk(), nonce,
+        action: mycel_trust::Action::Add { member: target.public(), role: Role::Relay, keyring: None },
+    })).collect();
+    let result = a.ingest_batch(ops, vec![]);
+    assert_eq!(result.rejected, 0);
+    let doc = StreamId::new_doc();
+    let env = put(&mut a, doc, "still", "writable");
+    assert_eq!(env.header.auth_heads.len(), 1);
+    assert_eq!(a.doc_json(&doc), json!({"still": "writable"}));
+}
+
+#[test]
+fn revocation_recomputes_equivocation_from_remaining_valid_changes() {
+    let (mut a, b, bk) = pair(Role::Writer);
+    let doc = StreamId::new_doc();
+    let fork = |value: &str| {
+        let mut d = AutoCommit::new().with_actor(ActorId::from(bk.sign_pk().0.to_vec()));
+        d.put(ROOT, "fork", value).unwrap();
+        d.commit();
+        let plaintext = d.get_last_local_change().unwrap().bytes().to_vec();
+        signed_doc_payload(&b, doc, &plaintext)
+    };
+    let one = fork("one");
+    let two = fork("two");
+    let (x, y) = if one.id() < two.id() { (one, two) } else { (two, one) };
+    a.ingest_envelope(y.clone()).unwrap();
+    a.ingest_envelope(x.clone()).unwrap();
+    assert!(a.equivocated.contains(&y.id()));
+    let (remove, _, _) = a.graph.remove_member(&a.me, bk.sign_pk(), Some(y.id())).unwrap();
+    a.ingest_op(remove).unwrap();
+    assert_eq!(a.status(&x.id()), Status::Invalid("beyond revocation cutoff"));
+    assert_eq!(a.status(&y.id()), Status::Valid);
+    let restored = Replica::restore(a.me.clone(), a.op(&a.space_id()).unwrap().clone(), a.all_ops(),
+        a.envelope_ids().iter().map(|id| a.envelope(id).unwrap().clone()).collect(), None).unwrap();
+    assert_eq!(a.doc_json(&doc), restored.doc_json(&doc));
+    assert!(!a.equivocated.contains(&y.id()));
+    assert!(a.doc_json(&doc).get("fork").is_some());
+}
+
+fn signed_doc_payload(author: &Replica, doc: StreamId, plaintext: &[u8]) -> Envelope {
+    let epoch = author.graph.state().write_epoch().unwrap();
+    let (author_seq, author_prev) = author.my_chain_tip();
+    let header = Header { space: author.space_id(), stream: doc, author: author.me.sign_pk(),
+        author_seq, author_prev, auth_heads: author.graph.heads(), epoch, nonce: random() };
+    let ciphertext = author.ring.get(&epoch).unwrap().seal(&header.nonce, &content_aad(&header), plaintext).unwrap();
+    let sig = author.me.sign(CTX_ENV_SIG, &[&encode(&header), &ciphertext]);
+    Envelope { header, ciphertext, sig }
+}
+
+#[test]
+fn oversized_compressed_change_is_not_materialized() {
+    let (mut a, b, bk) = pair(Role::Writer);
+    let doc = StreamId::new_doc();
+    let mut d = AutoCommit::new().with_actor(ActorId::from(bk.sign_pk().0.to_vec()));
+    d.put(ROOT, "oversized", "z".repeat(MAX_ENVELOPE_CIPHERTEXT + 1)).unwrap();
+    d.commit();
+    let mut change = d.get_last_local_change().unwrap();
+    assert!(change.raw_bytes().len() > MAX_ENVELOPE_CIPHERTEXT);
+    let plain = change.bytes().to_vec();
+    assert_eq!(plain[8], 2, "test must exercise a compressed change");
+    assert!(plain.len() < MAX_ENVELOPE_CIPHERTEXT);
+    a.ingest_envelope(signed_doc_payload(&b, doc, &plain)).unwrap();
+    assert!(a.doc_json(&doc).get("oversized").is_none());
+}
+
+#[test]
+fn oversized_local_change_rolls_back_before_next_edit() {
+    let (mut a, _) = Replica::create(dev(), None).unwrap();
+    let doc = StreamId::new_doc();
+    put(&mut a, doc, "kept", "small");
+    let count = a.envelope_ids().len();
+    assert!(matches!(a.change(doc, |d| d.put(ROOT, "oversized", "z".repeat(MAX_ENVELOPE_CIPHERTEXT + 1))), Err(SyncError::TooLarge)));
+    assert_eq!(a.envelope_ids().len(), count);
+    assert_eq!(a.doc_json(&doc), json!({"kept": "small"}));
+    put(&mut a, doc, "next", "works");
+    assert_eq!(a.doc_json(&doc), json!({"kept": "small", "next": "works"}));
+}
+
+#[test]
+fn oversized_local_operation_run_rolls_back_before_next_edit() {
+    let (mut a, _) = Replica::create(dev(), None).unwrap();
+    let doc = StreamId::new_doc();
+    put(&mut a, doc, "kept", "small");
+    let count = a.envelope_ids().len();
+    let result = a.change(doc, |d| {
+        let text = d.put_object(ROOT, "text", automerge::ObjType::Text)?;
+        d.splice_text(&text, 0, 0, &"a".repeat(MAX_DOC_CHANGE_OPS))
+    });
+    assert!(matches!(result, Err(SyncError::TooLarge)));
+    assert_eq!(a.envelope_ids().len(), count);
+    assert_eq!(a.doc_json(&doc), json!({"kept": "small"}));
+    put(&mut a, doc, "next", "works");
+    assert_eq!(a.doc_json(&doc), json!({"kept": "small", "next": "works"}));
+}
+
+#[test]
+fn malformed_change_sequence_cannot_unwind_or_poison_document() {
+    let (mut a, mut b, bk) = pair(Role::Writer);
+    let doc = StreamId::new_doc();
+    put(&mut a, doc, "kept", "small");
+    let mut source = AutoCommit::new().with_actor(ActorId::from(bk.sign_pk().0.to_vec()));
+    source.put(ROOT, "malformed", "discard").unwrap();
+    source.commit();
+    let mut expanded = source.get_last_local_change().unwrap().decode();
+    expanded.seq = 2;
+    assert!(expanded.deps.is_empty());
+    let mut change = automerge::Change::from(expanded);
+    let empty_doc = StreamId::new_doc();
+    let empty_malformed = signed_doc_payload(&b, empty_doc, &change.bytes());
+    let empty_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        a.ingest_envelope(empty_malformed)
+    }));
+    assert!(matches!(empty_result, Ok(Ok(true))));
+    assert!(!a.docs.contains_key(&empty_doc), "failed apply must not create an empty document");
+    let malformed = signed_doc_payload(&b, doc, &change.bytes());
+    let id = malformed.id();
+    let before_applied = a.docs[&doc].applied.clone();
+    let before_seqs = a.docs[&doc].seqs.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        a.ingest_envelope(malformed)
+    }));
+    assert!(matches!(result, Ok(Ok(true))));
+    assert_eq!(a.status(&id), Status::Valid, "auth status stays independent of document payload");
+    assert_eq!(a.doc_json(&doc), json!({"kept": "small"}));
+    assert_eq!(a.docs[&doc].applied, before_applied);
+    assert_eq!(a.docs[&doc].seqs, before_seqs);
+    let valid = put(&mut b, doc, "writer", "works");
+    a.ingest_envelope(valid).unwrap();
+    put(&mut a, doc, "next", "works");
+    assert_eq!(a.doc_json(&doc), json!({"kept": "small", "writer": "works", "next": "works"}));
+}
+
+#[test]
+fn malformed_waiting_change_does_not_block_its_real_dependency() {
+    let (mut receiver, mut honest, _) = pair(Role::Writer);
+    let attacker_keys = dev();
+    receiver.add_member(attacker_keys.public(), Role::Writer).unwrap();
+    let mut attacker = Replica::join(attacker_keys.clone(), receiver.op(&receiver.space_id()).unwrap().clone(), None).unwrap();
+    sync(&mut receiver, &mut attacker);
+    sync(&mut receiver, &mut honest);
+    let doc = StreamId::new_doc();
+    let dependency = put(&mut honest, doc, "good", "dependency");
+    let hash = honest.doc(&doc).unwrap().clone().get_last_local_change().unwrap().hash();
+    let mut source = AutoCommit::new().with_actor(ActorId::from(attacker_keys.sign_pk().0.to_vec()));
+    source.put(ROOT, "malformed", "discard").unwrap();
+    source.commit();
+    let mut expanded = source.get_last_local_change().unwrap().decode();
+    expanded.seq = 2; // attacker has no first change, even after the honest dep arrives
+    expanded.deps = vec![hash];
+    let mut change = automerge::Change::from(expanded);
+    let malformed = signed_doc_payload(&attacker, doc, &change.bytes());
+    let bad_id = malformed.id();
+    receiver.ingest_envelope(malformed).unwrap();
+    receiver.ingest_envelope(dependency).unwrap();
+    assert_eq!(receiver.doc_json(&doc), json!({"good": "dependency"}));
+    assert!(!receiver.docs[&doc].applied.contains(&bad_id));
+    let next = put(&mut honest, doc, "next", "works");
+    receiver.ingest_envelope(next).unwrap();
+    assert_eq!(receiver.doc_json(&doc), json!({"good": "dependency", "next": "works"}));
+    let restored = Replica::restore(receiver.me.clone(), receiver.op(&receiver.space_id()).unwrap().clone(),
+        receiver.all_ops(), receiver.envelope_ids().iter().map(|id| receiver.envelope(id).unwrap().clone()).collect(), None).unwrap();
+    assert_eq!(receiver.doc_json(&doc), restored.doc_json(&doc));
+}
+
+#[test]
+fn document_changes_delivered_in_reverse_dependency_order_converge() {
+    let (mut receiver, mut writer, _) = pair(Role::Writer);
+    let doc = StreamId::new_doc();
+    let mut envelopes = Vec::new();
+    for n in 0..12 {
+        envelopes.push(put(&mut writer, doc, &format!("key{n}"), &format!("value{n}")));
+    }
+    envelopes.reverse();
+    let result = receiver.ingest_batch(vec![], envelopes.clone());
+    assert_eq!(result.rejected, 0);
+    assert_eq!(receiver.docs[&doc].applied.len(), envelopes.len());
+    assert_eq!(receiver.doc_json(&doc), writer.doc_json(&doc));
+    let restored = Replica::restore(receiver.me.clone(), receiver.op(&receiver.space_id()).unwrap().clone(),
+        receiver.all_ops(), envelopes, None).unwrap();
+    assert_eq!(restored.doc_json(&doc), writer.doc_json(&doc));
+}
+
+#[test]
+fn lower_id_fork_waiting_on_a_dependency_remains_canonical() {
+    let (mut source, writer, wk) = pair(Role::Writer);
+    let mut receiver = Replica::restore(source.me.clone(), source.op(&source.space_id()).unwrap().clone(),
+        source.all_ops(), vec![], None).unwrap();
+    let doc = StreamId::new_doc();
+    let dependency = put(&mut source, doc, "base", "present");
+    let mut waiting = source.doc(&doc).unwrap().clone().with_actor(ActorId::from(wk.sign_pk().0.to_vec()));
+    waiting.put(ROOT, "fork", "waiting").unwrap();
+    waiting.commit();
+    let waiting_bytes = waiting.get_last_local_change().unwrap().bytes().to_vec();
+    let mut ready = AutoCommit::new().with_actor(ActorId::from(wk.sign_pk().0.to_vec()));
+    ready.put(ROOT, "fork", "ready").unwrap();
+    ready.commit();
+    let ready_bytes = ready.get_last_local_change().unwrap().bytes().to_vec();
+    // Generate both nonce variants together; this only selects delivery/fork
+    // ordering, and does not rely on any particular random ID value.
+    let (x, y) = (0..128).find_map(|_| {
+        let x = signed_doc_payload(&writer, doc, &waiting_bytes);
+        let y = signed_doc_payload(&writer, doc, &ready_bytes);
+        (x.id() < y.id()).then_some((x, y))
+    }).unwrap();
+    receiver.ingest_envelope(y).unwrap();
+    receiver.ingest_envelope(x).unwrap();
+    receiver.ingest_envelope(dependency).unwrap();
+    assert_eq!(receiver.doc_json(&doc), json!({"base": "present", "fork": "waiting"}));
+}
+
+fn empty_copy(r: &Replica) -> Replica {
+    Replica::restore(r.me.clone(), r.op(&r.space_id()).unwrap().clone(), r.all_ops(), vec![], None).unwrap()
+}
+
+fn assert_context_independent_rejection(mut receiver: Replica, good: Envelope, bad: Envelope,
+    doc: StreamId, expected: serde_json::Value) {
+    let mut other = empty_copy(&receiver);
+    receiver.ingest_envelope(bad.clone()).unwrap();
+    receiver.ingest_envelope(good.clone()).unwrap();
+    other.ingest_envelope(good.clone()).unwrap();
+    other.ingest_envelope(bad.clone()).unwrap();
+    assert_eq!(receiver.doc_json(&doc), expected);
+    assert_eq!(other.doc_json(&doc), expected);
+    for envelopes in [vec![bad.clone(), good.clone()], vec![good.clone(), bad.clone()]] {
+        let restored = Replica::restore(receiver.me.clone(), receiver.op(&receiver.space_id()).unwrap().clone(),
+            receiver.all_ops(), envelopes, None).unwrap();
+        assert_eq!(restored.doc_json(&doc), expected);
+        assert!(!restored.docs[&doc].applied.contains(&bad.id()));
+    }
+}
+
+#[test]
+fn omitted_actor_predecessor_is_rejected_in_every_delivery_order() {
+    let (receiver, writer, wk) = pair(Role::Writer);
+    let doc = StreamId::new_doc();
+    let mut first = AutoCommit::new().with_actor(ActorId::from(wk.sign_pk().0.to_vec()));
+    first.put(ROOT, "first", "valid").unwrap();
+    first.commit();
+    let good = signed_doc_payload(&writer, doc, &first.get_last_local_change().unwrap().bytes());
+    let mut malformed = AutoCommit::new().with_actor(ActorId::from(wk.sign_pk().0.to_vec()));
+    malformed.put(ROOT, "bad", "discard").unwrap();
+    malformed.commit();
+    let mut expanded = malformed.get_last_local_change().unwrap().decode();
+    expanded.seq = 2;
+    expanded.start_op = std::num::NonZeroU64::new(2).unwrap();
+    assert!(expanded.deps.is_empty());
+    let bad = signed_doc_payload(&writer, doc, &automerge::Change::from(expanded).bytes());
+    assert_context_independent_rejection(receiver, good, bad, doc, json!({"first": "valid"}));
+}
+
+#[test]
+fn omitted_object_creator_is_rejected_in_every_delivery_order() {
+    let (receiver, writer, wk) = pair(Role::Writer);
+    let doc = StreamId::new_doc();
+    let mut parent = AutoCommit::new().with_actor(ActorId::from(receiver.me.sign_pk().0.to_vec()));
+    let obj = parent.put_object(ROOT, "container", automerge::ObjType::Map).unwrap();
+    parent.commit();
+    let good = signed_doc_payload(&receiver, doc, &parent.get_last_local_change().unwrap().bytes());
+    let mut child = parent.with_actor(ActorId::from(wk.sign_pk().0.to_vec()));
+    child.put(&obj, "bad", "discard").unwrap();
+    child.commit();
+    let mut expanded = child.get_last_local_change().unwrap().decode();
+    expanded.deps.clear();
+    let bad = signed_doc_payload(&writer, doc, &automerge::Change::from(expanded).bytes());
+    assert_context_independent_rejection(receiver, good, bad, doc, json!({"container": {}}));
+}
+
+#[test]
+fn actor_predecessor_can_be_transitive_through_another_actor() {
+    let (mut first, mut second, _) = pair(Role::Writer);
+    let mut receiver = empty_copy(&first);
+    let doc = StreamId::new_doc();
+    let first_env = put(&mut first, doc, "first", "valid");
+    let first_hash = first.doc(&doc).unwrap().clone().get_last_local_change().unwrap().hash();
+    second.ingest_envelope(first_env.clone()).unwrap();
+    let second_env = put(&mut second, doc, "second", "valid");
+    let second_hash = second.doc(&doc).unwrap().clone().get_last_local_change().unwrap().hash();
+    let mut third = second.doc(&doc).unwrap().clone().with_actor(ActorId::from(first.me.sign_pk().0.to_vec()));
+    third.put(ROOT, "third", "valid").unwrap();
+    third.commit();
+    let mut expanded = third.get_last_local_change().unwrap().decode();
+    expanded.deps.retain(|hash| *hash != first_hash);
+    assert_eq!(expanded.deps, vec![second_hash]);
+    assert_eq!(expanded.seq, 2);
+    let third_env = signed_doc_payload(&first, doc, &automerge::Change::from(expanded).bytes());
+    let envelopes = vec![third_env, second_env, first_env];
+    receiver.ingest_batch(vec![], envelopes.clone());
+    let expected = json!({"first": "valid", "second": "valid", "third": "valid"});
+    assert_eq!(receiver.doc_json(&doc), expected);
+    let restored = Replica::restore(receiver.me.clone(), receiver.op(&receiver.space_id()).unwrap().clone(),
+        receiver.all_ops(), envelopes, None).unwrap();
+    assert_eq!(restored.doc_json(&doc), expected);
+}
+
+#[test]
+fn causal_operation_counters_allow_gaps_but_reject_overlap_and_overflow() {
+    let (mut receiver, writer, wk) = pair(Role::Writer);
+    let doc = StreamId::new_doc();
+    let mut source = AutoCommit::new().with_actor(ActorId::from(wk.sign_pk().0.to_vec()));
+    source.put(ROOT, "first", "valid").unwrap();
+    source.commit();
+    let mut expanded = source.get_last_local_change().unwrap().decode();
+    expanded.start_op = std::num::NonZeroU64::new(100).unwrap();
+    let mut gap = automerge::Change::from(expanded.clone());
+    let good = signed_doc_payload(&writer, doc, &gap.bytes());
+    receiver.ingest_envelope(good).unwrap();
+    assert_eq!(receiver.doc_json(&doc), json!({"first": "valid"}));
+    expanded.seq = 2;
+    expanded.deps = vec![gap.hash()];
+    let mut overlap = automerge::Change::from(expanded);
+    let bad = signed_doc_payload(&writer, doc, &overlap.bytes());
+    let bad_id = bad.id();
+    receiver.ingest_envelope(bad).unwrap();
+    assert!(receiver.doc_rejected.contains(&bad_id));
+    assert_eq!(receiver.doc_json(&doc), json!({"first": "valid"}));
+
+    let overflow_doc = StreamId::new_doc();
+    let mut two_ops = AutoCommit::new().with_actor(ActorId::from(wk.sign_pk().0.to_vec()));
+    two_ops.put(ROOT, "one", "bad").unwrap();
+    two_ops.put(ROOT, "two", "bad").unwrap();
+    two_ops.commit();
+    let mut expanded = two_ops.get_last_local_change().unwrap().decode();
+    expanded.start_op = std::num::NonZeroU64::new(u32::MAX as u64).unwrap();
+    let mut overflow = automerge::Change::from(expanded.clone());
+    let bytes = overflow.bytes().to_vec();
+    assert!(bounded_change::parse(&bytes).is_ok(), "upstream only checks the starting counter");
+    let bad = signed_doc_payload(&writer, overflow_doc, &bytes);
+    let bad_id = bad.id();
+    receiver.ingest_envelope(bad).unwrap();
+    assert!(receiver.doc_rejected.contains(&bad_id));
+    assert!(!receiver.docs.contains_key(&overflow_doc));
+
+    expanded.operations.clear();
+    expanded.start_op = std::num::NonZeroU64::new(1).unwrap();
+    let empty = automerge::Change::from(expanded);
+    assert_eq!(empty.len(), 0);
+    assert!(Replica::causal_metadata_valid(None, &empty));
+}

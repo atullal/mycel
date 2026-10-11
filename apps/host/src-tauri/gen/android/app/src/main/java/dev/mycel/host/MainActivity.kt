@@ -100,7 +100,7 @@ class MainActivity : TauriActivity() {
       } catch (e: ActivityNotFoundException) {
         Toast.makeText(this, "No app on this phone can open ${File(path).name}", Toast.LENGTH_LONG).show()
       } catch (e: Exception) {
-        Log.w("Mycel", "can't open $path", e)
+        Log.w("Mycel", "attachment open failed")
         Toast.makeText(this, "Can't open ${File(path).name}", Toast.LENGTH_LONG).show()
       }
     }

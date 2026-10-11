@@ -3660,6 +3660,7 @@ dependencies = [
 name = "mycel-host"
 version = "0.1.0"
 dependencies = [
+ "block2",
  "data-encoding",
  "jni 0.21.1",
  "libc",
@@ -3787,6 +3788,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "chacha20poly1305",
+ "core-foundation",
  "data-encoding",
  "hex",
  "libc",
@@ -3804,6 +3806,8 @@ dependencies = [
  "parking_lot",
  "postcard",
  "redb",
+ "security-framework",
+ "security-framework-sys",
  "serde",
  "serde_json",
  "tokio",
@@ -3858,11 +3862,14 @@ name = "mycel-sync"
 version = "0.1.0"
 dependencies = [
  "automerge",
+ "flate2",
+ "leb128",
  "mycel-crypto",
  "mycel-trust",
  "postcard",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.21",
 ]
 

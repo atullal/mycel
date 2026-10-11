@@ -27,6 +27,8 @@ const CTX_OP_SIG: &str = "mycel/v0/op";
 pub const MAX_PARENTS: usize = 64;
 pub const MAX_MEMBERS: usize = 1024;
 pub const MAX_PENDING: usize = 4096;
+/// One author cannot exhaust the shared missing-parent pool.
+pub const MAX_PENDING_PER_AUTHOR: usize = 256;
 const STATE_CACHE_MAX: usize = 1024;
 const CTX_OP_ID: &str = "mycel/v0/op-id";
 const CTX_LOCKBOX: &str = "mycel/v0/lockbox";
@@ -433,9 +435,9 @@ impl SpaceGraph {
         if self.contains(&id) {
             return Ok(Inserted::Duplicate);
         }
-        self.stage(op)?;
+        let ready = self.stage(op)?;
         let promoted = self.promote_pending();
-        if promoted.contains(&id) {
+        if ready || promoted.contains(&id) {
             self.reresolve();
             Ok(Inserted::New)
         } else {
@@ -447,22 +449,32 @@ impl SpaceGraph {
     /// reported; returns (ids that became part of the graph, rejected count).
     pub fn insert_many(&mut self, ops: impl IntoIterator<Item = SignedOp>) -> (Vec<OpId>, usize) {
         let mut rejected = 0;
+        let mut promoted = HashSet::new();
         for op in ops {
             if self.contains(&op.id()) {
                 continue;
             }
-            if self.stage(op).is_err() {
-                rejected += 1;
+            let id = op.id();
+            match self.stage(op) {
+                Ok(true) => {
+                    promoted.insert(id);
+                    // Release newly resolvable ops before admitting the next
+                    // item, so only genuinely missing parents consume quota.
+                    promoted.extend(self.promote_pending());
+                }
+                Ok(false) => {}
+                Err(_) => rejected += 1,
             }
         }
-        let promoted: Vec<OpId> = self.promote_pending().into_iter().collect();
+        promoted.extend(self.promote_pending());
         if !promoted.is_empty() {
             self.reresolve();
         }
-        (promoted, rejected)
+        (promoted.into_iter().collect(), rejected)
     }
 
-    fn stage(&mut self, op: SignedOp) -> Result<()> {
+    /// Returns true when inserted directly into the resolvable graph.
+    fn stage(&mut self, op: SignedOp) -> Result<bool> {
         op.verify_standalone()?;
         if op.op.space != Some(self.space) {
             return Err(TrustError::WrongSpace);
@@ -473,11 +485,18 @@ impl SpaceGraph {
         if !self.ever_named(&op.op.author) {
             return Err(TrustError::NotAuthorized("author was never added to this space"));
         }
+        if op.op.parents.iter().all(|parent| self.ops.contains_key(parent)) {
+            self.ops.insert(op.id(), op);
+            return Ok(true);
+        }
         if self.pending.len() >= MAX_PENDING {
             return Err(TrustError::Malformed("too many pending ops"));
         }
+        if self.pending.values().filter(|p| p.op.author == op.op.author).count() >= MAX_PENDING_PER_AUTHOR {
+            return Err(TrustError::Malformed("too many pending ops by author"));
+        }
         self.pending.insert(op.id(), op);
-        Ok(())
+        Ok(false)
     }
 
     /// Has any known op (valid or not) named `pk` as founder or added member?
@@ -514,17 +533,12 @@ impl SpaceGraph {
         }
     }
 
-    /// Ops (valid or not) that no other known op names as a parent.
+    /// Causally maximal valid ops, for authoring membership and content.
+    /// Invalid descendants cannot hide a valid ancestor. Ancestry still runs
+    /// through every stored op, and a genuinely wide valid frontier is never
+    /// truncated to fit the per-op parent limit.
     pub fn heads(&self) -> Vec<OpId> {
-        let parents: HashSet<&OpId> = self.ops.values().flat_map(|o| &o.op.parents).collect();
-        let mut heads: Vec<OpId> = self
-            .ops
-            .keys()
-            .filter(|id| !parents.contains(id))
-            .copied()
-            .collect();
-        heads.sort();
-        heads
+        self.res.heads.clone()
     }
 
     pub fn resolution(&self) -> &Resolution {

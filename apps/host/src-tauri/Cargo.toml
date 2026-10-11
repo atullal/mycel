@@ -37,9 +37,10 @@ tokio = { version = "1", features = ["sync"] }
 # The device's name for a new profile, and the share sheet for attachments.
 [target.'cfg(target_os = "ios")'.dependencies]
 objc2 = "0.6"
+block2 = "0.6"
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSArray", "NSString", "NSURL"] }
-objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-foundation", "UIActivityViewController", "UIDevice", "UIPopoverPresentationController", "UIPresentationController", "UIResponder", "UIView", "UIViewController"] }
+objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-foundation", "UIActivityViewController", "UIApplication", "UIDevice", "UIPopoverPresentationController", "UIPresentationController", "UIResponder", "UIView", "UIViewController"] }
 
 # Calls into MainActivity and MycelService (attachments, notifications, a
 # window for a reopened activity).

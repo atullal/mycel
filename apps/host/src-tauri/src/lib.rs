@@ -35,7 +35,9 @@ pub type Rt = Arc<Runtime>;
 
 fn network_mode(data_dir: &std::path::Path) -> Result<NetworkMode, String> {
     match std::env::var("MYCEL_NET").ok().as_deref().map(str::trim) {
-        None | Some("") => Ok(Runtime::saved_network_mode(data_dir).unwrap_or(NetworkMode::Internet)),
+        None | Some("") => Runtime::saved_network_mode(data_dir)
+            .map(|mode| mode.unwrap_or(NetworkMode::Internet))
+            .map_err(|e| format!("cannot read saved network mode: {e:#}")),
         Some("lan") => Ok(NetworkMode::Lan),
         Some("internet") => Ok(NetworkMode::Internet),
         Some("local") => Ok(NetworkMode::Local),
@@ -160,19 +162,121 @@ fn log_to_file(data_dir: &std::path::Path) {
         return;
     }
     let path = data_dir.join("mycel.log");
+    // Opening a fresh file after rotation avoids following a planted symlink.
+    // Device/link diagnostics remain opt-in through MYCEL_BLE_LOG.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Ok(previous) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+            && previous.metadata().is_ok_and(|metadata| metadata.is_file())
+        {
+            let _ = previous.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
     let _ = std::fs::rename(&path, data_dir.join("mycel.log.1"));
-    if let Ok(file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    if let Ok(file) = options.open(&path) {
         redirect_stderr(file);
     }
-    if std::env::var_os("MYCEL_BLE_LOG").is_none() {
-        // SAFETY: called during startup, before other threads read the environment.
-        unsafe { std::env::set_var("MYCEL_BLE_LOG", "1") };
+}
+
+/// Retain exactly one owned copy of a pipe writer until its owner is dropped.
+#[cfg(all(unix, any(target_os = "ios", test)))]
+fn retain_pipe_writer(
+    retained: &mut Option<std::os::fd::OwnedFd>,
+    writer: std::os::fd::RawFd,
+) -> std::io::Result<()> {
+    use std::os::fd::FromRawFd;
+    if retained.is_none() {
+        // SAFETY: dup creates a separately owned descriptor; an error acquires
+        // no descriptor and leaves the caller's original writer untouched.
+        let duplicate = unsafe { libc::dup(writer) };
+        if duplicate < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        *retained = Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) });
+    }
+    Ok(())
+}
+
+
+#[cfg(all(unix, test))]
+mod logging_tests {
+    use super::retain_pipe_writer;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    #[test]
+    fn retained_writer_prevents_eof_and_repeated_initialization_keeps_one_descriptor() {
+        let mut descriptors = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        let read = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+        let write = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+        let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+
+        let mut retained = None;
+        retain_pipe_writer(&mut retained, write.as_raw_fd()).unwrap();
+        let duplicate = retained.as_ref().unwrap().as_raw_fd();
+        for _ in 0..10 {
+            retain_pipe_writer(&mut retained, write.as_raw_fd()).unwrap();
+            assert_eq!(retained.as_ref().unwrap().as_raw_fd(), duplicate);
+        }
+        // Replacing stderr closes the original pipe writer. The retained copy
+        // must leave an empty pipe pending, rather than permanently EOF-ready.
+        drop(write);
+        let mut byte = 0u8;
+        assert_eq!(
+            unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(retained);
+        assert_eq!(
+            unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
+            0
+        );
+
+        let mut failed = None;
+        assert!(retain_pipe_writer(&mut failed, -1).is_err());
+        assert!(failed.is_none());
     }
 }
+
 
 #[cfg(unix)]
 fn redirect_stderr(file: std::fs::File) {
     use std::os::fd::AsRawFd;
+    #[cfg(target_os = "ios")]
+    {
+        // Tauri's Swift reader does not cancel on EOF. Keep its pipe open
+        // when redirecting stderr so an idle app cannot spin that reader.
+        static PIPE_WRITER: std::sync::Mutex<Option<std::os::fd::OwnedFd>> =
+            std::sync::Mutex::new(None);
+        let retained = PIPE_WRITER
+            .lock()
+            .map_err(|_| std::io::Error::other("iOS logging writer lock poisoned"))
+            .and_then(|mut writer| retain_pipe_writer(&mut writer, libc::STDERR_FILENO));
+        if let Err(error) = retained {
+            eprintln!("mycel-host: cannot retain iOS logging pipe: {error}");
+            return;
+        }
+    }
     // SAFETY: dup2 onto stderr; `file` stays open until dup2 has copied it.
     unsafe { libc::dup2(file.as_raw_fd(), 2) };
 }
@@ -225,37 +329,47 @@ fn edge_to_edge(window: &tauri::WebviewWindow) {
     });
 }
 
-/// iPhone and iPad: going to the background, ask iOS for the time it allows
-/// (about 30 s) so a message sent just before the phone locks still goes
-/// out. iOS ends the task when the time is up; we end it a little earlier.
+/// Flush as soon as the app is suspended and before releasing its remaining
+/// background time. The expiration handler ends the UIKit task exactly once.
 #[cfg(target_os = "ios")]
 fn finish_in_background(handle: &AppHandle) {
-    use objc2::msg_send;
-    use objc2::runtime::{AnyClass, AnyObject};
-    fn shared_app() -> Option<&'static AnyObject> {
-        let cls = AnyClass::get(c"UIApplication")?;
-        // SAFETY: +sharedApplication returns the app singleton (main thread).
-        let app: *mut AnyObject = unsafe { msg_send![cls, sharedApplication] };
-        // SAFETY: the singleton lives as long as the process.
-        unsafe { app.as_ref() }
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use objc2::MainThreadMarker;
+    use objc2_ui_kit::{UIApplication, UIBackgroundTaskInvalid};
+
+    fn end_task(task: &AtomicUsize) {
+        let Some(mtm) = MainThreadMarker::new() else { return };
+        // SAFETY: UIKit's immutable exported invalid-task sentinel.
+        let invalid = unsafe { UIBackgroundTaskInvalid };
+        let id = task.swap(invalid, Ordering::AcqRel);
+        if id != invalid {
+            UIApplication::sharedApplication(mtm).endBackgroundTask(id);
+        }
     }
-    let Some(app) = shared_app() else { return };
-    let none: *mut AnyObject = std::ptr::null_mut();
-    // SAFETY: on the main thread (Tauri's event loop); a nil expiration
-    // handler is allowed; returns an NSUInteger task id.
-    let task: usize = unsafe { msg_send![app, beginBackgroundTaskWithExpirationHandler: none] };
-    if task == 0 {
-        return; // UIBackgroundTaskInvalid
-    }
+
+    let Some(mtm) = MainThreadMarker::new() else { return };
+    let Some(runtime) = handle.try_state::<Rt>().map(|rt| rt.inner().clone()) else { return };
+    // SAFETY: UIKit's immutable exported invalid-task sentinel.
+    let invalid = unsafe { UIBackgroundTaskInvalid };
+    let task = Arc::new(AtomicUsize::new(invalid));
+    let expiration_task = task.clone();
+    let expiration = block2::RcBlock::new(move || end_task(&expiration_task));
+    let id = UIApplication::sharedApplication(mtm)
+        .beginBackgroundTaskWithExpirationHandler(Some(&expiration));
+    task.store(id, Ordering::Release);
     let handle = handle.clone();
     std::thread::spawn(move || {
+        if let Err(error) = runtime.flush() {
+            eprintln!("mycel-host: background persistence failed: {error}");
+        }
+        if id == invalid {
+            return;
+        }
         std::thread::sleep(std::time::Duration::from_secs(25));
-        let _ = handle.run_on_main_thread(move || {
-            if let Some(app) = shared_app() {
-                // SAFETY: ends the task begun above, on the main thread.
-                let _: () = unsafe { msg_send![app, endBackgroundTask: task] };
-            }
-        });
+        if let Err(error) = runtime.flush() {
+            eprintln!("mycel-host: background persistence failed: {error}");
+        }
+        let _ = handle.run_on_main_thread(move || end_task(&task));
     });
 }
 
@@ -357,7 +471,6 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
     };
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
-    log_to_file(&data_dir);
     let mode = network_mode(&data_dir)?;
     let name = std::env::var("MYCEL_NAME")
         .ok()
@@ -380,6 +493,8 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
             format!("cannot open Mycel data in {}: {e:#}{hint}", data_dir.display())
         })?;
 
+    // Identity/profile validation holds the exclusive lease before log rotation.
+    log_to_file(&data_dir);
     allow_attachment_files(app, &data_dir)?;
 
     let notifier = Arc::new(notify::Notifier::new(&runtime));

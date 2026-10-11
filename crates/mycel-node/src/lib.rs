@@ -13,6 +13,7 @@ pub mod api;
 pub mod dispatch;
 pub mod links;
 mod files;
+mod identity;
 mod runtime;
 pub mod store;
 

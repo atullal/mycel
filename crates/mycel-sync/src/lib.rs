@@ -10,13 +10,16 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use automerge::{ActorId, AutoCommit, Change};
+use automerge::{ActorId, AutoCommit};
 use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, Sig, SignPk, random};
 use mycel_trust::{EpochId, Inserted, Keyring, OpId, Role, SignedOp, SpaceGraph, SpaceId};
 use serde::{Deserialize, Serialize};
 
 pub use automerge;
 pub use mycel_trust;
+
+mod bounded_change;
+mod change_resources;
 
 pub type EnvelopeId = Hash32;
 
@@ -26,6 +29,16 @@ const CTX_CONTENT_AAD: &str = "mycel/v0/content";
 
 /// Envelopes carry small changes; large data goes through blobs.
 pub const MAX_ENVELOPE_CIPHERTEXT: usize = 1024 * 1024;
+/// Maximum serialized Automerge change size after decompression, including
+/// its framing. All document writers and readers enforce this same limit.
+pub const MAX_DOC_CHANGE_BYTES: usize = 1024 * 1024;
+/// Interoperability limits for column encoding expansion within one change.
+/// Larger edits must be split into multiple changes, even if highly compressible.
+pub const MAX_DOC_CHANGE_OPS: usize = 65_536;
+/// Shared count of logical column cells plus entries declared by group counts.
+pub const MAX_DOC_COLUMN_VALUES: usize = 1_048_576;
+/// Shared byte count of strings after expanding string-column runs.
+pub const MAX_DOC_COLUMN_STRING_BYTES: usize = 1024 * 1024;
 /// Max membership heads an envelope may reference (DoS hardening).
 pub const MAX_AUTH_HEADS: usize = 64;
 
@@ -270,6 +283,9 @@ pub struct Replica {
     /// Doc changes excluded because their author equivocated (two different
     /// changes with the same actor+seq): the lowest envelope id wins, everywhere.
     equivocated: HashSet<EnvelopeId>,
+    /// Payloads rejected during the current document rebuild. Deferred inputs
+    /// stay only in the existing valid_by_stream index, never in Automerge.
+    doc_rejected: HashSet<EnvelopeId>,
 }
 
 impl Replica {
@@ -330,6 +346,7 @@ impl Replica {
             validator: None,
             rule_rejected: HashSet::new(),
             equivocated: HashSet::new(),
+            doc_rejected: HashSet::new(),
         }
     }
 
@@ -640,11 +657,16 @@ impl Replica {
             if lost {
                 self.docs.remove(&stream);
                 self.feeds.remove(&stream);
+                self.clear_equivocation(stream);
             }
             self.valid_by_stream.insert(stream, valid.clone());
-            // (Re)apply everything; already-applied items are skipped.
-            for id in valid {
-                self.materialize(&id);
+            self.clear_doc_rejections(stream);
+            if stream.kind == StreamKind::Doc {
+                self.refresh_doc(stream);
+            } else {
+                for id in valid {
+                    self.materialize(&id);
+                }
             }
         }
     }
@@ -688,6 +710,10 @@ impl Replica {
     fn materialize(&mut self, id: &EnvelopeId) {
         let env = &self.envelopes[id];
         let stream = env.header.stream;
+        if stream.kind == StreamKind::Doc {
+            self.refresh_doc(stream);
+            return;
+        }
         let Some(key) = self.ring.get(&env.header.epoch) else {
             return; // opaque (e.g. we are a keeper, or joined after this epoch)
         };
@@ -696,46 +722,7 @@ impl Replica {
             return;
         };
         match stream.kind {
-            StreamKind::Doc => {
-                if self.docs.get(&stream).is_some_and(|d| d.applied.contains(id)) {
-                    return;
-                }
-                let Ok(change) = Change::from_bytes(plain) else {
-                    return;
-                };
-                // An author may only write under their own actor id.
-                if change.actor_id().to_bytes() != env.header.author.0 {
-                    return;
-                }
-                if self.equivocated.contains(id) {
-                    return;
-                }
-                let actor = ActorId::from(self.me.sign_pk().0.to_vec());
-                let state = self.docs.entry(stream).or_insert_with(|| DocState {
-                    doc: AutoCommit::new().with_actor(actor),
-                    applied: BTreeSet::new(),
-                    seqs: HashMap::new(),
-                });
-                let key = (change.actor_id().to_bytes().to_vec(), change.seq());
-                match state.seqs.get(&key) {
-                    Some((hash, _)) if *hash == change.hash() => {}
-                    Some((_, other)) => {
-                        // Equivocation: keep the lowest envelope id on every peer.
-                        let (winner, loser) = if id < other { (*id, *other) } else { (*other, *id) };
-                        self.equivocated.insert(loser);
-                        if winner == *id {
-                            self.rebuild_doc(stream);
-                        }
-                        return;
-                    }
-                    None => {
-                        state.seqs.insert(key, (change.hash(), *id));
-                    }
-                }
-                // Automerge queues changes whose deps haven't arrived yet.
-                let _ = state.doc.apply_changes([change]);
-                state.applied.insert(*id);
-            }
+            StreamKind::Doc => unreachable!("documents use refresh_doc"),
             StreamKind::Feed => {
                 if self.feeds.get(&stream).is_some_and(|f| f.items.contains_key(id)) {
                     return;
@@ -769,17 +756,182 @@ impl Replica {
         }
     }
 
-    /// Re-derive one document from its valid envelopes in canonical order.
+    /// Re-derive one document, including payload rejection and fork decisions.
     fn rebuild_doc(&mut self, stream: StreamId) {
         self.docs.remove(&stream);
-        let ids: Vec<EnvelopeId> = self
-            .valid_by_stream
-            .get(&stream)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_default();
-        for id in ids {
-            self.materialize(&id);
+        self.clear_doc_rejections(stream);
+        self.refresh_doc(stream);
+    }
+
+    fn clear_doc_rejections(&mut self, stream: StreamId) {
+        self.doc_rejected.retain(|id| self.envelopes[id].header.stream != stream);
+    }
+
+    /// The encrypted input index is also the deferred backlog. Do not allocate
+    /// another queue, retain parsed changes, or copy the entire ID set on retry.
+    fn doc_batch(&self, stream: StreamId, after: Option<EnvelopeId>) -> Vec<EnvelopeId> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        self.valid_by_stream.get(&stream).map(|ids| {
+            ids.range((after.map(Excluded).unwrap_or(Unbounded), Unbounded))
+                .take(256).copied().collect()
+        }).unwrap_or_default()
+    }
+
+    fn doc_change(&self, id: &EnvelopeId) -> std::result::Result<Option<automerge::Change>, ()> {
+        let env = &self.envelopes[id];
+        let Some(key) = self.ring.get(&env.header.epoch) else { return Ok(None); };
+        let plain = key.open(&env.header.nonce, &content_aad(&env.header), &env.ciphertext).map_err(|_| ())?;
+        let change = bounded_change::parse(&plain).map_err(|_| ())?;
+        if change.actor_id().to_bytes() != env.header.author.0 { return Err(()); }
+        Ok(Some(change))
+    }
+
+    /// Select canonical forks before retrying dependencies. A lower-ID fork
+    /// may depend on a later-ID change; selecting only already-applied forks
+    /// would repeatedly rebuild against its higher-ID competitor.
+    fn refresh_doc(&mut self, stream: StreamId) {
+        loop {
+            self.clear_equivocation(stream);
+            let mut winners = HashMap::new();
+            let mut after = None;
+            loop {
+                let batch = self.doc_batch(stream, after);
+                if batch.is_empty() { break; }
+                after = batch.last().copied();
+                for id in batch {
+                    if self.doc_rejected.contains(&id) { continue; }
+                    let change = match self.doc_change(&id) {
+                        Ok(Some(change)) => change,
+                        Ok(None) => continue,
+                        Err(()) => { self.doc_rejected.insert(id); continue; }
+                    };
+                    let key = (change.actor_id().to_bytes().to_vec(), change.seq());
+                    let winner = winners.entry(key).or_insert(change.hash());
+                    if *winner != change.hash() { self.equivocated.insert(id); }
+                }
+            }
+            drop(winners);
+            // Any newly selected fork invalidates its old materialization and
+            // all descendants. Recompute from the same encrypted input set.
+            if self.docs.get(&stream).is_some_and(|state| state.applied.iter().any(|id| {
+                self.equivocated.contains(id) || self.doc_rejected.contains(id)
+            })) {
+                self.docs.remove(&stream);
+            }
+            // No recursion and no upstream dependency queue: retry the stored
+            // IDs only while changes actually apply. A failed candidate is
+            // rejected, then fork selection is recomputed to permit fallback.
+            let rejected_before = self.doc_rejected.len();
+            loop {
+                let mut progressed = false;
+                let mut after = None;
+                loop {
+                    let batch = self.doc_batch(stream, after);
+                    if batch.is_empty() { break; }
+                    after = batch.last().copied();
+                    for id in batch { progressed |= self.apply_ready_doc(&id); }
+                }
+                if self.doc_rejected.len() != rejected_before { break; }
+                if !progressed { return; }
+            }
         }
+    }
+
+    /// Apply only when every dependency is present in the materialized doc.
+    /// Missing-dependency changes remain encrypted in the existing input index.
+    fn apply_ready_doc(&mut self, id: &EnvelopeId) -> bool {
+        let stream = self.envelopes[id].header.stream;
+        if self.equivocated.contains(id) || self.doc_rejected.contains(id)
+            || self.docs.get(&stream).is_some_and(|s| s.applied.contains(id)) {
+            return false;
+        }
+        let change = match self.doc_change(id) {
+            Ok(Some(change)) => change,
+            Ok(None) => return false,
+            Err(()) => { self.doc_rejected.insert(*id); return false; }
+        };
+        let state = self.docs.get(&stream);
+        if change.deps().iter().any(|dep| state.is_none_or(|s| automerge::ReadDoc::get_change_by_hash(&s.doc, dep).is_none())) {
+            return false;
+        }
+        if !Self::causal_metadata_valid(state, &change) {
+            self.doc_rejected.insert(*id);
+            return false;
+        }
+        let key = (change.actor_id().to_bytes().to_vec(), change.seq());
+        let hash = change.hash();
+        let canonical = state.and_then(|s| s.seqs.get(&key))
+            .map(|(_, other)| (*id).min(*other)).unwrap_or(*id);
+        let actor = ActorId::from(self.me.sign_pk().0.to_vec());
+        let mut candidate = state.map(|s| s.doc.clone())
+            .unwrap_or_else(|| AutoCommit::new().with_actor(actor));
+        // Validate semantics using only declared causal history. Applying to
+        // the full local doc first could accept undeclared actor/object refs
+        // merely because concurrent changes happened to arrive earlier.
+        let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let Ok(mut causal) = candidate.fork_at(change.deps()) else { return false; };
+            if causal.apply_changes([change.clone()]).is_err()
+                || causal.get_change_by_hash(&hash).is_none() {
+                return false;
+            }
+            // Only a causally valid change can enter the full document. Errors
+            // and panics discard both temporary docs and their bookkeeping.
+            candidate.apply_changes([change]).is_ok()
+                && candidate.get_change_by_hash(&hash).is_some()
+        }));
+        if !matches!(applied, Ok(true)) {
+            self.doc_rejected.insert(*id);
+            return false;
+        }
+        let state = match self.docs.entry(stream) {
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                let state = entry.into_mut();
+                state.doc = candidate;
+                state
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(DocState {
+                doc: candidate, applied: BTreeSet::new(), seqs: HashMap::new(),
+            }),
+        };
+        state.seqs.insert(key, (hash, canonical));
+        state.applied.insert(*id);
+        true
+    }
+
+    /// Automerge's actor sequence is consecutive within declared ancestry;
+    /// operation counters are Lamport counters, so gaps are allowed but no
+    /// counter may overlap causal history. The upstream graph stores u32 ends.
+    fn causal_metadata_valid(state: Option<&DocState>, change: &automerge::Change) -> bool {
+        let end = |c: &automerge::Change| {
+            let start = c.start_op().get();
+            let last = start.checked_add(c.len() as u64)?.checked_sub(1)?;
+            (start <= u32::MAX as u64 && last <= u32::MAX as u64).then_some(last)
+        };
+        if end(change).is_none() { return false; }
+        let mut seen = HashSet::new();
+        let mut todo = Vec::new();
+        for dep in change.deps() {
+            if seen.insert(*dep) { todo.push(*dep); }
+        }
+        let mut previous_seq = 0u64;
+        let mut previous_counter = 0u64;
+        while let Some(hash) = todo.pop() {
+            let Some(prior) = state.and_then(|s| automerge::ReadDoc::get_change_by_hash(&s.doc, &hash)) else {
+                return false;
+            };
+            if prior.actor_id() == change.actor_id() { previous_seq = previous_seq.max(prior.seq()); }
+            let Some(last) = end(&prior) else { return false; };
+            previous_counter = previous_counter.max(last);
+            for dep in prior.deps() {
+                if seen.insert(*dep) { todo.push(*dep); }
+            }
+        }
+        previous_seq.checked_add(1) == Some(change.seq())
+            && change.start_op().get() > previous_counter
+    }
+
+    fn clear_equivocation(&mut self, stream: StreamId) {
+        self.equivocated.retain(|id| self.envelopes[id].header.stream != stream);
     }
 
     // ───────────── app-facing ─────────────
@@ -877,14 +1029,31 @@ impl Replica {
         let Some(mut change) = state.doc.get_last_local_change() else {
             return Ok((ops, None));
         };
+        if let Err(err) = bounded_change::validate(change.raw_bytes()) {
+            self.rebuild_doc(doc);
+            return Err(err);
+        }
+        if !Self::causal_metadata_valid(self.docs.get(&doc), &change) {
+            self.rebuild_doc(doc);
+            return Err(SyncError::Encoding);
+        }
         let plaintext = change.bytes().to_vec();
-        let env = self.seal(doc, epoch, &plaintext)?;
+        let env = match self.seal(doc, epoch, &plaintext) {
+            Ok(env) => env,
+            Err(err) => {
+                self.rebuild_doc(doc);
+                return Err(err);
+            }
+        };
         let id = env.id();
-        self.ingest_envelope(env.clone())?;
-        if self.status(&id) != Status::Valid {
+        if let Err(err) = self.ingest_envelope(env.clone()) {
+            self.rebuild_doc(doc);
+            return Err(err);
+        }
+        if self.status(&id) != Status::Valid
+            || !self.docs.get(&doc).is_some_and(|state| state.applied.contains(&id)) {
             // Roll the local doc back to the valid set.
-            self.docs.remove(&doc);
-            self.full_refresh();
+            self.rebuild_doc(doc);
         }
         Ok((ops, Some(env)))
     }

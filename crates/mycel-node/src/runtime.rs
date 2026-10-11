@@ -62,6 +62,17 @@ pub fn chat_rules_hash() -> String {
 }
 const CONTACT_PREFIX: &str = "mycel:";
 
+/// Bound unsolicited request metadata independently of blob consent. Accepted
+/// conversations and their sync history are outside these admission limits.
+const MAX_PENDING_REQUESTS: usize = 256;
+const MAX_PENDING_PER_INVITER: usize = 32;
+
+fn may_record_request(requests: &BTreeMap<SpaceId, SignPk>, from: &SignPk, space: &SpaceId) -> bool {
+    requests.contains_key(space)
+        || (requests.len() < MAX_PENDING_REQUESTS
+            && requests.values().filter(|peer| *peer == from).count() < MAX_PENDING_PER_INVITER)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StoredContact {
     keys: MemberKeys,
@@ -83,6 +94,7 @@ pub struct RuntimeOptions {
 
 pub struct Runtime {
     data_dir: PathBuf,
+    _profile_lock: crate::identity::ProfileLock,
     keys: Arc<DeviceKeys>,
     node: Node,
     store: Arc<DbStore>,
@@ -98,11 +110,11 @@ pub struct Runtime {
     /// Names people announced (Profile ops), across all conversations.
     announced: Mutex<HashMap<SignPk, String>>,
     /// Conversations from non-contacts awaiting accept/decline: space → inviter.
-    requests: Mutex<BTreeMap<SpaceId, SignPk>>,
+    requests: Arc<Mutex<BTreeMap<SpaceId, SignPk>>>,
     /// Just-accepted invites not yet classified (see `invite_policy`).
     arriving: Arc<Mutex<HashSet<SpaceId>>>,
     /// Declined conversations we keep locally but never show.
-    hidden: Mutex<BTreeSet<SpaceId>>,
+    hidden: Arc<Mutex<BTreeSet<SpaceId>>>,
     /// Keys whose invites we refuse at the network layer.
     blocked: Arc<Mutex<BTreeSet<SignPk>>>,
     /// Direct-address hints from contact codes (for networks without mDNS).
@@ -167,8 +179,7 @@ impl CallHost for RuntimeCallHost {
 
 fn load_set<T: serde::de::DeserializeOwned + Ord>(store: &DbStore, key: &str) -> Result<BTreeSet<T>> {
     Ok(store
-        .kv_get(key)?
-        .and_then(|b| postcard::from_bytes::<Vec<T>>(&b).ok())
+        .kv_decode::<Vec<T>>(key)?
         .unwrap_or_default()
         .into_iter()
         .collect())
@@ -347,26 +358,6 @@ fn net_mode(m: NetworkMode) -> NetMode {
     }
 }
 
-fn load_or_create_identity(dir: &Path) -> Result<DeviceKeys> {
-    let path = dir.join("identity.key");
-    if let Ok(bytes) = std::fs::read(&path) {
-        let seed: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| anyhow!("identity.key is corrupt"))?;
-        return Ok(DeviceKeys::from_seed(seed));
-    }
-    let keys = DeviceKeys::generate();
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, keys.seed())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, &path)?;
-    Ok(keys)
-}
-
 // ───────────────────────────── runtime ─────────────────────────────
 
 impl Runtime {
@@ -388,9 +379,13 @@ impl Runtime {
 
     pub async fn open_with(opts: RuntimeOptions) -> Result<Arc<Runtime>> {
         let dir = opts.data_dir;
-        std::fs::create_dir_all(&dir)?;
-        let keys = Arc::new(load_or_create_identity(&dir)?);
+        let profile_lock = crate::identity::ProfileLock::acquire(&dir)?;
+        let keys = Arc::new(crate::identity::load(&dir, &profile_lock)?);
+        // Validate persisted mode before opening any network transport.
+        let next_mode = Self::saved_network_mode(&dir)?.unwrap_or(opts.mode);
         let store = DbStore::open(dir.join("mycel.redb"))?;
+        // Reject malformed persisted rows before spawning any transport task.
+        let stored_spaces = store.load_spaces()?;
 
         let stored_name = store.kv_get("name")?.and_then(|b| String::from_utf8(b).ok());
         let name = match (opts.name, stored_name) {
@@ -408,8 +403,7 @@ impl Runtime {
             }
         };
         let contacts: BTreeMap<SignPk, StoredContact> = store
-            .kv_get("contacts")?
-            .and_then(|b| postcard::from_bytes::<Vec<StoredContact>>(&b).ok())
+            .kv_decode::<Vec<StoredContact>>("contacts")?
             .unwrap_or_default()
             .into_iter()
             .map(|c| (c.keys.sign_pk, c))
@@ -428,34 +422,57 @@ impl Runtime {
         if std::env::var("MYCEL_IP").is_ok_and(|v| v.trim() == "0") {
             nopts.ip = false;
         }
-        // v0 policy: accept any conversation we're added to (the inviter needed
-        // our contact card to add us). Blocking lists can come later.
-        // Invites from blocked keys are refused outright; invites from anyone
-        // else are accepted, and non-contacts land as message requests.
+        // Load application consent before starting the network endpoint.
         let blocked: Arc<Mutex<BTreeSet<SignPk>>> = Arc::new(Mutex::new(load_set(&store, "blocked")?));
-        let blocked_for_policy = blocked.clone();
-        // Spaces accepted by the network layer but not yet sorted into
-        // contact conversation vs message request (the event bridge does that):
-        // hidden until then, so a request never shows up as a normal chat.
+        let requests: Arc<Mutex<BTreeMap<SpaceId, SignPk>>> = Arc::new(Mutex::new(
+            store.kv_decode::<Vec<(SpaceId, SignPk)>>("requests")?.unwrap_or_default().into_iter().collect(),
+        ));
+        let hidden: Arc<Mutex<BTreeSet<SpaceId>>> = Arc::new(Mutex::new(load_set(&store, "hidden")?));
         let arriving: Arc<Mutex<HashSet<SpaceId>>> = Arc::default();
-        let arriving_for_policy = arriving.clone();
+        let (blocked_for_policy, hidden_for_policy) = (blocked.clone(), hidden.clone());
+        let (arriving_for_policy, requests_for_policy, request_store) = (arriving.clone(), requests.clone(), store.clone());
+        let keeper = opts.keeper;
         nopts.invite_policy = Arc::new(move |from, space| {
-            let ok = !blocked_for_policy.lock().contains(from);
-            if ok {
+            // Serialize refusal checks and admission with accept/decline.
+            let mut requests = requests_for_policy.lock();
+            let blocked = blocked_for_policy.lock().contains(from);
+            let hidden = hidden_for_policy.lock().contains(space);
+            if blocked || hidden {
+                return false;
+            }
+            if !keeper {
+                // Persist provisional consent *before* network membership can
+                // be persisted. A crash before the event bridge classifies this
+                // invitation must restore a request, never an accepted chat.
+                if !may_record_request(&requests, from, space) {
+                    return false;
+                }
+                if !requests.contains_key(space) {
+                    let mut pending = requests.clone();
+                    pending.insert(*space, *from);
+                    let list: Vec<_> = pending.iter().map(|(a, b)| (*a, *b)).collect();
+                    let saved = postcard::to_allocvec(&list).map_err(anyhow::Error::from).and_then(|bytes| {
+                        request_store.kv_batch_durable(vec![("requests".into(), Some(bytes))])
+                    });
+                    if saved.is_err() {
+                        return false;
+                    }
+                    *requests = pending;
+                }
                 arriving_for_policy.lock().insert(*space);
             }
-            ok
+            true
         });
-        let requests: BTreeMap<SpaceId, SignPk> = store
-            .kv_get("requests")?
-            .and_then(|b| postcard::from_bytes::<Vec<(SpaceId, SignPk)>>(&b).ok())
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
-        let hidden: BTreeSet<SpaceId> = load_set(&store, "hidden")?;
+        let (requests_for_blobs, arriving_for_blobs, hidden_for_blobs) =
+            (requests.clone(), arriving.clone(), hidden.clone());
+        nopts.blob_push_policy = Arc::new(move |_peer, space| {
+            let arriving = arriving_for_blobs.lock().contains(&space);
+            let pending = requests_for_blobs.lock().contains_key(&space);
+            let hidden = hidden_for_blobs.lock().contains(&space);
+            keeper || (!arriving && !pending && !hidden)
+        });
         let hints: BTreeMap<SignPk, Vec<String>> = store
-            .kv_get("hints")?
-            .and_then(|b| postcard::from_bytes::<Vec<(SignPk, Vec<String>)>>(&b).ok())
+            .kv_decode::<Vec<(SignPk, Vec<String>)>>("hints")?
             .unwrap_or_default()
             .into_iter()
             .collect();
@@ -470,9 +487,8 @@ impl Runtime {
             .map_err(|e| anyhow!("chat rules failed to load: {e:?}"))?;
         nopts.feed_validator = Some(Arc::new(WasmRules(engine)));
         let node = Node::spawn(keys.clone(), nopts).await?;
-        let next_mode = Self::saved_network_mode(&dir).unwrap_or(opts.mode);
 
-        for (space, (ops, envs)) in store.load_spaces()? {
+        for (space, (ops, envs)) in stored_spaces {
             let Some(genesis) = ops.iter().find(|o| o.id() == space).cloned() else {
                 continue;
             };
@@ -489,6 +505,7 @@ impl Runtime {
         let me = keys.sign_pk();
         let rt = Arc::new_cyclic(|weak| Runtime {
             data_dir: dir,
+            _profile_lock: profile_lock,
             keys,
             node,
             store,
@@ -500,9 +517,9 @@ impl Runtime {
             keeper: opts.keeper,
             views: Mutex::default(),
             announced: Mutex::default(),
-            requests: Mutex::new(requests),
+            requests,
             arriving,
-            hidden: Mutex::new(hidden),
+            hidden,
             blocked,
             hints: Mutex::new(hints),
             calls: CallManager::new(Arc::new(RuntimeCallHost { me, rt: weak.clone() })),
@@ -544,6 +561,11 @@ impl Runtime {
 
     pub fn is_keeper(&self) -> bool {
         self.keeper
+    }
+
+    /// Durability barrier used when the host enters the background.
+    pub fn flush(&self) -> Result<()> {
+        self.store.flush()
     }
 
     pub async fn shutdown(&self) -> Result<()> {
@@ -707,12 +729,14 @@ impl Runtime {
 
     /// The network mode saved by `set_network_mode`, if any. Hosts read it
     /// before opening the runtime (the mode is fixed while running).
-    pub fn saved_network_mode(data_dir: &Path) -> Option<NetworkMode> {
-        let s = std::fs::read_to_string(data_dir.join("network-mode")).ok()?;
-        match s.trim() {
-            "lan" => Some(NetworkMode::Lan),
-            "internet" => Some(NetworkMode::Internet),
-            _ => None,
+    pub fn saved_network_mode(data_dir: &Path) -> Result<Option<NetworkMode>> {
+        let Some(bytes) = crate::identity::read_optional(&data_dir.join("network-mode"), 64)? else {
+            return Ok(None);
+        };
+        match std::str::from_utf8(&bytes).context("corrupt saved network mode")?.trim() {
+            "lan" => Ok(Some(NetworkMode::Lan)),
+            "internet" => Ok(Some(NetworkMode::Internet)),
+            _ => bail!("corrupt saved network mode"),
         }
     }
 
@@ -724,7 +748,7 @@ impl Runtime {
             NetworkMode::Internet => "internet",
             NetworkMode::Local => bail!("local mode is for tests"),
         };
-        std::fs::write(self.data_dir.join("network-mode"), word)?;
+        crate::identity::atomic_write(&self.data_dir.join("network-mode"), word.as_bytes(), true)?;
         *self.next_mode.lock() = mode;
         self.emit(Event::NetworkChanged);
         Ok(self.network_status())
@@ -1169,6 +1193,13 @@ impl Runtime {
             }
         }
         let (space, a) = found.context("unknown attachment")?;
+        // Consent applies even to already-cached files. Do not require current
+        // membership: accepted history remains available after leaving a chat.
+        if self.requests.lock().contains_key(&space) || self.arriving.lock().contains(&space)
+            || self.hidden.lock().contains(&space)
+        {
+            bail!("accept this message request before downloading attachments");
+        }
         let out = self.file_path(&a).context("no file path")?;
         if out.exists() {
             return Ok(out.to_string_lossy().into_owned());
@@ -1323,22 +1354,18 @@ impl Runtime {
         Ok(())
     }
 
-    fn save_requests(&self) {
-        let list: Vec<(SpaceId, SignPk)> = self.requests.lock().iter().map(|(a, b)| (*a, *b)).collect();
-        self.store.kv_put("requests", postcard::to_allocvec(&list).unwrap());
-    }
-
-    fn save_set<T: serde::Serialize + Copy>(&self, key: &str, set: &BTreeSet<T>) {
-        let list: Vec<T> = set.iter().copied().collect();
-        self.store.kv_put(key, postcard::to_allocvec(&list).unwrap());
-    }
-
     /// Accept a message request: the inviter becomes a contact (with the name
     /// they announced) and we introduce ourselves.
     pub fn accept_request(&self, id: ConversationId) -> Result<ConversationSummary> {
         let space = parse_space(&id)?;
-        let inviter = self.requests.lock().remove(&space).context("not a message request")?;
-        self.save_requests();
+        let inviter = {
+            let mut requests = self.requests.lock();
+            let inviter = *requests.get(&space).context("not a message request")?;
+            let list: Vec<_> = requests.iter().filter(|(s, _)| **s != space).map(|(s, p)| (*s, *p)).collect();
+            self.store.kv_batch_durable(vec![("requests".into(), Some(postcard::to_allocvec(&list)?))])?;
+            requests.remove(&space);
+            inviter
+        };
         let keys = self.node.with_space(&space, |r| {
             r.members().into_iter().find(|(k, _)| k.sign_pk == inviter).map(|(k, _)| k)
         })?;
@@ -1358,24 +1385,31 @@ impl Runtime {
     /// Decline a message request (leave it), optionally blocking the inviter.
     pub fn decline_request(&self, id: ConversationId, block: bool) -> Result<()> {
         let space = parse_space(&id)?;
-        let inviter = self.requests.lock().remove(&space).context("not a message request")?;
-        self.save_requests();
+        // Persist all refusal state atomically before relaxing the pending
+        // gate. Keep lock order consistent with the push policy.
+        {
+            let mut requests = self.requests.lock();
+            let inviter = *requests.get(&space).context("not a message request")?;
+            let mut hidden = self.hidden.lock();
+            let mut blocked = self.blocked.lock();
+            let request_list: Vec<_> = requests.iter().filter(|(s, _)| **s != space).map(|(s, p)| (*s, *p)).collect();
+            let mut hidden_next = hidden.clone();
+            hidden_next.insert(space);
+            let mut blocked_next = blocked.clone();
+            if block {
+                blocked_next.insert(inviter);
+            }
+            self.store.kv_batch_durable(vec![
+                ("requests".into(), Some(postcard::to_allocvec(&request_list)?)),
+                ("hidden".into(), Some(postcard::to_allocvec(&hidden_next.iter().copied().collect::<Vec<_>>())?)),
+                ("blocked".into(), Some(postcard::to_allocvec(&blocked_next.iter().copied().collect::<Vec<_>>())?)),
+            ])?;
+            *hidden = hidden_next;
+            *blocked = blocked_next;
+            requests.remove(&space);
+        }
         let _ = self.node.with_space(&space, |r| r.leave());
         self.touch(space);
-        let hidden = {
-            let mut h = self.hidden.lock();
-            h.insert(space);
-            h.clone()
-        };
-        self.save_set("hidden", &hidden);
-        if block {
-            let blocked = {
-                let mut b = self.blocked.lock();
-                b.insert(inviter);
-                b.clone()
-            };
-            self.save_set("blocked", &blocked);
-        }
         self.emit(Event::ConversationUpdated { conversation: id });
         Ok(())
     }
@@ -1536,16 +1570,30 @@ async fn bridge(rt: Weak<Runtime>, mut rx: broadcast::Receiver<NetEvent>) {
                 if !rt.keeper {
                     let known = rt.contacts.lock().contains_key(&from);
                     if known {
+                        let cleared = {
+                            let mut requests = rt.requests.lock();
+                            let list: Vec<_> = requests.iter().filter(|(s, _)| **s != space).map(|(s, p)| (*s, *p)).collect();
+                            let result = postcard::to_allocvec(&list).map_err(anyhow::Error::from).and_then(|bytes| {
+                                rt.store.kv_batch_durable(vec![("requests".into(), Some(bytes))])
+                            });
+                            if result.is_ok() {
+                                requests.remove(&space);
+                            }
+                            result.is_ok()
+                        };
+                        if !cleared {
+                            // Storage failure retains the conservative request.
+                            continue;
+                        }
                         // a contact added us: introduce ourselves right away
                         if rt.my_role(&space).is_some_and(Role::can_write) {
                             let name = rt.name.lock().clone();
                             let _ = rt.post(space, ChatOp::Profile { name });
                         }
-                    } else {
-                        // a stranger: message request; nothing is trusted or posted yet
-                        rt.requests.lock().insert(space, from);
-                        rt.save_requests();
                     }
+                    // Stranger requests were persisted by invite_policy before
+                    // admission. A concurrent accept/decline may already have
+                    // removed one by the time this event is handled.
                 }
                 rt.arriving.lock().remove(&space);
                 rt.emit(Event::ConversationAdded { conversation: space.to_string() });
@@ -1598,6 +1646,32 @@ fn sample_rate(s: &mut std::collections::VecDeque<(Instant, u64)>, now: Instant,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pending_request_limits_apply_before_admission_and_keep_repeats_idempotent() {
+        use super::*;
+        fn space(n: usize) -> SpaceId {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            Hash32(bytes)
+        }
+        let first = SignPk([1; 32]);
+        let second = SignPk([2; 32]);
+        let mut pending = BTreeMap::new();
+        for n in 0..MAX_PENDING_PER_INVITER {
+            assert!(may_record_request(&pending, &first, &space(n)));
+            pending.insert(space(n), first);
+        }
+        assert!(!may_record_request(&pending, &first, &space(32)));
+        assert!(may_record_request(&pending, &second, &space(32)));
+        for n in MAX_PENDING_PER_INVITER..MAX_PENDING_REQUESTS {
+            let peer = SignPk([2 + (n / MAX_PENDING_PER_INVITER) as u8; 32]);
+            assert!(may_record_request(&pending, &peer, &space(n)));
+            pending.insert(space(n), peer);
+        }
+        assert!(!may_record_request(&pending, &second, &space(MAX_PENDING_REQUESTS)));
+        assert!(may_record_request(&pending, &first, &space(0)), "existing request survives both limits");
+    }
+
     use super::sanitize_file_name as s;
 
     #[test]
