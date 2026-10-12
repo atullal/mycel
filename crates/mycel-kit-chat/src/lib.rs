@@ -266,6 +266,34 @@ mod tests {
     }
 
     #[test]
+    fn deletion_clears_all_media_and_reactions_and_cannot_be_undone_by_later_ops() {
+        for (mime, name) in [("image/png", "photo.png"), ("text/plain", "file.txt"), ("audio/mp4", "voice.m4a")] {
+            let attachment = AttachmentRef {
+                blob: Hash32([20; 32]), key: [21; 32], nonce: [22; 24],
+                name: name.into(), mime: mime.into(), size: 123,
+            };
+            let target = Hash32([1; 32]);
+            let mut items = vec![
+                item(1, 1, Role::Writer, ChatOp::Text { body: "caption".into(), reply_to: None, attachments: vec![attachment.clone()] }),
+                item(2, 2, Role::Writer, ChatOp::React { target, emoji: "test".into(), on: true }),
+                item(3, 2, Role::Admin, ChatOp::Delete { target }),
+            ];
+            let forged = reduce(&items);
+            assert!(!forged.messages[0].deleted);
+            assert_eq!(forged.messages[0].attachments, vec![attachment]);
+            items.extend([
+                item(4, 1, Role::Writer, ChatOp::Delete { target }),
+                item(5, 1, Role::Writer, ChatOp::Edit { target, body: "resurrect".into() }),
+                item(6, 2, Role::Writer, ChatOp::React { target, emoji: "test".into(), on: true }),
+            ]);
+            let deleted = reduce(&items);
+            let message = &deleted.messages[0];
+            assert!(message.deleted);
+            assert!(message.body.is_empty() && message.attachments.is_empty() && message.reactions.is_empty());
+        }
+    }
+
+    #[test]
     fn reactions_toggle_and_receipts_track_unread() {
         let items = vec![
             text(1, 1, "a"),

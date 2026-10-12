@@ -907,3 +907,20 @@
     display: none;
   }
 }
+
+/* Small text fields make iOS zoom the whole webview on focus. That zoom
+   survives keyboard dismissal and displaces the app's navigation controls.
+   Preserve larger inherited text and user pinch zoom. */
+@media (pointer: coarse) {
+  :root input,
+  :root textarea,
+  :root select {
+    font-size: max(1em, 16px);
+  }
+}
+
+/* Conversation navigation belongs in its header on a phone. */
+@media (max-width: 720px) {
+  .host:has(.mx-root.has-selection) { grid-template-rows: minmax(0, 1fr); }
+  .host:has(.mx-root.has-selection) > .rail { display: none; }
+}

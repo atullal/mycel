@@ -48,6 +48,9 @@ export interface Commands {
   ];
   edit_message: [{ id: ConversationId; message: MessageId; body: string }, null];
   delete_message: [{ id: ConversationId; message: MessageId }, null];
+  delete_message_local: [{ id: ConversationId; message: MessageId }, null];
+  restore_message_local: [{ id: ConversationId; message: MessageId }, null];
+  search_messages: [{ id: ConversationId; query: string; limit?: number }, MessageView[]];
   toggle_reaction: [{ id: ConversationId; message: MessageId; emoji: string }, null];
   mark_read: [{ id: ConversationId }, null];
   set_typing: [{ id: ConversationId }, null];

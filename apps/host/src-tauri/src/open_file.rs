@@ -91,8 +91,8 @@ fn platform_open(app: &AppHandle, path: PathBuf) -> Result<(), String> {
                 let Ok(arg) = env.new_string(path.to_string_lossy()) else { return };
                 // MainActivity.openFile (gen/android/.../MainActivity.kt)
                 let res = env.call_method(activity, "openFile", "(Ljava/lang/String;)V", &[(&arg).into()]);
-                if let Err(e) = res {
-                    eprintln!("mycel-host: can't open {}: {e}", path.display());
+                if res.is_err() {
+                    eprintln!("mycel-host: attachment open failed");
                     let _ = env.exception_clear();
                 }
             });

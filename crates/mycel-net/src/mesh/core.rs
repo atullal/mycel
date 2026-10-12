@@ -230,8 +230,8 @@ pub struct Config {
     pub max_internet_hops: usize,
     /// Reachability records a gateway publishes for others.
     pub max_records: usize,
-    /// Announcement signatures remembered as checked (an (origin, seqno)
-    /// is verified once). A simulator with stubbed signatures keeps this
+    /// Announcement signed identities remembered as checked (including the
+    /// signature, excluding only mutable hops/cost). A simulator with stubbed signatures keeps this
     /// small: it is most of a router's memory.
     pub verified_max: usize,
     /// Seed for jitter (deterministic simulations).
@@ -306,6 +306,25 @@ pub struct Announce {
     pub uplink: u32,
     pub name: Arc<str>,
     pub sig: Sig,
+}
+
+/// Cache identity includes every signed field and the signature itself.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct VerifiedAnnounce {
+    origin: SignPk,
+    seq: u64,
+    flags: u8,
+    scope: u8,
+    uplink: u32,
+    name: Arc<str>,
+    sig: Sig,
+}
+
+impl From<&Announce> for VerifiedAnnounce {
+    fn from(a: &Announce) -> Self {
+        Self { origin: a.origin, seq: a.seq, flags: a.flags, scope: a.scope,
+            uplink: a.uplink, name: a.name.clone(), sig: a.sig }
+    }
 }
 
 /// The fields of our next announcement, for the caller to sign.
@@ -576,7 +595,7 @@ pub struct Router {
     /// Waypoints offered to QUIC per destination.
     published: Map<SignPk, Vec<SignPk>>,
     reasm: Map<(SignPk, u32), Reasm>,
-    verified: Set<(SignPk, u64)>,
+    verified: Set<VerifiedAnnounce>,
     total_budget: Bucket,
     gateway_budget: Bucket,
     reach: Map<SignPk, Reach>,
@@ -1008,7 +1027,7 @@ impl Router {
     }
 
     /// An announcement from a neighbour. `verify` checks the origin's
-    /// signature; it runs once per (origin, seq), after the cheap checks.
+    /// signature; it runs once per signed identity, after the cheap checks.
     pub fn on_announce(
         &mut self,
         from: SignPk,
@@ -1040,7 +1059,8 @@ impl Router {
             self.stats.announcements_stale += 1;
             return;
         }
-        if !self.verified.contains(&(a.origin, a.seq)) {
+        let verified = VerifiedAnnounce::from(&a);
+        if !self.verified.contains(&verified) {
             if !verify(&a) {
                 self.stats.announcements_forged += 1;
                 return;
@@ -1048,7 +1068,9 @@ impl Router {
             if self.verified.len() >= self.cfg.verified_max {
                 self.verified.clear();
             }
-            self.verified.insert((a.origin, a.seq));
+            if self.cfg.verified_max > 0 {
+                self.verified.insert(verified);
+            }
         }
         if a.cost == INFINITY {
             self.on_retraction(from, a.origin, a.seq, now);

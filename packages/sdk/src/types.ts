@@ -45,6 +45,10 @@ export interface Member {
 
 export interface ConversationSummary {
   id: ConversationId;
+  /** Original encrypted spaces represented by this conversation, including id. */
+  aliases: ConversationId[];
+  /** Stable display identity across late-arriving direct-chat aliases. Not a wire-space ID. */
+  threadKey: string;
   title: string;
   /** True for a 1:1 conversation. */
   direct: boolean;

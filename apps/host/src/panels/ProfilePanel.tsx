@@ -1,11 +1,15 @@
 import { useState } from "react";
+import { isMobile } from "@mycel/sdk";
 import { useProfile } from "@mycel/sdk/react";
 import { Glyph } from "../icons.tsx";
 import { applyTheme, readTheme, type ThemeChoice } from "../theme.ts";
 import { Qr } from "./Qr.tsx";
 import { Avatar, errorText, shortId } from "./common.tsx";
+import type { NotificationPermission } from "../notifications.ts";
 
-export function ProfilePanel() {
+export function ProfilePanel({ notifications }: {
+  notifications?: { native: boolean; permission: NotificationPermission; error: string | null; checkPermission: () => Promise<void> };
+}) {
   const { profile, setName, error: loadError } = useProfile();
   const [editing, setEditing] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -96,6 +100,21 @@ export function ProfilePanel() {
           </button>
         </div>
       </section>
+
+      {notifications?.native && <section className="p-card" aria-label="Notifications">
+        <h4>Notifications</h4>
+        <p className="p-help" role="status">
+          {notifications.permission === "granted" ? "Enabled for incoming messages, requests and calls. Names and message contents stay private."
+            : notifications.permission === "denied" ? "Disabled in device settings. Allow notifications for Mycel in Settings to receive alerts."
+            : notifications.permission === "checking" ? "Checking notification permission…"
+            : "Allow notifications to receive message and call alerts."}
+        </p>
+        {isMobile() && <p className="p-help">Alerts arrive while Mycel is connected. Your phone may pause the connection when Mycel is in the background.</p>}
+        {notifications.permission !== "granted" && <button className="h-btn h-btn-quiet" onClick={() => void notifications.checkPermission()}>
+          {notifications.permission === "prompt" ? "Enable notifications" : "Check notification settings"}
+        </button>}
+        {notifications.error && <p className="p-error" role="alert">{notifications.error}</p>}
+      </section>}
 
       <section className="p-card">
         <h4>Appearance</h4>

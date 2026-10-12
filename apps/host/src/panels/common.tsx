@@ -1,5 +1,6 @@
 // Small pieces shared by the host panels. The host deliberately does not import
-// UI from apps: apps and host only meet through @mycel/sdk.
+// UI from apps. Presence labels share a pure semantic helper with messaging.
+import { presenceOf, PRESENCE_LABEL } from "../../../messaging/src/presence.ts";
 
 const TONES = ["moss", "slate", "ochre", "plum", "clay", "tide"] as const;
 
@@ -43,15 +44,8 @@ export function Avatar({
   );
 }
 
-export function statusOf(c: { nearby: boolean; online: boolean }): "nearby" | "online" | "offline" {
-  return c.nearby ? "nearby" : c.online ? "online" : "offline";
-}
-
-export const STATUS_LABEL = {
-  nearby: "On your network",
-  online: "Online",
-  offline: "Offline",
-} as const;
+export const statusOf = presenceOf;
+export const STATUS_LABEL = PRESENCE_LABEL;
 
 export function errorText(e: unknown) {
   return e instanceof Error ? e.message : String(e);

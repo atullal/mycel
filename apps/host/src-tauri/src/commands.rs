@@ -147,6 +147,21 @@ pub async fn delete_message(rt: State<'_, Rt>, id: ConversationId, message: Mess
 }
 
 #[tauri::command]
+pub async fn delete_message_local(rt: State<'_, Rt>, id: ConversationId, message: MessageId) -> Res<()> {
+    rt.delete_message_local(id, message).map_err(err)
+}
+
+#[tauri::command]
+pub async fn restore_message_local(rt: State<'_, Rt>, id: ConversationId, message: MessageId) -> Res<()> {
+    rt.restore_message_local(id, message).map_err(err)
+}
+
+#[tauri::command]
+pub async fn search_messages(rt: State<'_, Rt>, id: ConversationId, query: String, limit: Option<u32>) -> Res<Vec<MessageView>> {
+    rt.search_messages(id, query, limit).map_err(err)
+}
+
+#[tauri::command]
 pub async fn toggle_reaction(
     rt: State<'_, Rt>,
     id: ConversationId,

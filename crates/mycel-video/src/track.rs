@@ -534,6 +534,34 @@ fn reset_seq(e: &ReadError) -> Option<u32> {
     }
 }
 
+/// Fit the camera into the quality budget without stretching its pixels.
+/// Portrait cameras receive a portrait budget; H.264 requires even sizes.
+fn fitted_quality(width: u32, height: u32, budget: Quality) -> Quality {
+    let (width, height) = (width.max(2), height.max(2));
+    let (bw, bh) = if height > width {
+        (budget.height, budget.width)
+    } else {
+        (budget.width, budget.height)
+    };
+    let even = |n: u32| (n & !1).max(2);
+    let (w, h) = if width <= bw && height <= bh {
+        (even(width), even(height))
+    } else if u64::from(width) * u64::from(bh) >= u64::from(height) * u64::from(bw) {
+        let w = even(bw);
+        (
+            w,
+            even((u64::from(height) * u64::from(w) / u64::from(width)) as u32),
+        )
+    } else {
+        let h = even(bh);
+        (
+            even((u64::from(width) * u64::from(h) / u64::from(height)) as u32),
+            h,
+        )
+    };
+    Quality::new(w, h, budget.fps)
+}
+
 fn encode_loop(sh: Arc<Shared>, out: mpsc::UnboundedSender<EncodedFrame>) {
     let mut encoder: Option<(H264Encoder, Quality, u32)> = None;
     let mut generation = u64::MAX;
@@ -581,6 +609,10 @@ fn encode_loop(sh: Arc<Shared>, out: mpsc::UnboundedSender<EncodedFrame>) {
                 continue;
             }
         };
+        // Browser capture fits its own source before encoding. Native
+        // VideoToolbox scales directly into these dimensions, so fit here.
+        // A camera rotation changes the size and creates a fresh keyframe.
+        let quality = if crate::platform::SOURCE_PACED { quality } else { fitted_quality(pic.width, pic.height, quality) };
         let reuse = match &mut encoder {
             Some((_, q, _)) if q.width == quality.width && q.height == quality.height => true,
             // A source that encodes itself (the web view) just gets new
@@ -958,6 +990,52 @@ fn on_ctrl(sh: &Shared, m: VideoCtrl) {
             let mut r = sh.recv.lock();
             r.remote_camera = camera;
             r.remote_paused = paused;
+        }
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn camera_shape_survives_portrait_landscape_and_rotation() {
+        let budget = Quality::new(1280, 720, 30);
+        assert_eq!(fitted_quality(1920, 1080, budget), budget);
+        assert_eq!(
+            fitted_quality(1080, 1920, budget),
+            Quality::new(720, 1280, 30)
+        );
+        assert_eq!(
+            fitted_quality(1920, 1440, budget),
+            Quality::new(960, 720, 30)
+        );
+        assert_eq!(
+            fitted_quality(1440, 1920, budget),
+            Quality::new(720, 960, 30)
+        );
+        assert_ne!(
+            fitted_quality(1080, 1920, budget),
+            fitted_quality(1920, 1080, budget)
+        );
+    }
+
+    #[test]
+    fn dimensions_stay_even_and_within_every_quality_budget() {
+        for (_, budget) in crate::rate::LADDER {
+            for (w, h) in [(4031, 3023), (3023, 4031), (121, 89), (89, 121)] {
+                let fitted = fitted_quality(w, h, budget);
+                assert_eq!(fitted.width % 2, 0);
+                assert_eq!(fitted.height % 2, 0);
+                assert!(fitted.width <= w && fitted.height <= h);
+                assert!(fitted.pixels() <= budget.pixels());
+                let shape_error =
+                    (fitted.width as f64 / fitted.height as f64 - w as f64 / h as f64).abs();
+                assert!(
+                    shape_error <= 2.0 * (1.0 + w as f64 / h as f64) / fitted.height as f64,
+                    "{w}x{h} => {fitted:?}"
+                );
+            }
         }
     }
 }

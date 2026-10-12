@@ -1,7 +1,10 @@
 import { useState } from "react";
 import { useConversation, useMycel } from "@mycel/sdk/react";
 import type { Contact, Member } from "@mycel/sdk";
-import { Avatar, Icon, ROLE_LABEL, errorText } from "./ui.tsx";
+import { Avatar, Icon, PresenceLabel, ROLE_LABEL, errorText } from "./ui.tsx";
+import { presenceOf } from "./presence.ts";
+import { matchesSearch } from "./search.ts";
+import { SearchField } from "./SearchField.tsx";
 
 type Mode = "idle" | "add" | "keeper";
 
@@ -24,6 +27,7 @@ export function MembersPanel({
   const [confirm, setConfirm] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
 
   if (!c) {
     return (
@@ -40,6 +44,8 @@ export function MembersPanel({
   const candidates = contacts.filter((x) => !memberIds.has(x.id));
   const people = c.members.filter((m) => m.role !== "keeper");
   const keepers = c.members.filter((m) => m.role === "keeper");
+  const shownPeople = people.filter((m) => matchesSearch(query, m.name));
+  const shownKeepers = keepers.filter((m) => matchesSearch(query, m.name));
 
   const run = async (p: Promise<unknown>, after?: () => void) => {
     setBusy(true);
@@ -77,6 +83,10 @@ export function MembersPanel({
       <PanelHead title={c.direct ? "Details" : "Members"} onClose={onClose} />
 
       <div className="mx-panel-scroll">
+        <SearchField value={query} onChange={setQuery} label="Search members" placeholder="Search names" />
+        {query.trim() && shownPeople.length === 0 && shownKeepers.length === 0 && (
+          <p className="mx-panel-note" role="status">No members match "{query.trim()}".</p>
+        )}
         {!c.direct && (
           <section className="mx-panel-section">
             {renaming !== null ? (
@@ -115,10 +125,11 @@ export function MembersPanel({
         <section className="mx-panel-section">
           <h4>{c.direct ? "Between" : `${people.length} people`}</h4>
           <ul className="mx-members">
-            {people.map((m) => (
+            {shownPeople.map((m) => (
               <MemberRow
                 key={m.id}
                 m={m}
+                contact={m.isMe ? undefined : contacts.find((c) => c.id === m.id)}
                 canRemove={isAdmin && !m.isMe && !c.direct}
                 confirming={confirm === m.id}
                 onAsk={() => setConfirm(m.id)}
@@ -152,12 +163,13 @@ export function MembersPanel({
             A keeper is an always-on device you trust to hold encrypted copies, so messages reach people who are offline.
             It can't read them.
           </p>
-          {keepers.length > 0 && (
+          {shownKeepers.length > 0 && (
             <ul className="mx-members">
-              {keepers.map((m) => (
+              {shownKeepers.map((m) => (
                 <MemberRow
                   key={m.id}
                   m={m}
+                  contact={m.isMe ? undefined : contacts.find((c) => c.id === m.id)}
                   canRemove={isAdmin}
                   confirming={confirm === m.id}
                   onAsk={() => setConfirm(m.id)}
@@ -238,6 +250,7 @@ function PanelHead({ title, onClose }: { title: string; onClose: () => void }) {
 
 function MemberRow({
   m,
+  contact,
   canRemove,
   confirming,
   onAsk,
@@ -245,18 +258,21 @@ function MemberRow({
   onRemove,
 }: {
   m: Member;
+  contact?: Contact;
   canRemove: boolean;
   confirming: boolean;
   onAsk: () => void;
   onCancel: () => void;
   onRemove: () => void;
 }) {
+  const presence = contact ? presenceOf(contact) : undefined;
   return (
     <li className="mx-member">
-      <Avatar id={m.id} name={m.name} size={32} />
+      <Avatar id={m.id} name={m.name} size={32} status={presence} />
       <span className="mx-member-name">
         {m.name}
         {m.isMe && <span className="mx-you"> (you)</span>}
+        <PresenceLabel status={presence} />
       </span>
       <span className={`mx-role role-${m.role}`}>{ROLE_LABEL[m.role]}</span>
       {!canRemove && <span className="mx-member-spacer" />}
@@ -298,19 +314,25 @@ function Picker({
   onSubmit: () => void;
   busy: boolean;
 }) {
+  const [query, setQuery] = useState("");
   if (options.length === 0) return <p className="mx-panel-note">{empty}</p>;
+  const shownOptions = options.filter((o) => matchesSearch(query, o.name));
   const toggle = (id: string) =>
     onChange(multi ? (picked.includes(id) ? picked.filter((x) => x !== id) : [...picked, id]) : picked[0] === id ? [] : [id]);
   return (
     <div className="mx-picker-list">
+      <SearchField value={query} onChange={setQuery} label={multi ? "Find people to add" : "Find a keeper"} placeholder="Search names" />
+      {picked.length > 0 && <p className="mx-picker-selection" role="status">{picked.length} selected</p>}
+      {shownOptions.length === 0 && <p className="mx-panel-note" role="status">No contacts match "{query.trim()}".</p>}
       <ul>
-        {options.map((o) => (
+        {shownOptions.map((o) => (
           <li key={o.id}>
             <label className={`mx-person is-compact${picked.includes(o.id) ? " is-checked" : ""}`}>
               <input type={multi ? "checkbox" : "radio"} name="mx-pick" checked={picked.includes(o.id)} onChange={() => toggle(o.id)} />
-              <Avatar id={o.id} name={o.name} size={28} />
+              <Avatar id={o.id} name={o.name} size={28} status={presenceOf(o)} />
               <span className="mx-person-text">
                 <span className="mx-person-name">{o.name}</span>
+                <PresenceLabel status={presenceOf(o)} />
               </span>
               <span className="mx-check" aria-hidden="true">
                 <Icon.Check size={13} />

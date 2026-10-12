@@ -27,6 +27,9 @@
 
 mod blobs;
 mod pool;
+mod resources;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod native_mdns;
 pub mod link;
 pub mod emu;
 pub mod mesh;
@@ -60,7 +63,7 @@ pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_fr
 pub use iroh;
 pub use link::{Link, LinkEvent, LinkStatus, PathKind};
 pub use mesh::{Mesh, MeshOptions, MeshRoute, MeshStats, Tap};
-pub use wire::ContactCard;
+pub use wire::{ContactCard, MAX_EPHEMERAL};
 use wire::*;
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
@@ -105,6 +108,9 @@ pub enum NetMode {
     Internet,
 }
 
+/// Whether an authenticated member may push unsolicited blob bytes.
+pub type BlobPushPolicy = Arc<dyn Fn(SignPk, SpaceId) -> bool + Send + Sync>;
+
 /// Which pushed invites (spaces we didn't have) to accept.
 pub type InvitePolicy = Arc<dyn Fn(&SignPk, &SpaceId) -> bool + Send + Sync>;
 
@@ -116,6 +122,8 @@ pub struct NodeOptions {
     /// Where blobs live. `None` disables blob storage.
     pub blob_dir: Option<PathBuf>,
     pub invite_policy: InvitePolicy,
+    /// Additional consent gate for incoming Put/Offer, after membership.
+    pub blob_push_policy: BlobPushPolicy,
     /// Accept invites that give us only the Relay role (keepers: yes;
     /// personal devices: no — otherwise anyone could use our disk).
     pub accept_relay_invites: bool,
@@ -151,6 +159,7 @@ impl NodeOptions {
             store: None,
             blob_dir: None,
             invite_policy: Arc::new(|_, _| true),
+            blob_push_policy: Arc::new(|_, _| true),
             accept_relay_invites: false,
             port: 0,
             feed_validator: None,
@@ -169,7 +178,7 @@ pub enum NetEvent {
     /// A space was pushed to us and accepted.
     SpaceAdded { space: SpaceId, from: SignPk },
     Ephemeral { space: SpaceId, from: SignPk, data: Vec<u8> },
-    /// Nearby (mDNS) peer list or a peer's online status changed.
+    /// Directly discovered peer list or a peer's online status changed.
     PeersChanged,
     BlobStored { hash: Hash32 },
 }
@@ -197,6 +206,12 @@ pub struct PeerState {
 }
 
 impl PeerState {
+    /// Currently discovered on the LAN or a direct device link. A mesh
+    /// route or a recent successful exchange alone does not imply proximity.
+    pub fn is_directly_discovered(&self) -> bool {
+        self.nearby || self.links.iter().any(|kind| *kind != PathKind::Mesh)
+    }
+
     pub fn online(&self) -> bool {
         self.nearby || !self.links.is_empty() || self.last_ok.is_some_and(|t| t.elapsed() < ONLINE_WINDOW)
     }
@@ -220,10 +235,13 @@ struct Inner {
     store: Option<Arc<dyn Store>>,
     blob_dir: Option<PathBuf>,
     invite_policy: InvitePolicy,
+    blob_push_policy: BlobPushPolicy,
     accept_relay_invites: bool,
     feed_validator: Option<Arc<dyn FeedValidator>>,
     spaces: Mutex<HashMap<SpaceId, Replica>>,
     peers: Mutex<HashMap<SignPk, PeerState>>,
+    /// Independent LAN discovery sources; loss of one cannot hide another.
+    lan_sources: Mutex<HashMap<SignPk, BTreeSet<&'static str>>>,
     events: broadcast::Sender<NetEvent>,
     memory: MemoryLookup,
     /// Addresses learned from links, kept apart from contact-code hints so a
@@ -286,6 +304,19 @@ impl Inner {
         if !was_online {
             self.emit(NetEvent::PeersChanged);
         }
+    }
+
+    /// Recent successful exchanges age out without another network event.
+    /// Clear the expired timestamp and publish the transition for UI watchers.
+    fn expire_reachability(&self) {
+        let mut changed = false;
+        for peer in self.peers.lock().values_mut() {
+            if peer.last_ok.is_some_and(|t| t.elapsed() >= ONLINE_WINDOW) {
+                peer.last_ok = None;
+                changed |= !peer.nearby && peer.links.is_empty();
+            }
+        }
+        if changed { self.emit(NetEvent::PeersChanged); }
     }
 
     /// Remember which path a finished exchange used (for the Network panel).
@@ -375,7 +406,7 @@ impl Inner {
             .peers
             .lock()
             .get(&peer)
-            .is_some_and(|p| p.nearby || p.links.iter().any(|k| *k != PathKind::Mesh));
+            .is_some_and(PeerState::is_directly_discovered);
         mesh.set_direct(peer, direct);
     }
 
@@ -519,11 +550,32 @@ fn missing(r: &Replica, theirs: &Inventory) -> Inventory {
     }
 }
 
-fn gather(r: &Replica, want: &Inventory) -> Data {
-    Data {
-        ops: want.ops.iter().filter_map(|i| r.op(i).cloned()).collect(),
-        envelopes: want.envelopes.iter().filter_map(|i| r.envelope(i).cloned()).collect(),
+fn gather(r: &Replica, want: &Inventory, budget: usize) -> Result<Data> {
+    // Retain references while measuring; reject the whole response before
+    // cloning any ciphertext. Count the exact Vec length prefixes as well.
+    let mut seen = HashSet::new();
+    let mut ops = Vec::new();
+    let mut envelopes = Vec::new();
+    let mut remaining = budget;
+    for id in &want.ops {
+        if !seen.insert(*id) { continue; }
+        if let Some(op) = r.op(id) {
+            remaining = remaining.checked_sub(wire::encoded_size(op, remaining)?)
+                .ok_or_else(|| anyhow!("sync response too large"))?;
+            ops.push(op);
+        }
     }
+    seen.clear();
+    for id in &want.envelopes {
+        if !seen.insert(*id) { continue; }
+        if let Some(envelope) = r.envelope(id) {
+            remaining = remaining.checked_sub(wire::encoded_size(envelope, remaining)?)
+                .ok_or_else(|| anyhow!("sync response too large"))?;
+            envelopes.push(envelope);
+        }
+    }
+    wire::encoded_size(&(ops.len(), envelopes.len()), remaining)?;
+    Ok(Data { ops: ops.into_iter().cloned().collect(), envelopes: envelopes.into_iter().cloned().collect() })
 }
 
 // ─────────────────────────── protocol handlers ───────────────────────────
@@ -563,21 +615,28 @@ impl ProtocolHandler for Handler {
 async fn serve_conn(inner: &Arc<Inner>, conn: Connection) {
     inner.accepted.fetch_add(1, Ordering::Relaxed);
     let peer = to_sign_pk(&conn.remote_id());
+    let admission = resources::Admission::new();
     loop {
         tokio::select! {
             bi = conn.accept_bi() => {
                 let Ok((tx, rx)) = bi else { break };
+                let Some(permit) = admission.try_acquire() else { drop((tx, rx)); continue };
                 let (inner, conn) = (inner.clone(), conn.clone());
-                tokio::spawn(async move {
+                let frames = admission.frames();
+                tokio::spawn(resources::with_frames(frames, async move {
+                    let _permit = permit;
                     let _ = serve_bi(&inner, &conn, peer, tx, rx).await;
-                });
+                }));
             }
             uni = conn.accept_uni() => {
                 let Ok(rx) = uni else { break };
+                let Some(permit) = admission.try_acquire() else { drop(rx); continue };
                 let inner = inner.clone();
-                tokio::spawn(async move {
+                let frames = admission.frames();
+                tokio::spawn(resources::with_frames(frames, async move {
+                    let _permit = permit;
                     let _ = serve_uni(&inner, peer, rx).await;
-                });
+                }));
             }
         }
     }
@@ -585,7 +644,7 @@ async fn serve_conn(inner: &Arc<Inner>, conn: Connection) {
 
 async fn stream_kind(rx: &mut RecvStream) -> Result<StreamKind> {
     let mut b = [0u8; 1];
-    rx.read_exact(&mut b).await?;
+    resources::header(rx.read_exact(&mut b)).await?;
     StreamKind::from_byte(b[0]).ok_or_else(|| anyhow!("unknown stream kind {}", b[0]))
 }
 
@@ -593,7 +652,7 @@ async fn serve_bi(inner: &Arc<Inner>, conn: &Connection, peer: SignPk, tx: SendS
     let kind = stream_kind(&mut rx).await?;
     tx.set_priority(kind.priority()).ok();
     match kind {
-        StreamKind::Sync => serve_sync(inner, conn, peer, tx, rx).await,
+        StreamKind::Sync => tokio::time::timeout(SESSION_TIMEOUT, serve_sync(inner, conn, peer, tx, rx)).await?,
         StreamKind::Card => serve_card(inner, tx).await,
         StreamKind::Blob => blobs::serve(inner, peer, tx, rx).await,
         StreamKind::Ephemeral => bail!("ephemeral messages use uni-streams"),
@@ -614,7 +673,7 @@ async fn serve_sync(
     mut tx: SendStream,
     mut rx: RecvStream,
 ) -> Result<()> {
-    let mut msg: SyncMsg = recv(&mut rx).await?;
+    let (mut msg, mut msg_permit) = recv_held::<SyncMsg>(&mut rx).await?;
     loop {
         let SyncMsg::Hello { space, inv, invite } = msg else {
             bail!("expected Hello");
@@ -624,7 +683,9 @@ async fn serve_sync(
             match invite {
                 None => {
                     send(&mut tx, &SyncMsg::NeedInvite).await?;
-                    msg = recv(&mut rx).await?;
+                    drop(inv);
+                    drop(msg_permit);
+                    (msg, msg_permit) = recv_held(&mut rx).await?;
                     continue;
                 }
                 Some(ops) => {
@@ -633,6 +694,8 @@ async fn serve_sync(
                     }
                 }
             }
+        } else {
+            drop(invite);
         }
         // Membership gate: only current members (any role) may sync.
         let reply = inner.with_space(&space, |r| {
@@ -651,10 +714,14 @@ async fn serve_sync(
             return Ok(());
         };
         send(&mut tx, &reply).await?;
-        let SyncMsg::DataAndWant { data, want } = recv(&mut rx).await? else {
+        drop(reply);
+        drop(inv);
+        drop(msg_permit);
+        let (msg, _data_permit) = recv_held(&mut rx).await?;
+        let SyncMsg::DataAndWant { data, want } = msg else {
             bail!("expected DataAndWant");
         };
-        let out = inner.with_space(&space, |r| gather(r, &want))?;
+        let out = inner.with_space(&space, |r| gather(r, &want, MAX_FRAME - 1))??;
         let sent: Vec<EnvelopeId> = out.envelopes.iter().map(|e| e.id()).collect();
         send(&mut tx, &SyncMsg::Data { data: out }).await?;
         tx.finish()?;
@@ -676,7 +743,7 @@ async fn deny(mut tx: SendStream) -> Result<()> {
 /// A space pushed to us: accept only if policy allows and the ops prove that
 /// both we and the pusher are members.
 fn accept_invite(inner: &Arc<Inner>, from: SignPk, space: SpaceId, ops: Vec<SignedOp>) -> bool {
-    if ops.len() > MAX_INVITE_OPS || !(inner.invite_policy)(&from, &space) {
+    if ops.len() > MAX_INVITE_OPS {
         return false;
     }
     let Some(genesis) = ops.iter().find(|o| o.id() == space).cloned() else {
@@ -692,6 +759,11 @@ fn accept_invite(inner: &Arc<Inner>, from: SignPk, space: SpaceId, ops: Vec<Sign
         _ => {}
     }
     if !r.is_member(&from) {
+        return false;
+    }
+    // Policies may durably record consent state: invoke only for a valid
+    // invitation, before the membership itself is attached to storage.
+    if !(inner.invite_policy)(&from, &space) {
         return false;
     }
     // Re-create with the store attached so everything is persisted.
@@ -718,7 +790,7 @@ async fn serve_card(inner: &Arc<Inner>, mut tx: SendStream) -> Result<()> {
 }
 
 async fn serve_eph(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) -> Result<()> {
-    let msg: EphMsg = recv(&mut rx).await?;
+    let (msg, _permit) = recv_ephemeral(&mut rx).await?;
     let data = inner.with_space(&msg.space, |r| {
         if !r.is_member(&peer) {
             return None;
@@ -802,10 +874,11 @@ async fn sync_exchange(
 ) -> Result<SyncStats> {
     let (mut tx, mut rx) = open_bi(conn, StreamKind::Sync).await?;
     send(&mut tx, &SyncMsg::Hello { space, inv: inv.clone(), invite: None }).await?;
-    let mut reply: SyncMsg = recv(&mut rx).await?;
+    let (mut reply, mut reply_permit) = recv_held::<SyncMsg>(&mut rx).await?;
     if matches!(reply, SyncMsg::NeedInvite) {
         send(&mut tx, &SyncMsg::Hello { space, inv, invite: Some(ops) }).await?;
-        reply = recv(&mut rx).await?;
+        drop(reply_permit);
+        (reply, reply_permit) = recv_held(&mut rx).await?;
     }
     let (their_inv, their_want) = match reply {
         SyncMsg::Accept { inv, want } => (inv, want),
@@ -817,19 +890,28 @@ async fn sync_exchange(
             }
             bail!("peer denied sync (we were removed from this space)")
         }
-        other => bail!("unexpected reply: {other:?}"),
+        _ => bail!("unexpected sync reply"),
     };
     let out = inner.with_space(&space, |r| {
         r.note_holder(peer, &their_inv.envelopes);
-        SyncMsg::DataAndWant { data: gather(r, &their_want), want: missing(r, &their_inv) }
-    })?;
+        let want = missing(r, &their_inv);
+        let overhead = wire::encoded_size(&want, MAX_FRAME - 1)? + 1;
+        Ok::<_, anyhow::Error>(SyncMsg::DataAndWant {
+            data: gather(r, &their_want, MAX_FRAME - overhead)?, want,
+        })
+    })??;
     let sent: Vec<EnvelopeId> = match &out {
         SyncMsg::DataAndWant { data, .. } => data.envelopes.iter().map(|e| e.id()).collect(),
         _ => vec![],
     };
     send(&mut tx, &out).await?;
     tx.finish()?;
-    let SyncMsg::Data { data } = recv(&mut rx).await? else {
+    drop(out);
+    drop(their_inv);
+    drop(their_want);
+    drop(reply_permit);
+    let (msg, _data_permit) = recv_held(&mut rx).await?;
+    let SyncMsg::Data { data } = msg else {
         bail!("expected Data");
     };
     inner.note_path(peer, conn);
@@ -920,51 +1002,51 @@ async fn scheduler(inner: Arc<Inner>) {
 /// Track nearby peers via mDNS and sync shared spaces when one appears.
 async fn watch_mdns(inner: Arc<Inner>, mdns: MdnsAddressLookup) {
     let mut events = mdns.subscribe().await;
-    while let Some(ev) = events.next().await {
-        match ev {
-            DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                let pk = to_sign_pk(&endpoint_info.endpoint_id);
-                if pk == inner.keys.sign_pk() {
-                    continue;
-                }
-                let name = endpoint_info
-                    .data
-                    .user_data()
-                    .and_then(|u| u.as_ref().strip_prefix("mycel:").map(str::to_string));
-                let newly = {
-                    let mut peers = inner.peers.lock();
-                    let p = peers.entry(pk).or_default();
-                    let newly = !p.nearby || p.name != name;
-                    p.nearby = true;
-                    p.name = name;
-                    p.failures = 0;
-                    newly
-                };
-                inner.update_direct(pk);
-                if newly {
-                    inner.emit(NetEvent::PeersChanged);
-                    let shared: Vec<SpaceId> = inner
-                        .spaces
-                        .lock()
-                        .iter()
-                        .filter(|(_, r)| r.is_member(&pk))
-                        .map(|(s, _)| *s)
-                        .collect();
-                    for s in shared {
-                        tokio::spawn(sync_once(inner.clone(), pk, s));
-                    }
-                }
-            }
-            DiscoveryEvent::Expired { endpoint_id } => {
-                let pk = to_sign_pk(&endpoint_id);
-                if let Some(p) = inner.peers.lock().get_mut(&pk) {
-                    p.nearby = false;
-                }
-                inner.update_direct(pk);
+    while let Some(ev) = events.next().await { on_lan_discovery(&inner, "raw", ev); }
+}
+
+fn on_lan_discovery(inner: &Arc<Inner>, source: &'static str, ev: DiscoveryEvent) {
+    match ev {
+        DiscoveryEvent::Discovered { endpoint_info, .. } => {
+            let pk = to_sign_pk(&endpoint_info.endpoint_id);
+            if pk == inner.keys.sign_pk() { return; }
+
+            let name = endpoint_info.data.user_data()
+                .and_then(|u| u.as_ref().strip_prefix("mycel:").map(str::to_string));
+            let newly = {
+                let mut sources = inner.lan_sources.lock();
+                sources.entry(pk).or_default().insert(source);
+                let mut peers = inner.peers.lock();
+                let p = peers.entry(pk).or_default();
+                let newly = !p.nearby || name.is_some() && p.name != name;
+                p.nearby = true;
+                if name.is_some() { p.name = name; }
+                p.failures = 0;
+                newly
+            };
+            inner.update_direct(pk);
+            if newly {
                 inner.emit(NetEvent::PeersChanged);
+                let shared: Vec<SpaceId> = inner.spaces.lock().iter()
+                    .filter(|(_, r)| r.is_member(&pk)).map(|(s, _)| *s).collect();
+                for s in shared { tokio::spawn(sync_once(inner.clone(), pk, s)); }
             }
-            _ => {}
         }
+        DiscoveryEvent::Expired { endpoint_id } => {
+            let pk = to_sign_pk(&endpoint_id);
+            let changed = {
+                let mut sources = inner.lan_sources.lock();
+                if let Some(s) = sources.get_mut(&pk) { s.remove(source); }
+                let nearby = sources.get(&pk).is_some_and(|s| !s.is_empty());
+                if !nearby { sources.remove(&pk); }
+                if let Some(p) = inner.peers.lock().get_mut(&pk) {
+                    let changed = p.nearby != nearby; p.nearby = nearby; changed
+                } else { false }
+            };
+            inner.update_direct(pk);
+            if changed { inner.emit(NetEvent::PeersChanged); }
+        }
+        _ => {}
     }
 }
 
@@ -1064,6 +1146,15 @@ impl Node {
         } else {
             None
         };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let native_mdns = if opts.mode != NetMode::Local && opts.ip {
+            let sockets = endpoint.bound_sockets();
+            let port = sockets.iter().find(|a| a.is_ipv4()).or_else(|| sockets.first()).map_or(0, |a| a.port());
+            match native_mdns::NativeMdns::start(endpoint.id(), port) {
+                Ok((lookup, events)) => { endpoint.address_lookup()?.add(lookup.clone()); Some((lookup, events)) },
+                Err(err) => { eprintln!("[mycel] native Bonjour unavailable: {err}"); None },
+            }
+        } else { None };
         let (events, _) = broadcast::channel(1024);
         let pool = Pool::new(endpoint.clone());
         let inner = Arc::new(Inner {
@@ -1073,10 +1164,12 @@ impl Node {
             store: opts.store,
             blob_dir: opts.blob_dir,
             invite_policy: opts.invite_policy,
+            blob_push_policy: opts.blob_push_policy,
             accept_relay_invites: opts.accept_relay_invites,
             feed_validator: opts.feed_validator,
             spaces: Mutex::default(),
             peers: Mutex::default(),
+            lan_sources: Mutex::default(),
             events,
             memory,
             link_lookup,
@@ -1107,8 +1200,17 @@ impl Node {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 reaper.pool.reap(POOL_IDLE);
+                reaper.expire_reachability();
             }
         }));
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some((lookup, mut events)) = native_mdns {
+            let native_inner = inner.clone();
+            tasks.push(tokio::spawn(async move {
+                let _keep_alive = lookup;
+                while let Some(ev) = events.recv().await { on_lan_discovery(&native_inner, "native", ev); }
+            }));
+        }
         if let Some(mdns) = mdns {
             tasks.push(tokio::spawn(watch_mdns(inner.clone(), mdns)));
         }
@@ -1331,10 +1433,10 @@ impl Node {
     /// Fetch a device's self-signed contact card (anyone may ask).
     pub async fn fetch_card(&self, peer: SignPk) -> Result<ContactCard> {
         let inner = &self.inner;
-        let card: ContactCard = on_conn!(inner, &peer, |conn| async {
+        let (card, _permit) = on_conn!(inner, &peer, |conn| async {
             let (mut tx, mut rx) = open_bi(&conn, StreamKind::Card).await?;
             tx.finish()?;
-            recv::<ContactCard>(&mut rx).await
+            recv_held::<ContactCard>(&mut rx).await
         })?;
         card.verify()?;
         if card.keys.sign_pk != peer {
@@ -1344,7 +1446,9 @@ impl Node {
     }
 
     /// Fire-and-forget an encrypted ephemeral message to online members.
+    /// Typing/presence payloads are limited to [`MAX_EPHEMERAL`] bytes.
     pub fn send_ephemeral(&self, space: SpaceId, data: Vec<u8>) -> Result<()> {
+        anyhow::ensure!(data.len() <= MAX_EPHEMERAL, "ephemeral message too large");
         let me = self.id();
         let (msg, members) = self.with_space(&space, |r| {
             let sealed = r.seal_ephemeral(&eph_aad(&space, &me.0), &data);
@@ -1400,4 +1504,224 @@ impl Node {
         }
         Ok(())
     }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use link::{CustomAddr, TRANSPORT_BLUETOOTH, TRANSPORT_MESH, TRANSPORT_PEER_WIFI};
+
+    #[test]
+    fn direct_discovery_excludes_mesh_and_recent_exchanges() {
+        let mut state = PeerState { last_ok: Some(Instant::now()), ..Default::default() };
+        assert!(state.online());
+        assert!(!state.is_directly_discovered());
+        state.links.insert(PathKind::Mesh);
+        assert!(!state.is_directly_discovered());
+        for kind in [PathKind::Bluetooth, PathKind::PeerWifi] {
+            state.links.insert(kind);
+            assert!(state.is_directly_discovered());
+            state.links.remove(&kind);
+            assert!(!state.is_directly_discovered());
+        }
+        state.nearby = true;
+        assert!(state.is_directly_discovered());
+    }
+
+    #[tokio::test]
+    async fn lan_discovery_sources_expire_independently() {
+        let node = Node::spawn(Arc::new(DeviceKeys::generate()), NodeOptions::new(NetMode::Local, "lan-source-test")).await.unwrap();
+        let peer = DeviceKeys::generate().sign_pk();
+        let id = to_endpoint_id(&peer).unwrap();
+        let found = || DiscoveryEvent::Discovered { endpoint_info: iroh::address_lookup::EndpointInfo::from_parts(id, Default::default()), last_updated: None };
+        let lost = || DiscoveryEvent::Expired { endpoint_id: id };
+        on_lan_discovery(&node.inner, "native", found());
+        on_lan_discovery(&node.inner, "raw", found());
+        on_lan_discovery(&node.inner, "raw", lost());
+        assert!(node.peers()[&peer].nearby);
+        assert!(node.peers()[&peer].is_directly_discovered());
+        on_lan_discovery(&node.inner, "native", lost());
+        assert!(!node.peers()[&peer].nearby);
+        assert!(!node.peers()[&peer].online());
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recent_reachability_expiry_emits_once_and_preserves_path_history() {
+        let node = Node::spawn(Arc::new(DeviceKeys::generate()), NodeOptions::new(NetMode::Local, "expiry-test")).await.unwrap();
+        let gone = DeviceKeys::generate().sign_pk();
+        let live = DeviceKeys::generate().sign_pk();
+        let old = Instant::now() - ONLINE_WINDOW - Duration::from_secs(1);
+        node.inner.peers.lock().insert(gone, PeerState { last_ok: Some(old), via: Some(PathKind::Relay), ..Default::default() });
+        node.inner.peers.lock().insert(live, PeerState { last_ok: Some(old), nearby: true, ..Default::default() });
+        let mut events = node.subscribe();
+        node.inner.expire_reachability();
+        assert!(matches!(events.try_recv(), Ok(NetEvent::PeersChanged)));
+        assert!(!node.peers()[&gone].online());
+        assert_eq!(node.peers()[&gone].via, Some(PathKind::Relay));
+        assert!(node.peers()[&live].online());
+        node.inner.expire_reachability();
+        assert!(events.try_recv().is_err());
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_discovery_tracks_found_and_lost_link_addresses() {
+        let node = Node::spawn(Arc::new(DeviceKeys::generate()), NodeOptions::new(NetMode::Local, "discovery-test"))
+            .await.unwrap();
+        let peer = DeviceKeys::generate().sign_pk();
+        let addr = |id, suffix| {
+            let mut data = peer.0.to_vec();
+            data.push(suffix);
+            CustomAddr::from_parts(id, &data)
+        };
+        let mesh = addr(TRANSPORT_MESH, 0);
+        let wifi1 = addr(TRANSPORT_PEER_WIFI, 1);
+        let wifi2 = addr(TRANSPORT_PEER_WIFI, 2);
+        let bluetooth = addr(TRANSPORT_BLUETOOTH, 0);
+        let found = |addr| node.inner.on_link_event(LinkEvent::Found { peer, addr, name: Some("Nearby device".into()) });
+        let lost = |addr| node.inner.on_link_event(LinkEvent::Lost { peer, addr });
+        let state = || node.peers().remove(&peer).unwrap();
+        found(mesh);
+        node.inner.mark_ok(peer);
+        assert!(state().online());
+        assert!(!state().is_directly_discovered());
+        found(wifi1.clone());
+        found(wifi2.clone());
+        found(bluetooth.clone());
+        assert!(state().is_directly_discovered());
+        assert!(!state().nearby, "direct radio discovery must not claim an mDNS/LAN path");
+        lost(wifi1);
+        assert!(state().links.contains(&PathKind::PeerWifi), "one Wi-Fi address remains");
+        lost(wifi2);
+        assert!(!state().links.contains(&PathKind::PeerWifi));
+        assert!(state().is_directly_discovered(), "Bluetooth remains");
+        lost(bluetooth);
+        assert!(!state().is_directly_discovered(), "mesh and last_ok cannot retain proximity");
+        assert!(state().online(), "a remote reachable peer can remain online");
+        node.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn security_gather_deduplicates_requested_records() {
+        let (r, genesis) = Replica::create(Arc::new(DeviceKeys::generate()), None).unwrap();
+        let want = Inventory { ops: vec![genesis.id(); 1024], envelopes: vec![] };
+        let data = gather(&r, &want, MAX_FRAME - 1).unwrap();
+        assert_eq!(data.ops.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod security_gather_tests {
+    use super::*;
+    #[test]
+    fn security_gather_envelope_duplicates_and_exact_budget() {
+        let (mut r, genesis) = Replica::create(Arc::new(DeviceKeys::generate()), None).unwrap();
+        let (_, env) = r.append(mycel_sync::StreamId::new_feed(), vec![42; 16 * 1024]).unwrap();
+        let want = Inventory { ops: vec![genesis.id(); 1024], envelopes: vec![env.id(); 1024] };
+        let expected = Data { ops: vec![genesis], envelopes: vec![env] };
+        let size = wire::encoded_size(&expected, MAX_FRAME).unwrap();
+        let actual = gather(&r, &want, size).unwrap();
+        assert_eq!(actual.ops.len(), 1);
+        assert_eq!(actual.envelopes.len(), 1);
+        assert_eq!(wire::encoded_size(&actual, MAX_FRAME).unwrap(), size);
+        assert!(gather(&r, &want, size - 1).is_err());
+        assert!(gather(&r, &want, 128).is_err());
+    }
+}
+
+#[cfg(test)]
+mod security_exchange_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn security_responder_deduplicates_want_over_real_quic() {
+        let alice = Node::spawn(Arc::new(DeviceKeys::generate()), NodeOptions::new(NetMode::Local, "alice")).await.unwrap();
+        let bob = Node::spawn(Arc::new(DeviceKeys::generate()), NodeOptions::new(NetMode::Local, "bob")).await.unwrap();
+        let (space, genesis) = bob.create_space().unwrap();
+        bob.with_space(&space, |r| r.add_member(alice.keys().public(), Role::Writer)).unwrap().unwrap();
+        let conn = alice.inner.endpoint.connect(bob.addr(), ALPN).await.unwrap();
+        let (mut tx, mut rx) = open_bi(&conn, StreamKind::Sync).await.unwrap();
+        send(&mut tx, &SyncMsg::Hello { space, inv: Inventory::default(), invite: None }).await.unwrap();
+        assert!(matches!(recv::<SyncMsg>(&mut rx).await.unwrap(), SyncMsg::Accept { .. }));
+        send(&mut tx, &SyncMsg::DataAndWant {
+            data: Data::default(), want: Inventory { ops: vec![genesis.id(); 1024], envelopes: vec![] },
+        }).await.unwrap();
+        let SyncMsg::Data { data } = recv(&mut rx).await.unwrap() else { panic!("expected data") };
+        assert_eq!(data.ops.len(), 1);
+        alice.shutdown().await.unwrap();
+        bob.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn security_initiator_deduplicates_want_over_real_quic() {
+        let alice = Node::spawn(Arc::new(DeviceKeys::generate()), NodeOptions::new(NetMode::Local, "alice")).await.unwrap();
+        let remote_keys = DeviceKeys::generate();
+        let remote = Endpoint::builder(presets::Minimal)
+            .secret_key(SecretKey::from_bytes(&remote_keys.seed()))
+            .relay_mode(iroh::RelayMode::Disabled).bind_addr("127.0.0.1:0").unwrap()
+            .alpns(vec![ALPN.to_vec()]).bind().await.unwrap();
+        let (space, genesis) = alice.create_space().unwrap();
+        alice.with_space(&space, |r| r.add_member(remote_keys.public(), Role::Writer)).unwrap().unwrap();
+        let id = genesis.id();
+        let remote_task = {
+            let remote = remote.clone();
+            tokio::spawn(async move {
+                let conn = remote.accept().await.unwrap().await.unwrap();
+                let (mut tx, mut rx) = conn.accept_bi().await.unwrap();
+                assert_eq!(stream_kind(&mut rx).await.unwrap(), StreamKind::Sync);
+                assert!(matches!(recv::<SyncMsg>(&mut rx).await.unwrap(), SyncMsg::Hello { .. }));
+                send(&mut tx, &SyncMsg::Accept {
+                    inv: Inventory::default(), want: Inventory { ops: vec![id; 1024], envelopes: vec![] },
+                }).await.unwrap();
+                let SyncMsg::DataAndWant { data, .. } = recv(&mut rx).await.unwrap() else { panic!("expected data") };
+                assert_eq!(data.ops.len(), 1);
+                send(&mut tx, &SyncMsg::Data { data: Data::default() }).await.unwrap();
+                tx.finish().unwrap();
+                tx.stopped().await.unwrap();
+            })
+        };
+        let conn = alice.inner.endpoint.connect(remote.addr(), ALPN).await.unwrap();
+        let inv = alice.with_space(&space, |r| inventory(r)).unwrap();
+        sync_exchange(&alice.inner, &conn, remote_keys.sign_pk(), space, inv, vec![]).await.unwrap();
+        remote_task.await.unwrap();
+        alice.shutdown().await.unwrap();
+        remote.close().await;
+    }
+    #[tokio::test]
+    async fn security_invite_policy_runs_only_after_validation() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut opts = NodeOptions::new(NetMode::Local, "receiver");
+        let observed = calls.clone();
+        opts.invite_policy = Arc::new(move |_, _| {
+            observed.fetch_add(1, Ordering::Relaxed);
+            false
+        });
+        let receiver = Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap();
+        let sender = Arc::new(DeviceKeys::generate());
+        let (mut replica, genesis) = Replica::create(sender.clone(), None).unwrap();
+        let space = genesis.id();
+        assert!(!accept_invite(&receiver.inner, sender.sign_pk(), space, vec![genesis]));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        replica.add_member(receiver.keys().public(), Role::Writer).unwrap();
+        assert!(!accept_invite(&receiver.inner, sender.sign_pk(), space, replica.all_ops()));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(!receiver.inner.spaces.lock().contains_key(&space));
+        receiver.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn security_ephemeral_plaintext_boundary() {
+        let node = Node::spawn(Arc::new(DeviceKeys::generate()), NodeOptions::new(NetMode::Local, "ephemeral")).await.unwrap();
+        let (space, _) = node.create_space().unwrap();
+        assert!(node.send_ephemeral(space, vec![42; MAX_EPHEMERAL]).is_ok());
+        assert!(node.send_ephemeral(space, vec![42; MAX_EPHEMERAL + 1]).is_err());
+        node.shutdown().await.unwrap();
+    }
+
 }

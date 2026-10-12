@@ -764,24 +764,46 @@ impl Driver {
     /// Streams a neighbour opens on the hop connection: summaries and
     /// bundles (datagrams carry routing and packets).
     async fn serve_streams(self: Arc<Self>, peer: SignPk, conn: Connection) {
+        let admission = crate::resources::Admission::new();
         loop {
             tokio::select! {
                 bi = conn.accept_bi() => {
                     let Ok((tx, rx)) = bi else { break };
+                    let Some(permit) = admission.try_acquire() else { drop((tx, rx)); continue };
                     let me = self.clone();
-                    tokio::spawn(async move { let _ = me.on_bundle_stream(peer, tx, rx).await; });
+                    let frames = admission.frames();
+                    tokio::spawn(crate::resources::with_frames(frames, async move {
+                        let _permit = permit;
+                        let _ = me.on_bundle_stream(peer, tx, rx).await;
+                    }));
                 }
                 uni = conn.accept_uni() => {
                     let Ok(rx) = uni else { break };
+                    let Some(permit) = admission.try_acquire() else { drop(rx); continue };
                     let me = self.clone();
-                    tokio::spawn(async move { let _ = me.on_summary_stream(peer, rx).await; });
+                    let frames = admission.frames();
+                    tokio::spawn(crate::resources::with_frames(frames, async move {
+                        let _permit = permit;
+                        let _ = tokio::time::timeout(crate::SESSION_TIMEOUT, me.on_summary_stream(peer, rx)).await;
+                    }));
                 }
             }
         }
     }
 
     async fn on_summary_stream(self: Arc<Self>, from: SignPk, mut rx: iroh::endpoint::RecvStream) -> Result<()> {
-        let bytes = rx.read_to_end(MAX_SUMMARY).await?;
+        let _permit = crate::resources::frame_bytes(MAX_SUMMARY)?;
+        let mut bytes = Vec::new();
+        loop {
+            let chunk = if bytes.is_empty() {
+                crate::resources::header(rx.read_chunk(16 * 1024)).await?
+            } else {
+                crate::resources::idle(rx.read_chunk(16 * 1024)).await?
+            };
+            let Some(chunk) = chunk else { break };
+            anyhow::ensure!(bytes.len() + chunk.len() <= MAX_SUMMARY, "summary too large");
+            bytes.extend_from_slice(&chunk);
+        }
         let Some((&K_SUMMARY, body)) = bytes.split_first() else { return Ok(()) };
         let w: WireSummary = postcard::from_bytes(body)?;
         let s = dtn::Summary {
@@ -810,7 +832,7 @@ impl Driver {
         mut rx: iroh::endpoint::RecvStream,
     ) -> Result<()> {
         let Some(c) = &self.carrier else { return Ok(()) };
-        let head = read_frame(&mut rx, MAX_OFFER).await?;
+        let (head, _head_permit) = read_frame(&mut rx, MAX_OFFER).await?;
         let Some((&K_OFFER, body)) = head.split_first() else { return Ok(()) };
         let w: WireOffer = postcard::from_bytes(body)?;
         let o = dtn::Offer {
@@ -828,11 +850,13 @@ impl Driver {
             c.set_clock(self.now(), wall_ms());
             c.offered(from, &o, self.now(), verify_offer)
         };
-        write_frame(&mut tx, &postcard::to_allocvec(&WireAnswer::from(answer))?).await?;
+        write_frame(&mut tx, &crate::wire::encode_bounded(&WireAnswer::from(answer), 64)?).await?;
         let dtn::Answer::Take { from: at } = answer else {
             tx.finish()?;
             return Ok(());
         };
+        // Account for the retained partial and incoming payload before copying.
+        let _payload_permit = crate::resources::frame_bytes(usize::try_from(o.size)?)?;
         // the payload from `at`: keep what arrives even if the link drops
         let mut payload = c.lock().partial(&o.id).map_or_else(Vec::new, |p| p.to_vec());
         payload.truncate(at as usize);
@@ -841,7 +865,7 @@ impl Driver {
         }
         let want = o.size as usize;
         let cut = loop {
-            match rx.read_chunk(want.saturating_sub(payload.len()).max(1)).await {
+            match crate::resources::idle(rx.read_chunk(want.saturating_sub(payload.len()).clamp(1, 64 * 1024))).await {
                 Ok(Some(chunk)) if payload.len() + chunk.len() <= want => payload.extend_from_slice(&chunk),
                 Ok(Some(_)) => return Ok(()), // more than offered: not that bundle
                 Ok(None) => break false,
@@ -866,7 +890,7 @@ impl Driver {
         let now = self.now();
         let got = c.lock().accept(from, b, o.copies, now, verify_bundle);
         let ok = !matches!(got, dtn::Accepted::Refused(_));
-        tx.write_all(&[ok as u8]).await?;
+        crate::resources::write_all(&mut tx, &[ok as u8]).await?;
         tx.finish()?;
         if let dtn::Accepted::ForMe(b) = got {
             let sig = self.keys.sign(RECEIPT_CTX, &[&b.id.0]);
@@ -901,14 +925,14 @@ impl Driver {
                 evictable: s.evictable,
                 wants: s.wants,
             };
-            let Ok(body) = postcard::to_allocvec(&wire) else { continue };
+            let Ok(body) = crate::wire::encode_bounded(&wire, MAX_SUMMARY - 1) else { continue };
             let Some(conn) = self.conn(&k) else { continue };
             let mut msg = vec![K_SUMMARY];
             msg.extend_from_slice(&body);
             let me = self.clone();
             self.keep(tokio::spawn(async move {
-                let sent = match conn.open_uni().await {
-                    Ok(mut tx) => tx.write_all(&msg).await.is_ok() && tx.finish().is_ok(),
+                let sent = match crate::resources::header(conn.open_uni()).await {
+                    Ok(mut tx) => crate::resources::write_all(&mut tx, &msg).await.is_ok() && tx.finish().is_ok(),
                     Err(_) => false,
                 };
                 // it may have heard nothing: tell it everything next time
@@ -1383,16 +1407,16 @@ async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8) -> Result<S
         copies,
     };
     let mut msg = vec![K_OFFER];
-    msg.extend_from_slice(&postcard::to_allocvec(&offer)?);
-    let (mut tx, mut rx) = conn.open_bi().await?;
+    msg.extend_from_slice(&crate::wire::encode_bounded(&offer, MAX_OFFER - 1)?);
+    let (mut tx, mut rx) = crate::resources::header(conn.open_bi()).await?;
     write_frame(&mut tx, &msg).await?;
-    let answer = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut rx, 64)).await??;
+    let (answer, _answer_permit) = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut rx, 64)).await??;
     let at = match postcard::from_bytes::<WireAnswer>(&answer)? {
         WireAnswer::Duplicate => return Ok(Sent::Took),
         WireAnswer::Refuse(full) => return Ok(Sent::Refused(full)),
         WireAnswer::Take(at) => (at as usize).min(b.payload.len()),
     };
-    tx.write_all(&b.payload[at..]).await?;
+    crate::resources::write_all(&mut tx, &b.payload[at..]).await?;
     tx.finish()?;
     let ack = tokio::time::timeout(Duration::from_secs(30), rx.read_to_end(1)).await??;
     Ok(if ack.first() == Some(&1) { Sent::Took } else { Sent::Refused(false) })
@@ -1400,19 +1424,21 @@ async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8) -> Result<S
 
 /// A length-prefixed frame on a stream that goes on after it.
 async fn write_frame(tx: &mut iroh::endpoint::SendStream, body: &[u8]) -> Result<()> {
-    tx.write_all(&(body.len() as u32).to_be_bytes()).await?;
-    tx.write_all(body).await?;
+    anyhow::ensure!(body.len() <= crate::wire::MAX_FRAME, "frame too large");
+    crate::resources::write_all(tx, &(body.len() as u32).to_be_bytes()).await?;
+    crate::resources::write_all(tx, body).await?;
     Ok(())
 }
 
-async fn read_frame(rx: &mut iroh::endpoint::RecvStream, max: usize) -> Result<Vec<u8>> {
+async fn read_frame(rx: &mut iroh::endpoint::RecvStream, max: usize) -> Result<(Vec<u8>, crate::resources::FramePermit)> {
     let mut len = [0u8; 4];
-    rx.read_exact(&mut len).await?;
+    crate::resources::header(rx.read_exact(&mut len)).await?;
     let len = u32::from_be_bytes(len) as usize;
     anyhow::ensure!(len <= max, "frame of {len} bytes");
+    let permit = crate::resources::frame_bytes(len)?;
     let mut body = vec![0u8; len];
-    rx.read_exact(&mut body).await?;
-    Ok(body)
+    crate::resources::idle(rx.read_exact(&mut body)).await?;
+    Ok((body, permit))
 }
 
 /// An Iroh address lookup: for a device beyond our mesh, one mesh address

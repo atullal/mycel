@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { useMycel, useNearby, useNetwork } from "@mycel/sdk/react";
 import { Avatar, errorText } from "./common.tsx";
+import { matchesSearch } from "../../../messaging/src/search.ts";
+import { SearchField } from "../../../messaging/src/SearchField.tsx";
 
 export function NearbyPanel() {
   const mycel = useMycel();
@@ -8,6 +10,7 @@ export function NearbyPanel() {
   const { status } = useNetwork();
   const [pending, setPending] = useState<Set<string>>(new Set());
   const [errors, setErrors] = useState<Record<string, string>>({});
+  const [query, setQuery] = useState("");
 
   const add = async (id: string) => {
     setPending((p) => new Set(p).add(id));
@@ -26,7 +29,8 @@ export function NearbyPanel() {
   };
 
   const localOnly = status?.mode === "local";
-  const sorted = [...nearby].sort((a, b) => Number(a.isContact) - Number(b.isContact) || a.name.localeCompare(b.name));
+  const sorted = nearby.filter((n) => matchesSearch(query, n.name))
+    .sort((a, b) => Number(a.isContact) - Number(b.isContact) || a.name.localeCompare(b.name));
 
   return (
     <div className="p-nearby">
@@ -38,14 +42,20 @@ export function NearbyPanel() {
       <p className="p-help">
         {localOnly
           ? "This device is in local-only mode, so it isn't looking for anyone on the network."
-          : "People running Mycel on the same Wi-Fi or wired network show up here. No internet needed."}
+          : "Find people using Mycel nearby through Wi-Fi, Bluetooth, or a shared network. No internet needed."}
       </p>
 
-      {!loading && nearby.length === 0 && !localOnly && (
-        <p className="p-empty">Nobody nearby right now. They'll appear here as soon as they open Mycel on this network.</p>
+      <SearchField value={query} onChange={setQuery} label="Search nearby people" placeholder="Search names" />
+
+      {!loading && query.trim() && sorted.length === 0 && !localOnly && (
+        <p className="p-empty" role="status">No nearby people match "{query.trim()}".</p>
       )}
 
-      <ul className="p-people">
+      {!loading && nearby.length === 0 && !localOnly && !query.trim() && (
+        <p className="p-empty">Nobody nearby right now. Keep Mycel open on both devices to find each other.</p>
+      )}
+
+      <ul className="p-people" aria-label="Nearby people">
         {sorted.map((n) => (
           <li key={n.id} className="p-person">
             <Avatar id={n.id} name={n.name} size={36} status="nearby" />
