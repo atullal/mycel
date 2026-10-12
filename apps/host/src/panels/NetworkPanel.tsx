@@ -136,7 +136,7 @@ function Hyphae({ me, nodes }: { me: { id: string; name: string }; nodes: Node[]
       ))}
       {laid.map((n) => (
         <g key={n.id} className={`hy-node is-${n.state}`} transform={`translate(${n.x.toFixed(1)} ${n.y.toFixed(1)})`}>
-          <title>{`${n.name}: ${n.state === "nearby" ? "on your network" : n.state}`}</title>
+          <title>{`${n.name}: ${n.state}`}</title>
           <circle r="17" className={`tone-${toneFor(n.id)}`} />
           <text dy="4.2">{initials(n.name)}</text>
           <text className="hy-label" dy="33">
@@ -224,7 +224,7 @@ export function NetworkPanel() {
     <div className="p-network">
       {profile && <Hyphae me={profile} nodes={nodes} />}
       <ul className="hy-legend" aria-label="Legend">
-        <li className="is-nearby">On your network</li>
+        <li className="is-nearby">Nearby</li>
         <li className="is-online">Connected</li>
         <li className="is-offline">Offline</li>
       </ul>
@@ -235,7 +235,7 @@ export function NetworkPanel() {
           <dd>{status.onlinePeers.length}</dd>
         </div>
         <div>
-          <dt>On your network</dt>
+          <dt>Nearby</dt>
           <dd>{status.nearbyPeers}</dd>
         </div>
       </dl>

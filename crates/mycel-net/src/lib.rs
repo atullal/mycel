@@ -176,7 +176,7 @@ pub enum NetEvent {
     /// A space was pushed to us and accepted.
     SpaceAdded { space: SpaceId, from: SignPk },
     Ephemeral { space: SpaceId, from: SignPk, data: Vec<u8> },
-    /// Nearby (mDNS) peer list or a peer's online status changed.
+    /// Directly discovered peer list or a peer's online status changed.
     PeersChanged,
     BlobStored { hash: Hash32 },
 }
@@ -204,6 +204,12 @@ pub struct PeerState {
 }
 
 impl PeerState {
+    /// Currently discovered on the LAN or a direct device link. A mesh
+    /// route or a recent successful exchange alone does not imply proximity.
+    pub fn is_directly_discovered(&self) -> bool {
+        self.nearby || self.links.iter().any(|kind| *kind != PathKind::Mesh)
+    }
+
     pub fn online(&self) -> bool {
         self.nearby || !self.links.is_empty() || self.last_ok.is_some_and(|t| t.elapsed() < ONLINE_WINDOW)
     }
@@ -383,7 +389,7 @@ impl Inner {
             .peers
             .lock()
             .get(&peer)
-            .is_some_and(|p| p.nearby || p.links.iter().any(|k| *k != PathKind::Mesh));
+            .is_some_and(PeerState::is_directly_discovered);
         mesh.set_direct(peer, direct);
     }
 
@@ -1461,6 +1467,66 @@ impl Node {
             r?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+    use link::{CustomAddr, TRANSPORT_BLUETOOTH, TRANSPORT_MESH, TRANSPORT_PEER_WIFI};
+
+    #[test]
+    fn direct_discovery_excludes_mesh_and_recent_exchanges() {
+        let mut state = PeerState { last_ok: Some(Instant::now()), ..Default::default() };
+        assert!(state.online());
+        assert!(!state.is_directly_discovered());
+        state.links.insert(PathKind::Mesh);
+        assert!(!state.is_directly_discovered());
+        for kind in [PathKind::Bluetooth, PathKind::PeerWifi] {
+            state.links.insert(kind);
+            assert!(state.is_directly_discovered());
+            state.links.remove(&kind);
+            assert!(!state.is_directly_discovered());
+        }
+        state.nearby = true;
+        assert!(state.is_directly_discovered());
+    }
+
+    #[tokio::test]
+    async fn direct_discovery_tracks_found_and_lost_link_addresses() {
+        let node = Node::spawn(Arc::new(DeviceKeys::generate()), NodeOptions::new(NetMode::Local, "discovery-test"))
+            .await.unwrap();
+        let peer = DeviceKeys::generate().sign_pk();
+        let addr = |id, suffix| {
+            let mut data = peer.0.to_vec();
+            data.push(suffix);
+            CustomAddr::from_parts(id, &data)
+        };
+        let mesh = addr(TRANSPORT_MESH, 0);
+        let wifi1 = addr(TRANSPORT_PEER_WIFI, 1);
+        let wifi2 = addr(TRANSPORT_PEER_WIFI, 2);
+        let bluetooth = addr(TRANSPORT_BLUETOOTH, 0);
+        let found = |addr| node.inner.on_link_event(LinkEvent::Found { peer, addr, name: Some("Nearby device".into()) });
+        let lost = |addr| node.inner.on_link_event(LinkEvent::Lost { peer, addr });
+        let state = || node.peers().remove(&peer).unwrap();
+        found(mesh);
+        node.inner.mark_ok(peer);
+        assert!(state().online());
+        assert!(!state().is_directly_discovered());
+        found(wifi1.clone());
+        found(wifi2.clone());
+        found(bluetooth.clone());
+        assert!(state().is_directly_discovered());
+        assert!(!state().nearby, "direct radio discovery must not claim an mDNS/LAN path");
+        lost(wifi1);
+        assert!(state().links.contains(&PathKind::PeerWifi), "one Wi-Fi address remains");
+        lost(wifi2);
+        assert!(!state().links.contains(&PathKind::PeerWifi));
+        assert!(state().is_directly_discovered(), "Bluetooth remains");
+        lost(bluetooth);
+        assert!(!state().is_directly_discovered(), "mesh and last_ok cannot retain proximity");
+        assert!(state().online(), "a remote reachable peer can remain online");
+        node.shutdown().await.unwrap();
     }
 }
 

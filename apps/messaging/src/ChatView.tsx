@@ -80,7 +80,7 @@ export function ChatView({
       const other = others[0];
       const contact = other ? contactsById.get(other.id) : undefined;
       if (!contact) return "Not in your contacts";
-      if (contact.nearby) return "On your network";
+      if (contact.nearby) return "Nearby";
       if (contact.online) return "Online";
       return "Offline. Messages will arrive when they're back.";
     }

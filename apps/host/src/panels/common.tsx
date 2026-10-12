@@ -48,7 +48,7 @@ export function statusOf(c: { nearby: boolean; online: boolean }): "nearby" | "o
 }
 
 export const STATUS_LABEL = {
-  nearby: "On your network",
+  nearby: "Nearby",
   online: "Online",
   offline: "Offline",
 } as const;

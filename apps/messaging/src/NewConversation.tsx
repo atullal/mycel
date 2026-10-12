@@ -123,7 +123,7 @@ export function NewConversationDialog({
                 key={c.id}
                 id={c.id}
                 name={c.name}
-                note={c.nearby ? "On your network" : c.online ? "Online" : "Offline"}
+                note={c.nearby ? "Nearby" : c.online ? "Online" : "Offline"}
                 status={c.nearby ? "nearby" : c.online ? "online" : "offline"}
                 checked={chosen.includes(c.id)}
                 onToggle={() => toggle(c.id)}

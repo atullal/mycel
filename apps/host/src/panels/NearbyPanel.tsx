@@ -42,7 +42,7 @@ export function NearbyPanel() {
       <p className="p-help">
         {localOnly
           ? "This device is in local-only mode, so it isn't looking for anyone on the network."
-          : "People running Mycel on the same Wi-Fi or wired network show up here. No internet needed."}
+          : "Find people using Mycel nearby through Wi-Fi, Bluetooth, or a shared network. No internet needed."}
       </p>
 
       <SearchField value={query} onChange={setQuery} label="Search nearby people" placeholder="Search names" />
@@ -52,7 +52,7 @@ export function NearbyPanel() {
       )}
 
       {!loading && nearby.length === 0 && !localOnly && !query.trim() && (
-        <p className="p-empty">Nobody nearby right now. They'll appear here as soon as they open Mycel on this network.</p>
+        <p className="p-empty">Nobody nearby right now. Keep Mycel open on both devices to find each other.</p>
       )}
 
       <ul className="p-people" aria-label="Nearby people">

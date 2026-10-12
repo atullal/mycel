@@ -69,7 +69,7 @@ export interface Mycel {
     list(): Promise<Contact[]>;
     /** `add_contact`: add someone from their contact code. */
     add(code: string): Promise<Contact>;
-    /** `add_nearby_contact`: fetch a nearby person's card over the LAN and add them. */
+    /** `add_nearby_contact`: fetch a nearby person's card over an available direct path and add them. */
     addNearby(id: PeerId): Promise<Contact>;
     /** `remove_contact` */
     remove(id: PeerId): Promise<void>;

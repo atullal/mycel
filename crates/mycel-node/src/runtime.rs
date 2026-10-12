@@ -13,7 +13,7 @@ use data_encoding::BASE64URL_NOPAD;
 use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, SignPk, SymKey, random};
 use mycel_kit_chat::{AttachmentRef, ChatOp, ChatSignal, ChatView, messages_feed, reduce};
 use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallManager};
-use mycel_net::{ContactCard, ExtraProtocol, NetEvent, NetMode, Node, NodeOptions, PathKind};
+use mycel_net::{ContactCard, ExtraProtocol, NetEvent, NetMode, Node, NodeOptions, PathKind, PeerState};
 use mycel_sync::Replica;
 use mycel_trust::{Role, SpaceId};
 use serde::{Deserialize, Serialize};
@@ -664,7 +664,7 @@ impl Runtime {
         Some(Contact {
             id: hex_id(pk),
             name: self.name_of(pk),
-            nearby: peers.get(pk).is_some_and(|p| p.nearby),
+            nearby: peers.get(pk).is_some_and(PeerState::is_directly_discovered),
             online: peers.get(pk).is_some_and(|p| p.online()),
         })
     }
@@ -677,15 +677,17 @@ impl Runtime {
     }
 
     pub fn nearby(&self) -> Vec<NearbyPeer> {
+        self.nearby_from_peers(self.node.peers())
+    }
+
+    fn nearby_from_peers(&self, peers: HashMap<SignPk, PeerState>) -> Vec<NearbyPeer> {
         let contacts = self.contacts.lock().clone();
-        let mut out: Vec<NearbyPeer> = self
-            .node
-            .peers()
+        let mut out: Vec<NearbyPeer> = peers
             .into_iter()
-            .filter(|(_, p)| p.nearby)
-            .map(|(pk, p)| NearbyPeer {
+            .filter(|(_, p)| p.is_directly_discovered())
+            .map(|(pk, _)| NearbyPeer {
                 id: hex_id(&pk),
-                name: p.name.clone().unwrap_or_else(|| pk.short()),
+                name: self.name_of(&pk),
                 is_contact: contacts.contains_key(&pk),
             })
             .collect();
@@ -728,7 +730,7 @@ impl Runtime {
                 .filter(|(_, p)| p.online())
                 .map(|(pk, _)| hex_id(pk))
                 .collect(),
-            nearby_peers: peers.values().filter(|p| p.nearby || !p.links.is_empty()).count() as u32,
+            nearby_peers: peers.values().filter(|p| p.is_directly_discovered()).count() as u32,
             addresses: self.node.local_addresses(),
             links: self.node.link_status(),
             peers: paths,
@@ -763,7 +765,7 @@ impl Runtime {
     }
 
     /// Best display name: contact name, else the name they announced in any
-    /// conversation, else the LAN name, else a short id.
+    /// conversation, else the discovered device name, else a short id.
     fn name_of(&self, pk: &SignPk) -> String {
         if *pk == self.keys.sign_pk() {
             return self.name.lock().clone();
@@ -1752,6 +1754,49 @@ fn sample_rate(s: &mut std::collections::VecDeque<(Instant, u64)>, now: Instant,
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn nearby_list_includes_direct_radios_but_excludes_remote_reachability() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("mycel-nearby-{}", mycel_crypto::random_u64()));
+        let runtime = Runtime::open(&dir, NetworkMode::Local, Some("Discovery test".into())).await.unwrap();
+        let bluetooth = DeviceKeys::generate().public();
+        let wifi = DeviceKeys::generate().sign_pk();
+        let lan = DeviceKeys::generate().sign_pk();
+        let mesh = DeviceKeys::generate().sign_pk();
+        let recent = DeviceKeys::generate().sign_pk();
+        runtime.contacts.lock().insert(bluetooth.sign_pk, StoredContact { keys: bluetooth, name: "Alice's phone".into() });
+        runtime.announced.lock().insert(wifi, "Bob's phone".into());
+        let mut peers = HashMap::from([
+            (bluetooth.sign_pk, PeerState { links: BTreeSet::from([PathKind::Bluetooth]), ..Default::default() }),
+            (wifi, PeerState { links: BTreeSet::from([PathKind::PeerWifi]), ..Default::default() }),
+            (lan, PeerState { nearby: true, ..Default::default() }),
+            (mesh, PeerState { links: BTreeSet::from([PathKind::Mesh]), last_ok: Some(Instant::now()), ..Default::default() }),
+            (recent, PeerState { last_ok: Some(Instant::now()), ..Default::default() }),
+        ]);
+        // This is the same filtering/name construction called by nearby(),
+        // whose old mDNS-only filter omitted both radio-discovered phones.
+        let nearby = runtime.nearby_from_peers(peers.clone());
+        assert_eq!(nearby.len(), 3);
+        let alice = nearby.iter().find(|p| p.id == hex_id(&bluetooth.sign_pk)).unwrap();
+        assert_eq!(alice.name, "Alice's phone");
+        assert!(alice.is_contact);
+        let bob = nearby.iter().find(|p| p.id == hex_id(&wifi)).unwrap();
+        assert_eq!(bob.name, "Bob's phone");
+        assert!(!bob.is_contact);
+        assert!(nearby.iter().any(|p| p.id == hex_id(&lan)));
+        assert!(!nearby.iter().any(|p| p.id == hex_id(&mesh) || p.id == hex_id(&recent)));
+        // A successful exchange or mesh fallback after the direct radio is
+        // lost keeps online status, but must remove it from Nearby/pickers.
+        let lost = peers.get_mut(&wifi).unwrap();
+        lost.links = BTreeSet::from([PathKind::Mesh]);
+        lost.last_ok = Some(Instant::now());
+        assert!(lost.online());
+        assert!(!runtime.nearby_from_peers(peers).iter().any(|p| p.id == hex_id(&wifi)));
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn voice_note_mime_types() {
         assert_eq!(super::guess_mime("Voice note.m4a"), "audio/mp4");

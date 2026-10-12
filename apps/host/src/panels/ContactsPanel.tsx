@@ -66,8 +66,8 @@ export function ContactsPanel({ onShowNearby }: { onShowNearby: () => void }) {
         <button className="p-nearby-hint" onClick={onShowNearby}>
           <span className="p-nearby-dot" />
           {strangers.length === 1
-            ? `${strangers[0]!.name} is on your network. Add them?`
-            : `${strangers.length} people on your network aren't in your contacts.`}
+            ? `${strangers[0]!.name} is nearby. Add them?`
+            : `${strangers.length} people nearby aren't in your contacts.`}
         </button>
       )}
 
@@ -76,7 +76,7 @@ export function ContactsPanel({ onShowNearby }: { onShowNearby: () => void }) {
       </h4>
       <SearchField value={query} onChange={setQuery} label="Search contacts" placeholder="Search names" />
       {!loading && contacts.length === 0 && (
-        <p className="p-empty">No contacts yet. Ask someone for their code, or add a person who's on your network.</p>
+        <p className="p-empty">No contacts yet. Ask someone for their code, or add someone nearby.</p>
       )}
       {!loading && contacts.length > 0 && shownContacts.length === 0 && (
         <p className="p-empty" role="status">No contacts match "{query.trim()}".</p>
