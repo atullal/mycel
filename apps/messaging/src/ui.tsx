@@ -1,5 +1,7 @@
 import type { ReactNode, SVGProps } from "react";
 import type { Member, MessageView } from "@mycel/sdk";
+import { PRESENCE_LABEL, type Presence } from "./presence.ts";
+import "./presence.css";
 
 // ---------------------------------------------------------------------------
 // Icons (1.6px strokes on a 20px grid, drawn for this app)
@@ -214,6 +216,10 @@ export function DeliveryMark({ delivery }: { delivery: MessageView["delivery"] }
 // ---------------------------------------------------------------------------
 // Avatars
 
+export function PresenceLabel({ status, className = "" }: { status?: Presence; className?: string }) {
+  return status ? <span className={`mx-presence-label is-${status} ${className}`}>{PRESENCE_LABEL[status]}</span> : null;
+}
+
 // Six muted, mutually harmonious hues; picked by id so a person keeps theirs everywhere.
 const AVATAR_TONES = ["moss", "slate", "ochre", "plum", "clay", "tide"] as const;
 
@@ -264,15 +270,17 @@ export function ConversationAvatar({
   members,
   title,
   size = 40,
+  status,
 }: {
   id: string;
   direct: boolean;
   members: Member[];
   title: string;
   size?: number;
+  status?: Presence;
 }) {
   const others = members.filter((m) => !m.isMe && m.role !== "keeper");
-  if (direct && others[0]) return <Avatar id={others[0].id} name={others[0].name} size={size} />;
+  if (direct && others[0]) return <Avatar id={others[0].id} name={others[0].name} size={size} status={status} />;
   const shown = others.slice(0, 2);
   if (shown.length < 2) return <Avatar id={id} name={title} size={size} />;
   const small = Math.round(size * 0.64);

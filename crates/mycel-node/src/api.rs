@@ -68,6 +68,14 @@ pub struct Member {
 #[serde(rename_all = "camelCase")]
 pub struct ConversationSummary {
     pub id: ConversationId,
+    /// Original spaces represented by this logical conversation. Old IDs
+    /// remain valid aliases; message operations retain their source space.
+    #[serde(default)]
+    pub aliases: Vec<ConversationId>,
+    /// Stable local UI/notification identity, independent of transport and
+    /// independently created direct-space IDs. Never used as a wire space ID.
+    #[serde(default)]
+    pub thread_key: String,
     pub title: String,
     /// True for a 1:1 conversation.
     pub direct: bool,

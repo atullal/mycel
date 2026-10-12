@@ -3,6 +3,7 @@ import { useContacts, useMycel, useNearby } from "@mycel/sdk/react";
 import { Avatar, Icon, errorText } from "./ui.tsx";
 import { matchesSearch } from "./search.ts";
 import { SearchField } from "./SearchField.tsx";
+import { presenceOf, PRESENCE_LABEL } from "./presence.ts";
 
 export function NewConversationDialog({
   onClose,
@@ -123,8 +124,8 @@ export function NewConversationDialog({
                 key={c.id}
                 id={c.id}
                 name={c.name}
-                note={c.nearby ? "Nearby" : c.online ? "Online" : "Offline"}
-                status={c.nearby ? "nearby" : c.online ? "online" : "offline"}
+                note={PRESENCE_LABEL[presenceOf(c)]}
+                status={presenceOf(c)}
                 checked={chosen.includes(c.id)}
                 onToggle={() => toggle(c.id)}
               />
@@ -140,7 +141,7 @@ export function NewConversationDialog({
                     key={n.id}
                     id={n.id}
                     name={n.name}
-                    note="Will be added to your contacts"
+                    note="Nearby · Will be added to your contacts"
                     status="nearby"
                     checked={chosen.includes(n.id)}
                     onToggle={() => toggle(n.id)}

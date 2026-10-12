@@ -14,6 +14,11 @@ export interface MessagingAppProps {
   initialConversation?: string;
   /** Ask the host to show its Contacts panel (used by empty states). */
   onOpenContacts?: () => void;
+  /** Host panels can cover the mounted chat; covered chats are not being read. */
+  visible?: boolean;
+  /** Host notification routing; a token allows opening the same chat twice. */
+  openRequest?: { id: string; token: number } | null;
+  onVisibleConversationChange?: (id: string | null) => void;
 }
 
 const LAST_KEY = "mycel.messaging.lastConversation";
@@ -35,7 +40,7 @@ function writeLast(id: string | null) {
   }
 }
 
-export function MessagingApp({ initialConversation, onOpenContacts }: MessagingAppProps) {
+export function MessagingApp({ initialConversation, onOpenContacts, visible = true, openRequest, onVisibleConversationChange }: MessagingAppProps) {
   const { conversations, loading } = useConversations();
   const { contacts } = useContacts();
   const { profile } = useProfile();
@@ -75,7 +80,7 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
   useEffect(() => {
     if (loading || validated.current) return;
     validated.current = true;
-    if (selected && !conversations.some((c) => c.id === selected)) setSelected(null);
+    if (selected && !conversations.some((c) => c.id === selected || c.aliases?.includes(selected))) setSelected(null);
   }, [loading, conversations, selected]);
 
   const select = useCallback((id: string | null) => {
@@ -107,7 +112,24 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
     return () => window.removeEventListener("popstate", onPop);
   }, [select]);
 
-  const current = conversations.find((c) => c.id === selected) ?? null;
+  const current = conversations.find((c) => c.id === selected || (selected != null && c.aliases?.includes(selected))) ?? null;
+  // A late-arriving duplicate may choose a different canonical space. Keep
+  // the current person selected without discarding the underlying histories.
+  useEffect(() => {
+    if (current && selected !== current.id) select(current.id);
+  }, [current?.id, selected, select]);
+  useEffect(() => {
+    if (!openRequest) return;
+    setComposing(false);
+    setMembersOpen(false);
+    setVideoMinimized(true);
+    select(openRequest.id);
+  }, [openRequest?.token, openRequest?.id, select]);
+  const visibleConversation = visible && !videoExpanded && !composing && !membersOpen ? current?.id ?? null : null;
+  useEffect(() => {
+    onVisibleConversationChange?.(visibleConversation);
+    return () => onVisibleConversationChange?.(null);
+  }, [visibleConversation, onVisibleConversationChange]);
   const currentCall = current
     ? (calls.find((c) => c.conversation === current.id && (isLive(c) || c.state === "joinable")) ?? null)
     : null;
@@ -141,7 +163,7 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
         )}
         {current ? (
           <ChatView
-            key={current.id}
+            key={current.threadKey ?? current.id}
             summary={current}
             me={profile?.id}
             contactsById={contactsById}
@@ -154,6 +176,7 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
             onVideoCall={() => void startCall(current.id, true)}
             call={currentCall}
             meName={profile?.name}
+            visible={visibleConversation === current.id}
           />
         ) : (
           <NoSelection
@@ -167,7 +190,7 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
       </main>
       {current && membersOpen && (
         <MembersPanel
-          key={current.id}
+          key={current.threadKey ?? current.id}
           conversationId={current.id}
           contacts={contacts}
           onClose={() => setMembersOpen(false)}

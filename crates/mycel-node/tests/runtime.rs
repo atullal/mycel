@@ -49,6 +49,59 @@ fn free_port() -> u16 {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn direct_chat_creation_reuses_peer_identity_across_concurrent_calls_and_restart() {
+    let (da, db, dc) = (tmp("direct-a"), tmp("direct-b"), tmp("direct-c"));
+    let mut alice = open(&da, "Alice", free_port(), false).await;
+    let bob = open(&db, "Same display name", free_port(), false).await;
+    let charlie = open(&dc, "Same display name", free_port(), false).await;
+    let b = alice.add_contact(bob.profile().contact_code).unwrap();
+    let c = alice.add_contact(charlie.profile().contact_code).unwrap();
+
+    let conversations = std::thread::scope(|scope| {
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let calls: Vec<_> = (0..16).map(|_| {
+            let rt = &alice;
+            let id = b.id.clone();
+            let barrier = barrier.clone();
+            scope.spawn(move || {
+                barrier.wait();
+                rt.create_conversation(None, vec![id]).unwrap().id
+            })
+        }).collect();
+        calls.into_iter().map(|call| call.join().unwrap()).collect::<Vec<_>>()
+    });
+    assert!(conversations.iter().all(|id| id == &conversations[0]));
+    assert_eq!(alice.conversations().len(), 1, "concurrent Start chat calls create one space");
+    let id = conversations[0].clone();
+    let message = alice.send_message(id.clone(), "preserve this message".into(), None, vec![]).await.unwrap();
+    assert_eq!(alice.create_conversation(Some("   ".into()), vec![b.id.clone()]).unwrap().id, id);
+
+    // Reachability/address discovery is mutable; identity is the signing key.
+    alice.node().add_peer_addr(bob.node().addr());
+    assert_eq!(alice.create_conversation(None, vec![b.id.clone()]).unwrap().id, id);
+    let other = alice.create_conversation(None, vec![c.id.clone()]).unwrap();
+    assert_ne!(other.id, id, "the same display name cannot collapse two identities");
+    let group = alice.create_conversation(Some("Team".into()), vec![b.id.clone()]).unwrap();
+    assert_ne!(group.id, id, "a named group with two members remains a distinct group");
+    let multi = alice.create_conversation(None, vec![b.id.clone(), c.id]).unwrap();
+    assert_ne!(multi.id, id);
+    alice.remove_member(multi.id.clone(), charlie.profile().id).unwrap();
+    assert_eq!(alice.create_conversation(None, vec![b.id.clone()]).unwrap().id, id,
+        "a group reduced to two members must not become the direct chat");
+
+    alice.shutdown().await.unwrap();
+    drop(alice);
+    alice = open(&da, "Alice", free_port(), false).await;
+    assert_eq!(alice.create_conversation(None, vec![b.id]).unwrap().id, id);
+    assert!(alice.messages(id, None, None).unwrap().iter().any(|m| m.id == message.id));
+    alice.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
+    charlie.shutdown().await.unwrap();
+    drop((alice, bob, charlie));
+    for dir in [da, db, dc] { std::fs::remove_dir_all(dir).unwrap(); }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn messaging_end_to_end() {
     let (da, db) = (tmp("alice"), tmp("bob"));
     let (pa, pb) = (free_port(), free_port());

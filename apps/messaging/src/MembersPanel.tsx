@@ -1,7 +1,8 @@
 import { useState } from "react";
 import { useConversation, useMycel } from "@mycel/sdk/react";
 import type { Contact, Member } from "@mycel/sdk";
-import { Avatar, Icon, ROLE_LABEL, errorText } from "./ui.tsx";
+import { Avatar, Icon, PresenceLabel, ROLE_LABEL, errorText } from "./ui.tsx";
+import { presenceOf } from "./presence.ts";
 import { matchesSearch } from "./search.ts";
 import { SearchField } from "./SearchField.tsx";
 
@@ -128,6 +129,7 @@ export function MembersPanel({
               <MemberRow
                 key={m.id}
                 m={m}
+                contact={m.isMe ? undefined : contacts.find((c) => c.id === m.id)}
                 canRemove={isAdmin && !m.isMe && !c.direct}
                 confirming={confirm === m.id}
                 onAsk={() => setConfirm(m.id)}
@@ -167,6 +169,7 @@ export function MembersPanel({
                 <MemberRow
                   key={m.id}
                   m={m}
+                  contact={m.isMe ? undefined : contacts.find((c) => c.id === m.id)}
                   canRemove={isAdmin}
                   confirming={confirm === m.id}
                   onAsk={() => setConfirm(m.id)}
@@ -247,6 +250,7 @@ function PanelHead({ title, onClose }: { title: string; onClose: () => void }) {
 
 function MemberRow({
   m,
+  contact,
   canRemove,
   confirming,
   onAsk,
@@ -254,18 +258,21 @@ function MemberRow({
   onRemove,
 }: {
   m: Member;
+  contact?: Contact;
   canRemove: boolean;
   confirming: boolean;
   onAsk: () => void;
   onCancel: () => void;
   onRemove: () => void;
 }) {
+  const presence = contact ? presenceOf(contact) : undefined;
   return (
     <li className="mx-member">
-      <Avatar id={m.id} name={m.name} size={32} />
+      <Avatar id={m.id} name={m.name} size={32} status={presence} />
       <span className="mx-member-name">
         {m.name}
         {m.isMe && <span className="mx-you"> (you)</span>}
+        <PresenceLabel status={presence} />
       </span>
       <span className={`mx-role role-${m.role}`}>{ROLE_LABEL[m.role]}</span>
       {!canRemove && <span className="mx-member-spacer" />}
@@ -322,9 +329,10 @@ function Picker({
           <li key={o.id}>
             <label className={`mx-person is-compact${picked.includes(o.id) ? " is-checked" : ""}`}>
               <input type={multi ? "checkbox" : "radio"} name="mx-pick" checked={picked.includes(o.id)} onChange={() => toggle(o.id)} />
-              <Avatar id={o.id} name={o.name} size={28} />
+              <Avatar id={o.id} name={o.name} size={28} status={presenceOf(o)} />
               <span className="mx-person-text">
                 <span className="mx-person-name">{o.name}</span>
+                <PresenceLabel status={presenceOf(o)} />
               </span>
               <span className="mx-check" aria-hidden="true">
                 <Icon.Check size={13} />

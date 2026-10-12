@@ -1,8 +1,9 @@
-import { useState } from "react";
-import { useConversations, useMycel } from "@mycel/sdk/react";
+import { useMemo, useState } from "react";
+import { useContacts, useConversations, useMycel } from "@mycel/sdk/react";
 import type { MessageView } from "@mycel/sdk";
 import { ChatModal } from "./ChatModal.tsx";
-import { Icon, errorText, previewText } from "./ui.tsx";
+import { Icon, PresenceLabel, errorText, previewText } from "./ui.tsx";
+import { directPresence } from "./presence.ts";
 import { SearchField } from "./SearchField.tsx";
 import { matchesSearch } from "./search.ts";
 
@@ -15,6 +16,8 @@ export function MessageActions({ message, onClose, onReply, onEdit, canInteract 
 }) {
   const mycel = useMycel();
   const { conversations } = useConversations();
+  const { contacts } = useContacts();
+  const contactsById = useMemo(() => new Map(contacts.map((c) => [c.id, c])), [contacts]);
   const [forwarding, setForwarding] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [query, setQuery] = useState("");
@@ -57,7 +60,7 @@ export function MessageActions({ message, onClose, onReply, onEdit, canInteract 
       <div className="mx-forward-list">
         {shown.map((c) =>
           <button key={c.id} className="mx-menu-item" aria-pressed={target === c.id} disabled={busy} onClick={() => setTarget(c.id)}>
-            <span>{c.title}</span>{target === c.id && <Icon.Check />}
+            <span className="mx-forward-person">{c.title}<PresenceLabel status={directPresence(c, contactsById)} /></span>{target === c.id && <Icon.Check />}
           </button>)}
         {!shown.length && <p className="mx-modal-note" role="status">{query.trim() ? "No matching conversations." : "No conversations available."}</p>}
       </div>

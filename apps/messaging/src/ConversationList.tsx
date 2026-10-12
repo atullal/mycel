@@ -1,6 +1,8 @@
 import { useMemo, useState } from "react";
 import type { ConversationSummary } from "@mycel/sdk";
-import { ConversationAvatar, Icon, formatListTime, previewText } from "./ui.tsx";
+import { useContacts } from "@mycel/sdk/react";
+import { ConversationAvatar, Icon, PresenceLabel, formatListTime, previewText } from "./ui.tsx";
+import { directPresence, type Presence } from "./presence.ts";
 import { matchesSearch } from "./search.ts";
 import { SearchField } from "./SearchField.tsx";
 
@@ -22,6 +24,8 @@ export function ConversationList({
   onSelect: (id: string) => void;
   onCompose: () => void;
 }) {
+  const { contacts } = useContacts();
+  const contactsById = useMemo(() => new Map(contacts.map((c) => [c.id, c])), [contacts]);
   const [query, setQuery] = useState("");
   const [requestsOpen, setRequestsOpen] = useState(true);
   const filtered = useMemo(() => {
@@ -61,7 +65,7 @@ export function ConversationList({
             {requestsOpen && (
               <ul role="listbox" aria-label="Message requests">
                 {requests.map((c) => (
-                  <ConversationRow key={c.id} c={c} active={c.id === selected} onSelect={onSelect} />
+                  <ConversationRow key={c.id} c={c} status={directPresence(c, contactsById)} active={c.id === selected} onSelect={onSelect} />
                 ))}
               </ul>
             )}
@@ -85,7 +89,7 @@ export function ConversationList({
             </li>
           )}
           {chats.map((c) => (
-            <ConversationRow key={c.id} c={c} active={c.id === selected} onSelect={onSelect} />
+            <ConversationRow key={c.id} c={c} status={directPresence(c, contactsById)} active={c.id === selected} onSelect={onSelect} />
           ))}
         </ul>
       </div>
@@ -95,10 +99,12 @@ export function ConversationList({
 
 function ConversationRow({
   c,
+  status,
   active,
   onSelect,
 }: {
   c: ConversationSummary;
+  status?: Presence;
   active: boolean;
   onSelect: (id: string) => void;
 }) {
@@ -125,12 +131,13 @@ function ConversationRow({
         }
       }}
     >
-      <ConversationAvatar id={c.id} direct={c.direct} members={c.members} title={c.title} size={42} />
+      <ConversationAvatar id={c.id} direct={c.direct} members={c.members} title={c.title} size={42} status={status} />
       <div className="mx-row-text">
         <div className="mx-row-top">
           <span className="mx-row-title">{c.title}</span>
           {last && <time className="mx-row-time">{formatListTime(last.sentAt)}</time>}
         </div>
+        <PresenceLabel status={status} className="mx-row-presence" />
         <div className="mx-row-bottom">
           <span className={`mx-row-preview${last?.deleted ? " is-deleted" : ""}`}>{preview}</span>
           {c.request ? (

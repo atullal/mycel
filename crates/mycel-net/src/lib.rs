@@ -28,6 +28,8 @@
 mod blobs;
 mod pool;
 mod resources;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod native_mdns;
 pub mod link;
 pub mod emu;
 pub mod mesh;
@@ -238,6 +240,8 @@ struct Inner {
     feed_validator: Option<Arc<dyn FeedValidator>>,
     spaces: Mutex<HashMap<SpaceId, Replica>>,
     peers: Mutex<HashMap<SignPk, PeerState>>,
+    /// Independent LAN discovery sources; loss of one cannot hide another.
+    lan_sources: Mutex<HashMap<SignPk, BTreeSet<&'static str>>>,
     events: broadcast::Sender<NetEvent>,
     memory: MemoryLookup,
     /// Addresses learned from links, kept apart from contact-code hints so a
@@ -300,6 +304,19 @@ impl Inner {
         if !was_online {
             self.emit(NetEvent::PeersChanged);
         }
+    }
+
+    /// Recent successful exchanges age out without another network event.
+    /// Clear the expired timestamp and publish the transition for UI watchers.
+    fn expire_reachability(&self) {
+        let mut changed = false;
+        for peer in self.peers.lock().values_mut() {
+            if peer.last_ok.is_some_and(|t| t.elapsed() >= ONLINE_WINDOW) {
+                peer.last_ok = None;
+                changed |= !peer.nearby && peer.links.is_empty();
+            }
+        }
+        if changed { self.emit(NetEvent::PeersChanged); }
     }
 
     /// Remember which path a finished exchange used (for the Network panel).
@@ -985,51 +1002,51 @@ async fn scheduler(inner: Arc<Inner>) {
 /// Track nearby peers via mDNS and sync shared spaces when one appears.
 async fn watch_mdns(inner: Arc<Inner>, mdns: MdnsAddressLookup) {
     let mut events = mdns.subscribe().await;
-    while let Some(ev) = events.next().await {
-        match ev {
-            DiscoveryEvent::Discovered { endpoint_info, .. } => {
-                let pk = to_sign_pk(&endpoint_info.endpoint_id);
-                if pk == inner.keys.sign_pk() {
-                    continue;
-                }
-                let name = endpoint_info
-                    .data
-                    .user_data()
-                    .and_then(|u| u.as_ref().strip_prefix("mycel:").map(str::to_string));
-                let newly = {
-                    let mut peers = inner.peers.lock();
-                    let p = peers.entry(pk).or_default();
-                    let newly = !p.nearby || p.name != name;
-                    p.nearby = true;
-                    p.name = name;
-                    p.failures = 0;
-                    newly
-                };
-                inner.update_direct(pk);
-                if newly {
-                    inner.emit(NetEvent::PeersChanged);
-                    let shared: Vec<SpaceId> = inner
-                        .spaces
-                        .lock()
-                        .iter()
-                        .filter(|(_, r)| r.is_member(&pk))
-                        .map(|(s, _)| *s)
-                        .collect();
-                    for s in shared {
-                        tokio::spawn(sync_once(inner.clone(), pk, s));
-                    }
-                }
-            }
-            DiscoveryEvent::Expired { endpoint_id } => {
-                let pk = to_sign_pk(&endpoint_id);
-                if let Some(p) = inner.peers.lock().get_mut(&pk) {
-                    p.nearby = false;
-                }
-                inner.update_direct(pk);
+    while let Some(ev) = events.next().await { on_lan_discovery(&inner, "raw", ev); }
+}
+
+fn on_lan_discovery(inner: &Arc<Inner>, source: &'static str, ev: DiscoveryEvent) {
+    match ev {
+        DiscoveryEvent::Discovered { endpoint_info, .. } => {
+            let pk = to_sign_pk(&endpoint_info.endpoint_id);
+            if pk == inner.keys.sign_pk() { return; }
+
+            let name = endpoint_info.data.user_data()
+                .and_then(|u| u.as_ref().strip_prefix("mycel:").map(str::to_string));
+            let newly = {
+                let mut sources = inner.lan_sources.lock();
+                sources.entry(pk).or_default().insert(source);
+                let mut peers = inner.peers.lock();
+                let p = peers.entry(pk).or_default();
+                let newly = !p.nearby || name.is_some() && p.name != name;
+                p.nearby = true;
+                if name.is_some() { p.name = name; }
+                p.failures = 0;
+                newly
+            };
+            inner.update_direct(pk);
+            if newly {
                 inner.emit(NetEvent::PeersChanged);
+                let shared: Vec<SpaceId> = inner.spaces.lock().iter()
+                    .filter(|(_, r)| r.is_member(&pk)).map(|(s, _)| *s).collect();
+                for s in shared { tokio::spawn(sync_once(inner.clone(), pk, s)); }
             }
-            _ => {}
         }
+        DiscoveryEvent::Expired { endpoint_id } => {
+            let pk = to_sign_pk(&endpoint_id);
+            let changed = {
+                let mut sources = inner.lan_sources.lock();
+                if let Some(s) = sources.get_mut(&pk) { s.remove(source); }
+                let nearby = sources.get(&pk).is_some_and(|s| !s.is_empty());
+                if !nearby { sources.remove(&pk); }
+                if let Some(p) = inner.peers.lock().get_mut(&pk) {
+                    let changed = p.nearby != nearby; p.nearby = nearby; changed
+                } else { false }
+            };
+            inner.update_direct(pk);
+            if changed { inner.emit(NetEvent::PeersChanged); }
+        }
+        _ => {}
     }
 }
 
@@ -1129,6 +1146,15 @@ impl Node {
         } else {
             None
         };
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let native_mdns = if opts.mode != NetMode::Local && opts.ip {
+            let sockets = endpoint.bound_sockets();
+            let port = sockets.iter().find(|a| a.is_ipv4()).or_else(|| sockets.first()).map_or(0, |a| a.port());
+            match native_mdns::NativeMdns::start(endpoint.id(), port) {
+                Ok((lookup, events)) => { endpoint.address_lookup()?.add(lookup.clone()); Some((lookup, events)) },
+                Err(err) => { eprintln!("[mycel] native Bonjour unavailable: {err}"); None },
+            }
+        } else { None };
         let (events, _) = broadcast::channel(1024);
         let pool = Pool::new(endpoint.clone());
         let inner = Arc::new(Inner {
@@ -1143,6 +1169,7 @@ impl Node {
             feed_validator: opts.feed_validator,
             spaces: Mutex::default(),
             peers: Mutex::default(),
+            lan_sources: Mutex::default(),
             events,
             memory,
             link_lookup,
@@ -1173,8 +1200,17 @@ impl Node {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 reaper.pool.reap(POOL_IDLE);
+                reaper.expire_reachability();
             }
         }));
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some((lookup, mut events)) = native_mdns {
+            let native_inner = inner.clone();
+            tasks.push(tokio::spawn(async move {
+                let _keep_alive = lookup;
+                while let Some(ev) = events.recv().await { on_lan_discovery(&native_inner, "native", ev); }
+            }));
+        }
         if let Some(mdns) = mdns {
             tasks.push(tokio::spawn(watch_mdns(inner.clone(), mdns)));
         }
@@ -1490,6 +1526,43 @@ mod discovery_tests {
         }
         state.nearby = true;
         assert!(state.is_directly_discovered());
+    }
+
+    #[tokio::test]
+    async fn lan_discovery_sources_expire_independently() {
+        let node = Node::spawn(Arc::new(DeviceKeys::generate()), NodeOptions::new(NetMode::Local, "lan-source-test")).await.unwrap();
+        let peer = DeviceKeys::generate().sign_pk();
+        let id = to_endpoint_id(&peer).unwrap();
+        let found = || DiscoveryEvent::Discovered { endpoint_info: iroh::address_lookup::EndpointInfo::from_parts(id, Default::default()), last_updated: None };
+        let lost = || DiscoveryEvent::Expired { endpoint_id: id };
+        on_lan_discovery(&node.inner, "native", found());
+        on_lan_discovery(&node.inner, "raw", found());
+        on_lan_discovery(&node.inner, "raw", lost());
+        assert!(node.peers()[&peer].nearby);
+        assert!(node.peers()[&peer].is_directly_discovered());
+        on_lan_discovery(&node.inner, "native", lost());
+        assert!(!node.peers()[&peer].nearby);
+        assert!(!node.peers()[&peer].online());
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recent_reachability_expiry_emits_once_and_preserves_path_history() {
+        let node = Node::spawn(Arc::new(DeviceKeys::generate()), NodeOptions::new(NetMode::Local, "expiry-test")).await.unwrap();
+        let gone = DeviceKeys::generate().sign_pk();
+        let live = DeviceKeys::generate().sign_pk();
+        let old = Instant::now() - ONLINE_WINDOW - Duration::from_secs(1);
+        node.inner.peers.lock().insert(gone, PeerState { last_ok: Some(old), via: Some(PathKind::Relay), ..Default::default() });
+        node.inner.peers.lock().insert(live, PeerState { last_ok: Some(old), nearby: true, ..Default::default() });
+        let mut events = node.subscribe();
+        node.inner.expire_reachability();
+        assert!(matches!(events.try_recv(), Ok(NetEvent::PeersChanged)));
+        assert!(!node.peers()[&gone].online());
+        assert_eq!(node.peers()[&gone].via, Some(PathKind::Relay));
+        assert!(node.peers()[&live].online());
+        node.inner.expire_reachability();
+        assert!(events.try_recv().is_err());
+        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]

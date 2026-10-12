@@ -9,6 +9,7 @@ import {
   type Ref,
 } from "react";
 import { useMycel, useTransfer } from "@mycel/sdk/react";
+import { isMobile } from "@mycel/sdk";
 import type { ConversationSummary, MessageView } from "@mycel/sdk";
 import { Icon, errorText, fileNameFromPath, formatRate, formatSize, previewText } from "./ui.tsx";
 
@@ -48,6 +49,7 @@ export function Composer({
   const mycel = useMycel();
   const [attachmentMenu, setAttachmentMenu] = useState(false);
   const [recording, setRecording] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
   const photoInput = useRef<HTMLInputElement>(null);
   const cameraInput = useRef<HTMLInputElement>(null);
   const [text, setText] = useState("");
@@ -177,7 +179,7 @@ export function Composer({
     } catch (e) {
       setError(errorText(e));
     }
-    input.current?.focus();
+    if (matchMedia("(pointer: fine)").matches) input.current?.focus();
   };
 
   // Pasted images and HTML-dropped files have no path: copy them to the runtime first.
@@ -218,6 +220,8 @@ export function Composer({
 
   return (
     <div className="mx-composer">
+      {/* Mobile file inputs already offer Photos, Camera and Files in the system chooser. */}
+      <input ref={fileInput} type="file" multiple hidden onChange={(e) => { void attachFiles(Array.from(e.currentTarget.files ?? [])); e.currentTarget.value = ""; }} />
       <input ref={photoInput} type="file" accept="image/*,video/*" multiple hidden onChange={(e) => { void attachFiles(Array.from(e.currentTarget.files ?? [])); e.currentTarget.value = ""; }} />
       <input ref={cameraInput} type="file" accept="image/*" capture="environment" hidden onChange={(e) => { void attachFiles(Array.from(e.currentTarget.files ?? [])); e.currentTarget.value = ""; }} />
       {attachmentMenu && <ChatModal title="Attach" onClose={() => setAttachmentMenu(false)}>
@@ -269,7 +273,10 @@ export function Composer({
 
       {!recording && <div className="mx-composer-box">
         {!editing && (
-          <button className="mx-icon-btn mx-attach" disabled={busy || staging > 0} onClick={() => setAttachmentMenu(true)} aria-label="Attach files" title="Attach files">
+          <button className="mx-icon-btn mx-attach" disabled={busy || staging > 0} onClick={() => {
+            if (isMobile()) fileInput.current?.click();
+            else setAttachmentMenu(true);
+          }} aria-label="Attach files" title="Attach files">
             <Icon.Plus />
           </button>
         )}

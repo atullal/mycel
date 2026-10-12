@@ -6,6 +6,7 @@ import { Composer, type ComposerHandle } from "./Composer.tsx";
 import { ConversationAvatar, Icon, errorText } from "./ui.tsx";
 import { GroupCallPanel, JoinBanner, isLive } from "./Calls.tsx";
 import { ChatSearch } from "./ChatSearch.tsx";
+import { directPresence, PRESENCE_LABEL } from "./presence.ts";
 
 export function ChatView({
   summary,
@@ -20,6 +21,7 @@ export function ChatView({
   onVideoCall,
   call = null,
   meName = "You",
+  visible = true,
 }: {
   summary: ConversationSummary;
   me: string | undefined;
@@ -39,9 +41,11 @@ export function ChatView({
   call?: CallInfo | null;
   /** Your name, for your own tile in a group call. */
   meName?: string;
+  /** Whether the message history is actually visible and readable. */
+  visible?: boolean;
 }) {
   const mycel = useMycel();
-  const { messages, loading, hasMore, loadOlder, error } = useMessages(summary.id);
+  const { messages, loading, hasMore, loadOlder, error } = useMessages(summary.id, undefined, summary.threadKey ?? summary.id);
   const typingPeers = useTyping(summary.id);
   const [replyTo, setReplyTo] = useState<MessageView | null>(null);
   const [editing, setEditing] = useState<MessageView | null>(null);
@@ -54,9 +58,9 @@ export function ChatView({
   // would tell a stranger you've seen it.
   const unread = summary.unread;
   useEffect(() => {
-    if (!unread || !summary.active || summary.request) return;
+    if (!visible || !unread || !summary.active || summary.request) return;
     const tryMark = () => {
-      if (document.visibilityState === "visible") {
+      if (document.visibilityState === "visible" && document.hasFocus()) {
         void mycel.chat.markRead(summary.id).catch(() => {});
       }
     };
@@ -67,26 +71,22 @@ export function ChatView({
       window.removeEventListener("focus", tryMark);
       document.removeEventListener("visibilitychange", tryMark);
     };
-  }, [mycel, summary.id, unread, summary.active, summary.request, messages.length]);
+  }, [mycel, summary.id, unread, summary.active, summary.request, messages.length, visible]);
 
   const others = summary.members.filter((m) => !m.isMe && m.role !== "keeper");
   const joinable = call?.state === "joinable";
   const keepers = summary.members.filter((m) => m.role === "keeper");
+  const presence = directPresence(summary, contactsById);
 
   const subtitle = useMemo(() => {
     if (!summary.active) return "You're no longer a member. History stays on this device.";
     if (summary.request) return summary.direct ? "Message request" : `Message request, ${others.length + 1} people`;
     if (summary.direct) {
-      const other = others[0];
-      const contact = other ? contactsById.get(other.id) : undefined;
-      if (!contact) return "Not in your contacts";
-      if (contact.nearby) return "Nearby";
-      if (contact.online) return "Online";
-      return "Offline. Messages will arrive when they're back.";
+      return presence ? PRESENCE_LABEL[presence] : "Not in your contacts";
     }
     const people = `${others.length + 1} people`;
     return keepers.length ? `${people}, ${keepers.length} keeper${keepers.length > 1 ? "s" : ""}` : people;
-  }, [summary, others, keepers, contactsById]);
+  }, [summary, others, keepers, contactsById, presence]);
 
   const typingNames = typingPeers
     .filter((p) => p !== me)
@@ -167,7 +167,7 @@ export function ChatView({
         <button className="mx-icon-btn mx-back" onClick={onBack} aria-label="Back to conversations">
           <Icon.Back />
         </button>
-        <ConversationAvatar id={summary.id} direct={summary.direct} members={summary.members} title={summary.title} size={38} />
+        <ConversationAvatar id={summary.id} direct={summary.direct} members={summary.members} title={summary.title} size={38} status={presence} />
         <button className="mx-chat-title" onClick={onToggleMembers} aria-label="Conversation details">
           <h2>{summary.title}</h2>
           <p>{typingNames.length ? "typing…" : subtitle}</p>

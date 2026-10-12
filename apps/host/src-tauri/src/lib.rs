@@ -553,6 +553,10 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            notify::prepare_notifications,
+            notify::set_notification_context,
+            notify::notification_target,
+            notify::take_notification_action,
             commands::get_profile,
             commands::set_name,
             commands::add_contact,

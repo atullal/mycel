@@ -36,7 +36,8 @@ const PATH: Record<PathKind, { name: string; text: string }> = {
 
 /** "via Peer-to-peer Wi-Fi", "via Mesh (via Bob, 2 hops)", or "via Mesh (gateway Bob, then the internet)". */
 function viaText(p: PeerPaths): string {
-  if (!p.via) return p.online ? "reachable" : "offline";
+  if (!p.online) return "Not reachable";
+  if (!p.via) return "Reachable";
   if (p.via === "mesh" && p.mesh?.gateway) return `via Mesh (gateway ${p.mesh.viaName}, then the internet)`;
   if (p.via === "mesh" && p.mesh) return `via Mesh (via ${p.mesh.viaName}, ${p.mesh.hops} hops)`;
   return `via ${PATH[p.via].name}`;
@@ -226,7 +227,7 @@ export function NetworkPanel() {
       <ul className="hy-legend" aria-label="Legend">
         <li className="is-nearby">Nearby</li>
         <li className="is-online">Connected</li>
-        <li className="is-offline">Offline</li>
+        <li className="is-offline">Not reachable</li>
       </ul>
 
       <dl className="p-stats">
@@ -268,7 +269,7 @@ export function NetworkPanel() {
                 <span className="p-path-name">{p.name}</span>
                 <span className="p-path-state">
                   {viaText(p)}
-                  {p.available.length > 1 && ` · ${p.available.length} paths`}
+                  {p.online && p.available.length > 1 && ` · ${p.available.length} paths`}
                 </span>
               </li>
             ))}

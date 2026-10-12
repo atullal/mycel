@@ -339,6 +339,8 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       .slice(0, c.unread).filter((m) => locallyHidden(c, m)).length;
     return {
       id: c.id,
+      aliases: [c.id],
+      threadKey: c.id,
       title: titleOf(c),
       direct: isDirect(c),
       members: c.members.map((m) => ({ id: m.id, name: nameOf(m.id), role: m.role, isMe: m.id === meId })),

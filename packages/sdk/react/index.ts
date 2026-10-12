@@ -196,28 +196,33 @@ const PAGE = 50;
  * `conversationUpdated` for it and on `blobReady` for any loaded attachment.
  * `loadOlder()` pages backwards.
  */
-export function useMessages(id: ConversationId | null | undefined, pageSize = PAGE) {
+export function useMessages(id: ConversationId | null | undefined, pageSize = PAGE, threadKey: string | null | undefined = id) {
   const [window_, setWindow] = useState(pageSize);
-  const [hasMore, setHasMore] = useState(false);
   const blobsRef = useRef<Set<string>>(new Set());
 
-  useEffect(() => setWindow(pageSize), [id, pageSize]);
+  useEffect(() => setWindow(pageSize), [threadKey, pageSize]);
 
   const q = useMycelQuery(
     async (c) => {
-      if (!id) return [] as MessageView[];
+      if (!id) return { threadKey, messages: [] as MessageView[], hasMore: false };
       // Ask for one extra to learn whether older history exists.
       const list = await c.chat.messages(id, { limit: window_ + 1 });
-      setHasMore(list.length > window_);
-      return list.length > window_ ? list.slice(1) : list;
+      return { threadKey, messages: list.length > window_ ? list.slice(1) : list, hasMore: list.length > window_ };
     },
-    [id, window_],
+    [id, window_, threadKey],
     (e) =>
       (e.type === "conversationUpdated" && e.conversation === id) ||
       (e.type === "blobReady" && blobsRef.current.has(e.blob)),
   );
 
-  const messages = q.data ?? [];
+  // A message retains its original encrypted space ID. Keep the loaded page
+  // by logical thread identity while pagination or a canonical alias reloads.
+  const prev = useRef<typeof q.data>(undefined);
+  if (q.data?.threadKey === threadKey) prev.current = q.data;
+  const page = q.data?.threadKey === threadKey ? q.data
+    : q.loading && prev.current?.threadKey === threadKey ? prev.current : undefined;
+  const messages = page?.messages ?? [];
+  const hasMore = page?.hasMore ?? false;
   blobsRef.current = useMemo(
     () => new Set(messages.flatMap((m) => m.attachments.map((a) => a.blob))),
     [messages],
@@ -227,12 +232,7 @@ export function useMessages(id: ConversationId | null | undefined, pageSize = PA
     if (hasMore) setWindow((w) => w + pageSize);
   }, [hasMore, pageSize]);
 
-  // Keep showing the previous page while a larger window loads.
-  const prev = useRef<MessageView[]>([]);
-  if (q.data) prev.current = q.data;
-  const shown = q.data ?? (q.loading && id && prev.current[0]?.conversation === id ? prev.current : []);
-
-  return { ...q, messages: shown, hasMore, loadOlder };
+  return { ...q, data: q.data?.threadKey === threadKey ? q.data?.messages : undefined, messages, hasMore, loadOlder };
 }
 
 /**
