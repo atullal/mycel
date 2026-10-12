@@ -918,3 +918,9 @@
     font-size: max(1em, 16px);
   }
 }
+
+/* Conversation navigation belongs in its header on a phone. */
+@media (max-width: 720px) {
+  .host:has(.mx-root.has-selection) { grid-template-rows: minmax(0, 1fr); }
+  .host:has(.mx-root.has-selection) > .rail { display: none; }
+}

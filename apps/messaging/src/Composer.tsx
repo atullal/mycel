@@ -12,6 +12,9 @@ import { useMycel, useTransfer } from "@mycel/sdk/react";
 import type { ConversationSummary, MessageView } from "@mycel/sdk";
 import { Icon, errorText, fileNameFromPath, formatRate, formatSize, previewText } from "./ui.tsx";
 
+import { ChatModal } from "./ChatModal.tsx";
+import { VoiceRecorder } from "./VoiceRecorder.tsx";
+
 /** Lets the conversation view hand the composer dropped files. */
 export interface ComposerHandle {
   /** Local paths (native drag-and-drop). */
@@ -43,6 +46,10 @@ export function Composer({
   onStartEdit: (m: MessageView) => void;
 }) {
   const mycel = useMycel();
+  const [attachmentMenu, setAttachmentMenu] = useState(false);
+  const [recording, setRecording] = useState(false);
+  const photoInput = useRef<HTMLInputElement>(null);
+  const cameraInput = useRef<HTMLInputElement>(null);
   const [text, setText] = useState("");
   const [files, setFiles] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
@@ -82,7 +89,7 @@ export function Composer({
   }, [replyTo]);
 
   useEffect(() => {
-    input.current?.focus();
+    if (matchMedia("(pointer: fine)").matches) input.current?.focus();
   }, [conversation.id]);
 
   const cancelEdit = () => {
@@ -91,7 +98,7 @@ export function Composer({
   };
 
   const submit = async () => {
-    if (busy) return;
+    if (busy || staging > 0 || recording) return;
     const body = text.trim();
     setError(null);
     if (editing) {
@@ -131,7 +138,7 @@ export function Composer({
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.nativeEvent.isComposing) return;
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey && (matchMedia("(pointer: fine)").matches || e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       void submit();
     } else if (e.key === "Escape") {
@@ -174,10 +181,12 @@ export function Composer({
   };
 
   // Pasted images and HTML-dropped files have no path: copy them to the runtime first.
-  const attachFiles = async (list: File[]) => {
+  const attachFiles = async (list: File[], propagateError = false) => {
     if (!list.length) return;
     if (!mycel.files.stage) {
-      setError("Use the paperclip to attach files here.");
+      const unavailable = new Error("Use Attach files to add files here.");
+      setError(unavailable.message);
+      if (propagateError) throw unavailable;
       return;
     }
     setError(null);
@@ -186,9 +195,10 @@ export function Composer({
       attachPaths(await mycel.files.stage(list));
     } catch (e) {
       setError(errorText(e));
+      if (propagateError) throw e;
     } finally {
       setStaging((n) => n - 1);
-      input.current?.focus();
+      if (matchMedia("(pointer: fine)").matches) input.current?.focus();
     }
   };
 
@@ -204,14 +214,18 @@ export function Composer({
   };
 
   const canSend = (editing ? !!text.trim() : !!text.trim() || files.length > 0) && staging === 0;
-  const placeholder = editing
-    ? "Edit message"
-    : conversation.direct
-      ? `Message ${conversation.title.split(" ")[0]}`
-      : `Message ${conversation.title}`;
+  const placeholder = editing ? "Edit message" : "Message";
 
   return (
     <div className="mx-composer">
+      <input ref={photoInput} type="file" accept="image/*,video/*" multiple hidden onChange={(e) => { void attachFiles(Array.from(e.currentTarget.files ?? [])); e.currentTarget.value = ""; }} />
+      <input ref={cameraInput} type="file" accept="image/*" capture="environment" hidden onChange={(e) => { void attachFiles(Array.from(e.currentTarget.files ?? [])); e.currentTarget.value = ""; }} />
+      {attachmentMenu && <ChatModal title="Attach" onClose={() => setAttachmentMenu(false)}>
+        <button className="mx-menu-item" onClick={() => { setAttachmentMenu(false); photoInput.current?.click(); }}><Icon.Image /><span>Photos and videos</span></button>
+        <button className="mx-menu-item" onClick={() => { setAttachmentMenu(false); cameraInput.current?.click(); }}><Icon.Camera /><span>Camera</span></button>
+        <button className="mx-menu-item" onClick={() => { setAttachmentMenu(false); void attach(); }}><Icon.File /><span>Document</span></button>
+      </ChatModal>}
+      {recording && <VoiceRecorder onCancel={() => setRecording(false)} onAttach={(file) => attachFiles([file], true)} />}
       {(replyTo || editing) && (
         <div className={`mx-context${editing ? " is-edit" : ""}`}>
           {editing ? <Icon.Edit size={16} /> : <Icon.Reply size={16} />}
@@ -253,10 +267,10 @@ export function Composer({
         </p>
       )}
 
-      <div className="mx-composer-box">
+      {!recording && <div className="mx-composer-box">
         {!editing && (
-          <button className="mx-icon-btn" onClick={attach} aria-label="Attach files" title="Attach files">
-            <Icon.Clip />
+          <button className="mx-icon-btn mx-attach" disabled={busy || staging > 0} onClick={() => setAttachmentMenu(true)} aria-label="Attach files" title="Attach files">
+            <Icon.Plus />
           </button>
         )}
         <textarea
@@ -269,7 +283,10 @@ export function Composer({
           onPaste={onPaste}
           aria-label={placeholder}
         />
-        <button
+        {!canSend && !editing && staging === 0 && !busy ? <>
+          <button className="mx-icon-btn mx-camera" onClick={() => cameraInput.current?.click()} aria-label="Camera"><Icon.Camera /></button>
+          <button className="mx-icon-btn mx-record" onClick={() => setRecording(true)} aria-label="Record voice note"><Icon.Mic /></button>
+        </> : <button
           className="mx-send"
           onClick={() => void submit()}
           disabled={!canSend || busy}
@@ -277,8 +294,8 @@ export function Composer({
           title={editing ? "Save (Enter)" : "Send (Enter)"}
         >
           {editing ? <Icon.Check size={18} /> : <Icon.Send size={18} />}
-        </button>
-      </div>
+        </button>}
+      </div>}
       <p className="mx-hint">
         <kbd>Enter</kbd> to send, <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line, <kbd>↑</kbd> to edit your last message.
         Drop or paste files to attach.

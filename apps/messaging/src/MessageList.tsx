@@ -13,10 +13,13 @@ import {
   previewText,
   sameDay,
 } from "./ui.tsx";
+import { MessageActions } from "./MessageActions.tsx";
+import { ChatModal } from "./ChatModal.tsx";
+import { completesReply, replyDistance } from "./messageGesture.ts";
 import { HyphaeMark } from "./MessagingApp.tsx";
 
 const GROUP_GAP_MS = 6 * 60_000;
-export const QUICK_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+export { QUICK_REACTIONS } from "./MessageActions.tsx";
 
 interface Props {
   me: string | undefined;
@@ -35,6 +38,9 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
   const scroller = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const restoreFrom = useRef<{ height: number; top: number } | null>(null);
+  const previousLast = useRef<string | undefined>(undefined);
+  const [away, setAway] = useState(false);
+  const [selected, setSelected] = useState<MessageView | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
 
   const byId = useMemo(() => new Map(messages.map((m) => [m.id, m])), [messages]);
@@ -46,13 +52,17 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
   useLayoutEffect(() => {
     const el = scroller.current;
     if (!el) return;
+    const newMessage = previousLast.current !== lastId;
+    previousLast.current = lastId;
     if (restoreFrom.current) {
       const { height, top } = restoreFrom.current;
       el.scrollTop = el.scrollHeight - height + top;
       restoreFrom.current = null;
       return;
     }
-    if (stickToBottom.current || lastIsMine) el.scrollTop = el.scrollHeight;
+    if (stickToBottom.current || (newMessage && lastIsMine)) {
+      el.scrollTop = el.scrollHeight; stickToBottom.current = true; setAway(false);
+    }
   }, [messages, lastId, lastIsMine]);
 
   // Images load after layout; stay pinned while they do.
@@ -63,7 +73,9 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
       if (stickToBottom.current) el.scrollTop = el.scrollHeight;
     };
     el.addEventListener("load", onLoad, true);
-    return () => el.removeEventListener("load", onLoad, true);
+    const observer = new ResizeObserver(onLoad);
+    observer.observe(el);
+    return () => { el.removeEventListener("load", onLoad, true); observer.disconnect(); };
   }, []);
 
   const loadOlder = () => {
@@ -81,12 +93,14 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
   };
 
   return (
+    <div className="mx-messages-area">
     <div
       className="mx-scroll"
       ref={scroller}
       onScroll={(e) => {
         const el = e.currentTarget;
         stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        setAway(!stickToBottom.current);
       }}
     >
       <div className={`mx-thread${summary.direct ? " is-direct" : " is-group"}`} role="log" aria-label="Messages">
@@ -142,7 +156,7 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
                 quoted={m.replyTo ? byId.get(m.replyTo) ?? null : undefined}
                 onJump={jumpTo}
                 onReply={onReply}
-                onEdit={onEdit}
+                onActions={setSelected}
                 canAct={summary.active && !summary.request}
                 inert={summary.request}
                 flashing={flash === m.id}
@@ -153,6 +167,9 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
           );
         })}
       </div>
+    </div>
+    {away && <button className="mx-latest" aria-label="Jump to latest message" onClick={() => { const el = scroller.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); }}><Icon.Down /></button>}
+    {selected && <MessageActions message={byId.get(selected.id) ?? selected} onClose={() => setSelected(null)} onReply={onReply} onEdit={onEdit} />}
     </div>
   );
 }
@@ -166,7 +183,7 @@ const MessageRow = memo(function MessageRow({
   quoted,
   onJump,
   onReply,
-  onEdit,
+  onActions,
   canAct,
   flashing,
   editing,
@@ -185,19 +202,21 @@ const MessageRow = memo(function MessageRow({
   quoted: MessageView | null | undefined;
   onJump: (id: string) => void;
   onReply?: (m: MessageView) => void;
-  onEdit?: (m: MessageView) => void;
+  onActions: (m: MessageView) => void;
   canAct: boolean;
   flashing: boolean;
   editing: boolean;
 }) {
   const mycel = useMycel();
-  const [picking, setPicking] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  const gesture = useRef<{ x: number; y: number; dx: number; dy: number; timer: ReturnType<typeof setTimeout> | null } | null>(null);
+  const suppressClick = useRef(false);
+  const [offset, setOffset] = useState(0);
+  const cancelGesture = () => { if (gesture.current?.timer) clearTimeout(gesture.current.timer); gesture.current = null; setOffset(0); };
+  useEffect(() => () => { if (gesture.current?.timer) clearTimeout(gesture.current.timer); }, []);
   const [failure, setFailure] = useState<string | null>(null);
 
   const act = (p: Promise<unknown>) => p.catch((e) => setFailure(errorText(e)));
   const react = (emoji: string) => {
-    setPicking(false);
     void act(mycel.chat.react(m.conversation, m.id, emoji));
   };
 
@@ -218,12 +237,39 @@ const MessageRow = memo(function MessageRow({
   const bodyOnlyEmoji = /^\p{Extended_Pictographic}{1,3}$/u.test(m.body.replace(/\s/g, "")) && !m.attachments.length;
 
   return (
-    <div className={cls} data-mid={m.id} onMouseLeave={() => setPicking(false)}>
+    <div className={cls} data-mid={m.id}>
       <div className="mx-msg-gutter">{showAvatar && <Avatar id={m.author} name={m.authorName} size={28} />}</div>
       <div className="mx-msg-col">
         {showAuthor && <div className="mx-msg-author">{m.authorName}</div>}
-        <div className="mx-msg-line">
-          <div className={`mx-bubble${bodyOnlyEmoji ? " is-emoji" : ""}${images.length && !m.body ? " is-media" : ""}`}>
+        <div className="mx-msg-line"
+          onContextMenu={(e) => { if (canAct && !m.deleted) { e.preventDefault(); onActions(m); } }}>
+          {offset > 0 && <span className="mx-swipe-hint" aria-hidden="true"><Icon.Reply /></span>}
+          <div className={`mx-bubble${bodyOnlyEmoji ? " is-emoji" : ""}${images.length && !m.body ? " is-media" : ""}`}
+            tabIndex={canAct && !m.deleted ? 0 : undefined}
+            aria-label={canAct && !m.deleted ? `${m.isMine ? "You" : m.authorName}: ${previewText(m)}. Message actions` : undefined}
+            style={offset ? { transform: `translateX(${offset}px)` } : undefined}
+            onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ") && canAct && !m.deleted) { e.preventDefault(); onActions(m); } }}
+            onPointerDown={(e) => {
+              suppressClick.current = false;
+              if (!canAct || m.deleted || e.pointerType === "mouse" || (e.target as Element).closest("button:not(.mx-image),a,audio,video")) return;
+              cancelGesture();
+              const g = { x: e.clientX, y: e.clientY, dx: 0, dy: 0, timer: null as ReturnType<typeof setTimeout> | null };
+              g.timer = setTimeout(() => { suppressClick.current = true; cancelGesture(); onActions(m); }, 480);
+              gesture.current = g;
+            }}
+            onPointerMove={(e) => {
+              const g = gesture.current; if (!g) return;
+              g.dx = e.clientX - g.x; g.dy = e.clientY - g.y;
+              if (Math.hypot(g.dx, g.dy) > 10 && g.timer) { clearTimeout(g.timer); g.timer = null; }
+              if (onReply) setOffset(replyDistance(g.dx, g.dy));
+            }}
+            onPointerUp={() => {
+              const g = gesture.current;
+              if (g && onReply && completesReply(g.dx, g.dy)) { suppressClick.current = true; onReply(m); }
+              cancelGesture();
+            }}
+            onPointerCancel={cancelGesture}
+            onClickCapture={(e) => { if (suppressClick.current) { e.preventDefault(); e.stopPropagation(); suppressClick.current = false; } }}>
             {m.deleted ? (
               <span className="mx-deleted">{m.isMine ? "You deleted this message" : "This message was deleted"}</span>
             ) : (
@@ -263,52 +309,7 @@ const MessageRow = memo(function MessageRow({
             </span>
           </div>
 
-          {canAct && !m.deleted && (
-            <div className="mx-actions" role="toolbar" aria-label="Message actions">
-              <button className="mx-act" onClick={() => setPicking((p) => !p)} aria-label="React" title="React" aria-expanded={picking}>
-                <Icon.Smile size={17} />
-              </button>
-              {onReply && (
-                <button className="mx-act" onClick={() => onReply(m)} aria-label="Reply" title="Reply">
-                  <Icon.Reply size={17} />
-                </button>
-              )}
-              {m.isMine && onEdit && (
-                <button className="mx-act" onClick={() => onEdit(m)} aria-label="Edit" title="Edit">
-                  <Icon.Edit size={17} />
-                </button>
-              )}
-              {m.isMine &&
-                (confirmDelete ? (
-                  <>
-                    <button
-                      className="mx-act mx-act-danger is-confirm"
-                      onClick={() => void act(mycel.chat.delete(m.conversation, m.id))}
-                      onBlur={() => setConfirmDelete(false)}
-                      autoFocus
-                    >
-                      Delete for everyone
-                    </button>
-                    <button className="mx-act" onClick={() => setConfirmDelete(false)} aria-label="Cancel deletion">
-                      Cancel
-                    </button>
-                  </>
-                ) : (
-                  <button className="mx-act mx-act-danger" onClick={() => setConfirmDelete(true)} aria-label="Delete" title="Delete">
-                    <Icon.Trash size={17} />
-                  </button>
-                ))}
-              {picking && (
-                <div className="mx-picker" role="menu" aria-label="Pick a reaction">
-                  {QUICK_REACTIONS.map((e) => (
-                    <button key={e} role="menuitem" onClick={() => react(e)} aria-label={`React with ${e}`}>
-                      {e}
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
-          )}
+          {canAct && !m.deleted && <button className="mx-message-more mx-icon-btn" onClick={() => onActions(m)} aria-label="Message actions" title="Message actions"><Icon.More size={16} /></button>}
         </div>
 
         {m.reactions.length > 0 && (
@@ -403,11 +404,13 @@ function ProgressBar({ pct }: { pct: number }) {
 
 function ImageAttachment({ a }: { a: Attachment }) {
   const { state, err, fetch, url, open, pct, rate } = useAttachment(a);
+  const [viewing, setViewing] = useState(false);
   if (url) {
     return (
-      <button className="mx-image" onClick={open} title={`Open ${a.name}`}>
+      <><button className="mx-image" onClick={() => setViewing(true)} title={`Open ${a.name}`}>
         <img src={url} alt={a.name} loading="lazy" />
       </button>
+      {viewing && <ChatModal title={a.name} className="mx-media-viewer" onClose={() => setViewing(false)}><img src={url} alt={a.name} /><button className="mx-menu-item" onClick={open}>Share or save<Icon.Open /></button>{err && <p role="alert">{err}</p>}</ChatModal>}</>
     );
   }
   return (
@@ -442,6 +445,13 @@ function InertAttachment({ a }: { a: Attachment }) {
 
 function FileAttachment({ a }: { a: Attachment }) {
   const { state, err, fetch, url, open, pct, rate } = useAttachment(a);
+  if (url && (a.mime.startsWith("audio/") || a.mime.startsWith("video/"))) {
+    return <div className="mx-inline-media">{a.mime.startsWith("audio/")
+      ? <audio controls preload="metadata" src={url} aria-label={a.name} />
+      : <video controls playsInline preload="metadata" src={url} aria-label={a.name} />}
+      <span className="mx-file-size">{a.name}</span>
+    </div>;
+  }
   return (
     <div className="mx-file">
       <span className="mx-file-icon">

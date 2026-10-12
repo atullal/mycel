@@ -164,10 +164,10 @@ export function ChatView({
           <Icon.Back />
         </button>
         <ConversationAvatar id={summary.id} direct={summary.direct} members={summary.members} title={summary.title} size={38} />
-        <div className="mx-chat-title">
+        <button className="mx-chat-title" onClick={onToggleMembers} aria-label="Conversation details">
           <h2>{summary.title}</h2>
-          <p>{subtitle}</p>
-        </div>
+          <p>{typingNames.length ? "typing…" : subtitle}</p>
+        </button>
         {onCall && summary.active && !summary.request && others.length > 0 && (
           <button
             className={`mx-icon-btn mx-call-btn${inCall ? " is-on" : ""}`}
@@ -205,7 +205,7 @@ export function ChatView({
           <span>Encrypted</span>
         </span>
         <button
-          className={`mx-icon-btn${membersOpen ? " is-on" : ""}`}
+          className={`mx-icon-btn mx-members-button${membersOpen ? " is-on" : ""}`}
           onClick={onToggleMembers}
           aria-pressed={membersOpen}
           title={summary.direct ? "Details" : "Members"}
@@ -233,7 +233,7 @@ export function ChatView({
         editingId={editing?.id ?? null}
       />
 
-      <div className="mx-typing" aria-live="polite">
+      <div className={`mx-typing${typingNames.length ? " is-active" : ""}`} aria-live="polite">
         {typingNames.length > 0 && (
           <>
             <span className="mx-typing-dots" aria-hidden="true">

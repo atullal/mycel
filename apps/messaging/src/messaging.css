@@ -2207,36 +2207,6 @@
   color: #f2f3f4;
 }
 
-/* Touch has no hover: keep actions in the message flow. Revealing them on
-   hover makes WebKit consume the first tap on an attachment as a preview. */
-@media (hover: none), (pointer: coarse) {
-  .mx-msg-line,
-  .mx-msg.is-mine .mx-msg-line {
-    flex-direction: column;
-    align-items: flex-start;
-  }
-  .mx-msg.is-mine .mx-msg-line {
-    align-items: flex-end;
-  }
-  .mx-actions,
-  .mx-msg.is-mine .mx-actions {
-    position: relative;
-    inset: auto;
-    transform: none;
-    opacity: 1;
-    pointer-events: auto;
-    max-width: 100%;
-    flex-wrap: wrap;
-  }
-  .mx-act {
-    min-width: 44px;
-    min-height: 44px;
-  }
-  .mx-reactions {
-    margin-top: 4px;
-  }
-}
-
 /* ---------------------------------------------------------------- narrow */
 
 @media (max-width: 1080px) {
@@ -2324,4 +2294,93 @@
     padding-left: 12px;
     gap: 8px;
   }
+}
+
+/* Conversation interactions: controls occupy space only when requested. */
+.mx-chat-title { border: 0; background: none; padding: 0; text-align: left; color: inherit; cursor: pointer; }
+.mx-messages-area { position: relative; display: flex; flex: 1; min-height: 0; }
+.mx-messages-area .mx-scroll { min-width: 0; }
+.mx-bubble { touch-action: pan-y pinch-zoom; -webkit-touch-callout: none; }
+.mx-bubble:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.mx-message-more { position: absolute; left: calc(100% + 4px); opacity: 0; pointer-events: none; }
+.mx-msg.is-mine .mx-message-more { left: auto; right: calc(100% + 4px); }
+.mx-msg-line:focus-within .mx-message-more { opacity: 1; pointer-events: auto; }
+@media (hover: hover) and (pointer: fine) {
+  .mx-msg-line:hover .mx-message-more { opacity: 1; pointer-events: auto; }
+}
+@media (pointer: coarse) {
+  .mx-bubble { -webkit-user-select: none; user-select: none; }
+  .mx-message-more { width: 1px; height: 1px; min-width: 0; padding: 0; clip-path: inset(50%); overflow: hidden; }
+  .mx-message-more:focus-visible { width: 44px; height: 44px; clip-path: none; opacity: 1; pointer-events: auto; z-index: 2; }
+}
+.mx-swipe-hint { position: absolute; left: 4px; top: 50%; transform: translateY(-50%); color: var(--accent); }
+.mx-latest { position: absolute; right: 16px; bottom: 12px; width: 44px; height: 44px; border: 1px solid var(--line-soft); border-radius: 50%; background: var(--raised); color: var(--ink); display: grid; place-items: center; box-shadow: var(--shadow-pop); z-index: 2; }
+.mx-chat-modal { width: min(380px, calc(100% - 32px)); max-height: min(80dvh, 680px); border: 1px solid var(--line-soft); padding: 0; border-radius: 20px; background: var(--raised); color: var(--ink); box-shadow: var(--shadow-pop); overflow: auto; overscroll-behavior: contain; }
+.mx-chat-modal::backdrop { background: rgb(0 0 0 / 48%); backdrop-filter: blur(5px); }
+.mx-modal-body { padding: 12px; }
+.mx-modal-body > header { display: flex; align-items: center; justify-content: space-between; min-height: 44px; gap: 12px; padding-left: 8px; }
+.mx-modal-body > header strong { font: 600 17px var(--font-ui); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mx-chat-modal button { font-family: var(--font-ui); }
+.mx-chat-modal .mx-icon-btn { min-width: 44px; min-height: 44px; }
+.mx-action-preview { border-left: 3px solid var(--accent); padding: 8px 10px; margin: 4px 8px 12px; font-size: 14px; line-height: 1.4; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow-wrap: anywhere; background: var(--surface-2); border-radius: 6px; }
+.mx-context-reactions { display: flex; justify-content: space-around; padding: 4px 0 12px; border-bottom: 1px solid var(--line-soft); }
+.mx-context-reactions button { width: 44px; height: 44px; border: 0; background: var(--surface-2); border-radius: 50%; font-size: 25px; padding: 0; }
+.mx-menu-item { display: flex; align-items: center; justify-content: space-between; gap: 14px; width: 100%; min-height: 48px; padding: 10px 12px; border: 0; border-bottom: 1px solid var(--line-soft); background: transparent; color: var(--ink); font-size: 16px; text-align: left; }
+.mx-menu-item > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.mx-menu-item[aria-pressed="true"] { background: var(--accent-soft); border-radius: 8px; }
+.mx-menu-item:active { background: var(--surface-3); }
+.mx-modal-note { color: var(--ink-2); margin: 8px; font-size: 14px; }
+.mx-forward-list { max-height: 40dvh; overflow: auto; }
+.mx-forward-send { margin-top: 12px; width: 100%; min-height: 44px; }
+.mx-media-viewer { width: min(860px, calc(100% - 24px)); }
+.mx-media-viewer img { display: block; width: 100%; max-height: 65dvh; object-fit: contain; }
+.mx-inline-media { max-width: 100%; width: 280px; padding: 4px 0; display: flex; flex-direction: column; gap: 4px; }
+.mx-inline-media audio, .mx-inline-media video { width: 100%; max-width: 100%; }
+.mx-inline-media video { max-height: 360px; border-radius: 8px; }
+.mx-inline-media .mx-file-size { font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mx-voice-recorder { padding: 10px; border-radius: 14px; background: var(--surface-2); border: 1px solid var(--line); }
+.mx-voice-status { font-size: 15px; font-variant-numeric: tabular-nums; padding: 4px 0 10px; }
+.mx-voice-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; }
+.mx-voice-controls button { min-height: 44px; }
+.mx-voice-recorder audio { width: 100%; margin-bottom: 8px; }
+.mx-typing:not(.is-active) { height: 8px; min-height: 8px; padding: 0; }
+
+@media (max-width: 720px) {
+  .mx-chat { background: var(--bg); }
+  .mx-chat-head { gap: 4px; min-height: 58px; padding: 4px 8px; background: var(--surface); flex-shrink: 0; }
+  .mx-chat-head .mx-icon-btn { width: 44px; height: 44px; flex: none; }
+  .mx-chat-head .mx-back { margin-left: -4px; width: 32px; }
+  .mx-chat-head .mx-avatar { flex: none; }
+  .mx-chat-title { margin: 0 2px 0 6px; }
+  .mx-chat-title h2 { font-family: var(--font-ui); font-size: 16px; font-weight: 600; line-height: 1.25; }
+  .mx-chat-title p { font-size: 11px; color: var(--ink-2); line-height: 1.4; }
+  .mx-chat-head .mx-e2e, .mx-chat-head .mx-members-button { display: none; }
+  .mx-thread { padding: 8px 10px 8px; }
+  .mx-msg { margin: 2px 0; }
+  .mx-msg.is-first { margin-top: 7px; }
+  .mx-msg-col { max-width: 86%; }
+  .mx-bubble { font-size: 16px; line-height: 1.35; border-radius: 12px; padding: 7px 9px 6px; box-shadow: 0 1px 1px rgb(0 0 0 / 8%); }
+  .mx-meta { font-size: 10px; margin-top: 7px; gap: 3px; }
+  .mx-msg.is-mine.is-last .mx-bubble { border-bottom-right-radius: 3px; }
+  .mx-msg.is-theirs.is-last .mx-bubble { border-bottom-left-radius: 3px; }
+  .mx-day { margin: 12px 0; }
+  .mx-day span { padding: 4px 10px; background: var(--surface-3); font-size: 11px; border-radius: 7px; }
+  .mx-origin { font-size: 11px; margin: 8px 12px 16px; }
+  .mx-composer { padding: 5px 8px max(8px, var(--safe-bottom)); background: var(--surface); border-top: 1px solid var(--line-soft); }
+  :root.keyboard-open .mx-composer { padding-bottom: 6px; }
+  .mx-composer-box { border: 0; border-radius: 0; box-shadow: none; background: transparent; padding: 0; gap: 4px; align-items: flex-end; }
+  .mx-composer-box:focus-within { border: 0; box-shadow: none; }
+  .mx-composer-box textarea { border: 1px solid var(--line); border-radius: 22px; background: var(--raised); font-size: 16px; line-height: 22px; padding: 9px 12px; min-height: 42px; max-height: 132px; margin: 0; }
+  .mx-composer-box .mx-icon-btn { width: 38px; height: 44px; flex: none; padding: 0; color: var(--accent); }
+  .mx-composer-box .mx-send { width: 42px; height: 42px; margin: 0 0 1px 2px; flex: none; }
+  .mx-context { margin: 0 0 6px 40px; border-radius: 10px; font-size: 13px; }
+  .mx-context .mx-icon-btn { min-width: 44px; min-height: 44px; }
+  .mx-typing:not(.is-active) { display: none; }
+  .mx-typing.is-active { font-size: 11px; height: 22px; padding-left: 16px; background: var(--surface); }
+  .mx-file { min-width: 0; width: min(270px, 100%); }
+  .mx-file-btn { min-width: 44px; min-height: 44px; }
+  .mx-quote-text { max-width: 58vw; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mx-bubble, .mx-chat-modal { transition: none; animation: none; }
 }

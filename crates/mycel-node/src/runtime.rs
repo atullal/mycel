@@ -295,6 +295,10 @@ fn guess_mime(name: &str) -> &'static str {
         "mp4" => "video/mp4",
         "mov" => "video/quicktime",
         "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "weba" => "audio/webm",
+        "ogg" | "opus" => "audio/ogg",
+        "webm" => "video/webm",
         "wav" => "audio/wav",
         "zip" => "application/zip",
         "json" => "application/json",
@@ -1646,6 +1650,14 @@ fn sample_rate(s: &mut std::collections::VecDeque<(Instant, u64)>, now: Instant,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn voice_note_mime_types() {
+        assert_eq!(super::guess_mime("Voice note.m4a"), "audio/mp4");
+        assert_eq!(super::guess_mime("Voice note.WEBA"), "audio/webm");
+        assert_eq!(super::guess_mime("Voice note.ogg"), "audio/ogg");
+        assert_eq!(super::guess_mime("Movie.webm"), "video/webm");
+    }
+
     #[test]
     fn pending_request_limits_apply_before_admission_and_keep_repeats_idempotent() {
         use super::*;

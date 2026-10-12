@@ -27,6 +27,13 @@ function Svg({ size = 20, children, ...rest }: IconProps & { children: ReactNode
 }
 
 export const Icon = {
+  More: (p: IconProps) => <Svg {...p}><path d="M4 10h.01M10 10h.01M16 10h.01" strokeWidth={3} /></Svg>,
+  Copy: (p: IconProps) => <Svg {...p}><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M13 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2"/></Svg>,
+  Forward: (p: IconProps) => <Svg {...p}><path d="M12 4l5 5-5 5M17 9H9a5 5 0 0 0-5 5v2"/></Svg>,
+  Camera: (p: IconProps) => <Svg {...p}><path d="M3 6h3l1-2h6l1 2h3v11H3z"/><circle cx="10" cy="11" r="3"/></Svg>,
+  Image: (p: IconProps) => <Svg {...p}><rect x="2" y="3" width="16" height="14" rx="2"/><circle cx="7" cy="7" r="1"/><path d="M3 15l5-5 3 3 3-4 4 6"/></Svg>,
+  Stop: (p: IconProps) => <Svg {...p}><rect x="5" y="5" width="10" height="10" rx="1" fill="currentColor"/></Svg>,
+  Down: (p: IconProps) => <Svg {...p}><path d="M4 7l6 6 6-6"/></Svg>,
   Compose: (p: IconProps) => (
     <Svg {...p}>
       <path d="M9 3.5H5.5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V11" />
