@@ -32,9 +32,16 @@ interface Props {
   onReply?: (m: MessageView) => void;
   onEdit?: (m: MessageView) => void;
   editingId: string | null;
+  onDeleted?: (m: MessageView) => void;
+  jumpToId?: string | null;
+  onJumped?: () => void;
 }
 
-export function MessageList({ me, summary, messages, loading, error, hasMore, onLoadOlder, onReply, onEdit, editingId }: Props) {
+export function MessageList({ me, summary, messages, loading, error, hasMore, onLoadOlder, onReply, onEdit, editingId, onDeleted, jumpToId, onJumped }: Props) {
+  const mycel = useMycel();
+  const [undo, setUndo] = useState<MessageView | null>(null);
+  const [undoError, setUndoError] = useState<string | null>(null);
+  useEffect(() => { if (!undo) return; const timer = setTimeout(() => setUndo(null), 5000); return () => clearTimeout(timer); }, [undo]);
   const scroller = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const restoreFrom = useRef<{ height: number; top: number } | null>(null);
@@ -91,6 +98,16 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
     setFlash(id);
     setTimeout(() => setFlash((f) => (f === id ? null : f)), 1400);
   };
+
+  useEffect(() => {
+    if (!jumpToId || loading || error) return;
+    if (byId.has(jumpToId)) {
+      stickToBottom.current = false;
+      jumpTo(jumpToId);
+      onJumped?.();
+    } else if (hasMore) onLoadOlder();
+    else onJumped?.();
+  }, [jumpToId, byId, loading, error, hasMore, onLoadOlder, onJumped]);
 
   return (
     <div className="mx-messages-area">
@@ -169,7 +186,12 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
       </div>
     </div>
     {away && <button className="mx-latest" aria-label="Jump to latest message" onClick={() => { const el = scroller.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); }}><Icon.Down /></button>}
-    {selected && <MessageActions message={byId.get(selected.id) ?? selected} onClose={() => setSelected(null)} onReply={onReply} onEdit={onEdit} />}
+    {undo && <div className="mx-delete-undo" role="status"><span>Message deleted for you</span><button className="mx-btn mx-btn-quiet" onClick={() => {
+      const message = undo; setUndo(null); setUndoError(null);
+      void mycel.chat.restoreLocal(message.conversation, message.id).catch((e) => setUndoError(errorText(e)));
+    }}>Undo</button></div>}
+    {undoError && <p className="mx-msg-error" role="alert">{undoError}</p>}
+    {selected && <MessageActions message={byId.get(selected.id) ?? selected} canInteract={summary.active && !summary.request && summary.myRole !== "readOnly"} onClose={() => setSelected(null)} onReply={onReply} onEdit={onEdit} onDeleted={(m, local) => { onDeleted?.(m); if (local) { setUndoError(null); setUndo(m); } }} />}
     </div>
   );
 }
@@ -242,16 +264,16 @@ const MessageRow = memo(function MessageRow({
       <div className="mx-msg-col">
         {showAuthor && <div className="mx-msg-author">{m.authorName}</div>}
         <div className="mx-msg-line"
-          onContextMenu={(e) => { if (canAct && !m.deleted) { e.preventDefault(); onActions(m); } }}>
+          onContextMenu={(e) => { { e.preventDefault(); onActions(m); } }}>
           {offset > 0 && <span className="mx-swipe-hint" aria-hidden="true"><Icon.Reply /></span>}
           <div className={`mx-bubble${bodyOnlyEmoji ? " is-emoji" : ""}${images.length && !m.body ? " is-media" : ""}`}
-            tabIndex={canAct && !m.deleted ? 0 : undefined}
-            aria-label={canAct && !m.deleted ? `${m.isMine ? "You" : m.authorName}: ${previewText(m)}. Message actions` : undefined}
+            tabIndex={0}
+            aria-label={`${m.isMine ? "You" : m.authorName}: ${previewText(m)}. Message actions`}
             style={offset ? { transform: `translateX(${offset}px)` } : undefined}
-            onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ") && canAct && !m.deleted) { e.preventDefault(); onActions(m); } }}
-            onPointerDown={(e) => {
+            onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); onActions(m); } }}
+            onPointerDownCapture={(e) => {
               suppressClick.current = false;
-              if (!canAct || m.deleted || e.pointerType === "mouse" || (e.target as Element).closest("button:not(.mx-image),a,audio,video")) return;
+              if (!e.isPrimary || e.pointerType === "mouse" || (e.target as Element).closest("button:not(.mx-image),a,audio,video")) return;
               cancelGesture();
               const g = { x: e.clientX, y: e.clientY, dx: 0, dy: 0, timer: null as ReturnType<typeof setTimeout> | null };
               g.timer = setTimeout(() => { suppressClick.current = true; cancelGesture(); onActions(m); }, 480);
@@ -261,11 +283,15 @@ const MessageRow = memo(function MessageRow({
               const g = gesture.current; if (!g) return;
               g.dx = e.clientX - g.x; g.dy = e.clientY - g.y;
               if (Math.hypot(g.dx, g.dy) > 10 && g.timer) { clearTimeout(g.timer); g.timer = null; }
-              if (onReply) setOffset(replyDistance(g.dx, g.dy));
+              if (onReply && !m.deleted) {
+                const distance = replyDistance(g.dx, g.dy);
+                if (distance && !e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.setPointerCapture(e.pointerId);
+                setOffset(distance);
+              }
             }}
-            onPointerUp={() => {
+            onPointerUp={(e) => {
               const g = gesture.current;
-              if (g && onReply && completesReply(g.dx, g.dy)) { suppressClick.current = true; onReply(m); }
+              if (g && onReply && !m.deleted && completesReply(e.clientX - g.x, e.clientY - g.y)) { suppressClick.current = true; onReply(m); }
               cancelGesture();
             }}
             onPointerCancel={cancelGesture}
@@ -309,7 +335,7 @@ const MessageRow = memo(function MessageRow({
             </span>
           </div>
 
-          {canAct && !m.deleted && <button className="mx-message-more mx-icon-btn" onClick={() => onActions(m)} aria-label="Message actions" title="Message actions"><Icon.More size={16} /></button>}
+          {<button className="mx-message-more mx-icon-btn" onClick={() => onActions(m)} aria-label="Message actions" title="Message actions"><Icon.More size={16} /></button>}
         </div>
 
         {m.reactions.length > 0 && (
@@ -407,8 +433,8 @@ function ImageAttachment({ a }: { a: Attachment }) {
   const [viewing, setViewing] = useState(false);
   if (url) {
     return (
-      <><button className="mx-image" onClick={() => setViewing(true)} title={`Open ${a.name}`}>
-        <img src={url} alt={a.name} loading="lazy" />
+      <><button className="mx-image" onDragStart={(e) => e.preventDefault()} onClick={() => setViewing(true)} title={`Open ${a.name}`}>
+        <img src={url} alt={a.name} loading="lazy" draggable={false} />
       </button>
       {viewing && <ChatModal title={a.name} className="mx-media-viewer" onClose={() => setViewing(false)}><img src={url} alt={a.name} /><button className="mx-menu-item" onClick={open}>Share or save<Icon.Open /></button>{err && <p role="alert">{err}</p>}</ChatModal>}</>
     );

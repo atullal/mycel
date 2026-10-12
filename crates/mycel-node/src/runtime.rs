@@ -115,6 +115,8 @@ pub struct Runtime {
     arriving: Arc<Mutex<HashSet<SpaceId>>>,
     /// Declined conversations we keep locally but never show.
     hidden: Arc<Mutex<BTreeSet<SpaceId>>>,
+    /// Per-device message visibility; never published to conversation peers.
+    hidden_messages: Mutex<BTreeSet<(SpaceId, Hash32)>>,
     /// Keys whose invites we refuse at the network layer.
     blocked: Arc<Mutex<BTreeSet<SignPk>>>,
     /// Direct-address hints from contact codes (for networks without mDNS).
@@ -432,6 +434,7 @@ impl Runtime {
             store.kv_decode::<Vec<(SpaceId, SignPk)>>("requests")?.unwrap_or_default().into_iter().collect(),
         ));
         let hidden: Arc<Mutex<BTreeSet<SpaceId>>> = Arc::new(Mutex::new(load_set(&store, "hidden")?));
+        let hidden_messages = Mutex::new(load_set(&store, "hidden_messages")?);
         let arriving: Arc<Mutex<HashSet<SpaceId>>> = Arc::default();
         let (blocked_for_policy, hidden_for_policy) = (blocked.clone(), hidden.clone());
         let (arriving_for_policy, requests_for_policy, request_store) = (arriving.clone(), requests.clone(), store.clone());
@@ -524,6 +527,7 @@ impl Runtime {
             requests,
             arriving,
             hidden,
+            hidden_messages,
             blocked,
             hints: Mutex::new(hints),
             calls: CallManager::new(Arc::new(RuntimeCallHost { me, rt: weak.clone() })),
@@ -872,12 +876,28 @@ impl Runtime {
             None if people.is_empty() => "Just you".to_string(),
             None => people.iter().map(|m| m.name.clone()).collect::<Vec<_>>().join(", "),
         };
-        let last = view
-            .messages
-            .iter()
-            .rev()
-            .find(|m| !m.deleted)
-            .map(|m| self.message_view(space, &view, m, &HashSet::new()));
+        let (last, unread) = {
+            let hidden = self.hidden_messages.lock();
+            let visible =
+                |m: &&mycel_kit_chat::Message| !m.deleted && !hidden.contains(&(*space, m.id));
+            let last = view
+                .messages
+                .iter()
+                .rev()
+                .find(visible)
+                .map(|m| self.message_view(space, &view, m, &HashSet::new()));
+            let start = view
+                .read_upto
+                .get(&me)
+                .map_or(0, |i| i + 1)
+                .min(view.messages.len());
+            let unread = view.messages[start..]
+                .iter()
+                .filter(visible)
+                .filter(|m| m.author != me)
+                .count() as u32;
+            (last, unread)
+        };
         // (take the lock once: two guards in one expression would deadlock)
         let inviter = self.requests.lock().get(space).copied();
         Ok(ConversationSummary {
@@ -886,7 +906,7 @@ impl Runtime {
             direct: view.direct || (view.title.is_none() && people.len() == 1),
             members,
             last_message: last,
-            unread: view.unread_for(&me),
+            unread,
             active: my_role.is_some(),
             my_role: my_role.map(role_of),
             request: inviter.is_some(),
@@ -1022,12 +1042,55 @@ impl Runtime {
         let space = parse_space(&id)?;
         let view = self.view(&space)?;
         let end = match before {
-            Some(b) => view.index_of(&parse_hash(&b)?).unwrap_or(view.messages.len()),
+            Some(b) => view
+                .index_of(&parse_hash(&b)?)
+                .unwrap_or(view.messages.len()),
             None => view.messages.len(),
         };
-        let start = end.saturating_sub(limit.unwrap_or(200) as usize);
-        Ok(view.messages[start..end]
+        let hidden = self.hidden_messages.lock();
+        // Select visible messages before applying the page size. Hidden rows do
+        // not shrink pages or prevent the UI from reaching older history.
+        let mut selected: Vec<_> = view.messages[..end]
             .iter()
+            .rev()
+            .filter(|m| !hidden.contains(&(space, m.id)))
+            .take(limit.unwrap_or(200).min(10_000) as usize)
+            .collect();
+        selected.reverse();
+        Ok(selected
+            .into_iter()
+            .map(|m| self.message_view(&space, &view, m, &HashSet::new()))
+            .collect())
+    }
+
+    /// Search the entire locally synchronized history, newest match first.
+    pub fn search_messages(
+        &self,
+        id: ConversationId,
+        query: String,
+        limit: Option<u32>,
+    ) -> Result<Vec<MessageView>> {
+        let space = parse_space(&id)?;
+        let view = self.view(&space)?;
+        let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let hidden = self.hidden_messages.lock();
+        Ok(view
+            .messages
+            .iter()
+            .rev()
+            .filter(|m| !m.deleted && !hidden.contains(&(space, m.id)))
+            .filter(|m| {
+                let content = std::iter::once(m.body.as_str())
+                    .chain(m.attachments.iter().map(|a| a.name.as_str()))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .to_lowercase();
+                terms.iter().all(|term| content.contains(term))
+            })
+            .take(limit.unwrap_or(100).min(1_000) as usize)
             .map(|m| self.message_view(&space, &view, m, &HashSet::new()))
             .collect())
     }
@@ -1260,6 +1323,45 @@ impl Runtime {
         self.require_member(&space)?;
         let target = self.own_message(&space, &message)?;
         self.post(space, ChatOp::Delete { target })?;
+        Ok(())
+    }
+
+    /// Hide a message only on this device, including messages by other people.
+    pub fn delete_message_local(&self, id: ConversationId, message: MessageId) -> Result<()> {
+        self.set_message_hidden(id, message, true)
+    }
+
+    pub fn restore_message_local(&self, id: ConversationId, message: MessageId) -> Result<()> {
+        self.set_message_hidden(id, message, false)
+    }
+
+    fn set_message_hidden(&self, id: ConversationId, message: MessageId, hide: bool) -> Result<()> {
+        let space = parse_space(&id)?;
+        let target = parse_hash(&message)?;
+        let view = self.view(&space)?;
+        if view.index_of(&target).is_none() {
+            bail!("unknown message");
+        }
+        let mut hidden = self.hidden_messages.lock();
+        let mut next = hidden.clone();
+        let changed = if hide {
+            next.insert((space, target))
+        } else {
+            next.remove(&(space, target))
+        };
+        if changed {
+            self.store.kv_batch_durable(vec![(
+                "hidden_messages".into(),
+                Some(postcard::to_allocvec(
+                    &next.iter().copied().collect::<Vec<_>>(),
+                )?),
+            )])?;
+            *hidden = next;
+        }
+        drop(hidden);
+        if changed {
+            self.emit(Event::ConversationUpdated { conversation: id });
+        }
         Ok(())
     }
 

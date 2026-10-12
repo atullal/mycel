@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useContacts, useMycel, useNearby } from "@mycel/sdk/react";
 import { Avatar, Icon, errorText } from "./ui.tsx";
+import { matchesSearch } from "./search.ts";
+import { SearchField } from "./SearchField.tsx";
 
 export function NewConversationDialog({
   onClose,
@@ -27,9 +29,8 @@ export function NewConversationDialog({
   }, []);
 
   const strangers = nearby.filter((n) => !n.isContact);
-  const q = query.trim().toLowerCase();
-  const shownContacts = useMemo(() => contacts.filter((c) => !q || c.name.toLowerCase().includes(q)), [contacts, q]);
-  const shownStrangers = strangers.filter((n) => !q || n.name.toLowerCase().includes(q));
+  const shownContacts = useMemo(() => contacts.filter((c) => matchesSearch(query, c.name)), [contacts, query]);
+  const shownStrangers = strangers.filter((n) => matchesSearch(query, n.name));
   const names = new Map([...contacts, ...strangers].map((p) => [p.id, p.name]));
 
   const toggle = (id: string) => setChosen((c) => (c.includes(id) ? c.filter((x) => x !== id) : [...c, id]));
@@ -78,17 +79,7 @@ export function NewConversationDialog({
           </button>
         </header>
 
-        <label className="mx-search mx-dialog-search">
-          <Icon.Search size={16} />
-          <input
-            autoFocus
-            type="search"
-            placeholder="Find people"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            aria-label="Find people"
-          />
-        </label>
+        <SearchField value={query} onChange={setQuery} label="Find people" autoFocus />
 
         {chosen.length > 0 && (
           <ul className="mx-chips" aria-label="Selected">
@@ -123,6 +114,9 @@ export function NewConversationDialog({
             </p>
           )}
           {contacts.length > 0 && shownContacts.length === 0 && <p className="mx-people-empty">No contacts match.</p>}
+          {!loading && query.trim() && shownContacts.length === 0 && shownStrangers.length === 0 && (
+            <p className="mx-people-empty" role="status">No people match "{query.trim()}".</p>
+          )}
           <ul>
             {shownContacts.map((c) => (
               <PersonRow

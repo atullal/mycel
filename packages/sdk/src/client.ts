@@ -104,6 +104,12 @@ export interface Mycel {
     edit(id: ConversationId, message: MessageId, body: string): Promise<void>;
     /** `delete_message` (author only) */
     delete(id: ConversationId, message: MessageId): Promise<void>;
+    /** Hide only on this device; no conversation operation is sent. */
+    deleteLocal(id: ConversationId, message: MessageId): Promise<void>;
+    /** Undo local hiding; cannot undo a Delete for everyone tombstone. */
+    restoreLocal(id: ConversationId, message: MessageId): Promise<void>;
+    /** Search all synchronized visible messages, newest match first. */
+    search(id: ConversationId, query: string, limit?: number): Promise<MessageView[]>;
     /** `toggle_reaction` */
     react(id: ConversationId, message: MessageId, emoji: string): Promise<void>;
     /** `mark_read` */
@@ -257,6 +263,9 @@ export function createMycel(transport: Transport): Mycel {
       },
       edit: (id, message, body) => call("edit_message", { id, message, body }).then(done),
       delete: (id, message) => call("delete_message", { id, message }).then(done),
+      deleteLocal: (id, message) => call("delete_message_local", { id, message }).then(done),
+      restoreLocal: (id, message) => call("restore_message_local", { id, message }).then(done),
+      search: (id, query, limit) => call("search_messages", limit == null ? { id, query } : { id, query, limit }),
       react: (id, message, emoji) => call("toggle_reaction", { id, message, emoji }).then(done),
       markRead: (id) => call("mark_read", { id }).then(done),
       typing: (id) => call("set_typing", { id }).then(done),

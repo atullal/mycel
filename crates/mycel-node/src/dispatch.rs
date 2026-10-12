@@ -44,6 +44,14 @@ struct ListMessages {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SearchMessages {
+    id: String,
+    query: String,
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Send {
     id: String,
     body: String,
@@ -198,6 +206,10 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
             let l: ListMessages = args(a)?;
             ok(rt.messages(l.id, l.limit, l.before)?)
         }
+        "search_messages" => {
+            let s: SearchMessages = args(a)?;
+            ok(rt.search_messages(s.id, s.query, s.limit)?)
+        }
         "send_message" => {
             let s: Send = args(a)?;
             ok(rt
@@ -211,6 +223,14 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
         "delete_message" => {
             let m: Msg = args(a)?;
             ok(rt.delete_message(m.id, m.message)?)
+        }
+        "delete_message_local" => {
+            let m: Msg = args(a)?;
+            ok(rt.delete_message_local(m.id, m.message)?)
+        }
+        "restore_message_local" => {
+            let m: Msg = args(a)?;
+            ok(rt.restore_message_local(m.id, m.message)?)
         }
         "toggle_reaction" => {
             let r: React = args(a)?;

@@ -5,6 +5,7 @@ import { MessageList } from "./MessageList.tsx";
 import { Composer, type ComposerHandle } from "./Composer.tsx";
 import { ConversationAvatar, Icon, errorText } from "./ui.tsx";
 import { GroupCallPanel, JoinBanner, isLive } from "./Calls.tsx";
+import { ChatSearch } from "./ChatSearch.tsx";
 
 export function ChatView({
   summary,
@@ -44,6 +45,9 @@ export function ChatView({
   const typingPeers = useTyping(summary.id);
   const [replyTo, setReplyTo] = useState<MessageView | null>(null);
   const [editing, setEditing] = useState<MessageView | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [jumpToId, setJumpToId] = useState<string | null>(null);
+  const clearJump = useCallback(() => setJumpToId(null), []);
 
   // Mark read while the conversation is on screen (re-checked when the window
   // regains focus or visibility). Never for a message request: a read receipt
@@ -204,6 +208,7 @@ export function ChatView({
           <Icon.Lock size={15} />
           <span>Encrypted</span>
         </span>
+        <button className="mx-icon-btn" onClick={() => setSearchOpen(true)} aria-label="Search messages" title="Search messages"><Icon.Search /></button>
         <button
           className={`mx-icon-btn mx-members-button${membersOpen ? " is-on" : ""}`}
           onClick={onToggleMembers}
@@ -214,6 +219,7 @@ export function ChatView({
           <Icon.People />
         </button>
       </header>
+      {searchOpen && <ChatSearch conversation={summary.id} onClose={() => setSearchOpen(false)} onPick={(m) => setJumpToId(m.id)} />}
 
       {call && joinable && <JoinBanner call={call} />}
       {call && call.group && isLive(call) && !(call.direction === "incoming" && call.state === "ringing") && (
@@ -231,6 +237,9 @@ export function ChatView({
         onReply={canPost ? startReply : undefined}
         onEdit={canPost ? startEdit : undefined}
         editingId={editing?.id ?? null}
+        jumpToId={jumpToId}
+        onJumped={clearJump}
+        onDeleted={(m) => { if (editing?.id === m.id) setEditing(null); if (replyTo?.id === m.id) setReplyTo(null); }}
       />
 
       <div className={`mx-typing${typingNames.length ? " is-active" : ""}`} aria-live="polite">

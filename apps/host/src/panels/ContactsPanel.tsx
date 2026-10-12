@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { useContacts, useMycel, useNearby } from "@mycel/sdk/react";
 import { Avatar, STATUS_LABEL, errorText, statusOf } from "./common.tsx";
+import { matchesSearch } from "../../../messaging/src/search.ts";
+import { SearchField } from "../../../messaging/src/SearchField.tsx";
 
 export function ContactsPanel({ onShowNearby }: { onShowNearby: () => void }) {
   const mycel = useMycel();
@@ -11,8 +13,10 @@ export function ContactsPanel({ onShowNearby }: { onShowNearby: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [added, setAdded] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
 
   const strangers = nearby.filter((n) => !n.isContact);
+  const shownContacts = contacts.filter((c) => matchesSearch(query, c.name)).sort((a, b) => a.name.localeCompare(b.name));
 
   const add = async () => {
     const c = code.trim();
@@ -70,11 +74,15 @@ export function ContactsPanel({ onShowNearby }: { onShowNearby: () => void }) {
       <h4 className="p-sub">
         {contacts.length ? `${contacts.length} contact${contacts.length === 1 ? "" : "s"}` : "Contacts"}
       </h4>
+      <SearchField value={query} onChange={setQuery} label="Search contacts" placeholder="Search names" />
       {!loading && contacts.length === 0 && (
         <p className="p-empty">No contacts yet. Ask someone for their code, or add a person who's on your network.</p>
       )}
-      <ul className="p-people">
-        {contacts.map((c) => {
+      {!loading && contacts.length > 0 && shownContacts.length === 0 && (
+        <p className="p-empty" role="status">No contacts match "{query.trim()}".</p>
+      )}
+      <ul className="p-people" aria-label="Contacts">
+        {shownContacts.map((c) => {
           const s = statusOf(c);
           return (
             <li key={c.id} className="p-person">

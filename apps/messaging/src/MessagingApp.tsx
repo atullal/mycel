@@ -52,6 +52,9 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
   const ringing = calls.find((c) => c.direction === "incoming" && c.state === "ringing") ?? null;
   const barCall = calls.find((c) => isLive(c) && c !== ringing) ?? calls.find((c) => c.state === "ended") ?? null;
   const liveCall = calls.find((c) => isLive(c) && c !== ringing) ?? null;
+  const [videoMinimized, setVideoMinimized] = useState(false);
+  useEffect(() => setVideoMinimized(false), [liveCall?.id]);
+  const videoExpanded = !!liveCall && hasVideo(liveCall) && !videoMinimized;
   const [callError, setCallError] = useState<string | null>(null);
   const startCall = useCallback(
     async (conversation: string, video = false) => {
@@ -110,7 +113,7 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
     : null;
 
   return (
-    <div className={`mx-root${current ? " has-selection" : ""}${membersOpen && current ? " members-open" : ""}`}>
+    <div inert={videoExpanded} className={`mx-root${current ? " has-selection" : ""}${membersOpen && current ? " members-open" : ""}`}>
       <ConversationList
         conversations={conversations}
         loading={loading}
@@ -120,7 +123,22 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
       />
       <main className="mx-main">
         <CallBar call={barCall} onOpen={select} error={callError} onDismissError={() => setCallError(null)} />
-        {liveCall && hasVideo(liveCall) && <VideoStage key={liveCall.id} call={liveCall} />}
+        {liveCall && hasVideo(liveCall) && (
+          <VideoStage
+            key={liveCall.id}
+            call={liveCall}
+            minimized={videoMinimized}
+            onMinimize={() => {
+              setVideoMinimized(true);
+              if (!current) select(liveCall.conversation);
+            }}
+            onRestore={() => setVideoMinimized(false)}
+            onOpenChat={() => {
+              select(liveCall.conversation);
+              setVideoMinimized(true);
+            }}
+          />
+        )}
         {current ? (
           <ChatView
             key={current.id}
