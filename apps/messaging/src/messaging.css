@@ -2352,7 +2352,6 @@
 .mx-voice-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; }
 .mx-voice-controls button { min-height: 44px; }
 .mx-voice-recorder audio { width: 100%; margin-bottom: 8px; }
-.mx-typing:not(.is-active) { height: 8px; min-height: 8px; padding: 0; }
 
 @media (max-width: 720px) {
   .mx-chat { background: var(--bg); }
