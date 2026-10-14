@@ -8,6 +8,7 @@ import { NearbyPanel } from "./panels/NearbyPanel.tsx";
 import { NetworkPanel } from "./panels/NetworkPanel.tsx";
 import { Avatar } from "./panels/common.tsx";
 import { useNativeNotifications } from "./notifications.ts";
+import { NoticeBanner } from "./Notices.tsx";
 
 type AppId = "messaging" | "docs" | "newsroom" | "game";
 type PanelId = "profile" | "contacts" | "nearby" | "network";
@@ -151,6 +152,7 @@ export function App() {
       </nav>
 
       <div className="stage">
+        <NoticeBanner onOpenNetwork={() => setPanel("network")} />
         <div className="stage-app" inert={panel ? true : undefined}>
           {current.ready ? (
             <MessagingApp
