@@ -9,6 +9,7 @@
     "build": "tsc --noEmit -p . && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p .",
+    "test": "node --test tests/*.test.ts",
     "tauri": "cargo tauri"
   },
   "dependencies": {

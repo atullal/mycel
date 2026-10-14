@@ -1,11 +1,8 @@
 import { useMemo, useState } from "react";
-import { useContacts, useConversations, useMycel } from "@mycel/sdk/react";
-import type { MessageView } from "@mycel/sdk";
+import { SearchField, useContacts, useConversations, useMycel } from "@mycel/sdk/react";
+import { directPresence, matchesSearch, type MessageView } from "@mycel/sdk";
 import { ChatModal } from "./ChatModal.tsx";
 import { Icon, PresenceLabel, errorText, previewText } from "./ui.tsx";
-import { directPresence } from "./presence.ts";
-import { SearchField } from "./SearchField.tsx";
-import { matchesSearch } from "./search.ts";
 
 export const QUICK_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
 

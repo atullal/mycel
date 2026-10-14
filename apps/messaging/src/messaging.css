@@ -960,7 +960,8 @@
   left: auto;
   right: calc(100% + 6px);
 }
-.mx-actions:focus-within {
+.mx-actions:focus-within,
+.mx-msg-line:focus-within .mx-actions {
   opacity: 1;
   pointer-events: auto;
 }
@@ -2124,6 +2125,8 @@
   bottom: 14px;
   width: clamp(112px, 22%, 220px);
   aspect-ratio: 16 / 9;
+  /* a portrait camera stays inside the stage (the picture is cropped) */
+  max-height: calc(100% - 28px);
   border-radius: var(--r-md);
   overflow: hidden;
   background: #1d2023;
@@ -2310,6 +2313,8 @@
 }
 @media (pointer: coarse) {
   .mx-bubble { -webkit-user-select: none; user-select: none; }
+  /* A long press opens the message's actions, not the image's drag or menu. */
+  .mx-image img { -webkit-user-drag: none; pointer-events: none; user-select: none; }
   .mx-message-more { width: 1px; height: 1px; min-width: 0; padding: 0; clip-path: inset(50%); overflow: hidden; }
   .mx-message-more:focus-visible { width: 44px; height: 44px; clip-path: none; opacity: 1; pointer-events: auto; z-index: 2; }
 }
@@ -2334,7 +2339,6 @@
 .mx-forward-send { margin-top: 12px; width: 100%; min-height: 44px; }
 .mx-menu-item.mx-delete-action { color: var(--danger, #f18f80); }
 .mx-delete-undo { position: absolute; left: 12px; right: 12px; bottom: 10px; z-index: 5; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface-3); box-shadow: 0 4px 20px #0005; }
-.mx-image img { -webkit-user-drag: none; pointer-events: none; user-select: none; }
 .mx-chat-search-results { max-height: 55dvh; overflow-y: auto; }
 .mx-chat-search-result { display: block; }
 .mx-chat-search-result small { display: block; color: var(--ink-3); font-size: 12px; margin-bottom: 5px; }
@@ -2350,7 +2354,6 @@
 .mx-voice-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px; }
 .mx-voice-controls button { min-height: 44px; }
 .mx-voice-recorder audio { width: 100%; margin-bottom: 8px; }
-.mx-typing:not(.is-active) { height: 8px; min-height: 8px; padding: 0; }
 
 @media (max-width: 720px) {
   .mx-chat { background: var(--bg); }

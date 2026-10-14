@@ -1,8 +1,7 @@
-import { useEffect, useState } from "react";
-import { useMycel } from "@mycel/sdk/react";
+import { useEffect, useRef, useState } from "react";
+import { SearchField, useMycel } from "@mycel/sdk/react";
 import type { MessageView } from "@mycel/sdk";
 import { ChatModal } from "./ChatModal.tsx";
-import { SearchField } from "./SearchField.tsx";
 import { errorText, previewText } from "./ui.tsx";
 
 export function ChatSearch({ conversation, onClose, onPick }: {
@@ -14,20 +13,52 @@ export function ChatSearch({ conversation, onClose, onPick }: {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [revision, setRevision] = useState(0);
-  useEffect(() => mycel.on("conversationUpdated", (e) => {
-    if (e.conversation === conversation) setRevision((r) => r + 1);
-  }), [mycel, conversation]);
+  useEffect(
+    () =>
+      mycel.on("conversationUpdated", (e) => {
+        if (e.conversation === conversation) setRevision((r) => r + 1);
+      }),
+    [mycel, conversation],
+  );
+  // The query these results answer. A new query starts afresh ("Searching…");
+  // a change in the conversation (a new message, a receipt, an edit) re-runs
+  // the same query quietly and swaps the results in when they arrive.
+  const searched = useRef<string | null>(null);
   useEffect(() => {
     let cancelled = false;
-    setResults([]); setError(null);
-    if (!query.trim()) { setBusy(false); return; }
-    setBusy(true);
+    if (!query.trim()) {
+      searched.current = null;
+      setResults([]);
+      setError(null);
+      setBusy(false);
+      return;
+    }
+    const fresh = searched.current !== query;
+    if (fresh) {
+      setResults([]);
+      setError(null);
+      setBusy(true);
+    }
     const timer = setTimeout(() => {
-      void mycel.chat.search(conversation, query, 101).then((messages) => {
-        if (!cancelled) { setResults(messages); setBusy(false); }
-      }, (e) => { if (!cancelled) { setError(errorText(e)); setBusy(false); } });
-    }, 180);
-    return () => { cancelled = true; clearTimeout(timer); };
+      void mycel.chat.search(conversation, query, 101).then(
+        (messages) => {
+          if (cancelled) return;
+          searched.current = query;
+          setResults(messages);
+          setError(null);
+          setBusy(false);
+        },
+        (e) => {
+          if (cancelled) return;
+          setError(errorText(e));
+          setBusy(false);
+        },
+      );
+    }, fresh ? 180 : 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
   }, [mycel, conversation, query, revision]);
   return <ChatModal title="Search messages" onClose={onClose}>
     <SearchField value={query} onChange={setQuery} label="Search messages" placeholder="Search text or attachment names" autoFocus />

@@ -1,6 +1,5 @@
 import type { ReactNode, SVGProps } from "react";
-import type { Member, MessageView } from "@mycel/sdk";
-import { PRESENCE_LABEL, type Presence } from "./presence.ts";
+import { PRESENCE_LABEL, type Member, type MessageView, type Presence } from "@mycel/sdk";
 import "./presence.css";
 
 // ---------------------------------------------------------------------------

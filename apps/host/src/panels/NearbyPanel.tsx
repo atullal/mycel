@@ -1,8 +1,7 @@
 import { useState } from "react";
-import { useMycel, useNearby, useNetwork } from "@mycel/sdk/react";
+import { matchesSearch } from "@mycel/sdk";
+import { SearchField, useMycel, useNearby, useNetwork } from "@mycel/sdk/react";
 import { Avatar, errorText } from "./common.tsx";
-import { matchesSearch } from "../../../messaging/src/search.ts";
-import { SearchField } from "../../../messaging/src/SearchField.tsx";
 
 export function NearbyPanel() {
   const mycel = useMycel();

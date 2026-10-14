@@ -1,3 +1,6 @@
+// How reachable a person is right now. Shared by the host's panels and every
+// app, so "Nearby" means the same thing everywhere.
+
 /** Reachability describes the current route, not whether a device is powered on. */
 export type Presence = "nearby" | "online" | "offline";
 
@@ -11,7 +14,11 @@ export function presenceOf(contact: { nearby: boolean; online: boolean }): Prese
   return contact.nearby ? "nearby" : contact.online ? "online" : "offline";
 }
 
-/** Resolve by signing identity. A name, group membership, or absent contact is not presence evidence. */
+/**
+ * The other person's presence in a direct conversation, resolved by signing
+ * identity. A name, group membership, or absent contact is not presence
+ * evidence: those give `undefined`.
+ */
 export function directPresence(
   conversation: { direct: boolean; members: { id: string; isMe: boolean; role: string }[] },
   contacts: ReadonlyMap<string, { nearby: boolean; online: boolean }>,

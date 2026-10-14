@@ -11,3 +11,5 @@ Store the latest default tap's opaque notification identifier until consumed thr
 Bound the optional notification metadata cache to 256 records, protect it with a lock, and prune records on cancellation/removal. Evicted or removed records still convert safely from retained OS request content.
 
 Regression: `tests/retained-notification/run.sh` compiles the actual handler and UserNotifications framework on macOS with minimal Tauri/model stubs, then verifies conversion of an OS request in a newly constructed handler and the encoded tap payload. The actual iOS host build validates the full Swift plugin.
+
+Packaging: the crate's own `Cargo.lock` from the published package is not kept. Cargo ignores lock files of path dependencies; this plugin builds from the workspace's `Cargo.lock` like every other crate here.

@@ -13,13 +13,14 @@ import {
   previewText,
   sameDay,
 } from "./ui.tsx";
-import { MessageActions } from "./MessageActions.tsx";
+import { MessageActions, QUICK_REACTIONS } from "./MessageActions.tsx";
 import { ChatModal } from "./ChatModal.tsx";
 import { completesReply, replyDistance } from "./messageGesture.ts";
 import { HyphaeMark } from "./MessagingApp.tsx";
+import { FINE_POINTER, SYSTEM_MENU_TARGETS, keepsSystemMenu } from "./layout.ts";
+import { useMediaQuery } from "./useMediaQuery.ts";
 
 const GROUP_GAP_MS = 6 * 60_000;
-export { QUICK_REACTIONS } from "./MessageActions.tsx";
 
 interface Props {
   me: string | undefined;
@@ -28,7 +29,8 @@ interface Props {
   loading: boolean;
   error: Error | null;
   hasMore: boolean;
-  onLoadOlder: () => void;
+  /** One more page, or `count` more messages. */
+  onLoadOlder: (count?: number) => void;
   onReply?: (m: MessageView) => void;
   onEdit?: (m: MessageView) => void;
   editingId: string | null;
@@ -49,6 +51,9 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
   const [away, setAway] = useState(false);
   const [selected, setSelected] = useState<MessageView | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
+  // Mouse and trackpad: hover toolbar and the system menu where it helps.
+  // Touch: long press, swipe to reply and the actions sheet.
+  const fine = useMediaQuery(FINE_POINTER);
 
   const byId = useMemo(() => new Map(messages.map((m) => [m.id, m])), [messages]);
   const lastId = messages[messages.length - 1]?.id;
@@ -91,6 +96,11 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
     onLoadOlder();
   };
 
+  // Going to a message that isn't loaded (a search hit far back): double
+  // what's loaded each step, so reaching it takes a few fetches, not one
+  // per page. (Each fetch returns the whole window.)
+  const loadedCount = messages.length;
+
   const jumpTo = (id: string) => {
     const node = scroller.current?.querySelector(`[data-mid="${id}"]`);
     if (!node) return;
@@ -105,9 +115,9 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
       stickToBottom.current = false;
       jumpTo(jumpToId);
       onJumped?.();
-    } else if (hasMore) onLoadOlder();
+    } else if (hasMore) onLoadOlder(Math.max(loadedCount, 1));
     else onJumped?.();
-  }, [jumpToId, byId, loading, error, hasMore, onLoadOlder, onJumped]);
+  }, [jumpToId, byId, loading, error, hasMore, onLoadOlder, onJumped, loadedCount]);
 
   return (
     <div className="mx-messages-area">
@@ -173,7 +183,9 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
                 quoted={m.replyTo ? byId.get(m.replyTo) ?? null : undefined}
                 onJump={jumpTo}
                 onReply={onReply}
+                onEdit={onEdit}
                 onActions={setSelected}
+                fine={fine}
                 canAct={summary.active && !summary.request}
                 inert={summary.request}
                 flashing={flash === m.id}
@@ -205,7 +217,9 @@ const MessageRow = memo(function MessageRow({
   quoted,
   onJump,
   onReply,
+  onEdit,
   onActions,
+  fine,
   canAct,
   flashing,
   editing,
@@ -224,7 +238,10 @@ const MessageRow = memo(function MessageRow({
   quoted: MessageView | null | undefined;
   onJump: (id: string) => void;
   onReply?: (m: MessageView) => void;
+  onEdit?: (m: MessageView) => void;
   onActions: (m: MessageView) => void;
+  /** A mouse or trackpad (hover toolbar, system menu) rather than touch. */
+  fine: boolean;
   canAct: boolean;
   flashing: boolean;
   editing: boolean;
@@ -236,9 +253,11 @@ const MessageRow = memo(function MessageRow({
   const cancelGesture = () => { if (gesture.current?.timer) clearTimeout(gesture.current.timer); gesture.current = null; setOffset(0); };
   useEffect(() => () => { if (gesture.current?.timer) clearTimeout(gesture.current.timer); }, []);
   const [failure, setFailure] = useState<string | null>(null);
+  const [picking, setPicking] = useState(false);
 
   const act = (p: Promise<unknown>) => p.catch((e) => setFailure(errorText(e)));
   const react = (emoji: string) => {
+    setPicking(false);
     void act(mycel.chat.react(m.conversation, m.id, emoji));
   };
 
@@ -259,12 +278,26 @@ const MessageRow = memo(function MessageRow({
   const bodyOnlyEmoji = /^\p{Extended_Pictographic}{1,3}$/u.test(m.body.replace(/\s/g, "")) && !m.attachments.length;
 
   return (
-    <div className={cls} data-mid={m.id}>
+    <div className={cls} data-mid={m.id} onMouseLeave={() => setPicking(false)}>
       <div className="mx-msg-gutter">{showAvatar && <Avatar id={m.author} name={m.authorName} size={28} />}</div>
       <div className="mx-msg-col">
         {showAuthor && <div className="mx-msg-author">{m.authorName}</div>}
-        <div className="mx-msg-line"
-          onContextMenu={(e) => { { e.preventDefault(); onActions(m); } }}>
+        <div
+          className="mx-msg-line"
+          onContextMenu={(e) => {
+            if (fine) {
+              const selection = window.getSelection();
+              const target = e.target instanceof Element ? e.target : null;
+              const keep = keepsSystemMenu({
+                selectionInMessage: !!selection && !selection.isCollapsed && selection.containsNode(e.currentTarget, true),
+                linkOrMedia: !!target?.closest(SYSTEM_MENU_TARGETS),
+              });
+              if (keep) return;
+            }
+            e.preventDefault();
+            onActions(m);
+          }}
+        >
           {offset > 0 && <span className="mx-swipe-hint" aria-hidden="true"><Icon.Reply /></span>}
           <div className={`mx-bubble${bodyOnlyEmoji ? " is-emoji" : ""}${images.length && !m.body ? " is-media" : ""}`}
             tabIndex={0}
@@ -316,7 +349,7 @@ const MessageRow = memo(function MessageRow({
                 ) : (
                   <>
                     {images.map((a) => (
-                      <ImageAttachment key={a.blob} a={a} />
+                      <ImageAttachment key={a.blob} a={a} touch={!fine} />
                     ))}
                     {files.map((a) => (
                       <FileAttachment key={a.blob} a={a} />
@@ -335,7 +368,39 @@ const MessageRow = memo(function MessageRow({
             </span>
           </div>
 
-          {<button className="mx-message-more mx-icon-btn" onClick={() => onActions(m)} aria-label="Message actions" title="Message actions"><Icon.More size={16} /></button>}
+          {fine && canAct && !m.deleted ? (
+            <div className="mx-actions" role="toolbar" aria-label="Message actions">
+              <button className="mx-act" onClick={() => setPicking((p) => !p)} aria-label="React" title="React" aria-expanded={picking}>
+                <Icon.Smile size={17} />
+              </button>
+              {onReply && (
+                <button className="mx-act" onClick={() => onReply(m)} aria-label="Reply" title="Reply">
+                  <Icon.Reply size={17} />
+                </button>
+              )}
+              {m.isMine && onEdit && !!m.body && (
+                <button className="mx-act" onClick={() => onEdit(m)} aria-label="Edit" title="Edit">
+                  <Icon.Edit size={17} />
+                </button>
+              )}
+              <button className="mx-act" onClick={() => onActions(m)} aria-label="More actions" title="Copy, forward, delete…">
+                <Icon.More size={17} />
+              </button>
+              {picking && (
+                <div className="mx-picker" role="menu" aria-label="Pick a reaction">
+                  {QUICK_REACTIONS.map((e) => (
+                    <button key={e} role="menuitem" onClick={() => react(e)} aria-label={`React with ${e}`}>
+                      {e}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : (
+            <button className="mx-message-more mx-icon-btn" onClick={() => onActions(m)} aria-label="Message actions" title="Message actions">
+              <Icon.More size={16} />
+            </button>
+          )}
         </div>
 
         {m.reactions.length > 0 && (
@@ -428,15 +493,36 @@ function ProgressBar({ pct }: { pct: number }) {
   );
 }
 
-function ImageAttachment({ a }: { a: Attachment }) {
+/**
+ * A photo in a message. On touch screens a long press opens the message's
+ * actions, so the picture itself must not start the system's drag or image
+ * menu; with a mouse it can be dragged out or saved from the right-click menu.
+ */
+function ImageAttachment({ a, touch }: { a: Attachment; touch: boolean }) {
   const { state, err, fetch, url, open, pct, rate } = useAttachment(a);
   const [viewing, setViewing] = useState(false);
   if (url) {
     return (
-      <><button className="mx-image" onDragStart={(e) => e.preventDefault()} onClick={() => setViewing(true)} title={`Open ${a.name}`}>
-        <img src={url} alt={a.name} loading="lazy" draggable={false} />
-      </button>
-      {viewing && <ChatModal title={a.name} className="mx-media-viewer" onClose={() => setViewing(false)}><img src={url} alt={a.name} /><button className="mx-menu-item" onClick={open}>Share or save<Icon.Open /></button>{err && <p role="alert">{err}</p>}</ChatModal>}</>
+      <>
+        <button
+          className="mx-image"
+          onDragStart={touch ? (e) => e.preventDefault() : undefined}
+          onClick={() => setViewing(true)}
+          title={`Open ${a.name}`}
+        >
+          <img src={url} alt={a.name} loading="lazy" draggable={touch ? false : undefined} />
+        </button>
+        {viewing && (
+          <ChatModal title={a.name} className="mx-media-viewer" onClose={() => setViewing(false)}>
+            <img src={url} alt={a.name} />
+            <button className="mx-menu-item" onClick={open}>
+              Share or save
+              <Icon.Open />
+            </button>
+            {err && <p role="alert">{err}</p>}
+          </ChatModal>
+        )}
+      </>
     );
   }
   return (

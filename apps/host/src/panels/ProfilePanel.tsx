@@ -5,11 +5,16 @@ import { Glyph } from "../icons.tsx";
 import { applyTheme, readTheme, type ThemeChoice } from "../theme.ts";
 import { Qr } from "./Qr.tsx";
 import { Avatar, errorText, shortId } from "./common.tsx";
-import type { NotificationPermission } from "../notifications.ts";
+import { notificationStatus, type NotificationPermission } from "../notificationStatus.ts";
 
-export function ProfilePanel({ notifications }: {
-  notifications?: { native: boolean; permission: NotificationPermission; error: string | null; checkPermission: () => Promise<void> };
-}) {
+interface NotificationsState {
+  native: boolean;
+  permission: NotificationPermission;
+  error: string | null;
+  checkPermission: () => Promise<void>;
+}
+
+export function ProfilePanel({ notifications }: { notifications?: NotificationsState }) {
   const { profile, setName, error: loadError } = useProfile();
   const [editing, setEditing] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -101,20 +106,7 @@ export function ProfilePanel({ notifications }: {
         </div>
       </section>
 
-      {notifications?.native && <section className="p-card" aria-label="Notifications">
-        <h4>Notifications</h4>
-        <p className="p-help" role="status">
-          {notifications.permission === "granted" ? "Enabled for incoming messages, requests and calls. Names and message contents stay private."
-            : notifications.permission === "denied" ? "Disabled in device settings. Allow notifications for Mycel in Settings to receive alerts."
-            : notifications.permission === "checking" ? "Checking notification permission…"
-            : "Allow notifications to receive message and call alerts."}
-        </p>
-        {isMobile() && <p className="p-help">Alerts arrive while Mycel is connected. Your phone may pause the connection when Mycel is in the background.</p>}
-        {notifications.permission !== "granted" && <button className="h-btn h-btn-quiet" onClick={() => void notifications.checkPermission()}>
-          {notifications.permission === "prompt" ? "Enable notifications" : "Check notification settings"}
-        </button>}
-        {notifications.error && <p className="p-error" role="alert">{notifications.error}</p>}
-      </section>}
+      {notifications?.native && <NotificationsCard notifications={notifications} />}
 
       <section className="p-card">
         <h4>Appearance</h4>
@@ -127,5 +119,30 @@ export function ProfilePanel({ notifications }: {
         </div>
       </section>
     </div>
+  );
+}
+
+function NotificationsCard({ notifications }: { notifications: NotificationsState }) {
+  const status = notificationStatus(notifications.permission);
+  return (
+    <section className="p-card" aria-label="Notifications">
+      <h4>Notifications</h4>
+      <p className="p-help" role="status">
+        {status.text}
+      </p>
+      {isMobile() && (
+        <p className="p-help">Alerts arrive while Mycel is connected. Your phone may pause the connection when Mycel is in the background.</p>
+      )}
+      {status.button && (
+        <button className="h-btn h-btn-quiet" onClick={() => void notifications.checkPermission()}>
+          {status.button}
+        </button>
+      )}
+      {notifications.error && (
+        <p className="p-error" role="alert">
+          {notifications.error}
+        </p>
+      )}
+    </section>
   );
 }

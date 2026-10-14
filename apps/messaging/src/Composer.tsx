@@ -12,8 +12,6 @@ import { useMycel, useTransfer } from "@mycel/sdk/react";
 import { isMobile } from "@mycel/sdk";
 import type { ConversationSummary, MessageView } from "@mycel/sdk";
 import { Icon, errorText, fileNameFromPath, formatRate, formatSize, previewText } from "./ui.tsx";
-
-import { ChatModal } from "./ChatModal.tsx";
 import { VoiceRecorder } from "./VoiceRecorder.tsx";
 
 /** Lets the conversation view hand the composer dropped files. */
@@ -47,10 +45,13 @@ export function Composer({
   onStartEdit: (m: MessageView) => void;
 }) {
   const mycel = useMycel();
-  const [attachmentMenu, setAttachmentMenu] = useState(false);
+  // Phones and tablets pick through the system's chooser (photos, camera,
+  // files): it hands over copies, which are staged with the runtime. A
+  // computer's file dialog gives real paths, which the runtime reads itself,
+  // so even very large files never pass through the web view.
+  const systemChooser = isMobile();
   const [recording, setRecording] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
-  const photoInput = useRef<HTMLInputElement>(null);
   const cameraInput = useRef<HTMLInputElement>(null);
   const [text, setText] = useState("");
   const [files, setFiles] = useState<string[]>([]);
@@ -216,19 +217,21 @@ export function Composer({
   };
 
   const canSend = (editing ? !!text.trim() : !!text.trim() || files.length > 0) && staging === 0;
-  const placeholder = editing ? "Edit message" : "Message";
+  const placeholder = editing
+    ? "Edit message"
+    : conversation.direct
+      ? `Message ${conversation.title.split(" ")[0]}`
+      : `Message ${conversation.title}`;
 
   return (
     <div className="mx-composer">
-      {/* Mobile file inputs already offer Photos, Camera and Files in the system chooser. */}
-      <input ref={fileInput} type="file" multiple hidden onChange={(e) => { void attachFiles(Array.from(e.currentTarget.files ?? [])); e.currentTarget.value = ""; }} />
-      <input ref={photoInput} type="file" accept="image/*,video/*" multiple hidden onChange={(e) => { void attachFiles(Array.from(e.currentTarget.files ?? [])); e.currentTarget.value = ""; }} />
-      <input ref={cameraInput} type="file" accept="image/*" capture="environment" hidden onChange={(e) => { void attachFiles(Array.from(e.currentTarget.files ?? [])); e.currentTarget.value = ""; }} />
-      {attachmentMenu && <ChatModal title="Attach" onClose={() => setAttachmentMenu(false)}>
-        <button className="mx-menu-item" onClick={() => { setAttachmentMenu(false); photoInput.current?.click(); }}><Icon.Image /><span>Photos and videos</span></button>
-        <button className="mx-menu-item" onClick={() => { setAttachmentMenu(false); cameraInput.current?.click(); }}><Icon.Camera /><span>Camera</span></button>
-        <button className="mx-menu-item" onClick={() => { setAttachmentMenu(false); void attach(); }}><Icon.File /><span>Document</span></button>
-      </ChatModal>}
+      {systemChooser && (
+        <>
+          {/* The system chooser already offers Photos, Camera and Files. */}
+          <input ref={fileInput} type="file" multiple hidden onChange={(e) => { void attachFiles(Array.from(e.currentTarget.files ?? [])); e.currentTarget.value = ""; }} />
+          <input ref={cameraInput} type="file" accept="image/*" capture="environment" hidden onChange={(e) => { void attachFiles(Array.from(e.currentTarget.files ?? [])); e.currentTarget.value = ""; }} />
+        </>
+      )}
       {recording && <VoiceRecorder onCancel={() => setRecording(false)} onAttach={(file) => attachFiles([file], true)} />}
       {(replyTo || editing) && (
         <div className={`mx-context${editing ? " is-edit" : ""}`}>
@@ -273,11 +276,14 @@ export function Composer({
 
       {!recording && <div className="mx-composer-box">
         {!editing && (
-          <button className="mx-icon-btn mx-attach" disabled={busy || staging > 0} onClick={() => {
-            if (isMobile()) fileInput.current?.click();
-            else setAttachmentMenu(true);
-          }} aria-label="Attach files" title="Attach files">
-            <Icon.Plus />
+          <button
+            className="mx-icon-btn mx-attach"
+            disabled={busy || staging > 0}
+            onClick={() => (systemChooser ? fileInput.current?.click() : void attach())}
+            aria-label="Attach files"
+            title="Attach files"
+          >
+            {systemChooser ? <Icon.Plus /> : <Icon.Clip />}
           </button>
         )}
         <textarea
@@ -291,8 +297,8 @@ export function Composer({
           aria-label={placeholder}
         />
         {!canSend && !editing && staging === 0 && !busy ? <>
-          <button className="mx-icon-btn mx-camera" onClick={() => cameraInput.current?.click()} aria-label="Camera"><Icon.Camera /></button>
-          <button className="mx-icon-btn mx-record" onClick={() => setRecording(true)} aria-label="Record voice note"><Icon.Mic /></button>
+          {systemChooser && <button className="mx-icon-btn mx-camera" onClick={() => cameraInput.current?.click()} aria-label="Camera"><Icon.Camera /></button>}
+          <button className="mx-icon-btn mx-record" onClick={() => setRecording(true)} aria-label="Record voice note" title="Record voice note"><Icon.Mic /></button>
         </> : <button
           className="mx-send"
           onClick={() => void submit()}

@@ -45,9 +45,17 @@ export interface Member {
 
 export interface ConversationSummary {
   id: ConversationId;
-  /** Original encrypted spaces represented by this conversation, including id. */
+  /**
+   * Every encrypted space shown as this conversation, including `id` (a
+   * direct chat both sides started at once has two). Empty from runtimes
+   * that predate aliases; `isConversation()` handles both.
+   */
   aliases: ConversationId[];
-  /** Stable display identity across late-arriving direct-chat aliases. Not a wire-space ID. */
+  /**
+   * Stable UI identity across late-arriving direct-chat aliases; never a
+   * space id. Empty ("") from runtimes that predate it: use
+   * `threadKeyOf()`, which falls back to `id`.
+   */
   threadKey: string;
   title: string;
   /** True for a 1:1 conversation. */

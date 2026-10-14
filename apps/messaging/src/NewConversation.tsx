@@ -1,9 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useContacts, useMycel, useNearby } from "@mycel/sdk/react";
+import { SearchField, useContacts, useMycel, useNearby } from "@mycel/sdk/react";
+import { matchesSearch, presenceOf, PRESENCE_LABEL } from "@mycel/sdk";
 import { Avatar, Icon, errorText } from "./ui.tsx";
-import { matchesSearch } from "./search.ts";
-import { SearchField } from "./SearchField.tsx";
-import { presenceOf, PRESENCE_LABEL } from "./presence.ts";
 
 export function NewConversationDialog({
   onClose,

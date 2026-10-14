@@ -29,6 +29,9 @@ import type {
   Profile,
 } from "../src/types.ts";
 
+// Shared widgets that any app (and the host's panels) can use.
+export { SearchField } from "./SearchField.tsx";
+
 const MycelContext = createContext<Mycel | null>(null);
 
 /** Optional: provide a specific client (otherwise the default `mycel` is used). */
@@ -190,15 +193,26 @@ export function useConversation(id: ConversationId | null | undefined) {
 }
 
 const PAGE = 50;
+/**
+ * The runtime returns at most 10 000 messages per call (`messages` in
+ * crates/mycel-node/src/runtime.rs); one is the "is there more?" probe.
+ */
+const MAX_WINDOW = 9_999;
 
 /**
  * Messages of one conversation, oldest -> newest. Refreshes on
  * `conversationUpdated` for it and on `blobReady` for any loaded attachment.
- * `loadOlder()` pages backwards.
+ * `loadOlder()` pages backwards, one page or `count` more messages (grow
+ * geometrically when looking for an old message: each step refetches the
+ * whole window).
+ *
+ * `threadKey` (see `threadKeyOf`) keeps the loaded history while the
+ * conversation's canonical space changes; it defaults to `id`.
  */
-export function useMessages(id: ConversationId | null | undefined, pageSize = PAGE, threadKey: string | null | undefined = id) {
+export function useMessages(id: ConversationId | null | undefined, pageSize = PAGE, threadKey?: string | null) {
   const [window_, setWindow] = useState(pageSize);
   const blobsRef = useRef<Set<string>>(new Set());
+  threadKey = threadKey || id;
 
   useEffect(() => setWindow(pageSize), [threadKey, pageSize]);
 
@@ -207,7 +221,9 @@ export function useMessages(id: ConversationId | null | undefined, pageSize = PA
       if (!id) return { threadKey, messages: [] as MessageView[], hasMore: false };
       // Ask for one extra to learn whether older history exists.
       const list = await c.chat.messages(id, { limit: window_ + 1 });
-      return { threadKey, messages: list.length > window_ ? list.slice(1) : list, hasMore: list.length > window_ };
+      const more = list.length > window_;
+      // At the cap there may be older history this window can't reach.
+      return { threadKey, messages: more ? list.slice(1) : list, hasMore: more && window_ < MAX_WINDOW };
     },
     [id, window_, threadKey],
     (e) =>
@@ -228,9 +244,12 @@ export function useMessages(id: ConversationId | null | undefined, pageSize = PA
     [messages],
   );
 
-  const loadOlder = useCallback(() => {
-    if (hasMore) setWindow((w) => w + pageSize);
-  }, [hasMore, pageSize]);
+  const loadOlder = useCallback(
+    (count: number = pageSize) => {
+      if (hasMore) setWindow((w) => Math.min(MAX_WINDOW, w + Math.max(1, count)));
+    },
+    [hasMore, pageSize],
+  );
 
   return { ...q, data: q.data?.threadKey === threadKey ? q.data?.messages : undefined, messages, hasMore, loadOlder };
 }

@@ -1,8 +1,7 @@
 import { useState } from "react";
-import { useContacts, useMycel, useNearby } from "@mycel/sdk/react";
+import { matchesSearch } from "@mycel/sdk";
+import { SearchField, useContacts, useMycel, useNearby } from "@mycel/sdk/react";
 import { Avatar, STATUS_LABEL, errorText, statusOf } from "./common.tsx";
-import { matchesSearch } from "../../../messaging/src/search.ts";
-import { SearchField } from "../../../messaging/src/SearchField.tsx";
 
 export function ContactsPanel({ onShowNearby }: { onShowNearby: () => void }) {
   const mycel = useMycel();

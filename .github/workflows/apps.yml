@@ -44,6 +44,17 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      # The web side: types, then the node:test suites of the SDK, Messaging
+      # and the host (`npm test` runs each workspace's tests/*.test.ts with
+      # Node's built-in TypeScript type stripping, Node 22.18 or later).
+      - name: Web checks
+        run: |
+          npm run typecheck
+          npm test
+      # The host's own Rust tests (logging, notifications); they need the
+      # webview libraries installed above, so they run here.
+      - name: Host tests
+        run: cargo test -p mycel-host --lib
       - name: Build
         working-directory: apps/host
         run: npx --yes "$TAURI_CLI" build --bundles deb,rpm,appimage

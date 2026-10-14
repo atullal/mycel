@@ -229,7 +229,7 @@ pub async fn fetch_attachment(rt: State<'_, Rt>, blob: String) -> Res<String> {
 pub async fn stage_file(rt: State<'_, Rt>, request: tauri::ipc::Request<'_>) -> Res<String> {
     let data = body_bytes(&request, "stage_file")?;
     let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok()).map(percent_decode);
-    // Android sends big files in pieces: the rest go onto the staged file.
+    // Files arrive in pieces (the SDK's `files.stage`): the rest go onto the staged file.
     if let Some(path) = header("x-mycel-append").filter(|p| !p.is_empty()) {
         let uploads = std::fs::canonicalize(rt.data_dir().join("uploads")).map_err(err)?;
         let file = std::fs::canonicalize(&path).map_err(err)?;

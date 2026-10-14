@@ -65,17 +65,14 @@ const tauriFiles: FileHost = {
     else await openPath(path);
   },
   async stage(files) {
+    // `stage_file` writes the first piece to a new file under uploads/ and
+    // appends the rest to it. In pieces, so a file (a long video from the
+    // photo library, say) never sits whole in the web view's memory or in
+    // one IPC message. Android's IPC carries base64 JSON: smaller pieces.
+    const piece = (bytesAsJson ? 2 : 8) * 1024 * 1024;
     const paths: string[] = [];
     for (const f of files) {
       const name = encodeURIComponent(f.name || "pasted");
-      if (!bytesAsJson) {
-        // Raw body: the `stage_file` command writes it under uploads/.
-        const bytes = new Uint8Array(await f.arrayBuffer());
-        paths.push(await invokeBytes<string>("stage_file", bytes, { "x-mycel-name": name }));
-        continue;
-      }
-      // Android (base64 over JSON): in pieces, so big files fit.
-      const piece = 2 * 1024 * 1024;
       let path = "";
       for (let at = 0; at === 0 || at < f.size; at += piece) {
         const bytes = new Uint8Array(await f.slice(at, at + piece).arrayBuffer());
