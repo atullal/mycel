@@ -1894,6 +1894,42 @@ impl Runtime {
         Ok(())
     }
 
+    /// An invitation was admitted (see `invite_policy`): a contact's becomes
+    /// a conversation, anyone else's stays a request. Either way it stops
+    /// being hidden as arriving, even when storage fails.
+    fn classify_arrival(&self, space: SpaceId, from: SignPk) {
+        self.leave_evicted_requests();
+        self.invalidate(&space);
+        if !self.keeper {
+            let known = self.contacts.lock().contains_key(&from);
+            if known {
+                let cleared = {
+                    let mut requests = self.requests.lock();
+                    let list: Vec<_> = requests.iter().filter(|(s, _)| **s != space).map(|(s, p)| (*s, *p)).collect();
+                    let result = postcard::to_allocvec(&list).map_err(anyhow::Error::from).and_then(|bytes| {
+                        self.store.kv_batch_durable(vec![("requests".into(), Some(bytes))])
+                    });
+                    if result.is_ok() {
+                        requests.remove(&space);
+                    }
+                    result.is_ok()
+                };
+                // Storage failure retains the conservative request: it shows
+                // as a request to accept, rather than not at all.
+                // A contact added us: introduce ourselves right away.
+                if cleared && self.my_role(&space).is_some_and(Role::can_write) {
+                    let name = self.name.lock().clone();
+                    let _ = self.post(space, ChatOp::Profile { name });
+                }
+            }
+            // Stranger requests were persisted by invite_policy before
+            // admission. A concurrent accept/decline may already have
+            // removed one by the time this event is handled.
+        }
+        self.arriving.lock().remove(&space);
+        self.emit(Event::ConversationAdded { conversation: space.to_string() });
+    }
+
     /// Leave the stranger requests the invite policy declined to make room,
     /// as declining one by hand does.
     fn leave_evicted_requests(&self) {
@@ -2058,40 +2094,7 @@ async fn bridge(rt: Weak<Runtime>, mut rx: broadcast::Receiver<NetEvent>) {
                 let _ = rt.view(&space);
                 rt.emit(Event::ConversationUpdated { conversation: space.to_string() });
             }
-            NetEvent::SpaceAdded { space, from } => {
-                rt.leave_evicted_requests();
-                rt.invalidate(&space);
-                if !rt.keeper {
-                    let known = rt.contacts.lock().contains_key(&from);
-                    if known {
-                        let cleared = {
-                            let mut requests = rt.requests.lock();
-                            let list: Vec<_> = requests.iter().filter(|(s, _)| **s != space).map(|(s, p)| (*s, *p)).collect();
-                            let result = postcard::to_allocvec(&list).map_err(anyhow::Error::from).and_then(|bytes| {
-                                rt.store.kv_batch_durable(vec![("requests".into(), Some(bytes))])
-                            });
-                            if result.is_ok() {
-                                requests.remove(&space);
-                            }
-                            result.is_ok()
-                        };
-                        if !cleared {
-                            // Storage failure retains the conservative request.
-                            continue;
-                        }
-                        // a contact added us: introduce ourselves right away
-                        if rt.my_role(&space).is_some_and(Role::can_write) {
-                            let name = rt.name.lock().clone();
-                            let _ = rt.post(space, ChatOp::Profile { name });
-                        }
-                    }
-                    // Stranger requests were persisted by invite_policy before
-                    // admission. A concurrent accept/decline may already have
-                    // removed one by the time this event is handled.
-                }
-                rt.arriving.lock().remove(&space);
-                rt.emit(Event::ConversationAdded { conversation: space.to_string() });
-            }
+            NetEvent::SpaceAdded { space, from } => rt.classify_arrival(space, from),
             NetEvent::Ephemeral { space, from, data } => {
                 if let Some(ChatSignal::Typing) = ChatSignal::decode(&data) {
                     rt.emit(Event::Typing {
@@ -2575,6 +2578,37 @@ mod tests {
         assert_eq!(super::guess_mime("Voice note.WEBA"), "audio/webm");
         assert_eq!(super::guess_mime("Voice note.ogg"), "audio/ogg");
         assert_eq!(super::guess_mime("Movie.webm"), "video/webm");
+    }
+
+    #[tokio::test]
+    async fn a_contacts_invite_shows_as_a_request_when_storage_fails() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("mycel-arrival-{}", mycel_crypto::random_u64()));
+        let runtime = Runtime::open(&dir, NetworkMode::Local, Some("Arrival test".into())).await.unwrap();
+        let peer = DeviceKeys::generate().public();
+        runtime.contacts.lock().insert(peer.sign_pk, StoredContact { keys: peer, name: "Peer".into() });
+        let (space, _) = runtime.node.create_space().unwrap();
+        runtime.node.with_space(&space, |r| r.add_member(peer, Role::Writer)).unwrap().unwrap();
+        // As invite_policy leaves an admitted invitation.
+        runtime.requests.lock().insert(space, peer.sign_pk);
+        runtime.arriving.lock().insert(space);
+        runtime.store.fail_commits(usize::MAX);
+        runtime.classify_arrival(space, peer.sign_pk);
+        assert!(!runtime.arriving.lock().contains(&space), "never stuck hidden");
+        assert!(runtime.requests.lock().contains_key(&space), "the conservative request is kept");
+        assert!(runtime.conversations().iter().any(|c| c.id == space.to_string() && c.request));
+        runtime.store.fail_commits(0);
+        // Once storage works, the same arrival becomes the conversation.
+        for _ in 0..200 {
+            if runtime.store.failure().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        runtime.classify_arrival(space, peer.sign_pk);
+        assert!(runtime.conversations().iter().any(|c| c.id == space.to_string() && !c.request));
+        runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

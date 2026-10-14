@@ -286,6 +286,12 @@ impl DbStore {
         })
     }
 
+    /// Make the next `n` commits fail, as a full or failing disk would.
+    #[cfg(test)]
+    pub(crate) fn fail_commits(&self, n: usize) {
+        self.shared.fail_commits.store(n, Ordering::SeqCst);
+    }
+
     /// Fail now, rather than buffer a local change that can't be saved.
     pub fn check_writable(&self) -> Result<()> {
         match self.failure() {
