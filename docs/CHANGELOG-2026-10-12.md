@@ -1,5 +1,16 @@
 # Published change ledger: security, mobile chat, discovery and notifications
 
+> **Follow-up, 2026-10-14.** This branch was merged into `main` without review while CI was red. A review confirmed the security fixes below. It also found that the branch:
+> - stopped Android from starting;
+> - broke Bluetooth failover;
+> - made document edits quadratic and rejected large pastes;
+> - reset legitimate streams;
+> - let one stranger hold the frame budget;
+> - regressed the desktop chat;
+> - put messaging rules into the platform runtime and host.
+>
+> Those are fixed on `fix/pr2-review`, and [STATUS.md](../STATUS.md) summarises the fixes. The revised resource limits are in [SECURITY-REVIEW-2026-10-11.md](SECURITY-REVIEW-2026-10-11.md#enforced-resource-policies). The `apps/host/tests/history-hook/` harness listed below was removed: it was a manual harness with a machine-specific path. Statements below about behaviour the fixes changed describe the branch as published.
+
 This ledger explains the cumulative implementation changes on `codex/security-hardening`, including their reasons, original commits, validation evidence, and remaining limits.
 
 - Repository: [atullal/mycel](https://github.com/atullal/mycel).

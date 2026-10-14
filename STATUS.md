@@ -1,6 +1,6 @@
 # Mycel: where things stand
 
-*Last updated: 2026-10-09, evening ET. This is a snapshot for collaborators. The
+*Last updated: 2026-10-14, ET. This is a snapshot for collaborators. The
 design docs in `docs/` are the source of truth.*
 
 ## TL;DR
@@ -24,6 +24,15 @@ design docs in `docs/` are the source of truth.*
   Since then: video from Android, Windows and Linux (the web view captures
   and encodes); Android keeps running in the background; notifications;
   iPhone calls continue in the background; the iPhone keyboard fix.
+- **New on 2026-10-12 to 2026-10-14: security hardening and a phone-first
+  chat (PR #2), then a review and fixes** (details below):
+  - attacks that could crash or stall every member of a space are closed;
+  - message requests need consent before files arrive, and notifications
+    show no names or text;
+  - the iPhone chat has gestures, voice notes and search, and the desktop
+    keeps its own controls;
+  - iPhones find peers on the LAN without Apple's multicast entitlement;
+  - long histories cost per page and per new message, never per history.
 - Test builds for every platform: the
   [dev-2026-10-09-apps pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-09-apps).
   **Every device needs a build from the same release.**
@@ -140,6 +149,81 @@ largest size this Mac runs. That's up to 100 seats for the conference and
 `disaster-dtn` is judged on the mean of 12 seeds because single runs swing
 ±3–6 points (SIMULATION.md §4, open 12).
 
+## What landed on 2026-10-12 to 2026-10-14
+
+**PR #2** (`codex/security-hardening`, explained in
+[docs/CHANGELOG-2026-10-12.md](docs/CHANGELOG-2026-10-12.md) and
+[docs/SECURITY-REVIEW-2026-10-11.md](docs/SECURITY-REVIEW-2026-10-11.md))
+closed real attacks. A review checked each one against the old code:
+
+- a malformed change from any writer crashed every member's app, and kept
+  crashing it after restarts;
+- small compressed changes expanded without limit;
+- a forged mesh announcement could skip signature checks;
+- junk membership operations could stop an admin from removing a member;
+- strangers could push files before their request was accepted.
+
+It also added private notifications and the phone chat. It was merged
+without review, with CI red, and it broke things. The review found these, and
+`fix/pr2-review` fixes them:
+
+- **Android:** a fresh install couldn't start, because Rust's file lock isn't
+  supported there and the platform's own folders made a new profile look
+  established. Fixed and checked on the emulator: a fresh install, a restart
+  and an upgrade from the old layout all keep the identity.
+- **Bluetooth failover:** a 5 s deadline applied to replies, so a sync in
+  flight while a link dropped failed. Only the start of a stream a peer
+  opens is now short. Waiting for a reply allows a failover or a slow route.
+- **Resource limits:** these now give backpressure and fairness instead of
+  resets.
+  - QUIC stream limits make extra streams wait.
+  - Frame budgets are per node and per peer, and charged as bytes arrive.
+  - Strangers get their own small pool.
+  - There is no fixed total deadline, so a long sync over Bluetooth
+    completes.
+- **Documents:** applying a change replayed the whole history, so 5,000
+  edits took 2 minutes. Now: 0.3 s locally, and 0.19 s for another member
+  ingesting them in one batch (2.7 s before the PR). Large pastes work:
+  writers split edits, and readers accept up to 16 MiB per change. Bombs are
+  still rejected.
+- **Chats:** two separately created chats with the same person still show as
+  one, but the merge rules now live in the chat kit.
+  - Listing and events no longer reread histories: listing 200 chats takes
+    3.5 ms (was 5.3 s).
+  - Leaving or adding people no longer splits a chat.
+  - New posts go to the same space on both devices.
+  - Messages page by cursor at any depth: about 130 µs per page in a
+    100,000-message chat. A new message updates the view instead of
+    rebuilding it.
+- **Notifications:** the messaging rules moved from the host into the chat
+  kit; the host only shows generic alerts.
+  - Tap routing never reuses IDs.
+  - OS calls no longer block the event loop.
+- **Identity and storage:**
+  - Profiles lock on every platform.
+  - An interrupted first launch recovers.
+  - Mycel's data is excluded from cloud backups (iOS and Android).
+  - An iPhone restored to a new device starts a new identity instead of
+    refusing to open; the old data is kept aside.
+  - Failed saves are retried.
+  - A damaged setting or record no longer stops startup: an unreadable
+    network setting becomes Local only, never wider.
+  - The user sees a notice for each of these, which stays until dismissed.
+- **Requests:** contacts are never blocked by strangers' request floods.
+- **Desktop:** the hover toolbar, native right-click, one-click attach,
+  inline video and correct read state are back. Phones keep the touch
+  design.
+- **Platform layering:** the host no longer imports the messaging app's
+  source, and the history-hook harness (with a machine-specific path) is
+  gone.
+- **iPhone LAN discovery:** iPhones now use the system's Bonjour, so no
+  multicast entitlement is needed. Checked on an iPhone 17 Pro. A patched
+  `swarm-discovery` lets iroh's mDNS and Bonjour see each other.
+
+**Same-build rule, again:** builds before this one can't see an iPhone's
+Bonjour announcement, and drop ephemeral messages over 4 KiB (the new limit
+is 64 KiB).
+
 ## Known issues and open questions
 
 - **Fixed on 2026-10-09: rules engine stack overflow.** wasmi's tail-call
@@ -211,13 +295,30 @@ largest size this Mac runs. That's up to 100 seats for the conference and
   allow it in System Settings > Privacy & Security > Local Network.
 - **Not audited.** The trust layer needs an external cryptographic review
   before anyone relies on it.
+- **Scaling work still to do:**
+  - Sync exchanges full inventories. Range-based set reconciliation is the
+    next step for very large spaces.
+  - Trust resolution is quadratic when many membership changes are
+    concurrent.
+  - A writer who sends K conflicting versions in K separate batches costs K
+    document rebuilds; within one batch it's one.
+  - Unread counts scale with the unread backlog.
+  - Loading a space re-checks its whole feed against the chat rules.
+- **Notifications:**
+  - Android has no notifications yet; Profile says so.
+  - Desktop notification centres can't take back an alert once shown.
+  - Ordering by "first seen" is per device: two phones can order messages
+    written offline differently.
+- **Spam requests:** a stranger's request declined to make room stays stored
+  (left, not deleted). Forgetting it fully needs a remove-space API.
 
 ## How we work
 
 - `main` stays green. Merge only after `cargo test --workspace` passes twice in
   a row and `cargo clippy --workspace --all-targets` is clean. Also run
   `npm run build` if you touched TypeScript.
-- Use feature branches and PRs into `main`.
+- Use feature branches and PRs into `main`. A PR gets a review before it
+  merges, and never merges with CI red.
 - Iroh is vendored with a small multipath patch. Read
   `vendor/iroh/MYCEL_PATCH.md` before touching it.
 - Don't commit `dist-release/` (built apps) or any CRAWDAD trace data.
