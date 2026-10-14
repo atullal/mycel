@@ -37,6 +37,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.hexane]
 opt-level = 3
+[profile.dev.package.zlib-rs]
+opt-level = 3
 # Live calls encode and decode audio in real time: the Opus codec and the call
 # pipeline must be optimized even in debug builds.
 [profile.dev.package.unsafe-libopus]
