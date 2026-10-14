@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useCalls, useContacts, useConversations, useMycel, useProfile } from "@mycel/sdk/react";
-import { isConversation, threadKeyOf, type Contact } from "@mycel/sdk";
+import { IMMERSIVE_ATTRIBUTE, isConversation, threadKeyOf, type Contact } from "@mycel/sdk";
 import { ConversationList } from "./ConversationList.tsx";
 import { ChatView } from "./ChatView.tsx";
 import { NewConversationDialog } from "./NewConversation.tsx";
@@ -144,7 +144,13 @@ export function MessagingApp({ initialConversation, onOpenContacts, visible = tr
     : null;
 
   return (
-    <div inert={videoExpanded} className={`mx-root${current ? " has-selection" : ""}${membersOpen && current ? " members-open" : ""}`}>
+    <div
+      inert={videoExpanded}
+      className={`mx-root${current ? " has-selection" : ""}${membersOpen && current ? " members-open" : ""}`}
+      // An open conversation has its own back button: on a phone the host
+      // can give its app bar's room to the chat.
+      {...(current ? { [IMMERSIVE_ATTRIBUTE]: "" } : {})}
+    >
       <ConversationList
         conversations={conversations}
         loading={loading}

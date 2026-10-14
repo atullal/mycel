@@ -919,8 +919,15 @@
   }
 }
 
-/* Conversation navigation belongs in its header on a phone. */
-@media (max-width: 720px) {
-  .host:has(.mx-root.has-selection) { grid-template-rows: minmax(0, 1fr); }
-  .host:has(.mx-root.has-selection) > .rail { display: none; }
+/* An app showing one thing full-screen with its own way back (an open
+   conversation) marks it with data-mycel-immersive (IMMERSIVE_ATTRIBUTE in
+   @mycel/sdk). On a phone, give it the app bar's room; a narrow window on a
+   computer keeps the bar. */
+@media (max-width: 720px) and (pointer: coarse) {
+  .host:has(.stage-app [data-mycel-immersive]) {
+    grid-template-rows: minmax(0, 1fr);
+  }
+  .host:has(.stage-app [data-mycel-immersive]) > .rail {
+    display: none;
+  }
 }

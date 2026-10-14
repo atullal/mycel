@@ -14,3 +14,4 @@ export { directPresence, presenceOf, PRESENCE_LABEL } from "./presence.ts";
 export type { Presence } from "./presence.ts";
 export { matchesSearch } from "./search.ts";
 export { isConversation, threadKeyOf } from "./conversation.ts";
+export { IMMERSIVE_ATTRIBUTE } from "./shell.ts";
