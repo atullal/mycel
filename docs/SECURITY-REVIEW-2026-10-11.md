@@ -104,28 +104,51 @@ identities and content. Logs are in the ignored `dist-release/security/` folder.
 
 ### Enforced resource policies
 
-These limits retain the wire format but intentionally reject oversized input
-that older builds may have accepted:
+*Revised 2026-10-14.* The first version of these limits broke failover to
+Bluetooth, reset legitimate streams, let one stranger hold the whole frame
+budget, and rejected ordinary large document edits. The limits below replace
+them. The wire format is unchanged.
 
-- 64 inbound streams per process and eight per connection; reject overload
-  before spawning tasks. Mesh DTN shares the process admission budget.
-- 64 MiB maximum ordinary frame; 128 MiB of encoded-frame reservations per
-  process and per connection, held while variable-size messages are handled.
-  Five-second header deadline, 30-second I/O inactivity deadline, 60-second
-  inbound sync deadline. Large blob/DTN payloads use inactivity deadlines.
-- 4 KiB maximum ephemeral plaintext. The app currently uses these messages for
-  typing indicators; media has separate protocols.
-- 1 MiB maximum expanded serialized document change, 65,536 operations,
-  1,048,576 logical column values/group entries, 1 MiB expanded column strings.
-  Writers enforce the same limits and roll back rejected local edits.
-  Declared dependency ancestry must justify actor sequence, operation counters
-  and object references. Counters may have gaps but cannot overlap causal
-  history or exceed the upstream graph's 32-bit counter storage.
-- 4,096 unresolved membership operations total, 256 per author. These quotas
-  do not block a ready administrator operation.
-- 256 provisional/pending invitations total and 32 per inviter. Because known
-  contacts are classified after admission, a full provisional queue can also
-  defer a new contact's invitation until a slot is freed.
+- **Streams:** QUIC limits each connection to 64 bidirectional and 128
+  unidirectional streams. A peer that opens more waits; it is not reset. DTN
+  sends at most 8 bundles at a time to one neighbour.
+- **Frame bytes:** the budgets belong to each node, not the process.
+  - Members share a 128 MiB pool, at most 32 MiB each.
+  - Devices that share no space with us get a separate 32 MiB pool, 8 MiB each.
+  - The mesh has its own pool.
+  - The node pool is charged only as bytes arrive, so a slow peer delays only
+    its own frames.
+  - A frame must average 512 B/s after a 60-second grace period.
+  - Sends are never charged.
+  - The largest frame is 64 MiB.
+- **Deadlines:**
+  - The first frame of a stream a peer opens must start within 10 s.
+  - Waiting for a reply allows 60 s, plus time for our own queued bytes to
+    drain.
+  - Bytes in transit have a 30-second inactivity deadline.
+  - Nothing has a fixed total deadline, so a long sync over Bluetooth
+    completes.
+- **Ephemeral messages:** 64 KiB of plaintext by default, configurable per
+  node. The size is checked before decryption. Older builds drop anything over
+  4 KiB.
+- **Document changes:**
+  - Readers accept up to 16 MiB expanded and 1,048,576 operations per change.
+  - Run-length expansion is capped at 64 values per byte of change body, never
+    below 4M and never above 16M values or 16 MiB of strings.
+  - Writers split large edits into changes of at most 65,536 operations and
+    512 KiB, so a multi-MB paste works.
+  - Declared dependency ancestry must justify actor sequence, operation
+    counters and object references. Counters may have gaps but cannot overlap
+    causal history or exceed the upstream graph's 32-bit counter storage.
+- **Membership:** 4,096 unresolved operations in total, 256 per author. These
+  caps never block a ready operation, and ops are sent in causal order, so a
+  new member receives a long history in one exchange.
+- **Message requests:**
+  - Contacts are always admitted and don't count toward the caps.
+  - A stranger can have at most 32 pending requests.
+  - When strangers fill all 256 slots, the oldest request from the inviter
+    with the most pending is declined, so a flood displaces its own requests
+    first.
 
 ## Encryption and compression
 
