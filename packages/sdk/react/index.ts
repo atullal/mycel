@@ -25,6 +25,7 @@ import type {
   MycelEvent,
   NearbyPeer,
   NetworkStatus,
+  Notice,
   PeerId,
   Profile,
 } from "../src/types.ts";
@@ -164,6 +165,15 @@ export function useNetwork() {
     (e) => e.type === "networkChanged" || e.type === "nearbyChanged" || e.type === "contactsChanged",
   );
   return { ...q, status: q.data as NetworkStatus | undefined };
+}
+
+/**
+ * Problems to tell the user about (`Notice`). Fetched on mount, since some
+ * exist only from startup, and again whenever the runtime says they changed.
+ */
+export function useNotices() {
+  const q = useMycelQuery((c) => c.notices.list(), [], (e) => e.type === "noticesChanged");
+  return { ...q, notices: (q.data ?? []) as Notice[] };
 }
 
 // ---------------------------------------------------------------------------

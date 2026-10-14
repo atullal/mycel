@@ -17,6 +17,7 @@ import type {
   NearbyPeer,
   NetworkMode,
   NetworkStatus,
+  Notice,
   PeerId,
   Profile,
 } from "./types.ts";
@@ -87,6 +88,14 @@ export interface Mycel {
     setMode(mode: NetworkMode): Promise<NetworkStatus>;
     /** `restart_app` (native host only; check `transport.kind === "tauri"`). */
     restart(): Promise<null>;
+  };
+
+  notices: {
+    /**
+     * `list_notices`: problems to tell the user about. Some exist only from
+     * startup, so fetch once when the UI starts and again on `noticesChanged`.
+     */
+    list(): Promise<Notice[]>;
   };
 
   chat: {
@@ -244,6 +253,9 @@ export function createMycel(transport: Transport): Mycel {
       status: () => call("network_status", none),
       setMode: (mode) => call("set_network_mode", { mode }),
       restart: () => call("restart_app", none),
+    },
+    notices: {
+      list: () => call("list_notices", none),
     },
     chat: {
       list: () => call("list_conversations", none),
