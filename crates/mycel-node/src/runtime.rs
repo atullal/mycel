@@ -329,22 +329,21 @@ fn remember_notices(store: &DbStore, new: Vec<Notice>) -> Vec<Notice> {
     };
     let before = all.clone();
     for notice in new {
-        if let Notice::RecordsSetAside { count } = notice {
-            if let Some(Notice::RecordsSetAside { count: total }) =
+        if let Notice::RecordsSetAside { count } = notice
+            && let Some(Notice::RecordsSetAside { count: total }) =
                 all.iter_mut().find(|n| matches!(n, Notice::RecordsSetAside { .. }))
-            {
-                *total += count;
-                continue;
-            }
+        {
+            *total += count;
+            continue;
         }
         if !all.contains(&notice) {
             all.push(notice);
         }
     }
-    if all != before {
-        if let Err(e) = store_notices(store, &all) {
-            eprintln!("mycel: couldn't save notices: {e:#}");
-        }
+    if all != before
+        && let Err(e) = store_notices(store, &all)
+    {
+        eprintln!("mycel: couldn't save notices: {e:#}");
     }
     all
 }
