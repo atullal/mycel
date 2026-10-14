@@ -240,6 +240,12 @@ pub trait Link: Send + Sync + 'static {
 /// sized for 100 Mbit/s at 100 ms) so one stream can fill several aggregated
 /// paths even when a loaded radio queue adds a few hundred ms of RTT. The
 /// connection-wide window caps what a peer can make us buffer.
+///
+/// The stream limits are how a peer is told to slow down: QUIC grants it
+/// a new stream only as one of its open ones ends, so an exchange beyond
+/// the limit waits on the peer's side for its turn instead of being
+/// refused. Each connection (one per peer) has its own, so one peer's
+/// streams never use up another's.
 pub fn transport_config() -> iroh::endpoint::QuicTransportConfig {
     iroh::endpoint::QuicTransportConfig::builder()
         .default_path_keep_alive_interval(Duration::from_millis(1500))
@@ -247,13 +253,23 @@ pub fn transport_config() -> iroh::endpoint::QuicTransportConfig {
         .stream_receive_window(STREAM_WINDOW.into())
         .receive_window(CONN_WINDOW.into())
         .send_window(u64::from(CONN_WINDOW))
+        .max_concurrent_bidi_streams(STREAMS_BIDI.into())
+        .max_concurrent_uni_streams(STREAMS_UNI.into())
         .build()
 }
 
 /// Per-stream receive window: 8 MiB (≈ 40 MB/s at 200 ms RTT).
-const STREAM_WINDOW: u32 = 8 * 1024 * 1024;
+pub(crate) const STREAM_WINDOW: u32 = 8 * 1024 * 1024;
 /// Whole-connection receive / send window.
 const CONN_WINDOW: u32 = 32 * 1024 * 1024;
+/// Bi-streams a peer may have open on one connection at once: syncs (up
+/// to 16 at a time), blob pieces (two per file it downloads from us) and
+/// pushes, cards; DTN bundles on a mesh hop connection.
+const STREAMS_BIDI: u32 = 64;
+/// Uni-streams: ephemeral messages (presence, cursors, game state), DTN
+/// summaries, and in calls one per video frame.
+const STREAMS_UNI: u32 = 128;
+
 
 /// Paths are ranked by the time a typical exchange of this many bytes takes
 /// on them: RTT + size / throughput. Big enough that throughput matters (the

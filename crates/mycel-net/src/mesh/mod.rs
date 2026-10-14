@@ -48,7 +48,7 @@ pub mod directory;
 pub mod dtn;
 pub mod wire;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -284,6 +284,30 @@ struct Driver {
     carrier: Option<Mutex<dtn::Carrier>>,
     /// Where bundles for us go (the node ingests them).
     bundle_sink: Mutex<Option<mpsc::UnboundedSender<(SignPk, Bytes)>>>,
+    /// Bundles being handed to each neighbour now ([`SENDS_PER_NEIGHBOUR`]).
+    sending: Mutex<HashMap<SignPk, HashSet<Hash32>>>,
+    /// One of them ended: plan the next without waiting for the tick.
+    dtn_due: AtomicBool,
+}
+
+/// A bundle being handed to a neighbour; ending lets the next one start.
+struct SendSlot {
+    d: Arc<Driver>,
+    to: SignPk,
+    id: Hash32,
+}
+
+impl Drop for SendSlot {
+    fn drop(&mut self) {
+        let mut sending = self.d.sending.lock();
+        if let Some(ids) = sending.get_mut(&self.to) {
+            ids.remove(&self.id);
+            if ids.is_empty() {
+                sending.remove(&self.to);
+            }
+        }
+        self.d.dtn_due.store(true, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for Driver {
@@ -762,28 +786,23 @@ impl Driver {
     // ───────────── store and forward ─────────────
 
     /// Streams a neighbour opens on the hop connection: summaries and
-    /// bundles (datagrams carry routing and packets).
+    /// bundles (datagrams carry routing and packets). QUIC's stream limits
+    /// make a neighbour with too many open wait for its turn.
     async fn serve_streams(self: Arc<Self>, peer: SignPk, conn: Connection) {
-        let admission = crate::resources::Admission::new();
+        let frames = crate::resources::connection_frames();
         loop {
             tokio::select! {
                 bi = conn.accept_bi() => {
                     let Ok((tx, rx)) = bi else { break };
-                    let Some(permit) = admission.try_acquire() else { drop((tx, rx)); continue };
                     let me = self.clone();
-                    let frames = admission.frames();
-                    tokio::spawn(crate::resources::with_frames(frames, async move {
-                        let _permit = permit;
+                    tokio::spawn(crate::resources::with_frames(frames.clone(), async move {
                         let _ = me.on_bundle_stream(peer, tx, rx).await;
                     }));
                 }
                 uni = conn.accept_uni() => {
                     let Ok(rx) = uni else { break };
-                    let Some(permit) = admission.try_acquire() else { drop(rx); continue };
                     let me = self.clone();
-                    let frames = admission.frames();
-                    tokio::spawn(crate::resources::with_frames(frames, async move {
-                        let _permit = permit;
+                    tokio::spawn(crate::resources::with_frames(frames.clone(), async move {
                         let _ = me.on_summary_stream(peer, rx).await;
                     }));
                 }
@@ -965,7 +984,21 @@ impl Driver {
             }
             plan
         };
+        // (deliveries first: the plan is in order of importance)
         for t in plan {
+            let slot = {
+                let mut sending = self.sending.lock();
+                let ids = sending.entry(t.to).or_default();
+                if ids.contains(&t.id) {
+                    continue; // still on its way there (a slow link)
+                }
+                (ids.len() < SENDS_PER_NEIGHBOUR && ids.insert(t.id)).then(|| SendSlot { d: self.clone(), to: t.to, id: t.id })
+            };
+            let Some(slot) = slot else {
+                // its turn comes when one of those ends
+                c.lock().transferred(t.to, t.id, t.copies, false, now);
+                continue;
+            };
             let Some(b) = c.lock().bundle(&t.id).cloned() else { continue };
             let Some(conn) = self.conn(&t.to) else {
                 c.lock().transferred(t.to, t.id, t.copies, false, now);
@@ -973,6 +1006,7 @@ impl Driver {
             };
             let me = self.clone();
             self.keep(tokio::spawn(async move {
+                let _slot = slot;
                 let sent = send_bundle(&conn, &b, t.copies).await.unwrap_or(Sent::Failed);
                 if let Some(c) = &me.carrier {
                     let mut c = c.lock();
@@ -1035,6 +1069,7 @@ async fn run(d: Arc<Driver>) {
     let tick = Duration::from_millis(20);
     let mut next_slow = Instant::now();
     let mut next_dtn = Instant::now();
+    let mut last_dtn = Instant::now();
     loop {
         tokio::time::sleep(tick).await;
         if d.stopped.load(Ordering::Relaxed) {
@@ -1063,8 +1098,11 @@ async fn run(d: Arc<Driver>) {
             d.dial_missing();
             d.measure();
         }
-        if Instant::now() >= next_dtn {
-            next_dtn = Instant::now() + DTN_EVERY;
+        let soon = d.dtn_due.load(Ordering::Relaxed) && last_dtn.elapsed() >= DTN_SOON;
+        if soon || Instant::now() >= next_dtn {
+            d.dtn_due.store(false, Ordering::Relaxed);
+            last_dtn = Instant::now();
+            next_dtn = last_dtn + DTN_EVERY;
             d.dtn_tick();
         }
     }
@@ -1121,6 +1159,8 @@ impl Mesh {
             records_published: Default::default(),
             carrier,
             bundle_sink: Mutex::default(),
+            sending: Mutex::default(),
+            dtn_due: AtomicBool::new(false),
         });
         Mesh { d }
     }
@@ -1317,6 +1357,13 @@ const K_OFFER: u8 = 3;
 const MAX_SUMMARY: usize = 256 * 1024;
 const MAX_OFFER: usize = 1024;
 const DTN_EVERY: Duration = Duration::from_secs(1);
+/// ... or this soon after a transfer ended, to start the next one.
+const DTN_SOON: Duration = Duration::from_millis(100);
+/// Bundles handed to one neighbour at once. More would only share its link:
+/// over a slow radio, bundles sent a few at a time get through whole before
+/// the contact ends, where all at once each would get a part. (QUIC's stream
+/// limit would only make the rest wait, unplanned work for nobody.)
+const SENDS_PER_NEIGHBOUR: usize = 8;
 
 /// A bundle offered before its payload.
 #[derive(Serialize, Deserialize)]

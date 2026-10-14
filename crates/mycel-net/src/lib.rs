@@ -611,29 +611,25 @@ impl ProtocolHandler for Handler {
 
 /// Serve every stream a peer opens on one connection, for as long as it
 /// lives: each stream is one exchange, handled concurrently with the others.
+/// How many it may have open at once is QUIC's per-connection stream limit
+/// (`link::transport_config`): beyond it the peer waits for its turn.
 async fn serve_conn(inner: &Arc<Inner>, conn: Connection) {
     inner.accepted.fetch_add(1, Ordering::Relaxed);
     let peer = to_sign_pk(&conn.remote_id());
-    let admission = resources::Admission::new();
+    let frames = resources::connection_frames();
     loop {
         tokio::select! {
             bi = conn.accept_bi() => {
                 let Ok((tx, rx)) = bi else { break };
-                let Some(permit) = admission.try_acquire() else { drop((tx, rx)); continue };
                 let (inner, conn) = (inner.clone(), conn.clone());
-                let frames = admission.frames();
-                tokio::spawn(resources::with_frames(frames, async move {
-                    let _permit = permit;
+                tokio::spawn(resources::with_frames(frames.clone(), async move {
                     let _ = serve_bi(&inner, &conn, peer, tx, rx).await;
                 }));
             }
             uni = conn.accept_uni() => {
                 let Ok(rx) = uni else { break };
-                let Some(permit) = admission.try_acquire() else { drop(rx); continue };
                 let inner = inner.clone();
-                let frames = admission.frames();
-                tokio::spawn(resources::with_frames(frames, async move {
-                    let _permit = permit;
+                tokio::spawn(resources::with_frames(frames.clone(), async move {
                     let _ = serve_uni(&inner, peer, rx).await;
                 }));
             }
@@ -848,9 +844,10 @@ macro_rules! on_conn {
 }
 pub(crate) use on_conn;
 
-/// Open a bi-stream of `kind` (labelled and prioritised).
+/// Open a bi-stream of `kind` (labelled and prioritised). Waits while the
+/// peer already has as many of our streams open as it allows.
 pub(crate) async fn open_bi(conn: &Connection, kind: StreamKind) -> Result<(SendStream, RecvStream)> {
-    let (mut tx, rx) = conn.open_bi().await?;
+    let (mut tx, rx) = resources::within(resources::REPLY_TIMEOUT, "no stream", conn.open_bi()).await?;
     tx.set_priority(kind.priority()).ok();
     tx.write_all(&[kind as u8]).await?;
     Ok((tx, rx))
@@ -1477,7 +1474,7 @@ impl Node {
             let msg = msg.clone();
             tokio::spawn(async move {
                 let _ = on_conn!(&inner, &pk, |conn| async {
-                    let mut tx = conn.open_uni().await?;
+                    let mut tx = resources::within(resources::REPLY_TIMEOUT, "no stream", conn.open_uni()).await?;
                     tx.set_priority(StreamKind::Ephemeral.priority()).ok();
                     tx.write_all(&[StreamKind::Ephemeral as u8]).await?;
                     send(&mut tx, &*msg).await?;
