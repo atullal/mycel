@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
+use rayon::prelude::*;
 use mycel_sim::report::{Status, markdown};
 use mycel_sim::scenarios::{self, Candidate, Opts};
 
@@ -95,19 +96,25 @@ fn main() -> anyhow::Result<()> {
         c => anyhow::bail!("unknown candidate {c}"),
     };
     let opts = Opts { seed: a.seed, scale: a.scale, candidate };
-    let mut results = Vec::new();
-    for s in pick {
+    let one = |s: &scenarios::Scenario| {
         eprintln!("▶ {} (tier {}): {}", s.name, s.tier, s.title);
         let t = Instant::now();
         let mut r = (s.run)(opts);
         r.wall_s = t.elapsed().as_secs_f64();
         r.finish();
-        eprintln!("  {:?} in {:.1} s — {}", r.status, r.wall_s, r.headline.join("; "));
+        eprintln!("  {}: {:?} in {:.1} s — {}", s.name, r.status, r.wall_s, r.headline.join("; "));
         for f in r.failed_slos() {
-            eprintln!("    ✗ {}: {} (target {})", f.name, f.actual, f.target);
+            eprintln!("    ✗ {}: {}: {} (target {})", s.name, f.name, f.actual, f.target);
         }
-        results.push(r);
-    }
+        r
+    };
+    // Tier 2 runs in virtual time, so its scenarios (and the runs inside them)
+    // share the cores. Tier 1 measures the wall clock: one scenario at a time,
+    // after tier 2.
+    let tier2: Vec<_> = pick.par_iter().filter(|s| s.tier == 2).map(|s| one(s)).collect();
+    let tier1 = pick.iter().filter(|s| s.tier != 2).map(|s| one(s));
+    let mut results: Vec<_> = tier2.into_iter().chain(tier1).collect();
+    results.sort_by_key(|r| pick.iter().position(|s| s.name == r.name).unwrap_or(usize::MAX));
     std::fs::create_dir_all(&a.out)?;
     std::fs::write(a.out.join("report.md"), markdown(&results))?;
     std::fs::write(a.out.join("results.json"), serde_json::to_string_pretty(&results)?)?;

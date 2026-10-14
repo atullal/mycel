@@ -10,6 +10,7 @@
 //! plan: the optimality ratio.
 
 use crate::stats::Map;
+use rayon::prelude::*;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -434,13 +435,9 @@ fn headline(r: &mut ScenarioResult, m: &T2Metrics) {
 /// Run the candidate and the references; report them all.
 fn compare(r: &mut ScenarioResult, o: &Opts, w: &World, plan: &Plan, until: Time, sample: Option<usize>, refs: &[Model]) -> (Run, Vec<Run>) {
     let cand_model = Model::of(o.candidate);
-    let cand = run(cand_model, w, plan, o.seed, until, sample);
-    let mut others = Vec::new();
-    for m in refs {
-        if *m != cand_model {
-            others.push(run(*m, w, plan, o.seed, until, sample));
-        }
-    }
+    let models: Vec<Model> = std::iter::once(cand_model).chain(refs.iter().copied().filter(|m| *m != cand_model)).collect();
+    let mut others: Vec<Run> = models.par_iter().map(|m| run(*m, w, plan, o.seed, until, sample)).collect();
+    let cand = others.remove(0);
     headline(r, &cand.m);
     r.note(row(&cand.m));
     if !cand.extra.is_null() {
@@ -827,20 +824,25 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
         ("now, fisheye off", GCfg { fisheye: false, ..now }),
         ("before (every 2 s, full scope of 8 hops every 4th, reduction on)", GCfg::before()),
     ];
-    let mut rows = Vec::new();
-    let mut cand_worst = 0.0f64;
-    let mut cand_cov = 1.0f64;
-    let mut main_worst = 0.0f64;
-    for &n in &sizes {
-        // Bluetooth-only phones, one per 900 m² outdoors: ~12 neighbours each
-        let mut w = mesh_world(n, o.seed, 900.0);
-        for s in w.specs.iter_mut() {
-            s.radios = Techs::of(&[Tech::Ble]);
-        }
-        let mut line = format!("N={n}:");
-        for (label, g) in variants {
-            // steady state: after one full fisheye cycle (cold start is
-            // reported apart), over the next cycle (at least 32 s)
+    // Bluetooth-only phones, one per 900 m² outdoors: ~12 neighbours each
+    let worlds: Vec<_> = sizes
+        .iter()
+        .map(|&n| {
+            let mut w = mesh_world(n, o.seed, 900.0);
+            for s in w.specs.iter_mut() {
+                s.radios = Techs::of(&[Tech::Ble]);
+            }
+            w
+        })
+        .collect();
+    // steady state: after one full fisheye cycle (cold start is reported
+    // apart), over the next cycle (at least 32 s). Every (size, variant) run is
+    // independent, so they all run at once: (steady, cold, coverage, wall).
+    let jobs: Vec<(usize, usize)> = (0..sizes.len()).flat_map(|i| (0..variants.len()).map(move |v| (i, v))).collect();
+    let runs: Vec<(f64, f64, f64, f64)> = jobs
+        .par_iter()
+        .map(|&(i, v)| {
+            let (n, w, g) = (sizes[i], &worlds[i], variants[v].1);
             let cycle = g.announce_every_ms * if g.fisheye { g.far_every.max(1) } else { 1 } * MS;
             let warm = cycle.max(10 * SEC);
             let window = cycle.max(32 * SEC);
@@ -858,7 +860,27 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
             let mut rng = Rng::new(o.seed);
             let pairs = pairs_within(&sim, n, 8, 200, &mut rng, None);
             let ok = pairs.iter().filter(|(a, b, _)| matches!(walk(&sim, *a, *b, 16), Walk::Reached(_))).count();
-            let cov = ok as f64 / pairs.len().max(1) as f64;
+            (steady, cold, ok as f64 / pairs.len().max(1) as f64, wall)
+        })
+        .collect();
+    let mains: Vec<f64> = worlds
+        .par_iter()
+        .map(|w| {
+            let cfg = Rc::new(Cfg::main());
+            let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Mycel::new(i, cfg.clone(), Role::Honest));
+            sim.start();
+            sim.run(40 * SEC);
+            metrics(&sim, "main", 0.0, None).ctrl_bytes_per_node_s
+        })
+        .collect();
+    let mut rows = Vec::new();
+    let mut cand_worst = 0.0f64;
+    let mut cand_cov = 1.0f64;
+    let mut main_worst = 0.0f64;
+    for (i, &n) in sizes.iter().enumerate() {
+        let mut line = format!("N={n}:");
+        for (v, (label, g)) in variants.into_iter().enumerate() {
+            let (steady, cold, cov, wall) = runs[i * variants.len() + v];
             let share = steady / ble;
             if label == "now" {
                 cand_worst = cand_worst.max(share);
@@ -873,15 +895,10 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
             ));
             rows.push(json!({"n": n, "variant": label, "every_ms": g.announce_every_ms, "far_every": g.far_every, "fisheye": g.fisheye, "flood_reduction": g.flood_reduction, "ctrl_bytes_per_node_s": steady, "first_cycle_bytes_per_node_s": cold, "ble_share": share, "coverage": cov, "wall_s": wall}));
         }
-        let cfg = Rc::new(Cfg::main());
-        let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Mycel::new(i, cfg.clone(), Role::Honest));
-        sim.start();
-        sim.run(40 * SEC);
-        let m = metrics(&sim, "main", 0.0, None);
-        let share = m.ctrl_bytes_per_node_s / ble;
+        let share = mains[i] / ble;
         main_worst = main_worst.max(share);
-        line.push_str(&format!(" [main: {} B/s ({:.1}% of BLE)]", fmt(m.ctrl_bytes_per_node_s), 100.0 * share));
-        rows.push(json!({"n": n, "model": "main", "ctrl_bytes_per_node_s": m.ctrl_bytes_per_node_s, "ble_share": share}));
+        line.push_str(&format!(" [main: {} B/s ({:.1}% of BLE)]", fmt(mains[i]), 100.0 * share));
+        rows.push(json!({"n": n, "model": "main", "ctrl_bytes_per_node_s": mains[i], "ble_share": share}));
         r.note(line);
     }
     let worst = if o.candidate == Candidate::Main { main_worst } else { cand_worst };
@@ -937,9 +954,8 @@ fn partial_route(o: Opts) -> ScenarioResult {
             plan.sends.push((60 * SEC + k as Time * 2 * SEC, 0, e, 2000, false));
         }
         let until = t3 + 120 * SEC;
-        let cand = run(Model::of(o.candidate), &w, &plan, o.seed, until, None);
-        let stand = run(Model::StandIn, &w, &plan, o.seed, until, None);
-        let holds = run(Model::SenderHolds, &w, &plan, o.seed, until, None);
+        let mut runs: Vec<Run> = [Model::of(o.candidate), Model::StandIn, Model::SenderHolds].par_iter().map(|m| run(*m, &w, &plan, o.seed, until, None)).collect();
+        let (holds, stand, cand) = (runs.pop().unwrap(), runs.pop().unwrap(), runs.pop().unwrap());
         r.at_least(&format!("gap {gap} m: delivery"), 100.0 * cand.m.delivery_ratio, 99.0, "%");
         r.at_most(&format!("gap {gap} m: optimality p95"), inf_if_none(&cand.m, cand.m.optimality.p95), 2.0, "×");
         r.headline(format!(
@@ -1021,19 +1037,24 @@ fn disaster_dtn(o: Opts) -> ScenarioResult {
     let (w, pairs) = disaster_world(&o);
     let plan = plan_for(&pairs);
     let until = 3 * HOUR;
-    let (cand, others) = compare(&mut r, &o, &w, &plan, until, None, &[Model::Main, Model::StandIn, Model::Prophet, Model::Spray(8), Model::Epidemic, Model::Flood(7)]);
+    // One run swings by tens of points with timing alone (seed to seed, or a
+    // few bytes more per summary: docs/SIMULATION.md §4, open 12), so the full
+    // scenario is judged on the mean of 12 seeds (worlds and runs), the given
+    // seed first.
+    let more_seeds = |k: u64| {
+        let ok = Opts { seed: o.seed + k, ..o };
+        let (w, pairs) = disaster_world(&ok);
+        100.0 * run(Model::of(o.candidate), &w, &plan_for(&pairs), ok.seed, until, None).m.delivery_ratio
+    };
+    let full = o.scale >= 1.0;
+    let ((cand, others), more) = rayon::join(
+        || compare(&mut r, &o, &w, &plan, until, None, &[Model::Main, Model::StandIn, Model::Prophet, Model::Spray(8), Model::Epidemic, Model::Flood(7)]),
+        || if full { (1..DISASTER_SEEDS).into_par_iter().map(more_seeds).collect() } else { Vec::new() },
+    );
     let epi = others.iter().find(|x| x.m.model == "epidemic").map(|x| x.m.clone()).unwrap_or_default();
-    if o.scale >= 1.0 {
-        // One run swings by tens of points with timing alone (seed to seed,
-        // or a few bytes more per summary: docs/SIMULATION.md §4, open 12),
-        // so the full scenario is judged on the mean of 12 seeds (worlds and
-        // runs), the given seed first.
+    if full {
         let mut per_seed = vec![100.0 * cand.m.delivery_ratio];
-        for k in 1..DISASTER_SEEDS {
-            let ok = Opts { seed: o.seed + k, ..o };
-            let (w, pairs) = disaster_world(&ok);
-            per_seed.push(100.0 * run(Model::of(o.candidate), &w, &plan_for(&pairs), ok.seed, until, None).m.delivery_ratio);
-        }
+        per_seed.extend(more);
         let mean = per_seed.iter().sum::<f64>() / per_seed.len() as f64;
         let (lo, hi) = per_seed.iter().fold((f64::INFINITY, 0.0f64), |(l, h), x| (l.min(*x), h.max(*x)));
         r.at_least(&format!("delivery within 3 h (of feasible), mean of seeds {}–{}", o.seed, o.seed + DISASTER_SEEDS - 1), mean, 80.0, "%");
@@ -1224,12 +1245,18 @@ fn adversarial(o: Opts) -> ScenarioResult {
         }
     }
     let until = 30 * SEC + plan.sends.len() as Time * 300 * MS + 90 * SEC;
-    let clean = run(Model::of(o.candidate), &w, &plan, o.seed, until, None);
     let attacked = Plan { roles: roles.clone(), ..plan.clone() };
-    let (cand, _) = compare(&mut r, &o, &w, &attacked, until, None, &[Model::Main, Model::StandIn]);
     let sybil = rng.below(n) as NodeId;
     let sybil_plan = Plan { poison: Some(sybil), roles: [(sybil, Role::BlackHole)].into_iter().collect(), ..plan.clone() };
-    let syb = run(Model::of(o.candidate), &w, &sybil_plan, o.seed, until, None);
+    let (clean, ((cand, _), syb)) = rayon::join(
+        || run(Model::of(o.candidate), &w, &plan, o.seed, until, None),
+        || {
+            rayon::join(
+                || compare(&mut r, &o, &w, &attacked, until, None, &[Model::Main, Model::StandIn]),
+                || run(Model::of(o.candidate), &w, &sybil_plan, o.seed, until, None),
+            )
+        },
+    );
     let num = |k1: &str, k2: &str| cand.extra.get(k1).or(cand.extra.get(k2)).and_then(|v| v.as_u64()).unwrap_or(0);
     let limited = num("announcements_limited", "ogm_limited");
     let stale = num("announcements_stale", "ogm_stale");
@@ -1326,8 +1353,8 @@ fn trace_replay(o: Opts) -> ScenarioResult {
     let until = trace.duration;
     let models = [Model::Global(GCfg::default()), Model::Epidemic, Model::Prophet, Model::Spray(6), Model::Flood(7)];
     let mut rows = Vec::new();
-    for m in models {
-        let x = run(m, &w, &plan, o.seed, until, Some(400));
+    let runs: Vec<Run> = models.par_iter().map(|m| run(*m, &w, &plan, o.seed, until, Some(400))).collect();
+    for (m, x) in models.into_iter().zip(runs) {
         // The ONE's relayed counts every transfer, the final one to the
         // destination included, so its (relayed − delivered)/delivered is
         // carrier-to-carrier hand-offs per delivered message
