@@ -17,7 +17,9 @@ const LEGACY_SEED_TEMP: &str = "identity.tmp";
 /// What Mycel keeps in a profile folder. Any of these means the profile is
 /// established, so a missing identity must never be silently replaced.
 /// Nothing else counts: platform files (Android's `cache/`, `code_cache/`,
-/// `files/`, WebView data), the host's `mycel.log` and set-aside profiles.
+/// `files/`, WebView data), the host's `mycel.log`/`mycel.log.1` and
+/// `link-diagnostics` switch (both may exist before the profile is opened),
+/// and set-aside profiles.
 /// (On Android the profile folder is the app's data root, so the attachment
 /// folder `files/` is also the platform's own and proves nothing.)
 const PROFILE_STATE: &[&str] = &[
@@ -931,9 +933,12 @@ mod tests {
         for platform in ["cache", "code_cache", "files", "app_webview", "shared_prefs"] {
             fs::create_dir(dir.0.join(platform)).unwrap();
         }
+        // The host logs and reads its diagnostics switch before opening.
         fs::write(dir.0.join("mycel.log"), b"early log").unwrap();
         fs::write(dir.0.join("mycel.log.1"), b"older log").unwrap();
+        fs::write(dir.0.join("link-diagnostics"), b"2").unwrap();
         let lease = ProfileLock::acquire(&dir.0).unwrap();
+        assert!(DiskProfile(&dir.0).is_pristine().unwrap());
         let pk = load(&dir.0, &lease).unwrap().sign_pk();
         assert_eq!(load(&dir.0, &lease).unwrap().sign_pk(), pk);
         // Mycel's own state still protects a profile whose identity is gone.
