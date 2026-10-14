@@ -462,8 +462,14 @@ pub(crate) async fn serve(inner: &Arc<Inner>, peer: SignPk, mut tx: SendStream, 
         (BlobReq::Get { .. }, Some(path)) => serve_get(inner, &mut tx, &path, None).await,
         (BlobReq::GetFrom { offset, .. }, Some(path)) => serve_get(inner, &mut tx, &path, Some(offset)).await,
         (BlobReq::GetRange { offset, len, .. }, Some(path)) => serve_range(inner, &mut tx, &path, offset, len).await,
-        (BlobReq::Put { len, .. }, Some(path)) => serve_put(inner, &mut tx, &mut rx, &path, hash, len, false, keeper).await,
-        (BlobReq::Offer { len, .. }, Some(path)) => serve_put(inner, &mut tx, &mut rx, &path, hash, len, true, keeper).await,
+        (BlobReq::Put { len, .. }, Some(path)) => {
+            let push = IncomingPush { hash, len, handshake: false, keeper };
+            serve_put(inner, &mut tx, &mut rx, &path, push).await
+        }
+        (BlobReq::Offer { len, .. }, Some(path)) => {
+            let push = IncomingPush { hash, len, handshake: true, keeper };
+            serve_put(inner, &mut tx, &mut rx, &path, push).await
+        }
     };
     tx.finish().ok();
     res
@@ -514,16 +520,18 @@ async fn serve_range(inner: &Arc<Inner>, tx: &mut SendStream, path: &Path, offse
     send_from(tx, path, start, end, &count_served(inner, start)).await
 }
 
-async fn serve_put(
-    inner: &Arc<Inner>,
-    tx: &mut SendStream,
-    rx: &mut RecvStream,
-    path: &Path,
+/// A blob a member pushes to us.
+struct IncomingPush {
     hash: Hash32,
     len: u64,
+    /// `Offer` (we answer before the bytes come), not the legacy `Put`.
     handshake: bool,
+    /// We are a keeper of the space: we keep partial pushes to resume.
     keeper: bool,
-) -> Result<()> {
+}
+
+async fn serve_put(inner: &Arc<Inner>, tx: &mut SendStream, rx: &mut RecvStream, path: &Path, push: IncomingPush) -> Result<()> {
+    let IncomingPush { hash, len, handshake, keeper } = push;
     if path.exists() {
         return send(tx, &BlobResp::Stored).await;
     }
