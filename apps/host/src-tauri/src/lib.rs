@@ -14,6 +14,11 @@
 //!   `local`. Without it, the mode chosen in the Network panel is used.
 //! - `MYCEL_LINKS`: which non-IP links to run (`all`, `none`, `awdl`, `ble`).
 //! - `MYCEL_NAME`: display name to use when creating a new profile.
+//! - `MYCEL_BLE_LOG`: Bluetooth link diagnostics on stderr / `mycel.log`
+//!   (1, or 2 for every state change). Off by default in release builds,
+//!   level 1 in debug builds that log to a file. Where there are no
+//!   environment variables (a phone), a `link-diagnostics` file in the data
+//!   folder holding the level turns them on (see `link_diagnostics`).
 
 mod commands;
 mod notify;
@@ -155,15 +160,23 @@ fn allow_attachment_files(app: &tauri::App, data_dir: &std::path::Path) -> Resul
 /// Opened from Finder or the Start menu, or on a phone, there's no terminal,
 /// so stderr (where the runtime and the peer-to-peer Wi-Fi / Bluetooth links
 /// log) goes nowhere. Send it to `<data dir>/mycel.log` instead (the previous
-/// run is kept as `mycel.log.1`).
+/// run is kept as `mycel.log.1`). Called before the runtime opens, so
+/// profile, storage and migration messages are in it too.
+///
+/// The log is private: created owner-only, never through a symlink (a fresh
+/// file after rotation, and the previous one is narrowed to owner-only too).
+/// Another copy of Mycel started on the same data folder stops at the
+/// profile lease, but only after this: it leaves a log that's in use alone
+/// instead of rotating it away (`log_in_use`).
 fn log_to_file(data_dir: &std::path::Path) {
     use std::io::IsTerminal;
     if std::io::stderr().is_terminal() {
         return;
     }
     let path = data_dir.join("mycel.log");
-    // Opening a fresh file after rotation avoids following a planted symlink.
-    // Device/link diagnostics remain opt-in through MYCEL_BLE_LOG.
+    if log_in_use(&path) {
+        return;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -185,7 +198,83 @@ fn log_to_file(data_dir: &std::path::Path) {
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     if let Ok(file) = options.open(&path) {
+        // Advisory and held as long as stderr points at the file (the lock
+        // belongs to the open file, which dup2 shares): marks the log in use.
+        #[cfg(unix)]
+        let _ = file.try_lock();
         redirect_stderr(file);
+        link_diagnostics(data_dir);
+    }
+}
+
+/// Is another running copy of Mycel writing this log?
+fn log_in_use(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // That copy holds an advisory lock on it (log_to_file). Ours is
+        // released when `file` closes, before the rotation.
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+        else {
+            return false;
+        };
+        file.metadata().is_ok_and(|m| m.is_file()) && matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // That copy keeps the file open for good (it's its stderr), so an
+        // exclusive open fails. (No lock: Windows locks are mandatory and
+        // would stop anyone reading the log while Mycel runs.)
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        matches!(
+            std::fs::OpenOptions::new().read(true).share_mode(0).open(path),
+            Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION)
+        )
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Bluetooth and peer-to-peer Wi-Fi link diagnostics in the log. They name
+/// nearby devices and when they came and went, so a release build leaves
+/// them off unless asked: `MYCEL_BLE_LOG` (Android: the `debug.mycel.ble_log`
+/// property), or, where a developer can't set either (an iPhone), a file
+/// named `link-diagnostics` in the data folder holding the level, 1 or 2
+/// (`xcrun devicectl device copy to --domain-type appDataContainer ...` on a
+/// development-signed build). Debug builds turn level 1 on by themselves.
+fn link_diagnostics(data_dir: &std::path::Path) {
+    if std::env::var_os("MYCEL_BLE_LOG").is_some() {
+        return;
+    }
+    let level = diagnostics_level(&data_dir.join("link-diagnostics"))
+        .or(cfg!(debug_assertions).then_some(1));
+    if let Some(level) = level {
+        eprintln!("mycel-host: link diagnostics on (level {level})");
+        // SAFETY: during startup, before the runtime (and its link threads)
+        // starts and reads the environment.
+        unsafe { std::env::set_var("MYCEL_BLE_LOG", level.to_string()) };
+    }
+}
+
+/// The level in a `link-diagnostics` file: 1 when it's empty, nothing when
+/// it's missing, not a regular file, or says something else.
+fn diagnostics_level(path: &std::path::Path) -> Option<u8> {
+    use std::io::Read;
+    if !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file()) {
+        return None;
+    }
+    let mut text = String::new();
+    std::fs::File::open(path).ok()?.take(16).read_to_string(&mut text).ok()?;
+    match text.trim() {
+        "" => Some(1),
+        level => level.parse().ok().filter(|l| (1..=2).contains(l)),
     }
 }
 
@@ -255,6 +344,52 @@ mod logging_tests {
         let mut failed = None;
         assert!(retain_pipe_writer(&mut failed, -1).is_err());
         assert!(failed.is_none());
+    }
+
+    /// A fresh directory under the system temp dir, removed on drop.
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("mycel-host-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_log_another_copy_is_writing_is_in_use_until_it_closes() {
+        let dir = TempDir::new("log-in-use");
+        let log = dir.0.join("mycel.log");
+        assert!(!super::log_in_use(&log), "no log yet");
+        let writer = std::fs::File::create(&log).unwrap();
+        assert!(!super::log_in_use(&log), "an unlocked log is a leftover from a previous run");
+        writer.try_lock().unwrap();
+        assert!(super::log_in_use(&log));
+        assert!(super::log_in_use(&log), "checking doesn't take the lock over");
+        drop(writer);
+        assert!(!super::log_in_use(&log));
+    }
+
+    #[test]
+    fn link_diagnostics_file_gives_a_level_only_when_it_says_one() {
+        let dir = TempDir::new("link-diagnostics");
+        let file = dir.0.join("link-diagnostics");
+        assert_eq!(super::diagnostics_level(&file), None);
+        for (text, level) in [("", Some(1)), ("1", Some(1)), ("2\n", Some(2)), (" 2 ", Some(2)), ("0", None), ("7", None), ("yes", None)] {
+            std::fs::write(&file, text).unwrap();
+            assert_eq!(super::diagnostics_level(&file), level, "{text:?}");
+        }
+        std::fs::remove_file(&file).unwrap();
+        let target = dir.0.join("elsewhere");
+        std::fs::write(&target, "2").unwrap();
+        std::os::unix::fs::symlink(&target, &file).unwrap();
+        assert_eq!(super::diagnostics_level(&file), None, "a symlink is ignored");
     }
 }
 
@@ -471,6 +606,7 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
     };
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
+    log_to_file(&data_dir);
     let mode = network_mode(&data_dir)?;
     let name = std::env::var("MYCEL_NAME")
         .ok()
@@ -493,8 +629,6 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
             format!("cannot open Mycel data in {}: {e:#}{hint}", data_dir.display())
         })?;
 
-    // Identity/profile validation holds the exclusive lease before log rotation.
-    log_to_file(&data_dir);
     allow_attachment_files(app, &data_dir)?;
 
     let notifier = Arc::new(notify::Notifier::new(&runtime));
