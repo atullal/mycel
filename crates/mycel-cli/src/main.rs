@@ -122,7 +122,7 @@ async fn open(dev: &DeviceArgs, keeper: bool) -> Result<Arc<Runtime>> {
     let data_dir = expand(&dev.data);
     let mode = match dev.net {
         Some(n) => n.into(),
-        None => Runtime::saved_network_mode(&data_dir)?.unwrap_or(NetworkMode::Internet),
+        None => Runtime::launch_network_mode(&data_dir, NetworkMode::Internet),
     };
     Runtime::open_with(RuntimeOptions {
         data_dir,

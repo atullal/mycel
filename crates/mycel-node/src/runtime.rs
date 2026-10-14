@@ -63,14 +63,52 @@ pub fn chat_rules_hash() -> String {
 const CONTACT_PREFIX: &str = "mycel:";
 
 /// Bound unsolicited request metadata independently of blob consent. Accepted
-/// conversations and their sync history are outside these admission limits.
+/// conversations and their sync history are outside these admission limits,
+/// and so are contacts: strangers can never lock contacts out.
 const MAX_PENDING_REQUESTS: usize = 256;
 const MAX_PENDING_PER_INVITER: usize = 32;
 
-fn may_record_request(requests: &BTreeMap<SpaceId, SignPk>, from: &SignPk, space: &SpaceId) -> bool {
-    requests.contains_key(space)
-        || (requests.len() < MAX_PENDING_REQUESTS
-            && requests.values().filter(|peer| *peer == from).count() < MAX_PENDING_PER_INVITER)
+/// What to do with an invitation before its membership is stored.
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    Admit,
+    /// Admit, declining this older stranger request to make room.
+    AdmitEvicting(SpaceId),
+    Refuse,
+}
+
+/// Contacts are always admitted. A stranger is refused only past its own
+/// limit; when strangers fill every slot, the oldest request of whoever has
+/// the most pending is declined, so a flood from throwaway keys displaces
+/// its own requests first and never refuses everyone new. `order` is this
+/// session's arrival order, oldest first; requests not in it are older.
+fn admit_request(
+    requests: &BTreeMap<SpaceId, SignPk>,
+    order: &[SpaceId],
+    is_contact: impl Fn(&SignPk) -> bool,
+    from: &SignPk,
+    space: &SpaceId,
+) -> Admission {
+    if requests.contains_key(space) || is_contact(from) {
+        return Admission::Admit;
+    }
+    let mut pending: HashMap<SignPk, usize> = HashMap::new();
+    for inviter in requests.values().filter(|p| !is_contact(p)) {
+        *pending.entry(*inviter).or_default() += 1;
+    }
+    if pending.get(from).is_some_and(|n| *n >= MAX_PENDING_PER_INVITER) {
+        return Admission::Refuse;
+    }
+    if pending.values().sum::<usize>() < MAX_PENDING_REQUESTS {
+        return Admission::Admit;
+    }
+    let most = pending.values().copied().max().unwrap_or(0);
+    let age = |s: &SpaceId| order.iter().position(|o| o == s).map_or((0, 0), |i| (1, i));
+    requests
+        .iter()
+        .filter(|(_, p)| pending.get(*p) == Some(&most) && !is_contact(p))
+        .min_by_key(|(s, _)| age(s))
+        .map_or(Admission::Refuse, |(s, _)| Admission::AdmitEvicting(*s))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -101,7 +139,7 @@ pub struct Runtime {
     store: Arc<DbStore>,
     events: broadcast::Sender<Event>,
     name: Mutex<String>,
-    contacts: Mutex<BTreeMap<SignPk, StoredContact>>,
+    contacts: Arc<Mutex<BTreeMap<SignPk, StoredContact>>>,
     mode: NetworkMode,
     /// The mode the next launch will use (`set_network_mode`).
     next_mode: Mutex<NetworkMode>,
@@ -132,6 +170,11 @@ pub struct Runtime {
     hints: Mutex<BTreeMap<SignPk, Vec<String>>>,
     /// Live voice calls (not on keepers).
     calls: CallManager,
+    /// What startup recovered from (see `notices`).
+    notices: Mutex<Vec<Notice>>,
+    /// Stranger requests declined to make room for newer ones (see
+    /// `admit_request`), still to be left.
+    evicted: Arc<Mutex<Vec<SpaceId>>>,
 }
 
 /// What calls need from the runtime: membership, names, dialing, events.
@@ -395,12 +438,32 @@ impl Runtime {
     pub async fn open_with(opts: RuntimeOptions) -> Result<Arc<Runtime>> {
         let dir = opts.data_dir;
         let profile_lock = crate::identity::ProfileLock::acquire(&dir)?;
-        let keys = Arc::new(crate::identity::load(&dir, &profile_lock)?);
+        let identity = crate::identity::load(&dir, &profile_lock)?;
+        let keys = Arc::new(identity.keys);
+        let mut notices = Vec::new();
+        if let Some(kept) = identity.replaced {
+            notices.push(Notice::IdentityReplaced { kept_in: kept.display().to_string() });
+        }
         // Validate persisted mode before opening any network transport.
-        let next_mode = Self::saved_network_mode(&dir)?.unwrap_or(opts.mode);
+        let next_mode = match Self::saved_network_mode(&dir) {
+            Ok(mode) => mode.unwrap_or(opts.mode),
+            Err(error) => {
+                // Never widen to the internet on a guess, and never refuse to
+                // start: local paths only until the user chooses again.
+                eprintln!("mycel: {error:#}; using local paths only (lan)");
+                if let Err(error) = crate::identity::atomic_write(&dir.join("network-mode"), b"lan", true) {
+                    eprintln!("mycel: couldn't repair the saved network mode: {error:#}");
+                }
+                notices.push(Notice::NetworkModeReset);
+                NetworkMode::Lan
+            }
+        };
         let store = DbStore::open(dir.join("mycel.redb"))?;
-        // Reject malformed persisted rows before spawning any transport task.
-        let stored_spaces = store.load_spaces()?;
+        // Set aside malformed persisted rows before spawning any transport task.
+        let (stored_spaces, set_aside) = store.load_spaces()?;
+        if set_aside > 0 {
+            notices.push(Notice::RecordsSetAside { count: set_aside });
+        }
 
         let stored_name = store.kv_get("name")?.and_then(|b| String::from_utf8(b).ok());
         let name = match (opts.name, stored_name) {
@@ -417,12 +480,12 @@ impl Runtime {
                 }
             }
         };
-        let contacts: BTreeMap<SignPk, StoredContact> = store
+        let contacts: Arc<Mutex<BTreeMap<SignPk, StoredContact>>> = Arc::new(Mutex::new(store
             .kv_decode::<Vec<StoredContact>>("contacts")?
             .unwrap_or_default()
             .into_iter()
             .map(|c| (c.keys.sign_pk, c))
-            .collect();
+            .collect()));
 
         let mut nopts = NodeOptions::new(net_mode(opts.mode), name.clone());
         nopts.store = Some(store.clone());
@@ -447,6 +510,9 @@ impl Runtime {
         let arriving: Arc<Mutex<HashSet<SpaceId>>> = Arc::default();
         let (blocked_for_policy, hidden_for_policy) = (blocked.clone(), hidden.clone());
         let (arriving_for_policy, requests_for_policy, request_store) = (arriving.clone(), requests.clone(), store.clone());
+        let (contacts_for_policy, evicted): (_, Arc<Mutex<Vec<SpaceId>>>) = (contacts.clone(), Arc::default());
+        let evicted_by_policy = evicted.clone();
+        let arrival_order: Mutex<Vec<SpaceId>> = Mutex::default();
         let keeper = opts.keeper;
         nopts.invite_policy = Arc::new(move |from, space| {
             // Serialize refusal checks and admission with accept/decline.
@@ -460,20 +526,42 @@ impl Runtime {
                 // Persist provisional consent *before* network membership can
                 // be persisted. A crash before the event bridge classifies this
                 // invitation must restore a request, never an accepted chat.
-                if !may_record_request(&requests, from, space) {
-                    return false;
-                }
+                let mut order = arrival_order.lock();
+                order.retain(|s| requests.contains_key(s));
+                let admission = {
+                    let contacts = contacts_for_policy.lock();
+                    admit_request(&requests, &order, |p| contacts.contains_key(p), from, space)
+                };
+                let evict = match admission {
+                    Admission::Refuse => return false,
+                    Admission::Admit => None,
+                    Admission::AdmitEvicting(victim) => Some(victim),
+                };
                 if !requests.contains_key(space) {
                     let mut pending = requests.clone();
                     pending.insert(*space, *from);
+                    let mut hidden = hidden_for_policy.lock();
+                    let mut hidden_next = hidden.clone();
+                    let mut writes = Vec::new();
+                    // An evicted request is declined (kept, never shown), in
+                    // the same transaction that records the new one.
+                    if let Some(victim) = evict {
+                        pending.remove(&victim);
+                        hidden_next.insert(victim);
+                        let list: Vec<_> = hidden_next.iter().copied().collect();
+                        writes.push(("hidden".to_string(), postcard::to_allocvec(&list).ok()));
+                    }
                     let list: Vec<_> = pending.iter().map(|(a, b)| (*a, *b)).collect();
-                    let saved = postcard::to_allocvec(&list).map_err(anyhow::Error::from).and_then(|bytes| {
-                        request_store.kv_batch_durable(vec![("requests".into(), Some(bytes))])
-                    });
-                    if saved.is_err() {
+                    writes.push(("requests".to_string(), postcard::to_allocvec(&list).ok()));
+                    if writes.iter().any(|(_, v)| v.is_none()) || request_store.kv_batch_durable(writes).is_err() {
                         return false;
                     }
                     *requests = pending;
+                    *hidden = hidden_next;
+                    order.push(*space);
+                    if let Some(victim) = evict {
+                        evicted_by_policy.lock().push(victim);
+                    }
                 }
                 arriving_for_policy.lock().insert(*space);
             }
@@ -518,6 +606,10 @@ impl Runtime {
         }
 
         let (events, _) = broadcast::channel(1024);
+        let health_events = events.clone();
+        store.on_health_change(Arc::new(move || {
+            let _ = health_events.send(Event::NoticesChanged);
+        }));
         let me = keys.sign_pk();
         let rt = Arc::new_cyclic(|weak| Runtime {
             data_dir: dir,
@@ -527,7 +619,7 @@ impl Runtime {
             store,
             events,
             name: Mutex::new(name),
-            contacts: Mutex::new(contacts),
+            contacts,
             mode: opts.mode,
             next_mode: Mutex::new(next_mode),
             keeper: opts.keeper,
@@ -543,6 +635,8 @@ impl Runtime {
             blocked,
             hints: Mutex::new(hints),
             calls: CallManager::new(Arc::new(RuntimeCallHost { me, rt: weak.clone() })),
+            notices: Mutex::new(notices),
+            evicted,
         });
         if !rt.keeper {
             rt.calls.serve(call_rx);
@@ -582,6 +676,15 @@ impl Runtime {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Problems the user should know about (see [`Notice`]).
+    pub fn notices(&self) -> Vec<Notice> {
+        let mut notices = self.notices.lock().clone();
+        if let Some(error) = self.store.failure() {
+            notices.push(Notice::StorageFailing { error });
+        }
+        notices
     }
 
     pub fn node(&self) -> &Node {
@@ -758,8 +861,24 @@ impl Runtime {
         }
     }
 
-    /// The network mode saved by `set_network_mode`, if any. Hosts read it
-    /// before opening the runtime (the mode is fixed while running).
+    /// The mode to launch with: the one saved by `set_network_mode`, else
+    /// `default`. Hosts read it before opening the runtime (the mode is fixed
+    /// while running). A saved mode that can't be read (releases before this
+    /// one wrote it non-atomically) means local paths only (`lan`), the most
+    /// private choice, never a wider one; `open` then repairs the file and
+    /// reports [`Notice::NetworkModeReset`].
+    pub fn launch_network_mode(data_dir: &Path, default: NetworkMode) -> NetworkMode {
+        match Self::saved_network_mode(data_dir) {
+            Ok(mode) => mode.unwrap_or(default),
+            Err(error) => {
+                eprintln!("mycel: {error:#}; using local paths only (lan)");
+                NetworkMode::Lan
+            }
+        }
+    }
+
+    /// The network mode saved by `set_network_mode`, if any; an error if the
+    /// saved mode can't be read (see `launch_network_mode`).
     pub fn saved_network_mode(data_dir: &Path) -> Result<Option<NetworkMode>> {
         let Some(bytes) = crate::identity::read_optional(&data_dir.join("network-mode"), 64)? else {
             return Ok(None);
@@ -881,6 +1000,8 @@ impl Runtime {
     }
 
     fn post(&self, space: SpaceId, op: ChatOp) -> Result<Hash32> {
+        // Don't sign what can't be saved: a peer could hold it while we lose it.
+        self.store.check_writable()?;
         let (_, env) = self
             .node
             .with_space(&space, |r| r.append(messages_feed(), op.encode()))??;
@@ -1232,6 +1353,7 @@ impl Runtime {
         if direct && let Some(existing) = self.existing_direct_conversation(keys[0].sign_pk) {
             return Ok(existing);
         }
+        self.store.check_writable()?;
         let (space, _) = self.node.create_space()?;
         let name = self.name.lock().clone();
         self.node.with_space(&space, |r| -> Result<()> {
@@ -1772,6 +1894,54 @@ impl Runtime {
         Ok(())
     }
 
+    /// An invitation was admitted (see `invite_policy`): a contact's becomes
+    /// a conversation, anyone else's stays a request. Either way it stops
+    /// being hidden as arriving, even when storage fails.
+    fn classify_arrival(&self, space: SpaceId, from: SignPk) {
+        self.leave_evicted_requests();
+        self.invalidate(&space);
+        if !self.keeper {
+            let known = self.contacts.lock().contains_key(&from);
+            if known {
+                let cleared = {
+                    let mut requests = self.requests.lock();
+                    let list: Vec<_> = requests.iter().filter(|(s, _)| **s != space).map(|(s, p)| (*s, *p)).collect();
+                    let result = postcard::to_allocvec(&list).map_err(anyhow::Error::from).and_then(|bytes| {
+                        self.store.kv_batch_durable(vec![("requests".into(), Some(bytes))])
+                    });
+                    if result.is_ok() {
+                        requests.remove(&space);
+                    }
+                    result.is_ok()
+                };
+                // Storage failure retains the conservative request: it shows
+                // as a request to accept, rather than not at all.
+                // A contact added us: introduce ourselves right away.
+                if cleared && self.my_role(&space).is_some_and(Role::can_write) {
+                    let name = self.name.lock().clone();
+                    let _ = self.post(space, ChatOp::Profile { name });
+                }
+            }
+            // Stranger requests were persisted by invite_policy before
+            // admission. A concurrent accept/decline may already have
+            // removed one by the time this event is handled.
+        }
+        self.arriving.lock().remove(&space);
+        self.emit(Event::ConversationAdded { conversation: space.to_string() });
+    }
+
+    /// Leave the stranger requests the invite policy declined to make room,
+    /// as declining one by hand does.
+    fn leave_evicted_requests(&self) {
+        let evicted = std::mem::take(&mut *self.evicted.lock());
+        for space in evicted {
+            if self.node.with_space(&space, |r| r.leave()).is_ok() {
+                self.touch(space);
+            }
+            self.emit(Event::ConversationUpdated { conversation: space.to_string() });
+        }
+    }
+
     pub fn rename_conversation(&self, id: ConversationId, title: String) -> Result<()> {
         let space = parse_space(&id)?;
         self.require_admin(&space)?;
@@ -1924,39 +2094,7 @@ async fn bridge(rt: Weak<Runtime>, mut rx: broadcast::Receiver<NetEvent>) {
                 let _ = rt.view(&space);
                 rt.emit(Event::ConversationUpdated { conversation: space.to_string() });
             }
-            NetEvent::SpaceAdded { space, from } => {
-                rt.invalidate(&space);
-                if !rt.keeper {
-                    let known = rt.contacts.lock().contains_key(&from);
-                    if known {
-                        let cleared = {
-                            let mut requests = rt.requests.lock();
-                            let list: Vec<_> = requests.iter().filter(|(s, _)| **s != space).map(|(s, p)| (*s, *p)).collect();
-                            let result = postcard::to_allocvec(&list).map_err(anyhow::Error::from).and_then(|bytes| {
-                                rt.store.kv_batch_durable(vec![("requests".into(), Some(bytes))])
-                            });
-                            if result.is_ok() {
-                                requests.remove(&space);
-                            }
-                            result.is_ok()
-                        };
-                        if !cleared {
-                            // Storage failure retains the conservative request.
-                            continue;
-                        }
-                        // a contact added us: introduce ourselves right away
-                        if rt.my_role(&space).is_some_and(Role::can_write) {
-                            let name = rt.name.lock().clone();
-                            let _ = rt.post(space, ChatOp::Profile { name });
-                        }
-                    }
-                    // Stranger requests were persisted by invite_policy before
-                    // admission. A concurrent accept/decline may already have
-                    // removed one by the time this event is handled.
-                }
-                rt.arriving.lock().remove(&space);
-                rt.emit(Event::ConversationAdded { conversation: space.to_string() });
-            }
+            NetEvent::SpaceAdded { space, from } => rt.classify_arrival(space, from),
             NetEvent::Ephemeral { space, from, data } => {
                 if let Some(ChatSignal::Typing) = ChatSignal::decode(&data) {
                     rt.emit(Event::Typing {
@@ -2442,30 +2580,158 @@ mod tests {
         assert_eq!(super::guess_mime("Movie.webm"), "video/webm");
     }
 
+    #[tokio::test]
+    async fn a_contacts_invite_shows_as_a_request_when_storage_fails() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("mycel-arrival-{}", mycel_crypto::random_u64()));
+        let runtime = Runtime::open(&dir, NetworkMode::Local, Some("Arrival test".into())).await.unwrap();
+        let peer = DeviceKeys::generate().public();
+        runtime.contacts.lock().insert(peer.sign_pk, StoredContact { keys: peer, name: "Peer".into() });
+        let (space, _) = runtime.node.create_space().unwrap();
+        runtime.node.with_space(&space, |r| r.add_member(peer, Role::Writer)).unwrap().unwrap();
+        // As invite_policy leaves an admitted invitation.
+        runtime.requests.lock().insert(space, peer.sign_pk);
+        runtime.arriving.lock().insert(space);
+        runtime.store.fail_commits(usize::MAX);
+        runtime.classify_arrival(space, peer.sign_pk);
+        assert!(!runtime.arriving.lock().contains(&space), "never stuck hidden");
+        assert!(runtime.requests.lock().contains_key(&space), "the conservative request is kept");
+        assert!(runtime.conversations().iter().any(|c| c.id == space.to_string() && c.request));
+        runtime.store.fail_commits(0);
+        // Once storage works, the same arrival becomes the conversation.
+        for _ in 0..200 {
+            if runtime.store.failure().is_none() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        runtime.classify_arrival(space, peer.sign_pk);
+        assert!(runtime.conversations().iter().any(|c| c.id == space.to_string() && !c.request));
+        runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
-    fn pending_request_limits_apply_before_admission_and_keep_repeats_idempotent() {
+    fn request_limits_never_refuse_contacts_or_everyone_new() {
         use super::*;
         fn space(n: usize) -> SpaceId {
             let mut bytes = [0; 32];
-            bytes[..8].copy_from_slice(&(n as u64).to_le_bytes());
+            bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
             Hash32(bytes)
         }
-        let first = SignPk([1; 32]);
-        let second = SignPk([2; 32]);
-        let mut pending = BTreeMap::new();
+        let stranger = |n: usize| {
+            let mut bytes = [0xA0; 32];
+            bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            SignPk(bytes)
+        };
+        let contact = SignPk([0xC0; 32]);
+        let is_contact = |p: &SignPk| *p == contact;
+        let (mut pending, mut order) = (BTreeMap::new(), Vec::new());
+        fn record(pending: &mut BTreeMap<SpaceId, SignPk>, order: &mut Vec<SpaceId>, from: SignPk, at: SpaceId) {
+            pending.insert(at, from);
+            order.push(at);
+        }
         for n in 0..MAX_PENDING_PER_INVITER {
-            assert!(may_record_request(&pending, &first, &space(n)));
-            pending.insert(space(n), first);
+            assert_eq!(admit_request(&pending, &[], is_contact, &stranger(0), &space(n)), Admission::Admit);
+            record(&mut pending, &mut order, stranger(0), space(n));
         }
-        assert!(!may_record_request(&pending, &first, &space(32)));
-        assert!(may_record_request(&pending, &second, &space(32)));
+        assert_eq!(admit_request(&pending, &order, is_contact, &stranger(0), &space(999)), Admission::Refuse);
+        assert_eq!(admit_request(&pending, &order, is_contact, &stranger(0), &space(0)), Admission::Admit, "repeats are idempotent");
+        // Eight throwaway keys fill every slot.
         for n in MAX_PENDING_PER_INVITER..MAX_PENDING_REQUESTS {
-            let peer = SignPk([2 + (n / MAX_PENDING_PER_INVITER) as u8; 32]);
-            assert!(may_record_request(&pending, &peer, &space(n)));
-            pending.insert(space(n), peer);
+            record(&mut pending, &mut order, stranger(n / MAX_PENDING_PER_INVITER), space(n));
         }
-        assert!(!may_record_request(&pending, &second, &space(MAX_PENDING_REQUESTS)));
-        assert!(may_record_request(&pending, &first, &space(0)), "existing request survives both limits");
+        // Contacts are always admitted, and their requests never count.
+        assert_eq!(admit_request(&pending, &order, is_contact, &contact, &space(1000)), Admission::Admit);
+        let mut with_contact = pending.clone();
+        with_contact.insert(space(1000), contact);
+        // A new stranger displaces the oldest request of a top inviter.
+        assert_eq!(
+            admit_request(&with_contact, &order, is_contact, &stranger(9), &space(1001)),
+            Admission::AdmitEvicting(space(0))
+        );
+        // A heavy inviter loses its own requests first, even its newest.
+        let mut fair = BTreeMap::new();
+        let mut fair_order = Vec::new();
+        for n in 0..MAX_PENDING_REQUESTS - MAX_PENDING_PER_INVITER {
+            fair.insert(space(n), stranger(100 + n));
+            fair_order.push(space(n));
+        }
+        for n in 0..MAX_PENDING_PER_INVITER {
+            fair.insert(space(500 + n), stranger(7));
+            fair_order.push(space(500 + n));
+        }
+        assert_eq!(
+            admit_request(&fair, &fair_order, is_contact, &stranger(8), &space(2000)),
+            Admission::AdmitEvicting(space(500))
+        );
+        // A profile already holding more requests than the limit (loaded
+        // from disk, so no arrival order) still admits newcomers.
+        let legacy: BTreeMap<_, _> = (0..300).map(|n| (space(n), stranger(n))).collect();
+        assert_eq!(
+            admit_request(&legacy, &[], is_contact, &stranger(5000), &space(3000)),
+            Admission::AdmitEvicting(space(0))
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn full_request_slots_never_lock_out_contacts_or_new_strangers() {
+        use super::*;
+        async fn eventually(mut check: impl FnMut() -> bool) {
+            for _ in 0..300 {
+                if check() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("condition did not become true");
+        }
+        let dirs: Vec<_> = (0..3)
+            .map(|n| std::env::temp_dir().join(format!("mycel-request-slots-{n}-{}", mycel_crypto::random_u64())))
+            .collect();
+        let alice = Runtime::open(&dirs[0], NetworkMode::Local, Some("Alice".into())).await.unwrap();
+        let bob = Runtime::open(&dirs[1], NetworkMode::Local, Some("Bob".into())).await.unwrap();
+        let carol = Runtime::open(&dirs[2], NetworkMode::Local, Some("Carol".into())).await.unwrap();
+        for a in [&alice, &bob, &carol] {
+            for b in [&alice, &bob, &carol] {
+                if a.profile().id != b.profile().id {
+                    a.node.add_peer_addr(b.node.addr());
+                }
+            }
+        }
+        // Eight throwaway stranger keys already fill every request slot.
+        let fake = |n: usize| {
+            let mut bytes = [0; 32];
+            bytes[..8].copy_from_slice(&(n as u64).to_be_bytes());
+            Hash32(bytes)
+        };
+        for n in 0..MAX_PENDING_REQUESTS {
+            let inviter = SignPk([0xE0 + (n / MAX_PENDING_PER_INVITER) as u8; 32]);
+            alice.requests.lock().insert(fake(n), inviter);
+        }
+        let alice_id = alice.profile().id;
+        alice.add_contact(bob.profile().contact_code).unwrap();
+        bob.add_contact(alice.profile().contact_code).unwrap();
+        carol.add_contact(alice.profile().contact_code).unwrap();
+
+        let from_bob = bob.create_conversation(Some("From a contact".into()), vec![alice_id.clone()]).unwrap();
+        eventually(|| alice.conversations().iter().any(|c| c.id == from_bob.id && !c.request)).await;
+        assert!(alice.hidden.lock().is_empty(), "a contact never displaces anyone");
+
+        let from_carol = carol.create_conversation(Some("From a stranger".into()), vec![alice_id]).unwrap();
+        eventually(|| alice.conversations().iter().any(|c| c.id == from_carol.id && c.request)).await;
+        assert_eq!(alice.hidden.lock().iter().copied().collect::<Vec<_>>(), vec![fake(0)]);
+        assert_eq!(alice.requests.lock().len(), MAX_PENDING_REQUESTS);
+        let saved: Vec<(SpaceId, SignPk)> = alice.store.kv_decode("requests").unwrap().unwrap();
+        assert!(saved.iter().any(|(s, _)| s.to_string() == from_carol.id) && !saved.iter().any(|(s, _)| *s == fake(0)));
+        let hidden: Vec<SpaceId> = alice.store.kv_decode("hidden").unwrap().unwrap();
+        assert_eq!(hidden, vec![fake(0)]);
+        for rt in [alice, bob, carol] {
+            rt.shutdown().await.unwrap();
+        }
+        for dir in dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
     }
 
     use super::sanitize_file_name as s;

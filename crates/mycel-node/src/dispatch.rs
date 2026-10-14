@@ -195,6 +195,7 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
         "list_contacts" => ok(rt.contacts()),
         "list_nearby" => ok(rt.nearby()),
         "network_status" => ok(rt.network_status()),
+        "list_notices" => ok(rt.notices()),
         "set_network_mode" => ok(rt.set_network_mode(args::<Mode>(a)?.mode)?),
         "list_conversations" => ok(rt.conversations()),
         "get_conversation" => ok(rt.conversation(args::<Id>(a)?.id)?),

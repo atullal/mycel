@@ -2,7 +2,7 @@
 //! device-only Keychain; other platforms deliberately retain the file backend.
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use mycel_crypto::{DeviceKeys, random};
@@ -11,6 +11,31 @@ use serde::{Deserialize, Serialize};
 const SEED: &str = "identity.key";
 const MARKER: &str = "identity-state.json";
 const LOCK: &str = ".identity.lock";
+/// The temporary seed name of releases before the durable protocol.
+const LEGACY_SEED_TEMP: &str = "identity.tmp";
+
+/// What Mycel keeps in a profile folder. Any of these means the profile is
+/// established, so a missing identity must never be silently replaced.
+/// Nothing else counts: platform files (Android's `cache/`, `code_cache/`,
+/// `files/`, WebView data), the host's `mycel.log`/`mycel.log.1` and
+/// `link-diagnostics` switch (both may exist before the profile is opened),
+/// and set-aside profiles.
+/// (On Android the profile folder is the app's data root, so the attachment
+/// folder `files/` is also the platform's own and proves nothing.)
+const PROFILE_STATE: &[&str] = &[
+    SEED,
+    MARKER,
+    "mycel.redb",
+    "network-mode",
+    "blobs",
+    "uploads",
+    "http-token",
+    "notification-targets.json",
+];
+
+const ALREADY_OPEN: &str = "this Mycel profile is already open in another process";
+const CANNOT_LOCK: &str =
+    "cannot lock the Mycel profile folder (its file system may not support file locks)";
 
 /// A process-wide, OS-released profile lease, held until the runtime is dropped.
 /// Never remove this file: unlinking a locked inode defeats mutual exclusion.
@@ -38,6 +63,10 @@ impl ProfileLock {
                 .sync_all()
                 .context("persist private profile permissions")?;
         }
+        // Before anything is written: the profile is bound to this device's
+        // Keychain, and encrypted conversations stay out of cloud backups.
+        #[cfg(target_os = "ios")]
+        ios::exclude_from_backup(dir);
         let path = dir.join(LOCK);
         reject_nonregular(&path)?;
         let mut options = OpenOptions::new();
@@ -47,14 +76,50 @@ impl ProfileLock {
         if !file.metadata()?.is_file() {
             bail!("profile lock must be a regular file");
         }
-        file.try_lock()
-            .context("profile is already open or cannot be locked")?;
+        lock_exclusive(&file)?;
         Ok(Self(file))
+    }
+}
+
+/// `File::try_lock` is unimplemented on Android (it fails as an I/O error), so
+/// Unix uses flock(2), which macOS, iOS, Linux and Android all provide. Its
+/// lock belongs to the open file, so a second open in this process conflicts
+/// too, and the OS releases it when the process dies.
+#[cfg(unix)]
+fn lock_exclusive(file: &File) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    loop {
+        // SAFETY: flock on a file descriptor this File owns.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EWOULDBLOCK) => bail!(ALREADY_OPEN),
+            _ => return Err(error).context(CANNOT_LOCK),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn lock_exclusive(file: &File) -> Result<()> {
+    match file.try_lock() {
+        Ok(()) => Ok(()),
+        Err(std::fs::TryLockError::WouldBlock) => bail!(ALREADY_OPEN),
+        Err(std::fs::TryLockError::Error(error)) => Err(error).context(CANNOT_LOCK),
     }
 }
 
 impl Drop for ProfileLock {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: unlock the descriptor this File owns (closing would too).
+            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
+        #[cfg(windows)]
         let _ = self.0.unlock();
     }
 }
@@ -82,6 +147,14 @@ fn reject_nonregular(path: &Path) -> Result<()> {
         }
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("inspect {}", path.display())),
+    }
+}
+
+fn exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(e).with_context(|| format!("inspect {}", path.display())),
     }
 }
@@ -138,7 +211,8 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], replace: bool) -> Result<(
         .open(&temporary)
         .context("create private temporary file")?;
     // On error, leave recoverable bytes rather than hiding an incomplete
-    // provisioning attempt. A later open fails closed if no seed was installed.
+    // provisioning attempt. `DiskProfile::recover` resolves what a crash in
+    // our own protocol can leave; anything else fails closed.
     file.write_all(bytes)?;
     file.sync_all()
         .context("persist identity/settings contents")?;
@@ -147,40 +221,125 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8], replace: bool) -> Result<(
     if replace {
         fs::rename(&temporary, path).context("install identity/settings state")?;
     } else {
-        install_new(&temporary, path)?;
+        install_new(&temporary, path, bytes)?;
     }
     sync_dir(dir)
 }
 
-fn install_new(temporary: &Path, path: &Path) -> Result<()> {
-    #[cfg(target_vendor = "apple")]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let source = std::ffi::CString::new(temporary.as_os_str().as_bytes())?;
-        let destination = std::ffi::CString::new(path.as_os_str().as_bytes())?;
-        // An atomic exclusive rename avoids a crash window with an extra seed
-        // hard link that would survive iOS Keychain migration cleanup.
-        let result = unsafe {
-            libc::renameatx_np(
-                libc::AT_FDCWD,
-                source.as_ptr(),
-                libc::AT_FDCWD,
-                destination.as_ptr(),
-                libc::RENAME_EXCL,
-            )
-        };
-        if result != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("install identity without replacing an existing file");
-        }
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        fs::hard_link(temporary, path)
-            .context("install identity without replacing an existing file")?;
-        fs::remove_file(temporary)?;
+/// Install a synced temporary file at `path` only if nothing is there.
+#[cfg(target_vendor = "apple")]
+fn install_new(temporary: &Path, path: &Path, _bytes: &[u8]) -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let source = std::ffi::CString::new(temporary.as_os_str().as_bytes())?;
+    let destination = std::ffi::CString::new(path.as_os_str().as_bytes())?;
+    // An atomic exclusive rename avoids a crash window with an extra seed
+    // hard link that would survive iOS Keychain migration cleanup.
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context(NO_CLOBBER);
     }
     Ok(())
+}
+
+/// Install a synced temporary file at `path` only if nothing is there.
+#[cfg(not(target_vendor = "apple"))]
+fn install_new(temporary: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    // The same atomic exclusive rename where the kernel offers one.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if rename_noreplace(temporary, path).context(NO_CLOBBER)? {
+        return Ok(());
+    }
+    // A hard link never replaces either. A crash before the temporary is
+    // removed leaves two names for one seed, which `recover` resolves.
+    // Android 10+ denies links in app data, and FAT volumes lack them.
+    match fs::hard_link(temporary, path) {
+        Ok(()) => {
+            fs::remove_file(temporary)?;
+            return Ok(());
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(e).context(NO_CLOBBER);
+        }
+        Err(_) => {}
+    }
+    install_by_copy(temporary, path, bytes).context(NO_CLOBBER)
+}
+
+const NO_CLOBBER: &str = "install identity without replacing an existing file";
+
+/// Last resort: exclusive create, write and sync. The complete, synced
+/// temporary stays until the copy is durable, so `recover` can finish (or
+/// clean up after) a copy that a crash interrupted.
+#[cfg_attr(target_vendor = "apple", allow(dead_code))]
+fn install_by_copy(temporary: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    private_options(&mut options);
+    let mut file = options.open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    sync_dir(path.parent().context("file has no parent")?)?;
+    fs::remove_file(temporary)?;
+    Ok(())
+}
+
+/// renameat2(RENAME_NOREPLACE): Linux 3.15+. `Ok(false)` when this kernel,
+/// file system or sandbox can't do it, so the caller falls back.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    // Before Android 11 the app seccomp filter may not allow renameat2, and a
+    // disallowed system call kills the process instead of failing.
+    #[cfg(target_os = "android")]
+    if android_api_level() < 30 {
+        return Ok(false);
+    }
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+    const RENAME_NOREPLACE: libc::c_uint = 1;
+    // SAFETY: NUL-terminated paths relative to the working directory.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENOSYS | libc::EINVAL | libc::EPERM | libc::EACCES | libc::EOPNOTSUPP) => {
+            Ok(false)
+        }
+        _ => Err(error),
+    }
+}
+
+#[cfg(target_os = "android")]
+fn android_api_level() -> u32 {
+    let mut value = [0 as libc::c_char; 92]; // PROP_VALUE_MAX
+    // SAFETY: a NUL-terminated key and a PROP_VALUE_MAX buffer.
+    let n = unsafe { libc::__system_property_get(c"ro.build.version.sdk".as_ptr(), value.as_mut_ptr()) };
+    if n <= 0 {
+        return 0;
+    }
+    // SAFETY: __system_property_get NUL-terminates what it wrote.
+    let level = unsafe { std::ffi::CStr::from_ptr(value.as_ptr()) };
+    level.to_str().ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -241,9 +400,70 @@ trait ProfileStorage {
     fn write_marker(&mut self, marker: &Marker, replace: bool) -> Result<()>;
     #[cfg(any(target_os = "ios", test))]
     fn remove_seed(&mut self) -> Result<()>;
+    /// Move all profile state into a new folder (never deleting anything) and
+    /// return it, leaving a pristine profile.
+    #[cfg(any(target_os = "ios", test))]
+    fn set_aside(&mut self) -> Result<PathBuf>;
+}
+
+/// What an interrupted no-clobber install left at `path`: nothing yet, or a
+/// prefix of its temporary (some file systems zero-fill after a crash).
+fn interrupted_copy(installed: &[u8], temporary: &[u8]) -> bool {
+    installed.len() < temporary.len()
+        && (temporary.starts_with(installed) || installed.iter().all(|b| *b == 0))
 }
 
 struct DiskProfile<'a>(&'a Path);
+impl DiskProfile<'_> {
+    /// Finish or clean up what a crash during our own protocol leaves: a
+    /// seed/marker temporary next to its completed or partial install, or a
+    /// first-launch seed that was never installed. A temporary in any other
+    /// state is preserved, and `read_seed` then refuses to continue.
+    fn recover(&mut self) -> Result<()> {
+        let marker_exists = exists(&self.0.join(MARKER))?;
+        let mut changed = false;
+        for entry in fs::read_dir(self.0)? {
+            let name = entry?.file_name();
+            let name = name.to_string_lossy();
+            let target = if name.starts_with(".identity.key-tmp-") || name == LEGACY_SEED_TEMP {
+                SEED
+            } else if name.starts_with(".identity-state.json-tmp-") {
+                MARKER
+            } else {
+                continue;
+            };
+            let temporary = self.0.join(&*name);
+            let path = self.0.join(target);
+            let Ok(Some(bytes)) = read_optional(&temporary, 4096) else {
+                continue;
+            };
+            match read_optional(&path, 4096)? {
+                // The install finished; only the temporary's removal did not.
+                Some(installed) if installed == bytes => fs::remove_file(&temporary)?,
+                // A copy-install stopped part way: it never became an identity
+                // (no marker binds it), so complete it from the synced original.
+                Some(installed)
+                    if interrupted_copy(&installed, &bytes)
+                        && (target == MARKER || (bytes.len() == 32 && !marker_exists)) =>
+                {
+                    fs::remove_file(&path)?;
+                    install_new(&temporary, &path, &bytes)?;
+                }
+                // Markers contain no secret; an unfinished replacement is moot.
+                _ if target == MARKER => fs::remove_file(&temporary)?,
+                // A first-launch seed that was never installed was never used.
+                None if !marker_exists && self.is_pristine()? => fs::remove_file(&temporary)?,
+                _ => continue,
+            }
+            changed = true;
+        }
+        if changed {
+            sync_dir(self.0)?;
+        }
+        Ok(())
+    }
+}
+
 impl ProfileStorage for DiskProfile<'_> {
     fn read_seed(&self) -> Result<Option<[u8; 32]>> {
         // Never complete a migration while an interrupted provisioning attempt
@@ -252,7 +472,7 @@ impl ProfileStorage for DiskProfile<'_> {
         for entry in fs::read_dir(self.0)? {
             let name = entry?.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(".identity.key-tmp-") || name == "identity.tmp" {
+            if name.starts_with(".identity.key-tmp-") || name == LEGACY_SEED_TEMP {
                 bail!(
                     "interrupted identity provisioning requires recovery; existing files were preserved"
                 );
@@ -276,8 +496,8 @@ impl ProfileStorage for DiskProfile<'_> {
             .transpose()
     }
     fn is_pristine(&self) -> Result<bool> {
-        for entry in fs::read_dir(self.0)? {
-            if entry?.file_name() != LOCK {
+        for name in PROFILE_STATE {
+            if exists(&self.0.join(name))? {
                 return Ok(false);
             }
         }
@@ -295,15 +515,56 @@ impl ProfileStorage for DiskProfile<'_> {
         fs::remove_file(self.0.join(SEED)).context("remove migrated file seed")?;
         sync_dir(self.0)
     }
+    #[cfg(any(target_os = "ios", test))]
+    fn set_aside(&mut self) -> Result<PathBuf> {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let kept = (0..)
+            .map(|n| match n {
+                0 => self.0.join(format!("unrecoverable-{secs}")),
+                n => self.0.join(format!("unrecoverable-{secs}-{n}")),
+            })
+            .find(|dir| !dir.exists())
+            .context("no folder name for the unrecoverable profile")?;
+        fs::create_dir(&kept).context("create a folder for the unrecoverable profile")?;
+        for entry in fs::read_dir(self.0)? {
+            let name = entry?.file_name();
+            let text = name.to_string_lossy();
+            // On iOS the folder is Mycel's alone: decrypted attachments too.
+            let ours = PROFILE_STATE.contains(&&*text)
+                || text == "files"
+                || text == LEGACY_SEED_TEMP
+                || text.starts_with(".identity.key-tmp-")
+                || text.starts_with(".identity-state.json-tmp-");
+            if ours {
+                fs::rename(self.0.join(&name), kept.join(&name))
+                    .with_context(|| format!("set aside {text}"))?;
+            }
+        }
+        sync_dir(&kept)?;
+        sync_dir(self.0)?;
+        Ok(kept)
+    }
+}
+
+/// A loaded identity. `replaced` is where an unusable profile (its identity
+/// isn't on this device) was kept when a new identity had to be started.
+pub(crate) struct Identity {
+    pub keys: DeviceKeys,
+    pub replaced: Option<PathBuf>,
 }
 
 /// The lease is required at the call site and retained by Runtime.
-pub(crate) fn load(dir: &Path, _lease: &ProfileLock) -> Result<DeviceKeys> {
+pub(crate) fn load(dir: &Path, _lease: &ProfileLock) -> Result<Identity> {
     let mut profile = DiskProfile(dir);
+    profile.recover()?;
     #[cfg(target_os = "ios")]
-    return load_keychain(&mut profile, &mut ios::Keychain);
+    return load_keychain(&mut profile, &mut ios::Keychain)
+        .map(|(keys, replaced)| Identity { keys, replaced });
     #[cfg(not(target_os = "ios"))]
-    load_file(&mut profile)
+    load_file(&mut profile).map(|keys| Identity { keys, replaced: None })
 }
 
 fn initial_seed(profile: &mut impl ProfileStorage) -> Result<[u8; 32]> {
@@ -351,14 +612,41 @@ fn load_file(profile: &mut impl ProfileStorage) -> Result<DeviceKeys> {
 trait SecretStorage {
     /// Creates only. Duplicate slots must be read and compared, never updated.
     fn add(&mut self, account: &str, seed: [u8; 32]) -> Result<()>;
+    /// `Ok(None)` only when the item definitely doesn't exist (not while the
+    /// Keychain is merely unavailable, e.g. before the first unlock).
     fn read(&self, account: &str) -> Result<Option<[u8; 32]>>;
 }
 
+/// Keychain items are device-only, so a profile restored onto another device
+/// (from a backup taken before profiles were excluded from backups, or by a
+/// device-to-device transfer) names an identity this device doesn't have.
+/// That profile is kept aside, never deleted, and a new identity is started:
+/// refusing would leave the app unable to start, forever.
 #[cfg(any(target_os = "ios", test))]
 fn load_keychain(
     profile: &mut impl ProfileStorage,
     secrets: &mut impl SecretStorage,
-) -> Result<DeviceKeys> {
+) -> Result<(DeviceKeys, Option<PathBuf>)> {
+    if let Some(keys) = provision_keychain(profile, secrets)? {
+        return Ok((keys, None));
+    }
+    let kept = profile.set_aside()?;
+    eprintln!(
+        "mycel: this profile's identity isn't on this device (it was restored or moved from another device); \
+         kept that profile in {} and started a new identity",
+        kept.display()
+    );
+    let keys = provision_keychain(profile, secrets)?
+        .context("a new identity could not be created")?;
+    Ok((keys, Some(kept)))
+}
+
+/// `Ok(None)`: the identity this profile is bound to is definitely absent.
+#[cfg(any(target_os = "ios", test))]
+fn provision_keychain(
+    profile: &mut impl ProfileStorage,
+    secrets: &mut impl SecretStorage,
+) -> Result<Option<DeviceKeys>> {
     let existing = profile.read_marker()?;
     if let Some(marker) = &existing {
         marker.validate()?;
@@ -400,9 +688,10 @@ fn load_keychain(
         if let Some(seed) = legacy {
             secrets.add(account, seed)?;
         }
-        let seed = secrets
-            .read(account)?
-            .context("pending Keychain identity is missing")?;
+        let Some(seed) = secrets.read(account)? else {
+            // No file seed (only removed after commit) and no Keychain item.
+            return Ok(None);
+        };
         marker.verify(seed)?;
         if legacy.is_some_and(|old| old != seed) {
             bail!("Keychain identity conflicts with existing seed");
@@ -410,10 +699,18 @@ fn load_keychain(
         marker.state = State::Committed;
         profile.write_marker(&marker, true)?;
     }
-    // A committed marker never permits fallback, re-add, or identity creation.
-    let seed = secrets
-        .read(account)?
-        .context("committed Keychain identity is missing")?;
+    // A committed marker never permits fallback or identity creation. The
+    // only re-add is the verified seed this marker is bound to.
+    let seed = match (secrets.read(account)?, legacy) {
+        (Some(seed), _) => seed,
+        (None, Some(seed)) => {
+            secrets.add(account, seed)?;
+            secrets
+                .read(account)?
+                .context("committed Keychain identity could not be restored")?
+        }
+        (None, None) => return Ok(None),
+    };
     let keys = marker.verify(seed)?;
     if let Some(old) = legacy {
         if old != seed {
@@ -421,7 +718,7 @@ fn load_keychain(
         }
         profile.remove_seed()?;
     }
-    Ok(keys)
+    Ok(Some(keys))
 }
 
 #[cfg(target_os = "ios")]
@@ -492,6 +789,34 @@ mod ios {
             }
         }
     }
+
+    /// Keep the profile out of iCloud and computer backups. Its identity is
+    /// a device-only Keychain item that a restore never brings back, and its
+    /// conversations are private. Failure is logged, never fatal.
+    pub(super) fn exclude_from_backup(dir: &Path) {
+        use core_foundation::{boolean::CFBoolean, error::CFError, url::CFURL};
+        use core_foundation_sys::url::{CFURLSetResourcePropertyForKey, kCFURLIsExcludedFromBackupKey};
+        let Some(url) = CFURL::from_path(dir, true) else {
+            eprintln!("mycel: can't exclude the profile from backups (bad path)");
+            return;
+        };
+        let mut error = std::ptr::null_mut();
+        // SAFETY: valid CF objects; an error is returned retained (create rule).
+        let ok = unsafe {
+            CFURLSetResourcePropertyForKey(
+                url.as_concrete_TypeRef(),
+                kCFURLIsExcludedFromBackupKey,
+                CFBoolean::true_value().as_CFTypeRef(),
+                &mut error,
+            )
+        };
+        if ok == 0 {
+            let reason = (!error.is_null())
+                .then(|| unsafe { CFError::wrap_under_create_rule(error) }.description().to_string())
+                .unwrap_or_default();
+            eprintln!("mycel: can't exclude the profile from backups: {reason}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -502,7 +827,9 @@ mod tests {
 
     // Unit tests never access a device Keychain, even when built for iOS.
     fn load(dir: &Path, _lease: &ProfileLock) -> Result<DeviceKeys> {
-        load_file(&mut DiskProfile(dir))
+        let mut profile = DiskProfile(dir);
+        profile.recover()?;
+        load_file(&mut profile)
     }
 
     struct TestDir(PathBuf);
@@ -591,6 +918,171 @@ mod tests {
         assert_eq!(fs::read(dir.0.join(SEED)).unwrap(), [19; 32]);
     }
 
+    #[test]
+    fn concurrent_open_and_unlockable_folders_explain_themselves() {
+        let dir = TestDir::new();
+        let _lease = ProfileLock::acquire(&dir.0).unwrap();
+        let error = ProfileLock::acquire(&dir.0).err().unwrap();
+        assert!(error.to_string().contains("already open"), "{error:#}");
+    }
+
+    #[test]
+    fn platform_files_and_logs_are_not_an_established_profile() {
+        // Android's app data root, where the host may already have logged.
+        let dir = TestDir::new();
+        for platform in ["cache", "code_cache", "files", "app_webview", "shared_prefs"] {
+            fs::create_dir(dir.0.join(platform)).unwrap();
+        }
+        // The host logs and reads its diagnostics switch before opening.
+        fs::write(dir.0.join("mycel.log"), b"early log").unwrap();
+        fs::write(dir.0.join("mycel.log.1"), b"older log").unwrap();
+        fs::write(dir.0.join("link-diagnostics"), b"2").unwrap();
+        let lease = ProfileLock::acquire(&dir.0).unwrap();
+        assert!(DiskProfile(&dir.0).is_pristine().unwrap());
+        let pk = load(&dir.0, &lease).unwrap().sign_pk();
+        assert_eq!(load(&dir.0, &lease).unwrap().sign_pk(), pk);
+        // Mycel's own state still protects a profile whose identity is gone.
+        for state in ["network-mode", "blobs", "notification-targets.json"] {
+            let other = TestDir::new();
+            fs::create_dir(other.0.join("cache")).unwrap();
+            if state == "blobs" {
+                fs::create_dir(other.0.join(state)).unwrap();
+            } else {
+                fs::write(other.0.join(state), b"lan").unwrap();
+            }
+            let lease = ProfileLock::acquire(&other.0).unwrap();
+            assert!(load(&other.0, &lease).is_err(), "{state}");
+            assert!(!other.0.join(SEED).exists());
+        }
+    }
+
+    #[test]
+    fn baseline_profile_upgrades_with_the_same_identity() {
+        // Releases before the durable protocol: a bare seed, no marker.
+        let dir = TestDir::new();
+        fs::write(dir.0.join(SEED), [57; 32]).unwrap();
+        fs::write(dir.0.join("mycel.redb"), b"existing database").unwrap();
+        fs::write(dir.0.join("network-mode"), b"lan").unwrap();
+        fs::create_dir(dir.0.join("blobs")).unwrap();
+        let expected = DeviceKeys::from_seed([57; 32]).sign_pk();
+        let lease = ProfileLock::acquire(&dir.0).unwrap();
+        assert_eq!(load(&dir.0, &lease).unwrap().sign_pk(), expected);
+        assert!(dir.0.join(MARKER).exists());
+        assert_eq!(fs::read(dir.0.join(SEED)).unwrap(), [57; 32]);
+        drop(lease);
+        let lease = ProfileLock::acquire(&dir.0).unwrap();
+        assert_eq!(load(&dir.0, &lease).unwrap().sign_pk(), expected);
+    }
+
+    #[test]
+    fn interrupted_installs_are_finished_or_cleaned_up() {
+        let temp = |dir: &TestDir| dir.0.join(".identity.key-tmp-0123456789abcdef");
+        // A link install that stopped before removing the temporary.
+        let dir = TestDir::new();
+        fs::write(dir.0.join(SEED), [3; 32]).unwrap();
+        fs::write(temp(&dir), [3; 32]).unwrap();
+        let lease = ProfileLock::acquire(&dir.0).unwrap();
+        assert_eq!(load(&dir.0, &lease).unwrap().sign_pk(), DeviceKeys::from_seed([3; 32]).sign_pk());
+        assert!(!temp(&dir).exists());
+        drop(lease);
+
+        // A copy install that stopped part way, before any marker existed.
+        for partial in [&[6u8; 10][..], &[][..], &[0u8; 20][..]] {
+            let dir = TestDir::new();
+            fs::write(dir.0.join(SEED), partial).unwrap();
+            fs::write(temp(&dir), [6; 32]).unwrap();
+            let lease = ProfileLock::acquire(&dir.0).unwrap();
+            assert_eq!(load(&dir.0, &lease).unwrap().sign_pk(), DeviceKeys::from_seed([6; 32]).sign_pk());
+            assert_eq!(fs::read(dir.0.join(SEED)).unwrap(), [6; 32]);
+            assert!(!temp(&dir).exists());
+        }
+
+        // A first launch that stopped before installing: nothing used it.
+        for leftover in [".identity.key-tmp-0123456789abcdef", LEGACY_SEED_TEMP] {
+            let dir = TestDir::new();
+            fs::create_dir(dir.0.join("cache")).unwrap();
+            fs::write(dir.0.join(leftover), [8; 32]).unwrap();
+            let lease = ProfileLock::acquire(&dir.0).unwrap();
+            load(&dir.0, &lease).unwrap();
+            assert!(!dir.0.join(leftover).exists());
+            assert!(dir.0.join(SEED).exists());
+        }
+
+        // The same leftover in an established profile is never discarded.
+        let dir = TestDir::new();
+        fs::write(dir.0.join("mycel.redb"), b"existing database").unwrap();
+        fs::write(temp(&dir), [8; 32]).unwrap();
+        let lease = ProfileLock::acquire(&dir.0).unwrap();
+        assert!(load(&dir.0, &lease).is_err());
+        assert_eq!(fs::read(temp(&dir)).unwrap(), [8; 32]);
+        assert!(!dir.0.join(SEED).exists());
+        drop(lease);
+
+        // A different complete seed next to the identity fails closed.
+        let dir = TestDir::new();
+        fs::write(dir.0.join(SEED), [1; 32]).unwrap();
+        fs::write(temp(&dir), [2; 32]).unwrap();
+        let lease = ProfileLock::acquire(&dir.0).unwrap();
+        assert!(load(&dir.0, &lease).is_err());
+        assert_eq!(fs::read(dir.0.join(SEED)).unwrap(), [1; 32]);
+        assert_eq!(fs::read(temp(&dir)).unwrap(), [2; 32]);
+        drop(lease);
+
+        // Marker leftovers hold no secret: a partial copy is completed and
+        // an unfinished replacement is dropped.
+        let dir = TestDir::new();
+        let lease = ProfileLock::acquire(&dir.0).unwrap();
+        let pk = load(&dir.0, &lease).unwrap().sign_pk();
+        let marker = fs::read(dir.0.join(MARKER)).unwrap();
+        let marker_temp = dir.0.join(".identity-state.json-tmp-0123456789abcdef");
+        fs::write(&marker_temp, &marker).unwrap();
+        fs::write(dir.0.join(MARKER), &marker[..marker.len() / 2]).unwrap();
+        assert_eq!(load(&dir.0, &lease).unwrap().sign_pk(), pk);
+        assert_eq!(fs::read(dir.0.join(MARKER)).unwrap(), marker);
+        fs::write(&marker_temp, b"{\"unfinished\":").unwrap();
+        assert_eq!(load(&dir.0, &lease).unwrap().sign_pk(), pk);
+        assert!(!marker_temp.exists());
+    }
+
+    #[test]
+    fn set_aside_keeps_every_profile_file_and_leaves_platform_files() {
+        let dir = TestDir::new();
+        let lease = ProfileLock::acquire(&dir.0).unwrap();
+        let pk = load(&dir.0, &lease).unwrap().sign_pk();
+        fs::write(dir.0.join("mycel.redb"), b"database").unwrap();
+        fs::create_dir(dir.0.join("files")).unwrap();
+        fs::create_dir(dir.0.join("cache")).unwrap();
+        fs::write(dir.0.join("mycel.log"), b"log").unwrap();
+        let kept = DiskProfile(&dir.0).set_aside().unwrap();
+        assert!(kept.starts_with(&dir.0));
+        for moved in [SEED, MARKER, "mycel.redb", "files"] {
+            assert!(kept.join(moved).exists() && !dir.0.join(moved).exists(), "{moved}");
+        }
+        for stays in ["cache", "mycel.log", LOCK] {
+            assert!(dir.0.join(stays).exists(), "{stays}");
+        }
+        assert!(DiskProfile(&dir.0).is_pristine().unwrap());
+        assert_ne!(load(&dir.0, &lease).unwrap().sign_pk(), pk);
+        let again = DiskProfile(&dir.0).set_aside().unwrap();
+        assert_ne!(again, kept);
+        assert_eq!(fs::read(kept.join("mycel.redb")).unwrap(), b"database");
+    }
+
+    #[test]
+    fn copy_install_never_replaces_and_removes_its_temporary_last() {
+        let dir = TestDir::new();
+        let (temporary, path) = (dir.0.join(".identity.key-tmp-1"), dir.0.join(SEED));
+        fs::write(&temporary, [4; 32]).unwrap();
+        fs::write(&path, [5; 32]).unwrap();
+        assert!(install_by_copy(&temporary, &path, &[4; 32]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), [5; 32]);
+        assert_eq!(fs::read(&temporary).unwrap(), [4; 32]);
+        fs::remove_file(&path).unwrap();
+        install_by_copy(&temporary, &path, &[4; 32]).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), [4; 32]);
+        assert!(!temporary.exists());
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_permissions_and_symlink_rejection() {
@@ -625,7 +1117,7 @@ mod tests {
         let lease = ProfileLock::acquire(&dir.0).unwrap();
         let path = dir.0.join(SEED);
         fs::write(&path, [9; 32]).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
         // Root can read mode 000; the CI/user process must exercise denial.
         if unsafe { libc::geteuid() } != 0 {
             assert!(load(&dir.0, &lease).is_err());
@@ -646,6 +1138,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(
+            crate::Runtime::launch_network_mode(&dir.0, crate::api::NetworkMode::Internet),
+            crate::api::NetworkMode::Internet
+        );
         atomic_write(&path, b"lan", true).unwrap();
         assert_eq!(
             crate::Runtime::saved_network_mode(&dir.0).unwrap(),
@@ -653,13 +1149,20 @@ mod tests {
         );
         atomic_write(&path, b"garbage", true).unwrap();
         assert!(crate::Runtime::saved_network_mode(&dir.0).is_err());
+        for default in [crate::api::NetworkMode::Internet, crate::api::NetworkMode::Lan] {
+            assert_eq!(
+                crate::Runtime::launch_network_mode(&dir.0, default),
+                crate::api::NetworkMode::Lan,
+                "unreadable means the most private mode, never a wider one"
+            );
+        }
         atomic_write(&path, &[255], true).unwrap();
         assert!(crate::Runtime::saved_network_mode(&dir.0).is_err());
         #[cfg(unix)]
         {
             use std::os::unix::fs::{PermissionsExt, symlink};
             atomic_write(&path, b"lan", true).unwrap();
-            fs::set_permissions(&path, fs::Permissions::from_mode(0)).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
             if unsafe { libc::geteuid() } != 0 {
                 assert!(crate::Runtime::saved_network_mode(&dir.0).is_err());
             }
@@ -670,6 +1173,24 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn truncated_network_mode_starts_local_only_and_is_repaired() {
+        let dir = TestDir::new();
+        let runtime = crate::Runtime::open(&dir.0, crate::api::NetworkMode::Local, None).await.unwrap();
+        runtime.set_network_mode(crate::api::NetworkMode::Internet).unwrap();
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        // What an interrupted non-atomic write by an older release leaves.
+        fs::write(dir.0.join("network-mode"), b"inter").unwrap();
+        let mode = crate::Runtime::launch_network_mode(&dir.0, crate::api::NetworkMode::Internet);
+        assert_eq!(mode, crate::api::NetworkMode::Lan);
+        let runtime = crate::Runtime::open(&dir.0, crate::api::NetworkMode::Local, None).await.unwrap();
+        assert!(runtime.notices().contains(&crate::api::Notice::NetworkModeReset));
+        assert_eq!(runtime.network_status().next_mode, crate::api::NetworkMode::Lan);
+        assert_eq!(fs::read(dir.0.join("network-mode")).unwrap(), b"lan");
+        runtime.shutdown().await.unwrap();
+    }
+
     #[derive(Default, Clone)]
     struct MemoryProfile {
         seed: Option<[u8; 32]>,
@@ -678,6 +1199,7 @@ mod tests {
         // Fail immediately after the nth durable mutation, simulating a crash.
         crash_after: Option<usize>,
         events: Vec<&'static str>,
+        kept: Option<(Option<[u8; 32]>, Option<Marker>)>,
     }
     impl MemoryProfile {
         fn mutate(&mut self, event: &'static str) -> Result<()> {
@@ -725,6 +1247,12 @@ mod tests {
             self.seed = None;
             self.mutate("removed")
         }
+        fn set_aside(&mut self) -> Result<PathBuf> {
+            self.kept = Some((self.seed.take(), self.marker.take()));
+            self.established = false;
+            self.mutate("set aside")?;
+            Ok(PathBuf::from("unrecoverable"))
+        }
     }
     #[derive(Default)]
     struct MemorySecrets {
@@ -767,7 +1295,7 @@ mod tests {
         let mut secrets = MemorySecrets::default();
         let expected = DeviceKeys::from_seed([71; 32]).sign_pk();
         assert_eq!(
-            load_keychain(&mut profile, &mut secrets).unwrap().sign_pk(),
+            load_keychain(&mut profile, &mut secrets).unwrap().0.sign_pk(),
             expected
         );
         let account = profile.marker.as_ref().unwrap().account.clone();
@@ -778,6 +1306,7 @@ mod tests {
         assert_eq!(
             load_keychain(&mut moved_profile, &mut secrets)
                 .unwrap()
+                .0
                 .sign_pk(),
             expected
         );
@@ -802,6 +1331,7 @@ mod tests {
             assert_eq!(
                 load_keychain(&mut profile, &mut secrets)
                     .unwrap()
+                    .0
                     .sign_pk()
                     .0,
                 expected
@@ -828,7 +1358,7 @@ mod tests {
             let account = profile.marker.as_ref().unwrap().account.clone();
             secrets.read_failure = false;
             assert_eq!(
-                load_keychain(&mut profile, &mut secrets).unwrap().sign_pk(),
+                load_keychain(&mut profile, &mut secrets).unwrap().0.sign_pk(),
                 DeviceKeys::from_seed([18; 32]).sign_pk()
             );
             assert_eq!(profile.marker.as_ref().unwrap().account, account);
@@ -855,16 +1385,63 @@ mod tests {
         assert_eq!(secrets.values[&account], [8; 32]);
         secrets.values.insert(account.clone(), [4; 32]);
         load_keychain(&mut profile, &mut secrets).unwrap();
+        // A committed identity re-adds only the seed its marker is bound to.
         secrets.values.clear();
-        // Even with a surviving legacy file a committed identity cannot re-add.
-        profile.seed = Some([4; 32]);
+        profile.seed = Some([9; 32]);
         let adds = secrets.adds;
         assert!(load_keychain(&mut profile, &mut secrets).is_err());
         assert_eq!(secrets.adds, adds);
-        assert_eq!(profile.seed, Some([4; 32]));
+        assert_eq!(profile.seed, Some([9; 32]));
+        profile.seed = Some([4; 32]);
+        let (keys, replaced) = load_keychain(&mut profile, &mut secrets).unwrap();
+        assert_eq!(keys.sign_pk(), DeviceKeys::from_seed([4; 32]).sign_pk());
+        assert!(replaced.is_none());
+        assert_eq!(secrets.adds, adds + 1);
+        assert_eq!(profile.seed, None);
+        let adds = secrets.adds;
         profile.marker.as_mut().unwrap().version = 99;
         assert!(load_keychain(&mut profile, &mut secrets).is_err());
         assert_eq!(secrets.adds, adds);
+    }
+
+    #[test]
+    fn restored_profile_without_its_keychain_identity_is_kept_and_replaced() {
+        let mut profile = MemoryProfile {
+            seed: Some([31; 32]),
+            ..Default::default()
+        };
+        let mut secrets = MemorySecrets::default();
+        let old = load_keychain(&mut profile, &mut secrets).unwrap().0.sign_pk();
+        let marker = profile.marker.clone().unwrap();
+        // A restore onto another device: the marker came back, the
+        // device-only Keychain item did not.
+        let mut restored = MemoryProfile {
+            marker: Some(marker.clone()),
+            established: true,
+            ..Default::default()
+        };
+        let mut other_device = MemorySecrets::default();
+        let (keys, replaced) = load_keychain(&mut restored, &mut other_device).unwrap();
+        assert_eq!(replaced, Some(PathBuf::from("unrecoverable")));
+        assert_ne!(keys.sign_pk(), old);
+        let (_, kept_marker) = restored.kept.clone().unwrap();
+        assert_eq!(kept_marker.unwrap().public_key, marker.public_key);
+        // The new identity is now the device's and loads normally.
+        let (again, replaced) = load_keychain(&mut restored, &mut other_device).unwrap();
+        assert_eq!(again.sign_pk(), keys.sign_pk());
+        assert!(replaced.is_none());
+        // A Keychain that is merely unavailable never triggers a replacement.
+        let mut locked = MemoryProfile {
+            marker: Some(marker),
+            established: true,
+            ..Default::default()
+        };
+        let mut unavailable = MemorySecrets {
+            read_failure: true,
+            ..Default::default()
+        };
+        assert!(load_keychain(&mut locked, &mut unavailable).is_err());
+        assert!(locked.kept.is_none() && locked.marker.is_some());
     }
 
     #[test]
@@ -878,14 +1455,21 @@ mod tests {
         assert!(load_keychain(&mut profile, &mut secrets).is_err());
         let account = profile.marker.as_ref().unwrap().account.clone().unwrap();
         profile.seed = None;
-        assert!(load_keychain(&mut profile, &mut secrets).is_err());
         secrets.values.insert(account.clone(), [8; 32]);
         assert!(load_keychain(&mut profile, &mut secrets).is_err());
-        secrets.values.insert(account, [5; 32]);
+        assert!(profile.kept.is_none(), "a conflicting slot is never replaced");
+        secrets.values.insert(account.clone(), [5; 32]);
+        let mut resumed = profile.clone();
         assert_eq!(
-            load_keychain(&mut profile, &mut secrets).unwrap().sign_pk(),
+            load_keychain(&mut resumed, &mut secrets).unwrap().0.sign_pk(),
             DeviceKeys::from_seed([5; 32]).sign_pk()
         );
         assert_eq!(secrets.adds, 0);
+        // With neither the file seed nor the slot, the identity is gone: the
+        // profile is kept aside rather than leaving the app unable to start.
+        secrets.values.remove(&account);
+        let (_, replaced) = load_keychain(&mut profile, &mut secrets).unwrap();
+        assert!(replaced.is_some());
+        assert!(profile.kept.as_ref().unwrap().1.is_some());
     }
 }
