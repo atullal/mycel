@@ -72,9 +72,11 @@ async fn push(
             other => return other,
         }
     } else {
-        tx.write_all(bytes).await.unwrap();
+        // A server that denies the legacy Put may answer and stop reading
+        // before the bytes are written: the write can fail, the answer stands.
+        let _ = tx.write_all(bytes).await;
     }
-    tx.finish().unwrap();
+    let _ = tx.finish();
     wire::recv(&mut rx).await.unwrap()
 }
 

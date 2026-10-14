@@ -11,6 +11,9 @@ fn tmp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!("mycel-rt-{name}-{}", mycel_node::crypto::random_u64()))
 }
 
+/// `port` 0 lets the OS pick when the endpoint binds. Probing for a free port
+/// first raced with parallel tests ("Address already in use"); restarts
+/// re-share addresses with `connect_all`, so no test needs a fixed port.
 async fn open(dir: &std::path::Path, name: &str, port: u16, keeper: bool) -> Arc<Runtime> {
     Runtime::open_with(RuntimeOptions {
         data_dir: dir.to_path_buf(),
@@ -44,16 +47,12 @@ async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
     panic!("timed out waiting for: {what}");
 }
 
-fn free_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn direct_chat_creation_reuses_peer_identity_across_concurrent_calls_and_restart() {
     let (da, db, dc) = (tmp("direct-a"), tmp("direct-b"), tmp("direct-c"));
-    let mut alice = open(&da, "Alice", free_port(), false).await;
-    let bob = open(&db, "Same display name", free_port(), false).await;
-    let charlie = open(&dc, "Same display name", free_port(), false).await;
+    let mut alice = open(&da, "Alice", 0, false).await;
+    let bob = open(&db, "Same display name", 0, false).await;
+    let charlie = open(&dc, "Same display name", 0, false).await;
     let b = alice.add_contact(bob.profile().contact_code).unwrap();
     let c = alice.add_contact(charlie.profile().contact_code).unwrap();
 
@@ -91,7 +90,7 @@ async fn direct_chat_creation_reuses_peer_identity_across_concurrent_calls_and_r
 
     alice.shutdown().await.unwrap();
     drop(alice);
-    alice = open(&da, "Alice", free_port(), false).await;
+    alice = open(&da, "Alice", 0, false).await;
     assert_eq!(alice.create_conversation(None, vec![b.id]).unwrap().id, id);
     assert!(alice.messages(id, None, None).unwrap().iter().any(|m| m.id == message.id));
     alice.shutdown().await.unwrap();
@@ -104,9 +103,8 @@ async fn direct_chat_creation_reuses_peer_identity_across_concurrent_calls_and_r
 #[tokio::test(flavor = "multi_thread")]
 async fn messaging_end_to_end() {
     let (da, db) = (tmp("alice"), tmp("bob"));
-    let (pa, pb) = (free_port(), free_port());
-    let alice = open(&da, "Alice", pa, false).await;
-    let mut bob = open(&db, "Bob", pb, false).await;
+    let alice = open(&da, "Alice", 0, false).await;
+    let mut bob = open(&db, "Bob", 0, false).await;
     connect_all(&[&alice, &bob]);
     let mut bob_events = bob.subscribe();
 
@@ -209,7 +207,7 @@ async fn messaging_end_to_end() {
     bob.shutdown().await.unwrap();
     drop(bob);
     tokio::time::sleep(Duration::from_millis(300)).await;
-    bob = open(&db, "Bob", pb, false).await;
+    bob = open(&db, "Bob", 0, false).await;
     assert_eq!(bob.profile().id, bob_id, "same identity after restart");
     connect_all(&[&alice, &bob]);
     let msgs = bob.messages(conv.id.clone(), None, None).unwrap();
@@ -229,10 +227,9 @@ async fn messaging_end_to_end() {
 #[tokio::test(flavor = "multi_thread")]
 async fn keeper_delivers_while_sender_is_offline() {
     let (da, db, dk) = (tmp("alice"), tmp("bob"), tmp("keeper"));
-    let (pa, pb, pk) = (free_port(), free_port(), free_port());
-    let alice = open(&da, "Alice", pa, false).await;
-    let bob = open(&db, "Bob", pb, false).await;
-    let keeper = open(&dk, "Keeper", pk, true).await;
+    let alice = open(&da, "Alice", 0, false).await;
+    let bob = open(&db, "Bob", 0, false).await;
+    let keeper = open(&dk, "Keeper", 0, true).await;
     connect_all(&[&alice, &bob, &keeper]);
 
     let b = alice.add_contact(bob.profile().contact_code).unwrap();
@@ -258,7 +255,7 @@ async fn keeper_delivers_while_sender_is_offline() {
 
     // Bob comes back: only the keeper is online.
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let bob = open(&db, "Bob", pb, false).await;
+    let bob = open(&db, "Bob", 0, false).await;
     connect_all(&[&bob, &keeper]);
     eventually("bob gets the message from the keeper", || {
         bob.messages(conv.id.clone(), None, None)
@@ -274,9 +271,9 @@ async fn keeper_delivers_while_sender_is_offline() {
 #[tokio::test(flavor = "multi_thread")]
 async fn group_admin_removes_member() {
     let dirs: Vec<PathBuf> = ["a", "b", "c"].iter().map(|n| tmp(n)).collect();
-    let alice = open(&dirs[0], "Alice", free_port(), false).await;
-    let bob = open(&dirs[1], "Bob", free_port(), false).await;
-    let carol = open(&dirs[2], "Carol", free_port(), false).await;
+    let alice = open(&dirs[0], "Alice", 0, false).await;
+    let bob = open(&dirs[1], "Bob", 0, false).await;
+    let carol = open(&dirs[2], "Carol", 0, false).await;
     connect_all(&[&alice, &bob, &carol]);
     let b = alice.add_contact(bob.profile().contact_code).unwrap();
     let c = alice.add_contact(carol.profile().contact_code).unwrap();
@@ -327,8 +324,8 @@ async fn group_admin_removes_member() {
 #[tokio::test(flavor = "multi_thread")]
 async fn declined_and_blocked_strangers_stay_out() {
     let (dm, dv) = (tmp("mallory"), tmp("victim"));
-    let mallory = open(&dm, "Mallory", free_port(), false).await;
-    let victim = open(&dv, "Victim", free_port(), false).await;
+    let mallory = open(&dm, "Mallory", 0, false).await;
+    let victim = open(&dv, "Victim", 0, false).await;
     connect_all(&[&mallory, &victim]);
     // Mallory only needs the victim's public card (e.g. from the LAN).
     let v = mallory.add_contact(victim.profile().contact_code).unwrap();
@@ -363,8 +360,8 @@ fn hash_of(s: &str) -> mycel_node::crypto::Hash32 {
 #[tokio::test(flavor = "multi_thread")]
 async fn contact_code_address_hints_connect_without_discovery() {
     // Local mode: no mDNS, and we deliberately don't call connect_all.
-    let alice = open(&tmp("ha"), "Alice", free_port(), false).await;
-    let bob = open(&tmp("hb"), "Bob", free_port(), false).await;
+    let alice = open(&tmp("ha"), "Alice", 0, false).await;
+    let bob = open(&tmp("hb"), "Bob", 0, false).await;
     let code = bob.profile().contact_code;
     assert!(code.contains('@'), "code carries address hints: {code}");
     let b = alice.add_contact(code).unwrap();
@@ -382,8 +379,8 @@ async fn contact_code_address_hints_connect_without_discovery() {
 
 /// Alice and Bob in an accepted DM.
 async fn dm_pair(tag: &str) -> (Arc<Runtime>, Arc<Runtime>, String) {
-    let alice = open(&tmp(tag), "Alice", free_port(), false).await;
-    let bob = open(&tmp(tag), "Bob", free_port(), false).await;
+    let alice = open(&tmp(tag), "Alice", 0, false).await;
+    let bob = open(&tmp(tag), "Bob", 0, false).await;
     connect_all(&[&alice, &bob]);
     let b = alice.add_contact(bob.profile().contact_code).unwrap();
     let conv = alice.create_conversation(None, vec![b.id]).unwrap();
@@ -602,8 +599,8 @@ async fn voice_call_between_runtimes() {
     use serde_json::json;
 
     let (da, db) = (tmp("call-alice"), tmp("call-bob"));
-    let alice = open(&da, "Alice", free_port(), false).await;
-    let bob = open(&db, "Bob", free_port(), false).await;
+    let alice = open(&da, "Alice", 0, false).await;
+    let bob = open(&db, "Bob", 0, false).await;
     connect_all(&[&alice, &bob]);
     let bob_audio = Arc::new(TestAudio::new(TestSource::Sine { hz: 330.0, amp: 0.5 }));
     alice.calls().set_audio(Arc::new(TestAudio::new(TestSource::Sine { hz: 440.0, amp: 0.5 })));
@@ -699,9 +696,9 @@ async fn group_call_between_runtimes() {
     use serde_json::json;
 
     let dirs: Vec<PathBuf> = ["ga", "gb", "gc"].iter().map(|n| tmp(n)).collect();
-    let alice = open(&dirs[0], "Alice", free_port(), false).await;
-    let bob = open(&dirs[1], "Bob", free_port(), false).await;
-    let carol = open(&dirs[2], "Carol", free_port(), false).await;
+    let alice = open(&dirs[0], "Alice", 0, false).await;
+    let bob = open(&dirs[1], "Bob", 0, false).await;
+    let carol = open(&dirs[2], "Carol", 0, false).await;
     connect_all(&[&alice, &bob, &carol]);
     let tones = [440.0, 660.0, 880.0];
     let audio: Vec<Arc<TestAudio>> =
