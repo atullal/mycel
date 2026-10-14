@@ -1833,13 +1833,37 @@ impl Runtime {
         self.node.send_ephemeral(space, ChatSignal::Typing.encode())
     }
 
+    // Administration of a logical conversation. A direct chat is the
+    // private chat of exactly two people, however many spaces (aliases) it
+    // spans, and no action may split it into a group and a chat:
+    // - add people: starts a new group with both of you and them (as common
+    //   messengers do); the direct chat's history is never shared with them;
+    // - rename, or remove the other person: refused;
+    // - leave: leaves every alias, all or nothing;
+    // - add a keeper: to every alias you administer (keepers aren't people).
+
+    /// Add people to a group. In a direct chat this starts a new group with
+    /// both of you and them instead (announced by `conversationAdded`).
     pub fn add_members(&self, id: ConversationId, members: Vec<PeerId>) -> Result<()> {
         let space = parse_space(&id)?;
-        self.require_admin(&space)?;
         let keys: Vec<MemberKeys> = members
             .iter()
             .map(|m| self.contact_keys(m))
             .collect::<Result<_>>()?;
+        if let Some(direct) = self.direct_of(&space).filter(|d| d.current) {
+            self.require_member(&self.posting_space(&space))?;
+            let peer = self
+                .node
+                .with_space(&space, |r| r.members().into_iter().find(|(k, _)| k.sign_pk == direct.peer).map(|(k, _)| k))?
+                .context("they're no longer in this chat")?;
+            let mut people = vec![peer];
+            people.extend(keys.into_iter().filter(|k| k.sign_pk != direct.peer && k.sign_pk != self.keys.sign_pk()));
+            if people.len() > 1 {
+                self.create_with(None, people)?;
+            }
+            return Ok(());
+        }
+        self.require_admin(&space)?;
         self.node.with_space(&space, |r| -> Result<()> {
             for k in keys {
                 if !r.is_member(&k.sign_pk) {
@@ -1852,35 +1876,81 @@ impl Runtime {
         Ok(())
     }
 
+    /// Add a keeper to every space of the conversation you administer.
     pub fn add_keeper(&self, id: ConversationId, keeper: PeerId) -> Result<()> {
-        let space = parse_space(&id)?;
-        self.require_admin(&space)?;
         let k = self.contact_keys(&keeper)?;
-        self.node.with_space(&space, |r| r.add_member(k, Role::Relay))??;
-        self.touch(space);
+        let spaces: Vec<SpaceId> = self
+            .conversation_spaces(&parse_space(&id)?)
+            .into_iter()
+            .filter(|s| self.my_role(s) == Some(Role::Admin))
+            .collect();
+        if spaces.is_empty() {
+            bail!("only admins can do that");
+        }
+        for space in spaces {
+            self.node.with_space(&space, |r| (!r.is_member(&k.sign_pk)).then(|| r.add_member(k, Role::Relay)))?.transpose()?;
+            self.touch(space);
+        }
         Ok(())
     }
 
     /// Remove someone (admins), or leave (anyone, when `member` is yourself).
+    /// The other person of a direct chat can't be removed.
     pub fn remove_member(&self, id: ConversationId, member: PeerId) -> Result<()> {
         let space = parse_space(&id)?;
         let pk = parse_pk(&member)?;
         if pk == self.keys.sign_pk() {
             return self.leave_conversation(id);
         }
-        self.require_admin(&space)?;
-        self.node.with_space(&space, |r| r.remove_member(pk))??;
-        self.touch(space);
+        if self.direct_of(&space).is_some_and(|d| d.peer == pk) {
+            bail!("a direct chat always has both of you");
+        }
+        // A keeper of a direct chat may be in several of its spaces.
+        let mut spaces: Vec<SpaceId> = self
+            .conversation_spaces(&space)
+            .into_iter()
+            .filter(|s| self.node.with_space(s, |r| r.is_member(&pk)).unwrap_or(false))
+            .collect();
+        if spaces.is_empty() {
+            spaces.push(space);
+        }
+        for s in &spaces {
+            self.require_admin(s)?;
+        }
+        for s in spaces {
+            self.node.with_space(&s, |r| r.remove_member(pk))??;
+            self.touch(s);
+        }
         Ok(())
     }
 
+    /// Leave a conversation: every space of it, so a direct chat can't come
+    /// back through an alias still joined. All or nothing: if you're the last
+    /// admin of any of them, nothing is left.
     pub fn leave_conversation(&self, id: ConversationId) -> Result<()> {
-        let space = parse_space(&id)?;
-        self.node.with_space(&space, |r| r.leave())?
-            .map_err(|e| anyhow!("can't leave: {e} (the last admin must remove others or promote someone first)"))?;
-        // tell everyone before we stop syncing this space
-        let node_space = space;
-        self.touch(node_space);
+        let me = self.keys.sign_pk();
+        let spaces: Vec<SpaceId> = self
+            .conversation_spaces(&parse_space(&id)?)
+            .into_iter()
+            .filter(|s| self.my_role(s).is_some())
+            .collect();
+        if spaces.is_empty() {
+            bail!("can't leave: you're not a member of this conversation");
+        }
+        // The trust layer's rule: someone else must remain an admin.
+        let last_admin = |s: &SpaceId| {
+            self.node
+                .with_space(s, |r| !r.graph().state().members.iter().any(|(pk, m)| *pk != me && m.role.is_admin()))
+                .unwrap_or(true)
+        };
+        if spaces.iter().any(last_admin) {
+            bail!("can't leave: you're the last admin (the last admin must remove others or promote someone first)");
+        }
+        for space in spaces {
+            self.node.with_space(&space, |r| r.leave())?.map_err(|e| anyhow!("can't leave: {e}"))?;
+            // tell everyone before we stop syncing this space
+            self.touch(space);
+        }
         Ok(())
     }
 
@@ -1944,8 +2014,13 @@ impl Runtime {
         Ok(())
     }
 
+    /// Name a group. A direct chat can't be named: that would turn one of
+    /// its spaces into a group and split the chat (start a group instead).
     pub fn rename_conversation(&self, id: ConversationId, title: String) -> Result<()> {
         let space = parse_space(&id)?;
+        if self.direct_of(&space).is_some() {
+            bail!("a direct chat can't be renamed; start a group to give it a name");
+        }
         self.require_admin(&space)?;
         let title = Some(title.trim().to_string()).filter(|t| !t.is_empty());
         self.post(space, ChatOp::Meta { title, direct: false })?;
@@ -2700,6 +2775,67 @@ mod tests {
             chat_thread::canonical_space(&peer.sign_pk, &mine, [low, high].iter().map(|s| (*s, &threads.spaces[s].membership)))
         };
         assert_eq!(peers_choice, Some(high), "the other device picks the same space");
+        finish(runtime, dir).await;
+    }
+
+    #[tokio::test]
+    async fn admin_actions_on_a_merged_direct_chat_never_split_it() {
+        use super::*;
+        let (runtime, dir) = scratch_runtime("admin").await;
+        let peer = DeviceKeys::generate().public();
+        let third = DeviceKeys::generate().public();
+        runtime.contacts.lock().insert(third.sign_pk, StoredContact { keys: third, name: "Third".into() });
+        let (a, b) = (direct_space(&runtime, peer), direct_space(&runtime, peer));
+        say(&runtime, a, "in one alias");
+        say(&runtime, b, "in the other");
+        let (low, high) = (a.min(b), a.max(b));
+        let id = low.to_string();
+        let before = runtime.conversation(high.to_string()).unwrap();
+        assert_eq!((before.id.as_str(), before.aliases.len()), (id.as_str(), 2));
+
+        assert!(runtime.rename_conversation(high.to_string(), "Team".into()).is_err(), "a direct chat isn't named");
+        assert!(runtime.remove_member(id.clone(), hex_id(&peer.sign_pk)).is_err(), "nor loses its other person");
+        // Adding someone starts a new group: no alias gains a member, and the
+        // private history isn't shared with the newcomer.
+        runtime.add_members(high.to_string(), vec![hex_id(&third.sign_pk)]).unwrap();
+        for alias in [low, high] {
+            assert!(!runtime.node.with_space(&alias, |r| r.is_member(&third.sign_pk)).unwrap());
+        }
+        let list = runtime.conversations();
+        assert_eq!(list.len(), 2);
+        let group = list.iter().find(|c| c.id != id).unwrap();
+        assert!(!group.direct);
+        for who in [peer.sign_pk, third.sign_pk] {
+            assert!(group.members.iter().any(|m| m.id == hex_id(&who)));
+        }
+        assert!(runtime.messages(group.id.clone(), None, None).unwrap().is_empty());
+        let after = runtime.conversation(id.clone()).unwrap();
+        assert_eq!((after.aliases, after.thread_key.clone(), after.direct), (before.aliases.clone(), before.thread_key.clone(), true));
+
+        // Leaving is all or nothing: I created both spaces, so I'm the last
+        // admin of each and nothing is left; nor when only one has another.
+        assert!(runtime.leave_conversation(id.clone()).is_err());
+        runtime.node.with_space(&low, |r| r.set_role(peer.sign_pk, Role::Admin)).unwrap().unwrap();
+        runtime.touch(low);
+        assert!(runtime.leave_conversation(id.clone()).is_err());
+        assert!(runtime.my_role(&low).is_some() && runtime.my_role(&high).is_some());
+        runtime.node.with_space(&high, |r| r.set_role(peer.sign_pk, Role::Admin)).unwrap().unwrap();
+        runtime.touch(high);
+        runtime.leave_conversation(high.to_string()).unwrap();
+        for alias in [low, high] {
+            assert!(runtime.my_role(&alias).is_none(), "every alias is left");
+        }
+        // One read-only history of the chat (not a row per alias), which
+        // never comes back as the current chat.
+        let list = runtime.conversations();
+        let history: Vec<_> = list.iter().filter(|c| c.aliases.contains(&id)).collect();
+        assert_eq!(history.len(), 1);
+        assert!(!history[0].active && history[0].aliases.len() == 2);
+        assert_ne!(history[0].thread_key, before.thread_key);
+        assert_eq!(runtime.messages(id.clone(), None, None).unwrap().len(), 2);
+        let again = runtime.create_conversation(None, vec![hex_id(&peer.sign_pk)]).unwrap();
+        assert!(again.id != low.to_string() && again.id != high.to_string());
+        assert_eq!(again.thread_key, before.thread_key, "a new chat with the same person");
         finish(runtime, dir).await;
     }
 
