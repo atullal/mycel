@@ -13,10 +13,12 @@ use data_encoding::BASE64URL_NOPAD;
 use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, SignPk, SymKey, random};
 use mycel_kit_chat::alerts::{self, AlertPolicy, ChatAlert, Latest, ThreadState};
 use mycel_kit_chat::thread::{self as chat_thread, Direct, Membership, Source};
-use mycel_kit_chat::{AttachmentRef, ChatOp, ChatSignal, ChatView, messages_feed, reduce};
+use mycel_kit_chat::{AttachmentRef, ChatOp, ChatSignal, ChatState, ChatView, ProfileHistory, messages_feed};
+#[cfg(test)]
+use mycel_kit_chat::reduce;
 use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallManager};
 use mycel_net::{ContactCard, ExtraProtocol, NetEvent, NetMode, Node, NodeOptions, PathKind, PeerState};
-use mycel_sync::Replica;
+use mycel_sync::{FeedCursor, Replica};
 use mycel_trust::{Role, SpaceId};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -147,7 +149,7 @@ pub struct Runtime {
     next_mode: Mutex<NetworkMode>,
     keeper: bool,
     /// Reduced chat views, invalidated whenever a space changes.
-    views: Mutex<HashMap<SpaceId, Arc<ChatView>>>,
+    views: Mutex<HashMap<SpaceId, Arc<CachedView>>>,
     /// One chat per person: cached per-space facts and the direct-chat index
     /// (rules in `mycel_kit_chat::thread`), so neither events nor listings
     /// reread message history to find a conversation's aliases.
@@ -256,6 +258,15 @@ fn load_set<T: serde::de::DeserializeOwned + Ord>(store: &DbStore, key: &str) ->
         .unwrap_or_default()
         .into_iter()
         .collect())
+}
+
+/// A conversation's view, kept up to date entry by entry: a change costs the
+/// new entries, not the history (`mycel_kit_chat::ChatState`).
+#[derive(Default)]
+struct CachedView {
+    /// New entries may have arrived (set without waiting for `fold`).
+    stale: std::sync::atomic::AtomicBool,
+    fold: Mutex<(ChatState, FeedCursor)>,
 }
 
 /// What the runtime caches per space to group conversations into logical
@@ -1033,17 +1044,49 @@ impl Runtime {
         self.node.with_space(space, |r| r.my_role()).ok().flatten()
     }
 
+    /// A conversation's current view. Catching up folds only the entries that
+    /// arrived since; a late entry that belongs before ones already folded
+    /// takes those back first (`ChatState::rewind`), and only one older than
+    /// the undo window means folding the whole history again.
     fn view(&self, space: &SpaceId) -> Result<Arc<ChatView>> {
-        if let Some(v) = self.views.lock().get(space) {
-            return Ok(v.clone());
-        }
-        let items = self.node.with_space(space, |r| r.feed(&messages_feed()))?;
-        #[cfg(test)]
-        self.history_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let view = Arc::new(reduce(&items));
-        let names_changed = self.learn_profile_names(&items);
-        self.views.lock().insert(*space, view.clone());
-        if names_changed {
+        use std::sync::atomic::Ordering::AcqRel;
+        let cached = self.views.lock().entry(*space).or_insert_with(|| {
+            Arc::new(CachedView { stale: true.into(), ..Default::default() })
+        }).clone();
+        let (view, names) = {
+            let mut fold = cached.fold.lock();
+            if !cached.stale.swap(false, AcqRel) {
+                return Ok(fold.0.view().clone());
+            }
+            let (state, cursor) = &mut *fold;
+            let changes = match self.node.with_space(space, |r| r.feed_changes(&messages_feed(), *cursor)) {
+                Ok(changes) => changes,
+                Err(e) => {
+                    // Not (or no longer) a space here: don't keep an entry.
+                    drop(fold);
+                    self.views.lock().remove(space);
+                    return Err(e);
+                }
+            };
+            let mut names = changes.from < state.len();
+            if changes.from == 0 || !state.rewind(changes.from) {
+                let all = if changes.from == 0 {
+                    changes
+                } else {
+                    self.node.with_space(space, |r| r.feed_changes(&messages_feed(), FeedCursor::default()))?
+                };
+                #[cfg(test)]
+                self.history_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                *state = ChatState::default();
+                names |= state.apply(&all.items);
+                *cursor = all.cursor;
+            } else {
+                names |= state.apply(&changes.items);
+                *cursor = changes.cursor;
+            }
+            (state.view().clone(), names)
+        };
+        if names && self.learn_profiles(&view.profiles) {
             self.emit(Event::ContactsChanged);
             self.emit(Event::NearbyChanged);
             self.emit(Event::NetworkChanged);
@@ -1051,51 +1094,41 @@ impl Runtime {
         Ok(view)
     }
 
+    #[cfg(test)]
     fn learn_profile_names(&self, items: &[mycel_sync::FeedItem]) -> bool {
-        let mut latest = HashMap::new();
-        let mut high_water = HashMap::new();
-        let mut profile_ids = HashSet::new();
-        for item in items {
-            // feed() contains authenticated, accepted envelopes; the signer
-            // can change only its own name, never another peer's contact.
-            if !item.author_role.can_write() { continue; }
-            let Some(ChatOp::Profile { name }) = ChatOp::decode(&item.body) else { continue };
-            let name = name.trim();
-            let mut end = name.len().min(mycel_kit_chat::MAX_NAME);
-            while !name.is_char_boundary(end) { end -= 1; }
-            let name = &name[..end];
-            if name.is_empty() { continue; }
-            profile_ids.insert(item.id);
-            let version = (item.ts_ms, item.id);
-            high_water.entry(item.author).and_modify(|previous: &mut (u64, Hash32)| {
-                *previous = (*previous).max(version);
-            }).or_insert(version);
-            // Feed items are causally ordered. A later update in the same
-            // history wins even when timestamps tie or the clock moves back.
-            latest.insert(item.author, (item.ts_ms, item.id, name.to_owned()));
-        }
+        self.learn_profiles(&reduce(items).profiles)
+    }
+
+    /// Learn the signed names in one conversation. A later name in the same
+    /// history wins even when timestamps tie or the clock moved back; an
+    /// older history replayed can't undo a newer rename.
+    fn learn_profiles(&self, profiles: &HashMap<SignPk, ProfileHistory>) -> bool {
+        // Profiles hold writers' authenticated entries only: the signer can
+        // change only its own name, never another peer's contact.
         let mut versions = self.announced_versions.lock();
         let mut current = self.announced_current.lock();
         let mut names = self.announced.lock();
         let mut changed = false;
-        for (author, (timestamp, id, name)) in latest {
-            let version = (timestamp, id);
-            if current.get(&author).is_none()
-                || versions.get(&author).is_none_or(|previous| version > *previous)
-                || current.get(&author).is_some_and(|previous| id != *previous && profile_ids.contains(previous))
+        for (author, history) in profiles {
+            let (version, id) = (history.latest, history.latest.1);
+            if current.get(author).is_none()
+                || versions.get(author).is_none_or(|previous| version > *previous)
+                || current.get(author).is_some_and(|previous| id != *previous && history.ids.contains(previous))
             {
-                current.insert(author, id);
-                changed |= names.get(&author).is_none_or(|previous| previous != &name);
-                names.insert(author, name);
+                current.insert(*author, id);
+                changed |= names.get(author).is_none_or(|previous| previous != &history.name);
+                names.insert(*author, history.name.clone());
             }
-            let peak = high_water[&author];
-            versions.entry(author).and_modify(|previous| *previous = (*previous).max(peak)).or_insert(peak);
+            let peak = history.high_water;
+            versions.entry(*author).and_modify(|previous| *previous = (*previous).max(peak)).or_insert(peak);
         }
         changed
     }
 
     fn invalidate(&self, space: &SpaceId) {
-        self.views.lock().remove(space);
+        if let Some(cached) = self.views.lock().get(space) {
+            cached.stale.store(true, std::sync::atomic::Ordering::Release);
+        }
         // Reclassified lazily, from the (re)reduced view and, only if a
         // membership op arrived, the membership graph.
         self.threads.lock().dirty.insert(*space);
@@ -1677,11 +1710,7 @@ impl Runtime {
             }
         }
         let view = self.view(&space)?;
-        let m = view
-            .messages
-            .iter()
-            .find(|m| m.id == msg_id)
-            .context("message was rejected")?;
+        let m = &view.messages[view.index_of(&msg_id).context("message was rejected")?];
         Ok(self.message_view(&space, &view, m, &HashSet::new()))
     }
 
@@ -1857,7 +1886,7 @@ impl Runtime {
     fn own_message(&self, space: &SpaceId, msg: &str) -> Result<Hash32> {
         let id = parse_hash(msg)?;
         let view = self.view(space)?;
-        let m = view.messages.iter().find(|m| m.id == id).context("unknown message")?;
+        let m = &view.messages[view.index_of(&id).context("unknown message")?];
         if m.author != self.keys.sign_pk() {
             bail!("you can only change your own messages");
         }
@@ -1924,7 +1953,7 @@ impl Runtime {
         self.require_member(&space)?;
         let target = parse_hash(&message)?;
         let view = self.view(&space)?;
-        let m = view.messages.iter().find(|m| m.id == target).context("unknown message")?;
+        let m = &view.messages[view.index_of(&target).context("unknown message")?];
         let on = !m
             .reactions
             .get(&emoji)
@@ -3438,12 +3467,14 @@ mod tests {
             assert!(runtime.message_entries(&space).is_ok());
         }
         assert_eq!(runtime.history_reads.load(Relaxed), reads, "no history was reread");
-        // A new message rereads only its own space's history.
+        // A new message is folded in on its own: no history is reread.
         let space = runtime.node.space_ids()[0];
         say(&runtime, space, "new");
         runtime.emit(Event::ConversationUpdated { conversation: space.to_string() });
         runtime.conversations();
-        assert_eq!(runtime.history_reads.load(Relaxed), reads + 1);
+        let latest = runtime.messages(space.to_string(), Some(1), None).unwrap();
+        assert_eq!(latest[0].body, "new");
+        assert_eq!(runtime.history_reads.load(Relaxed), reads);
         finish(runtime, dir).await;
     }
 
