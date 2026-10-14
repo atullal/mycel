@@ -19,6 +19,7 @@ impl Runtime {
     pub fn contacts(&self) -> Vec<Contact>;
     pub fn nearby(&self) -> Vec<NearbyPeer>;
     pub fn network_status(&self) -> NetworkStatus;
+    pub fn notices(&self) -> Vec<Notice>;                                  // problems to tell the user about
 
     // messaging (chat kit)
     pub fn conversations(&self) -> Vec<ConversationSummary>;               // newest activity first
@@ -71,6 +72,7 @@ impl Runtime {
 | `list_contacts` | — | `Contact[]` |
 | `list_nearby` | — | `NearbyPeer[]` |
 | `network_status` | — | `NetworkStatus` |
+| `list_notices` | — | `Notice[]` |
 | `list_conversations` | — | `ConversationSummary[]` |
 | `get_conversation` | `{ id }` | `ConversationSummary` |
 | `create_conversation` | `{ title?, members }` | `ConversationSummary` |
@@ -103,7 +105,9 @@ impl Runtime {
 
 Errors are rejected promises carrying a human-readable string. It includes the cause, e.g. `macOS didn't let Mycel read /Users/me/Desktop/x.mov. Allow Mycel in System Settings > Privacy & Security > Files and Folders …: Operation not permitted (os error 1)`.
 
-**Event:** the Tauri event `mycel://event` carries one `Event` (tagged by `type`): `conversationUpdated`, `conversationAdded`, `typing`, `contactsChanged`, `nearbyChanged`, `networkChanged`, `blobReady`, `transferProgress`, `callIncoming`, `callUpdated`.
+**Event:** the Tauri event `mycel://event` carries one `Event` (tagged by `type`): `conversationUpdated`, `conversationAdded`, `typing`, `contactsChanged`, `nearbyChanged`, `networkChanged`, `blobReady`, `transferProgress`, `callIncoming`, `callUpdated`, `noticesChanged`.
+
+**Notices** (`list_notices`, tagged by `kind`): `identityReplaced { keptIn }` (a new identity was started; the old profile is kept in that folder), `networkModeReset` (the saved network choice was unreadable: local paths only), `recordsSetAside { count }` (unreadable stored records were set aside, not deleted), `storageFailing { error }` (saving is failing and being retried; listed while it lasts). The first three come from startup and are never announced by an event, so a UI fetches the list once when it starts and again on `noticesChanged`.
 
 **Shell-only events** (hosts consume them and never forward them to apps): `alert { alert: { kind, thread, key, target, foreground } }` and `alertWithdrawn { thread, key? }`. The chat layer decides what is news (`mycel_kit_chat::alerts`: a new message from someone else, a message request, a group invitation, a call ringing or missed) and when it's stale (read here, answered, declined). `kind` is one of `message`, `messageRequest`, `groupInvitation`, `incomingCall`, `missedCall`; the strings are opaque local keys, never names or text. A native shell shows one fixed sentence per kind, replaces an alert with the same `key`, withdraws a thread's alerts together, and suppresses alerts while the app is focused on their thread (`Runtime::alert_thread(context)` maps what the app shows to a thread) or, when `foreground` is false, while the app is focused at all (it rings calls itself). A tap resolves `target` again through `Runtime::alert_route(target)`.
 

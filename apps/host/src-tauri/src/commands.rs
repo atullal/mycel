@@ -11,7 +11,7 @@
 
 use mycel_node::api::{
     CallInfo, Contact, ConversationId, ConversationSummary, MessageId, MessageView, NearbyPeer,
-    NetworkMode, NetworkStatus, PeerId, Profile,
+    NetworkMode, NetworkStatus, Notice, PeerId, Profile,
 };
 use tauri::{AppHandle, State};
 
@@ -67,6 +67,13 @@ pub async fn list_nearby(rt: State<'_, Rt>) -> Res<Vec<NearbyPeer>> {
 #[tauri::command]
 pub async fn network_status(rt: State<'_, Rt>) -> Res<NetworkStatus> {
     Ok(rt.network_status())
+}
+
+/// Problems to tell the user about. Startup ones have no event: the UI
+/// fetches this once when it starts, then on `noticesChanged`.
+#[tauri::command]
+pub async fn list_notices(rt: State<'_, Rt>) -> Res<Vec<Notice>> {
+    Ok(rt.notices())
 }
 
 #[tauri::command]

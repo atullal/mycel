@@ -23,6 +23,7 @@ import type {
   NearbyPeer,
   NetworkMode,
   NetworkStatus,
+  Notice,
   PathKind,
   PeerId,
   Profile,
@@ -40,6 +41,8 @@ export interface MockOptions {
   replies?: boolean;
   /** Network mode reported by `network_status`. Default "lan". */
   mode?: NetworkMode;
+  /** What `list_notices` reports (startup recoveries, a failing disk). Default none. */
+  notices?: Notice[];
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +248,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     ambient: options.ambient ?? true,
     replies: options.replies ?? true,
     mode: options.mode ?? ("lan" as NetworkMode),
+    notices: options.notices ?? [],
   };
 
   const meId = hexFrom(`peer:me:${opts.name}`);
@@ -1223,6 +1227,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     list_nearby: (): NearbyPeer[] =>
       [...people.values()].filter((p) => p.nearby).map((p) => ({ id: p.id, name: p.name, isContact: p.contact })),
     restart_app: () => null,
+    list_notices: () => opts.notices.map((n) => ({ ...n })),
     set_network_mode: ({ mode }): NetworkStatus => {
       nextMode = mode;
       emit({ type: "networkChanged" });
