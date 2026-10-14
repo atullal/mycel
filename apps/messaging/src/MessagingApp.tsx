@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useCalls, useContacts, useConversations, useMycel, useProfile } from "@mycel/sdk/react";
-import type { Contact } from "@mycel/sdk";
+import { isConversation, threadKeyOf, type Contact } from "@mycel/sdk";
 import { ConversationList } from "./ConversationList.tsx";
 import { ChatView } from "./ChatView.tsx";
 import { NewConversationDialog } from "./NewConversation.tsx";
@@ -88,7 +88,7 @@ export function MessagingApp({ initialConversation, onOpenContacts, visible = tr
   useEffect(() => {
     if (loading || validated.current) return;
     validated.current = true;
-    if (selected && !conversations.some((c) => c.id === selected || c.aliases?.includes(selected))) setSelected(null);
+    if (selected && !conversations.some((c) => isConversation(c, selected))) setSelected(null);
   }, [loading, conversations, selected]);
 
   const select = useCallback((id: string | null) => {
@@ -120,7 +120,7 @@ export function MessagingApp({ initialConversation, onOpenContacts, visible = tr
     return () => window.removeEventListener("popstate", onPop);
   }, [select]);
 
-  const current = conversations.find((c) => c.id === selected || (selected != null && c.aliases?.includes(selected))) ?? null;
+  const current = conversations.find((c) => isConversation(c, selected)) ?? null;
   // A late-arriving duplicate may choose a different canonical space. Keep
   // the current person selected without discarding the underlying histories.
   useEffect(() => {
@@ -172,7 +172,7 @@ export function MessagingApp({ initialConversation, onOpenContacts, visible = tr
         )}
         {current ? (
           <ChatView
-            key={current.threadKey ?? current.id}
+            key={threadKeyOf(current)}
             summary={current}
             me={profile?.id}
             contactsById={contactsById}
@@ -199,7 +199,7 @@ export function MessagingApp({ initialConversation, onOpenContacts, visible = tr
       </main>
       {current && membersOpen && (
         <MembersPanel
-          key={current.threadKey ?? current.id}
+          key={threadKeyOf(current)}
           conversationId={current.id}
           contacts={contacts}
           onClose={() => setMembersOpen(false)}

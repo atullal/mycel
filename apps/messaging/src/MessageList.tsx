@@ -29,7 +29,8 @@ interface Props {
   loading: boolean;
   error: Error | null;
   hasMore: boolean;
-  onLoadOlder: () => void;
+  /** One more page, or `count` more messages. */
+  onLoadOlder: (count?: number) => void;
   onReply?: (m: MessageView) => void;
   onEdit?: (m: MessageView) => void;
   editingId: string | null;
@@ -95,6 +96,11 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
     onLoadOlder();
   };
 
+  // Going to a message that isn't loaded (a search hit far back): double
+  // what's loaded each step, so reaching it takes a few fetches, not one
+  // per page. (Each fetch returns the whole window.)
+  const loadedCount = messages.length;
+
   const jumpTo = (id: string) => {
     const node = scroller.current?.querySelector(`[data-mid="${id}"]`);
     if (!node) return;
@@ -109,9 +115,9 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
       stickToBottom.current = false;
       jumpTo(jumpToId);
       onJumped?.();
-    } else if (hasMore) onLoadOlder();
+    } else if (hasMore) onLoadOlder(Math.max(loadedCount, 1));
     else onJumped?.();
-  }, [jumpToId, byId, loading, error, hasMore, onLoadOlder, onJumped]);
+  }, [jumpToId, byId, loading, error, hasMore, onLoadOlder, onJumped, loadedCount]);
 
   return (
     <div className="mx-messages-area">
