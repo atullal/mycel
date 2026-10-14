@@ -45,6 +45,18 @@ export interface Member {
 
 export interface ConversationSummary {
   id: ConversationId;
+  /**
+   * Every encrypted space shown as this conversation, including `id` (a
+   * direct chat both sides started at once has two). Empty from runtimes
+   * that predate aliases; `isConversation()` handles both.
+   */
+  aliases: ConversationId[];
+  /**
+   * Stable UI identity across late-arriving direct-chat aliases; never a
+   * space id. Empty ("") from runtimes that predate it: use
+   * `threadKeyOf()`, which falls back to `id`.
+   */
+  threadKey: string;
   title: string;
   /** True for a 1:1 conversation. */
   direct: boolean;
@@ -102,6 +114,15 @@ export interface MessageView {
   isMine: boolean;
   /** Only meaningful for my own messages. */
   delivery: Delivery;
+}
+
+/** Messages around one (`messages_around`), oldest -> newest. */
+export interface MessageWindow {
+  messages: MessageView[];
+  /** Older messages exist before the window. */
+  hasEarlier: boolean;
+  /** Newer messages exist after it (the window doesn't reach the latest). */
+  hasLater: boolean;
 }
 
 /**
@@ -415,6 +436,26 @@ export interface VideoInfo {
 }
 
 /**
+ * Something the user should know about: a problem Mycel recovered from at
+ * startup, or one that is still going on. `list_notices` returns the current
+ * ones; a `noticesChanged` event says the list changed. Tagged by `kind`.
+ */
+export type Notice =
+  /**
+   * This profile's identity isn't on this device (the profile was restored
+   * or moved from another device), so Mycel started a new identity: contacts
+   * need the new contact code. The old profile is kept, unchanged, in the
+   * folder `keptIn`.
+   */
+  | { kind: "identityReplaced"; keptIn: string }
+  /** The saved network choice couldn't be read: local paths only until another is chosen. */
+  | { kind: "networkModeReset" }
+  /** `count` saved records couldn't be read and were set aside (kept, not deleted). */
+  | { kind: "recordsSetAside"; count: number }
+  /** Saving to this device is failing (storage full, say). Mycel keeps retrying; sending waits. */
+  | { kind: "storageFailing"; error: string };
+
+/**
  * - `upload`: encrypting an attachment we're sending.
  * - `download`: downloading an attachment someone sent.
  */
@@ -441,7 +482,9 @@ export type MycelEvent =
   /** Someone is calling: show Accept / Decline. */
   | { type: "callIncoming"; call: CallInfo }
   /** A call changed (state, path, bitrate, mute); ~10x a second while active, for duration and meters. */
-  | { type: "callUpdated"; call: CallInfo };
+  | { type: "callUpdated"; call: CallInfo }
+  /** The list of `Notice`s changed: fetch it again (`list_notices`). */
+  | { type: "noticesChanged" };
 
 /** Alias matching the Rust name. */
 export type Event = MycelEvent;
@@ -463,4 +506,5 @@ export const EVENT_TYPES: readonly EventType[] = [
   "transferProgress",
   "callIncoming",
   "callUpdated",
+  "noticesChanged",
 ] as const;

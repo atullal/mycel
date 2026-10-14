@@ -3,9 +3,11 @@
 //!
 //! | link         | what                                                     | where          |
 //! |--------------|----------------------------------------------------------|----------------|
-//! | `awdl`       | Apple peer-to-peer Wi-Fi                                  | macOS          |
-//! | `ble`        | Bluetooth LE (CoreBluetooth / BlueZ, wire-compatible)     | macOS, Linux   |
-//! | `iface`      | any other network interface: UWB / 802.15.4, Thread,      | macOS, Linux   |
+//! | `awdl`       | Apple peer-to-peer Wi-Fi                                  | macOS, iOS     |
+//! | `ble`        | Bluetooth LE (CoreBluetooth / BlueZ, wire-compatible)     | macOS, iOS,    |
+//! |              |                                                           | Linux          |
+//! | `iface`      | any other network interface: UWB / 802.15.4, Thread,      | Unix (incl.    |
+//! |              |                                                           | iOS, Android)  |
 //! |              | Wi-Fi Direct and mesh groups, cables, a second NIC        |                |
 //! | `wifidirect` | also *form* Wi-Fi Direct groups (wpa_supplicant); opt-in  | Linux          |
 //!
@@ -33,7 +35,7 @@ pub fn mesh_options() -> Option<MeshOptions> {
 }
 
 /// Links this platform has, in the order they start.
-const PLATFORM: &[&str] = if cfg!(target_os = "macos") {
+const PLATFORM: &[&str] = if cfg!(any(target_os = "macos", target_os = "ios")) {
     &["awdl", "ble", "iface"]
 } else if cfg!(target_os = "linux") {
     &["ble", "iface", "wifidirect"]

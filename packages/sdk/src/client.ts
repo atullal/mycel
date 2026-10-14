@@ -13,19 +13,46 @@ import type {
   EventType,
   MessageId,
   MessageView,
+  MessageWindow,
   MycelEvent,
   NearbyPeer,
   NetworkMode,
   NetworkStatus,
+  Notice,
   PeerId,
   Profile,
 } from "./types.ts";
+
+/**
+ * Android only lets an app's screen ask for the microphone, so the native
+ * runtime can't. The web view can: getUserMedia brings up the system prompt
+ * (MainActivity's web view turns it into the app's permission), and the call
+ * audio then runs natively. If the user says no, the runtime's error says
+ * where to allow it.
+ */
+async function askForMicrophone(transport: Transport): Promise<void> {
+  if (transport.kind !== "tauri" || typeof navigator === "undefined") return;
+  if (!/Android/.test(navigator.userAgent) || !navigator.mediaDevices?.getUserMedia) return;
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    for (const track of stream.getTracks()) track.stop();
+  } catch {
+    /* denied or dismissed: start_call explains */
+  }
+}
 
 export interface MessagesOptions {
   /** Return at most this many messages (the newest ones before `before`). */
   limit?: number;
   /** Only messages strictly older than this one. */
   before?: MessageId;
+}
+
+export interface AroundOptions {
+  /** At most this many messages before the one asked for. */
+  before?: number;
+  /** At most this many after it. */
+  after?: number;
 }
 
 export interface SendOptions {
@@ -51,7 +78,7 @@ export interface Mycel {
     list(): Promise<Contact[]>;
     /** `add_contact`: add someone from their contact code. */
     add(code: string): Promise<Contact>;
-    /** `add_nearby_contact`: fetch a nearby person's card over the LAN and add them. */
+    /** `add_nearby_contact`: fetch a nearby person's card over an available direct path and add them. */
     addNearby(id: PeerId): Promise<Contact>;
     /** `remove_contact` */
     remove(id: PeerId): Promise<void>;
@@ -71,6 +98,16 @@ export interface Mycel {
     restart(): Promise<null>;
   };
 
+  notices: {
+    /**
+     * `list_notices`: problems to tell the user about. Some exist only from
+     * startup, so fetch once when the UI starts and again on `noticesChanged`.
+     */
+    list(): Promise<Notice[]>;
+    /** `dismiss_notice`: the user has seen it; it stops showing, across restarts too. */
+    dismiss(notice: Notice): Promise<null>;
+  };
+
   chat: {
     /** `list_conversations` (newest activity first) */
     list(): Promise<ConversationSummary[]>;
@@ -78,14 +115,26 @@ export interface Mycel {
     get(id: ConversationId): Promise<ConversationSummary>;
     /** `create_conversation`: one member and no title makes a direct conversation. */
     create(title: string | null | undefined, members: PeerId[]): Promise<ConversationSummary>;
-    /** `list_messages` (oldest -> newest) */
+    /**
+     * `list_messages` (oldest -> newest): the newest messages, or with
+     * `before` the newest older than that one. Page back with the oldest
+     * returned message as the next `before`; each page costs its own size.
+     */
     messages(id: ConversationId, opts?: MessagesOptions): Promise<MessageView[]>;
+    /** `messages_around`: a window around one message, at any depth (a search hit, a quoted message). */
+    around(id: ConversationId, message: MessageId, opts?: AroundOptions): Promise<MessageWindow>;
     /** `send_message`: resolves once written locally (`delivery: "local"`). */
     send(id: ConversationId, body: string, opts?: SendOptions): Promise<MessageView>;
     /** `edit_message` (author only) */
     edit(id: ConversationId, message: MessageId, body: string): Promise<void>;
     /** `delete_message` (author only) */
     delete(id: ConversationId, message: MessageId): Promise<void>;
+    /** Hide only on this device; no conversation operation is sent. */
+    deleteLocal(id: ConversationId, message: MessageId): Promise<void>;
+    /** Undo local hiding; cannot undo a Delete for everyone tombstone. */
+    restoreLocal(id: ConversationId, message: MessageId): Promise<void>;
+    /** Search all synchronized visible messages, newest match first. */
+    search(id: ConversationId, query: string, limit?: number): Promise<MessageView[]>;
     /** `toggle_reaction` */
     react(id: ConversationId, message: MessageId, emoji: string): Promise<void>;
     /** `mark_read` */
@@ -135,8 +184,11 @@ export interface Mycel {
      * prompt; if they say no it rejects, and `video.error` says where to allow it.
      */
     setCamera(call: CallId, on: boolean): Promise<CallInfo>;
-    /** `video_keyframe`: our video decoders lost their place; get fresh keyframes. */
-    requestKeyframe(call: CallId): Promise<void>;
+    /**
+     * `video_keyframe`: a video decoder lost its place; get a fresh keyframe
+     * for the self-view (`"local"`), from the others (`"remote"`), or both.
+     */
+    requestKeyframe(call: CallId, source?: "local" | "remote"): Promise<void>;
     /**
      * Encoded video frames as they arrive: everyone's video (one stream per
      * person, `frame.peer` says whose) and our self-view. Decode them with
@@ -218,6 +270,10 @@ export function createMycel(transport: Transport): Mycel {
       setMode: (mode) => call("set_network_mode", { mode }),
       restart: () => call("restart_app", none),
     },
+    notices: {
+      list: () => call("list_notices", none),
+      dismiss: (notice) => call("dismiss_notice", { notice }),
+    },
     chat: {
       list: () => call("list_conversations", none),
       get: (id) => call("get_conversation", { id }),
@@ -228,6 +284,12 @@ export function createMycel(transport: Transport): Mycel {
         if (opts.before != null) args.before = opts.before;
         return call("list_messages", args);
       },
+      around: (id, message, opts = {}) => {
+        const args: ArgsOf<"messages_around"> = { id, message };
+        if (opts.before != null) args.before = opts.before;
+        if (opts.after != null) args.after = opts.after;
+        return call("messages_around", args);
+      },
       send: (id, body, opts = {}) => {
         const args: ArgsOf<"send_message"> = { id, body };
         if (opts.replyTo != null) args.replyTo = opts.replyTo;
@@ -236,6 +298,9 @@ export function createMycel(transport: Transport): Mycel {
       },
       edit: (id, message, body) => call("edit_message", { id, message, body }).then(done),
       delete: (id, message) => call("delete_message", { id, message }).then(done),
+      deleteLocal: (id, message) => call("delete_message_local", { id, message }).then(done),
+      restoreLocal: (id, message) => call("restore_message_local", { id, message }).then(done),
+      search: (id, query, limit) => call("search_messages", limit == null ? { id, query } : { id, query, limit }),
       react: (id, message, emoji) => call("toggle_reaction", { id, message, emoji }).then(done),
       markRead: (id) => call("mark_read", { id }).then(done),
       typing: (id) => call("set_typing", { id }).then(done),
@@ -249,11 +314,14 @@ export function createMycel(transport: Transport): Mycel {
         call("decline_request", opts.block ? { id, block: true } : { id }).then(done),
     },
     calls: {
-      start: (conversation, opts) => call("start_call", { conversation, video: opts?.video ?? false }),
-      accept: (id, opts) => call("accept_call", { call: id, video: opts?.video ?? false }),
-      join: (id, opts) => call("accept_call", { call: id, video: opts?.video ?? false }),
+      start: (conversation, opts) =>
+        askForMicrophone(transport).then(() => call("start_call", { conversation, video: opts?.video ?? false })),
+      accept: (id, opts) =>
+        askForMicrophone(transport).then(() => call("accept_call", { call: id, video: opts?.video ?? false })),
+      join: (id, opts) =>
+        askForMicrophone(transport).then(() => call("accept_call", { call: id, video: opts?.video ?? false })),
       setCamera: (id, on) => call("set_camera", { call: id, on }),
-      requestKeyframe: (id) => call("video_keyframe", { call: id }).then(done),
+      requestKeyframe: (id, source) => call("video_keyframe", source ? { call: id, source } : { call: id }).then(done),
       onVideo: (handler) => {
         videoHandlers.add(handler);
         if (!stopVideo && transport.video) {

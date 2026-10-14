@@ -1,6 +1,8 @@
-//! macOS audio: Apple's voice-processing I/O unit (AUVoiceProcessingIO, the
-//! one FaceTime uses) for echo cancellation, noise suppression and gain
-//! control, plus the microphone permission check.
+//! Apple audio (macOS, iOS, iPadOS): Apple's voice-processing I/O unit
+//! (AUVoiceProcessingIO, the one FaceTime uses) for echo cancellation, noise
+//! suppression and gain control, plus the microphone permission check. On
+//! iPhone and iPad the app's audio session must also be switched to
+//! play-and-record for the call.
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -112,12 +114,71 @@ impl AudioIo for VoiceProcessingAudio {
     }
 
     fn open(&self, ports: AudioPorts) -> Result<AudioHandle> {
-        match VoiceUnit::start(ports) {
-            Ok(unit) => Ok(AudioHandle::new(unit)),
+        #[cfg(target_os = "ios")]
+        let session = CallSession::activate()?;
+        let handle = match VoiceUnit::start(ports) {
+            Ok(unit) => AudioHandle::new(unit),
             Err((e, ports)) => {
                 eprintln!("[mycel] voice processing unavailable ({e:#}); using plain audio devices");
-                DeviceAudio.open(ports)
+                DeviceAudio.open(ports)?
             }
+        };
+        // The session ends after the unit stops (fields drop in order).
+        #[cfg(target_os = "ios")]
+        let handle = AudioHandle::new((handle, session));
+        Ok(handle)
+    }
+}
+
+// ─────────────────────────── iOS audio session ───────────────────────────
+
+/// While a call runs: the app's audio session in play-and-record, voice chat
+/// mode (the system's call tuning), on the loudspeaker unless headphones or
+/// a Bluetooth headset are connected. Dropping it hands audio back to other
+/// apps.
+#[cfg(target_os = "ios")]
+struct CallSession;
+
+#[cfg(target_os = "ios")]
+impl CallSession {
+    fn session() -> Result<&'static objc2::runtime::AnyObject> {
+        let cls = AnyClass::get(c"AVAudioSession").ok_or_else(|| anyhow!("no AVAudioSession"))?;
+        // SAFETY: +[AVAudioSession sharedInstance] returns the process-wide
+        // session, which lives as long as the app.
+        let session: *mut objc2::runtime::AnyObject = unsafe { msg_send![cls, sharedInstance] };
+        // SAFETY: a valid object or nil.
+        unsafe { session.as_ref() }.ok_or_else(|| anyhow!("no audio session"))
+    }
+
+    fn activate() -> Result<CallSession> {
+        let session = Self::session()?;
+        let category = NSString::from_str("AVAudioSessionCategoryPlayAndRecord");
+        let mode = NSString::from_str("AVAudioSessionModeVoiceChat");
+        // AllowBluetooth (0x4) | DefaultToSpeaker (0x8)
+        let options: usize = 0x4 | 0x8;
+        let no_error = std::ptr::null_mut::<*mut objc2::runtime::AnyObject>();
+        // SAFETY: -setCategory:mode:options:error: and -setActive:error: take
+        // NSStrings, an NSUInteger, a BOOL and an optional NSError** (NULL).
+        let ok: Bool = unsafe { msg_send![session, setCategory: &*category, mode: &*mode, options: options, error: no_error] };
+        if !ok.as_bool() {
+            bail!("couldn't set up audio for the call");
+        }
+        let ok: Bool = unsafe { msg_send![session, setActive: Bool::YES, error: no_error] };
+        if !ok.as_bool() {
+            bail!("couldn't start audio for the call (is another app using the microphone?)");
+        }
+        Ok(CallSession)
+    }
+}
+
+#[cfg(target_os = "ios")]
+impl Drop for CallSession {
+    fn drop(&mut self) {
+        if let Ok(session) = Self::session() {
+            let no_error = std::ptr::null_mut::<*mut objc2::runtime::AnyObject>();
+            // NotifyOthersOnDeactivation (1): music apps may resume.
+            // SAFETY: -setActive:withOptions:error: with a NULL NSError**.
+            let _: Bool = unsafe { msg_send![session, setActive: Bool::NO, withOptions: 1usize, error: no_error] };
         }
     }
 }

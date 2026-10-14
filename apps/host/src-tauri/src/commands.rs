@@ -10,8 +10,8 @@
 //! main (UI) thread.
 
 use mycel_node::api::{
-    CallInfo, Contact, ConversationId, ConversationSummary, MessageId, MessageView, NearbyPeer,
-    NetworkMode, NetworkStatus, PeerId, Profile,
+    CallInfo, Contact, ConversationId, ConversationSummary, MessageId, MessageView, MessageWindow, NearbyPeer,
+    NetworkMode, NetworkStatus, Notice, PeerId, Profile,
 };
 use tauri::{AppHandle, State};
 
@@ -69,6 +69,19 @@ pub async fn network_status(rt: State<'_, Rt>) -> Res<NetworkStatus> {
     Ok(rt.network_status())
 }
 
+/// Problems to tell the user about. Startup ones have no event: the UI
+/// fetches this once when it starts, then on `noticesChanged`.
+#[tauri::command]
+pub async fn list_notices(rt: State<'_, Rt>) -> Res<Vec<Notice>> {
+    Ok(rt.notices())
+}
+
+/// The user has seen a notice: it stops showing, across restarts too.
+#[tauri::command]
+pub async fn dismiss_notice(rt: State<'_, Rt>, notice: Notice) -> Res<()> {
+    rt.dismiss_notice(notice).map_err(err)
+}
+
 #[tauri::command]
 pub async fn set_network_mode(rt: State<'_, Rt>, mode: NetworkMode) -> Res<NetworkStatus> {
     rt.set_network_mode(mode).map_err(err)
@@ -78,6 +91,13 @@ pub async fn set_network_mode(rt: State<'_, Rt>, mode: NetworkMode) -> Res<Netwo
 #[tauri::command]
 pub fn restart_app(app: tauri::AppHandle) {
     app.restart();
+}
+
+/// Open a downloaded attachment: the share sheet on iPhone and iPad, an
+/// "Open with" chooser on Android, the default app on a computer.
+#[tauri::command]
+pub async fn open_file(app: AppHandle, rt: State<'_, Rt>, path: String) -> Res<()> {
+    crate::open_file::open(&app, rt.data_dir(), &path)
 }
 
 // ---------------------------------------------------------------- messaging
@@ -112,6 +132,17 @@ pub async fn list_messages(
 }
 
 #[tauri::command]
+pub async fn messages_around(
+    rt: State<'_, Rt>,
+    id: ConversationId,
+    message: MessageId,
+    before: Option<u32>,
+    after: Option<u32>,
+) -> Res<MessageWindow> {
+    rt.messages_around(id, message, before, after).map_err(err)
+}
+
+#[tauri::command]
 pub async fn send_message(
     rt: State<'_, Rt>,
     id: ConversationId,
@@ -137,6 +168,21 @@ pub async fn edit_message(
 #[tauri::command]
 pub async fn delete_message(rt: State<'_, Rt>, id: ConversationId, message: MessageId) -> Res<()> {
     rt.delete_message(id, message).map_err(err)
+}
+
+#[tauri::command]
+pub async fn delete_message_local(rt: State<'_, Rt>, id: ConversationId, message: MessageId) -> Res<()> {
+    rt.delete_message_local(id, message).map_err(err)
+}
+
+#[tauri::command]
+pub async fn restore_message_local(rt: State<'_, Rt>, id: ConversationId, message: MessageId) -> Res<()> {
+    rt.restore_message_local(id, message).map_err(err)
+}
+
+#[tauri::command]
+pub async fn search_messages(rt: State<'_, Rt>, id: ConversationId, query: String, limit: Option<u32>) -> Res<Vec<MessageView>> {
+    rt.search_messages(id, query, limit).map_err(err)
 }
 
 #[tauri::command]
@@ -205,17 +251,42 @@ pub async fn fetch_attachment(rt: State<'_, Rt>, blob: String) -> Res<String> {
 /// carries its URI-encoded name. Returns the path to pass in `attachments`.
 #[tauri::command]
 pub async fn stage_file(rt: State<'_, Rt>, request: tauri::ipc::Request<'_>) -> Res<String> {
-    let tauri::ipc::InvokeBody::Raw(data) = request.body() else {
-        return Err("stage_file expects the file's bytes as the request body".into());
-    };
-    let name = request
-        .headers()
-        .get("x-mycel-name")
-        .and_then(|v| v.to_str().ok())
-        .map(percent_decode)
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| "pasted".into());
-    rt.stage_upload(&name, data).await.map_err(err)
+    let data = body_bytes(&request, "stage_file")?;
+    let header = |name: &str| request.headers().get(name).and_then(|v| v.to_str().ok()).map(percent_decode);
+    // Files arrive in pieces (the SDK's `files.stage`): the rest go onto the staged file.
+    if let Some(path) = header("x-mycel-append").filter(|p| !p.is_empty()) {
+        let uploads = std::fs::canonicalize(rt.data_dir().join("uploads")).map_err(err)?;
+        let file = std::fs::canonicalize(&path).map_err(err)?;
+        if !file.starts_with(&uploads) {
+            return Err("can only add to a staged upload".into());
+        }
+        let data = data.into_owned();
+        tauri::async_runtime::spawn_blocking(move || {
+            use std::io::Write;
+            std::fs::OpenOptions::new().append(true).open(&file)?.write_all(&data)
+        })
+        .await
+        .map_err(err)?
+        .map_err(err)?;
+        return Ok(path);
+    }
+    let name = header("x-mycel-name").filter(|n| !n.is_empty()).unwrap_or_else(|| "pasted".into());
+    rt.stage_upload(&name, &data).await.map_err(err)
+}
+
+/// The bytes of a binary command: the raw request body from desktop and iOS
+/// web views; Android's IPC only carries JSON, so there they arrive as
+/// `{"base64": "..."}` (the SDK's `invokeBytes`).
+fn body_bytes<'a>(request: &'a tauri::ipc::Request<'_>, cmd: &str) -> Res<std::borrow::Cow<'a, [u8]>> {
+    match request.body() {
+        tauri::ipc::InvokeBody::Raw(data) => Ok(std::borrow::Cow::Borrowed(data)),
+        tauri::ipc::InvokeBody::Json(v) => v
+            .get("base64")
+            .and_then(|b| b.as_str())
+            .and_then(|b| data_encoding::BASE64.decode(b.as_bytes()).ok())
+            .map(std::borrow::Cow::Owned)
+            .ok_or_else(|| format!("{cmd} expects the bytes as the request body (or base64)")),
+    }
 }
 
 fn percent_decode(s: &str) -> String {
@@ -256,8 +327,65 @@ pub async fn set_camera(rt: State<'_, Rt>, call: String, on: bool) -> Res<CallIn
 }
 
 #[tauri::command]
-pub async fn video_keyframe(rt: State<'_, Rt>, call: String) -> Res<()> {
-    rt.video_keyframe(call).map_err(err)
+pub async fn video_keyframe(rt: State<'_, Rt>, call: String, source: Option<String>) -> Res<()> {
+    rt.video_keyframe(call, source).map_err(err)
+}
+
+/// Android, Windows, Linux: the web view captures and encodes our camera
+/// (`mycel_video::web`). While a call has the camera on this says what to
+/// encode to; `null` means don't capture (camera off, or an Apple device,
+/// which uses its own camera).
+#[tauri::command]
+pub async fn video_targets() -> Res<Option<mycel_node::video::web::Targets>> {
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    if mycel_node::video::web::camera_on() {
+        return Ok(Some(mycel_node::video::web::targets()));
+    }
+    Ok(None)
+}
+
+/// One H.264 frame the web view encoded: the raw body is the `avcC` config
+/// (keyframes) then the AVCC data; `x-mycel-frame` says
+/// `key=0|1;w=..;h=..;cfg=<config bytes>;t=<capture µs>;n=<frame number>`. Answers with what
+/// to encode next, or `null` to stop capturing.
+#[tauri::command]
+pub async fn video_push(request: tauri::ipc::Request<'_>) -> Res<Option<mycel_node::video::web::Targets>> {
+    let body = body_bytes(&request, "video_push")?;
+    let header = request.headers().get("x-mycel-frame").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let field = |name: &str| -> u64 {
+        header
+            .split(';')
+            .filter_map(|kv| kv.split_once('='))
+            .find(|(k, _)| k.trim() == name)
+            .and_then(|(_, v)| v.trim().parse().ok())
+            .unwrap_or(0)
+    };
+    let cfg = (field("cfg") as usize).min(body.len());
+    let (w, h) = (field("w"), field("h"));
+    if w == 0 || h == 0 || w > 4096 || h > 4096 || body.len() == cfg {
+        return Err("bad video frame".into());
+    }
+    let frame = mycel_node::video::EncodedFrame {
+        seq: 0,
+        capture_us: field("t"),
+        keyframe: field("key") == 1,
+        width: w as u16,
+        height: h as u16,
+        config: (cfg > 0).then(|| bytes_of(&body[..cfg])),
+        data: bytes_of(&body[cfg..]),
+    };
+    let number = header.contains("n=").then(|| field("n"));
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    return Ok(mycel_node::video::web::push(frame, number));
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        let _ = (frame, number);
+        Ok(None)
+    }
+}
+
+fn bytes_of(b: &[u8]) -> mycel_node::video::Bytes {
+    mycel_node::video::Bytes::copy_from_slice(b)
 }
 
 /// Bumped by every `video_subscribe`: older subscriptions stop.

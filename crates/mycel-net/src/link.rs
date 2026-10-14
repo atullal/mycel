@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bytes::Bytes;
 use iroh::TransportAddr;
+use iroh::endpoint::{Path, PathList};
 use iroh::endpoint::transports::{
     Addr, CustomEndpoint, CustomSender, CustomTransport, FourTuple, PathSelection, PathSelectionContext, PathSelectionData,
     PathSelector, RecvInfo, Transmit,
@@ -182,6 +183,25 @@ impl PathKind {
     }
 }
 
+/// The path a connection is using: the one Iroh selected, else the open
+/// path that has carried the most.
+///
+/// Iroh selects one path per peer, across all connections to that peer, and
+/// marks it selected on each connection that has it. But each end selects on
+/// its own (whichever path it measured first, until another is clearly
+/// better), and only the end that dialed a connection opens paths on it. So
+/// on a connection the peer dialed, the path we selected may not exist: no
+/// path there is selected, and the connection sends on the paths it has.
+pub fn path_in_use<'a>(paths: &'a PathList<'_>) -> Option<Path<'a>> {
+    paths.iter().find(|p| p.is_selected()).or_else(|| {
+        // the first of equals: a new connection's first path
+        paths.iter().rev().max_by_key(|p| {
+            let s = p.stats();
+            s.udp_tx.bytes.saturating_add(s.udp_rx.bytes)
+        })
+    })
+}
+
 /// A link's health, shown in the Network panel.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -240,6 +260,12 @@ pub trait Link: Send + Sync + 'static {
 /// sized for 100 Mbit/s at 100 ms) so one stream can fill several aggregated
 /// paths even when a loaded radio queue adds a few hundred ms of RTT. The
 /// connection-wide window caps what a peer can make us buffer.
+///
+/// The stream limits are how a peer is told to slow down: QUIC grants it
+/// a new stream only as one of its open ones ends, so an exchange beyond
+/// the limit waits on the peer's side for its turn instead of being
+/// refused. Each connection (one per peer) has its own, so one peer's
+/// streams never use up another's.
 pub fn transport_config() -> iroh::endpoint::QuicTransportConfig {
     iroh::endpoint::QuicTransportConfig::builder()
         .default_path_keep_alive_interval(Duration::from_millis(1500))
@@ -247,13 +273,23 @@ pub fn transport_config() -> iroh::endpoint::QuicTransportConfig {
         .stream_receive_window(STREAM_WINDOW.into())
         .receive_window(CONN_WINDOW.into())
         .send_window(u64::from(CONN_WINDOW))
+        .max_concurrent_bidi_streams(STREAMS_BIDI.into())
+        .max_concurrent_uni_streams(STREAMS_UNI.into())
         .build()
 }
 
 /// Per-stream receive window: 8 MiB (≈ 40 MB/s at 200 ms RTT).
-const STREAM_WINDOW: u32 = 8 * 1024 * 1024;
+pub(crate) const STREAM_WINDOW: u32 = 8 * 1024 * 1024;
 /// Whole-connection receive / send window.
 const CONN_WINDOW: u32 = 32 * 1024 * 1024;
+/// Bi-streams a peer may have open on one connection at once: syncs (up
+/// to 16 at a time), blob pieces (two per file it downloads from us) and
+/// pushes, cards; DTN bundles on a mesh hop connection.
+const STREAMS_BIDI: u32 = 64;
+/// Uni-streams: ephemeral messages (presence, cursors, game state), DTN
+/// summaries, and in calls one per video frame.
+const STREAMS_UNI: u32 = 128;
+
 
 /// Paths are ranked by the time a typical exchange of this many bytes takes
 /// on them: RTT + size / throughput. Big enough that throughput matters (the
@@ -388,7 +424,14 @@ impl PathHealth {
     }
 
     /// Time a [`REF_BYTES`] exchange takes on this path, in nanoseconds.
+    /// While the path is busy with our traffic, its RTT mostly measures the
+    /// queue we built, and the capacity already prices that in (it drops
+    /// towards what a saturated path delivers): counting the queue again
+    /// made a bulk transfer's own queue hand the selection to an idle,
+    /// unmeasured path many times slower. So a busy path's RTT counts up to
+    /// where it would be called saturated.
     fn cost(&self, rtt: Duration) -> i128 {
+        let rtt = if self.rate >= BUSY_MIN { rtt.min(self.base_rtt * 2 + QUEUE_SLACK) } else { rtt };
         cost(rtt, self.capacity)
     }
 }
@@ -685,6 +728,7 @@ impl MemNet {
     /// `n` (0..16) picks the transport id; `kind` is what it reports as.
     /// (Bluetooth always uses the real Bluetooth transport id.)
     pub fn new(n: u64, kind: PathKind) -> MemNet {
+        crate::fine_timers();
         let id = if kind == PathKind::Bluetooth { TRANSPORT_BLUETOOTH } else { TRANSPORT_TEST_BASE + n };
         MemNet { id, kind, down: Arc::default(), inner: Arc::default(), shape: Arc::default() }
     }

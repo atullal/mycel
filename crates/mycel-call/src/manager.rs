@@ -90,8 +90,10 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// The path a call connection is using and its RTT, whichever end dialed
+/// it (see [`mycel_net::path_in_use`]).
 pub fn selected_path(conn: &Connection) -> (Option<PathKind>, Duration) {
-    match conn.paths().iter().find(|p| p.is_selected()) {
+    match mycel_net::path_in_use(&conn.paths()) {
         Some(p) => (Some(PathKind::of(p.remote_addr())), p.rtt()),
         None => (None, Duration::ZERO),
     }
@@ -360,10 +362,17 @@ impl CallManager {
     }
 
     /// The app's video decoders lost their place (or just started): get
-    /// fresh keyframes from everyone, and for the self-view.
-    pub fn video_keyframe(&self, id: &str) -> Result<()> {
+    /// fresh keyframes for the self-view (`source` "local"), from the others
+    /// ("remote"), or both (`None`). Asking only where needed matters: a
+    /// keyframe is several times a frame's size.
+    pub fn video_keyframe(&self, id: &str, source: Option<&str>) -> Result<()> {
         let call = self.find(id)?;
-        self.inner.video.keyframes(&call.id());
+        let (local, remote) = match source {
+            Some("local") => (true, false),
+            Some("remote") => (false, true),
+            _ => (true, true),
+        };
+        self.inner.video.keyframes(&call.id(), local, remote);
         Ok(())
     }
 
@@ -604,8 +613,11 @@ fn dial(mgr: &Arc<Mgr>, call: &Arc<Call>, peer: SignPk, why: Why, first: Ctrl) -
         };
         match tokio::time::timeout(HANDSHAKE, setup).await {
             Ok(Ok((conn, tx, rx))) => {
-                spawn_reader(ev.clone(), peer, serial, rx, conn.clone());
-                let _ = ev.send(Ev::Dialed { peer, serial, conn });
+                // the leg has its connection before any answer on it is
+                // handled (a `Started` handled first would join a leg
+                // without a connection: no path, no media)
+                let _ = ev.send(Ev::Dialed { peer, serial, conn: conn.clone() });
+                spawn_reader(ev.clone(), peer, serial, rx, conn);
                 write_loop(tx, out_rx).await;
             }
             other => {

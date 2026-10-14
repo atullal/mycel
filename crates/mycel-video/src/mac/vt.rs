@@ -263,20 +263,31 @@ impl H264Encoder {
             set(kVTCompressionPropertyKey_MaxKeyFrameInterval, cf(&*int(fps as i64 * 10)));
             set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, cf(&*num(10.0)));
             set(kVTCompressionPropertyKey_ExpectedFrameRate, cf(&*int(fps as i64)));
-            let mut hw: CFTypeRef = null();
-            let rc = VTSessionCopyProperty(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, null(), &mut hw);
-            if std::env::var_os("MYCEL_VIDEO_DEBUG").is_some() {
-                eprintln!("[video] hardware query: rc {rc} value {}", if hw.is_null() { "none" } else if hw == kCFBooleanTrue { "true" } else { "false" });
+            #[cfg(target_os = "macos")]
+            {
+                let mut hw: CFTypeRef = null();
+                let rc = VTSessionCopyProperty(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, null(), &mut hw);
+                if std::env::var_os("MYCEL_VIDEO_DEBUG").is_some() {
+                    eprintln!("[video] hardware query: rc {rc} value {}", if hw.is_null() { "none" } else if hw == kCFBooleanTrue { "true" } else { "false" });
+                }
+                if rc == 0 && !hw.is_null() {
+                    enc.hardware = Some(hw == kCFBooleanTrue);
+                    CFRelease(hw);
+                }
             }
-            if rc == 0 && !hw.is_null() {
-                enc.hardware = Some(hw == kCFBooleanTrue);
-                CFRelease(hw);
+            #[cfg(target_os = "ios")]
+            {
+                enc.hardware = Some(true);
             }
             VTCompressionSessionPrepareToEncodeFrames(session);
         }
         enc.set_bitrate(bitrate);
         Ok(enc)
     }
+
+    /// Only a source that encodes itself (`web`) can change size in place;
+    /// the track re-creates this encoder instead.
+    pub fn retarget(&mut self, _width: u32, _height: u32, _fps: u32) {}
 
     pub fn size(&self) -> (u32, u32) {
         (self.width, self.height)
@@ -527,6 +538,48 @@ mod tests {
                 bytes as f64 * 8.0 / 2.0 / 1000.0,
             );
             assert!(made >= 50, "the encoder dropped {} of 60", 60 - made);
+        }
+    }
+
+    #[test]
+    fn portrait_and_four_three_camera_frames_keep_their_shape() {
+        for (source_w, source_h, w, h) in [
+            (720, 1280, 288, 512),
+            (1280, 960, 240, 180),
+            (960, 1280, 192, 256),
+        ] {
+            let mut enc = H264Encoder::new(w, h, 30, 350_000).unwrap();
+            let mut dec = H264Decoder::default();
+            let mut source = draw(0, source_w, source_h);
+            source.y.fill(16);
+            source.uv.fill(128);
+            let radius = i64::from(source_w.min(source_h) / 6);
+            for y in 0..source_h {
+                for x in 0..source_w {
+                    let dx = i64::from(x) - i64::from(source_w / 2);
+                    let dy = i64::from(y) - i64::from(source_h / 2);
+                    if dx * dx + dy * dy <= radius * radius {
+                        source.y[(y * source_w + x) as usize] = 235;
+                    }
+                }
+            }
+            let pb = PixelBuffer::from_nv12(&source).unwrap();
+            let f = enc.encode(&pb, 0, true).unwrap().expect("first frame");
+            assert_eq!((u32::from(f.width), u32::from(f.height)), (w, h));
+            let pic = dec.decode(&f).unwrap();
+            assert_eq!(pic.size(), (w, h));
+            let (lw, lh, luma) = pic.luma().unwrap();
+            let horizontal = (0..lw).filter(|x| luma[(lh / 2) * lw + x] > 180).count();
+            let vertical = (0..lh).filter(|y| luma[y * lw + lw / 2] > 180).count();
+            assert!(
+                horizontal > 20 && vertical > 20,
+                "circle survives compression"
+            );
+            assert!(
+                horizontal.abs_diff(vertical) <= 4,
+                "{source_w}x{source_h} => {w}x{h}: circle is {horizontal}x{vertical}"
+            );
+            assert_eq!(source_w * h, source_h * w);
         }
     }
 }

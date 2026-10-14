@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { useContacts, useMycel, useNearby } from "@mycel/sdk/react";
+import { matchesSearch } from "@mycel/sdk";
+import { SearchField, useContacts, useMycel, useNearby } from "@mycel/sdk/react";
 import { Avatar, STATUS_LABEL, errorText, statusOf } from "./common.tsx";
 
 export function ContactsPanel({ onShowNearby }: { onShowNearby: () => void }) {
@@ -11,8 +12,10 @@ export function ContactsPanel({ onShowNearby }: { onShowNearby: () => void }) {
   const [error, setError] = useState<string | null>(null);
   const [added, setAdded] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
 
   const strangers = nearby.filter((n) => !n.isContact);
+  const shownContacts = contacts.filter((c) => matchesSearch(query, c.name)).sort((a, b) => a.name.localeCompare(b.name));
 
   const add = async () => {
     const c = code.trim();
@@ -62,19 +65,23 @@ export function ContactsPanel({ onShowNearby }: { onShowNearby: () => void }) {
         <button className="p-nearby-hint" onClick={onShowNearby}>
           <span className="p-nearby-dot" />
           {strangers.length === 1
-            ? `${strangers[0]!.name} is on your network. Add them?`
-            : `${strangers.length} people on your network aren't in your contacts.`}
+            ? `${strangers[0]!.name} is nearby. Add them?`
+            : `${strangers.length} people nearby aren't in your contacts.`}
         </button>
       )}
 
       <h4 className="p-sub">
         {contacts.length ? `${contacts.length} contact${contacts.length === 1 ? "" : "s"}` : "Contacts"}
       </h4>
+      <SearchField value={query} onChange={setQuery} label="Search contacts" placeholder="Search names" />
       {!loading && contacts.length === 0 && (
-        <p className="p-empty">No contacts yet. Ask someone for their code, or add a person who's on your network.</p>
+        <p className="p-empty">No contacts yet. Ask someone for their code, or add someone nearby.</p>
       )}
-      <ul className="p-people">
-        {contacts.map((c) => {
+      {!loading && contacts.length > 0 && shownContacts.length === 0 && (
+        <p className="p-empty" role="status">No contacts match "{query.trim()}".</p>
+      )}
+      <ul className="p-people" aria-label="Contacts">
+        {shownContacts.map((c) => {
           const s = statusOf(c);
           return (
             <li key={c.id} className="p-person">

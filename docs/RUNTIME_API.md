@@ -19,12 +19,14 @@ impl Runtime {
     pub fn contacts(&self) -> Vec<Contact>;
     pub fn nearby(&self) -> Vec<NearbyPeer>;
     pub fn network_status(&self) -> NetworkStatus;
+    pub fn notices(&self) -> Vec<Notice>;                                  // problems to tell the user about
 
     // messaging (chat kit)
     pub fn conversations(&self) -> Vec<ConversationSummary>;               // newest activity first
     pub fn conversation(&self, id: ConversationId) -> Result<ConversationSummary>;
     pub fn create_conversation(&self, title: Option<String>, members: Vec<PeerId>) -> Result<ConversationSummary>;
     pub fn messages(&self, id: ConversationId, limit: Option<u32>, before: Option<MessageId>) -> Result<Vec<MessageView>>; // oldest → newest
+    pub fn messages_around(&self, id: ConversationId, message: MessageId, before: Option<u32>, after: Option<u32>) -> Result<MessageWindow>;
     pub async fn send_message(&self, id: ConversationId, body: String, reply_to: Option<MessageId>, attachments: Vec<String> /* file paths */) -> Result<MessageView>;
     pub fn edit_message(&self, id: ConversationId, message: MessageId, body: String) -> Result<()>;
     pub fn delete_message(&self, id: ConversationId, message: MessageId) -> Result<()>;
@@ -52,6 +54,10 @@ impl Runtime {
     pub fn video_keyframe(&self, call: String) -> Result<()>;
     pub fn video_frames(&self) -> broadcast::Receiver<mycel_video::UiFrame>;
     pub async fn sync_now(&self);                                               // pull-to-refresh
+
+    // private local alerts (native shells; see "Shell-only events")
+    pub fn alert_thread(&self, context: &str) -> Option<String>;               // what's on screen → alert thread
+    pub fn alert_route(&self, target: &str) -> Option<ConversationId>;         // tapped alert → what to open now
 }
 ```
 
@@ -67,10 +73,13 @@ impl Runtime {
 | `list_contacts` | — | `Contact[]` |
 | `list_nearby` | — | `NearbyPeer[]` |
 | `network_status` | — | `NetworkStatus` |
+| `list_notices` | — | `Notice[]` |
+| `dismiss_notice` | `notice` | `null` |
 | `list_conversations` | — | `ConversationSummary[]` |
 | `get_conversation` | `{ id }` | `ConversationSummary` |
 | `create_conversation` | `{ title?, members }` | `ConversationSummary` |
 | `list_messages` | `{ id, limit?, before? }` | `MessageView[]` |
+| `messages_around` | `{ id, message, before?, after? }` | `MessageWindow` (`{ messages, hasEarlier, hasLater }`) |
 | `send_message` | `{ id, body, replyTo?, attachments? }` | `MessageView` |
 | `edit_message` | `{ id, message, body }` | `null` |
 | `delete_message` | `{ id, message }` | `null` |
@@ -99,7 +108,11 @@ impl Runtime {
 
 Errors are rejected promises carrying a human-readable string. It includes the cause, e.g. `macOS didn't let Mycel read /Users/me/Desktop/x.mov. Allow Mycel in System Settings > Privacy & Security > Files and Folders …: Operation not permitted (os error 1)`.
 
-**Event:** the Tauri event `mycel://event` carries one `Event` (tagged by `type`): `conversationUpdated`, `conversationAdded`, `typing`, `contactsChanged`, `nearbyChanged`, `networkChanged`, `blobReady`, `transferProgress`, `callIncoming`, `callUpdated`.
+**Event:** the Tauri event `mycel://event` carries one `Event` (tagged by `type`): `conversationUpdated`, `conversationAdded`, `typing`, `contactsChanged`, `nearbyChanged`, `networkChanged`, `blobReady`, `transferProgress`, `callIncoming`, `callUpdated`, `noticesChanged`.
+
+**Notices** (`list_notices`, tagged by `kind`): `identityReplaced { keptIn }` (a new identity was started; the old profile is kept in that folder), `networkModeReset` (the saved network choice was unreadable: local paths only), `recordsSetAside { count }` (unreadable stored records were set aside, not deleted), `storageFailing { error }` (saving is failing and being retried; listed while it lasts). The first three come from startup and are never announced by an event, so a UI fetches the list once when it starts and again on `noticesChanged`. They are kept (across restarts) until `dismiss_notice`, because a phone may start Mycel in the background where nobody sees them; `storageFailing` can't be dismissed and clears when saving works again.
+
+**Shell-only events** (hosts consume them and never forward them to apps): `alert { alert: { kind, thread, key, target, foreground } }` and `alertWithdrawn { thread, key? }`. The chat layer decides what is news (`mycel_kit_chat::alerts`: a new message from someone else, a message request, a group invitation, a call ringing or missed) and when it's stale (read here, answered, declined). `kind` is one of `message`, `messageRequest`, `groupInvitation`, `incomingCall`, `missedCall`; the strings are opaque local keys, never names or text. A native shell shows one fixed sentence per kind, replaces an alert with the same `key`, withdraws a thread's alerts together, and suppresses alerts while the app is focused on their thread (`Runtime::alert_thread(context)` maps what the app shows to a thread) or, when `foreground` is false, while the app is focused at all (it rings calls itself). A tap resolves `target` again through `Runtime::alert_route(target)`.
 
 `transferProgress { direction: "upload" | "download", id, done, total, rate }` (`rate` = bytes per second over the last 3 s):
 - Emitted at most every 250 ms, plus a final event with `done == total`.
@@ -110,6 +123,8 @@ Errors are rejected promises carrying a human-readable string. It includes the c
 ## Semantics the UI can rely on
 - **Instant local writes:** `send_message` returns as soon as the message is written locally (`delivery: "local"`). It moves to `sent`, then `delivered`, then `read` as peers sync, and each step emits `conversationUpdated`.
 - **Direct conversations:** a conversation with exactly one other member and no title is `direct`. Its title is the other person's name.
+- **One chat per person:** two people can each start a direct chat before their devices meet, so one pair can own several two-person spaces. They show as one conversation: `id` is the lowest of its `aliases`, every alias is a valid id, and `threadKey` (from the two signing keys) stays the same whichever spaces exist. Messages stay in the space they were written in (`MessageView.conversation`); new messages and calls go to the lowest space both people can write in, which both devices choose alike. The timeline keeps each space's causal order and never places a message before this device first saw its space, so a space that turns up later can't backdate messages into existing history. Only original private chats merge: requests, declined invitations, anything ever named, marked a group or joined by a third person stay apart (rules: `mycel_kit_chat::thread`).
+- **Administering a direct chat** never splits it: `add_members` starts a new group with both of you and the added people (the direct chat's history is not shared with them; `conversationAdded` announces it); `rename_conversation` and removing the other person are refused; `leave_conversation` leaves every alias, or none if you're the last admin of any; `add_keeper` adds the keeper to every alias you administer. After leaving, the chat's history is one inactive conversation (its `threadKey` differs from a new chat with the same person).
 - **Author-only edits and deletes:** only the author can edit or delete a message. Others' attempts are ignored by every peer.
 - **Typing is ephemeral:** a `typing` event should be shown for about 4 seconds.
 - **Message order:** messages arrive in causal order. `sentAt` is display-only (the author's clock).
@@ -269,7 +284,8 @@ When someone who isn't your contact adds you, the conversation arrives with `req
 - **`fetch_attachment`** resolves after the file is downloaded and decrypted, and also emits `blobReady`.
 - **Deleted messages** come back with an empty body and no attachments or reactions.
 - **Typing:** your own typing events are never echoed back to you.
-- **Pagination:** `list_messages` returns the newest `limit` messages (default 200) older than `before`.
+- **Pagination:** `list_messages` returns the newest `limit` messages (default 200, at most 10 000) older than `before`; page back by passing the oldest message returned. `messages_around` returns up to `before` and `after` messages (default 25 each) around one message, plus whether more exist on either side, to open a conversation at a search hit or quoted message. Both work across a direct chat's aliases, skip messages hidden on this device, and cost the page, not the history, at any depth.
+- **Cost of a new message:** the runtime folds new entries into a cached view (`mycel_kit_chat::ChatState`); a late entry that belongs before ones already shown takes back only those (up to 1,024), so a busy, long conversation costs per message, not per history.
 
 ## HTTP transport (`mycel serve`)
 `mycel serve` exposes the same command table on `http://127.0.0.1:<port>`. It refuses to listen on anything but loopback.

@@ -1,0 +1,101 @@
+<!doctype html>
+<!--
+  Can this web view send video the way the app does (packages/sdk/src/webcam.ts)?
+  Captures the camera, encodes H.264 with WebCodecs and counts what comes out.
+  CI loads it in WebKitGTK with mock capture devices (scripts/ci/video-probe-gtk.py)
+  and in headless Edge with a fake camera (scripts/ci/video-probe-chromium.mjs;
+  Chromium, as in WebView2). The result
+  goes to the title and the body as JSON.
+-->
+<meta charset="utf-8" />
+<title>running</title>
+<body>running</body>
+<script>
+  (async () => {
+    const r = {
+      userAgent: navigator.userAgent,
+      getUserMedia: typeof navigator.mediaDevices?.getUserMedia,
+      VideoEncoder: typeof VideoEncoder,
+      MediaStreamTrackProcessor: typeof MediaStreamTrackProcessor,
+    };
+    const done = (extra) => {
+      Object.assign(r, extra);
+      const s = JSON.stringify(r);
+      document.title = "probe " + s;
+      document.body.textContent = s;
+    };
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: { width: 640, height: 360 } });
+      const track = stream.getVideoTracks()[0];
+      r.camera = track.label || "unnamed";
+      const video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.srcObject = stream;
+      await video.play();
+      const canvas = document.createElement("canvas");
+      [canvas.width, canvas.height] = [640, 360];
+      const ctx = canvas.getContext("2d");
+      // as webcam.ts: hardware first; if that's refused or fails, whatever
+      // the web view has
+      Object.assign(attempt, { canvas, ctx });
+      r.attempts = [];
+      for (const hw of ["prefer-hardware", "no-preference"]) {
+        const a = await attempt(video, hw);
+        r.attempts.push(a);
+        if (a.ok) break;
+      }
+      track.stop();
+      done({ ok: r.attempts.some((a) => a.ok) });
+    } catch (e) {
+      done({ error: String(e && e.message ? e.message : e) });
+    }
+
+    async function attempt(video, hw) {
+      const { canvas, ctx } = attempt;
+      const config = { codec: "avc1.42E01F", width: 640, height: 360, bitrate: 500000, framerate: 30, latencyMode: "realtime", hardwareAcceleration: hw, avc: { format: "avc" } };
+      const s = await VideoEncoder.isConfigSupported(config).catch(() => ({ supported: false }));
+      if (!s.supported) return { hw, supported: false };
+      const chunks = [];
+      let description = 0;
+      let error = null;
+      const enc = new VideoEncoder({
+        output: (c, meta) => {
+          chunks.push(c.type);
+          const d = meta?.decoderConfig?.description;
+          if (d) description = d.byteLength;
+        },
+        error: (e) => (error = e.message),
+      });
+      try {
+        enc.configure(config);
+        let n = 0;
+        for (let i = 0; i < 40 && n < 30; i++) {
+          await new Promise((ok) => setTimeout(ok, 33));
+          if (enc.state !== "configured") break;
+          if (video.videoWidth === 0) continue;
+          // as webcam.ts: Chromium encodes frames from the <video>; WebKitGTK
+          // only through a canvas
+          let source = video;
+          if (!("MediaStreamTrackProcessor" in window)) {
+            ctx.drawImage(video, 0, 0, 640, 360);
+            source = canvas;
+          }
+          const f = new VideoFrame(source, { timestamp: i * 33333 });
+          try {
+            enc.encode(f, { keyFrame: n === 0 });
+            n++;
+          } finally {
+            f.close();
+          }
+        }
+        if (enc.state === "configured") await enc.flush();
+      } catch (e) {
+        error = error || String(e && e.message ? e.message : e);
+      }
+      if (enc.state !== "closed") enc.close();
+      const keyframes = chunks.filter((t) => t === "key").length;
+      return { hw, frames: chunks.length, keyframes, avcC: description, error, ok: chunks.length > 0 && description > 0 && !error };
+    }
+  })();
+</script>

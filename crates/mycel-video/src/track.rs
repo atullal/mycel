@@ -195,10 +195,12 @@ struct RecvSide {
     remote_paused: bool,
 }
 
-/// The latest picture, for the encoder thread (older ones are dropped).
+/// Pictures for the encoder thread: only the latest (older ones are
+/// dropped), or for a source that encodes itself (the web view) a few in
+/// order, since a dropped encoded frame costs a keyframe.
 #[derive(Default)]
 struct Latest {
-    pic: Mutex<Option<Picture>>,
+    pic: Mutex<std::collections::VecDeque<Picture>>,
     ready: Condvar,
 }
 
@@ -230,6 +232,14 @@ struct Shared {
 }
 
 impl Shared {
+    /// Make the next frame a keyframe (`MYCEL_VIDEO_DEBUG` says why).
+    fn force_keyframe(&self, why: &str) {
+        if std::env::var_os("MYCEL_VIDEO_DEBUG").is_some() {
+            eprintln!("[video] keyframe wanted: {why}");
+        }
+        self.force_key.store(true, Ordering::SeqCst);
+    }
+
     /// The backlog: bytes not yet handed to QUIC, and how long the oldest
     /// frame QUIC has is going unacknowledged.
     fn queued(&self, now: Instant) -> (u64, Option<Duration>) {
@@ -405,7 +415,14 @@ impl VideoTrack {
         if !self.shared.camera_on.load(Ordering::Relaxed) {
             return;
         }
-        *self.shared.latest.pic.lock() = Some(pic);
+        {
+            let mut q = self.shared.latest.pic.lock();
+            let keep = if crate::platform::SOURCE_PACED { 8 } else { 1 };
+            while q.len() >= keep {
+                q.pop_front();
+            }
+            q.push_back(pic);
+        }
         self.shared.latest.ready.notify_one();
     }
 
@@ -416,9 +433,9 @@ impl VideoTrack {
             return;
         }
         sh.generation.fetch_add(1, Ordering::SeqCst);
-        sh.latest.pic.lock().take();
+        sh.latest.pic.lock().clear();
         if on {
-            sh.force_key.store(true, Ordering::SeqCst);
+            sh.force_keyframe("camera on");
         }
         let _ = sh.ctrl_tx.send(sh.sending_state());
     }
@@ -426,7 +443,7 @@ impl VideoTrack {
     /// Also show what we encode for this peer as our self-view.
     pub fn set_self_view(&self, on: bool) {
         if !self.shared.self_view.swap(on, Ordering::SeqCst) && on {
-            self.shared.force_key.store(true, Ordering::SeqCst);
+            self.shared.force_keyframe("self-view on");
         }
     }
 
@@ -437,7 +454,7 @@ impl VideoTrack {
 
     /// Re-send our next frame as a keyframe (a new viewer of the self-view).
     pub fn force_keyframe(&self) {
-        self.shared.force_key.store(true, Ordering::SeqCst);
+        self.shared.force_keyframe("the app asked");
     }
 
     /// Tests: reset every `every`-th delta frame's stream mid-way, as the
@@ -517,6 +534,34 @@ fn reset_seq(e: &ReadError) -> Option<u32> {
     }
 }
 
+/// Fit the camera into the quality budget without stretching its pixels.
+/// Portrait cameras receive a portrait budget; H.264 requires even sizes.
+fn fitted_quality(width: u32, height: u32, budget: Quality) -> Quality {
+    let (width, height) = (width.max(2), height.max(2));
+    let (bw, bh) = if height > width {
+        (budget.height, budget.width)
+    } else {
+        (budget.width, budget.height)
+    };
+    let even = |n: u32| (n & !1).max(2);
+    let (w, h) = if width <= bw && height <= bh {
+        (even(width), even(height))
+    } else if u64::from(width) * u64::from(bh) >= u64::from(height) * u64::from(bw) {
+        let w = even(bw);
+        (
+            w,
+            even((u64::from(height) * u64::from(w) / u64::from(width)) as u32),
+        )
+    } else {
+        let h = even(bh);
+        (
+            even((u64::from(width) * u64::from(h) / u64::from(height)) as u32),
+            h,
+        )
+    };
+    Quality::new(w, h, budget.fps)
+}
+
 fn encode_loop(sh: Arc<Shared>, out: mpsc::UnboundedSender<EncodedFrame>) {
     let mut encoder: Option<(H264Encoder, Quality, u32)> = None;
     let mut generation = u64::MAX;
@@ -525,10 +570,10 @@ fn encode_loop(sh: Arc<Shared>, out: mpsc::UnboundedSender<EncodedFrame>) {
     while !sh.stop.load(Ordering::SeqCst) {
         let pic = {
             let mut slot = sh.latest.pic.lock();
-            if slot.is_none() {
+            if slot.is_empty() {
                 sh.latest.ready.wait_for(&mut slot, Duration::from_millis(100));
             }
-            slot.take()
+            slot.pop_front()
         };
         let Some(pic) = pic else { continue };
         let now = Instant::now();
@@ -548,6 +593,9 @@ fn encode_loop(sh: Arc<Shared>, out: mpsc::UnboundedSender<EncodedFrame>) {
         // what to encode for: the path, or just the self-view while paused
         let (quality, bitrate, send) = match verdict {
             Admit::Send => (quality, bitrate, true),
+            // A source that encodes at the target frame rate itself (the web
+            // view) is already paced; skipping its frame would cost a keyframe.
+            Admit::NotYet if crate::platform::SOURCE_PACED => (quality, bitrate, true),
             Admit::NotYet => continue,
             _ if paused => {
                 if now < preview_next {
@@ -561,9 +609,23 @@ fn encode_loop(sh: Arc<Shared>, out: mpsc::UnboundedSender<EncodedFrame>) {
                 continue;
             }
         };
-        let fresh = match &encoder {
-            Some((_, q, _)) if q.width == quality.width && q.height == quality.height => false,
-            _ => {
+        // Browser capture fits its own source before encoding. Native
+        // VideoToolbox scales directly into these dimensions, so fit here.
+        // A camera rotation changes the size and creates a fresh keyframe.
+        let quality = if crate::platform::SOURCE_PACED { quality } else { fitted_quality(pic.width, pic.height, quality) };
+        let reuse = match &mut encoder {
+            Some((_, q, _)) if q.width == quality.width && q.height == quality.height => true,
+            // A source that encodes itself (the web view) just gets new
+            // targets: a new encoder here would cost it a keyframe.
+            Some((e, _, _)) if crate::platform::SOURCE_PACED => {
+                e.retarget(quality.width, quality.height, quality.fps);
+                true
+            }
+            _ => false,
+        };
+        let fresh = match reuse {
+            true => false,
+            false => {
                 match H264Encoder::new(quality.width, quality.height, quality.fps, bitrate) {
                     Ok(e) => {
                         sh.send.lock().encoder = e.describe();
@@ -769,7 +831,7 @@ async fn tick(sh: Arc<Shared>) {
         ticker.tick().await;
         ticks += 1;
         let now = Instant::now();
-        let (path, rtt) = match sh.conn.paths().iter().find(|p| p.is_selected()) {
+        let (path, rtt) = match mycel_net::path_in_use(&sh.conn.paths()) {
             Some(p) => (Some(PathKind::of(p.remote_addr())), p.rtt()),
             None => (None, Duration::ZERO),
         };
@@ -784,8 +846,10 @@ async fn tick(sh: Arc<Shared>) {
             ctl.on_rtt(now, rtt);
             (ctl.tick(now, rtt), ctl.paused())
         };
-        if changed.is_some() {
-            sh.force_key.store(true, Ordering::SeqCst);
+        // (a source that encodes itself sends a keyframe when its size really
+        // changes; the quality steps above it don't need one)
+        if changed.is_some() && !crate::platform::SOURCE_PACED {
+            sh.force_keyframe("quality changed");
         }
         if std::env::var_os("MYCEL_VIDEO_DEBUG").is_some() && sh.send.lock().frames > 0 {
             static LAST: Mutex<Option<Instant>> = Mutex::new(None);
@@ -797,7 +861,7 @@ async fn tick(sh: Arc<Shared>) {
         }
         if paused != was_paused {
             was_paused = paused;
-            sh.force_key.store(true, Ordering::SeqCst);
+            sh.force_keyframe(if paused { "paused" } else { "resumed" });
             let _ = sh.ctrl_tx.send(sh.sending_state());
         } else if ticks.is_multiple_of(20) {
             // and once a second anyway (a few bytes): whatever the other
@@ -814,7 +878,7 @@ async fn tick(sh: Arc<Shared>) {
                         f.give_up(s, &sh.ctrl_tx);
                     }
                 }
-                sh.force_key.store(true, Ordering::SeqCst);
+                sh.force_keyframe("frames stuck");
             }
         }
         let (frames, ask, missing) = {
@@ -918,7 +982,7 @@ fn on_ctrl(sh: &Shared, m: VideoCtrl) {
             // a keyframe after the missing frame is already on its way
             let covered = sh.send.lock().last_key.is_some_and(|k| k >= missing);
             if !covered {
-                sh.force_key.store(true, Ordering::SeqCst);
+                sh.force_keyframe("they asked");
             }
         }
         VideoCtrl::Dropped { seq } => frame_lost(sh, seq),
@@ -926,6 +990,52 @@ fn on_ctrl(sh: &Shared, m: VideoCtrl) {
             let mut r = sh.recv.lock();
             r.remote_camera = camera;
             r.remote_paused = paused;
+        }
+    }
+}
+
+#[cfg(test)]
+mod size_tests {
+    use super::*;
+
+    #[test]
+    fn camera_shape_survives_portrait_landscape_and_rotation() {
+        let budget = Quality::new(1280, 720, 30);
+        assert_eq!(fitted_quality(1920, 1080, budget), budget);
+        assert_eq!(
+            fitted_quality(1080, 1920, budget),
+            Quality::new(720, 1280, 30)
+        );
+        assert_eq!(
+            fitted_quality(1920, 1440, budget),
+            Quality::new(960, 720, 30)
+        );
+        assert_eq!(
+            fitted_quality(1440, 1920, budget),
+            Quality::new(720, 960, 30)
+        );
+        assert_ne!(
+            fitted_quality(1080, 1920, budget),
+            fitted_quality(1920, 1080, budget)
+        );
+    }
+
+    #[test]
+    fn dimensions_stay_even_and_within_every_quality_budget() {
+        for (_, budget) in crate::rate::LADDER {
+            for (w, h) in [(4031, 3023), (3023, 4031), (121, 89), (89, 121)] {
+                let fitted = fitted_quality(w, h, budget);
+                assert_eq!(fitted.width % 2, 0);
+                assert_eq!(fitted.height % 2, 0);
+                assert!(fitted.width <= w && fitted.height <= h);
+                assert!(fitted.pixels() <= budget.pixels());
+                let shape_error =
+                    (fitted.width as f64 / fitted.height as f64 - w as f64 / h as f64).abs();
+                assert!(
+                    shape_error <= 2.0 * (1.0 + w as f64 / h as f64) / fitted.height as f64,
+                    "{w}x{h} => {fitted:?}"
+                );
+            }
         }
     }
 }

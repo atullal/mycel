@@ -21,14 +21,15 @@
 //! Bytes go straight between the QUIC stream and disk in small buffers, so
 //! memory stays bounded whatever the size. Data lands in `<hash>.part`, with
 //! a `<hash>.ranges` file listing which bytes are there (pieces arrive out of
-//! order; no `.ranges` means the `.part` is a plain prefix, as pushes and
+//! order; no `.ranges` means the `.part` is a plain prefix, as keeper pushes and
 //! older versions write it). The file is renamed into place only once the
 //! BLAKE3 hash of the whole blob matches; an interrupted transfer leaves both
 //! behind and the next attempt (from any members that have the blob) fetches
-//! only what's missing.
+//! only what's missing. Ordinary eager pushes use isolated disposable stages.
 //!
-//! There's no size limit and no quota. The only guard is free disk space: a
-//! transfer that would leave less than [`MIN_FREE_SPACE`] free is refused.
+//! There is no cumulative member quota. Concurrent remote writes reserve
+//! capacity process-wide and keep at least [`MIN_FREE_SPACE`] free. Accepted
+//! members can still consume available storage through repeated valid pushes.
 //!
 //! Push policy: blobs up to [`EAGER_PUSH_MAX`] are pushed to every member when
 //! posted; bigger ones are pushed only to keepers (whose job is to hold data
@@ -49,6 +50,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::resources::PeerFrames;
 use crate::wire::*;
 use crate::{Inner, NetEvent, Node, on_conn, open_bi, pooled};
 
@@ -94,7 +96,19 @@ fn free_space_at(path: &Path) -> Option<u64> {
     (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn free_space_at(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut available = 0u64;
+    // SAFETY: the path is NUL-terminated and `available` is writable; the
+    // optional total/free outputs are deliberately omitted.
+    (unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, std::ptr::null_mut(), std::ptr::null_mut()) } != 0)
+        .then_some(available)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn free_space_at(_path: &Path) -> Option<u64> {
     None
 }
@@ -124,6 +138,57 @@ pub fn ensure_free_space(dir: &Path, need: u64) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Conservative process-wide reservation pool. Counting reservations on other
+/// volumes too can reject a transfer early, but cannot overcommit one volume.
+/// Keep the entire remaining-byte reservation until all writers have stopped;
+/// bytes already written may be double-counted briefly, which is conservative.
+static RESERVED: LazyLock<Mutex<u64>> = LazyLock::new(Mutex::default);
+
+struct SpaceReservation(u64);
+
+impl SpaceReservation {
+    fn acquire(dir: &Path, need: u64) -> Result<Self> {
+        let mut reserved = RESERVED.lock();
+        Self::claim(&mut reserved, free_space(dir), need)?;
+        Ok(Self(need))
+    }
+
+    fn claim(reserved: &mut u64, free: Option<u64>, need: u64) -> Result<()> {
+        let free = free.context("cannot determine free disk space for blob transfer")?;
+        let all = reserved.checked_add(need).context("disk reservation overflow")?;
+        if all.checked_add(MIN_FREE_SPACE).is_none_or(|required| free < required) {
+            bail!("not enough disk space after active transfers are reserved");
+        }
+        *reserved = all;
+        Ok(())
+    }
+}
+
+impl Drop for SpaceReservation {
+    fn drop(&mut self) {
+        *RESERVED.lock() -= self.0;
+    }
+}
+
+/// Eager pushes never share the resumable `.part` / `.ranges` files used by
+/// explicit downloads and keepers. Creation is synchronous so cancellation
+/// cannot race a queued blocking open that recreates the file after cleanup.
+struct PushStage(PathBuf);
+
+impl PushStage {
+    fn create(path: &Path) -> Result<(Self, tokio::fs::File)> {
+        let stage = path.with_extension(format!("push.{:016x}", mycel_crypto::random_u64()));
+        let file = std::fs::OpenOptions::new().create_new(true).write(true).open(&stage)?;
+        Ok((Self(stage), tokio::fs::File::from_std(file)))
+    }
+}
+
+impl Drop for PushStage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Incremental [`blob_hash`]: feed the blob's bytes in pieces.
@@ -183,19 +248,12 @@ async fn hash_prefix(path: &Path, len: u64, digest: &mut Digest) -> Result<()> {
 /// Receive bytes `[offset, total)` into `part` (truncated to `offset` first).
 async fn receive_into(
     rx: &mut RecvStream,
-    part: &Path,
+    mut f: tokio::fs::File,
     offset: u64,
     total: u64,
     digest: &mut Digest,
     progress: &Progress,
 ) -> Result<()> {
-    let mut f = tokio::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(part)
-        .await
-        .with_context(|| format!("can't write {}", part.display()))?;
     f.set_len(offset).await?;
     f.seek(SeekFrom::Start(offset)).await?;
     let mut buf = vec![0u8; IO_CHUNK];
@@ -208,7 +266,7 @@ async fn receive_into(
         let mut n = 0;
         let mut ended = false;
         while n < want && !ended {
-            match rx.read(&mut buf[n..want]).await {
+            match crate::resources::idle(rx.read(&mut buf[n..want])).await {
                 Ok(Some(k)) => n += k,
                 // keep what arrived, so the next attempt resumes after it
                 Ok(None) | Err(_) => ended = true,
@@ -240,7 +298,7 @@ async fn send_from(tx: &mut SendStream, path: &Path, offset: u64, len: u64, prog
         if n == 0 {
             bail!("blob file shrank while sending it");
         }
-        tx.write_all(&buf[..n]).await?;
+        crate::resources::write_all(tx, &buf[..n]).await?;
         done += n as u64;
         progress(done, len);
     }
@@ -374,7 +432,7 @@ async fn drop_partial(part: &Path) {
 
 /// One blob request, on its own stream of a pooled connection.
 pub(crate) async fn serve(inner: &Arc<Inner>, peer: SignPk, mut tx: SendStream, mut rx: RecvStream) -> Result<()> {
-    let req: BlobReq = recv(&mut rx).await?;
+    let req: BlobReq = recv_small(&mut rx, crate::resources::FIRST_FRAME, &inner.frames(&peer)).await?;
     let (space, hash) = match &req {
         BlobReq::Get { space, hash }
         | BlobReq::Put { space, hash, .. }
@@ -387,10 +445,14 @@ pub(crate) async fn serve(inner: &Arc<Inner>, peer: SignPk, mut tx: SendStream, 
         .lock()
         .get(&space)
         .map_or((false, false), |r| (r.is_member(&peer), r.my_role() == Some(Role::Relay)));
-    let path = inner.blob_path(&space, &hash).filter(|_| allowed);
+    // Application consent is separate from cryptographic membership. Check
+    // before even deriving a push path, including the legacy Put protocol.
+    let is_push = matches!(&req, BlobReq::Put { .. } | BlobReq::Offer { .. });
+    let allowed = allowed && (!is_push || (inner.blob_push_policy)(peer, space));
+    let path = allowed.then(|| inner.blob_path(&space, &hash)).flatten();
     // Unsolicited pushes follow the push policy: keepers take any size, other
-    // devices only small blobs (big ones they fetch when their user asks), so
-    // a member can't fill someone's disk with files they never opened.
+    // devices only small blobs (big ones they fetch when their user asks).
+    // This bounds one push; it is not a cumulative quota for accepted members.
     let push_ok = |len: u64| keeper || len <= EAGER_PUSH_MAX;
     let res = match (req, path) {
         (_, None) => send(&mut tx, &BlobResp::Denied).await,
@@ -400,8 +462,14 @@ pub(crate) async fn serve(inner: &Arc<Inner>, peer: SignPk, mut tx: SendStream, 
         (BlobReq::Get { .. }, Some(path)) => serve_get(inner, &mut tx, &path, None).await,
         (BlobReq::GetFrom { offset, .. }, Some(path)) => serve_get(inner, &mut tx, &path, Some(offset)).await,
         (BlobReq::GetRange { offset, len, .. }, Some(path)) => serve_range(inner, &mut tx, &path, offset, len).await,
-        (BlobReq::Put { len, .. }, Some(path)) => serve_put(inner, &mut tx, &mut rx, &path, hash, len, false).await,
-        (BlobReq::Offer { len, .. }, Some(path)) => serve_put(inner, &mut tx, &mut rx, &path, hash, len, true).await,
+        (BlobReq::Put { len, .. }, Some(path)) => {
+            let push = IncomingPush { hash, len, handshake: false, keeper };
+            serve_put(inner, &mut tx, &mut rx, &path, push).await
+        }
+        (BlobReq::Offer { len, .. }, Some(path)) => {
+            let push = IncomingPush { hash, len, handshake: true, keeper };
+            serve_put(inner, &mut tx, &mut rx, &path, push).await
+        }
     };
     tx.finish().ok();
     res
@@ -452,45 +520,59 @@ async fn serve_range(inner: &Arc<Inner>, tx: &mut SendStream, path: &Path, offse
     send_from(tx, path, start, end, &count_served(inner, start)).await
 }
 
-async fn serve_put(
-    inner: &Arc<Inner>,
-    tx: &mut SendStream,
-    rx: &mut RecvStream,
-    path: &Path,
+/// A blob a member pushes to us.
+struct IncomingPush {
     hash: Hash32,
     len: u64,
+    /// `Offer` (we answer before the bytes come), not the legacy `Put`.
     handshake: bool,
-) -> Result<()> {
+    /// We are a keeper of the space: we keep partial pushes to resume.
+    keeper: bool,
+}
+
+async fn serve_put(inner: &Arc<Inner>, tx: &mut SendStream, rx: &mut RecvStream, path: &Path, push: IncomingPush) -> Result<()> {
+    let IncomingPush { hash, len, handshake, keeper } = push;
     if path.exists() {
         return send(tx, &BlobResp::Stored).await;
     }
     let Some(_lock) = WriteLock::try_acquire(path) else {
         return send(tx, &if handshake { BlobResp::Busy } else { BlobResp::Denied }).await;
     };
-    let part = part_path(path);
-    // Legacy `Put` streams from 0 without asking; `Offer` resumes after the
-    // contiguous prefix we hold (a multi-source download may have left
-    // other ranges too: a push writes sequentially, so they are dropped).
-    let mut offset = if handshake { load_done(&part, Some(len)).await.prefix() } else { 0 };
-    let _ = tokio::fs::remove_file(ranges_path(&part)).await;
+    let resume_part = part_path(path);
+    // Only an explicitly configured keeper retains unsolicited partials.
+    // Ordinary eager pushes start at zero in an isolated disposable stage.
+    let mut offset = if keeper && handshake { load_done(&resume_part, Some(len)).await.prefix() } else { 0 };
     if offset > len {
         offset = 0;
     }
-    let dir = path.parent().context("bad blob path")?;
-    if ensure_free_space(dir, len - offset).is_err() {
-        return send(tx, &if handshake { BlobResp::NoSpace } else { BlobResp::Denied }).await;
-    }
-    tokio::fs::create_dir_all(dir).await?;
     let mut digest = blob_digest();
-    if offset > 0 && hash_prefix(&part, offset, &mut digest).await.is_err() {
+    if offset > 0 && hash_prefix(&resume_part, offset, &mut digest).await.is_err() {
         offset = 0;
         digest = blob_digest();
     }
+    let dir = path.parent().context("bad blob path")?;
+    let Ok(_reservation) = SpaceReservation::acquire(dir, len - offset) else {
+        return send(tx, &if handshake { BlobResp::NoSpace } else { BlobResp::Denied }).await;
+    };
+    tokio::fs::create_dir_all(dir).await?;
+    let stage;
+    let (part, file) = if keeper {
+        let _ = tokio::fs::remove_file(ranges_path(&resume_part)).await;
+        let file = tokio::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&resume_part).await?;
+        (resume_part.as_path(), file)
+    } else {
+        let (guard, file) = PushStage::create(path)?;
+        stage = guard;
+        (stage.0.as_path(), file)
+    };
     if handshake {
         send(tx, &BlobResp::SendFrom { offset }).await?;
     }
-    receive_into(rx, &part, offset, len, &mut digest, &no_progress()).await?;
-    commit(inner, &part, path, hash, &digest).await?;
+    receive_into(rx, file, offset, len, &mut digest, &no_progress()).await?;
+    commit(inner, part, path, hash, &digest).await?;
+    if !keeper {
+        drop_partial(&resume_part).await;
+    }
     send(tx, &BlobResp::Stored).await
 }
 
@@ -502,12 +584,14 @@ async fn push(inner: &Arc<Inner>, pk: SignPk, space: SpaceId, hash: Hash32, path
     on_conn!(inner, &pk, |conn| async {
         let (mut tx, mut rx) = open_bi(&conn, StreamKind::Blob).await?;
         send(&mut tx, &BlobReq::Offer { space, hash, len }).await?;
-        match recv::<BlobResp>(&mut rx).await? {
+        match recv_small::<BlobResp>(&mut rx, crate::resources::REPLY_TIMEOUT, &inner.reply_frames(&pk)).await? {
             BlobResp::Stored => Ok(()),
             BlobResp::SendFrom { offset } if offset <= len => {
                 send_from(&mut tx, path, offset, len, &no_progress()).await?;
                 tx.finish()?;
-                match recv::<BlobResp>(&mut rx).await? {
+                // The bytes written may still be queued for a slow link.
+                let wait = crate::resources::reply_timeout(usize::try_from(len - offset).unwrap_or(usize::MAX));
+                match recv_small::<BlobResp>(&mut rx, wait, &inner.reply_frames(&pk)).await? {
                     BlobResp::Stored => Ok(()),
                     other => Err(anyhow!("push failed: {other:?}")),
                 }
@@ -538,6 +622,9 @@ struct Download {
     st: Mutex<DlState>,
     /// A piece finished or came back.
     changed: tokio::sync::Notify,
+    // Owned by the workers too: cancelling the parent cannot release capacity
+    // while an aborted worker still has pending disk I/O.
+    _reservation: SpaceReservation,
 }
 
 struct DlState {
@@ -634,12 +721,12 @@ impl Download {
 }
 
 /// Fetch `[start, end)` of the blob from one source into the `.part` file.
-async fn fetch_range(conn: &Connection, dl: &Download, id: u64, start: u64, end: u64) -> Result<()> {
+async fn fetch_range(conn: &Connection, frames: &PeerFrames, dl: &Download, id: u64, start: u64, end: u64) -> Result<()> {
     let (mut tx, mut rx) = open_bi(conn, StreamKind::Blob).await?;
     let (space, hash) = (dl.space, dl.hash);
     send(&mut tx, &BlobReq::GetRange { space, hash, offset: start, len: end - start }).await?;
     tx.finish()?;
-    match recv::<BlobResp>(&mut rx).await? {
+    match recv_small::<BlobResp>(&mut rx, crate::resources::REPLY_TIMEOUT, frames).await? {
         BlobResp::Range { total, offset } if total == dl.total && offset == start => {}
         other => bail!("not available: {other:?}"),
     }
@@ -658,7 +745,7 @@ async fn fetch_range(conn: &Connection, dl: &Download, id: u64, start: u64, end:
         let mut n = 0;
         let mut ended = false;
         while n < want && !ended {
-            match rx.read(&mut buf[n..want]).await {
+            match crate::resources::idle(rx.read(&mut buf[n..want])).await {
                 Ok(Some(k)) => n += k,
                 Ok(None) | Err(_) => ended = true,
             }
@@ -696,7 +783,7 @@ async fn source_worker(inner: Arc<Inner>, pk: SignPk, dl: Arc<Download>) -> Resu
                 continue;
             }
         };
-        let res = fetch_range(&conn, &dl, id, start, end).await;
+        let res = fetch_range(&conn, &inner.reply_frames(&pk), &dl, id, start, end).await;
         dl.release(id);
         drop(conn);
         match res {
@@ -714,7 +801,7 @@ async fn probe(inner: &Arc<Inner>, pk: SignPk, space: SpaceId, hash: Hash32) -> 
         let (mut tx, mut rx) = open_bi(&conn, StreamKind::Blob).await?;
         send(&mut tx, &BlobReq::GetRange { space, hash, offset: 0, len: 0 }).await?;
         tx.finish()?;
-        match recv::<BlobResp>(&mut rx).await? {
+        match recv_small::<BlobResp>(&mut rx, crate::resources::REPLY_TIMEOUT, &inner.reply_frames(&pk)).await? {
             BlobResp::Range { total, .. } => Ok(total),
             other => Err(anyhow!("not available: {other:?}")),
         }
@@ -756,7 +843,7 @@ async fn download(inner: &Arc<Inner>, sources: Vec<SignPk>, space: SpaceId, hash
             Step::Probed(pk, Ok(total)) => {
                 if dl.is_none() {
                     let done = load_done(&part, Some(total)).await;
-                    ensure_free_space(dir, total - done.covered().min(total))?;
+                    let reservation = SpaceReservation::acquire(dir, total - done.covered().min(total))?;
                     // From now on the `.part` may have holes: say what it holds.
                     save_done(&part, total, &done).await?;
                     progress(done.covered(), total);
@@ -769,6 +856,7 @@ async fn download(inner: &Arc<Inner>, sources: Vec<SignPk>, space: SpaceId, hash
                         progress: progress.clone(),
                         st: Mutex::new(DlState { done, pending, active: HashMap::new(), next_id: 0, unsaved: 0 }),
                         changed: tokio::sync::Notify::new(),
+                        _reservation: reservation,
                     }));
                 }
                 let d = dl.as_ref().expect("set above");
@@ -790,6 +878,8 @@ async fn download(inner: &Arc<Inner>, sources: Vec<SignPk>, space: SpaceId, hash
             }
         }
     }
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
     let Some(dl) = dl else {
         return Err(last_err.unwrap_or_else(|| anyhow!("nobody else in the conversation has this file")));
     };
@@ -903,5 +993,57 @@ impl Node {
         }
         res.map(|()| path)
             .map_err(|e| e.context("couldn't download the file from anyone in the conversation"))
+    }
+}
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn reservation_arithmetic_counts_concurrent_writers_and_remaining_resume_bytes() {
+        let free = Some(MIN_FREE_SPACE + 100);
+        let mut reserved = 0;
+        SpaceReservation::claim(&mut reserved, free, 60).unwrap();
+        assert!(SpaceReservation::claim(&mut reserved, free, 41).is_err());
+        assert_eq!(reserved, 60, "refusal leaves the pool unchanged");
+        // A 70-byte resume with a 30-byte prefix reserves only 40 new bytes.
+        SpaceReservation::claim(&mut reserved, free, 70 - 30).unwrap();
+        assert_eq!(reserved, 100);
+        assert!(SpaceReservation::claim(&mut reserved, None, 0).is_err());
+        assert!(SpaceReservation::claim(&mut reserved, Some(u64::MAX), u64::MAX).is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelled_reservation_releases_capacity() {
+        let before = *RESERVED.lock();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _reservation = SpaceReservation::acquire(&std::env::temp_dir(), 1).unwrap();
+            ready_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready_rx.await.unwrap();
+        assert_eq!(*RESERVED.lock(), before + 1);
+        task.abort();
+        let _ = task.await;
+        assert_eq!(*RESERVED.lock(), before);
+    }
+
+    #[test]
+    fn eager_stage_drop_preserves_download_partials() {
+        let dir = std::env::temp_dir().join(format!("mycel-stage-security-{}", mycel_crypto::random_u64()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blob");
+        let part = part_path(&path);
+        std::fs::write(&part, b"download prefix").unwrap();
+        std::fs::write(ranges_path(&part), b"download ranges").unwrap();
+        let (stage, file) = PushStage::create(&path).unwrap();
+        let stage_path = stage.0.clone();
+        drop(file);
+        drop(stage);
+        assert!(!stage_path.exists());
+        assert_eq!(std::fs::read(&part).unwrap(), b"download prefix");
+        assert_eq!(std::fs::read(ranges_path(&part)).unwrap(), b"download ranges");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

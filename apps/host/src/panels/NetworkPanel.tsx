@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useContacts, useMycel, useNearby, useNetwork, useProfile } from "@mycel/sdk/react";
-import type { LinkStatus, NetworkMode, NetworkStatus, PathKind, PeerPaths } from "@mycel/sdk";
+import { isMobile, type LinkStatus, type NetworkMode, type NetworkStatus, type PathKind, type PeerPaths } from "@mycel/sdk";
 import { initials, toneFor } from "./common.tsx";
 
 const MODE: Record<NetworkMode, { name: string; text: string }> = {
@@ -36,7 +36,8 @@ const PATH: Record<PathKind, { name: string; text: string }> = {
 
 /** "via Peer-to-peer Wi-Fi", "via Mesh (via Bob, 2 hops)", or "via Mesh (gateway Bob, then the internet)". */
 function viaText(p: PeerPaths): string {
-  if (!p.via) return p.online ? "reachable" : "offline";
+  if (!p.online) return "Not reachable";
+  if (!p.via) return "Reachable";
   if (p.via === "mesh" && p.mesh?.gateway) return `via Mesh (gateway ${p.mesh.viaName}, then the internet)`;
   if (p.via === "mesh" && p.mesh) return `via Mesh (via ${p.mesh.viaName}, ${p.mesh.hops} hops)`;
   return `via ${PATH[p.via].name}`;
@@ -136,7 +137,7 @@ function Hyphae({ me, nodes }: { me: { id: string; name: string }; nodes: Node[]
       ))}
       {laid.map((n) => (
         <g key={n.id} className={`hy-node is-${n.state}`} transform={`translate(${n.x.toFixed(1)} ${n.y.toFixed(1)})`}>
-          <title>{`${n.name}: ${n.state === "nearby" ? "on your network" : n.state}`}</title>
+          <title>{`${n.name}: ${n.state}`}</title>
           <circle r="17" className={`tone-${toneFor(n.id)}`} />
           <text dy="4.2">{initials(n.name)}</text>
           <text className="hy-label" dy="33">
@@ -185,7 +186,9 @@ function ModeSwitch({ status }: { status: NetworkStatus }) {
       {pending && (
         <div className="p-restart">
           <span>Restart Mycel to switch to “{MODE[status.nextMode].name}”.</span>
-          {native ? (
+          {native && isMobile() ? (
+            <span className="p-help">Close Mycel (swipe it away in the app switcher), then open it again.</span>
+          ) : native ? (
             <button className="h-btn h-btn-primary h-btn-small" onClick={() => void mycel.network.restart()}>
               Restart now
             </button>
@@ -222,9 +225,9 @@ export function NetworkPanel() {
     <div className="p-network">
       {profile && <Hyphae me={profile} nodes={nodes} />}
       <ul className="hy-legend" aria-label="Legend">
-        <li className="is-nearby">On your network</li>
+        <li className="is-nearby">Nearby</li>
         <li className="is-online">Connected</li>
-        <li className="is-offline">Offline</li>
+        <li className="is-offline">Not reachable</li>
       </ul>
 
       <dl className="p-stats">
@@ -233,7 +236,7 @@ export function NetworkPanel() {
           <dd>{status.onlinePeers.length}</dd>
         </div>
         <div>
-          <dt>On your network</dt>
+          <dt>Nearby</dt>
           <dd>{status.nearbyPeers}</dd>
         </div>
       </dl>
@@ -266,7 +269,7 @@ export function NetworkPanel() {
                 <span className="p-path-name">{p.name}</span>
                 <span className="p-path-state">
                   {viaText(p)}
-                  {p.available.length > 1 && ` · ${p.available.length} paths`}
+                  {p.online && p.available.length > 1 && ` · ${p.available.length} paths`}
                 </span>
               </li>
             ))}

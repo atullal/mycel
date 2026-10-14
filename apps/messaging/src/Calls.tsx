@@ -1,7 +1,10 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { useMycel, useVideoCanvas } from "@mycel/sdk/react";
 import type { CallInfo, Participant, ParticipantState, PathKind } from "@mycel/sdk";
 import { Avatar, Icon, errorText } from "./ui.tsx";
+import "./call-layout.css";
+import type { VideoLayout } from "./layout.ts";
 
 // Calls in the Messaging app: the incoming-call sheet, the in-call bar, the
 // group call's people (with their video) and the "join call" banner, the
@@ -493,8 +496,34 @@ export function hasVideo(c: CallInfo | null): boolean {
  * The video of a call: their picture large, ours small in the corner
  * (mirrored, as a mirror would show it), and what's happening when there's
  * no picture: camera off, video paused on a slow connection, connecting.
+ *
+ * Where it shows depends on the screen (`videoLayout` in layout.ts): on a
+ * wide screen above the conversation, which stays usable below it; on a
+ * phone full screen, or floating small over the app once minimized. Moving
+ * between inline and full screen/floating (a window resized across the
+ * phone breakpoint) mounts new canvases, which ask for a fresh keyframe.
  */
-export function VideoStage({ call }: { call: CallInfo }) {
+export function VideoStage({ call, layout, onMinimize, onRestore, onOpenChat }: {
+  call: CallInfo;
+  layout: VideoLayout;
+  onMinimize: () => void;
+  onRestore: () => void;
+  onOpenChat: () => void;
+}) {
+  if (layout === "inline") return <InlineVideoStage call={call} />;
+  return (
+    <OverlayVideoStage
+      call={call}
+      minimized={layout === "floating"}
+      onMinimize={onMinimize}
+      onRestore={onRestore}
+      onOpenChat={onOpenChat}
+    />
+  );
+}
+
+/** Their picture and ours, plus what to say while there's no picture. */
+function useStagePicture(call: CallInfo) {
   const remote = useRef<HTMLCanvasElement>(null);
   const self = useRef<HTMLCanvasElement>(null);
   const v = call.video;
@@ -502,26 +531,44 @@ export function VideoStage({ call }: { call: CallInfo }) {
   const them = useVideoCanvas(remote, { call: live ? call.id : null, source: "remote", peer: call.peer });
   const me = useVideoCanvas(self, { call: live ? call.id : null, source: "local" });
   const first = call.peerName.split(" ")[0] || call.peerName;
-  const ourCamera = v.camera === "on" || v.camera === "starting";
-
   let note: string | null = null;
   if (!them.supported) note = "Video can't be shown in this window (it needs WebCodecs: Safari 16.4 or later).";
   else if (!live) note = call.direction === "outgoing" ? "Calling…" : "Connecting…";
   else if (!v.remoteCamera) note = `${first}'s camera is off`;
   else if (v.remotePaused) note = "Video paused: slow connection";
   else if (!them.picture) note = "Connecting video…";
+  const compactNote = !them.supported
+    ? "Video unavailable"
+    : !live
+      ? "Calling…"
+      : !v.remoteCamera
+        ? "Camera off"
+        : v.remotePaused
+          ? "Video paused"
+          : "Connecting…";
+  return { remote, self, them, me, note, compactNote, live };
+}
 
+/** The canvases, notes and stats inside a stage, whichever layout it has. */
+function StagePicture({ call, picture, compact }: { call: CallInfo; picture: ReturnType<typeof useStagePicture>; compact: boolean }) {
+  const { remote, self, them, me, note, compactNote, live } = picture;
+  const v = call.video;
+  const ourCamera = v.camera === "on" || v.camera === "starting";
   return (
-    <section className="mx-stage" aria-label={`Video call with ${call.peerName}`}>
+    <>
       <canvas ref={remote} className={`mx-stage-remote${them.picture && !note ? " is-on" : ""}`} aria-label={`${call.peerName}'s video`} />
       {note && (
         <div className="mx-stage-note">
           <Avatar id={call.peer} name={call.peerName} size={64} />
-          <span>{note}</span>
+          <span title={note} aria-label={note}>{compact ? compactNote : note}</span>
         </div>
       )}
       {/* always mounted, so the decoder attaches once; hidden with the camera off */}
-      <div className={`mx-stage-self${me.picture ? " is-on" : ""}${ourCamera ? "" : " is-hidden"}`} aria-hidden={!ourCamera}>
+      <div
+        className={`mx-stage-self${me.picture ? " is-on" : ""}${ourCamera ? "" : " is-hidden"}`}
+        style={me.picture ? { aspectRatio: `${me.picture.width} / ${me.picture.height}` } : undefined}
+        aria-hidden={!ourCamera}
+      >
         <canvas ref={self} aria-label="Your video" />
         {v.paused && <span className="mx-stage-self-note">Your video is paused: slow connection</span>}
         {!v.paused && !me.picture && <span className="mx-stage-self-note">Starting camera…</span>}
@@ -532,6 +579,182 @@ export function VideoStage({ call }: { call: CallInfo }) {
           {v.latencyMs > 0 ? ` · ${v.latencyMs} ms` : ""}
         </span>
       )}
+    </>
+  );
+}
+
+/** Wide screens: the stage sits above the conversation, under the call bar. */
+function InlineVideoStage({ call }: { call: CallInfo }) {
+  const picture = useStagePicture(call);
+  return (
+    <section className="mx-stage" aria-label={`Video call with ${call.peerName}`}>
+      <StagePicture call={call} picture={picture} compact={false} />
     </section>
+  );
+}
+
+/** Phones: full screen over the app, or a small floating picture. */
+function OverlayVideoStage({ call, minimized, onMinimize, onRestore, onOpenChat }: {
+  call: CallInfo;
+  minimized: boolean;
+  onMinimize: () => void;
+  onRestore: () => void;
+  onOpenChat: () => void;
+}) {
+  const picture = useStagePicture(call);
+  const { them } = picture;
+  const stage = useRef<HTMLElement>(null);
+  const restore = useRef<HTMLButtonElement>(null);
+  const drag = useRef<{ x: number; y: number; left: number; top: number; moved: boolean; pointer: number } | null>(null);
+  const swipe = useRef<{ x: number; y: number } | null>(null);
+  const suppressRestore = useRef(false);
+  const [position, setPosition] = useState<{ left: number; top: number } | null>(null);
+  const [availableHeight, setAvailableHeight] = useState<number | undefined>();
+  const [corner, setCorner] = useState({ right: true, bottom: false });
+  const [dragging, setDragging] = useState(false);
+
+  // visualViewport shrinks and moves when the phone keyboard opens. Keep
+  // the floating call above it, and remember which corner was chosen.
+  useEffect(() => {
+    if (!minimized) return;
+    const place = () => {
+      const rect = stage.current?.getBoundingClientRect();
+      if (!rect) return;
+      const vp = window.visualViewport;
+      const left = vp?.offsetLeft ?? 0;
+      const top = vp?.offsetTop ?? 0;
+      const width = vp?.width ?? window.innerWidth;
+      const height = vp?.height ?? window.innerHeight;
+      const pad = 12;
+      const safeTop = Math.max(top + pad, parseFloat(getComputedStyle(stage.current!).getPropertyValue("--call-top-inset")) || 0);
+      setAvailableHeight(Math.max(80, Math.min(300, height * 0.4, height - (safeTop - top) - pad)));
+      setPosition({
+        left: corner.right ? Math.max(left + pad, left + width - rect.width - pad) : left + pad,
+        top: corner.bottom ? Math.max(safeTop, top + height - rect.height - pad) : safeTop,
+      });
+    };
+    place();
+    const viewport = window.visualViewport;
+    window.addEventListener("resize", place);
+    viewport?.addEventListener("resize", place);
+    viewport?.addEventListener("scroll", place);
+    const observer = new ResizeObserver(place);
+    if (stage.current) observer.observe(stage.current);
+    return () => {
+      window.removeEventListener("resize", place);
+      viewport?.removeEventListener("resize", place);
+      viewport?.removeEventListener("scroll", place);
+      observer.disconnect();
+    };
+  }, [minimized, corner]);
+
+  useEffect(() => {
+    if (minimized) restore.current?.focus({ preventScroll: true });
+    else stage.current?.focus({ preventScroll: true });
+  }, [minimized]);
+
+  return createPortal(
+    <section
+      ref={stage}
+      className={`mx-stage mx-call-stage${minimized ? " is-floating" : " is-expanded"}${dragging ? " is-dragging" : ""}`}
+      style={minimized ? { left: position?.left ?? 12, top: position?.top ?? 48, maxHeight: availableHeight,
+        aspectRatio: them.picture ? `${them.picture.width} / ${them.picture.height}` : undefined } : undefined}
+      role={minimized ? "region" : "dialog"}
+      aria-modal={minimized ? undefined : true}
+      aria-label={`Video call with ${call.peerName}`}
+      tabIndex={-1}
+      onKeyDown={(e) => {
+        if (e.key === "Escape" && !minimized) { e.preventDefault(); onMinimize(); }
+        if (!minimized && e.key === "Tab") {
+          const buttons = Array.from(stage.current!.querySelectorAll<HTMLButtonElement>("button:not(:disabled)"));
+          const first = buttons[0], last = buttons.at(-1);
+          if (e.shiftKey && (document.activeElement === first || document.activeElement === stage.current)) {
+            e.preventDefault(); last?.focus();
+          } else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); }
+        }
+      }}
+      onPointerDown={(e) => {
+        if (!minimized && !(e.target as Element).closest("button")) swipe.current = { x: e.clientX, y: e.clientY };
+      }}
+      onPointerUp={(e) => {
+        const start = swipe.current;
+        swipe.current = null;
+        if (!minimized && start && e.clientY - start.y > 90 && Math.abs(e.clientX - start.x) < 65) onMinimize();
+      }}
+      onPointerCancel={() => { swipe.current = null; }}
+    >
+      <StagePicture call={call} picture={picture} compact={minimized} />
+      {!minimized && (
+        <div className="mx-stage-controls">
+          <button className="mx-stage-minimize" onClick={onMinimize} aria-label="Minimize video call" title="Return to chat">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+          </button>
+          <CallBar call={call} onOpen={onOpenChat} error={null} onDismissError={() => {}} />
+        </div>
+      )}
+      {minimized && (
+        <>
+          <button
+            ref={restore}
+            className="mx-stage-restore"
+            aria-label="Restore video call"
+            title="Tap to open. Drag to move."
+            onClick={(e) => {
+              if (suppressRestore.current) { e.preventDefault(); suppressRestore.current = false; }
+              else onRestore();
+            }}
+            onKeyDown={(e) => {
+              if (e.key.startsWith("Arrow")) {
+                e.preventDefault();
+                setCorner((c) => ({ right: e.key === "ArrowRight" ? true : e.key === "ArrowLeft" ? false : c.right,
+                  bottom: e.key === "ArrowDown" ? true : e.key === "ArrowUp" ? false : c.bottom }));
+              }
+            }}
+            onPointerDown={(e) => {
+              if (e.pointerType === "mouse" && e.button !== 0) return;
+              suppressRestore.current = false;
+              const rect = stage.current!.getBoundingClientRect();
+              drag.current = { x: e.clientX, y: e.clientY, left: rect.left, top: rect.top, moved: false, pointer: e.pointerId };
+              e.currentTarget.setPointerCapture(e.pointerId);
+            }}
+            onPointerMove={(e) => {
+              const d = drag.current;
+              if (!d || d.pointer !== e.pointerId) return;
+              const dx = e.clientX - d.x, dy = e.clientY - d.y;
+              if (!d.moved && Math.hypot(dx, dy) < 6) return;
+              d.moved = true;
+              setDragging(true);
+              const vp = window.visualViewport;
+              const bounds = stage.current!.getBoundingClientRect();
+              const minX = (vp?.offsetLeft ?? 0) + 12, minY = (vp?.offsetTop ?? 0) + 12;
+              const maxX = Math.max(minX, (vp?.offsetLeft ?? 0) + (vp?.width ?? innerWidth) - bounds.width - 12);
+              const maxY = Math.max(minY, (vp?.offsetTop ?? 0) + (vp?.height ?? innerHeight) - bounds.height - 12);
+              setPosition({ left: Math.min(maxX, Math.max(minX, d.left + dx)), top: Math.min(maxY, Math.max(minY, d.top + dy)) });
+            }}
+            onPointerUp={(e) => {
+              const d = drag.current;
+              if (!d || d.pointer !== e.pointerId) return;
+              drag.current = null;
+              setDragging(false);
+              suppressRestore.current = d.moved;
+              if (d.moved) {
+                const rect = stage.current!.getBoundingClientRect(), vp = window.visualViewport;
+                setCorner({ right: rect.left + rect.width / 2 > (vp?.offsetLeft ?? 0) + (vp?.width ?? innerWidth) / 2,
+                  bottom: rect.top + rect.height / 2 > (vp?.offsetTop ?? 0) + (vp?.height ?? innerHeight) / 2 });
+              }
+              e.currentTarget.releasePointerCapture(e.pointerId);
+            }}
+            onPointerCancel={() => { drag.current = null; setDragging(false); suppressRestore.current = true; setCorner((c) => ({ ...c })); }}
+          >
+            <span><span className="mx-stage-caption-name">{call.peerName}</span><span className="mx-stage-caption-time">{statusText(call)}</span></span>
+          </button>
+          <button className="mx-stage-corner" aria-label="Move floating call to another corner" title="Move to next corner"
+            onClick={() => setCorner((c) => ({ right: c.bottom ? !c.right : c.right, bottom: !c.bottom }))}>
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true"><path d="M4 9V4h5m6 0h5v5m0 6v5h-5M9 20H4v-5" /></svg>
+          </button>
+        </>
+      )}
+    </section>
+    , document.body
   );
 }

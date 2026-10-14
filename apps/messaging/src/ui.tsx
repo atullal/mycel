@@ -1,5 +1,6 @@
 import type { ReactNode, SVGProps } from "react";
-import type { Member, MessageView } from "@mycel/sdk";
+import { PRESENCE_LABEL, type Member, type MessageView, type Presence } from "@mycel/sdk";
+import "./presence.css";
 
 // ---------------------------------------------------------------------------
 // Icons (1.6px strokes on a 20px grid, drawn for this app)
@@ -27,6 +28,13 @@ function Svg({ size = 20, children, ...rest }: IconProps & { children: ReactNode
 }
 
 export const Icon = {
+  More: (p: IconProps) => <Svg {...p}><path d="M4 10h.01M10 10h.01M16 10h.01" strokeWidth={3} /></Svg>,
+  Copy: (p: IconProps) => <Svg {...p}><rect x="7" y="7" width="10" height="10" rx="2"/><path d="M13 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2"/></Svg>,
+  Forward: (p: IconProps) => <Svg {...p}><path d="M12 4l5 5-5 5M17 9H9a5 5 0 0 0-5 5v2"/></Svg>,
+  Camera: (p: IconProps) => <Svg {...p}><path d="M3 6h3l1-2h6l1 2h3v11H3z"/><circle cx="10" cy="11" r="3"/></Svg>,
+  Image: (p: IconProps) => <Svg {...p}><rect x="2" y="3" width="16" height="14" rx="2"/><circle cx="7" cy="7" r="1"/><path d="M3 15l5-5 3 3 3-4 4 6"/></Svg>,
+  Stop: (p: IconProps) => <Svg {...p}><rect x="5" y="5" width="10" height="10" rx="1" fill="currentColor"/></Svg>,
+  Down: (p: IconProps) => <Svg {...p}><path d="M4 7l6 6 6-6"/></Svg>,
   Compose: (p: IconProps) => (
     <Svg {...p}>
       <path d="M9 3.5H5.5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V11" />
@@ -207,6 +215,10 @@ export function DeliveryMark({ delivery }: { delivery: MessageView["delivery"] }
 // ---------------------------------------------------------------------------
 // Avatars
 
+export function PresenceLabel({ status, className = "" }: { status?: Presence; className?: string }) {
+  return status ? <span className={`mx-presence-label is-${status} ${className}`}>{PRESENCE_LABEL[status]}</span> : null;
+}
+
 // Six muted, mutually harmonious hues; picked by id so a person keeps theirs everywhere.
 const AVATAR_TONES = ["moss", "slate", "ochre", "plum", "clay", "tide"] as const;
 
@@ -217,7 +229,11 @@ export function toneFor(id: string): (typeof AVATAR_TONES)[number] {
 }
 
 export function initials(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
+  // Words that start with a letter, ignoring "(M5)"-style suffixes, so a
+  // device name like "iPad Pro 11-inch (M5)" gives "IP".
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  const lettered = name.replace(/\([^)]*\)/g, " ").trim().split(/\s+/).filter((w) => /^\p{L}/u.test(w));
+  const parts = lettered.length ? lettered : words;
   if (parts.length === 0) return "?";
   if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase();
   return (parts[0]![0]! + parts[parts.length - 1]![0]!).toUpperCase();
@@ -253,15 +269,17 @@ export function ConversationAvatar({
   members,
   title,
   size = 40,
+  status,
 }: {
   id: string;
   direct: boolean;
   members: Member[];
   title: string;
   size?: number;
+  status?: Presence;
 }) {
   const others = members.filter((m) => !m.isMe && m.role !== "keeper");
-  if (direct && others[0]) return <Avatar id={others[0].id} name={others[0].name} size={size} />;
+  if (direct && others[0]) return <Avatar id={others[0].id} name={others[0].name} size={size} status={status} />;
   const shown = others.slice(0, 2);
   if (shown.length < 2) return <Avatar id={id} name={title} size={size} />;
   const small = Math.round(size * 0.64);

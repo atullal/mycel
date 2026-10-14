@@ -68,6 +68,14 @@ pub struct Member {
 #[serde(rename_all = "camelCase")]
 pub struct ConversationSummary {
     pub id: ConversationId,
+    /// Original spaces represented by this logical conversation. Old IDs
+    /// remain valid aliases; message operations retain their source space.
+    #[serde(default)]
+    pub aliases: Vec<ConversationId>,
+    /// Stable local UI/notification identity, independent of transport and
+    /// independently created direct-space IDs. Never used as a wire space ID.
+    #[serde(default)]
+    pub thread_key: String,
     pub title: String,
     /// True for a 1:1 conversation.
     pub direct: bool,
@@ -134,6 +142,17 @@ pub struct MessageView {
     pub is_mine: bool,
     /// Only meaningful for my own messages.
     pub delivery: Delivery,
+}
+
+/// Messages around one (`messages_around`), oldest → newest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageWindow {
+    pub messages: Vec<MessageView>,
+    /// Older messages exist before the window.
+    pub has_earlier: bool,
+    /// Newer messages exist after it (the window doesn't reach the latest).
+    pub has_later: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -203,6 +222,64 @@ pub enum TransferDirection {
     Download,
 }
 
+/// Something the user should know about: a problem Mycel recovered from, or
+/// one that is still going on. [`crate::Runtime::notices`] lists the current
+/// ones; [`Event::NoticesChanged`] says the list changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Notice {
+    /// This profile's identity isn't on this device (the profile was restored
+    /// or moved from another device), so Mycel started a new identity:
+    /// contacts need the new contact code. The old profile is kept, unchanged,
+    /// in the folder `kept_in`.
+    #[serde(rename_all = "camelCase")]
+    IdentityReplaced { kept_in: String },
+    /// The saved network choice couldn't be read, so Mycel uses local paths
+    /// only (the most private choice) until another one is chosen.
+    NetworkModeReset,
+    /// `count` saved records couldn't be read. They were set aside (kept, not
+    /// deleted) so Mycel could start; the conversations they belong to may
+    /// miss some history until peers sync it again.
+    #[serde(rename_all = "camelCase")]
+    RecordsSetAside { count: u64 },
+    /// Saving to this device is failing (for example, storage is full). Mycel
+    /// keeps retrying; new messages can't be sent until saving works again.
+    #[serde(rename_all = "camelCase")]
+    StorageFailing { error: String },
+}
+
+/// What a local alert is about. A native shell shows each kind as one fixed,
+/// generic sentence: no names, message text or IDs ever reach the OS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AlertKind {
+    Message,
+    MessageRequest,
+    GroupInvitation,
+    IncomingCall,
+    MissedCall,
+}
+
+/// A private local alert for the native shell. The chat layer has already
+/// decided it is news; every string here is an opaque local key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Alert {
+    pub kind: AlertKind,
+    /// What the alert is about (a conversation's stable thread key). A
+    /// thread's alerts are withdrawn together and suppressed while it is on
+    /// screen (`Runtime::alert_thread` maps what the app shows to a thread).
+    pub thread: String,
+    /// A later alert with the same key replaces this one.
+    pub key: String,
+    /// What a tap opens, resolved again through `Runtime::alert_route` when
+    /// tapped (it may have moved, or be gone).
+    pub target: String,
+    /// Also show it while the app is focused on something else. False when
+    /// the app has its own UI for it (an incoming call rings in the app).
+    pub foreground: bool,
+}
+
 /// Pushed to UIs (Tauri event `mycel://event`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -233,4 +310,22 @@ pub enum Event {
     /// while active (for the duration and level meters).
     #[serde(rename_all = "camelCase")]
     CallUpdated { call: CallInfo },
+    /// The list of [`Notice`]s changed: fetch it again with `notices`.
+    NoticesChanged,
+    /// For the native shell, not apps (hosts don't forward it): show a
+    /// private local alert.
+    #[serde(rename_all = "camelCase")]
+    Alert { alert: Alert },
+    /// For the native shell: take back delivered alerts, all of `thread`'s,
+    /// or only the one with `key`.
+    #[serde(rename_all = "camelCase")]
+    AlertWithdrawn { thread: String, key: Option<String> },
+}
+
+impl Event {
+    /// Shell-only events (alerts) that hosts handle themselves instead of
+    /// forwarding to apps.
+    pub fn is_for_shell(&self) -> bool {
+        matches!(self, Event::Alert { .. } | Event::AlertWithdrawn { .. })
+    }
 }

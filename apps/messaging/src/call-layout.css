@@ -1,0 +1,149 @@
+/* The canvas nodes remain mounted while the call moves between these layouts. */
+.mx-stage.mx-call-stage {
+  position: fixed;
+  z-index: 90;
+  font-family: var(--font-ui, system-ui, sans-serif);
+  --call-top-inset: 12px;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  outline: none;
+}
+.mx-call-stage.is-expanded {
+  inset: 0;
+  width: 100%;
+  height: 100dvh;
+  min-height: 0;
+  border: 0;
+}
+.mx-call-stage.is-expanded .mx-stage-remote {
+  object-fit: contain;
+}
+.mx-call-stage .mx-stage-controls {
+  position: absolute;
+  z-index: 3;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  padding: max(8px, env(safe-area-inset-top)) 8px 8px;
+  background: linear-gradient(#101214e8, #10121495, transparent);
+}
+.mx-stage-controls .mx-callbar {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: transparent;
+  --ink: #f2f3f4;
+  --ink-2: #c6ceca;
+  --ink-3: #a4b0aa;
+  --accent: #8bc4a3;
+}
+.mx-stage-controls .mx-callbar-who { min-width: 0; }
+.mx-stage-controls .mx-callbar-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mx-stage-controls .mx-callbar-meters { flex-shrink: 0; }
+.mx-stage-controls .mx-callbar-actions { flex-shrink: 0; }
+.mx-stage-controls .mx-icon-btn { min-width: 44px; min-height: 44px; }
+.mx-stage-minimize,
+.mx-stage-corner {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 44px;
+  height: 44px;
+  border: 0;
+  border-radius: 50%;
+  background: #10121490;
+  color: white;
+  cursor: pointer;
+}
+.mx-call-stage.is-expanded .mx-stage-self {
+  width: clamp(100px, 18vw, 200px);
+  max-height: 36dvh;
+  bottom: max(24px, env(safe-area-inset-bottom));
+  right: max(16px, env(safe-area-inset-right));
+}
+.mx-call-stage .mx-stage-self canvas { object-fit: contain; }
+.mx-call-stage.is-expanded .mx-stage-stats {
+  bottom: max(24px, env(safe-area-inset-bottom));
+}
+.mx-call-stage.is-floating {
+  inset: auto;
+  width: 176px;
+  height: auto;
+  aspect-ratio: 3 / 4;
+  min-height: 80px;
+  max-width: calc(100vw - 24px);
+  max-height: min(40dvh, 300px);
+  border: 1px solid #ffffff35;
+  border-radius: 18px;
+  box-shadow: 0 8px 28px #0007;
+  transition: left 170ms ease-out, top 170ms ease-out;
+}
+.mx-call-stage.is-floating.is-dragging { transition: none; }
+.mx-call-stage.is-floating .mx-stage-self,
+.mx-call-stage.is-floating .mx-stage-stats,
+.mx-call-stage.is-floating .mx-stage-note .mx-avatar { display: none; }
+.mx-call-stage.is-floating .mx-stage-note {
+  align-items: flex-start;
+  justify-content: flex-start;
+  font-size: 11px;
+  line-height: 1.2;
+  text-align: left;
+  padding: 12px 44px 32px 10px;
+}
+.mx-stage-restore {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #fff;
+  text-align: left;
+  cursor: grab;
+  touch-action: none;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.mx-stage-restore > span {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 16px 10px 8px;
+  background: linear-gradient(transparent, #0009);
+  font-size: 11px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+.mx-stage-caption-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.mx-stage-caption-time { margin-left: auto; flex-shrink: 0; }
+.mx-stage-corner { position: absolute; right: 0; top: 0; background: #10121450; }
+.mx-stage-restore:focus-visible,
+.mx-stage-minimize:focus-visible,
+.mx-stage-corner:focus-visible { outline: 3px solid #8bc4a3; outline-offset: -4px; }
+.mx-call-stage.is-dragging .mx-stage-restore { cursor: grabbing; }
+@media (max-width: 720px) {
+  .mx-stage.mx-call-stage { --call-top-inset: 48px; }
+  .mx-stage-controls .mx-callbar { padding: 0 2px 0 4px; gap: 4px; }
+  .mx-stage-controls .mx-callbar-meters { display: none; }
+  .mx-stage-controls .mx-callbar-who { flex: 1; gap: 4px; }
+  .mx-stage-controls .mx-callbar-name { max-width: 24vw; }
+  .mx-call-stage.is-expanded .mx-stage-self { width: 28vw; }
+  .mx-call-stage.is-floating { width: 144px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mx-call-stage.is-floating { transition: none; }
+}

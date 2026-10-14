@@ -1,19 +1,27 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useCalls, useContacts, useConversations, useMycel, useProfile } from "@mycel/sdk/react";
-import type { Contact } from "@mycel/sdk";
+import { IMMERSIVE_ATTRIBUTE, isConversation, threadKeyOf, type Contact } from "@mycel/sdk";
 import { ConversationList } from "./ConversationList.tsx";
 import { ChatView } from "./ChatView.tsx";
 import { NewConversationDialog } from "./NewConversation.tsx";
 import { MembersPanel } from "./MembersPanel.tsx";
 import { CallBar, IncomingCall, VideoStage, hasVideo, isLive, visibleCalls } from "./Calls.tsx";
 import { errorText } from "./ui.tsx";
+import { PANEL_OVER_CHAT, PHONE_LAYOUT, conversationInView, videoLayout } from "./layout.ts";
+import { useMediaQuery } from "./useMediaQuery.ts";
 import "./messaging.css";
+import "./search.css";
 
 export interface MessagingAppProps {
   /** Open this conversation first (otherwise the last one viewed). */
   initialConversation?: string;
   /** Ask the host to show its Contacts panel (used by empty states). */
   onOpenContacts?: () => void;
+  /** Host panels can cover the mounted chat; covered chats are not being read. */
+  visible?: boolean;
+  /** Host notification routing; a token allows opening the same chat twice. */
+  openRequest?: { id: string; token: number } | null;
+  onVisibleConversationChange?: (id: string | null) => void;
 }
 
 const LAST_KEY = "mycel.messaging.lastConversation";
@@ -35,7 +43,7 @@ function writeLast(id: string | null) {
   }
 }
 
-export function MessagingApp({ initialConversation, onOpenContacts }: MessagingAppProps) {
+export function MessagingApp({ initialConversation, onOpenContacts, visible = true, openRequest, onVisibleConversationChange }: MessagingAppProps) {
   const { conversations, loading } = useConversations();
   const { contacts } = useContacts();
   const { profile } = useProfile();
@@ -52,6 +60,14 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
   const ringing = calls.find((c) => c.direction === "incoming" && c.state === "ringing") ?? null;
   const barCall = calls.find((c) => isLive(c) && c !== ringing) ?? calls.find((c) => c.state === "ended") ?? null;
   const liveCall = calls.find((c) => isLive(c) && c !== ringing) ?? null;
+  const [videoMinimized, setVideoMinimized] = useState(false);
+  useEffect(() => setVideoMinimized(false), [liveCall?.id]);
+  const phoneLayout = useMediaQuery(PHONE_LAYOUT);
+  const panelOverChat = useMediaQuery(PANEL_OVER_CHAT);
+  const videoCall = liveCall && hasVideo(liveCall) ? liveCall : null;
+  const stageLayout = videoCall ? videoLayout(phoneLayout, videoMinimized) : null;
+  // Only a phone's full-screen call covers the app (and makes it inert).
+  const videoExpanded = stageLayout === "expanded";
   const [callError, setCallError] = useState<string | null>(null);
   const startCall = useCallback(
     async (conversation: string, video = false) => {
@@ -72,7 +88,7 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
   useEffect(() => {
     if (loading || validated.current) return;
     validated.current = true;
-    if (selected && !conversations.some((c) => c.id === selected)) setSelected(null);
+    if (selected && !conversations.some((c) => isConversation(c, selected))) setSelected(null);
   }, [loading, conversations, selected]);
 
   const select = useCallback((id: string | null) => {
@@ -80,13 +96,61 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
     writeLast(id);
   }, []);
 
-  const current = conversations.find((c) => c.id === selected) ?? null;
+  // Phones (and narrow windows) show either the list or one conversation:
+  // one history entry while a conversation is open lets Android's back
+  // button (and a browser's) return to the list instead of leaving the app.
+  const historyEntry = useRef(false);
+  useEffect(() => {
+    if (selected && !historyEntry.current) {
+      historyEntry.current = true;
+      history.pushState({ mycelConversation: true }, "");
+    } else if (!selected && historyEntry.current) {
+      // closed in the app (the back arrow): drop the entry too
+      historyEntry.current = false;
+      history.back();
+    }
+  }, [selected]);
+  useEffect(() => {
+    const onPop = () => {
+      if (!historyEntry.current) return;
+      historyEntry.current = false;
+      select(null);
+    };
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, [select]);
+
+  const current = conversations.find((c) => isConversation(c, selected)) ?? null;
+  // A late-arriving duplicate may choose a different canonical space. Keep
+  // the current person selected without discarding the underlying histories.
+  useEffect(() => {
+    if (current && selected !== current.id) select(current.id);
+  }, [current?.id, selected, select]);
+  useEffect(() => {
+    if (!openRequest) return;
+    setComposing(false);
+    setMembersOpen(false);
+    setVideoMinimized(true);
+    select(openRequest.id);
+  }, [openRequest?.token, openRequest?.id, select]);
+  const inView = conversationInView({ hostVisible: visible, composing, videoLayout: stageLayout, membersOpen, panelOverChat });
+  const visibleConversation = inView ? current?.id ?? null : null;
+  useEffect(() => {
+    onVisibleConversationChange?.(visibleConversation);
+    return () => onVisibleConversationChange?.(null);
+  }, [visibleConversation, onVisibleConversationChange]);
   const currentCall = current
     ? (calls.find((c) => c.conversation === current.id && (isLive(c) || c.state === "joinable")) ?? null)
     : null;
 
   return (
-    <div className={`mx-root${current ? " has-selection" : ""}${membersOpen && current ? " members-open" : ""}`}>
+    <div
+      inert={videoExpanded}
+      className={`mx-root${current ? " has-selection" : ""}${membersOpen && current ? " members-open" : ""}`}
+      // An open conversation has its own back button: on a phone the host
+      // can give its app bar's room to the chat.
+      {...(current ? { [IMMERSIVE_ATTRIBUTE]: "" } : {})}
+    >
       <ConversationList
         conversations={conversations}
         loading={loading}
@@ -96,10 +160,25 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
       />
       <main className="mx-main">
         <CallBar call={barCall} onOpen={select} error={callError} onDismissError={() => setCallError(null)} />
-        {liveCall && hasVideo(liveCall) && <VideoStage key={liveCall.id} call={liveCall} />}
+        {videoCall && stageLayout && (
+          <VideoStage
+            key={videoCall.id}
+            call={videoCall}
+            layout={stageLayout}
+            onMinimize={() => {
+              setVideoMinimized(true);
+              if (!current) select(videoCall.conversation);
+            }}
+            onRestore={() => setVideoMinimized(false)}
+            onOpenChat={() => {
+              select(videoCall.conversation);
+              setVideoMinimized(true);
+            }}
+          />
+        )}
         {current ? (
           <ChatView
-            key={current.id}
+            key={threadKeyOf(current)}
             summary={current}
             me={profile?.id}
             contactsById={contactsById}
@@ -112,6 +191,7 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
             onVideoCall={() => void startCall(current.id, true)}
             call={currentCall}
             meName={profile?.name}
+            visible={visibleConversation === current.id}
           />
         ) : (
           <NoSelection
@@ -125,7 +205,7 @@ export function MessagingApp({ initialConversation, onOpenContacts }: MessagingA
       </main>
       {current && membersOpen && (
         <MembersPanel
-          key={current.id}
+          key={threadKeyOf(current)}
           conversationId={current.id}
           contacts={contacts}
           onClose={() => setMembersOpen(false)}

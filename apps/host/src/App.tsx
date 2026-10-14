@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ReactNode } from "react";
 import { MessagingApp } from "@mycel/messaging";
 import { useConversations, useMycel, useNearby, useNetwork, useProfile } from "@mycel/sdk/react";
 import { Glyph, MycelMark } from "./icons.tsx";
@@ -7,6 +7,8 @@ import { ContactsPanel } from "./panels/ContactsPanel.tsx";
 import { NearbyPanel } from "./panels/NearbyPanel.tsx";
 import { NetworkPanel } from "./panels/NetworkPanel.tsx";
 import { Avatar } from "./panels/common.tsx";
+import { useNativeNotifications } from "./notifications.ts";
+import { NoticeBanner } from "./Notices.tsx";
 
 type AppId = "messaging" | "docs" | "newsroom" | "game";
 type PanelId = "profile" | "contacts" | "nearby" | "network";
@@ -52,6 +54,13 @@ export function App() {
   const { nearby } = useNearby();
   const { status } = useNetwork();
   const demo = mycel.transport.kind === "mock";
+  const [openRequest, setOpenRequest] = useState<{ id: string; token: number } | null>(null);
+  const openNotification = useCallback((id: string) => {
+    setApp("messaging");
+    setPanel(null);
+    setOpenRequest((previous) => ({ id, token: (previous?.token ?? 0) + 1 }));
+  }, []);
+  const notifications = useNativeNotifications(!!profile && !demo, openNotification);
 
   useEffect(() => {
     document.title = profile ? `${profile.name} — Mycel` : "Mycel";
@@ -143,9 +152,15 @@ export function App() {
       </nav>
 
       <div className="stage">
+        <NoticeBanner onOpenNetwork={() => setPanel("network")} />
         <div className="stage-app" inert={panel ? true : undefined}>
           {current.ready ? (
-            <MessagingApp onOpenContacts={() => setPanel("contacts")} />
+            <MessagingApp
+              onOpenContacts={() => setPanel("contacts")}
+              visible={!panel}
+              openRequest={openRequest}
+              onVisibleConversationChange={notifications.setVisibleConversation}
+            />
           ) : (
             <ComingSoon name={current.name} glyph={current.glyph} blurb={current.blurb} />
           )}
@@ -162,7 +177,7 @@ export function App() {
                 </button>
               </header>
               <div className="sheet-body">
-                {panel === "profile" && <ProfilePanel />}
+                {panel === "profile" && <ProfilePanel notifications={notifications} />}
                 {panel === "contacts" && <ContactsPanel onShowNearby={() => setPanel("nearby")} />}
                 {panel === "nearby" && <NearbyPanel />}
                 {panel === "network" && <NetworkPanel />}

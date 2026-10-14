@@ -81,9 +81,9 @@ impl VideoHub {
         r
     }
 
-    pub fn keyframes(&self, id: &CallId) {
+    pub fn keyframes(&self, id: &CallId, local: bool, remote: bool) {
         if let Some(v) = self.call(id) {
-            v.keyframes();
+            v.keyframes(local, remote);
         }
     }
 

@@ -15,7 +15,7 @@ socket2 = { version = "0.6.5", features = ["all"] }
 tokio = { version = "1.53.2", features = ["net", "rt", "sync", "time", "macros"] }
 
 [target.'cfg(unix)'.dependencies]
-libc = "0.2.190"
+libc = "0.2.189"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 futures-util = "0.3"

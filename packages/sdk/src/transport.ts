@@ -6,10 +6,12 @@ import type {
   ConversationSummary,
   MessageId,
   MessageView,
+  MessageWindow,
   MycelEvent,
   NearbyPeer,
   NetworkMode,
   NetworkStatus,
+  Notice,
   PeerId,
   Profile,
 } from "./types.ts";
@@ -30,12 +32,18 @@ export interface Commands {
   set_network_mode: [{ mode: NetworkMode }, NetworkStatus];
   /** Native host only: relaunch the app. */
   restart_app: [Record<string, never>, null];
+  list_notices: [Record<string, never>, Notice[]];
+  dismiss_notice: [{ notice: Notice }, null];
   list_conversations: [Record<string, never>, ConversationSummary[]];
   get_conversation: [{ id: ConversationId }, ConversationSummary];
   create_conversation: [{ title?: string | null; members: PeerId[] }, ConversationSummary];
   list_messages: [
     { id: ConversationId; limit?: number | null; before?: MessageId | null },
     MessageView[],
+  ];
+  messages_around: [
+    { id: ConversationId; message: MessageId; before?: number | null; after?: number | null },
+    MessageWindow,
   ];
   send_message: [
     {
@@ -48,6 +56,9 @@ export interface Commands {
   ];
   edit_message: [{ id: ConversationId; message: MessageId; body: string }, null];
   delete_message: [{ id: ConversationId; message: MessageId }, null];
+  delete_message_local: [{ id: ConversationId; message: MessageId }, null];
+  restore_message_local: [{ id: ConversationId; message: MessageId }, null];
+  search_messages: [{ id: ConversationId; query: string; limit?: number }, MessageView[]];
   toggle_reaction: [{ id: ConversationId; message: MessageId; emoji: string }, null];
   mark_read: [{ id: ConversationId }, null];
   set_typing: [{ id: ConversationId }, null];
@@ -61,7 +72,7 @@ export interface Commands {
   start_call: [{ conversation: ConversationId; video?: boolean }, CallInfo];
   accept_call: [{ call: CallId; video?: boolean }, CallInfo];
   set_camera: [{ call: CallId; on: boolean }, CallInfo];
-  video_keyframe: [{ call: CallId }, null];
+  video_keyframe: [{ call: CallId; source?: "local" | "remote" | null }, null];
   decline_call: [{ call: CallId }, null];
   end_call: [{ call: CallId }, null];
   set_muted: [{ call: CallId; muted: boolean }, CallInfo];

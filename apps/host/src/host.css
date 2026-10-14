@@ -5,6 +5,9 @@
   grid-template-columns: 76px minmax(0, 1fr);
   height: 100%;
   background: var(--bg);
+  /* Phones and tablets: the page runs under the status bar, notch and home
+     indicator (viewport-fit=cover); keep the app itself out of them. */
+  padding: var(--safe-top) var(--safe-right) var(--safe-bottom) var(--safe-left);
 }
 
 /* ---------------------------------------------------------------- rail */
@@ -184,6 +187,8 @@
 
 .stage {
   position: relative;
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   min-height: 0;
   margin: 8px 8px 8px 0;
@@ -193,7 +198,68 @@
   box-shadow: 0 0 0 1px var(--line-soft);
 }
 .stage-app {
-  height: 100%;
+  flex: 1;
+  min-height: 0;
+}
+
+/* Runtime notices (Notices.tsx): calm, above the app, dismissible. */
+.notices {
+  flex: none;
+  border-bottom: 1px solid var(--line-soft);
+}
+.notice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 8px 8px 16px;
+  background: var(--surface-2);
+  color: var(--ink);
+  font-size: 13.5px;
+  line-height: 1.4;
+}
+.notice + .notice {
+  border-top: 1px solid var(--line-soft);
+}
+.notice.is-ongoing {
+  background: var(--danger-soft);
+}
+.notice-mark {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.notice.is-ongoing .notice-mark {
+  background: var(--danger);
+}
+.notice-text {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  padding: 4px 0;
+  overflow-wrap: anywhere;
+}
+.notice-dismiss {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border: 0;
+  border-radius: var(--r-md);
+  background: transparent;
+  color: var(--ink-2);
+}
+.notice-dismiss:hover {
+  background: var(--surface-3);
+  color: var(--ink);
+}
+@media (pointer: coarse) {
+  .notice-dismiss {
+    width: 44px;
+    height: 44px;
+  }
 }
 
 .scrim {
@@ -859,12 +925,14 @@
   .host {
     grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr) auto;
+    /* the bottom bar pads itself above the home indicator */
+    padding-bottom: 0;
   }
   .rail {
     grid-row: 2;
     flex-direction: row;
     justify-content: space-around;
-    padding: 6px 8px calc(6px + env(safe-area-inset-bottom));
+    padding: 6px 8px calc(6px + var(--safe-bottom));
     gap: 0;
   }
   .rail-mark,
@@ -896,5 +964,33 @@
   .stage {
     margin: 0;
     border-radius: 0;
+  }
+  /* the on-screen keyboard is up: give its room to the conversation */
+  .keyboard-open .rail {
+    display: none;
+  }
+}
+
+/* Small text fields make iOS zoom the whole webview on focus. That zoom
+   survives keyboard dismissal and displaces the app's navigation controls.
+   Preserve larger inherited text and user pinch zoom. */
+@media (pointer: coarse) {
+  :root input,
+  :root textarea,
+  :root select {
+    font-size: max(1em, 16px);
+  }
+}
+
+/* An app showing one thing full-screen with its own way back (an open
+   conversation) marks it with data-mycel-immersive (IMMERSIVE_ATTRIBUTE in
+   @mycel/sdk). On a phone, give it the app bar's room; a narrow window on a
+   computer keeps the bar. */
+@media (max-width: 720px) and (pointer: coarse) {
+  .host:has(.stage-app [data-mycel-immersive]) {
+    grid-template-rows: minmax(0, 1fr);
+  }
+  .host:has(.stage-app [data-mycel-immersive]) > .rail {
+    display: none;
   }
 }

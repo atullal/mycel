@@ -146,6 +146,16 @@ body,
   margin: 0;
 }
 
+/* Room taken by the status bar, notch, home indicator or navigation bar on
+   phones and tablets: iOS reports it through env() (viewport-fit=cover),
+   Android through MainActivity (main.tsx). Zero on computers. */
+:root {
+  --safe-top: max(env(safe-area-inset-top), var(--android-inset-top, 0px));
+  --safe-right: max(env(safe-area-inset-right), var(--android-inset-right, 0px));
+  --safe-bottom: max(env(safe-area-inset-bottom), var(--android-inset-bottom, 0px));
+  --safe-left: max(env(safe-area-inset-left), var(--android-inset-left, 0px));
+}
+
 body {
   background: var(--bg);
   color: var(--ink);

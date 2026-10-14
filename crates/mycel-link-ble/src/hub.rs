@@ -220,7 +220,7 @@ impl Default for ChannelRx {
 }
 
 // (the Linux backend times its reads out instead)
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg_attr(not(any(target_os = "macos", target_os = "ios")), allow(dead_code))]
 impl ChannelRx {
     /// Nothing arrived for [`SILENT_AFTER`]: the channel is dead.
     pub fn silent(&self, now: Instant) -> bool {

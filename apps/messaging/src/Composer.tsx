@@ -9,8 +9,10 @@ import {
   type Ref,
 } from "react";
 import { useMycel, useTransfer } from "@mycel/sdk/react";
+import { isMobile } from "@mycel/sdk";
 import type { ConversationSummary, MessageView } from "@mycel/sdk";
 import { Icon, errorText, fileNameFromPath, formatRate, formatSize, previewText } from "./ui.tsx";
+import { VoiceRecorder } from "./VoiceRecorder.tsx";
 
 /** Lets the conversation view hand the composer dropped files. */
 export interface ComposerHandle {
@@ -43,6 +45,14 @@ export function Composer({
   onStartEdit: (m: MessageView) => void;
 }) {
   const mycel = useMycel();
+  // Phones and tablets pick through the system's chooser (photos, camera,
+  // files): it hands over copies, which are staged with the runtime. A
+  // computer's file dialog gives real paths, which the runtime reads itself,
+  // so even very large files never pass through the web view.
+  const systemChooser = isMobile();
+  const [recording, setRecording] = useState(false);
+  const fileInput = useRef<HTMLInputElement>(null);
+  const cameraInput = useRef<HTMLInputElement>(null);
   const [text, setText] = useState("");
   const [files, setFiles] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
@@ -82,7 +92,7 @@ export function Composer({
   }, [replyTo]);
 
   useEffect(() => {
-    input.current?.focus();
+    if (matchMedia("(pointer: fine)").matches) input.current?.focus();
   }, [conversation.id]);
 
   const cancelEdit = () => {
@@ -91,7 +101,7 @@ export function Composer({
   };
 
   const submit = async () => {
-    if (busy) return;
+    if (busy || staging > 0 || recording) return;
     const body = text.trim();
     setError(null);
     if (editing) {
@@ -131,7 +141,7 @@ export function Composer({
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.nativeEvent.isComposing) return;
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key === "Enter" && !e.shiftKey && (matchMedia("(pointer: fine)").matches || e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       void submit();
     } else if (e.key === "Escape") {
@@ -170,14 +180,16 @@ export function Composer({
     } catch (e) {
       setError(errorText(e));
     }
-    input.current?.focus();
+    if (matchMedia("(pointer: fine)").matches) input.current?.focus();
   };
 
   // Pasted images and HTML-dropped files have no path: copy them to the runtime first.
-  const attachFiles = async (list: File[]) => {
+  const attachFiles = async (list: File[], propagateError = false) => {
     if (!list.length) return;
     if (!mycel.files.stage) {
-      setError("Use the paperclip to attach files here.");
+      const unavailable = new Error("Use Attach files to add files here.");
+      setError(unavailable.message);
+      if (propagateError) throw unavailable;
       return;
     }
     setError(null);
@@ -186,9 +198,10 @@ export function Composer({
       attachPaths(await mycel.files.stage(list));
     } catch (e) {
       setError(errorText(e));
+      if (propagateError) throw e;
     } finally {
       setStaging((n) => n - 1);
-      input.current?.focus();
+      if (matchMedia("(pointer: fine)").matches) input.current?.focus();
     }
   };
 
@@ -212,6 +225,14 @@ export function Composer({
 
   return (
     <div className="mx-composer">
+      {systemChooser && (
+        <>
+          {/* The system chooser already offers Photos, Camera and Files. */}
+          <input ref={fileInput} type="file" multiple hidden onChange={(e) => { void attachFiles(Array.from(e.currentTarget.files ?? [])); e.currentTarget.value = ""; }} />
+          <input ref={cameraInput} type="file" accept="image/*" capture="environment" hidden onChange={(e) => { void attachFiles(Array.from(e.currentTarget.files ?? [])); e.currentTarget.value = ""; }} />
+        </>
+      )}
+      {recording && <VoiceRecorder onCancel={() => setRecording(false)} onAttach={(file) => attachFiles([file], true)} />}
       {(replyTo || editing) && (
         <div className={`mx-context${editing ? " is-edit" : ""}`}>
           {editing ? <Icon.Edit size={16} /> : <Icon.Reply size={16} />}
@@ -253,10 +274,16 @@ export function Composer({
         </p>
       )}
 
-      <div className="mx-composer-box">
+      {!recording && <div className="mx-composer-box">
         {!editing && (
-          <button className="mx-icon-btn" onClick={attach} aria-label="Attach files" title="Attach files">
-            <Icon.Clip />
+          <button
+            className="mx-icon-btn mx-attach"
+            disabled={busy || staging > 0}
+            onClick={() => (systemChooser ? fileInput.current?.click() : void attach())}
+            aria-label="Attach files"
+            title="Attach files"
+          >
+            {systemChooser ? <Icon.Plus /> : <Icon.Clip />}
           </button>
         )}
         <textarea
@@ -269,7 +296,10 @@ export function Composer({
           onPaste={onPaste}
           aria-label={placeholder}
         />
-        <button
+        {!canSend && !editing && staging === 0 && !busy ? <>
+          {systemChooser && <button className="mx-icon-btn mx-camera" onClick={() => cameraInput.current?.click()} aria-label="Camera"><Icon.Camera /></button>}
+          <button className="mx-icon-btn mx-record" onClick={() => setRecording(true)} aria-label="Record voice note" title="Record voice note"><Icon.Mic /></button>
+        </> : <button
           className="mx-send"
           onClick={() => void submit()}
           disabled={!canSend || busy}
@@ -277,8 +307,8 @@ export function Composer({
           title={editing ? "Save (Enter)" : "Send (Enter)"}
         >
           {editing ? <Icon.Check size={18} /> : <Icon.Send size={18} />}
-        </button>
-      </div>
+        </button>}
+      </div>}
       <p className="mx-hint">
         <kbd>Enter</kbd> to send, <kbd>Shift</kbd>+<kbd>Enter</kbd> for a new line, <kbd>↑</kbd> to edit your last message.
         Drop or paste files to attach.

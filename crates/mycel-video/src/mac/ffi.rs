@@ -200,6 +200,9 @@ unsafe extern "C" {
     pub static kVTCompressionPropertyKey_AverageBitRate: CFStringRef;
     pub static kVTCompressionPropertyKey_DataRateLimits: CFStringRef;
     pub static kVTCompressionPropertyKey_ExpectedFrameRate: CFStringRef;
+    // iOS has it only from 17.4 (Mycel supports 16.4): a missing symbol would
+    // stop the app from launching. iPhones and iPads always encode in hardware.
+    #[cfg(target_os = "macos")]
     pub static kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder: CFStringRef;
     pub static kVTProfileLevel_H264_High_AutoLevel: CFStringRef;
     pub static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;

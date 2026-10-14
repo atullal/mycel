@@ -138,12 +138,16 @@ impl VideoCall {
         self.camera.lock().is_some()
     }
 
-    /// The app's decoders need a fresh start: keyframes from everyone, and
-    /// for our self-view.
-    pub fn keyframes(&self) {
+    /// The app's decoders need a fresh start: keyframes from everyone
+    /// (`remote`), and/or from us for our self-view (`local`).
+    pub fn keyframes(&self, local: bool, remote: bool) {
         for t in self.tracks.lock().values() {
-            t.request_keyframe();
-            t.force_keyframe();
+            if remote {
+                t.request_keyframe();
+            }
+            if local {
+                t.force_keyframe();
+            }
         }
     }
 

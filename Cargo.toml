@@ -27,6 +27,21 @@ opt-level = 3
 # (the AEAD's generic code is instantiated here)
 [profile.dev.package.mycel-crypto]
 opt-level = 3
+# Every membership op and envelope is signature-checked, and documents are
+# Automerge: unoptimized, tests with long histories or large documents crawl.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.automerge]
+opt-level = 3
+# Its internal debug assertions walk whole documents on every edit: typing
+# grows quadratic in tests (flat in release), hiding our own costs.
+debug-assertions = false
+[profile.dev.package.hexane]
+opt-level = 3
+[profile.dev.package.zlib-rs]
+opt-level = 3
 # Live calls encode and decode audio in real time: the Opus codec and the call
 # pipeline must be optimized even in debug builds.
 [profile.dev.package.unsafe-libopus]
@@ -63,7 +78,13 @@ debug = "line-tables-only"
 # noq 1.3 / noq-proto 1.3 (Iroh's QUIC) with a crash fix: a late HANDSHAKE_DONE
 # after path 0 was abandoned panicked, and the panic aborted the process. See
 # vendor/noq-proto/MYCEL_PATCH.md.
+# swift-rs 1.0.8 with an Xcode 27 link fix for the iOS app
+# (vendor/swift-rs/MYCEL_PATCH.md).
 [patch.crates-io]
 iroh = { path = "vendor/iroh" }
+swift-rs = { path = "vendor/swift-rs" }
 noq = { path = "vendor/noq" }
 noq-proto = { path = "vendor/noq-proto" }
+tauri-plugin-notification = { path = "vendor/tauri-plugin-notification" }
+# standard DNS-SD interop for LAN discovery (vendor/swarm-discovery/MYCEL_PATCH.md)
+swarm-discovery = { path = "vendor/swarm-discovery" }

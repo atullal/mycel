@@ -18,6 +18,10 @@ impl BitSet {
             *a |= b;
         }
     }
+    /// Is every member of `other` also a member of `self`?
+    pub fn contains_all(&self, other: &BitSet) -> bool {
+        other.0.iter().zip(&self.0).all(|(o, s)| o & !s == 0)
+    }
     pub fn intersect(&self, other: &BitSet) -> BitSet {
         BitSet(self.0.iter().zip(&other.0).map(|(a, b)| a & b).collect())
     }

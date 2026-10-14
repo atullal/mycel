@@ -1,11 +1,20 @@
 import { useState } from "react";
+import { isMobile } from "@mycel/sdk";
 import { useProfile } from "@mycel/sdk/react";
 import { Glyph } from "../icons.tsx";
 import { applyTheme, readTheme, type ThemeChoice } from "../theme.ts";
 import { Qr } from "./Qr.tsx";
 import { Avatar, errorText, shortId } from "./common.tsx";
+import { notificationStatus, type NotificationPermission } from "../notificationStatus.ts";
 
-export function ProfilePanel() {
+interface NotificationsState {
+  native: boolean;
+  permission: NotificationPermission;
+  error: string | null;
+  checkPermission: () => Promise<void>;
+}
+
+export function ProfilePanel({ notifications }: { notifications?: NotificationsState }) {
   const { profile, setName, error: loadError } = useProfile();
   const [editing, setEditing] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -97,6 +106,8 @@ export function ProfilePanel() {
         </div>
       </section>
 
+      {notifications?.native && <NotificationsCard notifications={notifications} />}
+
       <section className="p-card">
         <h4>Appearance</h4>
         <div className="p-seg" role="radiogroup" aria-label="Theme">
@@ -108,5 +119,30 @@ export function ProfilePanel() {
         </div>
       </section>
     </div>
+  );
+}
+
+function NotificationsCard({ notifications }: { notifications: NotificationsState }) {
+  const status = notificationStatus(notifications.permission);
+  return (
+    <section className="p-card" aria-label="Notifications">
+      <h4>Notifications</h4>
+      <p className="p-help" role="status">
+        {status.text}
+      </p>
+      {isMobile() && (
+        <p className="p-help">Alerts arrive while Mycel is connected. Your phone may pause the connection when Mycel is in the background.</p>
+      )}
+      {status.button && (
+        <button className="h-btn h-btn-quiet" onClick={() => void notifications.checkPermission()}>
+          {status.button}
+        </button>
+      )}
+      {notifications.error && (
+        <p className="p-error" role="alert">
+          {notifications.error}
+        </p>
+      )}
+    </section>
   );
 }

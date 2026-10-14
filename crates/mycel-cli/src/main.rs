@@ -122,12 +122,13 @@ async fn open(dev: &DeviceArgs, keeper: bool) -> Result<Arc<Runtime>> {
     let data_dir = expand(&dev.data);
     let mode = match dev.net {
         Some(n) => n.into(),
-        None => Runtime::saved_network_mode(&data_dir).unwrap_or(NetworkMode::Internet),
+        None => Runtime::launch_network_mode(&data_dir, NetworkMode::Internet),
     };
     Runtime::open_with(RuntimeOptions {
         data_dir,
         mode,
         name: dev.name.clone(),
+        default_name: None,
         keeper,
         port: dev.port,
     })
@@ -144,6 +145,7 @@ async fn main() -> Result<()> {
                 data_dir: expand(&data),
                 mode: NetworkMode::Local,
                 name: None,
+                default_name: None,
                 keeper: false,
                 port: 0,
             })
@@ -264,7 +266,8 @@ async fn api_events(State(app): State<Shared>, headers: HeaderMap, Query(q): Que
         return r;
     }
     let stream = BroadcastStream::new(app.rt.subscribe()).filter_map(|ev| {
-        let ev = ev.ok()?;
+        // Alerts are for native shells (OS notifications), not pages.
+        let ev = ev.ok().filter(|ev| !ev.is_for_shell())?;
         let data = serde_json::to_string(&ev).ok()?;
         Some(Ok::<_, std::convert::Infallible>(SseEvent::default().data(data)))
     });

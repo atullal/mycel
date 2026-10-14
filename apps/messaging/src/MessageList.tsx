@@ -13,10 +13,14 @@ import {
   previewText,
   sameDay,
 } from "./ui.tsx";
+import { MessageActions, QUICK_REACTIONS } from "./MessageActions.tsx";
+import { ChatModal } from "./ChatModal.tsx";
+import { completesReply, replyDistance } from "./messageGesture.ts";
 import { HyphaeMark } from "./MessagingApp.tsx";
+import { FINE_POINTER, SYSTEM_MENU_TARGETS, keepsSystemMenu } from "./layout.ts";
+import { useMediaQuery } from "./useMediaQuery.ts";
 
 const GROUP_GAP_MS = 6 * 60_000;
-export const QUICK_REACTIONS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
 
 interface Props {
   me: string | undefined;
@@ -25,17 +29,40 @@ interface Props {
   loading: boolean;
   error: Error | null;
   hasMore: boolean;
-  onLoadOlder: () => void;
+  /** One more page, or `count` more messages. */
+  onLoadOlder: (count?: number) => void;
+  /** Newer messages exist after the loaded window (it was opened at an older message). */
+  hasNewer?: boolean;
+  onLoadNewer?: () => void;
+  /** Load the window around a message that isn't loaded (any depth). */
+  onShowMessage?: (id: string) => void;
+  /** Back to the newest messages, following new ones. */
+  onShowLatest?: () => void;
+  /** Go to a message (a quoted one that isn't loaded, say). */
+  onJumpRequest?: (id: string) => void;
   onReply?: (m: MessageView) => void;
   onEdit?: (m: MessageView) => void;
   editingId: string | null;
+  onDeleted?: (m: MessageView) => void;
+  jumpToId?: string | null;
+  onJumped?: () => void;
 }
 
-export function MessageList({ me, summary, messages, loading, error, hasMore, onLoadOlder, onReply, onEdit, editingId }: Props) {
+export function MessageList({ me, summary, messages, loading, error, hasMore, onLoadOlder, hasNewer = false, onLoadNewer, onShowMessage, onShowLatest, onJumpRequest, onReply, onEdit, editingId, onDeleted, jumpToId, onJumped }: Props) {
+  const mycel = useMycel();
+  const [undo, setUndo] = useState<MessageView | null>(null);
+  const [undoError, setUndoError] = useState<string | null>(null);
+  useEffect(() => { if (!undo) return; const timer = setTimeout(() => setUndo(null), 5000); return () => clearTimeout(timer); }, [undo]);
   const scroller = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
   const restoreFrom = useRef<{ height: number; top: number } | null>(null);
+  const previousLast = useRef<string | undefined>(undefined);
+  const [away, setAway] = useState(false);
+  const [selected, setSelected] = useState<MessageView | null>(null);
   const [flash, setFlash] = useState<string | null>(null);
+  // Mouse and trackpad: hover toolbar and the system menu where it helps.
+  // Touch: long press, swipe to reply and the actions sheet.
+  const fine = useMediaQuery(FINE_POINTER);
 
   const byId = useMemo(() => new Map(messages.map((m) => [m.id, m])), [messages]);
   const lastId = messages[messages.length - 1]?.id;
@@ -46,13 +73,17 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
   useLayoutEffect(() => {
     const el = scroller.current;
     if (!el) return;
+    const newMessage = previousLast.current !== lastId;
+    previousLast.current = lastId;
     if (restoreFrom.current) {
       const { height, top } = restoreFrom.current;
       el.scrollTop = el.scrollHeight - height + top;
       restoreFrom.current = null;
       return;
     }
-    if (stickToBottom.current || lastIsMine) el.scrollTop = el.scrollHeight;
+    if (stickToBottom.current || (newMessage && lastIsMine)) {
+      el.scrollTop = el.scrollHeight; stickToBottom.current = true; setAway(false);
+    }
   }, [messages, lastId, lastIsMine]);
 
   // Images load after layout; stay pinned while they do.
@@ -63,7 +94,9 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
       if (stickToBottom.current) el.scrollTop = el.scrollHeight;
     };
     el.addEventListener("load", onLoad, true);
-    return () => el.removeEventListener("load", onLoad, true);
+    const observer = new ResizeObserver(onLoad);
+    observer.observe(el);
+    return () => { el.removeEventListener("load", onLoad, true); observer.disconnect(); };
   }, []);
 
   const loadOlder = () => {
@@ -74,19 +107,52 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
 
   const jumpTo = (id: string) => {
     const node = scroller.current?.querySelector(`[data-mid="${id}"]`);
-    if (!node) return;
+    if (!node) {
+      // Not loaded (a quoted message far back): load the window around it.
+      onJumpRequest?.(id);
+      return;
+    }
     node.scrollIntoView({ block: "center", behavior: "smooth" });
     setFlash(id);
     setTimeout(() => setFlash((f) => (f === id ? null : f)), 1400);
   };
 
+  // Going to a message that isn't loaded (a search hit far back): one fetch
+  // of the window around it, at any depth.
+  const requested = useRef<string | null>(null);
+  useEffect(() => {
+    if (!jumpToId || loading || error) return;
+    if (byId.has(jumpToId)) {
+      requested.current = null;
+      stickToBottom.current = false;
+      jumpTo(jumpToId);
+      onJumped?.();
+    } else if (onShowMessage && requested.current !== jumpToId) {
+      requested.current = jumpToId;
+      onShowMessage(jumpToId);
+    } else {
+      // Its window is loaded and it isn't there: it's gone.
+      requested.current = null;
+      onJumped?.();
+    }
+  }, [jumpToId, byId, loading, error, onShowMessage, onJumped]);
+
+  const showLatest = () => {
+    stickToBottom.current = true;
+    if (hasNewer) onShowLatest?.();
+    const el = scroller.current;
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  };
+
   return (
+    <div className="mx-messages-area">
     <div
       className="mx-scroll"
       ref={scroller}
       onScroll={(e) => {
         const el = e.currentTarget;
         stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+        setAway(!stickToBottom.current);
       }}
     >
       <div className={`mx-thread${summary.direct ? " is-direct" : " is-group"}`} role="log" aria-label="Messages">
@@ -143,6 +209,8 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
                 onJump={jumpTo}
                 onReply={onReply}
                 onEdit={onEdit}
+                onActions={setSelected}
+                fine={fine}
                 canAct={summary.active && !summary.request}
                 inert={summary.request}
                 flashing={flash === m.id}
@@ -152,7 +220,22 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
             </Fragment>
           );
         })}
+        {hasNewer && (
+          <div className="mx-older">
+            <button className="mx-btn mx-btn-quiet" onClick={() => onLoadNewer?.()}>
+              Show newer messages
+            </button>
+          </div>
+        )}
       </div>
+    </div>
+    {(away || hasNewer) && <button className="mx-latest" aria-label="Jump to latest message" onClick={showLatest}><Icon.Down /></button>}
+    {undo && <div className="mx-delete-undo" role="status"><span>Message deleted for you</span><button className="mx-btn mx-btn-quiet" onClick={() => {
+      const message = undo; setUndo(null); setUndoError(null);
+      void mycel.chat.restoreLocal(message.conversation, message.id).catch((e) => setUndoError(errorText(e)));
+    }}>Undo</button></div>}
+    {undoError && <p className="mx-msg-error" role="alert">{undoError}</p>}
+    {selected && <MessageActions message={byId.get(selected.id) ?? selected} canInteract={summary.active && !summary.request && summary.myRole !== "readOnly"} onClose={() => setSelected(null)} onReply={onReply} onEdit={onEdit} onDeleted={(m, local) => { onDeleted?.(m); if (local) { setUndoError(null); setUndo(m); } }} />}
     </div>
   );
 }
@@ -167,6 +250,8 @@ const MessageRow = memo(function MessageRow({
   onJump,
   onReply,
   onEdit,
+  onActions,
+  fine,
   canAct,
   flashing,
   editing,
@@ -186,14 +271,21 @@ const MessageRow = memo(function MessageRow({
   onJump: (id: string) => void;
   onReply?: (m: MessageView) => void;
   onEdit?: (m: MessageView) => void;
+  onActions: (m: MessageView) => void;
+  /** A mouse or trackpad (hover toolbar, system menu) rather than touch. */
+  fine: boolean;
   canAct: boolean;
   flashing: boolean;
   editing: boolean;
 }) {
   const mycel = useMycel();
-  const [picking, setPicking] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  const gesture = useRef<{ x: number; y: number; dx: number; dy: number; timer: ReturnType<typeof setTimeout> | null } | null>(null);
+  const suppressClick = useRef(false);
+  const [offset, setOffset] = useState(0);
+  const cancelGesture = () => { if (gesture.current?.timer) clearTimeout(gesture.current.timer); gesture.current = null; setOffset(0); };
+  useEffect(() => () => { if (gesture.current?.timer) clearTimeout(gesture.current.timer); }, []);
   const [failure, setFailure] = useState<string | null>(null);
+  const [picking, setPicking] = useState(false);
 
   const act = (p: Promise<unknown>) => p.catch((e) => setFailure(errorText(e)));
   const react = (emoji: string) => {
@@ -222,8 +314,53 @@ const MessageRow = memo(function MessageRow({
       <div className="mx-msg-gutter">{showAvatar && <Avatar id={m.author} name={m.authorName} size={28} />}</div>
       <div className="mx-msg-col">
         {showAuthor && <div className="mx-msg-author">{m.authorName}</div>}
-        <div className="mx-msg-line">
-          <div className={`mx-bubble${bodyOnlyEmoji ? " is-emoji" : ""}${images.length && !m.body ? " is-media" : ""}`}>
+        <div
+          className="mx-msg-line"
+          onContextMenu={(e) => {
+            if (fine) {
+              const selection = window.getSelection();
+              const target = e.target instanceof Element ? e.target : null;
+              const keep = keepsSystemMenu({
+                selectionInMessage: !!selection && !selection.isCollapsed && selection.containsNode(e.currentTarget, true),
+                linkOrMedia: !!target?.closest(SYSTEM_MENU_TARGETS),
+              });
+              if (keep) return;
+            }
+            e.preventDefault();
+            onActions(m);
+          }}
+        >
+          {offset > 0 && <span className="mx-swipe-hint" aria-hidden="true"><Icon.Reply /></span>}
+          <div className={`mx-bubble${bodyOnlyEmoji ? " is-emoji" : ""}${images.length && !m.body ? " is-media" : ""}`}
+            tabIndex={0}
+            aria-label={`${m.isMine ? "You" : m.authorName}: ${previewText(m)}. Message actions`}
+            style={offset ? { transform: `translateX(${offset}px)` } : undefined}
+            onKeyDown={(e) => { if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); onActions(m); } }}
+            onPointerDownCapture={(e) => {
+              suppressClick.current = false;
+              if (!e.isPrimary || e.pointerType === "mouse" || (e.target as Element).closest("button:not(.mx-image),a,audio,video")) return;
+              cancelGesture();
+              const g = { x: e.clientX, y: e.clientY, dx: 0, dy: 0, timer: null as ReturnType<typeof setTimeout> | null };
+              g.timer = setTimeout(() => { suppressClick.current = true; cancelGesture(); onActions(m); }, 480);
+              gesture.current = g;
+            }}
+            onPointerMove={(e) => {
+              const g = gesture.current; if (!g) return;
+              g.dx = e.clientX - g.x; g.dy = e.clientY - g.y;
+              if (Math.hypot(g.dx, g.dy) > 10 && g.timer) { clearTimeout(g.timer); g.timer = null; }
+              if (onReply && !m.deleted) {
+                const distance = replyDistance(g.dx, g.dy);
+                if (distance && !e.currentTarget.hasPointerCapture(e.pointerId)) e.currentTarget.setPointerCapture(e.pointerId);
+                setOffset(distance);
+              }
+            }}
+            onPointerUp={(e) => {
+              const g = gesture.current;
+              if (g && onReply && !m.deleted && completesReply(e.clientX - g.x, e.clientY - g.y)) { suppressClick.current = true; onReply(m); }
+              cancelGesture();
+            }}
+            onPointerCancel={cancelGesture}
+            onClickCapture={(e) => { if (suppressClick.current) { e.preventDefault(); e.stopPropagation(); suppressClick.current = false; } }}>
             {m.deleted ? (
               <span className="mx-deleted">{m.isMine ? "You deleted this message" : "This message was deleted"}</span>
             ) : (
@@ -232,8 +369,7 @@ const MessageRow = memo(function MessageRow({
                   <button
                     className="mx-quote"
                     onClick={() => m.replyTo && onJump(m.replyTo)}
-                    disabled={!quoted}
-                    title={quoted ? "Go to message" : undefined}
+                    title="Go to message"
                   >
                     <span className="mx-quote-author">{quoted ? (quoted.isMine ? "You" : quoted.authorName) : "Reply"}</span>
                     <span className="mx-quote-text">{quoted ? previewText(quoted) : "Earlier message"}</span>
@@ -244,7 +380,7 @@ const MessageRow = memo(function MessageRow({
                 ) : (
                   <>
                     {images.map((a) => (
-                      <ImageAttachment key={a.blob} a={a} />
+                      <ImageAttachment key={a.blob} a={a} touch={!fine} />
                     ))}
                     {files.map((a) => (
                       <FileAttachment key={a.blob} a={a} />
@@ -263,7 +399,7 @@ const MessageRow = memo(function MessageRow({
             </span>
           </div>
 
-          {canAct && !m.deleted && (
+          {fine && canAct && !m.deleted ? (
             <div className="mx-actions" role="toolbar" aria-label="Message actions">
               <button className="mx-act" onClick={() => setPicking((p) => !p)} aria-label="React" title="React" aria-expanded={picking}>
                 <Icon.Smile size={17} />
@@ -273,26 +409,14 @@ const MessageRow = memo(function MessageRow({
                   <Icon.Reply size={17} />
                 </button>
               )}
-              {m.isMine && onEdit && (
+              {m.isMine && onEdit && !!m.body && (
                 <button className="mx-act" onClick={() => onEdit(m)} aria-label="Edit" title="Edit">
                   <Icon.Edit size={17} />
                 </button>
               )}
-              {m.isMine &&
-                (confirmDelete ? (
-                  <button
-                    className="mx-act mx-act-danger is-confirm"
-                    onClick={() => void act(mycel.chat.delete(m.conversation, m.id))}
-                    onBlur={() => setConfirmDelete(false)}
-                    autoFocus
-                  >
-                    Delete for everyone
-                  </button>
-                ) : (
-                  <button className="mx-act mx-act-danger" onClick={() => setConfirmDelete(true)} aria-label="Delete" title="Delete">
-                    <Icon.Trash size={17} />
-                  </button>
-                ))}
+              <button className="mx-act" onClick={() => onActions(m)} aria-label="More actions" title="Copy, forward, delete…">
+                <Icon.More size={17} />
+              </button>
               {picking && (
                 <div className="mx-picker" role="menu" aria-label="Pick a reaction">
                   {QUICK_REACTIONS.map((e) => (
@@ -303,6 +427,10 @@ const MessageRow = memo(function MessageRow({
                 </div>
               )}
             </div>
+          ) : (
+            <button className="mx-message-more mx-icon-btn" onClick={() => onActions(m)} aria-label="Message actions" title="Message actions">
+              <Icon.More size={16} />
+            </button>
           )}
         </div>
 
@@ -396,13 +524,36 @@ function ProgressBar({ pct }: { pct: number }) {
   );
 }
 
-function ImageAttachment({ a }: { a: Attachment }) {
+/**
+ * A photo in a message. On touch screens a long press opens the message's
+ * actions, so the picture itself must not start the system's drag or image
+ * menu; with a mouse it can be dragged out or saved from the right-click menu.
+ */
+function ImageAttachment({ a, touch }: { a: Attachment; touch: boolean }) {
   const { state, err, fetch, url, open, pct, rate } = useAttachment(a);
+  const [viewing, setViewing] = useState(false);
   if (url) {
     return (
-      <button className="mx-image" onClick={open} title={`Open ${a.name}`}>
-        <img src={url} alt={a.name} loading="lazy" />
-      </button>
+      <>
+        <button
+          className="mx-image"
+          onDragStart={touch ? (e) => e.preventDefault() : undefined}
+          onClick={() => setViewing(true)}
+          title={`Open ${a.name}`}
+        >
+          <img src={url} alt={a.name} loading="lazy" draggable={touch ? false : undefined} />
+        </button>
+        {viewing && (
+          <ChatModal title={a.name} className="mx-media-viewer" onClose={() => setViewing(false)}>
+            <img src={url} alt={a.name} />
+            <button className="mx-menu-item" onClick={open}>
+              Share or save
+              <Icon.Open />
+            </button>
+            {err && <p role="alert">{err}</p>}
+          </ChatModal>
+        )}
+      </>
     );
   }
   return (
@@ -437,6 +588,13 @@ function InertAttachment({ a }: { a: Attachment }) {
 
 function FileAttachment({ a }: { a: Attachment }) {
   const { state, err, fetch, url, open, pct, rate } = useAttachment(a);
+  if (url && (a.mime.startsWith("audio/") || a.mime.startsWith("video/"))) {
+    return <div className="mx-inline-media">{a.mime.startsWith("audio/")
+      ? <audio controls preload="metadata" src={url} aria-label={a.name} />
+      : <video controls playsInline preload="metadata" src={url} aria-label={a.name} />}
+      <span className="mx-file-size">{a.name}</span>
+    </div>;
+  }
   return (
     <div className="mx-file">
       <span className="mx-file-icon">

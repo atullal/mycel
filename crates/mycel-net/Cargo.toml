@@ -30,6 +30,10 @@ tokio = { version = "1.53.2", features = ["full"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# timeBeginPeriod (see `fine_timers`)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Media", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 serde_json = "1.0.151"
 bytes = "1.12"

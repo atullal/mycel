@@ -1,6 +1,6 @@
 # Mycel: where things stand
 
-*Last updated: 2026-10-09, 10:45 am ET. This is a snapshot for collaborators. The
+*Last updated: 2026-10-14, ET. This is a snapshot for collaborators. The
 design docs in `docs/` are the source of truth.*
 
 ## TL;DR
@@ -18,14 +18,33 @@ design docs in `docs/` are the source of truth.*
   - **benchmarks** against established routers (`bench/`);
   - the fixes they led to: a faster and leaner carrier, 8× less routing
     overhead, a crash fix, a memory-leak fix, and a multipath fix.
-- Test build: the [dev-2026-10-09 pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-09).
-  **Its wire format changed, so every device needs this build.**
+- **New in the afternoon of 2026-10-09: apps for iPhone and iPad, Android,
+  Windows and Linux** next to the Mac app. Same UI and runtime everywhere;
+  what works on which platform is in [docs/PLATFORMS.md](docs/PLATFORMS.md).
+  Since then: video from Android, Windows and Linux (the web view captures
+  and encodes); Android keeps running in the background; notifications;
+  iPhone calls continue in the background; the iPhone keyboard fix.
+- **New on 2026-10-12 to 2026-10-14: security hardening and a phone-first
+  chat (PR #2), then a review and fixes** (details below):
+  - attacks that could crash or stall every member of a space are closed;
+  - message requests need consent before files arrive, and notifications
+    show no names or text;
+  - the iPhone chat has gestures, voice notes and search, and the desktop
+    keeps its own controls;
+  - iPhones find peers on the LAN without Apple's multicast entitlement;
+  - long histories cost per page and per new message, never per history.
+- Test builds for every platform: the
+  [dev-2026-10-09-apps pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-09-apps).
+  **Every device needs a build from the same release.**
 
 ## Try it
 
-1. Download `Mycel_0.1.0_universal.dmg` from the
-   [pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-09).
-   It runs on Apple silicon and Intel Macs.
+1. Download the file for your device from the
+   [pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-09-apps):
+   `Mycel_0.1.0_universal.dmg` for a Mac (Apple silicon and Intel), the
+   `.apk` for Android, the Windows installer, or the Linux `.deb`, `.rpm` or
+   `.AppImage`. iPhones and iPads need a signed build (see
+   [docs/PLATFORMS.md](docs/PLATFORMS.md)).
 2. The app is unsigned. On first launch, right-click **Mycel > Open**. If macOS
    says it is "damaged", run `xattr -dr com.apple.quarantine /Applications/Mycel.app`.
 3. **Every device you test with needs the same build.** The store-and-forward
@@ -35,6 +54,18 @@ design docs in `docs/` are the source of truth.*
    is in [docs/TWO_LAPTOPS.md](docs/TWO_LAPTOPS.md).
 
 To build from source, see the [README](README.md). `cargo test --workspace --exclude mycel-host` runs about 300 Rust tests.
+
+## Apps for every platform
+
+How to build and install each one: [docs/PLATFORMS.md](docs/PLATFORMS.md).
+
+| Platform | State |
+|---|---|
+| macOS | as before (universal DMG) |
+| iPhone, iPad | Runs on the iOS 27 Simulator (iPhone and iPad layouts). Messages to and from a desktop peer work; the on-screen keyboard is checked with a UI test. Calls continue in the background. On devices it needs an Apple developer account in Xcode to sign (`scripts/package-ios.sh --install`). Voice calls use Apple's voice processing. Peer-to-peer Wi-Fi, Bluetooth and the camera share the Mac code, but haven't run on an iPhone yet. |
+| Android 9+ | Signed release APK (`scripts/package-android.sh`). Tested on the Android 14 emulator: messages both ways through the real UI, the on-screen keyboard, attachments both ways, notifications, running in the background and after being swiped away, and video calls both ways. Voice calls use the phone's echo canceller. No Bluetooth or Wi-Fi Direct yet. |
+| Windows 10+ | NSIS installer and MSI built by GitHub Actions. CI launches the app on a Windows runner: the runtime opens and the UI renders in WebView2 (screenshot artifact). Video: its web view engine (Edge, with a fake camera) captures and encodes H.264 in CI; not tried with a real camera. Not tried on a desktop PC yet. |
+| Linux | deb, rpm and AppImage built by GitHub Actions. CI launches the app under a virtual display: the runtime opens and the UI renders in WebKitGTK (screenshot artifact). Video: WebKitGTK (2.50 and 2.52, mock camera) captures and encodes H.264 in CI, through a canvas and with GStreamer's encoders, which the packages recommend; not tried with a real camera. On that bare CI machine it takes about 25 s to open: GTK's application startup waits for desktop D-Bus services the runner doesn't have (seen in a stack dump, before any Mycel code runs). Desktop sessions provide them. Not tried on a Linux desktop yet. |
 
 ## Where to read
 
@@ -118,7 +149,130 @@ largest size this Mac runs. That's up to 100 seats for the conference and
 `disaster-dtn` is judged on the mean of 12 seeds because single runs swing
 ±3–6 points (SIMULATION.md §4, open 12).
 
+## What landed on 2026-10-12 to 2026-10-14
+
+**PR #2** (`codex/security-hardening`, explained in
+[docs/CHANGELOG-2026-10-12.md](docs/CHANGELOG-2026-10-12.md) and
+[docs/SECURITY-REVIEW-2026-10-11.md](docs/SECURITY-REVIEW-2026-10-11.md))
+closed real attacks. A review checked each one against the old code:
+
+- a malformed change from any writer crashed every member's app, and kept
+  crashing it after restarts;
+- small compressed changes expanded without limit;
+- a forged mesh announcement could skip signature checks;
+- junk membership operations could stop an admin from removing a member;
+- strangers could push files before their request was accepted.
+
+It also added private notifications and the phone chat. It was merged
+without review, with CI red, and it broke things. The review found these, and
+`fix/pr2-review` fixes them:
+
+- **Android:** a fresh install couldn't start, because Rust's file lock isn't
+  supported there and the platform's own folders made a new profile look
+  established. Fixed and checked on the emulator: a fresh install, a restart
+  and an upgrade from the old layout all keep the identity.
+- **Bluetooth failover:** a 5 s deadline applied to replies, so a sync in
+  flight while a link dropped failed. Only the start of a stream a peer
+  opens is now short. Waiting for a reply allows a failover or a slow route.
+- **Resource limits:** these now give backpressure and fairness instead of
+  resets.
+  - QUIC stream limits make extra streams wait.
+  - Frame budgets are per node and per peer, and charged as bytes arrive.
+  - Strangers get their own small pool.
+  - There is no fixed total deadline, so a long sync over Bluetooth
+    completes.
+- **Documents:** applying a change replayed the whole history, so 5,000
+  edits took 2 minutes. Now: 0.3 s locally, and 0.19 s for another member
+  ingesting them in one batch (2.7 s before the PR). Large pastes work:
+  writers split edits, and readers accept up to 16 MiB per change. Bombs are
+  still rejected.
+- **Chats:** two separately created chats with the same person still show as
+  one, but the merge rules now live in the chat kit.
+  - Listing and events no longer reread histories: listing 200 chats takes
+    3.5 ms (was 5.3 s).
+  - Leaving or adding people no longer splits a chat.
+  - New posts go to the same space on both devices.
+  - Messages page by cursor at any depth: about 130 µs per page in a
+    100,000-message chat. A new message updates the view instead of
+    rebuilding it.
+- **Notifications:** the messaging rules moved from the host into the chat
+  kit; the host only shows generic alerts.
+  - Tap routing never reuses IDs.
+  - OS calls no longer block the event loop.
+- **Identity and storage:**
+  - Profiles lock on every platform.
+  - An interrupted first launch recovers.
+  - Mycel's data is excluded from cloud backups (iOS and Android).
+  - An iPhone restored to a new device starts a new identity instead of
+    refusing to open; the old data is kept aside.
+  - Failed saves are retried.
+  - A damaged setting or record no longer stops startup: an unreadable
+    network setting becomes Local only, never wider.
+  - The user sees a notice for each of these, which stays until dismissed.
+- **Requests:** contacts are never blocked by strangers' request floods.
+- **Desktop:** the hover toolbar, native right-click, one-click attach,
+  inline video and correct read state are back. Phones keep the touch
+  design.
+- **Platform layering:** the host no longer imports the messaging app's
+  source, and the history-hook harness (with a machine-specific path) is
+  gone.
+- **Calls and mesh:** the two ends of a connection can pick different
+  network paths, and only the side that dialed can open paths. So a call
+  participant's path could stay unknown for the whole call. That left the
+  bitrate cap at the network default and RTT reading 0. The same flaw on a
+  mesh hop meant routing couldn't tell a Bluetooth hop from a LAN hop, and
+  relayed frames were held to the minimum queue. Both now use the path that
+  carries the traffic. This was the cause of the intermittent
+  `group_call_between_runtimes` failure: it now passes 62 of 62 runs under
+  heavy load, and call glare 20 of 20.
+- **iPhone LAN discovery:** iPhones now use the system's Bonjour, so no
+  multicast entitlement is needed. Checked on an iPhone 17 Pro. A patched
+  `swarm-discovery` lets iroh's mDNS and Bonjour see each other.
+
+**Same-build rule, again:** builds before this one can't see an iPhone's
+Bonjour announcement, and drop ephemeral messages over 4 KiB (the new limit
+is 64 KiB).
+
 ## Known issues and open questions
+
+- **Fixed on 2026-10-09: rules engine stack overflow.** wasmi's tail-call
+  dispatch, which it picks in optimised builds, overflowed a 2 MiB thread
+  stack while validating chat messages at opt-level 2 on every platform we
+  tried. Release builds happened to pass. Mycel now uses wasmi's portable
+  (loop) dispatch everywhere, with identical fuel accounting. Builds made
+  before this commit (including the dev-2026-10-09 DMG) still have the
+  risky dispatch, though their release optimisation level passed the
+  tests.
+
+- **New platforms, first builds:**
+  - Windows and Linux builds have only run on CI machines so far.
+  - iPhone peer-to-peer Wi-Fi, Bluetooth and the camera are untested on
+    hardware.
+  - A suspended iPhone doesn't wake for new messages: they arrive when
+    Mycel is opened again, or through a keeper or store-and-forward. Waking
+    it needs Apple's push service, which needs a server. (Android keeps
+    running in the background; iPhone calls continue in the background.)
+  - **Fixed on 2026-10-09: the Windows test failures.** Measured on the
+    runner: a 1 ms sleep took 14.4 ms with Windows' default timer, 2.4 ms
+    with the 1 ms timer Mycel now asks for (`tests/timers.rs` checks it).
+    Chasing the rest found a real path-selection bug on every platform: a
+    bulk transfer's own queue could hand the primary path to an idle link
+    30× slower (a busy path's RTT now counts only up to where it's called
+    saturated). Tests that time emulated radios now run one at a time per
+    test binary, as the speed tests already did.
+  - Even so, on the small CI machines a different timing test misses its
+    deadline in each run, and each passes in other runs and on its own
+    (seen: the four-hop Bluetooth connect, call glare, a transfer's final
+    speed, link failover, and a free-port collision between runtime tests).
+    CI now retries a failed test twice and flags one that then passes as a
+    "Flaky test" warning on the run; one that fails three times fails it.
+    The final-speed check failed the first pass on Windows three runs in a
+    row: a real bug, now fixed (a finished transfer could report 0 B/s
+    when its completion was reported twice with a slow file check in
+    between). Call glare (`both_call_at_once_become_one_call`) failed the first
+    pass in three of four Windows runs, passing on retry: worth a look. Once, LAN
+    discovery over mDNS failed all three tries on one Windows runner and
+    passed on a fresh one (the runner's network, it seems).
 
 - **Bluetooth between two real Macs.** The link connects without pairing, but
   in one test session one laptop kept hanging up after 5–10 s and stopped
@@ -150,13 +304,30 @@ largest size this Mac runs. That's up to 100 seats for the conference and
   allow it in System Settings > Privacy & Security > Local Network.
 - **Not audited.** The trust layer needs an external cryptographic review
   before anyone relies on it.
+- **Scaling work still to do:**
+  - Sync exchanges full inventories. Range-based set reconciliation is the
+    next step for very large spaces.
+  - Trust resolution is quadratic when many membership changes are
+    concurrent.
+  - A writer who sends K conflicting versions in K separate batches costs K
+    document rebuilds; within one batch it's one.
+  - Unread counts scale with the unread backlog.
+  - Loading a space re-checks its whole feed against the chat rules.
+- **Notifications:**
+  - Android has no notifications yet; Profile says so.
+  - Desktop notification centres can't take back an alert once shown.
+  - Ordering by "first seen" is per device: two phones can order messages
+    written offline differently.
+- **Spam requests:** a stranger's request declined to make room stays stored
+  (left, not deleted). Forgetting it fully needs a remove-space API.
 
 ## How we work
 
 - `main` stays green. Merge only after `cargo test --workspace` passes twice in
   a row and `cargo clippy --workspace --all-targets` is clean. Also run
   `npm run build` if you touched TypeScript.
-- Use feature branches and PRs into `main`.
+- Use feature branches and PRs into `main`. A PR gets a review before it
+  merges, and never merges with CI red.
 - Iroh is vendored with a small multipath patch. Read
   `vendor/iroh/MYCEL_PATCH.md` before touching it.
 - Don't commit `dist-release/` (built apps) or any CRAWDAD trace data.

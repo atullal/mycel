@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { useMessages, useMycel, useTyping } from "@mycel/sdk/react";
-import type { CallInfo, Contact, ConversationSummary, MessageView } from "@mycel/sdk";
+import { directPresence, PRESENCE_LABEL, threadKeyOf, type CallInfo, type Contact, type ConversationSummary, type MessageView } from "@mycel/sdk";
 import { MessageList } from "./MessageList.tsx";
 import { Composer, type ComposerHandle } from "./Composer.tsx";
 import { ConversationAvatar, Icon, errorText } from "./ui.tsx";
 import { GroupCallPanel, JoinBanner, isLive } from "./Calls.tsx";
+import { ChatSearch } from "./ChatSearch.tsx";
 
 export function ChatView({
   summary,
@@ -19,6 +20,7 @@ export function ChatView({
   onVideoCall,
   call = null,
   meName = "You",
+  visible = true,
 }: {
   summary: ConversationSummary;
   me: string | undefined;
@@ -38,21 +40,26 @@ export function ChatView({
   call?: CallInfo | null;
   /** Your name, for your own tile in a group call. */
   meName?: string;
+  /** Whether the message history is actually visible and readable. */
+  visible?: boolean;
 }) {
   const mycel = useMycel();
-  const { messages, loading, hasMore, loadOlder, error } = useMessages(summary.id);
+  const { messages, loading, hasMore, loadOlder, hasNewer, loadNewer, showMessage, showLatest, error } = useMessages(summary.id, undefined, threadKeyOf(summary));
   const typingPeers = useTyping(summary.id);
   const [replyTo, setReplyTo] = useState<MessageView | null>(null);
   const [editing, setEditing] = useState<MessageView | null>(null);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [jumpToId, setJumpToId] = useState<string | null>(null);
+  const clearJump = useCallback(() => setJumpToId(null), []);
 
   // Mark read while the conversation is on screen (re-checked when the window
   // regains focus or visibility). Never for a message request: a read receipt
   // would tell a stranger you've seen it.
   const unread = summary.unread;
   useEffect(() => {
-    if (!unread || !summary.active || summary.request) return;
+    if (!visible || !unread || !summary.active || summary.request) return;
     const tryMark = () => {
-      if (document.visibilityState === "visible") {
+      if (document.visibilityState === "visible" && document.hasFocus()) {
         void mycel.chat.markRead(summary.id).catch(() => {});
       }
     };
@@ -63,26 +70,22 @@ export function ChatView({
       window.removeEventListener("focus", tryMark);
       document.removeEventListener("visibilitychange", tryMark);
     };
-  }, [mycel, summary.id, unread, summary.active, summary.request, messages.length]);
+  }, [mycel, summary.id, unread, summary.active, summary.request, messages.length, visible]);
 
   const others = summary.members.filter((m) => !m.isMe && m.role !== "keeper");
   const joinable = call?.state === "joinable";
   const keepers = summary.members.filter((m) => m.role === "keeper");
+  const presence = directPresence(summary, contactsById);
 
   const subtitle = useMemo(() => {
     if (!summary.active) return "You're no longer a member. History stays on this device.";
     if (summary.request) return summary.direct ? "Message request" : `Message request, ${others.length + 1} people`;
     if (summary.direct) {
-      const other = others[0];
-      const contact = other ? contactsById.get(other.id) : undefined;
-      if (!contact) return "Not in your contacts";
-      if (contact.nearby) return "On your network";
-      if (contact.online) return "Online";
-      return "Offline. Messages will arrive when they're back.";
+      return presence ? PRESENCE_LABEL[presence] : "Not in your contacts";
     }
     const people = `${others.length + 1} people`;
     return keepers.length ? `${people}, ${keepers.length} keeper${keepers.length > 1 ? "s" : ""}` : people;
-  }, [summary, others, keepers, contactsById]);
+  }, [summary, others, keepers, contactsById, presence]);
 
   const typingNames = typingPeers
     .filter((p) => p !== me)
@@ -163,11 +166,11 @@ export function ChatView({
         <button className="mx-icon-btn mx-back" onClick={onBack} aria-label="Back to conversations">
           <Icon.Back />
         </button>
-        <ConversationAvatar id={summary.id} direct={summary.direct} members={summary.members} title={summary.title} size={38} />
-        <div className="mx-chat-title">
+        <ConversationAvatar id={summary.id} direct={summary.direct} members={summary.members} title={summary.title} size={38} status={presence} />
+        <button className="mx-chat-title" onClick={onToggleMembers} aria-label="Conversation details">
           <h2>{summary.title}</h2>
-          <p>{subtitle}</p>
-        </div>
+          <p>{typingNames.length ? "typing…" : subtitle}</p>
+        </button>
         {onCall && summary.active && !summary.request && others.length > 0 && (
           <button
             className={`mx-icon-btn mx-call-btn${inCall ? " is-on" : ""}`}
@@ -204,8 +207,9 @@ export function ChatView({
           <Icon.Lock size={15} />
           <span>Encrypted</span>
         </span>
+        <button className="mx-icon-btn" onClick={() => setSearchOpen(true)} aria-label="Search messages" title="Search messages"><Icon.Search /></button>
         <button
-          className={`mx-icon-btn${membersOpen ? " is-on" : ""}`}
+          className={`mx-icon-btn mx-members-button${membersOpen ? " is-on" : ""}`}
           onClick={onToggleMembers}
           aria-pressed={membersOpen}
           title={summary.direct ? "Details" : "Members"}
@@ -214,6 +218,7 @@ export function ChatView({
           <Icon.People />
         </button>
       </header>
+      {searchOpen && <ChatSearch conversation={summary.id} onClose={() => setSearchOpen(false)} onPick={(m) => setJumpToId(m.id)} />}
 
       {call && joinable && <JoinBanner call={call} />}
       {call && call.group && isLive(call) && !(call.direction === "incoming" && call.state === "ringing") && (
@@ -228,12 +233,20 @@ export function ChatView({
         error={error}
         hasMore={hasMore}
         onLoadOlder={loadOlder}
+        hasNewer={hasNewer}
+        onLoadNewer={loadNewer}
+        onShowMessage={showMessage}
+        onShowLatest={showLatest}
+        onJumpRequest={setJumpToId}
         onReply={canPost ? startReply : undefined}
         onEdit={canPost ? startEdit : undefined}
         editingId={editing?.id ?? null}
+        jumpToId={jumpToId}
+        onJumped={clearJump}
+        onDeleted={(m) => { if (editing?.id === m.id) setEditing(null); if (replyTo?.id === m.id) setReplyTo(null); }}
       />
 
-      <div className="mx-typing" aria-live="polite">
+      <div className={`mx-typing${typingNames.length ? " is-active" : ""}`} aria-live="polite">
         {typingNames.length > 0 && (
           <>
             <span className="mx-typing-dots" aria-hidden="true">

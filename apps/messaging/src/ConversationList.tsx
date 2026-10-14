@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
-import type { ConversationSummary } from "@mycel/sdk";
-import { ConversationAvatar, Icon, formatListTime, previewText } from "./ui.tsx";
+import { directPresence, matchesSearch, type ConversationSummary, type Presence } from "@mycel/sdk";
+import { SearchField, useContacts } from "@mycel/sdk/react";
+import { ConversationAvatar, Icon, PresenceLabel, formatListTime, previewText } from "./ui.tsx";
 
 /** Unread count that belongs on badges: requests are counted separately. */
 export function unreadOf(c: ConversationSummary): number {
@@ -20,13 +21,13 @@ export function ConversationList({
   onSelect: (id: string) => void;
   onCompose: () => void;
 }) {
+  const { contacts } = useContacts();
+  const contactsById = useMemo(() => new Map(contacts.map((c) => [c.id, c])), [contacts]);
   const [query, setQuery] = useState("");
   const [requestsOpen, setRequestsOpen] = useState(true);
   const filtered = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (!q) return conversations;
     return conversations.filter(
-      (c) => c.title.toLowerCase().includes(q) || c.members.some((m) => m.name.toLowerCase().includes(q)),
+      (c) => matchesSearch(query, c.title, ...c.members.map((m) => m.name)),
     );
   }, [conversations, query]);
   const requests = filtered.filter((c) => c.request);
@@ -44,18 +45,7 @@ export function ConversationList({
           <Icon.Compose />
         </button>
       </header>
-      {conversations.length > 3 && (
-        <label className="mx-search">
-          <Icon.Search size={16} />
-          <input
-            type="search"
-            placeholder="Search"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            aria-label="Search conversations"
-          />
-        </label>
-      )}
+      <SearchField value={query} onChange={setQuery} label="Search conversations" placeholder="Search names or groups" />
       <div className="mx-list-items">
         {requests.length > 0 && (
           <section className="mx-requests" aria-label="Message requests">
@@ -72,7 +62,7 @@ export function ConversationList({
             {requestsOpen && (
               <ul role="listbox" aria-label="Message requests">
                 {requests.map((c) => (
-                  <ConversationRow key={c.id} c={c} active={c.id === selected} onSelect={onSelect} />
+                  <ConversationRow key={c.id} c={c} status={directPresence(c, contactsById)} active={c.id === selected} onSelect={onSelect} />
                 ))}
               </ul>
             )}
@@ -82,7 +72,7 @@ export function ConversationList({
         <ul role="listbox" aria-label="Chats">
           {loading && conversations.length === 0 &&
             [0, 1, 2].map((i) => <li key={i} className="mx-list-skeleton" aria-hidden="true" />)}
-          {!loading && chats.length === 0 && !query && (
+          {!loading && chats.length === 0 && !query.trim() && (
             <li className="mx-list-empty">
               <p>Your conversations will show up here.</p>
               <button className="mx-btn mx-btn-quiet" onClick={onCompose}>
@@ -90,13 +80,13 @@ export function ConversationList({
               </button>
             </li>
           )}
-          {conversations.length > 0 && filtered.length === 0 && (
+          {!loading && query.trim() && filtered.length === 0 && (
             <li className="mx-list-empty">
               <p>Nothing matches "{query}".</p>
             </li>
           )}
           {chats.map((c) => (
-            <ConversationRow key={c.id} c={c} active={c.id === selected} onSelect={onSelect} />
+            <ConversationRow key={c.id} c={c} status={directPresence(c, contactsById)} active={c.id === selected} onSelect={onSelect} />
           ))}
         </ul>
       </div>
@@ -106,10 +96,12 @@ export function ConversationList({
 
 function ConversationRow({
   c,
+  status,
   active,
   onSelect,
 }: {
   c: ConversationSummary;
+  status?: Presence;
   active: boolean;
   onSelect: (id: string) => void;
 }) {
@@ -136,12 +128,13 @@ function ConversationRow({
         }
       }}
     >
-      <ConversationAvatar id={c.id} direct={c.direct} members={c.members} title={c.title} size={42} />
+      <ConversationAvatar id={c.id} direct={c.direct} members={c.members} title={c.title} size={42} status={status} />
       <div className="mx-row-text">
         <div className="mx-row-top">
           <span className="mx-row-title">{c.title}</span>
           {last && <time className="mx-row-time">{formatListTime(last.sentAt)}</time>}
         </div>
+        <PresenceLabel status={status} className="mx-row-presence" />
         <div className="mx-row-bottom">
           <span className={`mx-row-preview${last?.deleted ? " is-deleted" : ""}`}>{preview}</span>
           {c.request ? (

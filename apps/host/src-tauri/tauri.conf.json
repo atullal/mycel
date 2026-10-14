@@ -14,6 +14,7 @@
     "windows": [
       {
         "label": "main",
+        "create": false,
         "title": "Mycel",
         "width": 1240,
         "height": 820,
@@ -46,6 +47,34 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "iOS": {
+      "minimumSystemVersion": "16.4",
+      "developmentTeam": "G2RU5ZQR8P"
+    },
+    "android": {
+      "minSdkVersion": 28
+    },
+    "linux": {
+      "deb": {
+        "depends": [
+          "libasound2",
+          "libdbus-1-3"
+        ],
+        "recommends": [
+          "gstreamer1.0-plugins-bad",
+          "gstreamer1.0-plugins-ugly"
+        ]
+      },
+      "rpm": {
+        "depends": [
+          "alsa-lib",
+          "dbus-libs"
+        ],
+        "recommends": [
+          "gstreamer1-plugin-openh264"
+        ]
+      }
+    }
   }
 }

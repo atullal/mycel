@@ -14,19 +14,25 @@ import {
 } from "react";
 import { getMycel, type Mycel } from "../src/client.ts";
 import { canDecodeVideo, videoCanvas, type VideoSource } from "../src/video.ts";
+import { webCameraStream } from "../src/webcam.ts";
 import type {
   CallId,
   CallInfo,
   Contact,
   ConversationId,
   ConversationSummary,
+  MessageId,
   MessageView,
   MycelEvent,
   NearbyPeer,
   NetworkStatus,
+  Notice,
   PeerId,
   Profile,
 } from "../src/types.ts";
+
+// Shared widgets that any app (and the host's panels) can use.
+export { SearchField } from "./SearchField.tsx";
 
 const MycelContext = createContext<Mycel | null>(null);
 
@@ -162,6 +168,15 @@ export function useNetwork() {
   return { ...q, status: q.data as NetworkStatus | undefined };
 }
 
+/**
+ * Problems to tell the user about (`Notice`). Fetched on mount, since some
+ * exist only from startup, and again whenever the runtime says they changed.
+ */
+export function useNotices() {
+  const q = useMycelQuery((c) => c.notices.list(), [], (e) => e.type === "noticesChanged");
+  return { ...q, notices: (q.data ?? []) as Notice[] };
+}
+
 // ---------------------------------------------------------------------------
 // chat
 
@@ -189,49 +204,132 @@ export function useConversation(id: ConversationId | null | undefined) {
 }
 
 const PAGE = 50;
+/** The runtime returns at most 10 000 messages per call; one is the "is there more?" probe. */
+const MAX_WINDOW = 9_999;
+
+/**
+ * Which messages are loaded: the newest `count` (following new ones), or a
+ * window around `anchor` (a search hit or quoted message at any depth).
+ * Every fetch costs the window, never the history.
+ */
+type MessageRange = { anchor: null; count: number } | { anchor: MessageId; before: number; after: number };
 
 /**
  * Messages of one conversation, oldest -> newest. Refreshes on
  * `conversationUpdated` for it and on `blobReady` for any loaded attachment.
- * `loadOlder()` pages backwards.
+ *
+ * - `loadOlder()` / `loadNewer()` extend the window by a page (or `count`);
+ *   past the runtime's per-call limit the window re-anchors on the oldest
+ *   (newest) loaded message, so any depth is reachable.
+ * - `showMessage(id)` loads the window around a message that isn't loaded.
+ * - `showLatest()` goes back to the newest messages and follows new ones;
+ *   `following` says whether the window reaches the newest message.
+ *
+ * `threadKey` (see `threadKeyOf`) keeps the loaded history while the
+ * conversation's canonical space changes; it defaults to `id`.
  */
-export function useMessages(id: ConversationId | null | undefined, pageSize = PAGE) {
-  const [window_, setWindow] = useState(pageSize);
-  const [hasMore, setHasMore] = useState(false);
+export function useMessages(id: ConversationId | null | undefined, pageSize = PAGE, threadKey?: string | null) {
+  const latest = useMemo<MessageRange>(() => ({ anchor: null, count: pageSize }), [pageSize]);
+  const [range, setRange] = useState<MessageRange>(latest);
   const blobsRef = useRef<Set<string>>(new Set());
+  threadKey = threadKey || id;
 
-  useEffect(() => setWindow(pageSize), [id, pageSize]);
+  useEffect(() => setRange(latest), [threadKey, latest]);
 
   const q = useMycelQuery(
     async (c) => {
-      if (!id) return [] as MessageView[];
+      if (!id) return { threadKey, range, messages: [] as MessageView[], hasMore: false, hasNewer: false };
+      if (range.anchor != null) {
+        try {
+          const w = await c.chat.around(id, range.anchor, { before: range.before, after: range.after });
+          return { threadKey, range, messages: w.messages, hasMore: w.hasEarlier, hasNewer: w.hasLater };
+        } catch {
+          // The message is gone (or never was): show the newest instead.
+        }
+      }
+      const count = range.anchor == null ? range.count : pageSize;
       // Ask for one extra to learn whether older history exists.
-      const list = await c.chat.messages(id, { limit: window_ + 1 });
-      setHasMore(list.length > window_);
-      return list.length > window_ ? list.slice(1) : list;
+      const list = await c.chat.messages(id, { limit: count + 1 });
+      const more = list.length > count;
+      return { threadKey, range, messages: more ? list.slice(1) : list, hasMore: more, hasNewer: false };
     },
-    [id, window_],
+    [id, range, threadKey, pageSize],
     (e) =>
       (e.type === "conversationUpdated" && e.conversation === id) ||
       (e.type === "blobReady" && blobsRef.current.has(e.blob)),
   );
 
-  const messages = q.data ?? [];
+  // A message retains its original encrypted space ID. Keep the loaded page
+  // by logical thread identity while pagination or a canonical alias reloads.
+  const prev = useRef<typeof q.data>(undefined);
+  if (q.data?.threadKey === threadKey) prev.current = q.data;
+  const page = q.data?.threadKey === threadKey ? q.data
+    : q.loading && prev.current?.threadKey === threadKey ? prev.current : undefined;
+  const messages = page?.messages ?? [];
+  const hasMore = page?.hasMore ?? false;
+  const hasNewer = page?.hasNewer ?? false;
   blobsRef.current = useMemo(
     () => new Set(messages.flatMap((m) => m.attachments.map((a) => a.blob))),
     [messages],
   );
 
-  const loadOlder = useCallback(() => {
-    if (hasMore) setWindow((w) => w + pageSize);
-  }, [hasMore, pageSize]);
+  const loaded = useRef(messages);
+  loaded.current = messages;
 
-  // Keep showing the previous page while a larger window loads.
-  const prev = useRef<MessageView[]>([]);
-  if (q.data) prev.current = q.data;
-  const shown = q.data ?? (q.loading && id && prev.current[0]?.conversation === id ? prev.current : []);
+  const loadOlder = useCallback(
+    (count: number = pageSize) => {
+      if (!hasMore) return;
+      const n = Math.max(1, count);
+      setRange((r) => {
+        const oldest = loaded.current[0]?.id;
+        const span = Math.min(MAX_WINDOW, loaded.current.length);
+        if (r.anchor == null) {
+          if (r.count + n <= MAX_WINDOW || !oldest) return { anchor: null, count: Math.min(MAX_WINDOW, r.count + n) };
+          return { anchor: oldest, before: Math.min(MAX_WINDOW, n), after: MAX_WINDOW };
+        }
+        if (r.before + n <= MAX_WINDOW || !oldest) return { ...r, before: Math.min(MAX_WINDOW, r.before + n) };
+        return { anchor: oldest, before: Math.min(MAX_WINDOW, n), after: span };
+      });
+    },
+    [hasMore, pageSize],
+  );
 
-  return { ...q, messages: shown, hasMore, loadOlder };
+  const loadNewer = useCallback(
+    (count: number = pageSize) => {
+      if (!hasNewer) return;
+      const n = Math.max(1, count);
+      setRange((r) => {
+        if (r.anchor == null) return r;
+        const newest = loaded.current[loaded.current.length - 1]?.id;
+        if (r.after + n <= MAX_WINDOW || !newest) return { ...r, after: Math.min(MAX_WINDOW, r.after + n) };
+        return { anchor: newest, before: Math.min(MAX_WINDOW, loaded.current.length), after: Math.min(MAX_WINDOW, n) };
+      });
+    },
+    [hasNewer, pageSize],
+  );
+
+  const showMessage = useCallback(
+    (message: MessageId) => {
+      if (loaded.current.some((m) => m.id === message)) return;
+      setRange({ anchor: message, before: pageSize, after: pageSize });
+    },
+    [pageSize],
+  );
+
+  const showLatest = useCallback(() => setRange(latest), [latest]);
+
+  return {
+    ...q,
+    data: q.data?.threadKey === threadKey ? q.data?.messages : undefined,
+    messages,
+    hasMore,
+    hasNewer,
+    following: !hasNewer,
+    loadOlder,
+    loadNewer,
+    showMessage,
+    showLatest,
+  };
 }
 
 /**
@@ -352,6 +450,46 @@ export function useCalls(): CallInfo[] {
   return useMemo(() => [...calls.values()].sort((a, b) => b.startedAt - a.startedAt), [calls]);
 }
 
+/** Draw the web view's camera stream (if it's capturing) onto `canvas`, ~30 times a second. */
+function drawCameraStream(canvas: HTMLCanvasElement, onSize: (w: number, h: number) => void) {
+  const ctx = canvas.getContext("2d");
+  let video: HTMLVideoElement | null = null;
+  let timer = 0;
+  let drawing = false;
+  const tick = () => {
+    const stream = webCameraStream();
+    drawing = !!stream;
+    if (stream && !video) {
+      video = document.createElement("video");
+      video.muted = true;
+      video.playsInline = true;
+      video.srcObject = stream;
+      void video.play().catch(() => {});
+    } else if (!stream && video) {
+      video.srcObject = null;
+      video = null;
+    }
+    if (video && video.videoWidth > 0) {
+      const { videoWidth: w, videoHeight: h } = video;
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w;
+        canvas.height = h;
+        onSize(w, h);
+      }
+      ctx?.drawImage(video, 0, 0, w, h);
+    }
+    timer = window.setTimeout(tick, 33);
+  };
+  tick();
+  return {
+    live: () => drawing,
+    stop: () => {
+      clearTimeout(timer);
+      if (video) video.srcObject = null;
+    },
+  };
+}
+
 /**
  * Show one video stream of a call on a canvas: the other side's video
  * (`source: "remote"`, `peer` = their device) or our self-view
@@ -374,15 +512,20 @@ export function useVideoCanvas(
     if (!call || !el || !supported) return;
     const view = videoCanvas(el, {
       onPicture: (width, height) => setPicture({ width, height }),
-      onNeedKeyframe: () => void client.calls.requestKeyframe(call).catch(() => {}),
+      onNeedKeyframe: () => void client.calls.requestKeyframe(call, source).catch(() => {}),
     });
+    // Where the web view captures the camera itself (Android, Windows,
+    // Linux), the self-view draws that stream: no decoding our own frames.
+    const camera = source === "local" ? drawCameraStream(el, (w, h) => setPicture({ width: w, height: h })) : null;
     const off = client.calls.onVideo((f) => {
       if (f.source !== source) return;
       if (source === "remote" && peer && f.peer !== peer) return;
+      if (camera?.live()) return;
       view.push(f);
     });
     return () => {
       off();
+      camera?.stop();
       view.close();
     };
   }, [client, canvas, call, source, peer, supported]);

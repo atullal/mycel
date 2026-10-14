@@ -74,7 +74,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use mycel_crypto::{Sig, SignPk};
+use mycel_crypto::{Digest, Hash32, Sig, SignPk};
 
 /// Milliseconds on a monotonic clock (virtual in a simulator).
 pub type Time = u64;
@@ -230,9 +230,10 @@ pub struct Config {
     pub max_internet_hops: usize,
     /// Reachability records a gateway publishes for others.
     pub max_records: usize,
-    /// Announcement signatures remembered as checked (an (origin, seqno)
-    /// is verified once). A simulator with stubbed signatures keeps this
-    /// small: it is most of a router's memory.
+    /// Announcements remembered as checked (a 32-byte digest of everything
+    /// signed and the signature: not the hops and cost filled in on the
+    /// way). A simulator with stubbed signatures keeps this small: it is
+    /// most of a router's memory.
     pub verified_max: usize,
     /// Seed for jitter (deterministic simulations).
     pub seed: u64,
@@ -306,6 +307,25 @@ pub struct Announce {
     pub uplink: u32,
     pub name: Arc<str>,
     pub sig: Sig,
+}
+
+/// What the signature cache keeps of a checked announcement: a digest of
+/// every signed field and of the signature itself, so a change to any of
+/// them is checked again; the hops and cost filled in on the way are left
+/// out. 32 bytes, where the fields (with the name) are about three times
+/// that.
+fn verified_id(a: &Announce) -> Hash32 {
+    static KEYED: std::sync::LazyLock<Digest> =
+        std::sync::LazyLock::new(|| Digest::new("mycel/v0/mesh-verified-announce"));
+    let mut d = KEYED.clone();
+    d.update(&a.origin.0)
+        .update(&a.seq.to_be_bytes())
+        .update(&[a.flags, a.scope])
+        .update(&a.uplink.to_be_bytes())
+        .update(&(a.name.len() as u64).to_be_bytes())
+        .update(a.name.as_bytes())
+        .update(&a.sig.0);
+    d.finalize()
 }
 
 /// The fields of our next announcement, for the caller to sign.
@@ -576,7 +596,7 @@ pub struct Router {
     /// Waypoints offered to QUIC per destination.
     published: Map<SignPk, Vec<SignPk>>,
     reasm: Map<(SignPk, u32), Reasm>,
-    verified: Set<(SignPk, u64)>,
+    verified: Set<Hash32>,
     total_budget: Bucket,
     gateway_budget: Bucket,
     reach: Map<SignPk, Reach>,
@@ -1008,7 +1028,7 @@ impl Router {
     }
 
     /// An announcement from a neighbour. `verify` checks the origin's
-    /// signature; it runs once per (origin, seq), after the cheap checks.
+    /// signature; it runs once per signed identity, after the cheap checks.
     pub fn on_announce(
         &mut self,
         from: SignPk,
@@ -1040,7 +1060,8 @@ impl Router {
             self.stats.announcements_stale += 1;
             return;
         }
-        if !self.verified.contains(&(a.origin, a.seq)) {
+        let verified = verified_id(&a);
+        if !self.verified.contains(&verified) {
             if !verify(&a) {
                 self.stats.announcements_forged += 1;
                 return;
@@ -1048,7 +1069,9 @@ impl Router {
             if self.verified.len() >= self.cfg.verified_max {
                 self.verified.clear();
             }
-            self.verified.insert((a.origin, a.seq));
+            if self.cfg.verified_max > 0 {
+                self.verified.insert(verified);
+            }
         }
         if a.cost == INFINITY {
             self.on_retraction(from, a.origin, a.seq, now);

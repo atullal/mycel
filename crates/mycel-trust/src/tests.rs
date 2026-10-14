@@ -428,3 +428,185 @@ fn ops_from_never_added_keys_are_dropped_at_the_door() {
     assert!(matches!(g.insert(junk), Err(TrustError::NotAuthorized(_))));
     assert_eq!(g.op_ids().len(), 1, "nothing stored");
 }
+
+fn relay_add(g: &SpaceGraph, author: &Peer, member: &Peer, parents: Vec<OpId>, nonce: u64) -> SignedOp {
+    SignedOp::sign(&author.keys, Op {
+        space: Some(g.space_id()), parents, author: author.pk(), nonce,
+        action: Action::Add { member: member.keys.public(), role: Role::Relay, keyring: None },
+    })
+}
+
+#[test]
+fn unauthorized_fanout_cannot_block_admin_removal() {
+    let (mut g, a) = space();
+    let reader = Peer::new();
+    let target = Peer::new();
+    let admitted = add(&mut g, &a, &reader, Role::Reader);
+    let junk: Vec<_> = (0..65).map(|n| relay_add(&g, &reader, &target, vec![admitted.id()], n)).collect();
+    let (added, rejected) = g.insert_many(junk);
+    assert_eq!((added.len(), rejected), (65, 0));
+    assert_eq!(g.heads(), vec![admitted.id()]);
+    let (remove, _, _) = g.remove_member(&a.keys, reader.pk(), None).unwrap();
+    g.insert(remove.clone()).unwrap();
+    assert!(g.is_valid(&remove.id()));
+    assert_eq!(g.heads(), vec![remove.id()]);
+}
+
+#[test]
+fn valid_frontier_keeps_ancestry_through_invalid_ops() {
+    let (mut g, a) = space();
+    let reader = Peer::new();
+    let target = Peer::new();
+    let admitted = add(&mut g, &a, &reader, Role::Reader);
+    let invalid = relay_add(&g, &reader, &target, vec![admitted.id()], 1);
+    g.insert(invalid.clone()).unwrap();
+    let valid = relay_add(&g, &a, &target, vec![invalid.id()], 2);
+    g.insert(valid.clone()).unwrap();
+    let invalid_child = relay_add(&g, &reader, &target, vec![valid.id()], 3);
+    g.insert(invalid_child).unwrap();
+    assert_eq!(g.heads(), vec![valid.id()]);
+    assert!(g.in_past(&admitted.id(), &g.heads()));
+    assert!(g.in_past(&invalid.id(), &g.heads()));
+    assert_eq!(g.state_at(&g.heads()), *g.state());
+    let (remove, _, _) = g.remove_member(&a.keys, reader.pk(), None).unwrap();
+    g.insert(remove.clone()).unwrap();
+    let after_revocation = relay_add(&g, &reader, &target, vec![remove.id()], 4);
+    g.insert(after_revocation).unwrap();
+    assert_eq!(g.heads(), vec![remove.id()]);
+    assert_eq!(g.revocations_of(&reader.pk()), vec![(remove.id(), None)]);
+}
+
+#[test]
+fn genuinely_concurrent_valid_frontier_is_never_truncated() {
+    let (mut g, a) = space();
+    let target = Peer::new();
+    let ops: Vec<_> = (0..65).map(|n| relay_add(&g, &a, &target, g.heads(), n)).collect();
+    let (added, rejected) = g.insert_many(ops);
+    assert_eq!((added.len(), rejected), (65, 0));
+    assert_eq!(g.heads().len(), 65);
+    assert!(g.heads().iter().all(|id| g.is_valid(id)));
+}
+
+fn missing_parent_op(g: &SpaceGraph, author: &Peer, nonce: u64) -> SignedOp {
+    SignedOp::sign(&author.keys, Op {
+        space: Some(g.space_id()), parents: vec![Hash32([0x37; 32])], author: author.pk(), nonce,
+        action: Action::Leave { cutoff: None },
+    })
+}
+
+#[test]
+fn pending_quota_is_per_author_and_does_not_block_ready_ops() {
+    let (mut g, a) = space();
+    let reader = Peer::new();
+    add(&mut g, &a, &reader, Role::Reader);
+    for n in 0..MAX_PENDING_PER_AUTHOR as u64 {
+        assert_eq!(g.insert(missing_parent_op(&g, &reader, n)).unwrap(), Inserted::Pending);
+    }
+    assert!(g.insert(missing_parent_op(&g, &reader, MAX_PENDING_PER_AUTHOR as u64)).is_err());
+    assert_eq!(g.insert(missing_parent_op(&g, &a, 0)).unwrap(), Inserted::Pending);
+    let leave = g.leave(&reader.keys, None).unwrap();
+    assert_eq!(g.insert(leave.clone()).unwrap(), Inserted::New);
+    assert!(g.is_valid(&leave.id()));
+}
+
+#[test]
+fn full_pending_pool_allows_admin_ops_and_bulk_resolution() {
+    let (mut g, a) = space();
+    let authors: Vec<_> = (0..MAX_PENDING / MAX_PENDING_PER_AUTHOR).map(|_| Peer::new()).collect();
+    for author in &authors { add(&mut g, &a, author, Role::Relay); }
+    let pending: Vec<_> = authors.iter().flat_map(|author| {
+        (0..MAX_PENDING_PER_AUTHOR as u64).map(|n| missing_parent_op(&g, author, n)).collect::<Vec<_>>()
+    }).collect();
+    assert_eq!(g.insert_many(pending), (vec![], 0));
+    assert_eq!(g.pending.len(), MAX_PENDING);
+    let first = Peer::new();
+    let second = Peer::new();
+    let parent = relay_add(&g, &a, &first, g.heads(), 10);
+    let child = relay_add(&g, &a, &second, vec![parent.id()], 11);
+    let (added, rejected) = g.insert_many([parent.clone(), child.clone()]);
+    assert_eq!(rejected, 0);
+    assert_eq!(added.len(), 2);
+    assert!(g.is_valid(&parent.id()) && g.is_valid(&child.id()));
+    let (remove, _, _) = g.remove_member(&a.keys, authors[0].pk(), None).unwrap();
+    assert_eq!(g.insert(remove.clone()).unwrap(), Inserted::New);
+    assert!(g.is_valid(&remove.id()));
+}
+
+#[test]
+fn bulk_parent_arrival_releases_pending_quota_before_next_admission() {
+    let (mut g, a) = space();
+    let reader = Peer::new();
+    let relay = Peer::new();
+    add(&mut g, &a, &reader, Role::Reader);
+    let parent = relay_add(&g, &a, &relay, g.heads(), 1);
+    let pending: Vec<_> = (0..MAX_PENDING_PER_AUTHOR as u64).map(|nonce| {
+        SignedOp::sign(&reader.keys, Op {
+            space: Some(g.space_id()), parents: vec![parent.id()], author: reader.pk(), nonce,
+            action: Action::Leave { cutoff: None },
+        })
+    }).collect();
+    assert_eq!(g.insert_many(pending), (vec![], 0));
+    let next_pending = missing_parent_op(&g, &reader, MAX_PENDING_PER_AUTHOR as u64);
+    let (added, rejected) = g.insert_many([parent, next_pending.clone()]);
+    assert_eq!(rejected, 0);
+    assert_eq!(added.len(), MAX_PENDING_PER_AUTHOR + 1);
+    assert_eq!(g.pending.len(), 1);
+    assert!(g.pending.contains_key(&next_pending.id()));
+}
+
+/// One admin's long history: `n` ops chained one after another, alternating
+/// adding a keeper, rotating, and removing that keeper again.
+fn long_admin_history(g: &SpaceGraph, admin: &Peer, n: usize) -> Vec<SignedOp> {
+    let mut parent = g.space_id();
+    let mut keeper = None;
+    (0..n as u64).map(|nonce| {
+        let action = match (nonce % 3, keeper.take()) {
+            (0, _) => {
+                let k = DeviceKeys::generate().public();
+                keeper = Some(k.sign_pk);
+                Action::Add { member: k, role: Role::Relay, keyring: None }
+            }
+            (1, k) => {
+                keeper = k;
+                Action::Rotate { rotation: new_rotation([&admin.keys.public()]).unwrap().0 }
+            }
+            (_, k) => Action::Remove {
+                member: k.unwrap(),
+                revocation: Revocation { cutoff: None },
+                rotation: new_rotation([&admin.keys.public()]).unwrap().0,
+            },
+        };
+        let op = SignedOp::sign(&admin.keys, Op {
+            space: Some(g.space_id()), parents: vec![parent], author: admin.pk(), nonce, action,
+        });
+        parent = op.id();
+        op
+    }).collect()
+}
+
+#[test]
+fn new_member_receives_a_long_admin_history_in_one_exchange() {
+    const N: usize = 10_000;
+    let (mut g, a) = space();
+    let history = long_admin_history(&g, &a, N);
+    let (added, rejected) = g.insert_many(history.clone());
+    assert_eq!((added.len(), rejected), (N, 0));
+    assert!(history.iter().all(|op| g.is_valid(&op.id())));
+
+    // What a peer sends: every op it knows, in its op_ids() order.
+    let sent: Vec<SignedOp> = g.op_ids().iter().map(|id| g.get(id).unwrap().clone()).collect();
+    let mut joiner = SpaceGraph::from_genesis(g.get(&g.space_id()).unwrap().clone()).unwrap();
+    let (added, rejected) = joiner.insert_many(sent);
+    assert_eq!((added.len(), rejected), (N, 0), "one exchange delivers everything");
+    assert!(joiner.pending.is_empty());
+    assert_eq!(joiner.state(), g.state());
+    assert_eq!(joiner.heads(), g.heads());
+
+    // Newest-first, ops park behind missing parents until the per-author
+    // quota drops the rest: unordered delivery needs several rounds.
+    let mut reversed: Vec<SignedOp> = history[..2 * MAX_PENDING_PER_AUTHOR].to_vec();
+    reversed.reverse();
+    let mut late = SpaceGraph::from_genesis(g.get(&g.space_id()).unwrap().clone()).unwrap();
+    let (_, rejected) = late.insert_many(reversed);
+    assert!(rejected > 0, "unordered delivery needs more rounds");
+}

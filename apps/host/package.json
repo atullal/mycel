@@ -9,11 +9,14 @@
     "build": "tsc --noEmit -p . && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit -p .",
+    "test": "node --test tests/*.test.ts",
     "tauri": "cargo tauri"
   },
   "dependencies": {
     "@mycel/messaging": "0.1.0",
     "@mycel/sdk": "0.1.0",
+    "@tauri-apps/api": "2.12.1",
+    "@tauri-apps/plugin-notification": "2.5.1",
     "qrcode-generator": "^2.0.4",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"

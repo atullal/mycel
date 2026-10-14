@@ -7,16 +7,22 @@
 //! Keepers run the same `Replica` with the Relay role: they validate and store
 //! envelopes but hold no keys, so they never materialize anything.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use automerge::{ActorId, AutoCommit, Change};
+use automerge::{ActorId, AutoCommit, Change, ChangeHash};
 use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, Sig, SignPk, random};
 use mycel_trust::{EpochId, Inserted, Keyring, OpId, Role, SignedOp, SpaceGraph, SpaceId};
 use serde::{Deserialize, Serialize};
 
 pub use automerge;
 pub use mycel_trust;
+
+mod bounded_change;
+mod change_ops;
+mod change_resources;
+mod doc_index;
 
 pub type EnvelopeId = Hash32;
 
@@ -26,6 +32,36 @@ const CTX_CONTENT_AAD: &str = "mycel/v0/content";
 
 /// Envelopes carry small changes; large data goes through blobs.
 pub const MAX_ENVELOPE_CIPHERTEXT: usize = 1024 * 1024;
+
+// Document change limits. Readers accept up to the `MAX_DOC_*` bounds; writers
+// stay within the much smaller `MAX_LOCAL_CHANGE_*` bounds and split larger
+// edits into several changes, so what they write is accepted by every
+// released version while what older versions wrote stays readable.
+//
+// Decompression is bounded by `MAX_DOC_CHANGE_BYTES` (DEFLATE itself cannot
+// exceed ~1032x). Run-length and group expansion is bounded relative to the
+// encoded change: up to 64 logical values (or string bytes) per byte of
+// change body, at least a quarter of the cap (deleting a long run encodes in
+// a few bytes) and never more than the cap. A single change therefore costs
+// at most ~1M operations / 16M logical values to parse and apply, whatever
+// its size on the wire.
+
+/// Maximum serialized Automerge change after decompression, framing included.
+pub const MAX_DOC_CHANGE_BYTES: usize = 16 * 1024 * 1024;
+/// Maximum operations in one received change.
+pub const MAX_DOC_CHANGE_OPS: usize = 1 << 20;
+/// Cap on logical column cells plus entries declared by group counts.
+pub const MAX_DOC_COLUMN_VALUES: usize = 16 << 20;
+/// Cap on string bytes after expanding string-column runs.
+pub const MAX_DOC_COLUMN_STRING_BYTES: usize = 16 * 1024 * 1024;
+/// Local edits are written as changes of at most this many serialized bytes
+/// (well inside one envelope even if incompressible)...
+pub const MAX_LOCAL_CHANGE_BYTES: usize = 512 * 1024;
+/// ...and at most this many operations each.
+pub const MAX_LOCAL_CHANGE_OPS: usize = 65_536;
+/// Validated changes are handed to Automerge in batches of about this many
+/// operations, bounding the memory one apply call needs.
+const APPLY_BATCH_OPS: usize = 1 << 20;
 /// Max membership heads an envelope may reference (DoS hardening).
 pub const MAX_AUTH_HEADS: usize = 64;
 
@@ -193,58 +229,237 @@ impl Ingested {
     }
 }
 
+/// A materialized document: the Automerge doc, the causal index of the changes
+/// in it, and the envelopes those changes came from.
 struct DocState {
     doc: AutoCommit,
+    index: doc_index::Index,
     applied: BTreeSet<EnvelopeId>,
-    /// (actor, seq) → (change hash, envelope) — to detect equivocation.
-    seqs: HashMap<(Vec<u8>, u64), (automerge::ChangeHash, EnvelopeId)>,
 }
 
+impl DocState {
+    fn new(actor: ActorId) -> Self {
+        DocState { doc: AutoCommit::new().with_actor(actor), index: Default::default(), applied: BTreeSet::new() }
+    }
+}
+
+/// An author's (actor, seq) slot in a document.
+type Slot = (ActorId, u64);
+
+/// Decrypted, well-formed changes of one document, applied or not. Waiting
+/// changes stay encrypted in the envelope store; only this metadata is kept.
 #[derive(Default)]
+struct DocInputs {
+    known: HashMap<EnvelopeId, Known>,
+    /// Candidates per slot. More than one change hash is equivocation: the
+    /// lowest envelope id wins on every replica.
+    slots: HashMap<Slot, BTreeMap<EnvelopeId, ChangeHash>>,
+    /// Missing dependency → envelopes waiting for it.
+    waiting: HashMap<ChangeHash, Vec<EnvelopeId>>,
+}
+
+struct Known {
+    hash: ChangeHash,
+    slot: Slot,
+    /// Distinct dependencies not yet in the document.
+    missing: usize,
+}
+
+impl DocInputs {
+    fn winner(&self, slot: &Slot) -> Option<ChangeHash> {
+        self.slots.get(slot).and_then(|c| c.first_key_value()).map(|(_, h)| *h)
+    }
+}
+
+enum DocFlow {
+    Done,
+    /// The document must be re-derived from its inputs.
+    Rebuild,
+}
+
+/// A reader's position in one feed: which incarnation of it, and how much of
+/// it the reader has applied (see [`Replica::feed_changes`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FeedCursor {
+    instance: u64,
+    version: u64,
+    len: usize,
+}
+
+/// What changed in a feed since a [`FeedCursor`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FeedChanges {
+    /// The first position (in causal order) that differs from what the
+    /// reader applied: everything before it is unchanged. The reader's length
+    /// when entries were only appended; 0 when the feed was rebuilt.
+    pub from: usize,
+    /// The feed from `from` on, in causal order.
+    pub items: Vec<FeedItem>,
+    pub cursor: FeedCursor,
+}
+
+/// Feed incarnations: a feed rebuilt from scratch (it lost entries, or the
+/// rules changed) is a new one, and its readers start over.
+static FEED_INSTANCES: AtomicU64 = AtomicU64::new(1);
+
+/// Recent changes remembered per feed, for readers catching up.
+const FEED_CHANGES_KEPT: usize = 4096;
+/// A new entry is placed in the order directly only if it lands among the
+/// newest this many; otherwise (a long-offline branch, a parent arriving
+/// after its children) the order is recomputed once, when next read, so a
+/// sync batch in any order costs one sort rather than one per entry.
+const FEED_PLACE_WITHIN: usize = 1024;
+
 struct FeedState {
+    instance: u64,
     items: HashMap<EnvelopeId, FeedItem>,
-    order: Option<Vec<EnvelopeId>>,
+    /// Deterministic causal order (Kahn over known deps, ties by (ts, id)),
+    /// maintained as entries arrive rather than recomputed.
+    order: Vec<EnvelopeId>,
+    position: HashMap<EnvelopeId, usize>,
+    /// Missing dep → entries that listed it. Its arrival can reorder them.
+    waiting: HashMap<EnvelopeId, Vec<EnvelopeId>>,
+    /// Every dep listed by an entry; heads are the entries not among them.
+    referenced: HashSet<EnvelopeId>,
+    heads: BTreeSet<EnvelopeId>,
+    /// Entries arrived that `order` doesn't place yet (see `FEED_PLACE_WITHIN`).
+    unsorted: bool,
+    /// One more per inserted entry.
+    version: u64,
+    /// (version, first position that changed), oldest first.
+    changes: VecDeque<(u64, usize)>,
+    /// Changes up to this version may have been forgotten.
+    forgotten: u64,
+}
+
+impl Default for FeedState {
+    fn default() -> Self {
+        FeedState {
+            instance: FEED_INSTANCES.fetch_add(1, Ordering::Relaxed),
+            items: HashMap::new(),
+            order: Vec::new(),
+            position: HashMap::new(),
+            waiting: HashMap::new(),
+            referenced: HashSet::new(),
+            heads: BTreeSet::new(),
+            unsorted: false,
+            version: 0,
+            changes: VecDeque::new(),
+            forgotten: 0,
+        }
+    }
 }
 
 impl FeedState {
-    /// Deterministic causal order: Kahn over known deps, ties by (ts, id).
-    fn ordered(&mut self) -> &[EnvelopeId] {
-        if self.order.is_none() {
-            let mut indeg: HashMap<EnvelopeId, usize> = HashMap::new();
-            let mut children: HashMap<EnvelopeId, Vec<EnvelopeId>> = HashMap::new();
-            for (id, item) in &self.items {
-                let known: HashSet<&EnvelopeId> =
-                    item.deps.iter().filter(|d| self.items.contains_key(d)).collect();
-                indeg.insert(*id, known.len());
-                for d in known {
-                    children.entry(*d).or_default().push(*id);
-                }
+    fn key(&self, id: &EnvelopeId) -> (u64, EnvelopeId) {
+        (self.items[id].ts_ms, *id)
+    }
+
+    /// Add an entry where the deterministic order puts it. Usually O(1): a
+    /// new entry follows its deps, and Kahn's choices up to them can't
+    /// change; from there it goes before the first entry with a greater
+    /// (ts, id). An entry that others already listed as a dep can reorder
+    /// them, and one far from the end would shift much of the order: both
+    /// leave the order to be recomputed once, when next read.
+    fn insert(&mut self, item: FeedItem) {
+        let id = item.id;
+        let key = (item.ts_ms, id);
+        for dep in &item.deps {
+            self.referenced.insert(*dep);
+            self.heads.remove(dep);
+            if !self.items.contains_key(dep) {
+                self.waiting.entry(*dep).or_default().push(id);
             }
-            let key = |id: &EnvelopeId| (self.items[id].ts_ms, *id);
-            let mut ready: BTreeSet<(u64, EnvelopeId)> =
-                indeg.iter().filter(|(_, d)| **d == 0).map(|(id, _)| key(id)).collect();
-            let mut order = Vec::with_capacity(self.items.len());
-            while let Some((_, id)) = ready.pop_first() {
-                order.push(id);
-                for c in children.get(&id).into_iter().flatten() {
-                    let d = indeg.get_mut(c).unwrap();
-                    *d -= 1;
-                    if *d == 0 {
-                        ready.insert(key(c));
-                    }
-                }
-            }
-            self.order = Some(order);
         }
-        self.order.as_deref().unwrap()
+        if !self.referenced.contains(&id) {
+            self.heads.insert(id);
+        }
+        let after = item.deps.iter().filter_map(|d| self.position.get(d)).max().map_or(0, |p| p + 1);
+        self.items.insert(id, item);
+        self.version += 1;
+        let waited = self.waiting.remove(&id).is_some();
+        if self.unsorted || waited || self.order.len() - after.min(self.order.len()) > FEED_PLACE_WITHIN {
+            self.unsorted = true;
+            return;
+        }
+        let at = (after..self.order.len())
+            .find(|&i| self.key(&self.order[i]) > key)
+            .unwrap_or(self.order.len());
+        self.order.insert(at, id);
+        for (i, entry) in self.order[at..].iter().enumerate() {
+            self.position.insert(*entry, at + i);
+        }
+        self.record(at);
+    }
+
+    fn record(&mut self, at: usize) {
+        self.changes.push_back((self.version, at));
+        if self.changes.len() > FEED_CHANGES_KEPT
+            && let Some((version, _)) = self.changes.pop_front()
+        {
+            self.forgotten = version;
+        }
+    }
+
+    /// The order, recomputed first if entries arrived it doesn't place.
+    fn sorted(&mut self) -> &[EnvelopeId] {
+        if self.unsorted {
+            self.unsorted = false;
+            let first = self.reorder();
+            self.record(first);
+        }
+        &self.order
+    }
+
+    /// Recompute the order from scratch; the first position that moved.
+    fn reorder(&mut self) -> usize {
+        let mut indeg: HashMap<EnvelopeId, usize> = HashMap::new();
+        let mut children: HashMap<EnvelopeId, Vec<EnvelopeId>> = HashMap::new();
+        for (id, item) in &self.items {
+            let known: HashSet<&EnvelopeId> = item.deps.iter().filter(|d| self.items.contains_key(d)).collect();
+            indeg.insert(*id, known.len());
+            for d in known {
+                children.entry(*d).or_default().push(*id);
+            }
+        }
+        let mut ready: BTreeSet<(u64, EnvelopeId)> =
+            indeg.iter().filter(|(_, d)| **d == 0).map(|(id, _)| self.key(id)).collect();
+        let mut order = Vec::with_capacity(self.items.len());
+        while let Some((_, id)) = ready.pop_first() {
+            order.push(id);
+            for c in children.get(&id).into_iter().flatten() {
+                let d = indeg.get_mut(c).unwrap();
+                *d -= 1;
+                if *d == 0 {
+                    ready.insert(self.key(c));
+                }
+            }
+        }
+        let first = self.order.iter().zip(&order).take_while(|(a, b)| a == b).count();
+        self.position = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        self.order = order;
+        first
     }
 
     fn heads(&self) -> Vec<EnvelopeId> {
-        let referenced: HashSet<&EnvelopeId> = self.items.values().flat_map(|i| &i.deps).collect();
-        let mut heads: Vec<EnvelopeId> =
-            self.items.keys().filter(|id| !referenced.contains(id)).copied().collect();
-        heads.sort();
-        heads
+        self.heads.iter().copied().collect()
+    }
+
+    fn changes_since(&mut self, since: FeedCursor) -> FeedChanges {
+        self.sorted();
+        let cursor = FeedCursor { instance: self.instance, version: self.version, len: self.order.len() };
+        let from = if since.instance != self.instance || since.version > self.version || since.version < self.forgotten {
+            0
+        } else {
+            self.changes
+                .iter()
+                .filter(|(v, _)| *v > since.version)
+                .map(|(_, at)| *at)
+                .fold(since.len, usize::min)
+                .min(self.order.len())
+        };
+        let items = self.order[from..].iter().map(|id| self.items[id].clone()).collect();
+        FeedChanges { from, items, cursor }
     }
 }
 
@@ -270,6 +485,24 @@ pub struct Replica {
     /// Doc changes excluded because their author equivocated (two different
     /// changes with the same actor+seq): the lowest envelope id wins, everywhere.
     equivocated: HashSet<EnvelopeId>,
+    /// Valid envelopes whose document payload is invalid: undecryptable with
+    /// the right key, malformed, written under another actor, or inconsistent
+    /// with its declared history. A property of the payload, so permanent.
+    doc_rejected: HashSet<EnvelopeId>,
+    doc_inputs: HashMap<StreamId, DocInputs>,
+    /// Envelopes whose status is Pending (re-checked when new inputs arrive).
+    pending: HashSet<EnvelopeId>,
+    #[cfg(test)]
+    stats: std::cell::Cell<DocStats>,
+}
+
+/// Work counters for the scaling tests.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct DocStats {
+    opens: usize,
+    applies: usize,
+    rebuilds: usize,
 }
 
 impl Replica {
@@ -330,6 +563,11 @@ impl Replica {
             validator: None,
             rule_rejected: HashSet::new(),
             equivocated: HashSet::new(),
+            doc_rejected: HashSet::new(),
+            doc_inputs: HashMap::new(),
+            pending: HashSet::new(),
+            #[cfg(test)]
+            stats: Default::default(),
         }
     }
 
@@ -339,10 +577,10 @@ impl Replica {
         self.rule_rejected.clear();
         self.feeds.clear();
         let ids: Vec<EnvelopeId> = self
-            .status
+            .valid_by_stream
             .iter()
-            .filter(|(_, s)| **s == Status::Valid)
-            .map(|(id, _)| *id)
+            .filter(|(stream, _)| stream.kind == StreamKind::Feed)
+            .flat_map(|(_, ids)| ids.iter().copied())
             .collect();
         for id in ids {
             self.materialize(&id);
@@ -613,10 +851,18 @@ impl Replica {
 
     // ───────────── materialization ─────────────
 
-    /// Membership changed: re-evaluate everything; rebuild streams that lost envelopes.
+    /// Membership changed: re-evaluate every envelope's status, then touch
+    /// only what that can change — envelopes that became valid or decryptable,
+    /// and documents that lost a change they had applied (or a fork candidate).
     fn full_refresh(&mut self) {
         let ids: Vec<EnvelopeId> = self.envelopes.keys().copied().collect();
         self.status = ids.iter().map(|id| (*id, self.compute_status(id))).collect();
+        self.pending = self
+            .status
+            .iter()
+            .filter(|(_, s)| matches!(s, Status::Pending(_)))
+            .map(|(id, _)| *id)
+            .collect();
         let mut by_stream: HashMap<StreamId, BTreeSet<EnvelopeId>> = HashMap::new();
         for (id, st) in &self.status {
             if *st == Status::Valid {
@@ -633,31 +879,71 @@ impl Replica {
             .collect();
         for stream in streams {
             let valid = by_stream.remove(&stream).unwrap_or_default();
-            let lost = self
-                .valid_by_stream
-                .get(&stream)
-                .is_some_and(|old| !old.is_subset(&valid));
-            if lost {
-                self.docs.remove(&stream);
-                self.feeds.remove(&stream);
+            let old = self.valid_by_stream.insert(stream, valid).unwrap_or_default();
+            let valid = &self.valid_by_stream[&stream];
+            let lost: Vec<EnvelopeId> = old.difference(valid).copied().collect();
+            if stream.kind == StreamKind::Feed {
+                if !lost.is_empty() {
+                    self.feeds.remove(&stream);
+                }
+                let ids: Vec<EnvelopeId> = valid.iter().copied().collect();
+                for id in ids {
+                    self.materialize(&id);
+                }
+                continue;
             }
-            self.valid_by_stream.insert(stream, valid.clone());
-            // (Re)apply everything; already-applied items are skipped.
-            for id in valid {
-                self.materialize(&id);
+            if lost.iter().any(|id| self.doc_input_matters(stream, id)) {
+                self.rebuild_doc(stream);
+                continue;
+            }
+            if let Some(inputs) = self.doc_inputs.get_mut(&stream) {
+                for id in &lost {
+                    if let Some(known) = inputs.known.remove(id)
+                        && let Some(candidates) = inputs.slots.get_mut(&known.slot)
+                    {
+                        candidates.remove(id);
+                        if candidates.is_empty() {
+                            inputs.slots.remove(&known.slot);
+                        }
+                    }
+                }
+            }
+            // Newly valid, or valid but previously undecryptable.
+            let fresh: Vec<EnvelopeId> = valid
+                .iter()
+                .filter(|id| {
+                    !self.doc_rejected.contains(id)
+                        && !self.doc_inputs.get(&stream).is_some_and(|i| i.known.contains_key(id))
+                        && self.ring.get(&self.envelopes[id].header.epoch).is_some()
+                })
+                .copied()
+                .collect();
+            if !fresh.is_empty() {
+                self.process_doc(stream, fresh);
             }
         }
     }
 
+    /// Would losing envelope `id` change `stream`'s materialization?
+    fn doc_input_matters(&self, stream: StreamId, id: &EnvelopeId) -> bool {
+        if self.docs.get(&stream).is_some_and(|d| d.applied.contains(id)) {
+            return true;
+        }
+        self.doc_inputs.get(&stream).is_some_and(|inputs| {
+            inputs
+                .known
+                .get(id)
+                .and_then(|k| inputs.slots.get(&k.slot))
+                .is_some_and(|candidates| candidates.len() > 1)
+        })
+    }
+
     /// New envelopes arrived: evaluate them and anything pending that they may unblock.
     fn incremental(&mut self, new: &[EnvelopeId]) {
+        // New envelopes have no status yet, so they are never in `pending`.
         let mut todo: Vec<EnvelopeId> = new.to_vec();
-        todo.extend(
-            self.status
-                .iter()
-                .filter(|(_, s)| matches!(s, Status::Pending(_)))
-                .map(|(id, _)| *id),
-        );
+        todo.extend(self.pending.iter().copied());
+        let mut docs: BTreeMap<StreamId, Vec<EnvelopeId>> = BTreeMap::new();
         loop {
             let mut progressed = false;
             let mut still = Vec::new();
@@ -668,11 +954,19 @@ impl Replica {
                     let stream = self.envelopes[&id].header.stream;
                     self.valid_by_stream.entry(stream).or_default().insert(id);
                     self.status.insert(id, st);
-                    self.materialize(&id);
+                    self.pending.remove(&id);
+                    if stream.kind == StreamKind::Doc {
+                        docs.entry(stream).or_default().push(id);
+                    } else {
+                        self.materialize(&id);
+                    }
                     progressed = true;
                 } else {
                     if matches!(st, Status::Pending(_)) {
+                        self.pending.insert(id);
                         still.push(id);
+                    } else {
+                        self.pending.remove(&id);
                     }
                     self.status.insert(id, st);
                 }
@@ -682,12 +976,25 @@ impl Replica {
             }
             todo = still;
         }
+        // Each touched document is refreshed once for the whole batch.
+        for (stream, ids) in docs {
+            self.process_doc(stream, ids);
+        }
     }
 
-    /// Apply one valid envelope to its stream, if we can decrypt it.
+    /// Apply one valid feed entry, if we can decrypt it.
     fn materialize(&mut self, id: &EnvelopeId) {
         let env = &self.envelopes[id];
         let stream = env.header.stream;
+        if stream.kind == StreamKind::Doc {
+            self.process_doc(stream, vec![*id]);
+            return;
+        }
+        if self.rule_rejected.contains(id)
+            || self.feeds.get(&stream).is_some_and(|f| f.items.contains_key(id))
+        {
+            return;
+        }
         let Some(key) = self.ring.get(&env.header.epoch) else {
             return; // opaque (e.g. we are a keeper, or joined after this epoch)
         };
@@ -695,90 +1002,272 @@ impl Replica {
         else {
             return;
         };
-        match stream.kind {
-            StreamKind::Doc => {
-                if self.docs.get(&stream).is_some_and(|d| d.applied.contains(id)) {
-                    return;
-                }
-                let Ok(change) = Change::from_bytes(plain) else {
-                    return;
-                };
-                // An author may only write under their own actor id.
-                if change.actor_id().to_bytes() != env.header.author.0 {
-                    return;
-                }
-                if self.equivocated.contains(id) {
-                    return;
-                }
-                let actor = ActorId::from(self.me.sign_pk().0.to_vec());
-                let state = self.docs.entry(stream).or_insert_with(|| DocState {
-                    doc: AutoCommit::new().with_actor(actor),
-                    applied: BTreeSet::new(),
-                    seqs: HashMap::new(),
-                });
-                let key = (change.actor_id().to_bytes().to_vec(), change.seq());
-                match state.seqs.get(&key) {
-                    Some((hash, _)) if *hash == change.hash() => {}
-                    Some((_, other)) => {
-                        // Equivocation: keep the lowest envelope id on every peer.
-                        let (winner, loser) = if id < other { (*id, *other) } else { (*other, *id) };
-                        self.equivocated.insert(loser);
-                        if winner == *id {
-                            self.rebuild_doc(stream);
-                        }
-                        return;
-                    }
-                    None => {
-                        state.seqs.insert(key, (change.hash(), *id));
-                    }
-                }
-                // Automerge queues changes whose deps haven't arrived yet.
-                let _ = state.doc.apply_changes([change]);
-                state.applied.insert(*id);
-            }
-            StreamKind::Feed => {
-                if self.feeds.get(&stream).is_some_and(|f| f.items.contains_key(id)) {
-                    return;
-                }
-                let Ok(entry) = postcard::from_bytes::<FeedEntry>(&plain) else {
-                    return;
-                };
-                let role = self
-                    .graph
-                    .state_at(&env.header.auth_heads)
-                    .role(&env.header.author)
-                    .unwrap_or(Role::Relay);
-                if let Some(v) = &self.validator
-                    && !v.validate(&stream, &env.header.author, role, &entry.body)
-                {
-                    self.rule_rejected.insert(*id);
-                    return;
-                }
-                let item = FeedItem {
-                    id: *id,
-                    author: env.header.author,
-                    author_role: role,
-                    ts_ms: entry.ts_ms,
-                    deps: entry.deps,
-                    body: entry.body,
-                };
-                let feed = self.feeds.entry(stream).or_default();
-                feed.items.insert(*id, item);
-                feed.order = None;
+        let Ok(entry) = postcard::from_bytes::<FeedEntry>(&plain) else {
+            return;
+        };
+        let role = self
+            .graph
+            .state_at(&env.header.auth_heads)
+            .role(&env.header.author)
+            .unwrap_or(Role::Relay);
+        if let Some(v) = &self.validator
+            && !v.validate(&stream, &env.header.author, role, &entry.body)
+        {
+            self.rule_rejected.insert(*id);
+            return;
+        }
+        let item = FeedItem {
+            id: *id,
+            author: env.header.author,
+            author_role: role,
+            ts_ms: entry.ts_ms,
+            deps: entry.deps,
+            body: entry.body,
+        };
+        self.feeds.entry(stream).or_default().insert(item);
+    }
+
+    /// Re-derive one document from its valid envelopes.
+    fn rebuild_doc(&mut self, stream: StreamId) {
+        let ids: Vec<EnvelopeId> = self
+            .valid_by_stream
+            .get(&stream)
+            .map(|ids| ids.iter().copied().collect())
+            .unwrap_or_default();
+        self.reset_doc(stream);
+        self.process_doc(stream, ids);
+    }
+
+    fn reset_doc(&mut self, stream: StreamId) {
+        #[cfg(test)]
+        self.stats.set(DocStats { rebuilds: self.stats.get().rebuilds + 1, ..self.stats.get() });
+        self.docs.remove(&stream);
+        if let Some(inputs) = self.doc_inputs.remove(&stream) {
+            for id in inputs.known.keys() {
+                self.equivocated.remove(id);
             }
         }
     }
 
-    /// Re-derive one document from its valid envelopes in canonical order.
-    fn rebuild_doc(&mut self, stream: StreamId) {
-        self.docs.remove(&stream);
-        let ids: Vec<EnvelopeId> = self
-            .valid_by_stream
-            .get(&stream)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_default();
+    fn doc_change(&self, id: &EnvelopeId) -> std::result::Result<Option<Change>, ()> {
+        let env = &self.envelopes[id];
+        let Some(key) = self.ring.get(&env.header.epoch) else { return Ok(None); };
+        #[cfg(test)]
+        self.stats.set(DocStats { opens: self.stats.get().opens + 1, ..self.stats.get() });
+        let plain = key.open(&env.header.nonce, &content_aad(&env.header), &env.ciphertext).map_err(|_| ())?;
+        let change = bounded_change::parse(&plain).map_err(|_| ())?;
+        if change.actor_id().to_bytes() != env.header.author.0 { return Err(()); }
+        Ok(Some(change))
+    }
+
+    /// Bring a document up to date with newly valid (or newly decryptable)
+    /// envelopes `ids`. Each envelope is decrypted and parsed once to learn
+    /// its slot and dependencies, and once more when it can be applied; a
+    /// change is validated once, against its declared history. Documents are
+    /// rebuilt from scratch at most once per call (when a lower-id fork
+    /// displaces an applied change), plus once per change that Automerge
+    /// fails on after passing validation.
+    fn process_doc(&mut self, stream: StreamId, mut ids: Vec<EnvelopeId>) {
+        loop {
+            let actor = ActorId::from(self.me.sign_pk().0.to_vec());
+            let mut state = self.docs.remove(&stream).unwrap_or_else(|| DocState::new(actor));
+            let mut inputs = self.doc_inputs.remove(&stream).unwrap_or_default();
+            match self.doc_pass(&mut state, &mut inputs, ids) {
+                DocFlow::Done => {
+                    debug_assert_eq!(state.doc.get_heads().into_iter().collect::<HashSet<_>>(), state.index.heads());
+                    if !state.index.is_empty() {
+                        self.docs.insert(stream, state);
+                    }
+                    self.doc_inputs.insert(stream, inputs);
+                    return;
+                }
+                DocFlow::Rebuild => {
+                    #[cfg(test)]
+                    self.stats.set(DocStats { rebuilds: self.stats.get().rebuilds + 1, ..self.stats.get() });
+                    for id in inputs.known.keys() {
+                        self.equivocated.remove(id);
+                    }
+                    ids = self
+                        .valid_by_stream
+                        .get(&stream)
+                        .map(|ids| ids.iter().copied().collect())
+                        .unwrap_or_default();
+                }
+            }
+        }
+    }
+
+    fn doc_pass(&mut self, state: &mut DocState, inputs: &mut DocInputs, mut ids: Vec<EnvelopeId>) -> DocFlow {
+        ids.sort_unstable();
+        ids.dedup();
+        // 1. Learn every new change's slot and dependencies, so fork selection
+        //    sees the whole batch before anything is applied.
+        let mut rebuild = false;
+        let mut work = Vec::new();
         for id in ids {
-            self.materialize(&id);
+            if self.doc_rejected.contains(&id) || inputs.known.contains_key(&id) {
+                continue;
+            }
+            let change = match self.doc_change(&id) {
+                Ok(Some(change)) => change,
+                Ok(None) => continue,
+                Err(()) => {
+                    self.doc_rejected.insert(id);
+                    continue;
+                }
+            };
+            let slot = (change.actor_id().clone(), change.seq());
+            let hash = change.hash();
+            let before = inputs.winner(&slot);
+            inputs.slots.entry(slot.clone()).or_default().insert(id, hash);
+            // A lower-id fork of an applied change replaces it and everything
+            // built on it: re-derive the document once, after this batch.
+            rebuild |= before.is_some_and(|b| Some(b) != inputs.winner(&slot) && state.index.contains(&b));
+            let mut missing: Vec<ChangeHash> =
+                change.deps().iter().filter(|d| !state.index.contains(d)).copied().collect();
+            missing.sort_unstable();
+            missing.dedup();
+            for dep in &missing {
+                inputs.waiting.entry(*dep).or_default().push(id);
+            }
+            inputs.known.insert(id, Known { hash, slot: slot.clone(), missing: missing.len() });
+            self.mark_forks(inputs, &slot);
+            work.push(id);
+        }
+        if rebuild {
+            return DocFlow::Rebuild;
+        }
+        // 2. Validate whatever is ready against the causal index, waking
+        //    dependents as their dependencies are admitted.
+        let mut batch: Vec<(EnvelopeId, Change)> = Vec::new();
+        let mut batch_ops = 0;
+        work.reverse();
+        while let Some(id) = work.pop() {
+            let Some(known) = inputs.known.get(&id) else { continue };
+            let hash = known.hash;
+            if state.index.contains(&hash) {
+                state.applied.insert(id);
+                continue;
+            }
+            if known.missing > 0 || inputs.winner(&known.slot) != Some(hash) {
+                continue;
+            }
+            let admitted = match self.doc_change(&id) {
+                Ok(Some(change)) => state.index.admit(&change).map(|a| (a, change)),
+                _ => None,
+            };
+            let Some((admitted, change)) = admitted else {
+                self.reject_doc_input(inputs, id, &mut work);
+                continue;
+            };
+            state.index.insert(admitted);
+            for (other, h) in &inputs.slots[&inputs.known[&id].slot] {
+                if *h == hash {
+                    state.applied.insert(*other);
+                }
+            }
+            for waiter in inputs.waiting.remove(&hash).unwrap_or_default() {
+                if let Some(k) = inputs.known.get_mut(&waiter) {
+                    k.missing -= 1;
+                    if k.missing == 0 {
+                        work.push(waiter);
+                    }
+                }
+            }
+            batch_ops += change.len();
+            batch.push((id, change));
+            // 3. Hand validated changes to Automerge in bounded batches.
+            if batch_ops >= APPLY_BATCH_OPS && !self.apply_doc_batch(state, std::mem::take(&mut batch)) {
+                return DocFlow::Rebuild;
+            }
+            if batch.is_empty() {
+                batch_ops = 0;
+            }
+        }
+        if !batch.is_empty() && !self.apply_doc_batch(state, batch) {
+            return DocFlow::Rebuild;
+        }
+        DocFlow::Done
+    }
+
+    /// Apply validated changes to a copy of the document (copies share
+    /// storage, so this is cheap) and keep it only if everything applied.
+    /// Validation makes failure an Automerge bug; if it happens anyway, find
+    /// the changes Automerge cannot apply, reject them, and report that the
+    /// document must be re-derived.
+    fn apply_doc_batch(&mut self, state: &mut DocState, batch: Vec<(EnvelopeId, Change)>) -> bool {
+        fn apply(doc: &AutoCommit, changes: Vec<Change>) -> Option<AutoCommit> {
+            let mut candidate = doc.clone();
+            let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                candidate.apply_changes(changes).is_ok() && candidate.get_missing_deps(&[]).is_empty()
+            }));
+            matches!(ok, Ok(true)).then_some(candidate)
+        }
+        #[cfg(test)]
+        self.stats.set(DocStats { applies: self.stats.get().applies + 1, ..self.stats.get() });
+        if let Some(doc) = apply(&state.doc, batch.iter().map(|(_, c)| c.clone()).collect()) {
+            state.doc = doc;
+            return true;
+        }
+        let mut doc = state.doc.clone();
+        let mut failed = HashSet::new();
+        for (id, change) in batch {
+            if change.deps().iter().any(|d| failed.contains(d)) {
+                failed.insert(change.hash());
+                continue;
+            }
+            let hash = change.hash();
+            match apply(&doc, vec![change]) {
+                Some(next) => doc = next,
+                None => {
+                    failed.insert(hash);
+                    self.doc_rejected.insert(id);
+                }
+            }
+        }
+        false
+    }
+
+    /// `id`'s change is invalid: reject every envelope carrying it, and let
+    /// the next fork in its slot (if any) take its place.
+    fn reject_doc_input(&mut self, inputs: &mut DocInputs, id: EnvelopeId, work: &mut Vec<EnvelopeId>) {
+        let Some(known) = inputs.known.remove(&id) else { return };
+        let slot = known.slot;
+        let before = inputs.winner(&slot);
+        let mut carriers = vec![id];
+        if let Some(candidates) = inputs.slots.get_mut(&slot) {
+            candidates.retain(|other, h| {
+                let same = *h == known.hash;
+                if same {
+                    carriers.push(*other);
+                }
+                !same
+            });
+            if candidates.is_empty() {
+                inputs.slots.remove(&slot);
+            }
+        }
+        for carrier in carriers {
+            inputs.known.remove(&carrier);
+            self.equivocated.remove(&carrier);
+            self.doc_rejected.insert(carrier);
+        }
+        if let Some(winner) = inputs.winner(&slot).filter(|w| Some(*w) != before) {
+            work.extend(inputs.slots[&slot].iter().filter(|(_, h)| **h == winner).map(|(id, _)| *id));
+        }
+        self.mark_forks(inputs, &slot);
+    }
+
+    /// Record which candidates of `slot` lose to its lowest-id envelope.
+    fn mark_forks(&mut self, inputs: &DocInputs, slot: &Slot) {
+        let Some(candidates) = inputs.slots.get(slot) else { return };
+        let winner = inputs.winner(slot);
+        for (id, hash) in candidates {
+            if Some(*hash) == winner {
+                self.equivocated.remove(id);
+            } else {
+                self.equivocated.insert(*id);
+            }
         }
     }
 
@@ -805,12 +1294,16 @@ impl Replica {
 
     /// Feed entries in deterministic causal order.
     pub fn feed(&mut self, feed: &StreamId) -> Vec<FeedItem> {
+        self.feed_changes(feed, FeedCursor::default()).items
+    }
+
+    /// What changed in a feed since `since` (`FeedCursor::default()`: all of
+    /// it), and the cursor to pass next time. Costs O(what changed): a new
+    /// entry usually lands at the end, so a reader applies just that.
+    pub fn feed_changes(&mut self, feed: &StreamId, since: FeedCursor) -> FeedChanges {
         match self.feeds.get_mut(feed) {
-            Some(f) => {
-                let order = f.ordered().to_vec();
-                order.iter().map(|id| f.items[id].clone()).collect()
-            }
-            None => Vec::new(),
+            Some(f) => f.changes_since(since),
+            None => FeedChanges::default(),
         }
     }
 
@@ -834,12 +1327,23 @@ impl Replica {
 
     fn seal(&mut self, stream: StreamId, epoch: EpochId, plaintext: &[u8]) -> Result<Envelope> {
         let (seq, prev) = self.my_chain_tip();
+        self.seal_at(stream, epoch, plaintext, seq, prev)
+    }
+
+    fn seal_at(
+        &self,
+        stream: StreamId,
+        epoch: EpochId,
+        plaintext: &[u8],
+        author_seq: u64,
+        author_prev: Option<EnvelopeId>,
+    ) -> Result<Envelope> {
         let header = Header {
             space: self.space_id(),
             stream,
             author: self.me.sign_pk(),
-            author_seq: seq,
-            author_prev: prev,
+            author_seq,
+            author_prev,
             auth_heads: self.graph.heads(),
             epoch,
             nonce: random(),
@@ -856,9 +1360,15 @@ impl Replica {
     /// Edit a document locally. Returns any ops (a self-healing rotation) and
     /// the envelope to broadcast.
     ///
+    /// An edit larger than one change may carry (`MAX_LOCAL_CHANGE_*`, e.g. a
+    /// multi-megabyte paste) is written as several consecutive changes, each
+    /// in its own envelope; all are stored and synced, and the last one is
+    /// returned.
+    ///
     /// The local role isn't pre-checked: a Reader's change is produced and
     /// signed like any other, and every honest peer — including ourselves —
-    /// rejects it. Apps should check `my_role()` first for UX.
+    /// rejects it. Apps should check `my_role()` first for UX. A rejected or
+    /// failed edit leaves the document as it was.
     pub fn change(
         &mut self,
         doc: StreamId,
@@ -867,26 +1377,115 @@ impl Replica {
         debug_assert_eq!(doc.kind, StreamKind::Doc);
         let (ops, epoch) = self.write_epoch()?;
         let actor = ActorId::from(self.me.sign_pk().0.to_vec());
-        let state = self.docs.entry(doc).or_insert_with(|| DocState {
-            doc: AutoCommit::new().with_actor(actor),
-            applied: BTreeSet::new(),
-            seqs: HashMap::new(),
+        let mut state = self.docs.remove(&doc).unwrap_or_else(|| DocState::new(actor));
+        // Copies share storage: keeping one to roll back to is cheap.
+        let snapshot = state.doc.clone();
+        let checkpoint = state.index.checkpoint();
+        let sealed = Self::commit_local(&mut state, &snapshot, edit).and_then(|mut parts| {
+            let (mut seq, mut prev) = self.my_chain_tip();
+            let mut envelopes = Vec::with_capacity(parts.len());
+            for part in &mut parts {
+                let env = self.seal_at(doc, epoch, &part.bytes(), seq, prev)?;
+                seq += 1;
+                prev = Some(env.id());
+                envelopes.push(env);
+            }
+            Ok((parts, envelopes))
         });
-        edit(&mut state.doc)?;
-        state.doc.commit();
-        let Some(mut change) = state.doc.get_last_local_change() else {
-            return Ok((ops, None));
+        let (parts, mut envelopes) = match sealed {
+            Ok(sealed) => sealed,
+            Err(err) => {
+                state.doc = snapshot;
+                state.index.rollback(checkpoint);
+                self.put_doc(doc, state);
+                return Err(err);
+            }
         };
-        let plaintext = change.bytes().to_vec();
-        let env = self.seal(doc, epoch, &plaintext)?;
-        let id = env.id();
-        self.ingest_envelope(env.clone())?;
-        if self.status(&id) != Status::Valid {
-            // Roll the local doc back to the valid set.
-            self.docs.remove(&doc);
-            self.full_refresh();
+        let mut staged = Vec::new();
+        let mut error = None;
+        for env in &envelopes {
+            match self.stage_envelope(env.clone()) {
+                Ok(Some(id)) => staged.push(id),
+                Ok(None) => {}
+                Err(err) => {
+                    error = Some(err);
+                    break;
+                }
+            }
         }
-        Ok((ops, Some(env)))
+        // The change is already in the local document (Automerge applied it
+        // while editing, and the index validated it once): keep it if its
+        // envelopes are valid, otherwise roll back to the valid set.
+        let keep = error.is_none()
+            && staged.len() == parts.len()
+            && staged.iter().all(|id| self.compute_status(id) == Status::Valid);
+        if keep {
+            let inputs = self.doc_inputs.entry(doc).or_default();
+            for (id, part) in staged.iter().zip(&parts) {
+                let slot = (part.actor_id().clone(), part.seq());
+                inputs.slots.entry(slot.clone()).or_default().insert(*id, part.hash());
+                inputs.known.insert(*id, Known { hash: part.hash(), slot, missing: 0 });
+                state.applied.insert(*id);
+            }
+            let forked = parts.iter().any(|p| inputs.winner(&(p.actor_id().clone(), p.seq())) != Some(p.hash()));
+            self.put_doc(doc, state);
+            if forked {
+                // Another envelope already holds one of our slots (e.g. this
+                // key wrote from a restored device): keep the canonical fork.
+                self.rebuild_doc(doc);
+            }
+        } else {
+            state.doc = snapshot;
+            state.index.rollback(checkpoint);
+            self.put_doc(doc, state);
+        }
+        self.incremental(&staged);
+        match error {
+            Some(err) => Err(err),
+            None => Ok((ops, envelopes.pop())),
+        }
+    }
+
+    fn put_doc(&mut self, doc: StreamId, state: DocState) {
+        if !state.index.is_empty() {
+            self.docs.insert(doc, state);
+        }
+    }
+
+    /// Run `edit`, commit it, and validate the result as one change, or as
+    /// several when it is too large for one. Returns the committed changes,
+    /// already part of `state` (index included).
+    fn commit_local(
+        state: &mut DocState,
+        before: &AutoCommit,
+        edit: impl FnOnce(&mut AutoCommit) -> std::result::Result<(), automerge::AutomergeError>,
+    ) -> Result<Vec<Change>> {
+        edit(&mut state.doc)?;
+        let Some(hash) = state.doc.commit() else { return Ok(Vec::new()) };
+        let change = state
+            .doc
+            .get_last_local_change()
+            .filter(|c| c.hash() == hash)
+            .ok_or(SyncError::Encoding)?;
+        let parts = if bounded_change::within(change.raw_bytes(), &change_resources::WRITE).is_ok() {
+            vec![change]
+        } else {
+            let parts = split_change(&change)?;
+            let mut doc = before.clone();
+            let applied = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                doc.apply_changes(parts.clone()).is_ok() && doc.get_missing_deps(&[]).is_empty()
+            }));
+            if !matches!(applied, Ok(true)) {
+                return Err(SyncError::Encoding);
+            }
+            state.doc = doc;
+            parts
+        };
+        for part in &parts {
+            let admitted = state.index.admit(part).ok_or(SyncError::Encoding)?;
+            state.index.insert(admitted);
+        }
+        Ok(parts)
     }
 
     /// Append an entry to a feed. Returns any ops and the envelope to broadcast.
@@ -975,6 +1574,69 @@ impl Replica {
     pub fn open_ephemeral(&self, epoch: &EpochId, nonce: &[u8; 24], aad: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
         self.ring.get(epoch)?.open(nonce, aad, ct).ok()
     }
+}
+
+/// Split one local change into consecutive changes within the write limits.
+/// Operation ids are preserved (each part starts where the previous ended and
+/// depends on it), so references between operations stay valid; Automerge's
+/// own encoder produces each part.
+fn split_change(change: &Change) -> Result<Vec<Change>> {
+    let mut template = change.decode();
+    let ops = std::mem::take(&mut template.operations);
+    let estimate = |op: &automerge::legacy::Op| {
+        let value = match &op.action {
+            automerge::legacy::OpType::Put(automerge::ScalarValue::Str(s)) => s.len(),
+            automerge::legacy::OpType::Put(automerge::ScalarValue::Bytes(b)) => b.len(),
+            _ => 8,
+        };
+        let key = match &op.key {
+            automerge::legacy::Key::Map(k) => k.len(),
+            _ => 0,
+        };
+        2 + value + key
+    };
+    let mut parts: Vec<Change> = Vec::new();
+    let (mut start, mut seq, mut start_op) = (0, template.seq, template.start_op.get());
+    let mut deps = template.deps.clone();
+    while start < ops.len() {
+        let mut end = start;
+        let mut bytes = 0;
+        while end < ops.len() && end - start < MAX_LOCAL_CHANGE_OPS {
+            bytes += estimate(&ops[end]);
+            if bytes > MAX_LOCAL_CHANGE_BYTES / 2 && end > start {
+                break;
+            }
+            end += 1;
+        }
+        let part = loop {
+            let first = parts.is_empty();
+            let candidate = Change::from(automerge::ExpandedChange {
+                operations: ops[start..end].to_vec(),
+                actor_id: template.actor_id.clone(),
+                hash: None,
+                seq,
+                start_op: std::num::NonZeroU64::new(start_op).ok_or(SyncError::Encoding)?,
+                time: template.time,
+                message: if first { template.message.clone() } else { None },
+                deps: deps.clone(),
+                extra_bytes: if first { template.extra_bytes.clone() } else { Vec::new() },
+                author: if first { template.author.clone() } else { None },
+            });
+            if bounded_change::within(candidate.raw_bytes(), &change_resources::WRITE).is_ok() {
+                break candidate;
+            }
+            if end - start == 1 {
+                return Err(SyncError::TooLarge); // one operation too large: use a blob
+            }
+            end = start + (end - start) / 2;
+        };
+        deps = vec![part.hash()];
+        seq += 1;
+        start_op += (end - start) as u64;
+        start = end;
+        parts.push(part);
+    }
+    Ok(parts)
 }
 
 #[cfg(test)]

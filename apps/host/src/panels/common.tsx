@@ -1,5 +1,6 @@
 // Small pieces shared by the host panels. The host deliberately does not import
 // UI from apps: apps and host only meet through @mycel/sdk.
+import { presenceOf, PRESENCE_LABEL } from "@mycel/sdk";
 
 const TONES = ["moss", "slate", "ochre", "plum", "clay", "tide"] as const;
 
@@ -10,7 +11,11 @@ export function toneFor(id: string) {
 }
 
 export function initials(name: string) {
-  const parts = name.trim().split(/\s+/).filter(Boolean);
+  // Words that start with a letter, ignoring "(M5)"-style suffixes, so a
+  // device name like "iPad Pro 11-inch (M5)" gives "IP".
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  const lettered = name.replace(/\([^)]*\)/g, " ").trim().split(/\s+/).filter((w) => /^\p{L}/u.test(w));
+  const parts = lettered.length ? lettered : words;
   if (parts.length === 0) return "?";
   if (parts.length === 1) return parts[0]!.slice(0, 2).toUpperCase();
   return (parts[0]![0]! + parts[parts.length - 1]![0]!).toUpperCase();
@@ -39,15 +44,8 @@ export function Avatar({
   );
 }
 
-export function statusOf(c: { nearby: boolean; online: boolean }): "nearby" | "online" | "offline" {
-  return c.nearby ? "nearby" : c.online ? "online" : "offline";
-}
-
-export const STATUS_LABEL = {
-  nearby: "On your network",
-  online: "Online",
-  offline: "Offline",
-} as const;
+export const statusOf = presenceOf;
+export const STATUS_LABEL = PRESENCE_LABEL;
 
 export function errorText(e: unknown) {
   return e instanceof Error ? e.message : String(e);

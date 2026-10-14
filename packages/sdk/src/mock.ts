@@ -23,6 +23,7 @@ import type {
   NearbyPeer,
   NetworkMode,
   NetworkStatus,
+  Notice,
   PathKind,
   PeerId,
   Profile,
@@ -40,6 +41,8 @@ export interface MockOptions {
   replies?: boolean;
   /** Network mode reported by `network_status`. Default "lan". */
   mode?: NetworkMode;
+  /** What `list_notices` reports (startup recoveries, a failing disk). Default none. */
+  notices?: Notice[];
 }
 
 // ---------------------------------------------------------------------------
@@ -245,12 +248,15 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     ambient: options.ambient ?? true,
     replies: options.replies ?? true,
     mode: options.mode ?? ("lan" as NetworkMode),
+    notices: options.notices ?? [],
   };
 
   const meId = hexFrom(`peer:me:${opts.name}`);
   const profile: Profile = { id: meId, name: opts.name, contactCode: mockContactCode(meId) };
   const people = new Map<PeerId, Person>(SEED_PEOPLE.map((p) => [p.id, { ...p }]));
   const convs = new Map<string, Conv>();
+  const hiddenMessages = new Map<string, Set<string>>();
+  const locallyHidden = (c: Conv, m: Msg) => hiddenMessages.get(c.id)?.has(m.id) ?? false;
   const blobs = new Map<string, Blob_>();
   const uploads = new Map<string, File>();
   const objectUrls = new Map<string, string>();
@@ -332,14 +338,18 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
   }
 
   function summary(c: Conv): ConversationSummary {
-    const last = c.messages[c.messages.length - 1];
+    const last = [...c.messages].reverse().find((m) => !m.deleted && !locallyHidden(c, m));
+    const hiddenUnread = [...c.messages].reverse().filter((m) => m.author !== meId && !m.deleted)
+      .slice(0, c.unread).filter((m) => locallyHidden(c, m)).length;
     return {
       id: c.id,
+      aliases: [c.id],
+      threadKey: c.id,
       title: titleOf(c),
       direct: isDirect(c),
       members: c.members.map((m) => ({ id: m.id, name: nameOf(m.id), role: m.role, isMe: m.id === meId })),
       lastMessage: last ? msgView(c, last) : null,
-      unread: c.unread,
+      unread: Math.max(0, c.unread - hiddenUnread),
       active: c.active,
       myRole: myRole(c),
       request: c.invitedBy != null,
@@ -1217,6 +1227,13 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
     list_nearby: (): NearbyPeer[] =>
       [...people.values()].filter((p) => p.nearby).map((p) => ({ id: p.id, name: p.name, isContact: p.contact })),
     restart_app: () => null,
+    list_notices: () => opts.notices.map((n) => ({ ...n })),
+    dismiss_notice: ({ notice }) => {
+      const before = opts.notices.length;
+      opts.notices = opts.notices.filter((n) => JSON.stringify(n) !== JSON.stringify(notice));
+      if (opts.notices.length !== before) emit({ type: "noticesChanged" });
+      return null;
+    },
     set_network_mode: ({ mode }): NetworkStatus => {
       nextMode = mode;
       emit({ type: "networkChanged" });
@@ -1283,8 +1300,36 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
         const i = c.messages.findIndex((m) => m.id === before);
         if (i >= 0) end = i;
       }
-      const start = limit != null ? Math.max(0, end - limit) : 0;
-      return c.messages.slice(start, end).map((m) => msgView(c, m));
+      const visible = c.messages.slice(0, end).filter((m) => !locallyHidden(c, m));
+      const count = Math.min(limit ?? 200, 10_000);
+      return visible.slice(Math.max(0, visible.length - count)).map((m) => msgView(c, m));
+    },
+    messages_around: ({ id, message, before, after }) => {
+      const c = getConv(id);
+      const at = c.messages.findIndex((m) => m.id === message);
+      if (at < 0) throw "unknown message";
+      const visible = (m: Msg) => !locallyHidden(c, m);
+      const take = (n: number | null | undefined) => Math.min(n ?? 25, 10_000);
+      const earlier = c.messages.slice(0, at).filter(visible);
+      const later = c.messages.slice(at + 1).filter(visible);
+      const b = take(before);
+      const a = take(after);
+      const anchor = visible(c.messages[at]!) ? [c.messages[at]!] : [];
+      return {
+        messages: [...earlier.slice(Math.max(0, earlier.length - b)), ...anchor, ...later.slice(0, a)].map((m) => msgView(c, m)),
+        hasEarlier: earlier.length > b,
+        hasLater: later.length > a,
+      };
+    },
+    search_messages: ({ id, query, limit }) => {
+      const c = getConv(id);
+      const terms = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);
+      if (!terms.length) return [];
+      return [...c.messages].reverse().filter((m) => !m.deleted && !locallyHidden(c, m))
+        .filter((m) => {
+          const content = [m.body, ...m.attachments.map((blob) => attachmentView(blob).name)].join(" ").toLocaleLowerCase();
+          return terms.every((term) => content.includes(term));
+        }).slice(0, Math.min(limit ?? 100, 1_000)).map((m) => msgView(c, m));
     },
     send_message: ({ id, body, replyTo, attachments }) => {
       const c = getConv(id);
@@ -1342,9 +1387,26 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       if (!m.deleted) {
         m.deleted = true;
         m.body = "";
+        m.attachments = [];
         m.reactions = [];
         touch(c);
       }
+      return null;
+    },
+    delete_message_local: ({ id, message }) => {
+      const c = getConv(id);
+      getMsg(c, message);
+      const hidden = hiddenMessages.get(id) ?? new Set<string>();
+      hidden.add(message);
+      hiddenMessages.set(id, hidden);
+      emit({ type: "conversationUpdated", conversation: id });
+      return null;
+    },
+    restore_message_local: ({ id, message }) => {
+      const c = getConv(id);
+      getMsg(c, message);
+      hiddenMessages.get(id)?.delete(message);
+      emit({ type: "conversationUpdated", conversation: id });
       return null;
     },
     toggle_reaction: ({ id, message, emoji }) => {

@@ -53,6 +53,19 @@
 //! dump_frames.rs`) decode through the SDK's `videoCanvas` with the right
 //! test-pattern counters on the canvas.
 //! [`platform::H264Decoder`] decodes in Rust for tests and headless runs.
+//!
+//! **Android, Windows, Linux: the web view encodes too** ([`web`]). There's
+//! no VideoToolbox, so the web view captures (`getUserMedia`) and encodes
+//! H.264 with WebCodecs, on the platform's own encoder where it has one
+//! (MediaCodec, Media Foundation) and under its codec licence, and pushes
+//! each frame to the runtime. The track treats that as an encoder that
+//! passes frames through: since a skipped H.264 frame breaks the chain, it
+//! drops deltas after a gap until the next keyframe and asks the web view
+//! for one, and the rate controller's size, frame rate and bitrate go back
+//! to the web view as targets. Constrained Baseline, AVCC with an `avcC`
+//! config on keyframes: the same frames as from a Mac (checked: a Pixel
+//! emulator's frames decode with ffmpeg; the SDK masks the reserved bits
+//! Chrome's software encoder sets in the profile-compatibility byte).
 
 pub mod call;
 pub mod pattern;
@@ -62,20 +75,26 @@ pub mod source;
 pub mod track;
 pub mod wire;
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod mac;
-#[cfg(not(target_os = "macos"))]
-mod stub;
+/// Camera and encoder in the app's web view (Android, Windows, Linux).
+/// Compiled everywhere so it's tested everywhere.
+pub mod web;
 
 /// The video backend for this platform.
 pub mod platform {
-    #[cfg(target_os = "macos")]
-    pub use crate::mac::{CAMERA_DENIED, H264Decoder, H264Encoder, PixelBuffer, camera};
-    #[cfg(not(target_os = "macos"))]
-    pub use crate::stub::{CAMERA_DENIED, H264Decoder, H264Encoder, PixelBuffer, camera};
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    pub use crate::mac::{CAMERA_DENIED, H264Decoder, H264Encoder, PixelBuffer, SOURCE_PACED, camera};
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    pub use crate::web::{CAMERA_DENIED, H264Decoder, H264Encoder, PixelBuffer, SOURCE_PACED, camera};
+
+    /// The web view captures and encodes (see [`crate::web`]).
+    pub const WEB_CAMERA: bool = cfg!(not(any(target_os = "macos", target_os = "ios")));
 }
 
 pub use source::{Picture, TestPattern, VideoSource, default_source};
 pub use call::VideoCall;
 pub use track::{CameraState, PeerVideo, TrackOptions, VideoInfo, VideoTrack};
 pub use wire::{EncodedFrame, UiFrame, UiSource};
+/// (Frame bytes: for building [`EncodedFrame`]s outside this crate.)
+pub use bytes::Bytes;

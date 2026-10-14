@@ -44,6 +44,23 @@ struct ListMessages {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct MessagesAround {
+    id: String,
+    message: String,
+    before: Option<u32>,
+    after: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchMessages {
+    id: String,
+    query: String,
+    limit: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Send {
     id: String,
     body: String,
@@ -130,6 +147,15 @@ struct CallArg {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct KeyframeArg {
+    call: String,
+    /// "local" (our self-view), "remote" (from the others), or both.
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct StartCall {
     conversation: String,
     #[serde(default)]
@@ -158,6 +184,11 @@ struct Mute {
     muted: bool,
 }
 
+#[derive(Deserialize)]
+struct DismissNotice {
+    notice: crate::api::Notice,
+}
+
 fn args<T: DeserializeOwned>(v: Value) -> Result<T> {
     let v = if v.is_null() { json!({}) } else { v };
     serde_json::from_value(v).map_err(|e| anyhow!("bad arguments: {e}"))
@@ -178,6 +209,8 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
         "list_contacts" => ok(rt.contacts()),
         "list_nearby" => ok(rt.nearby()),
         "network_status" => ok(rt.network_status()),
+        "list_notices" => ok(rt.notices()),
+        "dismiss_notice" => ok(rt.dismiss_notice(args::<DismissNotice>(a)?.notice)?),
         "set_network_mode" => ok(rt.set_network_mode(args::<Mode>(a)?.mode)?),
         "list_conversations" => ok(rt.conversations()),
         "get_conversation" => ok(rt.conversation(args::<Id>(a)?.id)?),
@@ -188,6 +221,14 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
         "list_messages" => {
             let l: ListMessages = args(a)?;
             ok(rt.messages(l.id, l.limit, l.before)?)
+        }
+        "messages_around" => {
+            let m: MessagesAround = args(a)?;
+            ok(rt.messages_around(m.id, m.message, m.before, m.after)?)
+        }
+        "search_messages" => {
+            let s: SearchMessages = args(a)?;
+            ok(rt.search_messages(s.id, s.query, s.limit)?)
         }
         "send_message" => {
             let s: Send = args(a)?;
@@ -202,6 +243,14 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
         "delete_message" => {
             let m: Msg = args(a)?;
             ok(rt.delete_message(m.id, m.message)?)
+        }
+        "delete_message_local" => {
+            let m: Msg = args(a)?;
+            ok(rt.delete_message_local(m.id, m.message)?)
+        }
+        "restore_message_local" => {
+            let m: Msg = args(a)?;
+            ok(rt.restore_message_local(m.id, m.message)?)
         }
         "toggle_reaction" => {
             let r: React = args(a)?;
@@ -243,7 +292,10 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
             let c: Camera = args(a)?;
             ok(rt.set_camera(c.call, c.on).await?)
         }
-        "video_keyframe" => ok(rt.video_keyframe(args::<CallArg>(a)?.call)?),
+        "video_keyframe" => {
+            let k: KeyframeArg = args(a)?;
+            ok(rt.video_keyframe(k.call, k.source)?)
+        }
         "decline_call" => ok(rt.decline_call(args::<CallArg>(a)?.call)?),
         "end_call" => ok(rt.end_call(args::<CallArg>(a)?.call)?),
         "set_muted" => {
