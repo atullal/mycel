@@ -1228,6 +1228,12 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       [...people.values()].filter((p) => p.nearby).map((p) => ({ id: p.id, name: p.name, isContact: p.contact })),
     restart_app: () => null,
     list_notices: () => opts.notices.map((n) => ({ ...n })),
+    dismiss_notice: ({ notice }) => {
+      const before = opts.notices.length;
+      opts.notices = opts.notices.filter((n) => JSON.stringify(n) !== JSON.stringify(notice));
+      if (opts.notices.length !== before) emit({ type: "noticesChanged" });
+      return null;
+    },
     set_network_mode: ({ mode }): NetworkStatus => {
       nextMode = mode;
       emit({ type: "networkChanged" });

@@ -96,6 +96,8 @@ export interface Mycel {
      * startup, so fetch once when the UI starts and again on `noticesChanged`.
      */
     list(): Promise<Notice[]>;
+    /** `dismiss_notice`: the user has seen it; it stops showing, across restarts too. */
+    dismiss(notice: Notice): Promise<null>;
   };
 
   chat: {
@@ -256,6 +258,7 @@ export function createMycel(transport: Transport): Mycel {
     },
     notices: {
       list: () => call("list_notices", none),
+      dismiss: (notice) => call("dismiss_notice", { notice }),
     },
     chat: {
       list: () => call("list_conversations", none),

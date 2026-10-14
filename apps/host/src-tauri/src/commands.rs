@@ -76,6 +76,12 @@ pub async fn list_notices(rt: State<'_, Rt>) -> Res<Vec<Notice>> {
     Ok(rt.notices())
 }
 
+/// The user has seen a notice: it stops showing, across restarts too.
+#[tauri::command]
+pub async fn dismiss_notice(rt: State<'_, Rt>, notice: Notice) -> Res<()> {
+    rt.dismiss_notice(notice).map_err(err)
+}
+
 #[tauri::command]
 pub async fn set_network_mode(rt: State<'_, Rt>, mode: NetworkMode) -> Res<NetworkStatus> {
     rt.set_network_mode(mode).map_err(err)

@@ -310,6 +310,50 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+const NOTICES: &str = "notices";
+
+/// Startup notices last until the user dismisses them (`dismiss_notice`): a
+/// phone may start Mycel in the background, where nobody sees this run's
+/// banner. Unreadable saved notices are dropped rather than stopping startup.
+fn remember_notices(store: &DbStore, new: Vec<Notice>) -> Vec<Notice> {
+    let mut all: Vec<Notice> = match store.kv_get(NOTICES) {
+        Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            eprintln!("mycel: dropping unreadable saved notices: {e}");
+            Vec::new()
+        }),
+        Ok(None) => Vec::new(),
+        Err(e) => {
+            eprintln!("mycel: couldn't read saved notices: {e:#}");
+            Vec::new()
+        }
+    };
+    let before = all.clone();
+    for notice in new {
+        if let Notice::RecordsSetAside { count } = notice {
+            if let Some(Notice::RecordsSetAside { count: total }) =
+                all.iter_mut().find(|n| matches!(n, Notice::RecordsSetAside { .. }))
+            {
+                *total += count;
+                continue;
+            }
+        }
+        if !all.contains(&notice) {
+            all.push(notice);
+        }
+    }
+    if all != before {
+        if let Err(e) = store_notices(store, &all) {
+            eprintln!("mycel: couldn't save notices: {e:#}");
+        }
+    }
+    all
+}
+
+fn store_notices(store: &DbStore, notices: &[Notice]) -> Result<()> {
+    let value = if notices.is_empty() { None } else { Some(serde_json::to_vec(notices)?) };
+    store.kv_batch_durable(vec![(NOTICES.into(), value)])
+}
+
 /// When each space was first seen here. On the first launch that records it,
 /// every space already stored keeps its old ordering (floor 0); so does an
 /// unreadable record, which must not stop Mycel from starting.
@@ -549,6 +593,7 @@ impl Runtime {
         if set_aside > 0 {
             notices.push(Notice::RecordsSetAside { count: set_aside });
         }
+        let notices = remember_notices(&store, notices);
 
         let stored_name = store.kv_get("name")?.and_then(|b| String::from_utf8(b).ok());
         let name = match (opts.name, stored_name) {
@@ -788,6 +833,22 @@ impl Runtime {
             notices.push(Notice::StorageFailing { error });
         }
         notices
+    }
+
+    /// The user has seen `notice`: stop reporting it, across restarts too.
+    /// A failing disk can't be dismissed; it clears when saving works again.
+    pub fn dismiss_notice(&self, notice: Notice) -> Result<()> {
+        let kept = {
+            let mut notices = self.notices.lock();
+            let before = notices.len();
+            notices.retain(|n| *n != notice);
+            if notices.len() == before {
+                return Ok(());
+            }
+            notices.clone()
+        };
+        self.emit(Event::NoticesChanged);
+        store_notices(&self.store, &kept)
     }
 
     pub fn node(&self) -> &Node {
@@ -2573,6 +2634,28 @@ fn sample_rate(s: &mut std::collections::VecDeque<(Instant, u64)>, now: Instant,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn notices_last_until_dismissed() {
+        use super::*;
+        let path = std::env::temp_dir().join(format!(
+            "mycel-notices-{}.redb",
+            hex::encode(mycel_crypto::random::<16>())
+        ));
+        let store = DbStore::open(&path).unwrap();
+        let first = remember_notices(&store, vec![Notice::NetworkModeReset, Notice::RecordsSetAside { count: 2 }]);
+        assert_eq!(first, vec![Notice::NetworkModeReset, Notice::RecordsSetAside { count: 2 }]);
+        // A later start that sees nothing new still reports them, and adds
+        // newly set-aside records to the same notice.
+        let again = remember_notices(&store, vec![Notice::NetworkModeReset, Notice::RecordsSetAside { count: 3 }]);
+        assert_eq!(again, vec![Notice::NetworkModeReset, Notice::RecordsSetAside { count: 5 }]);
+        store_notices(&store, &[Notice::RecordsSetAside { count: 5 }]).unwrap();
+        assert_eq!(remember_notices(&store, vec![]), vec![Notice::RecordsSetAside { count: 5 }]);
+        store_notices(&store, &[]).unwrap();
+        assert!(remember_notices(&store, vec![]).is_empty());
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn signed_profile_clock_rollback_keeps_new_name_after_stale_snapshot_replay() {
         use super::*;

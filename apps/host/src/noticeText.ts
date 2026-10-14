@@ -3,7 +3,7 @@
 import type { Notice } from "@mycel/sdk";
 
 export interface NoticeView {
-  /** The same while it's the same notice: dismissing hides it for this session. */
+  /** The same while it's the same notice (the banner hides it at once when dismissed). */
   key: string;
   text: string;
   /** Still going on: shown until it clears, with no dismiss button. */

@@ -175,6 +175,11 @@ struct Mute {
     muted: bool,
 }
 
+#[derive(Deserialize)]
+struct DismissNotice {
+    notice: crate::api::Notice,
+}
+
 fn args<T: DeserializeOwned>(v: Value) -> Result<T> {
     let v = if v.is_null() { json!({}) } else { v };
     serde_json::from_value(v).map_err(|e| anyhow!("bad arguments: {e}"))
@@ -196,6 +201,7 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
         "list_nearby" => ok(rt.nearby()),
         "network_status" => ok(rt.network_status()),
         "list_notices" => ok(rt.notices()),
+        "dismiss_notice" => ok(rt.dismiss_notice(args::<DismissNotice>(a)?.notice)?),
         "set_network_mode" => ok(rt.set_network_mode(args::<Mode>(a)?.mode)?),
         "list_conversations" => ok(rt.conversations()),
         "get_conversation" => ok(rt.conversation(args::<Id>(a)?.id)?),

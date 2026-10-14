@@ -695,6 +695,7 @@ pub fn run() {
             commands::list_contacts,
             commands::list_nearby,
             commands::list_notices,
+            commands::dismiss_notice,
             commands::network_status,
             commands::set_network_mode,
             commands::restart_app,
