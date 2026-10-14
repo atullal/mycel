@@ -268,10 +268,13 @@ fn now_ms() -> u64 {
 }
 
 /// When each space was first seen here. On the first launch that records it,
-/// every space already stored keeps its old ordering (floor 0).
+/// every space already stored keeps its old ordering (floor 0); so does an
+/// unreadable record, which must not stop Mycel from starting.
 fn load_first_seen(store: &DbStore, existing: &[SpaceId]) -> Result<HashMap<SpaceId, u64>> {
-    if let Some(list) = store.kv_decode::<Vec<(SpaceId, u64)>>("first_seen")? {
-        return Ok(list.into_iter().collect());
+    match store.kv_decode::<Vec<(SpaceId, u64)>>("first_seen") {
+        Ok(Some(list)) => return Ok(list.into_iter().collect()),
+        Ok(None) => {}
+        Err(e) => eprintln!("mycel: {e:#}; message order falls back to author times"),
     }
     let list: Vec<(SpaceId, u64)> = existing.iter().map(|s| (*s, 0)).collect();
     store.kv_batch_durable(vec![("first_seen".into(), Some(postcard::to_allocvec(&list)?))])?;
@@ -3061,6 +3064,12 @@ mod tests {
         assert_eq!(runtime.first_seen.lock()[&space], seen, "persisted");
         // A profile from before the record: its spaces keep author order.
         runtime.store.kv_batch_durable(vec![("first_seen".into(), None)]).unwrap();
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        let runtime = Runtime::open(&dir, NetworkMode::Local, None).await.unwrap();
+        assert_eq!(runtime.first_seen.lock()[&space], 0);
+        // An unreadable record doesn't stop Mycel from starting.
+        runtime.store.kv_batch_durable(vec![("first_seen".into(), Some(vec![0xff; 3]))]).unwrap();
         runtime.shutdown().await.unwrap();
         drop(runtime);
         let runtime = Runtime::open(&dir, NetworkMode::Local, None).await.unwrap();
