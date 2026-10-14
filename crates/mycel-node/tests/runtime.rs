@@ -741,22 +741,23 @@ async fn group_call_between_runtimes() {
             }
         }
     }
-    // Each person's path is known once that connection has selected a path;
-    // under load (a build running alongside) that can trail the audio by
-    // several seconds.
-    let mut st = json!(null);
-    for _ in 0..150 {
-        st = dispatch(&bob, "call_status", json!({})).await.unwrap();
-        if st[0]["participants"].as_array().is_some_and(|ps| ps.iter().all(|p| p["path"] == "network")) {
-            break;
+    // Everyone sees each other's path from the moment their leg joins,
+    // whichever of the two dialed it. (A connection the other side dialed
+    // may lack the path our end selected for them, as each end selects its
+    // own: then no path on it is "selected". That left a path unknown in
+    // about 1 run in 12 under load.)
+    for rt in [&alice, &bob, &carol] {
+        let st = dispatch(rt, "call_status", json!({})).await.unwrap();
+        let people = st[0]["participants"].as_array().unwrap();
+        assert_eq!(people.len(), 2);
+        for p in people {
+            assert_eq!(p["state"], "joined");
+            assert_eq!(p["path"], "network", "{}'s path, seen by {}", p["name"], rt.profile().name);
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let st = dispatch(&bob, "call_status", json!({})).await.unwrap();
     let people = st[0]["participants"].as_array().unwrap();
-    assert_eq!(people.len(), 2);
     for p in people {
-        assert_eq!(p["state"], "joined");
-        assert_eq!(p["path"], "network");
         assert_eq!(p["bitrate"], 32_000);
     }
     // Bob has Alice as a contact (her name); Carol only as a group member
