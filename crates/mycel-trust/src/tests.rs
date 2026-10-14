@@ -553,3 +553,60 @@ fn bulk_parent_arrival_releases_pending_quota_before_next_admission() {
     assert_eq!(g.pending.len(), 1);
     assert!(g.pending.contains_key(&next_pending.id()));
 }
+
+/// One admin's long history: `n` ops chained one after another, alternating
+/// adding a keeper, rotating, and removing that keeper again.
+fn long_admin_history(g: &SpaceGraph, admin: &Peer, n: usize) -> Vec<SignedOp> {
+    let mut parent = g.space_id();
+    let mut keeper = None;
+    (0..n as u64).map(|nonce| {
+        let action = match (nonce % 3, keeper.take()) {
+            (0, _) => {
+                let k = DeviceKeys::generate().public();
+                keeper = Some(k.sign_pk);
+                Action::Add { member: k, role: Role::Relay, keyring: None }
+            }
+            (1, k) => {
+                keeper = k;
+                Action::Rotate { rotation: new_rotation([&admin.keys.public()]).unwrap().0 }
+            }
+            (_, k) => Action::Remove {
+                member: k.unwrap(),
+                revocation: Revocation { cutoff: None },
+                rotation: new_rotation([&admin.keys.public()]).unwrap().0,
+            },
+        };
+        let op = SignedOp::sign(&admin.keys, Op {
+            space: Some(g.space_id()), parents: vec![parent], author: admin.pk(), nonce, action,
+        });
+        parent = op.id();
+        op
+    }).collect()
+}
+
+#[test]
+fn new_member_receives_a_long_admin_history_in_one_exchange() {
+    const N: usize = 10_000;
+    let (mut g, a) = space();
+    let history = long_admin_history(&g, &a, N);
+    let (added, rejected) = g.insert_many(history.clone());
+    assert_eq!((added.len(), rejected), (N, 0));
+    assert!(history.iter().all(|op| g.is_valid(&op.id())));
+
+    // What a peer sends: every op it knows, in its op_ids() order.
+    let sent: Vec<SignedOp> = g.op_ids().iter().map(|id| g.get(id).unwrap().clone()).collect();
+    let mut joiner = SpaceGraph::from_genesis(g.get(&g.space_id()).unwrap().clone()).unwrap();
+    let (added, rejected) = joiner.insert_many(sent);
+    assert_eq!((added.len(), rejected), (N, 0), "one exchange delivers everything");
+    assert!(joiner.pending.is_empty());
+    assert_eq!(joiner.state(), g.state());
+    assert_eq!(joiner.heads(), g.heads());
+
+    // Newest-first, ops park behind missing parents until the per-author
+    // quota drops the rest: unordered delivery needs several rounds.
+    let mut reversed: Vec<SignedOp> = history[..2 * MAX_PENDING_PER_AUTHOR].to_vec();
+    reversed.reverse();
+    let mut late = SpaceGraph::from_genesis(g.get(&g.space_id()).unwrap().clone()).unwrap();
+    let (_, rejected) = late.insert_many(reversed);
+    assert!(rejected > 0, "unordered delivery needs more rounds");
+}

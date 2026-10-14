@@ -10,7 +10,8 @@ use automerge::Change;
 use flate2::{Decompress, FlushDecompress, Status};
 use sha2::{Digest, Sha256};
 
-use crate::{MAX_DOC_CHANGE_BYTES, Result, SyncError};
+use crate::change_resources::{Limits, READ};
+use crate::{Result, SyncError};
 
 // Automerge 0.12 storage::{MAGIC_BYTES, chunk::ChunkType}. These framing
 // definitions are private upstream; keep compatibility covered by roundtrips.
@@ -18,8 +19,9 @@ const MAGIC: [u8; 4] = [0x85, 0x6f, 0x4a, 0x83];
 const CHANGE: u8 = 1;
 const COMPRESSED_CHANGE: u8 = 2;
 
+/// Parse a change received from anyone, within the network-wide limits.
 pub(super) fn parse(bytes: &[u8]) -> Result<Change> {
-    let raw = preflight(bytes)?;
+    let raw = preflight(bytes, &READ)?;
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Change::try_from(raw.as_ref())
     }))
@@ -27,14 +29,13 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Change> {
     .map_err(|_| SyncError::Encoding)
 }
 
-/// Also used on locally produced changes before sealing, to keep the accepted
-/// document policy identical on writers and readers without parsing ops twice.
-pub(super) fn validate(bytes: &[u8]) -> Result<()> {
-    preflight(bytes).map(|_| ())
+/// Check a locally produced change against `limits` without parsing its ops.
+pub(super) fn within(bytes: &[u8], limits: &Limits) -> Result<()> {
+    preflight(bytes, limits).map(|_| ())
 }
 
-fn preflight(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
-    let raw = uncompressed_frame(bytes)?;
+fn preflight<'a>(bytes: &'a [u8], limits: &Limits) -> Result<Cow<'a, [u8]>> {
+    let raw = uncompressed_frame(bytes, limits.bytes)?;
     // The Automerge checksum is SHA-256(type || canonical ULEB length || body).
     // Check it before the upstream parser, which does not validate it itself.
     if Sha256::digest(&raw[8..])[..4] != raw[4..8] {
@@ -42,12 +43,12 @@ fn preflight(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
     }
     let mut body = &raw[9..];
     leb128::read::unsigned(&mut body).map_err(|_| SyncError::Encoding)?;
-    crate::change_resources::check(body)?;
+    crate::change_resources::check(body, limits)?;
     Ok(raw)
 }
 
-fn uncompressed_frame(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
-    if bytes.len() > MAX_DOC_CHANGE_BYTES {
+fn uncompressed_frame(bytes: &[u8], max: usize) -> Result<Cow<'_, [u8]>> {
+    if bytes.len() > max {
         return Err(SyncError::TooLarge);
     }
     if bytes.len() < 10 || bytes[..4] != MAGIC {
@@ -70,26 +71,26 @@ fn uncompressed_frame(bytes: &[u8]) -> Result<Cow<'_, [u8]>> {
         return Ok(Cow::Borrowed(bytes));
     }
 
-    let expanded = inflate_bounded(body)?;
+    let expanded = inflate_bounded(body, max)?;
     let mut raw = Vec::with_capacity(12 + expanded.len());
     raw.extend_from_slice(&bytes[..8]);
     raw.push(CHANGE);
     leb128::write::unsigned(&mut raw, expanded.len() as u64).map_err(|_| SyncError::Encoding)?;
-    if raw.len() + expanded.len() > MAX_DOC_CHANGE_BYTES {
+    if raw.len() + expanded.len() > max {
         return Err(SyncError::TooLarge);
     }
     raw.extend_from_slice(&expanded);
     Ok(Cow::Owned(raw))
 }
 
-fn inflate_bounded(compressed: &[u8]) -> Result<Vec<u8>> {
+fn inflate_bounded(compressed: &[u8], max: usize) -> Result<Vec<u8>> {
     let mut decoder = Decompress::new(false); // Automerge uses raw DEFLATE.
     let mut output = Vec::new();
     let mut scratch = [0u8; 8192];
     loop {
         let before_in = decoder.total_in() as usize;
         let before_out = decoder.total_out() as usize;
-        let available = scratch.len().min(MAX_DOC_CHANGE_BYTES + 1 - output.len());
+        let available = scratch.len().min(max + 1 - output.len());
         let status = decoder
             .decompress(
                 &compressed[before_in..],
@@ -99,7 +100,7 @@ fn inflate_bounded(compressed: &[u8]) -> Result<Vec<u8>> {
             .map_err(|_| SyncError::Encoding)?;
         let produced = decoder.total_out() as usize - before_out;
         output.extend_from_slice(&scratch[..produced]);
-        if output.len() > MAX_DOC_CHANGE_BYTES {
+        if output.len() > max {
             return Err(SyncError::TooLarge);
         }
         if status == Status::StreamEnd {
@@ -120,6 +121,7 @@ fn inflate_bounded(compressed: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MAX_DOC_CHANGE_BYTES;
     use automerge::{AutoCommit, ROOT, transaction::Transactable};
     use std::io::Write;
 
@@ -266,7 +268,7 @@ mod tests {
             .write_all(&vec![0; MAX_DOC_CHANGE_BYTES * 4])
             .unwrap();
         let compressed = encoder.finish().unwrap();
-        assert!(compressed.len() < 8192);
+        assert!(compressed.len() < 128 * 1024);
         assert!(matches!(
             parse(&frame(COMPRESSED_CHANGE, &[0; 4], &compressed)),
             Err(SyncError::TooLarge)
@@ -326,19 +328,27 @@ mod tests {
 
     #[test]
     fn logical_operation_limit_precedes_upstream_expansion() {
-        let exact = repeated_ops(crate::MAX_DOC_CHANGE_OPS as u64, 0, "k");
+        let limits = Limits { ops: 1000, ..READ };
+        let exact = repeated_ops(1000, 0, "k");
         assert!(exact.len() < 128);
-        assert_eq!(parse(&exact).unwrap().len(), crate::MAX_DOC_CHANGE_OPS);
-        let over = repeated_ops(crate::MAX_DOC_CHANGE_OPS as u64 + 1, 0, "k");
+        assert!(preflight(&exact, &limits).is_ok());
+        let over = repeated_ops(1001, 0, "k");
         // Bounded demonstration that the upstream parser accepts this compact
         // amplification fixture; never hand it an unbounded adversarial count.
-        assert_eq!(
-            Change::try_from(over.as_slice()).unwrap().len(),
-            crate::MAX_DOC_CHANGE_OPS + 1
-        );
-        assert!(matches!(parse(&over), Err(SyncError::TooLarge)));
+        assert_eq!(Change::try_from(over.as_slice()).unwrap().len(), 1001);
+        assert!(matches!(preflight(&over, &limits), Err(SyncError::TooLarge)));
         let bomb = repeated_ops(i64::MAX as u64, 0, "k");
         assert!(matches!(parse(&bomb), Err(SyncError::TooLarge)));
+    }
+
+    #[test]
+    fn tiny_changes_expand_at_most_to_the_floor() {
+        // Five logical values per row; the body is a few dozen bytes.
+        let rows = (READ.values.floor / 5) as u64;
+        let exact = repeated_ops(rows, 0, "k");
+        assert!(exact.len() < 128);
+        assert_eq!(parse(&exact).unwrap().len() as u64, rows);
+        assert!(matches!(parse(&repeated_ops(rows + 1, 0, "k")), Err(SyncError::TooLarge)));
     }
 
     #[test]
@@ -351,9 +361,105 @@ mod tests {
     #[test]
     fn repeated_column_strings_have_a_shared_expansion_limit() {
         let key = "k".repeat(1024);
-        let exact = repeated_ops(1024, 0, &key);
+        let rows = (READ.strings.floor / 1024) as u64;
+        let exact = repeated_ops(rows, 0, &key);
         assert!(parse(&exact).is_ok());
-        let over = repeated_ops(1025, 0, &key);
+        let over = repeated_ops(rows + 1, 0, &key);
         assert!(matches!(parse(&over), Err(SyncError::TooLarge)));
+    }
+}
+
+/// Guard against an Automerge upgrade silently changing the format the
+/// parsers in this module, `change_resources` and `change_ops` hard-code.
+#[cfg(test)]
+mod automerge_format {
+    use super::*;
+
+    const FIXTURES: &str = include_str!("fixtures/automerge-0.12.0-changes.hex");
+    const REAUDIT: &str = "automerge changed: bounded_change.rs, change_resources.rs and change_ops.rs \
+        re-implement its private change framing and column encodings. Re-audit them against the new \
+        storage/ and columnar/ code, then regenerate src/fixtures \
+        (MYCEL_WRITE_FIXTURES=1 cargo test -p mycel-sync write_fixtures -- --ignored)";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn unhex(line: &str) -> Vec<u8> {
+        (0..line.len()).step_by(2).map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn stored() -> Vec<Vec<u8>> {
+        FIXTURES.lines().filter(|l| !l.is_empty()).map(unhex).collect()
+    }
+
+    /// Column specs of a raw change, in order.
+    fn specs(raw: &[u8]) -> Vec<u64> {
+        let mut input = &raw[9..];
+        let read = |input: &mut &[u8]| leb128::read::unsigned(input).unwrap();
+        read(&mut input);
+        let deps = read(&mut input) as usize;
+        input = &input[deps * 32..];
+        let len = read(&mut input) as usize;
+        input = &input[len..];
+        read(&mut input);
+        read(&mut input);
+        leb128::read::signed(&mut input).unwrap();
+        let len = read(&mut input) as usize;
+        input = &input[len..];
+        for _ in 0..read(&mut input) {
+            let len = read(&mut input) as usize;
+            input = &input[len..];
+        }
+        (0..read(&mut input)).map(|_| {
+            let spec = read(&mut input);
+            read(&mut input);
+            spec
+        }).collect()
+    }
+
+    #[test]
+    fn locked_automerge_is_the_audited_version() {
+        let lock = include_str!("../../../Cargo.lock");
+        assert!(lock.contains("name = \"automerge\"\nversion = \"0.12.0\"\n"), "{REAUDIT}");
+    }
+
+    #[test]
+    fn automerge_still_writes_the_audited_bytes() {
+        let fresh: Vec<Vec<u8>> =
+            crate::change_ops::tests::fixtures().iter().map(|c| c.raw_bytes().to_vec()).collect();
+        assert_eq!(fresh.iter().map(|b| hex(b)).collect::<Vec<_>>(), stored().iter().map(|b| hex(b)).collect::<Vec<_>>(), "{REAUDIT}");
+    }
+
+    #[test]
+    fn audited_bytes_cover_every_column_kind_and_parse() {
+        let stored = stored();
+        let mut seen = std::collections::BTreeSet::new();
+        for raw in &stored {
+            seen.extend(specs(raw));
+            let change = parse(raw).expect(REAUDIT);
+            assert_eq!(change.raw_bytes(), raw.as_slice(), "{REAUDIT}");
+            // Upstream re-encodes its own decoding identically.
+            assert_eq!(Change::from(change.decode()).raw_bytes(), raw.as_slice(), "{REAUDIT}");
+            let mut compressed = change.clone();
+            assert_eq!(parse(&compressed.bytes()).unwrap().hash(), change.hash());
+        }
+        // Object, key, insert, action, value, predecessor, expand and mark
+        // columns: every column type (group, actor, integer, delta, boolean,
+        // string, value metadata, raw value).
+        let expected = [0x01, 0x02, 0x11, 0x13, 0x15, 0x34, 0x42, 0x56, 0x57, 0x70, 0x71, 0x73, 0x94, 0xa5];
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), expected, "{REAUDIT}");
+    }
+
+    #[test]
+    #[ignore]
+    fn write_fixtures() {
+        if std::env::var_os("MYCEL_WRITE_FIXTURES").is_none() {
+            return;
+        }
+        let lines: String =
+            crate::change_ops::tests::fixtures().iter().map(|c| hex(c.raw_bytes()) + "\n").collect();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/fixtures/automerge-0.12.0-changes.hex");
+        std::fs::write(path, lines).unwrap();
     }
 }
