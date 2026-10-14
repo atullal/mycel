@@ -2125,6 +2125,8 @@
   bottom: 14px;
   width: clamp(112px, 22%, 220px);
   aspect-ratio: 16 / 9;
+  /* a portrait camera stays inside the stage (the picture is cropped) */
+  max-height: calc(100% - 28px);
   border-radius: var(--r-md);
   overflow: hidden;
   background: #1d2023;

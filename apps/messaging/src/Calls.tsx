@@ -4,6 +4,7 @@ import { useMycel, useVideoCanvas } from "@mycel/sdk/react";
 import type { CallInfo, Participant, ParticipantState, PathKind } from "@mycel/sdk";
 import { Avatar, Icon, errorText } from "./ui.tsx";
 import "./call-layout.css";
+import type { VideoLayout } from "./layout.ts";
 
 // Calls in the Messaging app: the incoming-call sheet, the in-call bar, the
 // group call's people (with their video) and the "join call" banner, the
@@ -495,16 +496,113 @@ export function hasVideo(c: CallInfo | null): boolean {
  * The video of a call: their picture large, ours small in the corner
  * (mirrored, as a mirror would show it), and what's happening when there's
  * no picture: camera off, video paused on a slow connection, connecting.
+ *
+ * Where it shows depends on the screen (`videoLayout` in layout.ts): on a
+ * wide screen above the conversation, which stays usable below it; on a
+ * phone full screen, or floating small over the app once minimized. Moving
+ * between inline and full screen/floating (a window resized across the
+ * phone breakpoint) mounts new canvases, which ask for a fresh keyframe.
  */
-export function VideoStage({ call, minimized, onMinimize, onRestore, onOpenChat }: {
+export function VideoStage({ call, layout, onMinimize, onRestore, onOpenChat }: {
+  call: CallInfo;
+  layout: VideoLayout;
+  onMinimize: () => void;
+  onRestore: () => void;
+  onOpenChat: () => void;
+}) {
+  if (layout === "inline") return <InlineVideoStage call={call} />;
+  return (
+    <OverlayVideoStage
+      call={call}
+      minimized={layout === "floating"}
+      onMinimize={onMinimize}
+      onRestore={onRestore}
+      onOpenChat={onOpenChat}
+    />
+  );
+}
+
+/** Their picture and ours, plus what to say while there's no picture. */
+function useStagePicture(call: CallInfo) {
+  const remote = useRef<HTMLCanvasElement>(null);
+  const self = useRef<HTMLCanvasElement>(null);
+  const v = call.video;
+  const live = call.state === "active";
+  const them = useVideoCanvas(remote, { call: live ? call.id : null, source: "remote", peer: call.peer });
+  const me = useVideoCanvas(self, { call: live ? call.id : null, source: "local" });
+  const first = call.peerName.split(" ")[0] || call.peerName;
+  let note: string | null = null;
+  if (!them.supported) note = "Video can't be shown in this window (it needs WebCodecs: Safari 16.4 or later).";
+  else if (!live) note = call.direction === "outgoing" ? "Calling…" : "Connecting…";
+  else if (!v.remoteCamera) note = `${first}'s camera is off`;
+  else if (v.remotePaused) note = "Video paused: slow connection";
+  else if (!them.picture) note = "Connecting video…";
+  const compactNote = !them.supported
+    ? "Video unavailable"
+    : !live
+      ? "Calling…"
+      : !v.remoteCamera
+        ? "Camera off"
+        : v.remotePaused
+          ? "Video paused"
+          : "Connecting…";
+  return { remote, self, them, me, note, compactNote, live };
+}
+
+/** The canvases, notes and stats inside a stage, whichever layout it has. */
+function StagePicture({ call, picture, compact }: { call: CallInfo; picture: ReturnType<typeof useStagePicture>; compact: boolean }) {
+  const { remote, self, them, me, note, compactNote, live } = picture;
+  const v = call.video;
+  const ourCamera = v.camera === "on" || v.camera === "starting";
+  return (
+    <>
+      <canvas ref={remote} className={`mx-stage-remote${them.picture && !note ? " is-on" : ""}`} aria-label={`${call.peerName}'s video`} />
+      {note && (
+        <div className="mx-stage-note">
+          <Avatar id={call.peer} name={call.peerName} size={64} />
+          <span title={note} aria-label={note}>{compact ? compactNote : note}</span>
+        </div>
+      )}
+      {/* always mounted, so the decoder attaches once; hidden with the camera off */}
+      <div
+        className={`mx-stage-self${me.picture ? " is-on" : ""}${ourCamera ? "" : " is-hidden"}`}
+        style={me.picture ? { aspectRatio: `${me.picture.width} / ${me.picture.height}` } : undefined}
+        aria-hidden={!ourCamera}
+      >
+        <canvas ref={self} aria-label="Your video" />
+        {v.paused && <span className="mx-stage-self-note">Your video is paused: slow connection</span>}
+        {!v.paused && !me.picture && <span className="mx-stage-self-note">Starting camera…</span>}
+      </div>
+      {live && them.picture && !note && v.recvWidth > 0 && (
+        <span className="mx-stage-stats" title="What you receive">
+          {v.recvHeight}p · {Math.round(v.recvFps)} fps
+          {v.latencyMs > 0 ? ` · ${v.latencyMs} ms` : ""}
+        </span>
+      )}
+    </>
+  );
+}
+
+/** Wide screens: the stage sits above the conversation, under the call bar. */
+function InlineVideoStage({ call }: { call: CallInfo }) {
+  const picture = useStagePicture(call);
+  return (
+    <section className="mx-stage" aria-label={`Video call with ${call.peerName}`}>
+      <StagePicture call={call} picture={picture} compact={false} />
+    </section>
+  );
+}
+
+/** Phones: full screen over the app, or a small floating picture. */
+function OverlayVideoStage({ call, minimized, onMinimize, onRestore, onOpenChat }: {
   call: CallInfo;
   minimized: boolean;
   onMinimize: () => void;
   onRestore: () => void;
   onOpenChat: () => void;
 }) {
-  const remote = useRef<HTMLCanvasElement>(null);
-  const self = useRef<HTMLCanvasElement>(null);
+  const picture = useStagePicture(call);
+  const { them } = picture;
   const stage = useRef<HTMLElement>(null);
   const restore = useRef<HTMLButtonElement>(null);
   const drag = useRef<{ x: number; y: number; left: number; top: number; moved: boolean; pointer: number } | null>(null);
@@ -514,12 +612,6 @@ export function VideoStage({ call, minimized, onMinimize, onRestore, onOpenChat 
   const [availableHeight, setAvailableHeight] = useState<number | undefined>();
   const [corner, setCorner] = useState({ right: true, bottom: false });
   const [dragging, setDragging] = useState(false);
-  const v = call.video;
-  const live = call.state === "active";
-  const them = useVideoCanvas(remote, { call: live ? call.id : null, source: "remote", peer: call.peer });
-  const me = useVideoCanvas(self, { call: live ? call.id : null, source: "local" });
-  const first = call.peerName.split(" ")[0] || call.peerName;
-  const ourCamera = v.camera === "on" || v.camera === "starting";
 
   // visualViewport shrinks and moves when the phone keyboard opens. Keep
   // the floating call above it, and remember which corner was chosen.
@@ -561,15 +653,6 @@ export function VideoStage({ call, minimized, onMinimize, onRestore, onOpenChat 
     else stage.current?.focus({ preventScroll: true });
   }, [minimized]);
 
-  let note: string | null = null;
-  if (!them.supported) note = "Video can't be shown in this window (it needs WebCodecs: Safari 16.4 or later).";
-  else if (!live) note = call.direction === "outgoing" ? "Calling…" : "Connecting…";
-  else if (!v.remoteCamera) note = `${first}'s camera is off`;
-  else if (v.remotePaused) note = "Video paused: slow connection";
-  else if (!them.picture) note = "Connecting video…";
-  const compactNote = !them.supported ? "Video unavailable" : !live ? "Calling…"
-    : !v.remoteCamera ? "Camera off" : v.remotePaused ? "Video paused" : "Connecting…";
-
   return createPortal(
     <section
       ref={stage}
@@ -600,29 +683,7 @@ export function VideoStage({ call, minimized, onMinimize, onRestore, onOpenChat 
       }}
       onPointerCancel={() => { swipe.current = null; }}
     >
-      <canvas ref={remote} className={`mx-stage-remote${them.picture && !note ? " is-on" : ""}`} aria-label={`${call.peerName}'s video`} />
-      {note && (
-        <div className="mx-stage-note">
-          <Avatar id={call.peer} name={call.peerName} size={64} />
-          <span title={note} aria-label={note}>{minimized ? compactNote : note}</span>
-        </div>
-      )}
-      {/* always mounted, so the decoder attaches once; hidden with the camera off */}
-      <div
-        className={`mx-stage-self${me.picture ? " is-on" : ""}${ourCamera ? "" : " is-hidden"}`}
-        style={me.picture ? { aspectRatio: `${me.picture.width} / ${me.picture.height}` } : undefined}
-        aria-hidden={!ourCamera}
-      >
-        <canvas ref={self} aria-label="Your video" />
-        {v.paused && <span className="mx-stage-self-note">Your video is paused: slow connection</span>}
-        {!v.paused && !me.picture && <span className="mx-stage-self-note">Starting camera…</span>}
-      </div>
-      {live && them.picture && !note && v.recvWidth > 0 && (
-        <span className="mx-stage-stats" title="What you receive">
-          {v.recvHeight}p · {Math.round(v.recvFps)} fps
-          {v.latencyMs > 0 ? ` · ${v.latencyMs} ms` : ""}
-        </span>
-      )}
+      <StagePicture call={call} picture={picture} compact={minimized} />
       {!minimized && (
         <div className="mx-stage-controls">
           <button className="mx-stage-minimize" onClick={onMinimize} aria-label="Minimize video call" title="Return to chat">

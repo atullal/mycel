@@ -7,6 +7,8 @@ import { NewConversationDialog } from "./NewConversation.tsx";
 import { MembersPanel } from "./MembersPanel.tsx";
 import { CallBar, IncomingCall, VideoStage, hasVideo, isLive, visibleCalls } from "./Calls.tsx";
 import { errorText } from "./ui.tsx";
+import { PANEL_OVER_CHAT, PHONE_LAYOUT, conversationInView, videoLayout } from "./layout.ts";
+import { useMediaQuery } from "./useMediaQuery.ts";
 import "./messaging.css";
 import "./search.css";
 
@@ -60,7 +62,12 @@ export function MessagingApp({ initialConversation, onOpenContacts, visible = tr
   const liveCall = calls.find((c) => isLive(c) && c !== ringing) ?? null;
   const [videoMinimized, setVideoMinimized] = useState(false);
   useEffect(() => setVideoMinimized(false), [liveCall?.id]);
-  const videoExpanded = !!liveCall && hasVideo(liveCall) && !videoMinimized;
+  const phoneLayout = useMediaQuery(PHONE_LAYOUT);
+  const panelOverChat = useMediaQuery(PANEL_OVER_CHAT);
+  const videoCall = liveCall && hasVideo(liveCall) ? liveCall : null;
+  const stageLayout = videoCall ? videoLayout(phoneLayout, videoMinimized) : null;
+  // Only a phone's full-screen call covers the app (and makes it inert).
+  const videoExpanded = stageLayout === "expanded";
   const [callError, setCallError] = useState<string | null>(null);
   const startCall = useCallback(
     async (conversation: string, video = false) => {
@@ -126,7 +133,8 @@ export function MessagingApp({ initialConversation, onOpenContacts, visible = tr
     setVideoMinimized(true);
     select(openRequest.id);
   }, [openRequest?.token, openRequest?.id, select]);
-  const visibleConversation = visible && !videoExpanded && !composing && !membersOpen ? current?.id ?? null : null;
+  const inView = conversationInView({ hostVisible: visible, composing, videoLayout: stageLayout, membersOpen, panelOverChat });
+  const visibleConversation = inView ? current?.id ?? null : null;
   useEffect(() => {
     onVisibleConversationChange?.(visibleConversation);
     return () => onVisibleConversationChange?.(null);
@@ -146,18 +154,18 @@ export function MessagingApp({ initialConversation, onOpenContacts, visible = tr
       />
       <main className="mx-main">
         <CallBar call={barCall} onOpen={select} error={callError} onDismissError={() => setCallError(null)} />
-        {liveCall && hasVideo(liveCall) && (
+        {videoCall && stageLayout && (
           <VideoStage
-            key={liveCall.id}
-            call={liveCall}
-            minimized={videoMinimized}
+            key={videoCall.id}
+            call={videoCall}
+            layout={stageLayout}
             onMinimize={() => {
               setVideoMinimized(true);
-              if (!current) select(liveCall.conversation);
+              if (!current) select(videoCall.conversation);
             }}
             onRestore={() => setVideoMinimized(false)}
             onOpenChat={() => {
-              select(liveCall.conversation);
+              select(videoCall.conversation);
               setVideoMinimized(true);
             }}
           />
