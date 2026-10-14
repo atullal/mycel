@@ -50,6 +50,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::resources::PeerFrames;
 use crate::wire::*;
 use crate::{Inner, NetEvent, Node, on_conn, open_bi, pooled};
 
@@ -431,7 +432,7 @@ async fn drop_partial(part: &Path) {
 
 /// One blob request, on its own stream of a pooled connection.
 pub(crate) async fn serve(inner: &Arc<Inner>, peer: SignPk, mut tx: SendStream, mut rx: RecvStream) -> Result<()> {
-    let req: BlobReq = recv(&mut rx).await?;
+    let req: BlobReq = recv_small(&mut rx, crate::resources::FIRST_FRAME, &inner.frames(&peer)).await?;
     let (space, hash) = match &req {
         BlobReq::Get { space, hash }
         | BlobReq::Put { space, hash, .. }
@@ -461,8 +462,14 @@ pub(crate) async fn serve(inner: &Arc<Inner>, peer: SignPk, mut tx: SendStream, 
         (BlobReq::Get { .. }, Some(path)) => serve_get(inner, &mut tx, &path, None).await,
         (BlobReq::GetFrom { offset, .. }, Some(path)) => serve_get(inner, &mut tx, &path, Some(offset)).await,
         (BlobReq::GetRange { offset, len, .. }, Some(path)) => serve_range(inner, &mut tx, &path, offset, len).await,
-        (BlobReq::Put { len, .. }, Some(path)) => serve_put(inner, &mut tx, &mut rx, &path, hash, len, false, keeper).await,
-        (BlobReq::Offer { len, .. }, Some(path)) => serve_put(inner, &mut tx, &mut rx, &path, hash, len, true, keeper).await,
+        (BlobReq::Put { len, .. }, Some(path)) => {
+            let push = IncomingPush { hash, len, handshake: false, keeper };
+            serve_put(inner, &mut tx, &mut rx, &path, push).await
+        }
+        (BlobReq::Offer { len, .. }, Some(path)) => {
+            let push = IncomingPush { hash, len, handshake: true, keeper };
+            serve_put(inner, &mut tx, &mut rx, &path, push).await
+        }
     };
     tx.finish().ok();
     res
@@ -513,16 +520,18 @@ async fn serve_range(inner: &Arc<Inner>, tx: &mut SendStream, path: &Path, offse
     send_from(tx, path, start, end, &count_served(inner, start)).await
 }
 
-async fn serve_put(
-    inner: &Arc<Inner>,
-    tx: &mut SendStream,
-    rx: &mut RecvStream,
-    path: &Path,
+/// A blob a member pushes to us.
+struct IncomingPush {
     hash: Hash32,
     len: u64,
+    /// `Offer` (we answer before the bytes come), not the legacy `Put`.
     handshake: bool,
+    /// We are a keeper of the space: we keep partial pushes to resume.
     keeper: bool,
-) -> Result<()> {
+}
+
+async fn serve_put(inner: &Arc<Inner>, tx: &mut SendStream, rx: &mut RecvStream, path: &Path, push: IncomingPush) -> Result<()> {
+    let IncomingPush { hash, len, handshake, keeper } = push;
     if path.exists() {
         return send(tx, &BlobResp::Stored).await;
     }
@@ -575,12 +584,14 @@ async fn push(inner: &Arc<Inner>, pk: SignPk, space: SpaceId, hash: Hash32, path
     on_conn!(inner, &pk, |conn| async {
         let (mut tx, mut rx) = open_bi(&conn, StreamKind::Blob).await?;
         send(&mut tx, &BlobReq::Offer { space, hash, len }).await?;
-        match recv::<BlobResp>(&mut rx).await? {
+        match recv_small::<BlobResp>(&mut rx, crate::resources::REPLY_TIMEOUT, &inner.reply_frames(&pk)).await? {
             BlobResp::Stored => Ok(()),
             BlobResp::SendFrom { offset } if offset <= len => {
                 send_from(&mut tx, path, offset, len, &no_progress()).await?;
                 tx.finish()?;
-                match recv::<BlobResp>(&mut rx).await? {
+                // The bytes written may still be queued for a slow link.
+                let wait = crate::resources::reply_timeout(usize::try_from(len - offset).unwrap_or(usize::MAX));
+                match recv_small::<BlobResp>(&mut rx, wait, &inner.reply_frames(&pk)).await? {
                     BlobResp::Stored => Ok(()),
                     other => Err(anyhow!("push failed: {other:?}")),
                 }
@@ -710,12 +721,12 @@ impl Download {
 }
 
 /// Fetch `[start, end)` of the blob from one source into the `.part` file.
-async fn fetch_range(conn: &Connection, dl: &Download, id: u64, start: u64, end: u64) -> Result<()> {
+async fn fetch_range(conn: &Connection, frames: &PeerFrames, dl: &Download, id: u64, start: u64, end: u64) -> Result<()> {
     let (mut tx, mut rx) = open_bi(conn, StreamKind::Blob).await?;
     let (space, hash) = (dl.space, dl.hash);
     send(&mut tx, &BlobReq::GetRange { space, hash, offset: start, len: end - start }).await?;
     tx.finish()?;
-    match recv::<BlobResp>(&mut rx).await? {
+    match recv_small::<BlobResp>(&mut rx, crate::resources::REPLY_TIMEOUT, frames).await? {
         BlobResp::Range { total, offset } if total == dl.total && offset == start => {}
         other => bail!("not available: {other:?}"),
     }
@@ -772,7 +783,7 @@ async fn source_worker(inner: Arc<Inner>, pk: SignPk, dl: Arc<Download>) -> Resu
                 continue;
             }
         };
-        let res = fetch_range(&conn, &dl, id, start, end).await;
+        let res = fetch_range(&conn, &inner.reply_frames(&pk), &dl, id, start, end).await;
         dl.release(id);
         drop(conn);
         match res {
@@ -790,7 +801,7 @@ async fn probe(inner: &Arc<Inner>, pk: SignPk, space: SpaceId, hash: Hash32) -> 
         let (mut tx, mut rx) = open_bi(&conn, StreamKind::Blob).await?;
         send(&mut tx, &BlobReq::GetRange { space, hash, offset: 0, len: 0 }).await?;
         tx.finish()?;
-        match recv::<BlobResp>(&mut rx).await? {
+        match recv_small::<BlobResp>(&mut rx, crate::resources::REPLY_TIMEOUT, &inner.reply_frames(&pk)).await? {
             BlobResp::Range { total, .. } => Ok(total),
             other => Err(anyhow!("not available: {other:?}")),
         }

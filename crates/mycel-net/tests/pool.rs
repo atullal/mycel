@@ -103,3 +103,45 @@ async fn syncs_reuse_one_connection_and_redial_after_restart() {
     bob.shutdown().await.unwrap();
 }
 
+
+/// Many exchanges at once on the one connection: chats are one space each
+/// and a device syncs up to 16 at a time, a download takes several streams.
+/// None is refused: past QUIC's stream limit (64) the rest wait for their
+/// turn, and the peer isn't marked as failing.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_exchanges_on_one_connection_all_complete() {
+    let alice = node(Arc::new(DeviceKeys::generate()), "alice", 0).await;
+    let bob = Arc::new(node(Arc::new(DeviceKeys::generate()), "bob", 0).await);
+    bob.add_peer_addr(alice.addr());
+    alice.add_peer_addr(bob.addr());
+    const SPACES: usize = 40;
+    let mut spaces = Vec::new();
+    for _ in 0..SPACES {
+        let (space, genesis) = alice.create_space().unwrap();
+        alice.with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer)).unwrap().unwrap();
+        bob.join_space(genesis).unwrap();
+        spaces.push(space);
+    }
+    let alice_id = alice.id();
+    let mut syncs = tokio::task::JoinSet::new();
+    for space in spaces {
+        let bob = bob.clone();
+        syncs.spawn(async move { bob.sync_with(alice_id, space, true).await });
+    }
+    // and more streams than QUIC lets a peer have open at once
+    const CARDS: usize = 100;
+    for _ in 0..CARDS {
+        let bob = bob.clone();
+        syncs.spawn(async move { bob.fetch_card(alice_id).await.map(|_| Default::default()) });
+    }
+    let mut done = 0;
+    while let Some(res) = syncs.join_next().await {
+        res.unwrap().expect("every exchange completes");
+        done += 1;
+    }
+    assert_eq!(done, SPACES + CARDS);
+    assert_eq!(bob.connection_counts().dialed, 1, "all on one connection");
+    assert_eq!(bob.peers()[&alice_id].failures, 0);
+    alice.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
+}
