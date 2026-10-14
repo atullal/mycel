@@ -864,9 +864,11 @@ fn forks_of_an_old_change_rebuild_at_most_once_per_batch() {
     sync(&mut a, &mut b);
     let expected_rest = a.doc_json(&doc);
     // b mints many competing versions of its first change, each in an
-    // envelope that wins on id over the previous ones.
+    // envelope that wins on id over the original (the lowest id wins a slot:
+    // with random nonces the original would otherwise win 1 time in 21).
+    let lowest = b.envelope_ids().into_iter().min().unwrap();
     let mut forks: Vec<Envelope> = (0..20)
-        .map(|i| {
+        .map(|i| loop {
             let mut fork = AutoCommit::new().with_actor(ActorId::from(bk.sign_pk().0.to_vec()));
             fork.put(ROOT, "base", format!("fork {i}")).unwrap();
             fork.commit();
@@ -878,7 +880,10 @@ fn forks_of_an_old_change_rebuild_at_most_once_per_batch() {
             header.nonce = random();
             let ct = b.ring.get(&header.epoch).unwrap().seal(&header.nonce, &content_aad(&header), &fork.get_last_local_change().unwrap().bytes()).unwrap();
             let sig = bk.sign(CTX_ENV_SIG, &[&encode(&header), &ct]);
-            Envelope { header, ciphertext: ct, sig }
+            let env = Envelope { header, ciphertext: ct, sig };
+            if env.id() < lowest {
+                break env;
+            }
         })
         .collect();
     forks.sort_by_key(|e| std::cmp::Reverse(e.id()));

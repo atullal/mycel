@@ -420,7 +420,8 @@ mod automerge_format {
 
     #[test]
     fn locked_automerge_is_the_audited_version() {
-        let lock = include_str!("../../../Cargo.lock");
+        // Windows checkouts may have CRLF line endings.
+        let lock = include_str!("../../../Cargo.lock").replace("\r\n", "\n");
         assert!(lock.contains("name = \"automerge\"\nversion = \"0.12.0\"\n"), "{REAUDIT}");
     }
 

@@ -263,9 +263,12 @@ async fn a_trickling_stranger_does_not_starve_members() {
         (StreamKind::Sync, 8 << 20),
     ] {
         let (mut tx, rx) = conn.open_bi().await.unwrap();
-        tx.write_all(&[kind as u8]).await.unwrap();
-        tx.write_all(&(declared as u32).to_le_bytes()).await.unwrap();
-        tx.write_all(&[0]).await.unwrap();
+        // Bob refuses an oversized blob declaration at once and may stop the
+        // stream before these writes land (seen on Windows): that's the
+        // defence working, not a failure.
+        let _ = tx.write_all(&[kind as u8]).await;
+        let _ = tx.write_all(&(declared as u32).to_le_bytes()).await;
+        let _ = tx.write_all(&[0]).await;
         trickling.push((tx, rx));
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
