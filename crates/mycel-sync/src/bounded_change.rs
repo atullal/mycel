@@ -368,3 +368,98 @@ mod tests {
         assert!(matches!(parse(&over), Err(SyncError::TooLarge)));
     }
 }
+
+/// Guard against an Automerge upgrade silently changing the format the
+/// parsers in this module, `change_resources` and `change_ops` hard-code.
+#[cfg(test)]
+mod automerge_format {
+    use super::*;
+
+    const FIXTURES: &str = include_str!("fixtures/automerge-0.12.0-changes.hex");
+    const REAUDIT: &str = "automerge changed: bounded_change.rs, change_resources.rs and change_ops.rs \
+        re-implement its private change framing and column encodings. Re-audit them against the new \
+        storage/ and columnar/ code, then regenerate src/fixtures \
+        (MYCEL_WRITE_FIXTURES=1 cargo test -p mycel-sync write_fixtures -- --ignored)";
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn unhex(line: &str) -> Vec<u8> {
+        (0..line.len()).step_by(2).map(|i| u8::from_str_radix(&line[i..i + 2], 16).unwrap()).collect()
+    }
+
+    fn stored() -> Vec<Vec<u8>> {
+        FIXTURES.lines().filter(|l| !l.is_empty()).map(unhex).collect()
+    }
+
+    /// Column specs of a raw change, in order.
+    fn specs(raw: &[u8]) -> Vec<u64> {
+        let mut input = &raw[9..];
+        let read = |input: &mut &[u8]| leb128::read::unsigned(input).unwrap();
+        read(&mut input);
+        let deps = read(&mut input) as usize;
+        input = &input[deps * 32..];
+        let len = read(&mut input) as usize;
+        input = &input[len..];
+        read(&mut input);
+        read(&mut input);
+        leb128::read::signed(&mut input).unwrap();
+        let len = read(&mut input) as usize;
+        input = &input[len..];
+        for _ in 0..read(&mut input) {
+            let len = read(&mut input) as usize;
+            input = &input[len..];
+        }
+        (0..read(&mut input)).map(|_| {
+            let spec = read(&mut input);
+            read(&mut input);
+            spec
+        }).collect()
+    }
+
+    #[test]
+    fn locked_automerge_is_the_audited_version() {
+        let lock = include_str!("../../../Cargo.lock");
+        assert!(lock.contains("name = \"automerge\"\nversion = \"0.12.0\"\n"), "{REAUDIT}");
+    }
+
+    #[test]
+    fn automerge_still_writes_the_audited_bytes() {
+        let fresh: Vec<Vec<u8>> =
+            crate::change_ops::tests::fixtures().iter().map(|c| c.raw_bytes().to_vec()).collect();
+        assert_eq!(fresh.iter().map(|b| hex(b)).collect::<Vec<_>>(), stored().iter().map(|b| hex(b)).collect::<Vec<_>>(), "{REAUDIT}");
+    }
+
+    #[test]
+    fn audited_bytes_cover_every_column_kind_and_parse() {
+        let stored = stored();
+        let mut seen = std::collections::BTreeSet::new();
+        for raw in &stored {
+            seen.extend(specs(raw));
+            let change = parse(raw).expect(REAUDIT);
+            assert_eq!(change.raw_bytes(), raw.as_slice(), "{REAUDIT}");
+            // Upstream re-encodes its own decoding identically.
+            assert_eq!(Change::from(change.decode()).raw_bytes(), raw.as_slice(), "{REAUDIT}");
+            let mut compressed = change.clone();
+            assert_eq!(parse(&compressed.bytes()).unwrap().hash(), change.hash());
+        }
+        // Object, key, insert, action, value, predecessor, expand and mark
+        // columns: every column type (group, actor, integer, delta, boolean,
+        // string, value metadata, raw value).
+        let expected = [0x01, 0x02, 0x11, 0x13, 0x15, 0x34, 0x42, 0x56, 0x57, 0x70, 0x71, 0x73, 0x94, 0xa5];
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), expected, "{REAUDIT}");
+    }
+
+    #[test]
+    #[ignore]
+    fn write_fixtures() {
+        if std::env::var_os("MYCEL_WRITE_FIXTURES").is_none() {
+            return;
+        }
+        let lines: String =
+            crate::change_ops::tests::fixtures().iter().map(|c| hex(c.raw_bytes()) + "\n").collect();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/fixtures/automerge-0.12.0-changes.hex");
+        std::fs::write(path, lines).unwrap();
+    }
+}
