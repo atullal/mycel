@@ -1,6 +1,6 @@
 // Small pieces shared by the host panels. The host deliberately does not import
-// UI from apps. Presence labels share a pure semantic helper with messaging.
-import { presenceOf, PRESENCE_LABEL } from "../../../messaging/src/presence.ts";
+// UI from apps: apps and host only meet through @mycel/sdk.
+import { presenceOf, PRESENCE_LABEL } from "@mycel/sdk";
 
 const TONES = ["moss", "slate", "ochre", "plum", "clay", "tide"] as const;
 

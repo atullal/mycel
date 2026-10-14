@@ -10,3 +10,6 @@ export { createHttpTransport, isHttpRuntime } from "./http.ts";
 export { canDecodeVideo, codecString, encodeVideoFrame, parseVideoFrame, videoCanvas } from "./video.ts";
 export type { VideoCanvas, VideoCanvasOptions, VideoFrameData, VideoSource } from "./video.ts";
 export { webCameraStream } from "./webcam.ts";
+export { directPresence, presenceOf, PRESENCE_LABEL } from "./presence.ts";
+export type { Presence } from "./presence.ts";
+export { matchesSearch } from "./search.ts";

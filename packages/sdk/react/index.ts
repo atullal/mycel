@@ -29,6 +29,9 @@ import type {
   Profile,
 } from "../src/types.ts";
 
+// Shared widgets that any app (and the host's panels) can use.
+export { SearchField } from "./SearchField.tsx";
+
 const MycelContext = createContext<Mycel | null>(null);
 
 /** Optional: provide a specific client (otherwise the default `mycel` is used). */

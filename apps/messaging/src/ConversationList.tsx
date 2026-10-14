@@ -1,10 +1,7 @@
 import { useMemo, useState } from "react";
-import type { ConversationSummary } from "@mycel/sdk";
-import { useContacts } from "@mycel/sdk/react";
+import { directPresence, matchesSearch, type ConversationSummary, type Presence } from "@mycel/sdk";
+import { SearchField, useContacts } from "@mycel/sdk/react";
 import { ConversationAvatar, Icon, PresenceLabel, formatListTime, previewText } from "./ui.tsx";
-import { directPresence, type Presence } from "./presence.ts";
-import { matchesSearch } from "./search.ts";
-import { SearchField } from "./SearchField.tsx";
 
 /** Unread count that belongs on badges: requests are counted separately. */
 export function unreadOf(c: ConversationSummary): number {

@@ -1,12 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { useMessages, useMycel, useTyping } from "@mycel/sdk/react";
-import type { CallInfo, Contact, ConversationSummary, MessageView } from "@mycel/sdk";
+import { directPresence, PRESENCE_LABEL, type CallInfo, type Contact, type ConversationSummary, type MessageView } from "@mycel/sdk";
 import { MessageList } from "./MessageList.tsx";
 import { Composer, type ComposerHandle } from "./Composer.tsx";
 import { ConversationAvatar, Icon, errorText } from "./ui.tsx";
 import { GroupCallPanel, JoinBanner, isLive } from "./Calls.tsx";
 import { ChatSearch } from "./ChatSearch.tsx";
-import { directPresence, PRESENCE_LABEL } from "./presence.ts";
 
 export function ChatView({
   summary,

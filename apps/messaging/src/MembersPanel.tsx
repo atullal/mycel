@@ -1,10 +1,7 @@
 import { useState } from "react";
-import { useConversation, useMycel } from "@mycel/sdk/react";
-import type { Contact, Member } from "@mycel/sdk";
+import { SearchField, useConversation, useMycel } from "@mycel/sdk/react";
+import { matchesSearch, presenceOf, type Contact, type Member } from "@mycel/sdk";
 import { Avatar, Icon, PresenceLabel, ROLE_LABEL, errorText } from "./ui.tsx";
-import { presenceOf } from "./presence.ts";
-import { matchesSearch } from "./search.ts";
-import { SearchField } from "./SearchField.tsx";
 
 type Mode = "idle" | "add" | "keeper";
 

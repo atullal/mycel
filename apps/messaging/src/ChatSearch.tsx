@@ -1,8 +1,7 @@
 import { useEffect, useState } from "react";
-import { useMycel } from "@mycel/sdk/react";
+import { SearchField, useMycel } from "@mycel/sdk/react";
 import type { MessageView } from "@mycel/sdk";
 import { ChatModal } from "./ChatModal.tsx";
-import { SearchField } from "./SearchField.tsx";
 import { errorText, previewText } from "./ui.tsx";
 
 export function ChatSearch({ conversation, onClose, onPick }: {

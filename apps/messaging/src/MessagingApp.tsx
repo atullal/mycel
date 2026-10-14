@@ -8,6 +8,7 @@ import { MembersPanel } from "./MembersPanel.tsx";
 import { CallBar, IncomingCall, VideoStage, hasVideo, isLive, visibleCalls } from "./Calls.tsx";
 import { errorText } from "./ui.tsx";
 import "./messaging.css";
+import "./search.css";
 
 export interface MessagingAppProps {
   /** Open this conversation first (otherwise the last one viewed). */
