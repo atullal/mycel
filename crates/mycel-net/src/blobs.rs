@@ -431,7 +431,7 @@ async fn drop_partial(part: &Path) {
 
 /// One blob request, on its own stream of a pooled connection.
 pub(crate) async fn serve(inner: &Arc<Inner>, peer: SignPk, mut tx: SendStream, mut rx: RecvStream) -> Result<()> {
-    let req: BlobReq = recv(&mut rx).await?;
+    let (req, _permit) = recv_held::<BlobReq>(&mut rx, crate::resources::FIRST_FRAME).await?;
     let (space, hash) = match &req {
         BlobReq::Get { space, hash }
         | BlobReq::Put { space, hash, .. }
@@ -580,7 +580,9 @@ async fn push(inner: &Arc<Inner>, pk: SignPk, space: SpaceId, hash: Hash32, path
             BlobResp::SendFrom { offset } if offset <= len => {
                 send_from(&mut tx, path, offset, len, &no_progress()).await?;
                 tx.finish()?;
-                match recv::<BlobResp>(&mut rx).await? {
+                // The bytes written may still be queued for a slow link.
+                let wait = crate::resources::reply_timeout(usize::try_from(len - offset).unwrap_or(usize::MAX));
+                match recv_held::<BlobResp>(&mut rx, wait).await?.0 {
                     BlobResp::Stored => Ok(()),
                     other => Err(anyhow!("push failed: {other:?}")),
                 }

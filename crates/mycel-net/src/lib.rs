@@ -69,11 +69,10 @@ use wire::*;
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 /// A pooled connection unused (no stream open from our side) this long is closed.
 pub const POOL_IDLE: Duration = Duration::from_secs(60);
-const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 /// A sync not through by now is also handed to store-and-forward carriers
 /// (the live attempt keeps going): a stale connection to a peer that moved
-/// away only times out at [`SESSION_TIMEOUT`], and a passer-by who could
-/// carry it may be gone by then.
+/// away only fails once the peer has had [`resources::REPLY_TIMEOUT`] to
+/// answer, and a passer-by who could carry it may be gone by then.
 const BUNDLE_AFTER: Duration = Duration::from_secs(10);
 const PERIODIC_SYNC: Duration = Duration::from_secs(15);
 /// How long shutting down waits for peers to acknowledge the close.
@@ -644,7 +643,7 @@ async fn serve_conn(inner: &Arc<Inner>, conn: Connection) {
 
 async fn stream_kind(rx: &mut RecvStream) -> Result<StreamKind> {
     let mut b = [0u8; 1];
-    resources::header(rx.read_exact(&mut b)).await?;
+    resources::first(rx.read_exact(&mut b)).await?;
     StreamKind::from_byte(b[0]).ok_or_else(|| anyhow!("unknown stream kind {}", b[0]))
 }
 
@@ -652,7 +651,9 @@ async fn serve_bi(inner: &Arc<Inner>, conn: &Connection, peer: SignPk, tx: SendS
     let kind = stream_kind(&mut rx).await?;
     tx.set_priority(kind.priority()).ok();
     match kind {
-        StreamKind::Sync => tokio::time::timeout(SESSION_TIMEOUT, serve_sync(inner, conn, peer, tx, rx)).await?,
+        // No total deadline: over a slow link a large sync takes minutes,
+        // and each wait inside is bounded while bytes keep moving.
+        StreamKind::Sync => serve_sync(inner, conn, peer, tx, rx).await,
         StreamKind::Card => serve_card(inner, tx).await,
         StreamKind::Blob => blobs::serve(inner, peer, tx, rx).await,
         StreamKind::Ephemeral => bail!("ephemeral messages use uni-streams"),
@@ -673,7 +674,7 @@ async fn serve_sync(
     mut tx: SendStream,
     mut rx: RecvStream,
 ) -> Result<()> {
-    let (mut msg, mut msg_permit) = recv_held::<SyncMsg>(&mut rx).await?;
+    let (mut msg, mut msg_permit) = recv_held::<SyncMsg>(&mut rx, resources::FIRST_FRAME).await?;
     loop {
         let SyncMsg::Hello { space, inv, invite } = msg else {
             bail!("expected Hello");
@@ -682,10 +683,10 @@ async fn serve_sync(
         if !known {
             match invite {
                 None => {
-                    send(&mut tx, &SyncMsg::NeedInvite).await?;
+                    let len = send_len(&mut tx, &SyncMsg::NeedInvite).await?;
                     drop(inv);
                     drop(msg_permit);
-                    (msg, msg_permit) = recv_held(&mut rx).await?;
+                    (msg, msg_permit) = recv_held(&mut rx, resources::reply_timeout(len)).await?;
                     continue;
                 }
                 Some(ops) => {
@@ -713,11 +714,11 @@ async fn serve_sync(
             tx.finish()?;
             return Ok(());
         };
-        send(&mut tx, &reply).await?;
+        let len = send_len(&mut tx, &reply).await?;
         drop(reply);
         drop(inv);
         drop(msg_permit);
-        let (msg, _data_permit) = recv_held(&mut rx).await?;
+        let (msg, _data_permit) = recv_held(&mut rx, resources::reply_timeout(len)).await?;
         let SyncMsg::DataAndWant { data, want } = msg else {
             bail!("expected DataAndWant");
         };
@@ -873,12 +874,12 @@ async fn sync_exchange(
     ops: Vec<SignedOp>,
 ) -> Result<SyncStats> {
     let (mut tx, mut rx) = open_bi(conn, StreamKind::Sync).await?;
-    send(&mut tx, &SyncMsg::Hello { space, inv: inv.clone(), invite: None }).await?;
-    let (mut reply, mut reply_permit) = recv_held::<SyncMsg>(&mut rx).await?;
+    let len = send_len(&mut tx, &SyncMsg::Hello { space, inv: inv.clone(), invite: None }).await?;
+    let (mut reply, mut reply_permit) = recv_held::<SyncMsg>(&mut rx, resources::reply_timeout(len)).await?;
     if matches!(reply, SyncMsg::NeedInvite) {
-        send(&mut tx, &SyncMsg::Hello { space, inv, invite: Some(ops) }).await?;
+        let len = send_len(&mut tx, &SyncMsg::Hello { space, inv, invite: Some(ops) }).await?;
         drop(reply_permit);
-        (reply, reply_permit) = recv_held(&mut rx).await?;
+        (reply, reply_permit) = recv_held(&mut rx, resources::reply_timeout(len)).await?;
     }
     let (their_inv, their_want) = match reply {
         SyncMsg::Accept { inv, want } => (inv, want),
@@ -904,13 +905,13 @@ async fn sync_exchange(
         SyncMsg::DataAndWant { data, .. } => data.envelopes.iter().map(|e| e.id()).collect(),
         _ => vec![],
     };
-    send(&mut tx, &out).await?;
+    let len = send_len(&mut tx, &out).await?;
     tx.finish()?;
     drop(out);
     drop(their_inv);
     drop(their_want);
     drop(reply_permit);
-    let (msg, _data_permit) = recv_held(&mut rx).await?;
+    let (msg, _data_permit) = recv_held(&mut rx, resources::reply_timeout(len)).await?;
     let SyncMsg::Data { data } = msg else {
         bail!("expected Data");
     };
@@ -930,7 +931,9 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
     }
     let _slot = inner.sync_slots.acquire().await;
     loop {
-        let session = tokio::time::timeout(SESSION_TIMEOUT, sync_session(&inner, peer, space, false));
+        // No total deadline (a large sync over Bluetooth takes minutes):
+        // every wait inside is bounded, and a dead connection fails it.
+        let session = sync_session(&inner, peer, space, false);
         tokio::pin!(session);
         let res = tokio::select! {
             r = &mut session => r,
@@ -939,7 +942,7 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
                 session.await
             }
         };
-        let ok = matches!(res, Ok(Ok(_)));
+        let ok = res.is_ok();
         if ok {
             inner.mark_ok(peer);
         } else {
@@ -1436,7 +1439,7 @@ impl Node {
         let (card, _permit) = on_conn!(inner, &peer, |conn| async {
             let (mut tx, mut rx) = open_bi(&conn, StreamKind::Card).await?;
             tx.finish()?;
-            recv_held::<ContactCard>(&mut rx).await
+            recv_held::<ContactCard>(&mut rx, resources::REPLY_TIMEOUT).await
         })?;
         card.verify()?;
         if card.keys.sign_pk != peer {

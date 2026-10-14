@@ -784,7 +784,7 @@ impl Driver {
                     let frames = admission.frames();
                     tokio::spawn(crate::resources::with_frames(frames, async move {
                         let _permit = permit;
-                        let _ = tokio::time::timeout(crate::SESSION_TIMEOUT, me.on_summary_stream(peer, rx)).await;
+                        let _ = me.on_summary_stream(peer, rx).await;
                     }));
                 }
             }
@@ -796,7 +796,7 @@ impl Driver {
         let mut bytes = Vec::new();
         loop {
             let chunk = if bytes.is_empty() {
-                crate::resources::header(rx.read_chunk(16 * 1024)).await?
+                crate::resources::first(rx.read_chunk(16 * 1024)).await?
             } else {
                 crate::resources::idle(rx.read_chunk(16 * 1024)).await?
             };
@@ -832,7 +832,7 @@ impl Driver {
         mut rx: iroh::endpoint::RecvStream,
     ) -> Result<()> {
         let Some(c) = &self.carrier else { return Ok(()) };
-        let (head, _head_permit) = read_frame(&mut rx, MAX_OFFER).await?;
+        let (head, _head_permit) = read_frame(&mut rx, MAX_OFFER, crate::resources::FIRST_FRAME).await?;
         let Some((&K_OFFER, body)) = head.split_first() else { return Ok(()) };
         let w: WireOffer = postcard::from_bytes(body)?;
         let o = dtn::Offer {
@@ -931,7 +931,9 @@ impl Driver {
             msg.extend_from_slice(&body);
             let me = self.clone();
             self.keep(tokio::spawn(async move {
-                let sent = match crate::resources::header(conn.open_uni()).await {
+                // (opening waits while the neighbour has as many streams from us as it allows)
+                let open = crate::resources::within(crate::resources::REPLY_TIMEOUT, "no stream", conn.open_uni());
+                let sent = match open.await {
                     Ok(mut tx) => crate::resources::write_all(&mut tx, &msg).await.is_ok() && tx.finish().is_ok(),
                     Err(_) => false,
                 };
@@ -1408,9 +1410,10 @@ async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8) -> Result<S
     };
     let mut msg = vec![K_OFFER];
     msg.extend_from_slice(&crate::wire::encode_bounded(&offer, MAX_OFFER - 1)?);
-    let (mut tx, mut rx) = crate::resources::header(conn.open_bi()).await?;
+    // (waits while the neighbour has as many streams from us as it allows)
+    let (mut tx, mut rx) = crate::resources::within(crate::resources::REPLY_TIMEOUT, "no stream", conn.open_bi()).await?;
     write_frame(&mut tx, &msg).await?;
-    let (answer, _answer_permit) = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut rx, 64)).await??;
+    let (answer, _answer_permit) = read_frame(&mut rx, 64, crate::resources::reply_timeout(4 + msg.len())).await?;
     let at = match postcard::from_bytes::<WireAnswer>(&answer)? {
         WireAnswer::Duplicate => return Ok(Sent::Took),
         WireAnswer::Refuse(full) => return Ok(Sent::Refused(full)),
@@ -1418,7 +1421,9 @@ async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8) -> Result<S
     };
     crate::resources::write_all(&mut tx, &b.payload[at..]).await?;
     tx.finish()?;
-    let ack = tokio::time::timeout(Duration::from_secs(30), rx.read_to_end(1)).await??;
+    // The payload written may still be queued for a slow link.
+    let wait = crate::resources::reply_timeout(b.payload.len() - at);
+    let ack = crate::resources::within(wait, "no receipt", rx.read_to_end(1)).await?;
     Ok(if ack.first() == Some(&1) { Sent::Took } else { Sent::Refused(false) })
 }
 
@@ -1430,9 +1435,14 @@ async fn write_frame(tx: &mut iroh::endpoint::SendStream, body: &[u8]) -> Result
     Ok(())
 }
 
-async fn read_frame(rx: &mut iroh::endpoint::RecvStream, max: usize) -> Result<(Vec<u8>, crate::resources::FramePermit)> {
+/// `wait`: for its first bytes (see [`crate::wire::recv_held`]).
+async fn read_frame(
+    rx: &mut iroh::endpoint::RecvStream,
+    max: usize,
+    wait: Duration,
+) -> Result<(Vec<u8>, crate::resources::FramePermit)> {
     let mut len = [0u8; 4];
-    crate::resources::header(rx.read_exact(&mut len)).await?;
+    crate::resources::within(wait, "no answer", rx.read_exact(&mut len)).await?;
     let len = u32::from_be_bytes(len) as usize;
     anyhow::ensure!(len <= max, "frame of {len} bytes");
     let permit = crate::resources::frame_bytes(len)?;

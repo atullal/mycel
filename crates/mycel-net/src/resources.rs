@@ -1,7 +1,7 @@
 //! Shared process limits for untrusted incoming streams and frame buffers.
 //! Admission is nonblocking: overload drops the stream instead of queuing a
 //! task. The process limits cover every node and the mesh DTN protocol.
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use std::{
     future::Future,
     sync::{Arc, LazyLock},
@@ -17,8 +17,33 @@ pub(crate) const CONNECTION_STREAMS: usize = 8;
 // reply. This accounts encoded bytes, not the complete heap: decoded types,
 // cloned store records and transport buffers can have additional overhead.
 pub(crate) const FRAME_BYTES: usize = 128 * 1024 * 1024;
-pub(crate) const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
+
+// ─────────────────────────────── deadlines ───────────────────────────────
+//
+// No exchange has a fixed total deadline: over Bluetooth (≈ 20 KB/s) or a
+// multi-hop mesh a sync or a file can take many minutes, and that is fine
+// for as long as its bytes keep moving. Each wait is bounded on its own.
+
+/// A stream a peer opens must name its kind and start its first frame
+/// within this long. Short: nothing is owed to a stream that sends nothing.
+/// It only starts once the stream's first bytes have arrived (a stream is
+/// accepted then), and the opener writes the rest right after them, so
+/// this only has to cover a lost packet's retransmission on a slow radio.
+pub(crate) const FIRST_FRAME: Duration = Duration::from_secs(10);
+/// Bytes already under way (a frame, a file) may stop arriving for this
+/// long: a path that dies is noticed in ~3 s and its successor carries on
+/// (5 s path idle timeout), and a radio's queue can hold seconds of data.
 pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a peer has to start answering us. Our request may first have
+/// to fail over to another path or cross several mesh hops, and the peer
+/// may have work to do (gathering a large sync, hashing a file) first.
+pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
+/// The slowest delivery rate planned for (bytes/s): a loaded multi-hop
+/// Bluetooth route shared with other streams.
+const SLOWEST_RATE: u64 = 2 * 1024;
+/// What we wrote is buffered, not delivered: QUIC accepts up to a stream
+/// window of it (`link::transport_config`) before writes start to wait.
+const MAX_UNDELIVERED: u64 = 8 * 1024 * 1024;
 tokio::task_local! { static CONNECTION_FRAMES: Arc<Semaphore>; }
 static STREAMS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(PROCESS_STREAMS)));
 static FRAMES: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(FRAME_BYTES)));
@@ -73,11 +98,34 @@ pub(crate) fn frame_bytes(len: usize) -> Result<FramePermit> {
     Ok(FramePermit { _global: global, _connection: connection })
 }
 
+/// How long to wait for the answer to a message of `sent` bytes: the
+/// part of it still buffered on our side must get there first, even over
+/// the slowest link, then the peer has [`REPLY_TIMEOUT`] to answer.
+pub(crate) fn reply_timeout(sent: usize) -> Duration {
+    REPLY_TIMEOUT + Duration::from_secs((sent as u64).min(MAX_UNDELIVERED) / SLOWEST_RATE)
+}
+
+/// `future`, which waits for the peer, within `wait`.
+pub(crate) async fn within<T, E>(
+    wait: Duration,
+    what: &str,
+    future: impl Future<Output = std::result::Result<T, E>>,
+) -> Result<T>
+where
+    E: Into<anyhow::Error>,
+{
+    match tokio::time::timeout(wait, future).await {
+        Ok(res) => res.map_err(Into::into),
+        Err(_) => bail!("{what}: nothing from the device for {} s", wait.as_secs()),
+    }
+}
+
+/// One step of a transfer already under way (see [`IDLE_TIMEOUT`]).
 pub(crate) async fn idle<T, E>(future: impl Future<Output = std::result::Result<T, E>>) -> Result<T>
 where
     E: Into<anyhow::Error>,
 {
-    tokio::time::timeout(IDLE_TIMEOUT, future).await.map_err(|_| anyhow!("stream inactive"))?.map_err(Into::into)
+    within(IDLE_TIMEOUT, "transfer stalled", future).await
 }
 
 /// Reset the inactivity deadline after each successful write, so a slow
@@ -92,14 +140,12 @@ pub(crate) async fn write_all<W: tokio::io::AsyncWrite + Unpin>(writer: &mut W, 
     Ok(())
 }
 
-pub(crate) async fn header<T, E>(future: impl Future<Output = std::result::Result<T, E>>) -> Result<T>
+/// The start of a stream a peer opened (see [`FIRST_FRAME`]).
+pub(crate) async fn first<T, E>(future: impl Future<Output = std::result::Result<T, E>>) -> Result<T>
 where
     E: Into<anyhow::Error>,
 {
-    tokio::time::timeout(HEADER_TIMEOUT, future)
-        .await
-        .map_err(|_| anyhow!("stream header timed out"))?
-        .map_err(Into::into)
+    within(FIRST_FRAME, "stream opened but not started", future).await
 }
 
 #[cfg(test)]

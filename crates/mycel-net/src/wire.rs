@@ -84,6 +84,12 @@ pub(crate) fn encode_bounded<T: Serialize>(msg: &T, max: usize) -> Result<Vec<u8
 }
 
 pub async fn send<T: Serialize>(s: &mut SendStream, msg: &T) -> Result<()> {
+    send_len(s, msg).await.map(|_| ())
+}
+
+/// [`send`], returning how many bytes went out (to size the wait for the
+/// answer: [`crate::resources::reply_timeout`]).
+pub(crate) async fn send_len<T: Serialize>(s: &mut SendStream, msg: &T) -> Result<usize> {
     // Measure with a capped serializer before any output allocation. The
     // fixed slice also caps a custom serializer that changes between passes.
     let len = encoded_size(msg, MAX_FRAME)?;
@@ -92,17 +98,26 @@ pub async fn send<T: Serialize>(s: &mut SendStream, msg: &T) -> Result<()> {
     let bytes = postcard::to_slice(msg, &mut bytes)?;
     crate::resources::write_all(s, &(bytes.len() as u32).to_le_bytes()).await?;
     crate::resources::write_all(s, bytes).await?;
-    Ok(())
+    Ok(4 + bytes.len())
 }
 
-/// Receive a value. Application handlers retaining variable-sized messages
-/// across awaits use `recv_held` to retain their encoded-byte reservation.
+/// Receive the answer to a short request (see
+/// [`crate::resources::REPLY_TIMEOUT`]).
 pub async fn recv<T: DeserializeOwned>(r: &mut RecvStream) -> Result<T> {
-    Ok(recv_held(r).await?.0)
+    Ok(recv_held(r, crate::resources::REPLY_TIMEOUT).await?.0)
 }
 
-pub(crate) async fn recv_held<T: DeserializeOwned>(r: &mut RecvStream) -> Result<(T, crate::resources::FramePermit)> {
-    recv_held_from(r, crate::resources::HEADER_TIMEOUT, crate::resources::IDLE_TIMEOUT).await
+/// Receive a frame whose first bytes must arrive within `wait`:
+/// [`crate::resources::FIRST_FRAME`] for the first frame of a stream a peer
+/// opened, [`crate::resources::reply_timeout`] for an answer to us. After
+/// that, the frame may take as long as its bytes keep coming. Handlers
+/// retaining variable-sized messages across awaits keep the returned
+/// encoded-byte reservation alive with them.
+pub(crate) async fn recv_held<T: DeserializeOwned>(
+    r: &mut RecvStream,
+    wait: std::time::Duration,
+) -> Result<(T, crate::resources::FramePermit)> {
+    recv_held_from(r, wait, crate::resources::IDLE_TIMEOUT).await
 }
 
 #[cfg(test)]
@@ -114,7 +129,7 @@ async fn recv_from<T: DeserializeOwned, R: tokio::io::AsyncRead + Unpin>(
 
 pub(crate) async fn recv_ephemeral<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<(EphMsg, crate::resources::FramePermit)> {
     let (msg, permit): (EphMsg, _) = recv_held_limited_from(
-        r, crate::resources::HEADER_TIMEOUT, crate::resources::IDLE_TIMEOUT, MAX_EPHEMERAL_FRAME,
+        r, crate::resources::FIRST_FRAME, crate::resources::IDLE_TIMEOUT, MAX_EPHEMERAL_FRAME,
     ).await?;
     if msg.ciphertext.len() > MAX_EPHEMERAL_CIPHERTEXT { bail!("ephemeral message too large"); }
     Ok((msg, permit))
@@ -131,7 +146,7 @@ async fn recv_held_limited_from<T: DeserializeOwned, R: tokio::io::AsyncRead + U
 ) -> Result<(T, crate::resources::FramePermit)> {
     use tokio::io::AsyncReadExt;
     let mut len = [0u8; 4];
-    tokio::time::timeout(header_timeout, r.read_exact(&mut len)).await??;
+    crate::resources::within(header_timeout, "no answer", r.read_exact(&mut len)).await?;
     let len = u32::from_le_bytes(len) as usize;
     if len > max.min(MAX_FRAME) { bail!("frame too large"); }
     let _permit = crate::resources::frame_bytes(len)?;
@@ -141,7 +156,7 @@ async fn recv_held_limited_from<T: DeserializeOwned, R: tokio::io::AsyncRead + U
     let mut chunk = [0u8; 16 * 1024];
     while buf.len() < len {
         let take = chunk.len().min(len - buf.len());
-        let got = tokio::time::timeout(idle_timeout, r.read(&mut chunk[..take])).await??;
+        let got = crate::resources::within(idle_timeout, "frame stalled", r.read(&mut chunk[..take])).await?;
         if got == 0 { bail!("truncated frame"); }
         if buf.capacity() < buf.len() + got {
             let target = (buf.len() + got).next_power_of_two().min(len);
@@ -298,6 +313,53 @@ mod security_tests {
         tx.write_all(&(MAX_FRAME as u32).to_le_bytes()).await.unwrap();
         assert!(recv_from::<Vec<u8>, _>(&mut rx, SHORT, SHORT).await.is_err());
         // A stalled maximum-size declaration never reaches a deserializer.
+    }
+
+    /// An answer can take longer than a stream's first frame may: our
+    /// request may have to fail over to another path first (dead path seen
+    /// after 3 s, closed after 5 s more) or cross a slow mesh route.
+    #[tokio::test(start_paused = true)]
+    async fn replies_may_arrive_after_a_failover() {
+        use crate::resources::{FIRST_FRAME, IDLE_TIMEOUT, reply_timeout};
+        let late = |delay: Duration| {
+            let (mut tx, rx) = tokio::io::duplex(64);
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                tx.write_all(&[1, 0, 0, 0, 7]).await.unwrap();
+                tx
+            });
+            rx
+        };
+        let mut rx = late(Duration::from_secs(20));
+        assert_eq!(recv_from::<u8, _>(&mut rx, reply_timeout(0), IDLE_TIMEOUT).await.unwrap(), 7);
+        // what is still queued on our side gets time to arrive first
+        assert!(reply_timeout(4 << 20) > reply_timeout(0) + Duration::from_secs(1000));
+        // a stream a peer opens and leaves silent is not waited for as long
+        let mut rx = late(FIRST_FRAME + Duration::from_secs(1));
+        let error = recv_from::<u8, _>(&mut rx, FIRST_FRAME, IDLE_TIMEOUT).await.unwrap_err();
+        assert!(error.to_string().contains("nothing from the device for 10 s"), "{error}");
+    }
+
+    /// A large sync delta over Bluetooth (≈ 20 KB/s) takes longer than any
+    /// fixed deadline would allow; it arrives as long as its bytes do.
+    #[tokio::test(start_paused = true)]
+    async fn a_frame_takes_as_long_as_a_slow_link_needs() {
+        use crate::resources::{FIRST_FRAME, IDLE_TIMEOUT};
+        let data = vec![42u8; 1_500_000];
+        let encoded = postcard::to_allocvec(&data).unwrap();
+        let (mut tx, mut rx) = tokio::io::duplex(64 * 1024);
+        let writer = tokio::spawn(async move {
+            tx.write_all(&(encoded.len() as u32).to_le_bytes()).await.unwrap();
+            for chunk in encoded.chunks(20_000) {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                tx.write_all(chunk).await.unwrap();
+            }
+        });
+        let start = tokio::time::Instant::now();
+        let got: Vec<u8> = recv_from(&mut rx, FIRST_FRAME, IDLE_TIMEOUT).await.unwrap();
+        assert_eq!(got, data);
+        assert!(start.elapsed() > Duration::from_secs(70));
+        writer.await.unwrap();
     }
 
     #[tokio::test]
