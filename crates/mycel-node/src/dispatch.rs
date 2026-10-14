@@ -44,6 +44,15 @@ struct ListMessages {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct MessagesAround {
+    id: String,
+    message: String,
+    before: Option<u32>,
+    after: Option<u32>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct SearchMessages {
     id: String,
     query: String,
@@ -212,6 +221,10 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
         "list_messages" => {
             let l: ListMessages = args(a)?;
             ok(rt.messages(l.id, l.limit, l.before)?)
+        }
+        "messages_around" => {
+            let m: MessagesAround = args(a)?;
+            ok(rt.messages_around(m.id, m.message, m.before, m.after)?)
         }
         "search_messages" => {
             let s: SearchMessages = args(a)?;

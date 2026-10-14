@@ -1304,6 +1304,23 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       const count = Math.min(limit ?? 200, 10_000);
       return visible.slice(Math.max(0, visible.length - count)).map((m) => msgView(c, m));
     },
+    messages_around: ({ id, message, before, after }) => {
+      const c = getConv(id);
+      const at = c.messages.findIndex((m) => m.id === message);
+      if (at < 0) throw "unknown message";
+      const visible = (m: Msg) => !locallyHidden(c, m);
+      const take = (n: number | null | undefined) => Math.min(n ?? 25, 10_000);
+      const earlier = c.messages.slice(0, at).filter(visible);
+      const later = c.messages.slice(at + 1).filter(visible);
+      const b = take(before);
+      const a = take(after);
+      const anchor = visible(c.messages[at]!) ? [c.messages[at]!] : [];
+      return {
+        messages: [...earlier.slice(Math.max(0, earlier.length - b)), ...anchor, ...later.slice(0, a)].map((m) => msgView(c, m)),
+        hasEarlier: earlier.length > b,
+        hasLater: later.length > a,
+      };
+    },
     search_messages: ({ id, query, limit }) => {
       const c = getConv(id);
       const terms = query.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean);

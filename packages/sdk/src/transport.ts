@@ -6,6 +6,7 @@ import type {
   ConversationSummary,
   MessageId,
   MessageView,
+  MessageWindow,
   MycelEvent,
   NearbyPeer,
   NetworkMode,
@@ -39,6 +40,10 @@ export interface Commands {
   list_messages: [
     { id: ConversationId; limit?: number | null; before?: MessageId | null },
     MessageView[],
+  ];
+  messages_around: [
+    { id: ConversationId; message: MessageId; before?: number | null; after?: number | null },
+    MessageWindow,
   ];
   send_message: [
     {

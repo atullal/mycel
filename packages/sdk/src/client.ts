@@ -13,6 +13,7 @@ import type {
   EventType,
   MessageId,
   MessageView,
+  MessageWindow,
   MycelEvent,
   NearbyPeer,
   NetworkMode,
@@ -45,6 +46,13 @@ export interface MessagesOptions {
   limit?: number;
   /** Only messages strictly older than this one. */
   before?: MessageId;
+}
+
+export interface AroundOptions {
+  /** At most this many messages before the one asked for. */
+  before?: number;
+  /** At most this many after it. */
+  after?: number;
 }
 
 export interface SendOptions {
@@ -107,8 +115,14 @@ export interface Mycel {
     get(id: ConversationId): Promise<ConversationSummary>;
     /** `create_conversation`: one member and no title makes a direct conversation. */
     create(title: string | null | undefined, members: PeerId[]): Promise<ConversationSummary>;
-    /** `list_messages` (oldest -> newest) */
+    /**
+     * `list_messages` (oldest -> newest): the newest messages, or with
+     * `before` the newest older than that one. Page back with the oldest
+     * returned message as the next `before`; each page costs its own size.
+     */
     messages(id: ConversationId, opts?: MessagesOptions): Promise<MessageView[]>;
+    /** `messages_around`: a window around one message, at any depth (a search hit, a quoted message). */
+    around(id: ConversationId, message: MessageId, opts?: AroundOptions): Promise<MessageWindow>;
     /** `send_message`: resolves once written locally (`delivery: "local"`). */
     send(id: ConversationId, body: string, opts?: SendOptions): Promise<MessageView>;
     /** `edit_message` (author only) */
@@ -269,6 +283,12 @@ export function createMycel(transport: Transport): Mycel {
         if (opts.limit != null) args.limit = opts.limit;
         if (opts.before != null) args.before = opts.before;
         return call("list_messages", args);
+      },
+      around: (id, message, opts = {}) => {
+        const args: ArgsOf<"messages_around"> = { id, message };
+        if (opts.before != null) args.before = opts.before;
+        if (opts.after != null) args.after = opts.after;
+        return call("messages_around", args);
       },
       send: (id, body, opts = {}) => {
         const args: ArgsOf<"send_message"> = { id, body };

@@ -144,6 +144,17 @@ pub struct MessageView {
     pub delivery: Delivery,
 }
 
+/// Messages around one (`messages_around`), oldest → newest.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageWindow {
+    pub messages: Vec<MessageView>,
+    /// Older messages exist before the window.
+    pub has_earlier: bool,
+    /// Newer messages exist after it (the window doesn't reach the latest).
+    pub has_later: bool,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum NetworkMode {
