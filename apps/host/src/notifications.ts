@@ -3,14 +3,14 @@ import { invoke, type PluginListener } from "@tauri-apps/api/core";
 import { onAction } from "@tauri-apps/plugin-notification";
 import { isMobile, isTauri } from "@mycel/sdk";
 import { notificationActionId } from "./notificationAction";
+import type { NotificationPermission } from "./notificationStatus.ts";
 
-export type NotificationPermission = "checking" | "granted" | "denied" | "prompt" | "unavailable";
+export type { NotificationPermission };
 
 export function useNativeNotifications(enabled: boolean, onOpen: (id: string) => void) {
   const native = isTauri();
   const [permission, setPermission] = useState<NotificationPermission>(native ? "checking" : "unavailable");
   const [error, setError] = useState<string | null>(null);
-  const [permissionError, setPermissionError] = useState<string | null>(null);
   const contextQueue = useRef(Promise.resolve());
   const handledActions = useRef(new Set<number>());
   const open = useRef(onOpen);
@@ -19,12 +19,9 @@ export function useNativeNotifications(enabled: boolean, onOpen: (id: string) =>
   const checkPermission = useCallback(async () => {
     if (!native || !enabled || document.visibilityState !== "visible") return;
     try {
-      const state = await invoke<Exclude<NotificationPermission, "checking">>("prepare_notifications");
-      setPermission(state);
-      setPermissionError(null);
+      setPermission(await invoke<Exclude<NotificationPermission, "checking" | "error">>("prepare_notifications"));
     } catch {
-      setPermission("unavailable");
-      setPermissionError("Notification settings could not be checked. Try again.");
+      setPermission("error");
     }
   }, [native, enabled]);
 
@@ -100,5 +97,5 @@ export function useNativeNotifications(enabled: boolean, onOpen: (id: string) =>
     };
   }, [native, enabled, checkPermission]);
 
-  return { native, permission, error: error ?? permissionError, checkPermission, setVisibleConversation };
+  return { native, permission, error, checkPermission, setVisibleConversation };
 }
