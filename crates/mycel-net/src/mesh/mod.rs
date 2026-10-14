@@ -47,6 +47,8 @@ pub mod core;
 pub mod directory;
 pub mod dtn;
 pub mod wire;
+#[cfg(test)]
+mod tests;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -57,7 +59,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bytes::Bytes;
-use iroh::endpoint::Connection;
+use iroh::endpoint::{Connection, PathId};
 use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr};
@@ -70,7 +72,7 @@ use self::core::{Config, Out, Router, Time};
 pub use self::core::Stats as MeshStats;
 pub use self::wire::{mesh_addr, parse_mesh_addr};
 use self::wire::{MIN_QUIC_MTU, T_DATA, T_OGM, T_OGMS, T_SEQREQ};
-use crate::link::{CustomAddr, Link, LinkEvent, LinkStatus, PathKind, TRANSPORT_MESH, n0_watcher, noq_udp};
+use crate::link::{CustomAddr, Link, LinkEvent, LinkStatus, PathKind, TRANSPORT_MESH, n0_watcher, noq_udp, path_in_use};
 
 /// Hop connections between neighbours (and internet hops to gateways).
 pub const ALPN: &[u8] = b"mycel/mesh/1";
@@ -187,17 +189,22 @@ pub struct MeshRoute {
     pub gateway: bool,
 }
 
+/// The path a hop connection uses, and its RTT. Not just the selected one:
+/// on a hop the neighbour dialed, the path our end selected for them may be
+/// missing, and then none is selected (see [`path_in_use`]).
+fn hop_path(conn: &Connection) -> Option<(PathId, Duration)> {
+    let paths = conn.paths();
+    path_in_use(&paths).map(|p| (p.id(), p.rtt()))
+}
+
 /// A hop's cost in 0.1 ms units: its RTT plus the time to move 64 KiB at
 /// the rate its congestion window allows (cwnd per RTT), so a slow radio
 /// with a low RTT doesn't look better than a fast one with a higher RTT.
-fn hop_cost(conn: &Connection) -> Option<u32> {
-    let paths = conn.paths();
-    let path = paths.iter().find(|p| p.is_selected())?;
-    let rtt = path.rtt();
+fn hop_cost(conn: &Connection, path: PathId, rtt: Duration) -> Option<u32> {
     if rtt.is_zero() {
         return None;
     }
-    let cwnd = conn.congestion_state(path.id()).map_or(0, |c| c.window()).max(1200) as f64;
+    let cwnd = conn.congestion_state(path).map_or(0, |c| c.window()).max(1200) as f64;
     let secs = rtt.as_secs_f64() * (1.0 + 65_536.0 / cwnd);
     Some((secs * 10_000.0).clamp(1.0, (u32::MAX / 2) as f64) as u32)
 }
@@ -229,6 +236,9 @@ struct Hop {
     direct: bool,
     direct_since: Instant,
     conn: Option<Connection>,
+    /// The path `conn` uses, as last looked up (each `measure`, or when it
+    /// closed): frames go out without a look at every path.
+    path: Option<PathId>,
     /// Largest datagram buffer space seen = the buffer's size.
     dgram_cap: usize,
     dialing: bool,
@@ -244,6 +254,7 @@ impl Hop {
             direct: false,
             direct_since: now,
             conn: None,
+            path: None,
             dgram_cap: 0,
             dialing: false,
             dialed_by_us: false,
@@ -430,13 +441,9 @@ impl Driver {
         let space = conn.datagram_send_buffer_space();
         h.dgram_cap = h.dgram_cap.max(space);
         let queued = h.dgram_cap - space;
+        let path = h.path;
         drop(hops);
-        let cwnd = conn
-            .paths()
-            .iter()
-            .find(|p| p.is_selected())
-            .and_then(|p| conn.congestion_state(p.id()))
-            .map_or(0, |c| c.window() as usize);
+        let cwnd = self.hop_window(to, &conn, path);
         let bytes: usize = datagrams.iter().map(|d| d.len()).sum();
         if queued + bytes > (cwnd / QUEUE_CWND_DIV).max(MIN_QUEUE) {
             self.dropped_queue.fetch_add(1, Ordering::Relaxed);
@@ -447,6 +454,23 @@ impl Driver {
                 self.dropped_queue.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// The congestion window of the path the hop to `to` uses: the one
+    /// remembered, or, on a new hop or once that path closed, the one in
+    /// use now (remembered for the next frames).
+    fn hop_window(&self, to: &SignPk, conn: &Connection, path: Option<PathId>) -> usize {
+        let window = |id: PathId| conn.congestion_state(id).map(|c| c.window() as usize);
+        if let Some(w) = path.and_then(window) {
+            return w;
+        }
+        let used = hop_path(conn).map(|(id, _)| id);
+        if let Some(h) = self.hops.lock().get_mut(to)
+            && h.live().is_some_and(|c| c.stable_id() == conn.stable_id())
+        {
+            h.path = used;
+        }
+        used.and_then(window).unwrap_or(0)
     }
 
     // ───────────── neighbours ─────────────
@@ -498,6 +522,7 @@ impl Driver {
                 old.close(0u32.into(), b"duplicate");
             }
             h.conn = Some(conn.clone());
+            h.path = None;
             h.dialed_by_us = conn.side().is_client();
             h.dgram_cap = conn.datagram_send_buffer_space();
             h.failures = 0;
@@ -634,12 +659,25 @@ impl Driver {
         self.keep(task);
     }
 
+    /// Each hop's cost, measured on the path its connection uses now (which
+    /// `send_frame` then uses too).
+    fn hop_costs(&self) -> Vec<(SignPk, u32)> {
+        let mut hops = self.hops.lock();
+        let mut costs = Vec::new();
+        for (pk, h) in hops.iter_mut() {
+            let Some(conn) = h.live().cloned() else { continue };
+            let used = hop_path(&conn);
+            h.path = used.map(|(id, _)| id);
+            if let Some(cost) = used.and_then(|(id, rtt)| hop_cost(&conn, id, rtt)) {
+                costs.push((*pk, cost));
+            }
+        }
+        costs
+    }
+
     /// Hop cost: each hop connection's measured RTT.
     fn measure(self: &Arc<Self>) {
-        let costs: Vec<(SignPk, u32)> = {
-            let hops = self.hops.lock();
-            hops.iter().filter_map(|(pk, h)| Some((*pk, hop_cost(h.live()?)?))).collect()
-        };
+        let costs = self.hop_costs();
         self.with_router(|r, _| {
             for (pk, c) in costs {
                 r.set_cost(pk, c);
@@ -1060,7 +1098,14 @@ impl Driver {
         }
         let rtts: Vec<u32> = {
             let hops = self.hops.lock();
-            hops.values().filter(|h| !h.direct).filter_map(|h| hop_cost(h.live()?)).collect()
+            hops.values()
+                .filter(|h| !h.direct)
+                .filter_map(|h| {
+                    let conn = h.live()?;
+                    let (path, rtt) = hop_path(conn)?;
+                    hop_cost(conn, path, rtt)
+                })
+                .collect()
         };
         if rtts.is_empty() { core::DEFAULT_INTERNET_COST / 2 } else { rtts.iter().sum::<u32>() / rtts.len() as u32 }
     }
