@@ -6,6 +6,10 @@ use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, Sig};
 use mycel_sync::{Envelope, EnvelopeId};
 use mycel_trust::{EpochId, OpId, SignedOp, SpaceId};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::time::Duration;
+use tokio::io::AsyncRead;
+
+use crate::resources::{FramePermit, PeerFrames};
 
 /// Mycel's protocol. One QUIC connection per pair of devices carries every
 /// exchange (sync sessions, contact cards, ephemeral messages, blob
@@ -52,6 +56,8 @@ impl StreamKind {
 }
 
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
+/// Blob requests and answers and contact cards are a few hundred bytes.
+pub(crate) const MAX_SMALL_FRAME: usize = 4 * 1024;
 /// Typing/presence plaintext limit; a full 1024-event queue holds at most
 /// 4 MiB of ephemeral payloads. Media uses separate protocols.
 pub const MAX_EPHEMERAL: usize = 4 * 1024;
@@ -88,12 +94,12 @@ pub async fn send<T: Serialize>(s: &mut SendStream, msg: &T) -> Result<()> {
 }
 
 /// [`send`], returning how many bytes went out (to size the wait for the
-/// answer: [`crate::resources::reply_timeout`]).
+/// answer: [`crate::resources::reply_timeout`]). What we send is our own
+/// memory: it comes out of no budget for what peers send us.
 pub(crate) async fn send_len<T: Serialize>(s: &mut SendStream, msg: &T) -> Result<usize> {
     // Measure with a capped serializer before any output allocation. The
     // fixed slice also caps a custom serializer that changes between passes.
     let len = encoded_size(msg, MAX_FRAME)?;
-    let _permit = crate::resources::frame_bytes(len)?;
     let mut bytes = vec![0; len];
     let bytes = postcard::to_slice(msg, &mut bytes)?;
     crate::resources::write_all(s, &(bytes.len() as u32).to_le_bytes()).await?;
@@ -102,71 +108,57 @@ pub(crate) async fn send_len<T: Serialize>(s: &mut SendStream, msg: &T) -> Resul
 }
 
 /// Receive the answer to a short request (see
-/// [`crate::resources::REPLY_TIMEOUT`]).
+/// [`crate::resources::REPLY_TIMEOUT`]). Outside a node: no memory budget,
+/// only the frame size limit.
 pub async fn recv<T: DeserializeOwned>(r: &mut RecvStream) -> Result<T> {
-    Ok(recv_held(r, crate::resources::REPLY_TIMEOUT).await?.0)
+    let frames = crate::resources::PeerFrames::unbudgeted();
+    Ok(recv_held(r, crate::resources::REPLY_TIMEOUT, &frames).await?.0)
 }
 
-/// Receive a frame whose first bytes must arrive within `wait`:
+/// Receive a frame from a peer, within its memory budget (`frames`, see
+/// `resources.rs`). Its first bytes must arrive within `wait`:
 /// [`crate::resources::FIRST_FRAME`] for the first frame of a stream a peer
 /// opened, [`crate::resources::reply_timeout`] for an answer to us. After
-/// that, the frame may take as long as its bytes keep coming. Handlers
-/// retaining variable-sized messages across awaits keep the returned
-/// encoded-byte reservation alive with them.
+/// that it may take as long as its bytes keep coming. Handlers retaining
+/// variable-sized messages across awaits keep the returned reservation
+/// alive with them.
 pub(crate) async fn recv_held<T: DeserializeOwned>(
     r: &mut RecvStream,
-    wait: std::time::Duration,
-) -> Result<(T, crate::resources::FramePermit)> {
-    recv_held_from(r, wait, crate::resources::IDLE_TIMEOUT).await
+    wait: Duration,
+    frames: &PeerFrames,
+) -> Result<(T, FramePermit)> {
+    recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, MAX_FRAME, frames).await
 }
 
-#[cfg(test)]
-async fn recv_from<T: DeserializeOwned, R: tokio::io::AsyncRead + Unpin>(
-    r: &mut R, header_timeout: std::time::Duration, idle_timeout: std::time::Duration,
-) -> Result<T> {
-    Ok(recv_held_from(r, header_timeout, idle_timeout).await?.0)
+/// [`recv_held`] for messages that are always small (blob requests and
+/// answers, contact cards): a bigger declared length is refused outright.
+pub(crate) async fn recv_small<T: DeserializeOwned>(r: &mut RecvStream, wait: Duration, frames: &PeerFrames) -> Result<T> {
+    Ok(recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, MAX_SMALL_FRAME, frames).await?.0)
 }
 
-pub(crate) async fn recv_ephemeral<R: tokio::io::AsyncRead + Unpin>(r: &mut R) -> Result<(EphMsg, crate::resources::FramePermit)> {
-    let (msg, permit): (EphMsg, _) = recv_held_limited_from(
-        r, crate::resources::FIRST_FRAME, crate::resources::IDLE_TIMEOUT, MAX_EPHEMERAL_FRAME,
+pub(crate) async fn recv_ephemeral<R: AsyncRead + Unpin>(r: &mut R, frames: &PeerFrames) -> Result<(EphMsg, FramePermit)> {
+    let (msg, permit): (EphMsg, _) = recv_frame(
+        r, crate::resources::FIRST_FRAME, crate::resources::IDLE_TIMEOUT, MAX_EPHEMERAL_FRAME, frames,
     ).await?;
     if msg.ciphertext.len() > MAX_EPHEMERAL_CIPHERTEXT { bail!("ephemeral message too large"); }
     Ok((msg, permit))
 }
 
-async fn recv_held_from<T: DeserializeOwned, R: tokio::io::AsyncRead + Unpin>(
-    r: &mut R, header_timeout: std::time::Duration, idle_timeout: std::time::Duration,
-) -> Result<(T, crate::resources::FramePermit)> {
-    recv_held_limited_from(r, header_timeout, idle_timeout, MAX_FRAME).await
-}
-
-async fn recv_held_limited_from<T: DeserializeOwned, R: tokio::io::AsyncRead + Unpin>(
-    r: &mut R, header_timeout: std::time::Duration, idle_timeout: std::time::Duration, max: usize,
-) -> Result<(T, crate::resources::FramePermit)> {
+async fn recv_frame<T: DeserializeOwned, R: AsyncRead + Unpin>(
+    r: &mut R, wait: Duration, idle: Duration, max: usize, frames: &PeerFrames,
+) -> Result<(T, FramePermit)> {
     use tokio::io::AsyncReadExt;
     let mut len = [0u8; 4];
-    crate::resources::within(header_timeout, "no answer", r.read_exact(&mut len)).await?;
+    crate::resources::within(wait, "no answer", r.read_exact(&mut len)).await?;
     let len = u32::from_le_bytes(len) as usize;
     if len > max.min(MAX_FRAME) { bail!("frame too large"); }
-    let _permit = crate::resources::frame_bytes(len)?;
-    // A length prefix reserves budget, never a length-sized allocation.
-    // Receive bounded chunks, growing only when bytes actually arrive.
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 16 * 1024];
-    while buf.len() < len {
-        let take = chunk.len().min(len - buf.len());
-        let got = crate::resources::within(idle_timeout, "frame stalled", r.read(&mut chunk[..take])).await?;
-        if got == 0 { bail!("truncated frame"); }
-        if buf.capacity() < buf.len() + got {
-            let target = (buf.len() + got).next_power_of_two().min(len);
-            buf.reserve_exact(target - buf.len());
-        }
-        buf.extend_from_slice(&chunk[..got]);
-    }
+    // A length prefix takes the peer's share, never a length-sized
+    // allocation: the buffer (and the node's pool) grow as bytes arrive.
+    let permit = frames.admit(len).await?;
+    let (buf, permit) = crate::resources::read_body(r, len, false, permit, idle).await?;
     // The caller retains this reservation until the decoded message has
     // finished processing, including waits for another frame or a reply.
-    Ok((postcard::from_bytes(&buf)?, _permit))
+    Ok((postcard::from_bytes(&buf)?, permit))
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -299,10 +291,16 @@ pub fn blob_hash(bytes: &[u8]) -> Hash32 {
 #[cfg(test)]
 mod security_tests {
     use super::*;
-    use std::{sync::atomic::{AtomicUsize, Ordering}, time::Duration};
+    use crate::resources::Frames;
+    use mycel_crypto::SignPk;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SHORT: Duration = Duration::from_millis(25);
+
+    async fn recv_from<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R, wait: Duration, idle: Duration) -> Result<T> {
+        Ok(recv_frame(r, wait, idle, MAX_FRAME, &PeerFrames::unbudgeted()).await?.0)
+    }
 
     #[tokio::test]
     async fn security_frame_header_and_body_inactivity_expire() {
@@ -422,35 +420,71 @@ mod security_tests {
 
     #[tokio::test]
     async fn security_frame_budget_released_after_decode_failure_and_cancellation() {
-        let frames = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
-        crate::resources::with_frames(frames.clone(), async {
-            let bytes = [1u32.to_le_bytes().as_slice(), &[255]].concat();
-            assert!(recv_from::<bool, _>(&mut std::io::Cursor::new(bytes), SHORT, SHORT).await.is_err());
-        }).await;
-        assert_eq!(frames.available_permits(), 64);
+        let frames = Frames::new(64, 64, 64);
+        let peer = frames.peer(&SignPk([1; 32]));
+        let bytes = [1u32.to_le_bytes().as_slice(), &[255]].concat();
+        assert!(recv_frame::<bool, _>(&mut std::io::Cursor::new(bytes), SHORT, SHORT, MAX_FRAME, &peer).await.is_err());
+        assert_eq!(frames.available(), 64);
         let (mut tx, mut rx) = tokio::io::duplex(64);
         tx.write_all(&64u32.to_le_bytes()).await.unwrap();
-        crate::resources::with_frames(frames.clone(), async {
-            assert!(tokio::time::timeout(SHORT, recv_from::<u8, _>(&mut rx, Duration::from_secs(5), Duration::from_secs(5))).await.is_err());
-        }).await;
-        assert_eq!(frames.available_permits(), 64);
+        tx.write_all(&[1; 20]).await.unwrap();
+        let long = Duration::from_secs(5);
+        assert!(tokio::time::timeout(SHORT, recv_frame::<u8, _>(&mut rx, long, long, MAX_FRAME, &peer)).await.is_err());
+        assert_eq!(frames.available(), 64);
+        assert_eq!(peer.available(), 64);
     }
+
     #[tokio::test]
     async fn security_frame_budget_is_held_during_deserialization() {
+        static FRAMES: std::sync::LazyLock<Frames> = std::sync::LazyLock::new(|| Frames::new(1, 1, 1));
         struct Checked;
         impl<'de> Deserialize<'de> for Checked {
             fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
                 let _ = u8::deserialize(deserializer)?;
-                assert!(crate::resources::frame_bytes(1).is_err());
+                assert_eq!(FRAMES.available(), 0);
                 Ok(Checked)
             }
         }
-        let frames = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
-        crate::resources::with_frames(frames.clone(), async {
-            let bytes = [1u32.to_le_bytes().as_slice(), &[7]].concat();
-            recv_from::<Checked, _>(&mut std::io::Cursor::new(bytes), SHORT, SHORT).await.unwrap();
-        }).await;
-        assert_eq!(frames.available_permits(), 1);
+        let bytes = [1u32.to_le_bytes().as_slice(), &[7]].concat();
+        let peer = FRAMES.peer(&SignPk([1; 32]));
+        recv_frame::<Checked, _>(&mut std::io::Cursor::new(bytes), SHORT, SHORT, MAX_FRAME, &peer).await.unwrap();
+        assert_eq!(FRAMES.available(), 1);
+    }
+
+    /// The memory a frame holds is what has arrived of it, and it must keep
+    /// arriving: a peer that declares big frames and trickles them holds
+    /// next to nothing, delays only its own next frames, and is cut off.
+    #[tokio::test(start_paused = true)]
+    async fn a_trickling_stranger_holds_nothing_and_blocks_no_one_else() {
+        let frames = Frames::new(1 << 20, 256 << 10, 256 << 10);
+        let (stranger, member) = (frames.peer(&SignPk([1; 32])), frames.peer(&SignPk([2; 32])));
+        let trickle = |declared: usize| {
+            let (mut tx, rx) = tokio::io::duplex(64);
+            tokio::spawn(async move {
+                tx.write_all(&(declared as u32).to_le_bytes()).await.unwrap();
+                for _ in 0..100 {
+                    if tx.write_all(&[1]).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_secs(25)).await;
+                }
+            });
+            rx
+        };
+        let idle = crate::resources::IDLE_TIMEOUT;
+        let mut slow = trickle(256 << 10);
+        let slow = tokio::spawn(async move { recv_frame::<Vec<u8>, _>(&mut slow, SHORT, idle, MAX_FRAME, &stranger).await });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(frames.available() > (1 << 20) - 1024, "only what arrived is held");
+        // another peer's full-size frame comes in at once
+        let encoded = postcard::to_allocvec(&vec![7u8; (256 << 10) - 4]).unwrap();
+        let bytes = [(encoded.len() as u32).to_le_bytes().as_slice(), &encoded].concat();
+        let got = recv_frame::<Vec<u8>, _>(&mut std::io::Cursor::new(bytes), SHORT, idle, MAX_FRAME, &member).await;
+        assert_eq!(got.unwrap().0.len(), (256 << 10) - 4);
+        // the trickle is cut off once its bytes stop paying for its time
+        let error = slow.await.unwrap().unwrap_err();
+        assert!(error.to_string().contains("frame stalled"), "{error}");
+        assert_eq!(frames.available(), 1 << 20);
     }
 
     #[tokio::test]
@@ -475,26 +509,23 @@ mod security_tests {
         let encoded = postcard::to_allocvec(&vec![42u8; 63]).unwrap();
         assert_eq!(encoded.len(), 64);
         let bytes = [64u32.to_le_bytes().as_slice(), &encoded].concat();
-        let frames = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
-        crate::resources::with_frames(frames.clone(), async {
-            let (message, permit) = recv_held_from::<Vec<u8>, _>(
-                &mut std::io::Cursor::new(bytes.clone()), SHORT, SHORT,
-            ).await.unwrap();
-            assert_eq!(frames.available_permits(), 0);
-            // Waiting for a peer's next frame must not let another stream
-            // reserve the same bytes while this decoded value stays alive.
-            tokio::task::yield_now().await;
-            assert!(recv_held_from::<Vec<u8>, _>(
-                &mut std::io::Cursor::new(bytes.clone()), SHORT, SHORT,
-            ).await.is_err());
-            assert_eq!(message, vec![42; 63]);
-            drop(message);
-            drop(permit);
-            assert!(recv_held_from::<Vec<u8>, _>(
-                &mut std::io::Cursor::new(bytes), SHORT, SHORT,
-            ).await.is_ok());
-        }).await;
-        assert_eq!(frames.available_permits(), 64);
+        let frames = Frames::new(64, 64, 64);
+        let peer = frames.peer(&SignPk([1; 32]));
+        let recv = |peer: PeerFrames| {
+            let bytes = bytes.clone();
+            async move { recv_frame::<Vec<u8>, _>(&mut std::io::Cursor::new(bytes), SHORT, SHORT, MAX_FRAME, &peer).await }
+        };
+        let (message, permit) = recv(peer.clone()).await.unwrap();
+        assert_eq!(frames.available(), 0);
+        // Waiting for a peer's next frame must not let another stream
+        // reserve the same bytes while this decoded value stays alive.
+        tokio::task::yield_now().await;
+        assert!(tokio::time::timeout(SHORT, recv(peer.clone())).await.is_err());
+        assert_eq!(message, vec![42; 63]);
+        drop(message);
+        drop(permit);
+        assert!(recv(peer).await.is_ok());
+        assert_eq!(frames.available(), 64);
     }
 
     #[tokio::test]
@@ -503,12 +534,12 @@ mod security_tests {
             let msg = EphMsg { space: Hash32([0; 32]), epoch: EpochId([1; 16]), nonce: [0; 24], ciphertext: vec![0; length] };
             let encoded = postcard::to_allocvec(&msg).unwrap();
             let bytes = [(encoded.len() as u32).to_le_bytes().as_slice(), &encoded].concat();
-            let received = recv_ephemeral(&mut std::io::Cursor::new(bytes)).await;
+            let received = recv_ephemeral(&mut std::io::Cursor::new(bytes), &PeerFrames::unbudgeted()).await;
             assert_eq!(received.is_ok(), length == MAX_EPHEMERAL_CIPHERTEXT);
         }
         // Reject the declaration alone, before allocating/decoding its body.
         let bytes = ((MAX_EPHEMERAL_FRAME + 1) as u32).to_le_bytes().to_vec();
-        let error = match recv_ephemeral(&mut std::io::Cursor::new(bytes)).await {
+        let error = match recv_ephemeral(&mut std::io::Cursor::new(bytes), &PeerFrames::unbudgeted()).await {
             Err(error) => error,
             Ok(_) => panic!("oversized ephemeral frame accepted"),
         };

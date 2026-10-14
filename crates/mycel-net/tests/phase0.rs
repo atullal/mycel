@@ -283,3 +283,39 @@ async fn lan_discovery_via_mdns() {
     alice.shutdown().await.unwrap();
     bob.shutdown().await.unwrap();
 }
+
+/// A device joining a space syncs first with whoever invited it, before it
+/// knows from the space's history that they are a member. Their answer is
+/// that whole history, and comes in however big (here 10 MiB): what we
+/// asked a device for isn't held to the small budget of devices we share
+/// no space with.
+#[tokio::test(flavor = "multi_thread")]
+async fn first_sync_with_an_inviter_brings_a_large_history() {
+    let mut nodes = mesh(3).await;
+    let bob = nodes.pop().unwrap();
+    let carol = nodes.pop().unwrap();
+    let alice = nodes.pop().unwrap();
+    let (space, genesis) = alice.create_space().unwrap();
+    let feed = StreamId::new_feed();
+    alice
+        .with_space(&space, |r| {
+            r.add_member(carol.keys().public(), Role::Writer)?;
+            r.add_member(bob.keys().public(), Role::Writer)?;
+            for i in 0..160u8 {
+                r.append(feed, vec![i; 64 * 1024])?;
+            }
+            anyhow::Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    carol.join_space(genesis.clone()).unwrap();
+    carol.sync_with(alice.id(), space, true).await.unwrap();
+    alice.shutdown().await.unwrap();
+    // Bob knows only the genesis: Carol isn't a member yet in his copy
+    bob.join_space(genesis).unwrap();
+    assert!(!bob.with_space(&space, |r| r.is_member(&carol.id())).unwrap());
+    let stats = bob.sync_with(carol.id(), space, true).await.unwrap();
+    assert_eq!(stats.envelopes, 160);
+    carol.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
+}

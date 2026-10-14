@@ -264,6 +264,10 @@ struct Inner {
     blob_served: AtomicU64,
     /// The last store-and-forward bundle sent per (member, space).
     bundled: Mutex<HashMap<(SignPk, SpaceId), Hash32>>,
+    /// Memory for what devices send us: those we share a space with, and
+    /// the rest (`resources.rs`).
+    member_frames: resources::Frames,
+    stranger_frames: resources::Frames,
 }
 
 /// How many QUIC connections (handshakes) a node has made.
@@ -443,6 +447,24 @@ impl Inner {
         p.last_fail = Some(Instant::now());
     }
 
+    /// The memory budget for what `peer` sends us on a stream it opened: a
+    /// share of the members' pool if we share a space with it (now: it may
+    /// just have joined one), of the strangers' otherwise.
+    fn frames(&self, peer: &SignPk) -> resources::PeerFrames {
+        if self.spaces.lock().values().any(|r| r.is_member(peer)) {
+            self.member_frames.peer(peer)
+        } else {
+            self.stranger_frames.peer(peer)
+        }
+    }
+
+    /// ... and for its answers to us: we chose to ask it (a device we were
+    /// just invited by may not be a member yet in our copy of the space, and
+    /// its first answer is the space's whole history).
+    fn reply_frames(&self, peer: &SignPk) -> resources::PeerFrames {
+        self.member_frames.peer(peer)
+    }
+
     fn with_space<R>(&self, space: &SpaceId, f: impl FnOnce(&mut Replica) -> R) -> Result<R> {
         let mut spaces = self.spaces.lock();
         let r = spaces.get_mut(space).ok_or_else(|| anyhow!("unknown space"))?;
@@ -616,22 +638,21 @@ impl ProtocolHandler for Handler {
 async fn serve_conn(inner: &Arc<Inner>, conn: Connection) {
     inner.accepted.fetch_add(1, Ordering::Relaxed);
     let peer = to_sign_pk(&conn.remote_id());
-    let frames = resources::connection_frames();
     loop {
         tokio::select! {
             bi = conn.accept_bi() => {
                 let Ok((tx, rx)) = bi else { break };
                 let (inner, conn) = (inner.clone(), conn.clone());
-                tokio::spawn(resources::with_frames(frames.clone(), async move {
+                tokio::spawn(async move {
                     let _ = serve_bi(&inner, &conn, peer, tx, rx).await;
-                }));
+                });
             }
             uni = conn.accept_uni() => {
                 let Ok(rx) = uni else { break };
                 let inner = inner.clone();
-                tokio::spawn(resources::with_frames(frames.clone(), async move {
+                tokio::spawn(async move {
                     let _ = serve_uni(&inner, peer, rx).await;
-                }));
+                });
             }
         }
     }
@@ -670,7 +691,7 @@ async fn serve_sync(
     mut tx: SendStream,
     mut rx: RecvStream,
 ) -> Result<()> {
-    let (mut msg, mut msg_permit) = recv_held::<SyncMsg>(&mut rx, resources::FIRST_FRAME).await?;
+    let (mut msg, mut msg_permit) = recv_held::<SyncMsg>(&mut rx, resources::FIRST_FRAME, &inner.frames(&peer)).await?;
     loop {
         let SyncMsg::Hello { space, inv, invite } = msg else {
             bail!("expected Hello");
@@ -682,7 +703,7 @@ async fn serve_sync(
                     let len = send_len(&mut tx, &SyncMsg::NeedInvite).await?;
                     drop(inv);
                     drop(msg_permit);
-                    (msg, msg_permit) = recv_held(&mut rx, resources::reply_timeout(len)).await?;
+                    (msg, msg_permit) = recv_held(&mut rx, resources::reply_timeout(len), &inner.frames(&peer)).await?;
                     continue;
                 }
                 Some(ops) => {
@@ -714,7 +735,8 @@ async fn serve_sync(
         drop(reply);
         drop(inv);
         drop(msg_permit);
-        let (msg, _data_permit) = recv_held(&mut rx, resources::reply_timeout(len)).await?;
+        // (a member now, if this was an invitation)
+        let (msg, _data_permit) = recv_held(&mut rx, resources::reply_timeout(len), &inner.frames(&peer)).await?;
         let SyncMsg::DataAndWant { data, want } = msg else {
             bail!("expected DataAndWant");
         };
@@ -787,7 +809,7 @@ async fn serve_card(inner: &Arc<Inner>, mut tx: SendStream) -> Result<()> {
 }
 
 async fn serve_eph(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) -> Result<()> {
-    let (msg, _permit) = recv_ephemeral(&mut rx).await?;
+    let (msg, _permit) = recv_ephemeral(&mut rx, &inner.frames(&peer)).await?;
     let data = inner.with_space(&msg.space, |r| {
         if !r.is_member(&peer) {
             return None;
@@ -872,11 +894,11 @@ async fn sync_exchange(
 ) -> Result<SyncStats> {
     let (mut tx, mut rx) = open_bi(conn, StreamKind::Sync).await?;
     let len = send_len(&mut tx, &SyncMsg::Hello { space, inv: inv.clone(), invite: None }).await?;
-    let (mut reply, mut reply_permit) = recv_held::<SyncMsg>(&mut rx, resources::reply_timeout(len)).await?;
+    let (mut reply, mut reply_permit) = recv_held::<SyncMsg>(&mut rx, resources::reply_timeout(len), &inner.reply_frames(&peer)).await?;
     if matches!(reply, SyncMsg::NeedInvite) {
         let len = send_len(&mut tx, &SyncMsg::Hello { space, inv, invite: Some(ops) }).await?;
         drop(reply_permit);
-        (reply, reply_permit) = recv_held(&mut rx, resources::reply_timeout(len)).await?;
+        (reply, reply_permit) = recv_held(&mut rx, resources::reply_timeout(len), &inner.reply_frames(&peer)).await?;
     }
     let (their_inv, their_want) = match reply {
         SyncMsg::Accept { inv, want } => (inv, want),
@@ -908,7 +930,7 @@ async fn sync_exchange(
     drop(their_inv);
     drop(their_want);
     drop(reply_permit);
-    let (msg, _data_permit) = recv_held(&mut rx, resources::reply_timeout(len)).await?;
+    let (msg, _data_permit) = recv_held(&mut rx, resources::reply_timeout(len), &inner.reply_frames(&peer)).await?;
     let SyncMsg::Data { data } = msg else {
         bail!("expected Data");
     };
@@ -1185,6 +1207,8 @@ impl Node {
             accepted: AtomicU64::new(0),
             blob_served: AtomicU64::new(0),
             bundled: Mutex::default(),
+            member_frames: resources::Frames::members(),
+            stranger_frames: resources::Frames::strangers(),
         });
         let mut router = Router::builder(endpoint).accept(ALPN, Handler { inner: inner.clone() });
         for p in opts.extra_protocols {
@@ -1433,10 +1457,10 @@ impl Node {
     /// Fetch a device's self-signed contact card (anyone may ask).
     pub async fn fetch_card(&self, peer: SignPk) -> Result<ContactCard> {
         let inner = &self.inner;
-        let (card, _permit) = on_conn!(inner, &peer, |conn| async {
+        let card: ContactCard = on_conn!(inner, &peer, |conn| async {
             let (mut tx, mut rx) = open_bi(&conn, StreamKind::Card).await?;
             tx.finish()?;
-            recv_held::<ContactCard>(&mut rx, resources::REPLY_TIMEOUT).await
+            recv_small(&mut rx, resources::REPLY_TIMEOUT, &inner.reply_frames(&peer)).await
         })?;
         card.verify()?;
         if card.keys.sign_pk != peer {

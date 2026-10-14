@@ -225,3 +225,74 @@ async fn keeper_push_retains_and_resumes_partial_bytes() {
     std::fs::remove_dir_all(alice_dir).ok();
     std::fs::remove_dir_all(keeper_dir).unwrap();
 }
+
+/// A device we share no space with opens streams declaring the largest
+/// frames and trickles a byte now and then. It holds next to no memory and
+/// delays only itself: a member's syncs with us go on both ways, at once,
+/// and so does what we send.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_trickling_stranger_does_not_starve_members() {
+    use mycel_sync::{
+        Replica,
+        automerge::{ROOT, transaction::Transactable},
+    };
+    let (alice, alice_dir) = node().await;
+    let (bob, bob_dir) = node().await;
+    let (mallory, mallory_dir) = node().await;
+    for n in [&alice, &mallory] {
+        n.add_peer_addr(bob.addr());
+        bob.add_peer_addr(n.addr());
+    }
+    let (space, genesis) = alice.create_space().unwrap();
+    alice
+        .with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer))
+        .unwrap()
+        .unwrap();
+    bob.join_space(genesis).unwrap();
+    bob.sync_with(alice.id(), space, true).await.unwrap();
+
+    let conn = mallory.connect(bob.id(), wire::ALPN).await.unwrap();
+    let mut trickling = Vec::new();
+    // blob requests are small: a big declaration is refused at once; a sync
+    // may be big, up to what a stranger may send (8 MiB)
+    for (kind, declared) in [
+        (StreamKind::Blob, wire::MAX_FRAME),
+        (StreamKind::Blob, wire::MAX_FRAME),
+        (StreamKind::Sync, 8 << 20),
+        (StreamKind::Sync, 8 << 20),
+        (StreamKind::Sync, 8 << 20),
+    ] {
+        let (mut tx, rx) = conn.open_bi().await.unwrap();
+        tx.write_all(&[kind as u8]).await.unwrap();
+        tx.write_all(&(declared as u32).to_le_bytes()).await.unwrap();
+        tx.write_all(&[0]).await.unwrap();
+        trickling.push((tx, rx));
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let doc = Replica::new_doc_id();
+    for i in 0..3i64 {
+        alice
+            .with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "n", i)))
+            .unwrap()
+            .unwrap();
+        let (a, b) = tokio::join!(
+            bob.sync_with(alice.id(), space, false),
+            alice.sync_with(bob.id(), space, false)
+        );
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(
+            bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(),
+            serde_json::json!({ "n": i })
+        );
+    }
+    assert_eq!(alice.fetch_card(bob.id()).await.unwrap().name, "synthetic test node");
+    drop(trickling);
+    for n in [alice, bob, mallory] {
+        n.shutdown().await.unwrap();
+    }
+    for d in [alice_dir, bob_dir, mallory_dir] {
+        std::fs::remove_dir_all(d).ok();
+    }
+}
