@@ -831,7 +831,7 @@ async fn tick(sh: Arc<Shared>) {
         ticker.tick().await;
         ticks += 1;
         let now = Instant::now();
-        let (path, rtt) = match sh.conn.paths().iter().find(|p| p.is_selected()) {
+        let (path, rtt) = match mycel_net::path_in_use(&sh.conn.paths()) {
             Some(p) => (Some(PathKind::of(p.remote_addr())), p.rtt()),
             None => (None, Duration::ZERO),
         };

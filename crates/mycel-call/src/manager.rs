@@ -90,8 +90,10 @@ fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// The path a call connection is using and its RTT, whichever end dialed
+/// it (see [`mycel_net::path_in_use`]).
 pub fn selected_path(conn: &Connection) -> (Option<PathKind>, Duration) {
-    match conn.paths().iter().find(|p| p.is_selected()) {
+    match mycel_net::path_in_use(&conn.paths()) {
         Some(p) => (Some(PathKind::of(p.remote_addr())), p.rtt()),
         None => (None, Duration::ZERO),
     }

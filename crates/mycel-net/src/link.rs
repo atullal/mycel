@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bytes::Bytes;
 use iroh::TransportAddr;
+use iroh::endpoint::{Path, PathList};
 use iroh::endpoint::transports::{
     Addr, CustomEndpoint, CustomSender, CustomTransport, FourTuple, PathSelection, PathSelectionContext, PathSelectionData,
     PathSelector, RecvInfo, Transmit,
@@ -180,6 +181,25 @@ impl PathKind {
             PathKind::Mesh => "Mesh",
         }
     }
+}
+
+/// The path a connection is using: the one Iroh selected, else the open
+/// path that has carried the most.
+///
+/// Iroh selects one path per peer, across all connections to that peer, and
+/// marks it selected on each connection that has it. But each end selects on
+/// its own (whichever path it measured first, until another is clearly
+/// better), and only the end that dialed a connection opens paths on it. So
+/// on a connection the peer dialed, the path we selected may not exist: no
+/// path there is selected, and the connection sends on the paths it has.
+pub fn path_in_use<'a>(paths: &'a PathList<'_>) -> Option<Path<'a>> {
+    paths.iter().find(|p| p.is_selected()).or_else(|| {
+        // the first of equals: a new connection's first path
+        paths.iter().rev().max_by_key(|p| {
+            let s = p.stats();
+            s.udp_tx.bytes.saturating_add(s.udp_rx.bytes)
+        })
+    })
 }
 
 /// A link's health, shown in the Network panel.

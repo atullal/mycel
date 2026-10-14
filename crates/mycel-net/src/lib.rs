@@ -61,7 +61,7 @@ use tokio::sync::{Notify, Semaphore, broadcast, mpsc};
 
 pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_free_space, free_space, human_size};
 pub use iroh;
-pub use link::{Link, LinkEvent, LinkStatus, PathKind};
+pub use link::{Link, LinkEvent, LinkStatus, PathKind, path_in_use};
 pub use mesh::{Mesh, MeshOptions, MeshRoute, MeshStats, Tap};
 pub use wire::{ContactCard, MAX_EPHEMERAL};
 use wire::*;
@@ -333,7 +333,7 @@ impl Inner {
 
     /// Remember which path a finished exchange used (for the Network panel).
     fn note_path(&self, pk: SignPk, conn: &Connection) {
-        let Some(addr) = conn.paths().iter().find(|p| p.is_selected()).map(|p| p.remote_addr().clone()) else {
+        let Some(addr) = link::path_in_use(&conn.paths()).map(|p| p.remote_addr().clone()) else {
             return;
         };
         let via = Some(PathKind::of(&addr));
