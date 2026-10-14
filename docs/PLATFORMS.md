@@ -103,6 +103,18 @@ scripts/package-ios.sh               # dist-release/Mycel_<v>_ios.ipa (developme
 scripts/package-ios.sh --install     # ...and install it on the connected iPhone/iPad
 ```
 
+**TestFlight:** `scripts/package-ios.sh --testflight N` archives with build
+number N (it must be higher than the last upload) and opens the archive in
+Xcode's Organizer: Distribute App > TestFlight Internal Only > Distribute.
+The upload has to go through the Organizer: Xcode 27's account sign-in
+(Settings > Apple Accounts) doesn't reach command-line `xcodebuild`, so
+the command line can only sign with profiles Xcode already made. App Store
+Connect needs the app record for `dev.mycel.host` (Xcode offers to create
+it, or create it at appstoreconnect.apple.com), and asks about encryption
+(export compliance) before testers can install a build.
+`gen/apple/PrivacyInfo.xcprivacy` is Apple's privacy manifest; the app icons
+must have no alpha channel.
+
 On the device, the first launch needs Settings > General > VPN & Device
 Management > trust the developer. With a free Apple ID the app expires after 7
 days; reinstall it. Sharing it with other people needs a paid developer

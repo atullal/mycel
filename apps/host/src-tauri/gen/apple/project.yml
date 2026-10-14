@@ -37,6 +37,9 @@ targets:
         buildPhase: resources
         type: folder
       - path: LaunchScreen.storyboard
+      # Apple's privacy manifest (required-reason APIs; no tracking)
+      - path: PrivacyInfo.xcprivacy
+        buildPhase: resources
     info:
       path: mycel-host_iOS/Info.plist
       properties:

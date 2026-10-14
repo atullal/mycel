@@ -7,6 +7,9 @@
 #   scripts/package-ios.sh --simulator        # Simulator build (.app, unsigned)
 #   scripts/package-ios.sh --unsigned         # unsigned device .ipa, for re-signing
 #                                             #    (Sideloadly, AltStore, `codesign`)
+#   scripts/package-ios.sh --testflight N     # archive with build number N (higher
+#                                             #    than the last upload) and open it in
+#                                             #    Xcode's Organizer to upload to TestFlight
 #
 # Device builds are signed with the Apple development team in
 # apps/host/src-tauri/tauri.conf.json (bundle > iOS > developmentTeam). Xcode
@@ -25,8 +28,9 @@ case "${1:-}" in
   --install) INSTALL=1; DEVICE="${2:-}" ;;
   --simulator) MODE=simulator ;;
   --unsigned) MODE=unsigned ;;
-  -h|--help) sed -n '2,16p' "$0"; exit 0 ;;
-  *) echo "unknown option: $1 (use --install, --simulator, --unsigned or nothing)" >&2; exit 2 ;;
+  --testflight) MODE=testflight; BUILD="${2:-}" ;;
+  -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+  *) echo "unknown option: $1 (use --install, --simulator, --unsigned, --testflight N or nothing)" >&2; exit 2 ;;
 esac
 
 command -v xcodebuild >/dev/null || { echo "Xcode not found: install it from the App Store" >&2; exit 1; }
@@ -75,6 +79,26 @@ if [ "$MODE" = unsigned ]; then
   echo "Built $DEST ($(du -h "$DEST" | cut -f1)), unsigned: re-sign it to install."
   exit 0
 fi
+if [ "$MODE" = testflight ]; then
+  # The command line can't upload: Xcode 27's account sign-in doesn't reach
+  # xcodebuild. So archive here (development-signed), and Xcode's Organizer
+  # re-signs it for the App Store and uploads it.
+  case "$BUILD" in
+    '' | *[!0-9]*) echo "give a build number higher than the last upload, e.g. --testflight 2" >&2; exit 2 ;;
+  esac
+  (cd apps/host && cargo tauri ios build --target aarch64 --archive-only --build-number "$BUILD")
+  ARCHIVE="$APPLE/build/mycel-host_iOS.xcarchive"
+  [ -d "$ARCHIVE" ] || { echo "no archive found" >&2; exit 1; }
+  # where the Organizer lists archives
+  DEST="$HOME/Library/Developer/Xcode/Archives/$(date +%Y-%m-%d)/Mycel $VERSION ($BUILD).xcarchive"
+  mkdir -p "$(dirname "$DEST")" && rm -rf "$DEST" && ditto "$ARCHIVE" "$DEST"
+  open "$DEST"
+  echo
+  echo "Archived $DEST"
+  echo "In Xcode's Organizer: select it > Distribute App > TestFlight Internal Only > Distribute."
+  exit 0
+fi
+
 (cd apps/host && cargo tauri ios build --target aarch64 --export-method debugging)
 IPA="$(ls -t "$APPLE"/build/arm64/*.ipa 2>/dev/null | head -1)"
 [ -f "$IPA" ] || { echo "no .ipa produced (see the Xcode output above)" >&2; exit 1; }
