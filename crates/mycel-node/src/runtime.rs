@@ -404,10 +404,25 @@ impl Runtime {
             notices.push(Notice::IdentityReplaced { kept_in: kept.display().to_string() });
         }
         // Validate persisted mode before opening any network transport.
-        let next_mode = Self::saved_network_mode(&dir)?.unwrap_or(opts.mode);
+        let next_mode = match Self::saved_network_mode(&dir) {
+            Ok(mode) => mode.unwrap_or(opts.mode),
+            Err(error) => {
+                // Never widen to the internet on a guess, and never refuse to
+                // start: local paths only until the user chooses again.
+                eprintln!("mycel: {error:#}; using local paths only (lan)");
+                if let Err(error) = crate::identity::atomic_write(&dir.join("network-mode"), b"lan", true) {
+                    eprintln!("mycel: couldn't repair the saved network mode: {error:#}");
+                }
+                notices.push(Notice::NetworkModeReset);
+                NetworkMode::Lan
+            }
+        };
         let store = DbStore::open(dir.join("mycel.redb"))?;
-        // Reject malformed persisted rows before spawning any transport task.
-        let stored_spaces = store.load_spaces()?;
+        // Set aside malformed persisted rows before spawning any transport task.
+        let (stored_spaces, set_aside) = store.load_spaces()?;
+        if set_aside > 0 {
+            notices.push(Notice::RecordsSetAside { count: set_aside });
+        }
 
         let stored_name = store.kv_get("name")?.and_then(|b| String::from_utf8(b).ok());
         let name = match (opts.name, stored_name) {
@@ -779,8 +794,24 @@ impl Runtime {
         }
     }
 
-    /// The network mode saved by `set_network_mode`, if any. Hosts read it
-    /// before opening the runtime (the mode is fixed while running).
+    /// The mode to launch with: the one saved by `set_network_mode`, else
+    /// `default`. Hosts read it before opening the runtime (the mode is fixed
+    /// while running). A saved mode that can't be read (releases before this
+    /// one wrote it non-atomically) means local paths only (`lan`), the most
+    /// private choice, never a wider one; `open` then repairs the file and
+    /// reports [`Notice::NetworkModeReset`].
+    pub fn launch_network_mode(data_dir: &Path, default: NetworkMode) -> NetworkMode {
+        match Self::saved_network_mode(data_dir) {
+            Ok(mode) => mode.unwrap_or(default),
+            Err(error) => {
+                eprintln!("mycel: {error:#}; using local paths only (lan)");
+                NetworkMode::Lan
+            }
+        }
+    }
+
+    /// The network mode saved by `set_network_mode`, if any; an error if the
+    /// saved mode can't be read (see `launch_network_mode`).
     pub fn saved_network_mode(data_dir: &Path) -> Result<Option<NetworkMode>> {
         let Some(bytes) = crate::identity::read_optional(&data_dir.join("network-mode"), 64)? else {
             return Ok(None);

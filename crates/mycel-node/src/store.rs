@@ -20,6 +20,9 @@ use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 const OPS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ops");
 const ENVS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("envelopes");
 const KV: TableDefinition<&str, &[u8]> = TableDefinition::new("kv");
+/// Stored records that couldn't be decoded, kept byte for byte under
+/// `<table>/<key>` so one bad row neither blocks startup nor is deleted.
+const QUARANTINE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("quarantine");
 
 /// Synced records buffered for the next commit. Past this, a healthy store
 /// makes writers wait for the flusher; a failing one stops buffering them.
@@ -391,31 +394,62 @@ impl DbStore {
         self.enqueue(Write::Kv(k.to_string(), None));
     }
 
-    /// Every stored space: (genesis + other ops, envelopes).
-    pub fn load_spaces(&self) -> Result<HashMap<SpaceId, StoredSpace>> {
+    /// Every stored space: (genesis + other ops, envelopes), and how many
+    /// undecodable records were moved aside into the quarantine table.
+    pub fn load_spaces(&self) -> Result<(HashMap<SpaceId, StoredSpace>, u64)> {
         self.flush()?;
-        let db = self.shared.db.read().unwrap();
-        let txn = db.as_ref().context("storage is unavailable")?.begin_read()?;
         let mut out: HashMap<SpaceId, StoredSpace> = HashMap::new();
-        let space_of = |k: &[u8]| -> Result<Hash32> {
-            if k.len() != 64 {
-                bail!("corrupt stored record key");
+        let mut bad: Vec<(&'static str, Vec<u8>, Vec<u8>)> = Vec::new();
+        let space_of = |k: &[u8]| -> Option<Hash32> { Some(Hash32(k.get(..32)?.try_into().ok()?)).filter(|_| k.len() == 64) };
+        self.shared.with_db(|db| {
+            let txn = db.begin_read()?;
+            for row in txn.open_table(OPS)?.iter()? {
+                let (k, v) = row?;
+                match (space_of(k.value()), postcard::from_bytes::<SignedOp>(v.value())) {
+                    (Some(space), Ok(op)) => out.entry(space).or_default().0.push(op),
+                    _ => bad.push(("ops", k.value().to_vec(), v.value().to_vec())),
+                }
             }
-            Ok(Hash32(k[..32].try_into().expect("checked key length")))
-        };
-        for row in txn.open_table(OPS)?.iter()? {
-            let (k, v) = row?;
-            let op = postcard::from_bytes::<SignedOp>(v.value())
-                .context("corrupt stored membership operation")?;
-            out.entry(space_of(k.value())?).or_default().0.push(op);
+            for row in txn.open_table(ENVS)?.iter()? {
+                let (k, v) = row?;
+                match (space_of(k.value()), postcard::from_bytes::<Envelope>(v.value())) {
+                    (Some(space), Ok(env)) => out.entry(space).or_default().1.push(env),
+                    _ => bad.push(("envelopes", k.value().to_vec(), v.value().to_vec())),
+                }
+            }
+            Ok(())
+        })?;
+        let count = bad.len() as u64;
+        if !bad.is_empty() {
+            eprintln!("mycel: {count} stored records couldn't be read; set them aside");
+            // Skipped either way; if moving them fails they're retried next time.
+            if let Err(error) = self.quarantine(&bad) {
+                eprintln!("mycel: couldn't set aside unreadable records: {error:#}");
+            }
         }
-        for row in txn.open_table(ENVS)?.iter()? {
-            let (k, v) = row?;
-            let env =
-                postcard::from_bytes::<Envelope>(v.value()).context("corrupt stored envelope")?;
-            out.entry(space_of(k.value())?).or_default().1.push(env);
-        }
-        Ok(out)
+        Ok((out, count))
+    }
+
+    fn quarantine(&self, rows: &[(&'static str, Vec<u8>, Vec<u8>)]) -> Result<()> {
+        let _gate = self.shared.commit_gate.lock().unwrap();
+        self.shared.with_db(|db| {
+            let txn = db.begin_write()?;
+            {
+                let mut quarantine = txn.open_table(QUARANTINE)?;
+                let mut ops = txn.open_table(OPS)?;
+                let mut envs = txn.open_table(ENVS)?;
+                for (table, key, value) in rows {
+                    let kept = [table.as_bytes(), b"/", key].concat();
+                    quarantine.insert(kept.as_slice(), value.as_slice())?;
+                    match *table {
+                        "ops" => ops.remove(key.as_slice())?,
+                        _ => envs.remove(key.as_slice())?,
+                    };
+                }
+            }
+            txn.commit()?;
+            Ok(())
+        })
     }
 }
 
@@ -586,29 +620,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn corrupt_space_startup_releases_profile_and_database() {
+    async fn unreadable_records_are_set_aside_and_startup_continues() {
         let dir = std::env::temp_dir().join(format!(
             "mycel-corrupt-startup-{}-{}", std::process::id(), mycel_crypto::random_u64()
         ));
         let runtime = crate::Runtime::open(&dir, crate::api::NetworkMode::Local, None).await.unwrap();
+        let id = runtime.profile().id;
         runtime.shutdown().await.unwrap();
         drop(runtime);
+        let rows: [(&str, &[u8], &[u8]); 3] =
+            [("ops", &[0u8; 64], &[255u8]), ("envelopes", &[1u8; 64], &[254u8, 1]), ("ops", &[2u8; 5], &[0u8])];
         {
             let db = Database::create(dir.join("mycel.redb")).unwrap();
             let transaction = db.begin_write().unwrap();
             {
                 let mut ops = transaction.open_table(OPS).unwrap();
-                ops.insert(&[0u8; 64][..], &[255u8][..]).unwrap();
+                let mut envs = transaction.open_table(ENVS).unwrap();
+                for (table, key, value) in rows {
+                    match table {
+                        "ops" => ops.insert(key, value).unwrap(),
+                        _ => envs.insert(key, value).unwrap(),
+                    };
+                }
             }
             transaction.commit().unwrap();
         }
-        assert!(crate::Runtime::open(&dir, crate::api::NetworkMode::Local, None).await.is_err());
-        // Detached network tasks would retain the store and its database lock.
-        let lease = crate::identity::ProfileLock::acquire(&dir).unwrap();
-        let store = DbStore::open(dir.join("mycel.redb")).unwrap();
-        store.close().unwrap();
-        drop(store);
-        drop(lease);
+        let runtime = crate::Runtime::open(&dir, crate::api::NetworkMode::Local, None).await.unwrap();
+        assert_eq!(runtime.profile().id, id);
+        assert!(runtime.notices().contains(&crate::api::Notice::RecordsSetAside { count: 3 }));
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        {
+            let db = Database::create(dir.join("mycel.redb")).unwrap();
+            let transaction = db.begin_read().unwrap();
+            let quarantine = transaction.open_table(QUARANTINE).unwrap();
+            let ops = transaction.open_table(OPS).unwrap();
+            for (table, key, value) in rows {
+                let kept = [table.as_bytes(), b"/", key].concat();
+                assert_eq!(quarantine.get(kept.as_slice()).unwrap().unwrap().value(), value, "kept byte for byte");
+                assert!(ops.get(key).unwrap().is_none());
+            }
+        }
+        let runtime = crate::Runtime::open(&dir, crate::api::NetworkMode::Local, None).await.unwrap();
+        assert!(runtime.notices().is_empty(), "set aside once");
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
         std::fs::remove_dir_all(dir).unwrap();
     }
 

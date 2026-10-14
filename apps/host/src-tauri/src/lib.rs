@@ -35,9 +35,8 @@ pub type Rt = Arc<Runtime>;
 
 fn network_mode(data_dir: &std::path::Path) -> Result<NetworkMode, String> {
     match std::env::var("MYCEL_NET").ok().as_deref().map(str::trim) {
-        None | Some("") => Runtime::saved_network_mode(data_dir)
-            .map(|mode| mode.unwrap_or(NetworkMode::Internet))
-            .map_err(|e| format!("cannot read saved network mode: {e:#}")),
+        // An unreadable saved mode means local paths only, never wider.
+        None | Some("") => Ok(Runtime::launch_network_mode(data_dir, NetworkMode::Internet)),
         Some("lan") => Ok(NetworkMode::Lan),
         Some("internet") => Ok(NetworkMode::Internet),
         Some("local") => Ok(NetworkMode::Local),

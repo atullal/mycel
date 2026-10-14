@@ -1138,6 +1138,10 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+        assert_eq!(
+            crate::Runtime::launch_network_mode(&dir.0, crate::api::NetworkMode::Internet),
+            crate::api::NetworkMode::Internet
+        );
         atomic_write(&path, b"lan", true).unwrap();
         assert_eq!(
             crate::Runtime::saved_network_mode(&dir.0).unwrap(),
@@ -1145,6 +1149,13 @@ mod tests {
         );
         atomic_write(&path, b"garbage", true).unwrap();
         assert!(crate::Runtime::saved_network_mode(&dir.0).is_err());
+        for default in [crate::api::NetworkMode::Internet, crate::api::NetworkMode::Lan] {
+            assert_eq!(
+                crate::Runtime::launch_network_mode(&dir.0, default),
+                crate::api::NetworkMode::Lan,
+                "unreadable means the most private mode, never a wider one"
+            );
+        }
         atomic_write(&path, &[255], true).unwrap();
         assert!(crate::Runtime::saved_network_mode(&dir.0).is_err());
         #[cfg(unix)]
@@ -1160,6 +1171,24 @@ mod tests {
             symlink(dir.0.join("absent"), &path).unwrap();
             assert!(crate::Runtime::saved_network_mode(&dir.0).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn truncated_network_mode_starts_local_only_and_is_repaired() {
+        let dir = TestDir::new();
+        let runtime = crate::Runtime::open(&dir.0, crate::api::NetworkMode::Local, None).await.unwrap();
+        runtime.set_network_mode(crate::api::NetworkMode::Internet).unwrap();
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        // What an interrupted non-atomic write by an older release leaves.
+        fs::write(dir.0.join("network-mode"), b"inter").unwrap();
+        let mode = crate::Runtime::launch_network_mode(&dir.0, crate::api::NetworkMode::Internet);
+        assert_eq!(mode, crate::api::NetworkMode::Lan);
+        let runtime = crate::Runtime::open(&dir.0, crate::api::NetworkMode::Local, None).await.unwrap();
+        assert!(runtime.notices().contains(&crate::api::Notice::NetworkModeReset));
+        assert_eq!(runtime.network_status().next_mode, crate::api::NetworkMode::Lan);
+        assert_eq!(fs::read(dir.0.join("network-mode")).unwrap(), b"lan");
+        runtime.shutdown().await.unwrap();
     }
 
     #[derive(Default, Clone)]
