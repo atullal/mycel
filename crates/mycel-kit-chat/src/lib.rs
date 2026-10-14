@@ -7,9 +7,10 @@
 //! only a message's author may edit or delete it, and only admins may retitle.
 //!
 //! [`thread`] decides which conversations are one logical chat with a person
-//! and how their histories merge. It is pure, so the runtime only caches its
-//! inputs.
+//! and how their histories merge; [`alerts`] decides when a chat deserves a
+//! private local alert. Both are pure, so the runtime only caches their inputs.
 
+pub mod alerts;
 pub mod thread;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};

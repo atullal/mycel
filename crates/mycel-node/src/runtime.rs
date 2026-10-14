@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::BASE64URL_NOPAD;
 use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, SignPk, SymKey, random};
+use mycel_kit_chat::alerts::{self, AlertPolicy, ChatAlert, Latest, ThreadState};
 use mycel_kit_chat::thread::{self as chat_thread, Direct, Membership, Source};
 use mycel_kit_chat::{AttachmentRef, ChatOp, ChatSignal, ChatView, messages_feed, reduce};
 use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallManager};
@@ -120,6 +121,9 @@ pub struct Runtime {
     /// this was recorded). A space that turns up later can't backdate
     /// messages into a merged timeline (`chat_thread::Source::floor_ms`).
     first_seen: Mutex<HashMap<SpaceId, u64>>,
+    /// Which conversation and call changes deserve a local alert
+    /// (`mycel_kit_chat::alerts`); the host only shows them.
+    alerts: Mutex<AlertPolicy>,
     /// Keep local Start chat calls idempotent, including double taps and
     /// concurrent callers. Transport discovery never defines chat identity.
     direct_chat_creation: Mutex<()>,
@@ -614,6 +618,7 @@ impl Runtime {
             threads: Mutex::default(),
             threads_settle: Mutex::new(()),
             first_seen: Mutex::new(first_seen),
+            alerts: Mutex::default(),
             direct_chat_creation: Mutex::new(()),
             announced: Mutex::default(),
             announced_versions: Mutex::default(),
@@ -640,6 +645,9 @@ impl Runtime {
             let _ = rt.view(&s);
         }
         rt.threads.lock().dirty.extend(rt.node.space_ids());
+        if !rt.keeper {
+            rt.seed_alerts();
+        }
         tokio::spawn(bridge(Arc::downgrade(&rt), rt.node.subscribe()));
         // catch up with everyone right away
         for s in rt.node.space_ids() {
@@ -653,7 +661,8 @@ impl Runtime {
     }
 
     /// Send an app event with conversation and call IDs projected onto their
-    /// logical chat (O(1): cached thread index).
+    /// logical chat (O(1): cached thread index), followed by any alerts the
+    /// chat layer decides it deserves.
     fn emit(&self, e: Event) {
         let canonical = |id: String| parse_space(&id).map(|space| self.logical_id(&space)).unwrap_or(id);
         let e = match e {
@@ -664,7 +673,11 @@ impl Runtime {
             Event::CallUpdated { call } => Event::CallUpdated { call: self.logical_call(call) },
             other => other,
         };
+        let alerts = if self.keeper { Vec::new() } else { self.alerts_for(&e) };
         let _ = self.events.send(e);
+        for alert in alerts {
+            let _ = self.events.send(alert);
+        }
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -2149,12 +2162,178 @@ impl Runtime {
         self.calls.status().into_iter().map(|call| self.logical_call(call)).collect()
     }
 
+    // ───────────── alerts ─────────────
+    //
+    // The chat layer decides what deserves a private local alert
+    // (`mycel_kit_chat::alerts`) and emits app-agnostic `Event::Alert` /
+    // `Event::AlertWithdrawn`. A native shell only shows generic sentences,
+    // routes taps and suppresses alerts about what's on screen.
+
+    /// The alert thread of what an app shows (a conversation id or any of
+    /// its aliases): the shell suppresses and withdraws that thread's alerts
+    /// while it's on screen.
+    pub fn alert_thread(&self, context: &str) -> Option<String> {
+        let space = parse_space(context).ok()?;
+        self.node.with_space(&space, |_| ()).ok()?;
+        Some(self.thread_key(&self.conversation_spaces(&space)))
+    }
+
+    /// What a tapped alert's `target` opens now: the conversation's current
+    /// id, or `None` once it's declined, gone or no longer active.
+    pub fn alert_route(&self, target: &str) -> Option<ConversationId> {
+        let space = parse_space(target).ok()?;
+        if self.hidden.lock().contains(&space) || self.arriving.lock().contains(&space) {
+            return None;
+        }
+        let spaces = self.conversation_spaces(&space);
+        self.my_role(&spaces[0]).is_some().then(|| spaces[0].to_string())
+    }
+
+    /// Alerts an (already projected) app event calls for.
+    fn alerts_for(&self, event: &Event) -> Vec<Event> {
+        match event {
+            Event::ConversationUpdated { conversation } | Event::ConversationAdded { conversation } => {
+                parse_space(conversation).map(|space| self.conversation_alerts(&space)).unwrap_or_default()
+            }
+            Event::CallIncoming { call } | Event::CallUpdated { call } if call.direction == CallDirection::Incoming => {
+                let actions = {
+                    let mut policy = self.alerts.lock();
+                    match event {
+                        Event::CallIncoming { .. } if call.state == CallPhase::Ringing => policy.call_ringing(&call.id),
+                        Event::CallIncoming { .. } => Vec::new(),
+                        _ => {
+                            let missed = call.end_reason == Some(CallEndReason::Missed)
+                                && matches!(call.state, CallPhase::Ended | CallPhase::Joinable);
+                            policy.call_changed(&call.id, call.state == CallPhase::Ringing, missed)
+                        }
+                    }
+                };
+                if actions.is_empty() {
+                    return Vec::new();
+                }
+                let thread = match parse_space(&call.conversation) {
+                    Ok(space) => self.thread_key(&self.conversation_spaces(&space)),
+                    Err(_) => call.conversation.clone(),
+                };
+                alert_events(actions, &thread, &call.conversation)
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn conversation_alerts(&self, space: &SpaceId) -> Vec<Event> {
+        let spaces = self.conversation_spaces(space);
+        let thread = self.thread_key(&spaces);
+        let previous: Vec<String> = spaces.iter().map(ToString::to_string).collect();
+        let snapshot = self.alert_snapshot(&spaces);
+        let actions = {
+            let mut policy = self.alerts.lock();
+            match snapshot {
+                Some(s) => policy.conversation(&s.state(&thread, &previous)),
+                None => policy.gone(&thread, &previous),
+            }
+        };
+        alert_events(actions, &thread, &previous[0])
+    }
+
+    /// Mark what's here at startup as seen.
+    fn seed_alerts(&self) {
+        for spaces in self.logical_threads() {
+            let thread = self.thread_key(&spaces);
+            let previous: Vec<String> = spaces.iter().map(ToString::to_string).collect();
+            if let Some(s) = self.alert_snapshot(&spaces) {
+                self.alerts.lock().seed(&s.state(&thread, &previous));
+            }
+        }
+    }
+
+    /// What the alert policy needs of a logical conversation: O(spaces +
+    /// unread) over cached views, no names or members. `None` once declined
+    /// or while still arriving.
+    fn alert_snapshot(&self, spaces: &[SpaceId]) -> Option<AlertSnapshot> {
+        let canonical = &spaces[0];
+        if self.hidden.lock().contains(canonical) || self.arriving.lock().contains(canonical) {
+            return None;
+        }
+        let me = self.keys.sign_pk();
+        let views = spaces.iter().map(|s| self.view(s)).collect::<Result<Vec<_>>>().ok()?;
+        let latest = self.merged_last(spaces, &views).map(|(s, i)| {
+            let m = &views[s].messages[i];
+            Latest { id: m.id, mine: m.author == me }
+        });
+        let unread = spaces.iter().zip(&views).fold(0u32, |n, (s, v)| n.saturating_add(self.unread_in(s, v)));
+        let (active, others) = {
+            let threads = self.threads.lock();
+            let facts = threads.spaces.get(canonical)?;
+            (facts.membership.my_role.is_some(), facts.membership.people.keys().filter(|k| **k != me).count())
+        };
+        let view = &views[0];
+        Some(AlertSnapshot {
+            latest,
+            unread,
+            active,
+            request: self.requests.lock().contains_key(canonical),
+            // as `ConversationSummary::direct`
+            direct: view.direct || (view.title.is_none() && others == 1),
+        })
+    }
+
     /// Sync every conversation with every member now (pull-to-refresh).
     pub async fn sync_now(&self) {
         for s in self.node.space_ids() {
             self.node.sync_all(s).await;
         }
     }
+}
+
+/// What the alert policy sees of a logical conversation.
+struct AlertSnapshot {
+    latest: Option<Latest>,
+    unread: u32,
+    active: bool,
+    request: bool,
+    direct: bool,
+}
+
+impl AlertSnapshot {
+    fn state<'a>(&self, thread: &'a str, previous: &'a [String]) -> ThreadState<'a> {
+        ThreadState {
+            thread,
+            previous,
+            latest: self.latest,
+            unread: self.unread,
+            active: self.active,
+            request: self.request,
+            direct: self.direct,
+        }
+    }
+}
+
+/// The chat layer's alert decisions as app-agnostic shell events.
+fn alert_events(actions: Vec<alerts::Action>, thread: &str, target: &str) -> Vec<Event> {
+    actions
+        .into_iter()
+        .map(|action| match action {
+            alerts::Action::Alert { kind, key } => Event::Alert {
+                alert: Alert {
+                    kind: match kind {
+                        ChatAlert::Message => AlertKind::Message,
+                        ChatAlert::MessageRequest => AlertKind::MessageRequest,
+                        ChatAlert::GroupInvitation => AlertKind::GroupInvitation,
+                        ChatAlert::IncomingCall => AlertKind::IncomingCall,
+                        ChatAlert::MissedCall => AlertKind::MissedCall,
+                    },
+                    thread: thread.into(),
+                    key,
+                    target: target.into(),
+                    // The app rings incoming calls itself while it's in front.
+                    foreground: kind != ChatAlert::IncomingCall,
+                },
+            },
+            alerts::Action::WithdrawThread(thread) => Event::AlertWithdrawn { thread, key: None },
+            alerts::Action::Withdraw(key) => Event::AlertWithdrawn { thread: thread.into(), key: Some(key) },
+        })
+        .collect()
 }
 
 /// Translate network events into app events (and react to invites).
@@ -2887,6 +3066,50 @@ mod tests {
         let runtime = Runtime::open(&dir, NetworkMode::Local, None).await.unwrap();
         assert_eq!(runtime.first_seen.lock()[&space], 0);
         finish(runtime, dir).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn chat_layer_raises_private_alerts_and_withdraws_them_once_read() {
+        use super::*;
+        async fn next(events: &mut broadcast::Receiver<Event>, mut want: impl FnMut(&Event) -> bool) -> Event {
+            tokio::time::timeout(Duration::from_secs(15), async {
+                loop {
+                    if let Ok(event) = events.recv().await && want(&event) {
+                        return event;
+                    }
+                }
+            }).await.expect("expected event")
+        }
+        let (alice, da) = scratch_runtime("alert-a").await;
+        let (bob, db) = scratch_runtime("alert-b").await;
+        alice.contacts.lock().insert(bob.keys.sign_pk(), StoredContact { keys: bob.keys.public(), name: "Bob".into() });
+        bob.contacts.lock().insert(alice.keys.sign_pk(), StoredContact { keys: alice.keys.public(), name: "Alice".into() });
+        alice.node.add_peer_addr(bob.node.addr());
+        bob.node.add_peer_addr(alice.node.addr());
+        let mut events = bob.subscribe();
+        let conversation = alice.create_conversation(None, vec![bob.profile().id]).unwrap();
+        next(&mut events, |e| matches!(e, Event::ConversationAdded { .. })).await;
+        alice.send_message(conversation.id.clone(), "Sensitive text".into(), None, vec![]).await.unwrap();
+        let shown = next(&mut events, |e| matches!(e, Event::Alert { .. })).await;
+        let Event::Alert { alert } = &shown else { unreachable!() };
+        let summary = bob.conversation(conversation.id.clone()).unwrap();
+        assert_eq!(alert.kind, AlertKind::Message);
+        assert_eq!((&alert.thread, &alert.target), (&summary.thread_key, &summary.id));
+        assert!(alert.foreground);
+        let json = serde_json::to_string(&shown).unwrap();
+        for private in ["Sensitive text", "Alice", &alice.profile().id] {
+            assert!(!json.contains(private), "alert exposes {private}");
+        }
+        assert_eq!(bob.alert_thread(&conversation.id), Some(summary.thread_key.clone()));
+        assert_eq!(bob.alert_route(&alert.target), Some(summary.id.clone()));
+        // Read here: withdrawn, once.
+        bob.mark_read(conversation.id.clone()).unwrap();
+        next(&mut events, |e| matches!(e, Event::AlertWithdrawn { thread, key: None } if *thread == summary.thread_key)).await;
+        alice.send_message(conversation.id.clone(), "another".into(), None, vec![]).await.unwrap();
+        let again = next(&mut events, |e| matches!(e, Event::Alert { .. } | Event::AlertWithdrawn { .. })).await;
+        assert!(matches!(again, Event::Alert { .. }), "no repeated withdrawal before the next alert");
+        finish(alice, da).await;
+        finish(bob, db).await;
     }
 
     /// `chats` direct chats of `messages` messages each (every fourth person

@@ -52,6 +52,10 @@ impl Runtime {
     pub fn video_keyframe(&self, call: String) -> Result<()>;
     pub fn video_frames(&self) -> broadcast::Receiver<mycel_video::UiFrame>;
     pub async fn sync_now(&self);                                               // pull-to-refresh
+
+    // private local alerts (native shells; see "Shell-only events")
+    pub fn alert_thread(&self, context: &str) -> Option<String>;               // what's on screen → alert thread
+    pub fn alert_route(&self, target: &str) -> Option<ConversationId>;         // tapped alert → what to open now
 }
 ```
 
@@ -100,6 +104,8 @@ impl Runtime {
 Errors are rejected promises carrying a human-readable string. It includes the cause, e.g. `macOS didn't let Mycel read /Users/me/Desktop/x.mov. Allow Mycel in System Settings > Privacy & Security > Files and Folders …: Operation not permitted (os error 1)`.
 
 **Event:** the Tauri event `mycel://event` carries one `Event` (tagged by `type`): `conversationUpdated`, `conversationAdded`, `typing`, `contactsChanged`, `nearbyChanged`, `networkChanged`, `blobReady`, `transferProgress`, `callIncoming`, `callUpdated`.
+
+**Shell-only events** (hosts consume them and never forward them to apps): `alert { alert: { kind, thread, key, target, foreground } }` and `alertWithdrawn { thread, key? }`. The chat layer decides what is news (`mycel_kit_chat::alerts`: a new message from someone else, a message request, a group invitation, a call ringing or missed) and when it's stale (read here, answered, declined). `kind` is one of `message`, `messageRequest`, `groupInvitation`, `incomingCall`, `missedCall`; the strings are opaque local keys, never names or text. A native shell shows one fixed sentence per kind, replaces an alert with the same `key`, withdraws a thread's alerts together, and suppresses alerts while the app is focused on their thread (`Runtime::alert_thread(context)` maps what the app shows to a thread) or, when `foreground` is false, while the app is focused at all (it rings calls itself). A tap resolves `target` again through `Runtime::alert_route(target)`.
 
 `transferProgress { direction: "upload" | "download", id, done, total, rate }` (`rate` = bytes per second over the last 3 s):
 - Emitted at most every 250 ms, plus a final event with `done == total`.
