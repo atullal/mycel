@@ -5,6 +5,12 @@
 //! a [`ChatView`] deterministically, so every peer shows the same thing. The
 //! reducer enforces the chat rules that the trust layer can't express:
 //! only a message's author may edit or delete it, and only admins may retitle.
+//!
+//! [`thread`] decides which conversations are one logical chat with a person
+//! and how their histories merge. It is pure, so the runtime only caches its
+//! inputs.
+
+pub mod thread;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -81,6 +87,10 @@ pub struct Message {
     pub id: Hash32,
     pub author: SignPk,
     pub ts_ms: u64,
+    /// The latest author time at or before this message in feed (causal)
+    /// order. Merged timelines sort by it, so a backdated message can't
+    /// move ahead of its own causal past ([`thread::merge`]).
+    pub order_ms: u64,
     pub body: String,
     pub reply_to: Option<Hash32>,
     pub edited: bool,
@@ -99,6 +109,9 @@ pub struct ChatView {
     pub read_upto: HashMap<SignPk, usize>,
     pub title: Option<String>,
     pub direct: bool,
+    /// An admin once marked this conversation as a group or named it. Later
+    /// metadata can't turn group history back into a private direct chat.
+    pub ever_group: bool,
 }
 
 impl ChatView {
@@ -145,10 +158,12 @@ pub fn reduce(items: &[FeedItem]) -> ChatView {
                     continue;
                 }
                 index.insert(item.id, view.messages.len());
+                let order_ms = view.messages.last().map_or(item.ts_ms, |m| m.order_ms.max(item.ts_ms));
                 view.messages.push(Message {
                     id: item.id,
                     author: item.author,
                     ts_ms: item.ts_ms,
+                    order_ms,
                     body,
                     reply_to,
                     edited: false,
@@ -211,6 +226,7 @@ pub fn reduce(items: &[FeedItem]) -> ChatView {
                 if item.author_role == Role::Admin {
                     view.title = title.map(|t| clamp(t.trim(), 128)).filter(|t| !t.is_empty());
                     view.direct = direct;
+                    view.ever_group |= !direct || view.title.is_some();
                 }
             }
         }

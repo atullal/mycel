@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::BASE64URL_NOPAD;
 use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, SignPk, SymKey, random};
+use mycel_kit_chat::thread::{self as chat_thread, Direct, Membership, Source};
 use mycel_kit_chat::{AttachmentRef, ChatOp, ChatSignal, ChatView, messages_feed, reduce};
 use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallManager};
 use mycel_net::{ContactCard, ExtraProtocol, NetEvent, NetMode, Node, NodeOptions, PathKind, PeerState};
@@ -108,6 +109,17 @@ pub struct Runtime {
     keeper: bool,
     /// Reduced chat views, invalidated whenever a space changes.
     views: Mutex<HashMap<SpaceId, Arc<ChatView>>>,
+    /// One chat per person: cached per-space facts and the direct-chat index
+    /// (rules in `mycel_kit_chat::thread`), so neither events nor listings
+    /// reread message history to find a conversation's aliases.
+    threads: Mutex<Threads>,
+    /// Serializes `settle_threads`, so an older refresh never overwrites a
+    /// newer one.
+    threads_settle: Mutex<()>,
+    /// When this device first saw each space (ms since the epoch; 0 = before
+    /// this was recorded). A space that turns up later can't backdate
+    /// messages into a merged timeline (`chat_thread::Source::floor_ms`).
+    first_seen: Mutex<HashMap<SpaceId, u64>>,
     /// Keep local Start chat calls idempotent, including double taps and
     /// concurrent callers. Transport discovery never defines chat identity.
     direct_chat_creation: Mutex<()>,
@@ -132,6 +144,9 @@ pub struct Runtime {
     hints: Mutex<BTreeMap<SignPk, Vec<String>>>,
     /// Live voice calls (not on keepers).
     calls: CallManager,
+    /// Message histories read and reduced (tests: lookups must not).
+    #[cfg(test)]
+    history_reads: std::sync::atomic::AtomicUsize,
 }
 
 /// What calls need from the runtime: membership, names, dialing, events.
@@ -194,6 +209,69 @@ fn load_set<T: serde::de::DeserializeOwned + Ord>(store: &DbStore, key: &str) ->
         .unwrap_or_default()
         .into_iter()
         .collect())
+}
+
+/// What the runtime caches per space to group conversations into logical
+/// chats. Updated only when a space changes (`invalidate` marks it dirty;
+/// `settle_threads` refreshes it), so lookups are O(1) per space.
+#[derive(Default)]
+struct Threads {
+    spaces: HashMap<SpaceId, SpaceFacts>,
+    /// Original direct spaces by (peer, still a member): a logical chat's
+    /// aliases. Local consent is checked when reading.
+    direct: HashMap<Direct, BTreeSet<SpaceId>>,
+    dirty: HashSet<SpaceId>,
+}
+
+struct SpaceFacts {
+    /// Size of the membership graph the facts were read from.
+    ops: usize,
+    membership: Membership,
+    direct: Option<Direct>,
+}
+
+impl Threads {
+    fn set(&mut self, space: SpaceId, facts: SpaceFacts) {
+        self.unlink(&space);
+        if let Some(direct) = facts.direct {
+            self.direct.entry(direct).or_default().insert(space);
+        }
+        self.spaces.insert(space, facts);
+    }
+
+    fn remove(&mut self, space: &SpaceId) {
+        self.unlink(space);
+        self.spaces.remove(space);
+    }
+
+    fn unlink(&mut self, space: &SpaceId) {
+        if let Some(old) = self.spaces.get(space).and_then(|f| f.direct)
+            && let Some(set) = self.direct.get_mut(&old)
+        {
+            set.remove(space);
+            if set.is_empty() {
+                self.direct.remove(&old);
+            }
+        }
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// When each space was first seen here. On the first launch that records it,
+/// every space already stored keeps its old ordering (floor 0).
+fn load_first_seen(store: &DbStore, existing: &[SpaceId]) -> Result<HashMap<SpaceId, u64>> {
+    if let Some(list) = store.kv_decode::<Vec<(SpaceId, u64)>>("first_seen")? {
+        return Ok(list.into_iter().collect());
+    }
+    let list: Vec<(SpaceId, u64)> = existing.iter().map(|s| (*s, 0)).collect();
+    store.kv_batch_durable(vec![("first_seen".into(), Some(postcard::to_allocvec(&list)?))])?;
+    Ok(list.into_iter().collect())
 }
 
 // ───────────────────────────── helpers ─────────────────────────────
@@ -516,6 +594,7 @@ impl Runtime {
                 Err(e) => eprintln!("mycel: could not restore space {space}: {e}"),
             }
         }
+        let first_seen = load_first_seen(&store, &node.space_ids())?;
 
         let (events, _) = broadcast::channel(1024);
         let me = keys.sign_pk();
@@ -532,6 +611,9 @@ impl Runtime {
             next_mode: Mutex::new(next_mode),
             keeper: opts.keeper,
             views: Mutex::default(),
+            threads: Mutex::default(),
+            threads_settle: Mutex::new(()),
+            first_seen: Mutex::new(first_seen),
             direct_chat_creation: Mutex::new(()),
             announced: Mutex::default(),
             announced_versions: Mutex::default(),
@@ -543,6 +625,8 @@ impl Runtime {
             blocked,
             hints: Mutex::new(hints),
             calls: CallManager::new(Arc::new(RuntimeCallHost { me, rt: weak.clone() })),
+            #[cfg(test)]
+            history_reads: Default::default(),
         });
         if !rt.keeper {
             rt.calls.serve(call_rx);
@@ -555,6 +639,7 @@ impl Runtime {
         for s in rt.node.space_ids() {
             let _ = rt.view(&s);
         }
+        rt.threads.lock().dirty.extend(rt.node.space_ids());
         tokio::spawn(bridge(Arc::downgrade(&rt), rt.node.subscribe()));
         // catch up with everyone right away
         for s in rt.node.space_ids() {
@@ -567,6 +652,8 @@ impl Runtime {
         self.events.subscribe()
     }
 
+    /// Send an app event with conversation and call IDs projected onto their
+    /// logical chat (O(1): cached thread index).
     fn emit(&self, e: Event) {
         let canonical = |id: String| parse_space(&id).map(|space| self.logical_id(&space)).unwrap_or(id);
         let e = match e {
@@ -816,6 +903,8 @@ impl Runtime {
             return Ok(v.clone());
         }
         let items = self.node.with_space(space, |r| r.feed(&messages_feed()))?;
+        #[cfg(test)]
+        self.history_reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let view = Arc::new(reduce(&items));
         let names_changed = self.learn_profile_names(&items);
         self.views.lock().insert(*space, view.clone());
@@ -872,6 +961,9 @@ impl Runtime {
 
     fn invalidate(&self, space: &SpaceId) {
         self.views.lock().remove(space);
+        // Reclassified lazily, from the (re)reduced view and, only if a
+        // membership op arrived, the membership graph.
+        self.threads.lock().dirty.insert(*space);
     }
 
     /// A local change: drop the cached view now, then sync + notify.
@@ -945,28 +1037,12 @@ impl Runtime {
             None if people.is_empty() => "Just you".to_string(),
             None => people.iter().map(|m| m.name.clone()).collect::<Vec<_>>().join(", "),
         };
-        let (last, unread) = {
+        let last = {
             let hidden = self.hidden_messages.lock();
-            let visible =
-                |m: &&mycel_kit_chat::Message| !m.deleted && !hidden.contains(&(*space, m.id));
-            let last = view
-                .messages
-                .iter()
-                .rev()
-                .find(visible)
-                .map(|m| self.message_view(space, &view, m, &HashSet::new()));
-            let start = view
-                .read_upto
-                .get(&me)
-                .map_or(0, |i| i + 1)
-                .min(view.messages.len());
-            let unread = view.messages[start..]
-                .iter()
-                .filter(visible)
-                .filter(|m| m.author != me)
-                .count() as u32;
-            (last, unread)
+            view.messages.iter().rposition(|m| !m.deleted && !hidden.contains(&(*space, m.id)))
         };
+        let last = last.map(|i| self.message_view(space, &view, &view.messages[i], &HashSet::new()));
+        let unread = self.unread_in(space, &view);
         // (take the lock once: two guards in one expression would deadlock)
         let inviter = self.requests.lock().get(space).copied();
         Ok(ConversationSummary {
@@ -1062,115 +1138,213 @@ impl Runtime {
     }
 
     pub fn conversations(&self) -> Vec<ConversationSummary> {
-        let mut seen = HashSet::new();
         let mut out: Vec<ConversationSummary> = self
-            .node
-            .space_ids()
+            .logical_threads()
             .iter()
-            .filter(|s| self.my_role(s) != Some(Role::Relay))
-            .filter(|s| !self.hidden.lock().contains(*s))
-            .filter_map(|s| self.logical_summary(s).ok())
-            .filter(|s| seen.insert(s.id.clone()))
+            .filter_map(|spaces| self.logical_summary(spaces).ok())
             .collect();
         out.sort_by_key(|c| std::cmp::Reverse(c.last_message.as_ref().map_or(0, |m| m.sent_at)));
         out
     }
 
     pub fn conversation(&self, id: ConversationId) -> Result<ConversationSummary> {
-        self.logical_summary(&parse_space(&id)?)
+        self.logical_summary(&self.conversation_spaces(&parse_space(&id)?))
     }
 
-    /// Only original two-person direct spaces may share a logical chat.
-    /// Requests, former groups, revoked history and hidden spaces stay separate.
-    fn direct_peer(&self, space: &SpaceId) -> Option<SignPk> {
-        if self.hidden.lock().contains(space)
-            || self.arriving.lock().contains(space)
-            || self.requests.lock().contains_key(space)
-        {
-            return None;
-        }
-        let view = self.view(space).ok()?;
-        if !view.direct || view.title.is_some() {
-            return None;
-        }
-        let me = self.keys.sign_pk();
-        self.node.with_space(space, |r| {
-            if !r.my_role().is_some_and(Role::can_read) { return None; }
-            let people: BTreeSet<SignPk> = r.members().into_iter()
-                .filter(|(_, role)| *role != Role::Relay)
-                .map(|(keys, _)| keys.sign_pk).collect();
-            if people.len() != 2 || !people.contains(&me) { return None; }
-            // A removed third person still makes this group history. Likewise
-            // a keeper promoted to a reader once had access to private data.
-            for op in r.all_ops() {
-                if !r.graph().is_valid(&op.id()) { continue; }
-                use mycel_trust::Action;
-                let member = match &op.op.action {
-                    Action::Genesis { founder, .. } => Some(founder.sign_pk),
-                    Action::Add { member, role, .. } if *role != Role::Relay => Some(member.sign_pk),
-                    Action::SetRole { member, role, .. } if *role != Role::Relay => Some(*member),
-                    _ => None,
-                };
-                if member.is_some_and(|key| !people.contains(&key)) { return None; }
+    /// Every conversation this device lists (not spaces it only keeps for
+    /// others, nor declined ones), each as its spaces, lowest id first. O(N)
+    /// over cached facts: no message history is read.
+    fn logical_threads(&self) -> Vec<Vec<SpaceId>> {
+        let ids = self.node.space_ids();
+        self.settle_threads_with(&ids);
+        let kept: HashSet<SpaceId> = {
+            let threads = self.threads.lock();
+            ids.iter()
+                .filter(|s| threads.spaces.get(s).is_some_and(|f| f.membership.my_role == Some(Role::Relay)))
+                .copied()
+                .collect()
+        };
+        let mut listed = HashSet::new();
+        let mut out = Vec::new();
+        for space in ids {
+            if kept.contains(&space) || self.hidden.lock().contains(&space) {
+                continue;
             }
-            // Current direct metadata cannot retroactively turn a group into
-            // private two-person history for aggregation purposes.
-            if r.feed(&messages_feed()).iter().any(|item| {
-                item.author_role == Role::Admin && matches!(ChatOp::decode(&item.body),
-                    Some(ChatOp::Meta { title, direct }) if !direct || title.as_ref().is_some_and(|t| !t.trim().is_empty()))
-            }) { return None; }
-            people.into_iter().find(|key| *key != me)
-        }).ok().flatten()
+            let spaces = self.conversation_spaces(&space);
+            if listed.insert(spaces[0]) {
+                out.push(spaces);
+            }
+        }
+        out
     }
 
+    /// Bring the cached facts of changed spaces up to date. O(changed
+    /// spaces): each is reclassified from its cached view and, only if its
+    /// membership graph grew, from the graph. Never reads message history.
+    fn settle_threads(&self) {
+        let _serial = self.threads_settle.lock();
+        let dirty: Vec<SpaceId> = self.threads.lock().dirty.drain().collect();
+        for space in dirty {
+            self.refresh_thread(space);
+        }
+    }
+
+    /// `settle_threads`, after queueing any of `spaces` not indexed yet.
+    fn settle_threads_with(&self, spaces: &[SpaceId]) {
+        {
+            let mut threads = self.threads.lock();
+            let missing: Vec<SpaceId> =
+                spaces.iter().filter(|s| !threads.spaces.contains_key(s)).copied().collect();
+            threads.dirty.extend(missing);
+        }
+        self.settle_threads();
+    }
+
+    fn refresh_thread(&self, space: SpaceId) {
+        let me = self.keys.sign_pk();
+        let known = self.threads.lock().spaces.get(&space).map(|f| f.ops);
+        let read = self.node.with_space(&space, |r| {
+            let ops = r.graph().len();
+            (ops, (known != Some(ops)).then(|| Membership::of(r.graph(), &me)))
+        });
+        let Ok((ops, fresh)) = read else {
+            self.threads.lock().remove(&space);
+            return;
+        };
+        self.note_first_seen(space);
+        let view = self.view(&space).ok();
+        let mut threads = self.threads.lock();
+        let membership = match fresh {
+            Some(membership) => membership,
+            None => match threads.spaces.get(&space) {
+                Some(facts) => facts.membership.clone(),
+                None => {
+                    threads.dirty.insert(space);
+                    return;
+                }
+            },
+        };
+        let direct = view.as_deref().and_then(|v| chat_thread::classify(&me, v, &membership));
+        threads.set(space, SpaceFacts { ops, membership, direct });
+    }
+
+    fn note_first_seen(&self, space: SpaceId) {
+        let mut seen = self.first_seen.lock();
+        if seen.contains_key(&space) {
+            return;
+        }
+        seen.insert(space, now_ms());
+        let list: Vec<(SpaceId, u64)> = seen.iter().map(|(s, t)| (*s, *t)).collect();
+        if let Ok(bytes) = postcard::to_allocvec(&list) {
+            self.store.kv_put("first_seen", bytes);
+        }
+    }
+
+    /// Local consent: message requests, declined and still-arriving spaces
+    /// never join a logical chat.
+    fn admitted(&self, space: &SpaceId) -> bool {
+        !self.hidden.lock().contains(space)
+            && !self.arriving.lock().contains(space)
+            && !self.requests.lock().contains_key(space)
+    }
+
+    /// The logical direct chat `space` belongs to, if any.
+    fn direct_of(&self, space: &SpaceId) -> Option<Direct> {
+        self.settle_threads_with(std::slice::from_ref(space));
+        let direct = self.threads.lock().spaces.get(space)?.direct?;
+        self.admitted(space).then_some(direct)
+    }
+
+    /// The other person, if `space` is a current direct chat.
+    #[cfg(test)]
+    fn direct_peer(&self, space: &SpaceId) -> Option<SignPk> {
+        self.direct_of(space).filter(|d| d.current).map(|d| d.peer)
+    }
+
+    /// The spaces of the logical conversation `space` belongs to, lowest id
+    /// first: a direct chat's admitted aliases, otherwise just `space`.
     fn conversation_spaces(&self, space: &SpaceId) -> Vec<SpaceId> {
-        let Some(peer) = self.direct_peer(space) else { return vec![*space] };
-        let mut spaces: Vec<_> = self.node.space_ids().into_iter()
-            .filter(|candidate| self.direct_peer(candidate) == Some(peer)).collect();
-        spaces.sort();
-        spaces
+        let Some(direct) = self.direct_of(space) else { return vec![*space] };
+        let aliases: Vec<SpaceId> = self
+            .threads
+            .lock()
+            .direct
+            .get(&direct)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
+        let spaces: Vec<SpaceId> = aliases.into_iter().filter(|s| self.admitted(s)).collect();
+        if spaces.is_empty() { vec![*space] } else { spaces }
+    }
+
+    /// A logical conversation's stable local identity
+    /// (`ConversationSummary::thread_key`).
+    fn thread_key(&self, spaces: &[SpaceId]) -> String {
+        match self.direct_of(&spaces[0]) {
+            Some(direct) => chat_thread::thread_key(&self.keys.sign_pk(), &direct),
+            None => spaces[0].to_string(),
+        }
     }
 
     fn logical_id(&self, space: &SpaceId) -> ConversationId {
-        self.conversation_spaces(space).first().unwrap_or(space).to_string()
+        self.conversation_spaces(space)[0].to_string()
     }
 
-    fn logical_summary(&self, space: &SpaceId) -> Result<ConversationSummary> {
-        let spaces = self.conversation_spaces(space);
+    /// Unread messages by others in one space: after my read marker,
+    /// neither deleted nor hidden on this device.
+    fn unread_in(&self, space: &SpaceId, view: &ChatView) -> u32 {
+        let me = self.keys.sign_pk();
+        let start = view.read_upto.get(&me).map_or(0, |i| i + 1).min(view.messages.len());
+        let hidden = self.hidden_messages.lock();
+        view.messages[start..]
+            .iter()
+            .filter(|m| m.author != me && !m.deleted && !hidden.contains(&(*space, m.id)))
+            .count() as u32
+    }
+
+    /// The histories of a logical conversation as merge sources, each
+    /// clamped to when this device first saw its space.
+    fn sources<'a>(&self, spaces: &[SpaceId], views: &'a [Arc<ChatView>]) -> Vec<Source<'a>> {
+        let seen = self.first_seen.lock();
+        spaces
+            .iter()
+            .zip(views)
+            .map(|(space, view)| Source { view, floor_ms: seen.get(space).copied().unwrap_or(0) })
+            .collect()
+    }
+
+    /// The newest visible message of a logical conversation, as (source,
+    /// index): O(spaces), no merge.
+    fn merged_last(&self, spaces: &[SpaceId], views: &[Arc<ChatView>]) -> Option<(usize, usize)> {
+        let sources = self.sources(spaces, views);
+        let hidden = self.hidden_messages.lock();
+        chat_thread::last(&sources, |s, m| !m.deleted && !hidden.contains(&(spaces[s], m.id)))
+    }
+
+    fn logical_summary(&self, spaces: &[SpaceId]) -> Result<ConversationSummary> {
         let mut result = self.summary(&spaces[0])?;
         result.aliases = spaces.iter().map(ToString::to_string).collect();
-        if let Some(peer) = self.direct_peer(&spaces[0]) {
-            let mut keys = [self.keys.sign_pk(), peer];
-            keys.sort();
-            let bytes: Vec<_> = keys.into_iter().flat_map(|key| key.0).collect();
-            result.thread_key = format!("direct:{}", Hash32::digest("mycel/v0/direct-thread", &bytes));
+        result.thread_key = self.thread_key(spaces);
+        if spaces.len() == 1 {
+            return Ok(result);
         }
-        for other in &spaces[1..] {
-            let summary = self.summary(other)?;
-            result.unread = result.unread.saturating_add(summary.unread);
-            // A logical chat can post if one original accepted space can.
-            // Grant only the writer UI capability here: admin operations still
-            // refer to the canonical space and keep its actual admin role.
-            if result.my_role == Some(MemberRole::ReadOnly)
-                && matches!(summary.my_role, Some(MemberRole::Admin | MemberRole::Member))
-            {
-                result.my_role = Some(MemberRole::Member);
-            }
-            if summary.last_message.as_ref().map(|m| (m.sent_at, &m.id))
-                > result.last_message.as_ref().map(|m| (m.sent_at, &m.id))
-            {
-                result.last_message = summary.last_message;
-            }
+        let views = spaces.iter().map(|s| self.view(s)).collect::<Result<Vec<_>>>()?;
+        for (space, view) in spaces[1..].iter().zip(&views[1..]) {
+            result.unread = result.unread.saturating_add(self.unread_in(space, view));
         }
-        if spaces.len() > 1 {
-            let entries = self.message_entries(&spaces[0])?;
-            let hidden = self.hidden_messages.lock();
-            result.last_message = entries.into_iter().rev().find_map(|(source, view, index)| {
-                let message = &view.messages[index];
-                (!message.deleted && !hidden.contains(&(source, message.id)))
-                    .then(|| self.message_view(&source, &view, message, &HashSet::new()))
-            });
+        // A logical chat can post if one of its spaces can. Grant only the
+        // writer UI capability: admin operations keep each space's own role.
+        let writable_alias = {
+            let threads = self.threads.lock();
+            spaces[1..].iter().any(|s| {
+                threads.spaces.get(s).is_some_and(|f| f.membership.my_role.is_some_and(Role::can_write))
+            })
+        };
+        if result.my_role == Some(MemberRole::ReadOnly) && writable_alias {
+            result.my_role = Some(MemberRole::Member);
         }
+        result.last_message = self
+            .merged_last(spaces, &views)
+            .map(|(s, i)| self.message_view(&spaces[s], &views[s], &views[s].messages[i], &HashSet::new()));
         Ok(result)
     }
 
@@ -1181,10 +1355,15 @@ impl Runtime {
         bail!("unknown message")
     }
 
-    fn posting_space(&self, space: &SpaceId) -> Result<SpaceId> {
-        self.conversation_spaces(space).into_iter()
-            .find(|source| self.my_role(source).is_some_and(Role::can_write))
-            .ok_or_else(|| anyhow!("you can't post in this conversation"))
+    /// Where a conversation posts and calls: a direct chat's canonical space
+    /// (the same on both devices, `chat_thread::canonical_space`), otherwise
+    /// the conversation itself. Permission is checked by the caller.
+    fn posting_space(&self, space: &SpaceId) -> SpaceId {
+        let spaces = self.conversation_spaces(space);
+        let Some(direct) = self.direct_of(&spaces[0]) else { return spaces[0] };
+        let threads = self.threads.lock();
+        let aliases = spaces.iter().filter_map(|s| Some((*s, &threads.spaces.get(s)?.membership)));
+        chat_thread::canonical_space(&self.keys.sign_pk(), &direct.peer, aliases).unwrap_or(spaces[0])
     }
 
     fn logical_call(&self, mut call: CallInfo) -> CallInfo {
@@ -1198,23 +1377,26 @@ impl Runtime {
         // A stable choice on every device once all spaces have synchronized.
         // Legacy duplicates remain intact so their message history is never
         // discarded by starting another chat.
-        let mut spaces = self.node.space_ids();
-        spaces.sort();
-        for space in spaces {
-            if self.hidden.lock().contains(&space)
-                || self.arriving.lock().contains(&space)
-                || self.requests.lock().contains_key(&space)
-            {
-                continue;
-            }
-            if self.direct_peer(&space) == Some(peer)
-                && self.my_role(&space).is_some_and(Role::can_write)
-                && let Ok(summary) = self.logical_summary(&space)
-            {
-                return Some(summary);
-            }
+        self.settle_threads_with(&self.node.space_ids());
+        let direct = Direct { peer, current: true };
+        let aliases: Vec<SpaceId> = self
+            .threads
+            .lock()
+            .direct
+            .get(&direct)
+            .map(|set| set.iter().copied().collect())
+            .unwrap_or_default();
+        let spaces: Vec<SpaceId> = aliases.into_iter().filter(|s| self.admitted(s)).collect();
+        let writable = {
+            let threads = self.threads.lock();
+            spaces.iter().any(|s| {
+                threads.spaces.get(s).is_some_and(|f| f.membership.my_role.is_some_and(Role::can_write))
+            })
+        };
+        if !writable {
+            return None;
         }
-        None
+        self.logical_summary(&spaces).ok()
     }
 
     pub fn create_conversation(
@@ -1226,6 +1408,10 @@ impl Runtime {
             .iter()
             .map(|m| self.contact_keys(m))
             .collect::<Result<_>>()?;
+        self.create_with(title, keys)
+    }
+
+    fn create_with(&self, title: Option<String>, keys: Vec<MemberKeys>) -> Result<ConversationSummary> {
         let title = title.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
         let direct = title.is_none() && keys.len() == 1;
         let _creation_guard = direct.then(|| self.direct_chat_creation.lock());
@@ -1244,7 +1430,7 @@ impl Runtime {
         })??;
         self.touch(space);
         self.emit(Event::ConversationAdded { conversation: space.to_string() });
-        self.logical_summary(&space)
+        self.logical_summary(&self.conversation_spaces(&space))
     }
 
     pub fn messages(
@@ -1279,26 +1465,12 @@ impl Runtime {
             .collect())
     }
 
+    /// A logical conversation's merged timeline (`chat_thread::merge`).
     fn message_entries(&self, space: &SpaceId) -> Result<Vec<(SpaceId, Arc<ChatView>, usize)>> {
-        let sources: Vec<_> = self.conversation_spaces(space).into_iter()
-            .map(|source| self.view(&source).map(|view| (source, view))).collect::<Result<_>>()?;
-        // Merge the heads of causally ordered histories. A global timestamp
-        // sort would reorder replies before their parents under clock skew.
-        let mut heads = BTreeSet::new();
-        for (source_index, (_, view)) in sources.iter().enumerate() {
-            if let Some(message) = view.messages.first() {
-                heads.insert((message.ts_ms, message.id, source_index, 0));
-            }
-        }
-        let mut entries = Vec::new();
-        while let Some((_, _, source_index, index)) = heads.pop_first() {
-            let (source, view) = &sources[source_index];
-            entries.push((*source, view.clone(), index));
-            if let Some(message) = view.messages.get(index + 1) {
-                heads.insert((message.ts_ms, message.id, source_index, index + 1));
-            }
-        }
-        Ok(entries)
+        let spaces = self.conversation_spaces(space);
+        let views = spaces.iter().map(|s| self.view(s)).collect::<Result<Vec<_>>>()?;
+        let order = chat_thread::merge(&self.sources(&spaces, &views));
+        Ok(order.into_iter().map(|(s, i)| (spaces[s], views[s].clone(), i)).collect())
     }
 
     /// Search the entire locally synchronized history, newest match first.
@@ -1346,7 +1518,7 @@ impl Runtime {
         let reply_to = reply_to.map(|r| parse_hash(&r)).transpose()?;
         let space = match reply_to {
             Some(target) => self.message_space(&requested, &target)?,
-            None => self.posting_space(&requested)?,
+            None => self.posting_space(&requested),
         };
         self.require_member(&space)?;
         if body.trim().is_empty() && attachments.is_empty() {
@@ -1656,7 +1828,7 @@ impl Runtime {
     }
 
     pub fn set_typing(&self, id: ConversationId) -> Result<()> {
-        let space = self.posting_space(&parse_space(&id)?)?;
+        let space = self.posting_space(&parse_space(&id)?);
         self.require_member(&space)?;
         self.node.send_ephemeral(space, ChatSignal::Typing.encode())
     }
@@ -1737,7 +1909,7 @@ impl Runtime {
             self.post(space, ChatOp::Profile { name })?;
         }
         self.emit(Event::ConversationUpdated { conversation: id.clone() });
-        self.logical_summary(&space)
+        self.logical_summary(&self.conversation_spaces(&space))
     }
 
     /// Decline a message request (leave it), optionally blocking the inviter.
@@ -1836,7 +2008,8 @@ impl Runtime {
     /// call is `connecting`); watch `callUpdated` for ringing / active /
     /// ended (`unavailable` if nobody can be reached).
     pub async fn start_call(&self, conversation: ConversationId) -> Result<CallInfo> {
-        let space = parse_space(&self.logical_id(&parse_space(&conversation)?))?;
+        // The space new messages go to: the same on both devices.
+        let space = self.posting_space(&parse_space(&conversation)?);
         self.calls.start(space).await.map(|call| self.logical_call(call))
     }
 
@@ -2466,6 +2639,210 @@ mod tests {
         }
         assert!(!may_record_request(&pending, &second, &space(MAX_PENDING_REQUESTS)));
         assert!(may_record_request(&pending, &first, &space(0)), "existing request survives both limits");
+    }
+
+    /// A direct chat with `peer` as this device creates one, plus a contact.
+    fn direct_space(runtime: &super::Runtime, peer: super::MemberKeys) -> super::SpaceId {
+        use super::*;
+        runtime.contacts.lock().insert(peer.sign_pk, StoredContact { keys: peer, name: "Peer".into() });
+        let (space, _) = runtime.node.create_space().unwrap();
+        runtime.node.with_space(&space, |r| -> Result<()> {
+            r.add_member(peer, Role::Writer)?;
+            r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode())?;
+            Ok(())
+        }).unwrap().unwrap();
+        runtime.touch(space);
+        space
+    }
+
+    fn say(runtime: &super::Runtime, space: super::SpaceId, body: &str) -> String {
+        use super::*;
+        runtime.post(space, ChatOp::Text { body: body.into(), reply_to: None, attachments: vec![] }).unwrap().to_string()
+    }
+
+    async fn scratch_runtime(tag: &str) -> (super::Arc<super::Runtime>, std::path::PathBuf) {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("mycel-{tag}-{}", mycel_crypto::random_u64()));
+        let runtime = Runtime::open(&dir, NetworkMode::Local, Some("Me".into())).await.unwrap();
+        (runtime, dir)
+    }
+
+    async fn finish(runtime: super::Arc<super::Runtime>, dir: std::path::PathBuf) {
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn merged_direct_chat_posts_where_both_people_can_write() {
+        use super::*;
+        let (runtime, dir) = scratch_runtime("canonical").await;
+        let peer = DeviceKeys::generate().public();
+        let (a, b) = (direct_space(&runtime, peer), direct_space(&runtime, peer));
+        let (low, high) = (a.min(b), a.max(b));
+        assert_eq!(runtime.posting_space(&high), low, "both can write everywhere: the lowest space");
+        // The peer can't write in the lowest space any more (made a reader
+        // there). Its history still belongs to the chat, but choosing by my
+        // own role would post where they can't answer and split new history;
+        // both devices instead choose from the same replicated membership.
+        runtime.node.with_space(&low, |r| r.set_role(peer.sign_pk, Role::Reader)).unwrap().unwrap();
+        runtime.touch(low);
+        assert_eq!(runtime.conversations().len(), 1);
+        for alias in [low, high] {
+            assert_eq!(runtime.posting_space(&alias), high);
+        }
+        let sent = runtime.send_message(low.to_string(), "next".into(), None, vec![]).await.unwrap();
+        assert_eq!(sent.conversation, high.to_string());
+        assert_eq!(runtime.conversation(high.to_string()).unwrap().id, low.to_string(), "the chat keeps its id");
+        let mine = runtime.keys.sign_pk();
+        let peers_choice = {
+            let threads = runtime.threads.lock();
+            chat_thread::canonical_space(&peer.sign_pk, &mine, [low, high].iter().map(|s| (*s, &threads.spaces[s].membership)))
+        };
+        assert_eq!(peers_choice, Some(high), "the other device picks the same space");
+        finish(runtime, dir).await;
+    }
+
+    #[tokio::test]
+    async fn an_alias_seen_later_cannot_backdate_into_existing_history() {
+        use super::*;
+        let (runtime, dir) = scratch_runtime("backdate").await;
+        let peer = DeviceKeys::generate().public();
+        // Written first (the earliest timestamps)...
+        let late = direct_space(&runtime, peer);
+        say(&runtime, late, "claims to come first");
+        std::thread::sleep(Duration::from_millis(5));
+        let original = direct_space(&runtime, peer);
+        say(&runtime, original, "old one");
+        std::thread::sleep(Duration::from_millis(5));
+        say(&runtime, original, "old two");
+        // ...but only reached this device after that history was here.
+        runtime.first_seen.lock().extend([(original, 0), (late, now_ms() + 1)]);
+        let id = runtime.logical_id(&original);
+        let bodies = || runtime.messages(id.clone(), None, None).unwrap().into_iter().map(|m| m.body).collect::<Vec<_>>();
+        assert_eq!(bodies(), ["old one", "old two", "claims to come first"]);
+        let summary = runtime.conversation(id.clone()).unwrap();
+        assert_eq!(summary.last_message.unwrap().body, "claims to come first", "the preview agrees with the timeline");
+        // Each history keeps its own order; only the late space is clamped.
+        assert_eq!(runtime.messages(id.clone(), Some(2), None).unwrap()[0].body, "old two");
+        runtime.first_seen.lock().insert(late, 0);
+        assert_eq!(bodies()[0], "claims to come first", "spaces from before the record keep author order");
+        finish(runtime, dir).await;
+    }
+
+    #[tokio::test]
+    async fn first_seen_is_recorded_once_and_older_spaces_keep_their_order() {
+        use super::*;
+        let (runtime, dir) = scratch_runtime("first-seen").await;
+        let peer = DeviceKeys::generate().public();
+        let started = now_ms();
+        let space = direct_space(&runtime, peer);
+        runtime.conversations();
+        let seen = runtime.first_seen.lock()[&space];
+        assert!(seen >= started);
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        let runtime = Runtime::open(&dir, NetworkMode::Local, None).await.unwrap();
+        assert_eq!(runtime.first_seen.lock()[&space], seen, "persisted");
+        // A profile from before the record: its spaces keep author order.
+        runtime.store.kv_batch_durable(vec![("first_seen".into(), None)]).unwrap();
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        let runtime = Runtime::open(&dir, NetworkMode::Local, None).await.unwrap();
+        assert_eq!(runtime.first_seen.lock()[&space], 0);
+        finish(runtime, dir).await;
+    }
+
+    /// `chats` direct chats of `messages` messages each (every fourth person
+    /// started a second chat too), built straight into replicas (in parallel:
+    /// signing dominates).
+    fn crowd(runtime: &super::Runtime, chats: usize, messages: usize) {
+        use super::*;
+        let peers: Vec<(MemberKeys, bool)> =
+            (0..chats).map(|n| (DeviceKeys::generate().public(), n % 4 == 0)).collect();
+        let jobs: Vec<MemberKeys> = peers.iter().flat_map(|(p, two)| std::iter::repeat_n(*p, 1 + usize::from(*two))).collect();
+        let build = |peer: &MemberKeys| {
+            let (mut r, _) = Replica::create(runtime.keys.clone(), None).unwrap();
+            r.add_member(*peer, Role::Writer).unwrap();
+            r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode()).unwrap();
+            for i in 0..messages {
+                let body = format!("message {i}");
+                r.append(messages_feed(), ChatOp::Text { body, reply_to: None, attachments: vec![] }.encode()).unwrap();
+            }
+            r
+        };
+        let replicas: Vec<Replica> = std::thread::scope(|scope| {
+            let workers: Vec<_> = jobs.chunks(jobs.len().div_ceil(4).max(1))
+                .map(|chunk| scope.spawn(move || chunk.iter().map(build).collect::<Vec<_>>()))
+                .collect();
+            workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+        });
+        for r in replicas {
+            let space = runtime.node.insert_replica(r);
+            runtime.invalidate(&space);
+        }
+    }
+
+    /// Finding a chat's aliases, listing chats and handling events must not
+    /// reread message histories: O(1) per event, O(chats) per listing.
+    #[tokio::test]
+    async fn thread_lookups_and_events_never_reread_history() {
+        use super::*;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (runtime, dir) = scratch_runtime("lookups").await;
+        crowd(&runtime, 24, 20);
+        let list = runtime.conversations();
+        assert_eq!(list.len(), 24);
+        assert_eq!(list.iter().filter(|c| c.aliases.len() == 2).count(), 6);
+        let reads = runtime.history_reads.load(Relaxed);
+        for _ in 0..3 {
+            assert_eq!(runtime.conversations().len(), 24);
+        }
+        for space in runtime.node.space_ids() {
+            runtime.emit(Event::ConversationUpdated { conversation: space.to_string() });
+            runtime.emit(Event::Typing { conversation: space.to_string(), peer: String::new() });
+            assert!(runtime.message_entries(&space).is_ok());
+        }
+        assert_eq!(runtime.history_reads.load(Relaxed), reads, "no history was reread");
+        // A new message rereads only its own space's history.
+        let space = runtime.node.space_ids()[0];
+        say(&runtime, space, "new");
+        runtime.emit(Event::ConversationUpdated { conversation: space.to_string() });
+        runtime.conversations();
+        assert_eq!(runtime.history_reads.load(Relaxed), reads + 1);
+        finish(runtime, dir).await;
+    }
+
+    /// `MYCEL_BENCH_CHATS=200 MYCEL_BENCH_MESSAGES=1000 cargo test -p mycel-node
+    /// --lib many_large_chats -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "benchmark"]
+    async fn many_large_chats_list_and_emit_quickly() {
+        use super::*;
+        let size = |var: &str, default: usize| std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default);
+        let (chats, messages) = (size("MYCEL_BENCH_CHATS", 200), size("MYCEL_BENCH_MESSAGES", 1000));
+        let (runtime, dir) = scratch_runtime("bench").await;
+        let built = Instant::now();
+        crowd(&runtime, chats, messages);
+        let built = built.elapsed();
+        let first = Instant::now();
+        assert_eq!(runtime.conversations().len(), chats);
+        let first = first.elapsed();
+        let rounds = size("MYCEL_BENCH_ROUNDS", 10).max(1);
+        let listing = Instant::now();
+        for _ in 0..rounds {
+            runtime.conversations();
+        }
+        let listing = listing.elapsed() / rounds as u32;
+        let spaces = runtime.node.space_ids();
+        let emitting = Instant::now();
+        for space in &spaces {
+            runtime.emit(Event::ConversationUpdated { conversation: space.to_string() });
+        }
+        let per_event = emitting.elapsed() / spaces.len() as u32;
+        eprintln!("{chats} chats ({} spaces) x {messages} messages: built in {built:?}; first listing {first:?}; \
+            conversations() {listing:?}; ConversationUpdated emit {per_event:?} per event", spaces.len());
+        finish(runtime, dir).await;
     }
 
     use super::sanitize_file_name as s;

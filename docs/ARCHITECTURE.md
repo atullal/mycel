@@ -173,7 +173,7 @@ Building blocks:
 
 | Kit | Provides | Used by |
 |---|---|---|
-| **Chat** | threads, replies, reactions, edits/deletes, read receipts | Messaging, Newsroom (story chat), Docs (comments), RPG (party chat) |
+| **Chat** | threads, replies, reactions, edits/deletes, read receipts; one chat per person across independently created spaces (`thread`) | Messaging, Newsroom (story chat), Docs (comments), RPG (party chat) |
 | **RichText** | ProseMirror ↔ Automerge, marks, comments anchored to text, suggestions | Docs, Newsroom |
 | **Workflow** | role-gated state machines, sign-offs, audit trail | Newsroom, Docs (approvals), RPG (turn phases) |
 | **Presence** | cursors, who's-here, typing, selection | all four |
