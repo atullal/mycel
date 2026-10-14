@@ -216,6 +216,15 @@ without review, with CI red, and it broke things. The review found these, and
 - **Platform layering:** the host no longer imports the messaging app's
   source, and the history-hook harness (with a machine-specific path) is
   gone.
+- **Calls and mesh:** the two ends of a connection can pick different
+  network paths, and only the side that dialed can open paths. So a call
+  participant's path could stay unknown for the whole call. That left the
+  bitrate cap at the network default and RTT reading 0. The same flaw on a
+  mesh hop meant routing couldn't tell a Bluetooth hop from a LAN hop, and
+  relayed frames were held to the minimum queue. Both now use the path that
+  carries the traffic. This was the cause of the intermittent
+  `group_call_between_runtimes` failure: it now passes 62 of 62 runs under
+  heavy load, and call glare 20 of 20.
 - **iPhone LAN discovery:** iPhones now use the system's Bonjour, so no
   multicast entitlement is needed. Checked on an iPhone 17 Pro. A patched
   `swarm-discovery` lets iroh's mDNS and Bonjour see each other.
