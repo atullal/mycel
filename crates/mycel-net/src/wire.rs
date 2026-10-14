@@ -58,12 +58,20 @@ impl StreamKind {
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 /// Blob requests and answers and contact cards are a few hundred bytes.
 pub(crate) const MAX_SMALL_FRAME: usize = 4 * 1024;
-/// Typing/presence plaintext limit; a full 1024-event queue holds at most
-/// 4 MiB of ephemeral payloads. Media uses separate protocols.
-pub const MAX_EPHEMERAL: usize = 4 * 1024;
-pub(crate) const MAX_EPHEMERAL_CIPHERTEXT: usize = MAX_EPHEMERAL + 16;
-// Space, epoch, nonce and postcard length-prefix overhead fit in 128 bytes.
-pub(crate) const MAX_EPHEMERAL_FRAME: usize = MAX_EPHEMERAL + 128;
+/// The largest ephemeral payload a node sends or takes by default
+/// ([`crate::NodeOptions::max_ephemeral`]). Ephemeral channels carry
+/// whatever apps share live and don't keep: typing and presence, cursors
+/// and selections in a shared document, a game's moving state. Media uses
+/// separate protocols.
+pub const MAX_EPHEMERAL: usize = 64 * 1024;
+/// Sealing adds a 16-byte tag ...
+pub(crate) const fn max_ephemeral_ciphertext(max_plain: usize) -> usize {
+    max_plain + 16
+}
+/// ... and space, epoch, nonce and postcard length prefixes fit in 128 bytes.
+pub(crate) const fn max_ephemeral_frame(max_plain: usize) -> usize {
+    max_plain + 128
+}
 
 /// Count encoded bytes without allocating, stopping at the caller's budget.
 pub(crate) fn encoded_size<T: Serialize + ?Sized>(msg: &T, max: usize) -> Result<usize> {
@@ -136,11 +144,15 @@ pub(crate) async fn recv_small<T: DeserializeOwned>(r: &mut RecvStream, wait: Du
     Ok(recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, MAX_SMALL_FRAME, frames).await?.0)
 }
 
-pub(crate) async fn recv_ephemeral<R: AsyncRead + Unpin>(r: &mut R, frames: &PeerFrames) -> Result<(EphMsg, FramePermit)> {
+/// An ephemeral message of up to `max_plain` bytes: sizes are checked
+/// before anything is decrypted.
+pub(crate) async fn recv_ephemeral<R: AsyncRead + Unpin>(
+    r: &mut R, frames: &PeerFrames, max_plain: usize,
+) -> Result<(EphMsg, FramePermit)> {
     let (msg, permit): (EphMsg, _) = recv_frame(
-        r, crate::resources::FIRST_FRAME, crate::resources::IDLE_TIMEOUT, MAX_EPHEMERAL_FRAME, frames,
+        r, crate::resources::FIRST_FRAME, crate::resources::IDLE_TIMEOUT, max_ephemeral_frame(max_plain), frames,
     ).await?;
-    if msg.ciphertext.len() > MAX_EPHEMERAL_CIPHERTEXT { bail!("ephemeral message too large"); }
+    if msg.ciphertext.len() > max_ephemeral_ciphertext(max_plain) { bail!("ephemeral message too large"); }
     Ok((msg, permit))
 }
 
@@ -230,7 +242,7 @@ impl ContactCard {
     }
 }
 
-/// Ephemeral message (typing, presence), encrypted under the space's current epoch.
+/// Ephemeral message (presence, cursors, live state), encrypted under the space's current epoch.
 /// The sender is the authenticated QUIC peer, so no extra signature is needed.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EphMsg {
@@ -530,16 +542,17 @@ mod security_tests {
 
     #[tokio::test]
     async fn security_ephemeral_ciphertext_and_frame_limits_precede_decryption() {
-        for length in [MAX_EPHEMERAL_CIPHERTEXT, MAX_EPHEMERAL_CIPHERTEXT + 1] {
+        let ciphertext_max = max_ephemeral_ciphertext(MAX_EPHEMERAL);
+        for length in [ciphertext_max, ciphertext_max + 1] {
             let msg = EphMsg { space: Hash32([0; 32]), epoch: EpochId([1; 16]), nonce: [0; 24], ciphertext: vec![0; length] };
             let encoded = postcard::to_allocvec(&msg).unwrap();
             let bytes = [(encoded.len() as u32).to_le_bytes().as_slice(), &encoded].concat();
-            let received = recv_ephemeral(&mut std::io::Cursor::new(bytes), &PeerFrames::unbudgeted()).await;
-            assert_eq!(received.is_ok(), length == MAX_EPHEMERAL_CIPHERTEXT);
+            let received = recv_ephemeral(&mut std::io::Cursor::new(bytes), &PeerFrames::unbudgeted(), MAX_EPHEMERAL).await;
+            assert_eq!(received.is_ok(), length == ciphertext_max);
         }
         // Reject the declaration alone, before allocating/decoding its body.
-        let bytes = ((MAX_EPHEMERAL_FRAME + 1) as u32).to_le_bytes().to_vec();
-        let error = match recv_ephemeral(&mut std::io::Cursor::new(bytes), &PeerFrames::unbudgeted()).await {
+        let bytes = ((max_ephemeral_frame(MAX_EPHEMERAL) + 1) as u32).to_le_bytes().to_vec();
+        let error = match recv_ephemeral(&mut std::io::Cursor::new(bytes), &PeerFrames::unbudgeted(), MAX_EPHEMERAL).await {
             Err(error) => error,
             Ok(_) => panic!("oversized ephemeral frame accepted"),
         };

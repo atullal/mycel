@@ -319,3 +319,58 @@ async fn first_sync_with_an_inviter_brings_a_large_history() {
     carol.shutdown().await.unwrap();
     bob.shutdown().await.unwrap();
 }
+
+/// Ephemeral channels carry what apps share live: a typing flag, but also
+/// cursors in a document or a game's state, kilobytes at a time. A device
+/// set to take less drops bigger ones unread (and won't send them).
+#[tokio::test(flavor = "multi_thread")]
+async fn ephemeral_messages_carry_live_state() {
+    let mut small = NodeOptions::new(NetMode::Local, "small");
+    small.max_ephemeral = 1024;
+    let carol = Node::spawn(Arc::new(DeviceKeys::generate()), small).await.unwrap();
+    let mut nodes = mesh(2).await;
+    let bob = nodes.pop().unwrap();
+    let alice = nodes.pop().unwrap();
+    for n in [&alice, &bob] {
+        n.add_peer_addr(carol.addr());
+        carol.add_peer_addr(n.addr());
+    }
+    let (space, genesis) = alice.create_space().unwrap();
+    alice
+        .with_space(&space, |r| {
+            r.add_member(bob.keys().public(), Role::Writer)?;
+            r.add_member(carol.keys().public(), Role::Writer)
+        })
+        .unwrap()
+        .unwrap();
+    for n in [&bob, &carol] {
+        n.join_space(genesis.clone()).unwrap();
+        n.sync_with(alice.id(), space, true).await.unwrap();
+    }
+    let received = |node: &Node| {
+        let mut events = node.subscribe();
+        async move {
+            let mut got = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(NetEvent::Ephemeral { data, .. }) = events.recv().await {
+                        got.push(data.len());
+                    }
+                }
+            })
+            .await;
+            got
+        }
+    };
+    let (at_bob, at_carol) = (received(&bob), received(&carol));
+    let state: Vec<u8> = (0..48 * 1024).map(|i| i as u8).collect();
+    alice.send_ephemeral(space, state).unwrap();
+    alice.send_ephemeral(space, vec![1; 512]).unwrap();
+    let (at_bob, at_carol) = tokio::join!(at_bob, at_carol);
+    assert_eq!(at_bob.iter().copied().collect::<std::collections::BTreeSet<_>>(), [512, 48 * 1024].into());
+    assert_eq!(at_carol, vec![512], "carol drops what is bigger than she takes");
+    assert!(carol.send_ephemeral(space, vec![0; 1025]).is_err());
+    for n in [alice, bob, carol] {
+        n.shutdown().await.unwrap();
+    }
+}

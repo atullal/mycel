@@ -139,6 +139,12 @@ pub struct NodeOptions {
     pub extra_protocols: Vec<ExtraProtocol>,
     /// Multi-hop relaying through nearby devices (`mesh.rs`); `None` = off.
     pub mesh: Option<MeshOptions>,
+    /// The largest ephemeral payload sent or taken ([`MAX_EPHEMERAL`] by
+    /// default; at most [`wire::MAX_FRAME`] less overhead). A device drops
+    /// bigger ones unread, so an app that needs more raises it on every
+    /// device. What is queued for the app (up to 1024 events) can hold
+    /// that much per event.
+    pub max_ephemeral: usize,
 }
 
 /// Another protocol served on the node's endpoint: incoming connections with
@@ -166,6 +172,7 @@ impl NodeOptions {
             ip: true,
             extra_protocols: Vec::new(),
             mesh: None,
+            max_ephemeral: MAX_EPHEMERAL,
         }
     }
 }
@@ -264,6 +271,8 @@ struct Inner {
     blob_served: AtomicU64,
     /// The last store-and-forward bundle sent per (member, space).
     bundled: Mutex<HashMap<(SignPk, SpaceId), Hash32>>,
+    /// See [`NodeOptions::max_ephemeral`].
+    max_ephemeral: usize,
     /// Memory for what devices send us: those we share a space with, and
     /// the rest (`resources.rs`).
     member_frames: resources::Frames,
@@ -809,7 +818,7 @@ async fn serve_card(inner: &Arc<Inner>, mut tx: SendStream) -> Result<()> {
 }
 
 async fn serve_eph(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) -> Result<()> {
-    let (msg, _permit) = recv_ephemeral(&mut rx, &inner.frames(&peer)).await?;
+    let (msg, _permit) = recv_ephemeral(&mut rx, &inner.frames(&peer), inner.max_ephemeral).await?;
     let data = inner.with_space(&msg.space, |r| {
         if !r.is_member(&peer) {
             return None;
@@ -1207,6 +1216,7 @@ impl Node {
             accepted: AtomicU64::new(0),
             blob_served: AtomicU64::new(0),
             bundled: Mutex::default(),
+            max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
             member_frames: resources::Frames::members(),
             stranger_frames: resources::Frames::strangers(),
         });
@@ -1470,9 +1480,9 @@ impl Node {
     }
 
     /// Fire-and-forget an encrypted ephemeral message to online members.
-    /// Typing/presence payloads are limited to [`MAX_EPHEMERAL`] bytes.
+    /// Payloads are limited to [`NodeOptions::max_ephemeral`] bytes.
     pub fn send_ephemeral(&self, space: SpaceId, data: Vec<u8>) -> Result<()> {
-        anyhow::ensure!(data.len() <= MAX_EPHEMERAL, "ephemeral message too large");
+        anyhow::ensure!(data.len() <= self.inner.max_ephemeral, "ephemeral message too large");
         let me = self.id();
         let (msg, members) = self.with_space(&space, |r| {
             let sealed = r.seal_ephemeral(&eph_aad(&space, &me.0), &data);
