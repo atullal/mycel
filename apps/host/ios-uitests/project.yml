@@ -1,6 +1,6 @@
 # UI tests for the iOS app (not part of the app): `xcodegen generate` here,
 # then see docs/PLATFORMS.md. The Host app only exists because Xcode wants a
-# target app; the tests drive the installed Mycel (dev.mycel.host).
+# target app; the tests drive the installed Mycel (com.atullal.mycel).
 name: MycelUITests
 options:
   bundleIdPrefix: dev.mycel.uitests

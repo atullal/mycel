@@ -1,6 +1,6 @@
 import XCTest
 
-/// Drives the installed Mycel app (dev.mycel.host) through its real UI with
+/// Drives the installed Mycel app (com.atullal.mycel) through its real UI with
 /// the on-screen keyboard. Needs a conversation with the contact named in
 /// MYCEL_CONTACT (default "Desk Test"); see docs/PLATFORMS.md.
 final class KeyboardTests: XCTestCase {
@@ -13,7 +13,7 @@ final class KeyboardTests: XCTestCase {
 
     func testReplyWithTheOnScreenKeyboard() throws {
         let contact = ProcessInfo.processInfo.environment["MYCEL_CONTACT"] ?? "Desk Test"
-        let app = XCUIApplication(bundleIdentifier: "dev.mycel.host")
+        let app = XCUIApplication(bundleIdentifier: "com.atullal.mycel")
         app.launch()
         let row = app.staticTexts[contact].firstMatch
         XCTAssert(row.waitForExistence(timeout: 20), "the conversation with \(contact) is listed")

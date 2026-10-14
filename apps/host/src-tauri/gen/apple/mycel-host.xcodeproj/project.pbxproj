@@ -23,6 +23,7 @@
 		7158F7D9A0E3175227D5F9C2 /* CoreMedia.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AB39F84949BAF13ABCFBBBC1 /* CoreMedia.framework */; };
 		74DEEB8A18334D5B97C71F89 /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 679763AB647C60B15B6FDD93 /* AVFoundation.framework */; };
 		8B3907D2367E80EF0C53B047 /* CoreVideo.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 295924B2D0781FC5A55540A7 /* CoreVideo.framework */; };
+		8C99BC20FEFA18020476AE27 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 43F15A67A362EAD0C81E7FC0 /* PrivacyInfo.xcprivacy */; };
 		942E1DC59B2DFA7565233AB2 /* VideoToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 140E1446C2A0F30FBAB5FEAF /* VideoToolbox.framework */; };
 		A9D14FED31C5EC0538FAFD65 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = FDC4E509A7735B5C449D2BDE /* CoreGraphics.framework */; };
 		B64EC3162C52762530942CA3 /* Network.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AB0834A1176DECD442A96363 /* Network.framework */; };
@@ -37,7 +38,9 @@
 		2204F13D38537B628284E8EB /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		25619DBB3DECB15CF1D8AE39 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		295924B2D0781FC5A55540A7 /* CoreVideo.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreVideo.framework; path = System/Library/Frameworks/CoreVideo.framework; sourceTree = SDKROOT; };
+		3555E2C7BAB07835BBE13FBF /* notify.rs */ = {isa = PBXFileReference; path = notify.rs; sourceTree = "<group>"; };
 		3781B1EEFDD85EE7ADFA2A94 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		43F15A67A362EAD0C81E7FC0 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		456310891DC9817B03F81E18 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
 		490F4E0794B72DF85E5C0D13 /* AudioToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AudioToolbox.framework; path = System/Library/Frameworks/AudioToolbox.framework; sourceTree = SDKROOT; };
 		4C30C1CA7EE81CFD176CEB19 /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
@@ -104,6 +107,7 @@
 				8F7354FFAC6516F993507ACA /* commands.rs */,
 				53A6196748E3ECE412ED67DB /* lib.rs */,
 				4C30C1CA7EE81CFD176CEB19 /* main.rs */,
+				3555E2C7BAB07835BBE13FBF /* notify.rs */,
 				916D698AAC9440D4E351E388 /* open_file.rs */,
 			);
 			name = src;
@@ -125,6 +129,7 @@
 				782DC6CEC25A603744C016AF /* assets */,
 				B81AFB5AF7FDD0E5767D6800 /* Assets.xcassets */,
 				BCB5A42EA6A0A31A5D1F76FA /* LaunchScreen.storyboard */,
+				43F15A67A362EAD0C81E7FC0 /* PrivacyInfo.xcprivacy */,
 				D654AB042960BE001151FF69 /* Externals */,
 				3B468C85470A77249C7AB54B /* mycel-host_iOS */,
 				9BEC91D2EBE8E476ED299028 /* Sources */,
@@ -253,6 +258,7 @@
 			files = (
 				69E599B493ED66268B5070A4 /* Assets.xcassets in Resources */,
 				6338B22365CF928DC5F58B4D /* LaunchScreen.storyboard in Resources */,
+				8C99BC20FEFA18020476AE27 /* PrivacyInfo.xcprivacy in Resources */,
 				60D7FD85D5EBEAD5CEBFA116 /* assets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -319,7 +325,7 @@
 				);
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.mycel.host;
+				PRODUCT_BUNDLE_IDENTIFIER = com.atullal.mycel;
 				PRODUCT_NAME = "Mycel";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
@@ -470,7 +476,7 @@
 				);
 				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
 				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
-				PRODUCT_BUNDLE_IDENTIFIER = dev.mycel.host;
+				PRODUCT_BUNDLE_IDENTIFIER = com.atullal.mycel;
 				PRODUCT_NAME = "Mycel";
 				SDKROOT = iphoneos;
 				TARGETED_DEVICE_FAMILY = "1,2";
