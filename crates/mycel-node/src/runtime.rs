@@ -132,6 +132,8 @@ pub struct Runtime {
     hints: Mutex<BTreeMap<SignPk, Vec<String>>>,
     /// Live voice calls (not on keepers).
     calls: CallManager,
+    /// What startup recovered from (see `notices`).
+    notices: Mutex<Vec<Notice>>,
 }
 
 /// What calls need from the runtime: membership, names, dialing, events.
@@ -395,7 +397,12 @@ impl Runtime {
     pub async fn open_with(opts: RuntimeOptions) -> Result<Arc<Runtime>> {
         let dir = opts.data_dir;
         let profile_lock = crate::identity::ProfileLock::acquire(&dir)?;
-        let keys = Arc::new(crate::identity::load(&dir, &profile_lock)?);
+        let identity = crate::identity::load(&dir, &profile_lock)?;
+        let keys = Arc::new(identity.keys);
+        let mut notices = Vec::new();
+        if let Some(kept) = identity.replaced {
+            notices.push(Notice::IdentityReplaced { kept_in: kept.display().to_string() });
+        }
         // Validate persisted mode before opening any network transport.
         let next_mode = Self::saved_network_mode(&dir)?.unwrap_or(opts.mode);
         let store = DbStore::open(dir.join("mycel.redb"))?;
@@ -543,6 +550,7 @@ impl Runtime {
             blocked,
             hints: Mutex::new(hints),
             calls: CallManager::new(Arc::new(RuntimeCallHost { me, rt: weak.clone() })),
+            notices: Mutex::new(notices),
         });
         if !rt.keeper {
             rt.calls.serve(call_rx);
@@ -582,6 +590,11 @@ impl Runtime {
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// Problems the user should know about (see [`Notice`]).
+    pub fn notices(&self) -> Vec<Notice> {
+        self.notices.lock().clone()
     }
 
     pub fn node(&self) -> &Node {

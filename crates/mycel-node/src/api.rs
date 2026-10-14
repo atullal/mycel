@@ -211,6 +211,32 @@ pub enum TransferDirection {
     Download,
 }
 
+/// Something the user should know about: a problem Mycel recovered from, or
+/// one that is still going on. [`crate::Runtime::notices`] lists the current
+/// ones; [`Event::NoticesChanged`] says the list changed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum Notice {
+    /// This profile's identity isn't on this device (the profile was restored
+    /// or moved from another device), so Mycel started a new identity:
+    /// contacts need the new contact code. The old profile is kept, unchanged,
+    /// in the folder `kept_in`.
+    #[serde(rename_all = "camelCase")]
+    IdentityReplaced { kept_in: String },
+    /// The saved network choice couldn't be read, so Mycel uses local paths
+    /// only (the most private choice) until another one is chosen.
+    NetworkModeReset,
+    /// `count` saved records couldn't be read. They were set aside (kept, not
+    /// deleted) so Mycel could start; the conversations they belong to may
+    /// miss some history until peers sync it again.
+    #[serde(rename_all = "camelCase")]
+    RecordsSetAside { count: u64 },
+    /// Saving to this device is failing (for example, storage is full). Mycel
+    /// keeps retrying; new messages can't be sent until saving works again.
+    #[serde(rename_all = "camelCase")]
+    StorageFailing { error: String },
+}
+
 /// Pushed to UIs (Tauri event `mycel://event`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -241,4 +267,6 @@ pub enum Event {
     /// while active (for the duration and level meters).
     #[serde(rename_all = "camelCase")]
     CallUpdated { call: CallInfo },
+    /// The list of [`Notice`]s changed: fetch it again with `notices`.
+    NoticesChanged,
 }
