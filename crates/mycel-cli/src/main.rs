@@ -266,7 +266,8 @@ async fn api_events(State(app): State<Shared>, headers: HeaderMap, Query(q): Que
         return r;
     }
     let stream = BroadcastStream::new(app.rt.subscribe()).filter_map(|ev| {
-        let ev = ev.ok()?;
+        // Alerts are for native shells (OS notifications), not pages.
+        let ev = ev.ok().filter(|ev| !ev.is_for_shell())?;
         let data = serde_json::to_string(&ev).ok()?;
         Some(Ok::<_, std::convert::Infallible>(SseEvent::default().data(data)))
     });

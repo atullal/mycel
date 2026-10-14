@@ -1,15 +1,26 @@
-//! Private local alerts for incoming unread messages, requests and calls.
-//! iOS can only generate these while its process is running; this is not a
-//! remote push service. No names, message text or private IDs reach the OS.
+//! The OS side of private local alerts.
+//!
+//! The chat layer decides what is news (`mycel_kit_chat::alerts`) and emits
+//! `Event::Alert` / `Event::AlertWithdrawn`; this bridge holds no messaging
+//! rules. It only:
+//! - shows each alert kind as one fixed, generic sentence: no names, text,
+//!   conversation IDs or payload reach the OS;
+//! - routes taps through opaque OS ids that are never reused;
+//! - suppresses alerts about what's on screen while the app is focused;
+//! - asks for permission in the foreground.
+//!
+//! OS calls run on one worker thread, never on the async runtime that
+//! forwards events (Tauri's mobile bridge blocks on the main thread).
+//! iOS can only post these while its process is running: this is not a
+//! remote push service.
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::collections::BTreeMap;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 
-use mycel_node::api::{
-    CallDirection, CallEndReason, CallInfo, CallPhase, ConversationSummary, Event, MessageId,
-};
+use mycel_node::api::{Alert, AlertKind, Event};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, State};
 #[cfg(not(target_os = "android"))]
@@ -17,364 +28,326 @@ use tauri_plugin_notification::NotificationExt;
 
 use crate::Rt;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Notification {
-    Message,
-    MessageRequest,
-    GroupInvitation,
-    IncomingCall,
-    MissedCall,
+/// All the OS ever shows: one fixed sentence per kind.
+fn content(kind: AlertKind) -> (&'static str, &'static str) {
+    (
+        "Mycel",
+        match kind {
+            AlertKind::Message => "New message",
+            AlertKind::MessageRequest => "New message request",
+            AlertKind::GroupInvitation => "New group invitation",
+            AlertKind::IncomingCall => "Incoming call",
+            AlertKind::MissedCall => "Missed call",
+        },
+    )
 }
 
-impl Notification {
-    fn content(self) -> (&'static str, &'static str) {
-        (
-            "Mycel",
-            match self {
-                Self::Message => "New message",
-                Self::MessageRequest => "New message request",
-                Self::GroupInvitation => "New group invitation",
-                Self::IncomingCall => "Incoming call",
-                Self::MissedCall => "Missed call",
-            },
-        )
+/// Delivered alerts that stay routable.
+const MAX_ROUTES: usize = 256;
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Route {
+    /// What a tap opens (resolved again by the runtime when tapped).
+    target: String,
+    thread: String,
+    key: String,
+}
+
+/// Opaque OS notification ids and what they open. Kept only in Mycel's
+/// sandbox, across restarts. Ids are never reused: `last_id` only grows, and
+/// a table that can't be read starts over at a random point after clearing
+/// delivered alerts, so an old retained alert can never open another chat.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct Routes {
+    last_id: i32,
+    entries: BTreeMap<i32, Route>,
+}
+
+/// Delivered alerts to take off the screen.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Removal {
+    ids: Vec<i32>,
+    /// Every delivered alert (the ids started over).
+    all: bool,
+}
+
+impl Removal {
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty() && !self.all
     }
 }
 
-/// IDs supplied to the OS have no relationship to conversation or peer IDs.
-/// The routing table lives only in Mycel's sandbox and survives a restart.
-#[derive(Default, Serialize, Deserialize)]
-struct Targets {
-    next_id: i32,
-    entries: BTreeMap<i32, String>,
-}
+impl Routes {
+    /// A new table whose ids can't meet those of a lost one (well clear of
+    /// `i32::MAX`, so it won't wrap in practice either).
+    fn fresh() -> Routes {
+        let start = 1 + (mycel_node::crypto::random_u64() % (1 << 30)) as i32;
+        Routes { last_id: start, entries: BTreeMap::new() }
+    }
 
-impl Targets {
-    fn insert(&mut self, conversation: &str) -> i32 {
-        // Never reuse an old ID for another chat, including IDs evicted below.
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .filter(|id| *id > 0)
-            .unwrap_or(1);
-        while self.entries.contains_key(&self.next_id) {
-            self.next_id = self.next_id.checked_add(1).unwrap_or(1);
+    /// The table on disk, or a fresh one (`true`) if missing or unreadable:
+    /// delivered alerts can then no longer be routed and must be cleared.
+    fn load(path: &Path) -> (Routes, bool) {
+        let stored = std::fs::read(path)
+            .ok()
+            .and_then(|data| serde_json::from_slice::<Routes>(&data).ok())
+            .filter(|routes| routes.last_id > 0 && routes.entries.keys().all(|id| *id > 0 && *id <= routes.last_id));
+        match stored {
+            Some(routes) => (routes, false),
+            None => (Routes::fresh(), true),
         }
-        let id = self.next_id;
-        self.entries.insert(id, conversation.into());
-        while self.entries.len() > 256 {
-            if let Some(old) = self.entries.keys().next().copied() {
-                self.entries.remove(&old);
+    }
+
+    fn add(&mut self, route: Route) -> (i32, Removal) {
+        let mut removal = Removal::default();
+        let id = match self.last_id.checked_add(1) {
+            Some(id) => id,
+            None => {
+                // Two billion alerts later: start over with a clean screen.
+                self.entries.clear();
+                removal.all = true;
+                1
+            }
+        };
+        self.last_id = id;
+        self.entries.insert(id, route);
+        while self.entries.len() > MAX_ROUTES {
+            if let Some((old, _)) = self.entries.pop_first() {
+                removal.ids.push(old);
             }
         }
-        id
+        (id, removal)
+    }
+
+    fn take(&mut self, matches: impl Fn(&Route) -> bool) -> Vec<i32> {
+        let ids: Vec<i32> = self.entries.iter().filter(|(_, r)| matches(r)).map(|(id, _)| *id).collect();
+        for id in &ids {
+            self.entries.remove(id);
+        }
+        ids
     }
 }
 
-#[derive(Default)]
+/// Write a whole file so a crash leaves the old or the new contents, both
+/// on disk (file and directory synced).
+fn write_durably(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let temp = path.with_extension("json.tmp");
+    let mut file = std::fs::File::create(&temp)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&temp, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
+enum Job {
+    /// Clear delivered alerts the table can't route.
+    Startup { fresh: bool },
+    Show(Alert),
+    Withdraw { thread: String, key: Option<String> },
+}
+
 pub struct Notifier {
     away: AtomicBool,
-    visible_conversation: Mutex<Option<String>>,
-    // Keep a short history so deleting the newest message does not alert
-    // again about the older message that becomes the conversation preview.
-    seen: Mutex<HashMap<String, VecDeque<MessageId>>>,
-    requests_seen: Mutex<HashSet<String>>,
-    calls_seen: Mutex<HashSet<(String, bool)>>,
-    active: Mutex<HashMap<String, i32>>,
-    targets: Mutex<Targets>,
-    targets_path: Option<PathBuf>,
+    /// The alert thread on screen (`set_notification_context`).
+    visible: Mutex<Option<String>>,
+    routes: Mutex<Routes>,
+    path: Option<PathBuf>,
+    jobs: Mutex<Option<mpsc::Sender<Job>>>,
     #[cfg_attr(target_os = "android", allow(dead_code))]
     asked: AtomicBool,
 }
 
 impl Notifier {
-    pub fn new(rt: &Rt) -> Notifier {
-        let conversations = rt.conversations();
-        let requests_seen = conversations
-            .iter()
-            .filter(|c| c.request)
-            .map(|c| c.thread_key.clone())
-            .collect();
-        let seen = conversations
-            .into_iter()
-            .filter_map(|c| {
-                c.last_message
-                    .map(|m| (c.thread_key, VecDeque::from([m.id])))
-            })
-            .collect();
-        let path = rt.data_dir().join("notification-targets.json");
-        let targets = std::fs::read(&path)
-            .ok()
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or_default();
+    fn with_routes(routes: Routes, path: Option<PathBuf>) -> Notifier {
         Notifier {
-            seen: Mutex::new(seen),
-            requests_seen: Mutex::new(requests_seen),
-            targets: Mutex::new(targets),
-            targets_path: Some(path),
-            ..Notifier::default()
+            away: AtomicBool::new(false),
+            visible: Mutex::new(None),
+            routes: Mutex::new(routes),
+            path,
+            jobs: Mutex::new(None),
+            asked: AtomicBool::new(false),
         }
+    }
+
+    /// Start the OS bridge: its worker thread performs every OS call.
+    pub fn start(app: AppHandle, data_dir: &Path) -> Arc<Notifier> {
+        let path = data_dir.join("notification-targets.json");
+        let (routes, fresh) = Routes::load(&path);
+        let notifier = Arc::new(Notifier::with_routes(routes, Some(path)));
+        let (tx, rx) = mpsc::channel();
+        let _ = tx.send(Job::Startup { fresh });
+        *notifier.jobs.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        let worker = Arc::downgrade(&notifier);
+        std::thread::Builder::new()
+            .name("mycel-notify".into())
+            .spawn(move || {
+                for job in rx {
+                    let Some(notifier) = worker.upgrade() else { return };
+                    // A failing OS call must not stop later alerts.
+                    let run = std::panic::AssertUnwindSafe(|| notifier.run(&app, job));
+                    if std::panic::catch_unwind(run).is_err() {
+                        eprintln!("mycel-host: a notification task failed");
+                    }
+                }
+            })
+            .expect("notification thread");
+        notifier
     }
 
     pub fn set_away(&self, away: bool) {
         self.away.store(away, Ordering::Relaxed);
     }
 
-    fn viewing(&self, conversation: &str) -> bool {
-        !self.away.load(Ordering::Relaxed)
-            && self
-                .visible_conversation
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_deref()
-                == Some(conversation)
-    }
-
-    fn viewing_summary(&self, conversation: &ConversationSummary) -> bool {
-        if self.away.load(Ordering::Relaxed) {
-            return false;
-        }
-        let visible = self
-            .visible_conversation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        visible.as_ref().is_some_and(|key| {
-            key == &conversation.thread_key || conversation.aliases.contains(key)
-        })
-    }
-
-    pub fn on_event(&self, app: &AppHandle, rt: &Rt, event: &Event) {
+    /// Hand a shell event to the worker. Never blocks.
+    pub fn on_event(&self, event: &Event) {
         match event {
-            Event::ConversationUpdated { conversation }
-            | Event::ConversationAdded { conversation } => {
-                let Ok(summary) = rt.conversation(conversation.clone()) else {
-                    return;
-                };
-                if summary.unread == 0 || self.viewing_summary(&summary) {
-                    self.clear_conversation(app, &summary);
-                }
-                if let Some(notification) = self.for_conversation(&summary) {
-                    self.show(
-                        app,
-                        notification,
-                        &summary.id,
-                        &format!("message:{}", summary.thread_key),
-                    );
-                }
-            }
-            Event::CallIncoming { call } => {
-                if let Some(notification) = self.for_call(call, true) {
-                    self.show(
-                        app,
-                        notification,
-                        &call.conversation,
-                        &format!("call:{}", call.id),
-                    );
-                }
-            }
-            Event::CallUpdated { call } => {
-                // An answered/declined/ended call must not remain an incoming
-                // call in Notification Center. A missed alert replaces it.
-                if call.state != CallPhase::Ringing {
-                    self.clear_key(app, &format!("call:{}", call.id));
-                }
-                if let Some(notification) = self.for_call(call, false) {
-                    self.show(
-                        app,
-                        notification,
-                        &call.conversation,
-                        &format!("missed:{}", call.id),
-                    );
-                }
+            Event::Alert { alert } => self.send(Job::Show(alert.clone())),
+            Event::AlertWithdrawn { thread, key } => {
+                self.send(Job::Withdraw { thread: thread.clone(), key: key.clone() })
             }
             _ => {}
         }
     }
 
-    fn for_conversation(&self, c: &ConversationSummary) -> Option<Notification> {
-        if c.request && !c.direct && c.last_message.is_none() {
-            let fresh = self
-                .requests_seen
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(c.thread_key.clone());
-            return (fresh && c.active && !self.viewing_summary(c))
-                .then_some(Notification::GroupInvitation);
+    fn send(&self, job: Job) {
+        if let Some(jobs) = &*self.jobs.lock().unwrap_or_else(|e| e.into_inner()) {
+            let _ = jobs.send(job);
         }
-        let m = c.last_message.as_ref()?;
-        let fresh = {
-            let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
-            // Requests and pre-aggregation snapshots can have been observed
-            // under their wire ID before this thread became eligible. Carry
-            // their seen state forward instead of alerting again on acceptance.
-            let legacy: Vec<_> = c
-                .aliases
-                .iter()
-                .filter(|alias| *alias != &c.thread_key)
-                .filter_map(|alias| seen.remove(alias))
-                .flatten()
-                .collect();
-            let history = seen.entry(c.thread_key.clone()).or_default();
-            for id in legacy {
-                if !history.contains(&id) {
-                    history.push_back(id);
-                }
-            }
-            let fresh = !history.contains(&m.id);
-            if fresh {
-                history.push_back(m.id.clone());
-            }
-            while history.len() > 32 {
-                history.pop_front();
-            }
-            fresh
+    }
+
+    fn viewing(&self, thread: &str) -> bool {
+        !self.away.load(Ordering::Relaxed)
+            && self.visible.lock().unwrap_or_else(|e| e.into_inner()).as_deref() == Some(thread)
+    }
+
+    /// While the app is in front, alerts about what's on screen, and those
+    /// the app shows itself (an incoming call), stay quiet.
+    fn suppressed(&self, alert: &Alert) -> bool {
+        !self.away.load(Ordering::Relaxed) && (!alert.foreground || self.viewing(&alert.thread))
+    }
+
+    /// Route a new alert: drop the one it replaces and allocate a fresh id.
+    #[cfg_attr(target_os = "android", allow(dead_code))]
+    fn route(&self, alert: &Alert) -> (i32, Removal) {
+        let mut routes = self.routes.lock().unwrap_or_else(|e| e.into_inner());
+        let replaced = routes.take(|r| r.key == alert.key);
+        let (id, mut removal) = routes.add(Route {
+            target: alert.target.clone(),
+            thread: alert.thread.clone(),
+            key: alert.key.clone(),
+        });
+        removal.ids.extend(replaced);
+        self.persist(&routes);
+        (id, removal)
+    }
+
+    /// Forget withdrawn alerts; their ids to take off the screen.
+    fn withdraw(&self, thread: &str, key: Option<&str>) -> Vec<i32> {
+        let mut routes = self.routes.lock().unwrap_or_else(|e| e.into_inner());
+        let ids = match key {
+            Some(key) => routes.take(|r| r.key == key),
+            None => routes.take(|r| r.thread == thread),
         };
-        if !fresh || m.is_mine || m.deleted || !c.active || c.unread == 0 || self.viewing_summary(c)
-        {
-            return None;
+        if !ids.is_empty() {
+            self.persist(&routes);
         }
-        Some(if c.request {
-            Notification::MessageRequest
-        } else {
-            Notification::Message
-        })
-    }
-
-    fn for_call(&self, call: &CallInfo, incoming: bool) -> Option<Notification> {
-        if call.direction != CallDirection::Incoming {
-            return None;
-        }
-        let notification = if incoming && call.state == CallPhase::Ringing {
-            // The foreground call UI already rings and provides Accept/Decline.
-            if !self.away.load(Ordering::Relaxed) {
-                return None;
-            }
-            Notification::IncomingCall
-        } else if !incoming
-            && call.end_reason == Some(CallEndReason::Missed)
-            && matches!(call.state, CallPhase::Ended | CallPhase::Joinable)
-        {
-            Notification::MissedCall
-        } else {
-            return None;
-        };
-        let key = (call.id.clone(), notification == Notification::MissedCall);
-        let mut seen = self.calls_seen.lock().unwrap_or_else(|e| e.into_inner());
-        if !seen.insert(key) {
-            return None;
-        }
-        // Runtime retains only recent call state. Bound our companion cache.
-        if seen.len() > 512 {
-            seen.retain(|(id, _)| id == &call.id);
-        }
-        Some(notification)
-    }
-
-    fn id_for(&self, conversation: &str, key: &str) -> i32 {
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        let mut targets = self.targets.lock().unwrap_or_else(|e| e.into_inner());
-        let id = targets.insert(conversation);
-        // Atomic replacement prevents a partial routing table after a crash.
-        if let Some(path) = &self.targets_path {
-            let temp = path.with_extension("json.tmp");
-            if let Ok(data) = serde_json::to_vec(&*targets) {
-                if std::fs::write(&temp, data)
-                    .and_then(|()| std::fs::rename(&temp, path))
-                    .is_err()
-                {
-                    eprintln!("mycel-host: cannot persist notification routing");
-                }
-            }
-        }
-        active.insert(key.into(), id);
-        id
-    }
-
-    fn clear_key(&self, app: &AppHandle, key: &str) {
-        let id = self
-            .active
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(key);
-        if let Some(id) = id {
-            self.remove(app, vec![id]);
-        }
-    }
-
-    fn take_conversation_alerts(&self, conversation: &ConversationSummary) -> Vec<i32> {
-        // Retained alerts can refer to an older canonical wire ID, including
-        // records written before stable direct-message thread keys existed.
-        let mut ids: Vec<i32> = self
-            .targets
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .entries
-            .iter()
-            .filter_map(|(id, target)| {
-                (target == &conversation.id || conversation.aliases.contains(target)).then_some(*id)
-            })
-            .collect();
-        let mut active = self.active.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(id) = active.remove(&format!("message:{}", conversation.thread_key)) {
-            if !ids.contains(&id) {
-                ids.push(id);
-            }
-        }
-        active.retain(|_, id| !ids.contains(id));
         ids
     }
 
-    fn clear_conversation(&self, app: &AppHandle, conversation: &ConversationSummary) {
-        let ids = self.take_conversation_alerts(conversation);
-        if !ids.is_empty() {
-            self.remove(app, ids);
+    fn persist(&self, routes: &Routes) {
+        let Some(path) = &self.path else { return };
+        let saved = serde_json::to_vec(routes)
+            .map_err(std::io::Error::other)
+            .and_then(|data| write_durably(path, &data));
+        if saved.is_err() {
+            eprintln!("mycel-host: cannot persist notification routing");
+        }
+    }
+
+    fn run(&self, app: &AppHandle, job: Job) {
+        match job {
+            Job::Startup { fresh } => self.clear_unroutable(app, fresh),
+            Job::Show(alert) => {
+                if self.suppressed(&alert) {
+                    if self.viewing(&alert.thread) {
+                        let ids = self.withdraw(&alert.thread, None);
+                        self.remove(app, Removal { ids, all: false });
+                    }
+                    return;
+                }
+                self.show(app, &alert);
+            }
+            Job::Withdraw { thread, key } => {
+                let ids = self.withdraw(&thread, key.as_deref());
+                self.remove(app, Removal { ids, all: false });
+            }
         }
     }
 
     #[cfg(target_os = "ios")]
-    fn remove(&self, app: &AppHandle, ids: Vec<i32>) {
-        // Tauri's mobile bridge waits for the main thread; never call it from
-        // the main thread or retain our state locks during the call.
-        if let Err(e) = app.notification().remove_active(ids) {
+    fn clear_unroutable(&self, app: &AppHandle, fresh: bool) {
+        let n = app.notification();
+        if fresh {
+            if let Err(e) = n.remove_all_active() {
+                eprintln!("mycel-host: clearing old notifications failed: {e}");
+            }
+            return;
+        }
+        let Ok(active) = n.active() else { return };
+        let stale: Vec<i32> = {
+            let routes = self.routes.lock().unwrap_or_else(|e| e.into_inner());
+            active.iter().map(|a| a.id()).filter(|id| !routes.entries.contains_key(id)).collect()
+        };
+        self.remove(app, Removal { ids: stale, all: false });
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    fn clear_unroutable(&self, _app: &AppHandle, _fresh: bool) {}
+
+    #[cfg(target_os = "ios")]
+    fn remove(&self, app: &AppHandle, removal: Removal) {
+        if removal.is_empty() {
+            return;
+        }
+        let n = app.notification();
+        let removed = if removal.all { n.remove_all_active() } else { n.remove_active(removal.ids) };
+        if let Err(e) = removed {
             eprintln!("mycel-host: notification removal failed: {e}");
         }
     }
 
+    /// Desktop notification centers can't be cleared from here.
     #[cfg(not(target_os = "ios"))]
-    fn remove(&self, _app: &AppHandle, _ids: Vec<i32>) {}
+    fn remove(&self, _app: &AppHandle, _removal: Removal) {}
 
     #[cfg(target_os = "android")]
-    fn show(&self, _app: &AppHandle, notification: Notification, _conversation: &str, _key: &str) {
-        let (title, body) = notification.content();
+    fn show(&self, _app: &AppHandle, alert: &Alert) {
+        let (title, body) = content(alert.kind);
         if let Err(e) = android_notify(title, body) {
             eprintln!("mycel-host: notification failed: {e}");
         }
     }
 
     #[cfg(not(target_os = "android"))]
-    fn show(&self, app: &AppHandle, notification: Notification, conversation: &str, key: &str) {
+    fn show(&self, app: &AppHandle, alert: &Alert) {
         let n = app.notification();
-        // Request permission in the foreground through prepare_notifications,
-        // never while an incoming event arrives behind a locked screen.
-        if !matches!(
-            n.permission_state(),
-            Ok(tauri_plugin_notification::PermissionState::Granted)
-        ) {
+        // Permission is asked in the foreground (prepare_notifications),
+        // never while an event arrives behind a locked screen.
+        if !matches!(n.permission_state(), Ok(tauri_plugin_notification::PermissionState::Granted)) {
             return;
         }
-        let (title, body) = notification.content();
-        // A new alert gets a fresh opaque ID, even in the same conversation.
-        // This lets tap dedup distinguish two separate incoming messages.
-        self.clear_key(app, key);
-        let id = self.id_for(conversation, key);
-        if let Err(e) = n
-            .builder()
-            .id(id)
-            .title(title)
-            .body(body)
-            .sound("default")
-            .show()
-        {
+        let (title, body) = content(alert.kind);
+        // A fresh opaque id even in the same thread, so tap handling can
+        // tell two separate alerts apart.
+        let (id, replaced) = self.route(alert);
+        self.remove(app, replaced);
+        if let Err(e) = n.builder().id(id).title(title).body(body).sound("default").show() {
             eprintln!("mycel-host: notification failed: {e}");
         }
     }
@@ -397,13 +370,13 @@ impl Notifier {
     #[cfg(not(target_os = "android"))]
     fn should_request_permission(&self, state: tauri_plugin_notification::PermissionState) -> bool {
         use tauri_plugin_notification::PermissionState;
-        matches!(
-            state,
-            PermissionState::Prompt | PermissionState::PromptWithRationale
-        ) && !self.away.load(Ordering::Relaxed)
+        matches!(state, PermissionState::Prompt | PermissionState::PromptWithRationale)
+            && !self.away.load(Ordering::Relaxed)
             && !self.asked.swap(true, Ordering::Relaxed)
     }
 
+    /// Android posts alerts through MycelService; there's no permission
+    /// state to check from here.
     #[cfg(target_os = "android")]
     fn prepare(&self, _app: &AppHandle) -> String {
         "unavailable".into()
@@ -411,6 +384,9 @@ impl Notifier {
 }
 
 /// UI calls this after loading, while the permission prompt can be seen.
+/// Returns the plugin's state (`granted`, `denied`, `prompt`,
+/// `prompt-with-rationale`) or `unavailable`: no permission state to check
+/// here (Android, or a desktop without a notification service).
 #[tauri::command]
 pub async fn prepare_notifications(
     app: AppHandle,
@@ -425,27 +401,20 @@ pub async fn prepare_notifications(
 /// A mounted chat hidden by a panel or an app switch must report None.
 #[tauri::command]
 pub async fn set_notification_context(
-    app: AppHandle,
     notifier: State<'_, Arc<Notifier>>,
     rt: State<'_, Rt>,
     conversation: Option<String>,
 ) -> Result<(), String> {
-    let notifier = notifier.inner().clone();
-    let conversation = conversation.and_then(|id| rt.conversation(id).ok());
-    *notifier
-        .visible_conversation
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = conversation.as_ref().map(|c| c.thread_key.clone());
-    tauri::async_runtime::spawn_blocking(move || {
-        if let Some(conversation) = conversation.filter(|c| notifier.viewing(&c.thread_key)) {
-            notifier.clear_conversation(&app, &conversation);
-        }
-    })
-    .await
-    .map_err(|_| "Notification context update failed".into())
+    let thread = conversation.and_then(|id| rt.alert_thread(&id));
+    *notifier.visible.lock().unwrap_or_else(|e| e.into_inner()) = thread.clone();
+    if let Some(thread) = thread.filter(|t| notifier.viewing(t)) {
+        notifier.send(Job::Withdraw { thread, key: None });
+    }
+    Ok(())
 }
 
-/// Never trust an OS notification's payload as a conversation identifier.
+/// Never trust an OS notification's payload: only its opaque id, through
+/// our own table, then the runtime's current view of the target.
 #[tauri::command]
 pub async fn notification_target(
     notifier: State<'_, Arc<Notifier>>,
@@ -453,20 +422,13 @@ pub async fn notification_target(
     id: i32,
 ) -> Result<Option<String>, String> {
     let target = notifier
-        .targets
+        .routes
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entries
         .get(&id)
-        .cloned();
-    let Some(target) = target else {
-        return Ok(None);
-    };
-    Ok(rt
-        .conversation(target)
-        .ok()
-        .filter(|c| c.active)
-        .map(|c| c.id))
+        .map(|route| route.target.clone());
+    Ok(target.and_then(|target| rt.alert_route(&target)))
 }
 
 /// Consume a tap even when iOS delivered it before the webview was ready.
@@ -531,266 +493,136 @@ fn android_notify(title: &str, body: &str) -> jni::errors::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mycel_node::api::{Attachment, Delivery, MessageView};
 
-    fn private_conversation() -> ConversationSummary {
-        ConversationSummary {
-            id: "private-conversation-id".into(),
-            thread_key: "private-thread-key".into(),
-            aliases: vec!["private-conversation-id".into()],
-            title: "Sensitive group name".into(),
-            direct: false,
-            members: vec![],
-            last_message: Some(MessageView {
-                id: "private-message-id".into(),
-                conversation: "private-conversation-id".into(),
-                author: "private-author-id".into(),
-                author_name: "Sensitive sender name".into(),
-                sent_at: 0,
-                body: "Sensitive message text".into(),
-                reply_to: None,
-                edited: false,
-                deleted: false,
-                attachments: vec![Attachment {
-                    blob: "private-blob-id".into(),
-                    name: "Sensitive attachment filename.txt".into(),
-                    mime: "text/plain".into(),
-                    size: 17,
-                    local_path: Some("/private/attachment-path".into()),
-                }],
-                reactions: vec![],
-                is_mine: false,
-                delivery: Delivery::Delivered,
-            }),
-            unread: 1,
-            active: true,
-            my_role: None,
-            request: false,
-            invited_by: Some("private-inviter-id".into()),
+    const KINDS: [AlertKind; 5] = [
+        AlertKind::Message,
+        AlertKind::MessageRequest,
+        AlertKind::GroupInvitation,
+        AlertKind::IncomingCall,
+        AlertKind::MissedCall,
+    ];
+
+    fn alert(kind: AlertKind, thread: &str, key: &str) -> Alert {
+        Alert {
+            kind,
+            thread: thread.into(),
+            key: key.into(),
+            target: format!("target-of-{thread}"),
+            foreground: kind != AlertKind::IncomingCall,
         }
     }
 
-    #[test]
-    fn notification_output_contains_no_conversation_details() {
-        for direct in [false, true] {
-            for request in [false, true] {
-                for attachment_only in [false, true] {
-                    let notifier = Notifier::default();
-                    notifier.set_away(true);
-                    let mut conversation = private_conversation();
-                    conversation.direct = direct;
-                    conversation.request = request;
-                    if attachment_only {
-                        conversation.last_message.as_mut().unwrap().body.clear();
-                    }
-                    let (title, body) = notifier.for_conversation(&conversation).unwrap().content();
-                    assert_eq!(title, "Mycel");
-                    assert_eq!(
-                        body,
-                        if request {
-                            "New message request"
-                        } else {
-                            "New message"
-                        }
-                    );
-                    let output = format!("{title} {body}");
-                    let message = conversation.last_message.as_ref().unwrap();
-                    for private in [
-                        conversation.id.as_str(),
-                        conversation.title.as_str(),
-                        message.id.as_str(),
-                        message.author.as_str(),
-                        message.author_name.as_str(),
-                        "Sensitive message text",
-                        message.attachments[0].name.as_str(),
-                        message.attachments[0].blob.as_str(),
-                        message.attachments[0].local_path.as_deref().unwrap(),
-                        conversation.invited_by.as_deref().unwrap(),
-                    ] {
-                        assert!(
-                            !output.contains(private),
-                            "notification exposed private data"
-                        );
-                    }
-                }
-            }
-        }
+    fn notifier() -> Notifier {
+        Notifier::with_routes(Routes::fresh(), None)
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("mycel-notify-{tag}-{}", mycel_node::crypto::random_u64()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
     }
 
     #[test]
-    fn incoming_call_notification_is_generic() {
-        assert_eq!(
-            Notification::IncomingCall.content(),
-            ("Mycel", "Incoming call")
-        );
-        assert_eq!(Notification::MissedCall.content(), ("Mycel", "Missed call"));
-        assert_eq!(
-            Notification::GroupInvitation.content(),
-            ("Mycel", "New group invitation")
-        );
+    fn the_os_only_ever_sees_one_fixed_sentence_per_kind() {
+        let sentences: Vec<_> = KINDS.iter().map(|kind| content(*kind)).collect();
+        assert_eq!(sentences, [
+            ("Mycel", "New message"),
+            ("Mycel", "New message request"),
+            ("Mycel", "New group invitation"),
+            ("Mycel", "Incoming call"),
+            ("Mycel", "Missed call"),
+        ]);
+        // Alerts carry no names or text to leak: only opaque local keys.
+        let json = serde_json::to_value(alert(AlertKind::Message, "t", "k")).unwrap();
+        let mut fields: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
+        fields.sort();
+        assert_eq!(fields, ["foreground", "key", "kind", "target", "thread"]);
     }
 
     #[test]
-    fn message_alerts_follow_visible_chat_and_native_focus() {
-        let notifier = Notifier::default();
-        let mut conversation = private_conversation();
-        *notifier.visible_conversation.lock().unwrap() = Some("another-chat".into());
-        assert_eq!(
-            notifier.for_conversation(&conversation),
-            Some(Notification::Message)
-        );
-        *notifier.visible_conversation.lock().unwrap() = Some(conversation.thread_key.clone());
-        conversation.last_message.as_mut().unwrap().id = "currently-read".into();
-        assert_eq!(notifier.for_conversation(&conversation), None);
-        // The chat can remain mounted behind a locked screen; it is not read.
+    fn alerts_about_what_is_on_screen_or_rung_in_app_stay_quiet_while_focused() {
+        let notifier = notifier();
+        let message = alert(AlertKind::Message, "thread", "message:thread");
+        let call = alert(AlertKind::IncomingCall, "thread", "call:c");
+        *notifier.visible.lock().unwrap() = Some("another".into());
+        assert!(!notifier.suppressed(&message));
+        assert!(notifier.suppressed(&call), "the app rings calls itself");
+        *notifier.visible.lock().unwrap() = Some("thread".into());
+        assert!(notifier.suppressed(&message));
+        // A chat can stay mounted behind a locked screen: that isn't reading.
         notifier.set_away(true);
-        conversation.last_message.as_mut().unwrap().id = "background-message".into();
-        assert_eq!(
-            notifier.for_conversation(&conversation),
-            Some(Notification::Message)
-        );
+        assert!(!notifier.suppressed(&message) && !notifier.suppressed(&call));
+        assert!(!notifier.viewing("thread"));
     }
 
     #[test]
-    fn deleted_preview_rollback_does_not_repeat_an_old_alert() {
-        let notifier = Notifier::default();
-        let mut conversation = private_conversation();
-        assert_eq!(
-            notifier.for_conversation(&conversation),
-            Some(Notification::Message)
-        );
-        let old = conversation.last_message.as_ref().unwrap().id.clone();
-        conversation.last_message.as_mut().unwrap().id = "newer-message".into();
-        assert_eq!(
-            notifier.for_conversation(&conversation),
-            Some(Notification::Message)
-        );
-        conversation.last_message.as_mut().unwrap().id = old;
-        assert_eq!(notifier.for_conversation(&conversation), None);
+    fn routes_replace_by_key_and_are_pruned_when_withdrawn() {
+        let notifier = notifier();
+        let (first, _) = notifier.route(&alert(AlertKind::Message, "a", "message:a"));
+        let (second, replaced) = notifier.route(&alert(AlertKind::Message, "a", "message:a"));
+        assert!(second > first);
+        assert_eq!(replaced, Removal { ids: vec![first], all: false });
+        let (call, _) = notifier.route(&alert(AlertKind::MissedCall, "a", "missed:c"));
+        let (other, _) = notifier.route(&alert(AlertKind::Message, "b", "message:b"));
+        assert_eq!(notifier.withdraw("a", Some("missed:c")), vec![call]);
+        assert_eq!(notifier.withdraw("a", None), vec![second]);
+        // Nothing left for that thread: no OS call, however often it's read.
+        assert!(notifier.withdraw("a", None).is_empty());
+        assert_eq!(notifier.routes.lock().unwrap().entries.keys().copied().collect::<Vec<_>>(), [other]);
     }
 
     #[test]
-    fn late_canonical_alias_does_not_realert_and_clears_old_delivered_ids() {
-        let notifier = Notifier::default();
-        let mut conversation = private_conversation();
-        let key = format!("message:{}", conversation.thread_key);
-        assert_eq!(
-            notifier.for_conversation(&conversation),
-            Some(Notification::Message)
-        );
-        let first = notifier.id_for(&conversation.id, &key);
-        // A late competing direct chat changes the wire representative, while
-        // the two-peer logical thread and already observed message stay fixed.
-        conversation.aliases.push("earlier-canonical-id".into());
-        conversation.id = "earlier-canonical-id".into();
-        assert_eq!(notifier.for_conversation(&conversation), None);
-        assert!(
-            notifier
-                .take_conversation_alerts(&conversation)
-                .contains(&first)
-        );
-        assert!(!notifier.active.lock().unwrap().contains_key(&key));
-        // Legacy persisted targets refer to the former wire alias and clear too.
-        assert_eq!(
-            notifier
-                .targets
-                .lock()
-                .unwrap()
-                .entries
-                .get(&first)
-                .map(String::as_str),
-            Some("private-conversation-id")
-        );
-        conversation.last_message.as_mut().unwrap().id = "genuinely-new-message".into();
-        assert_eq!(
-            notifier.for_conversation(&conversation),
-            Some(Notification::Message)
-        );
-        let second = notifier.id_for(&conversation.id, &key);
-        assert_ne!(first, second);
-        let cleared = notifier.take_conversation_alerts(&conversation);
-        assert!(cleared.contains(&first) && cleared.contains(&second));
-    }
-
-    #[test]
-    fn visible_thread_stays_visible_when_its_wire_id_changes() {
-        let notifier = Notifier::default();
-        let mut conversation = private_conversation();
-        *notifier.visible_conversation.lock().unwrap() = Some(conversation.thread_key.clone());
-        conversation.id = "new-canonical-wire-id".into();
-        assert_eq!(notifier.for_conversation(&conversation), None);
-        notifier.set_away(true);
-        conversation.last_message.as_mut().unwrap().id = "new-background-message".into();
-        assert_eq!(
-            notifier.for_conversation(&conversation),
-            Some(Notification::Message)
-        );
-    }
-
-    #[test]
-    fn accepting_a_wire_keyed_request_preserves_seen_and_visible_state() {
-        let notifier = Notifier::default();
-        let mut conversation = private_conversation();
-        conversation.direct = true;
-        conversation.request = true;
-        conversation.thread_key = conversation.id.clone();
-        assert_eq!(
-            notifier.for_conversation(&conversation),
-            Some(Notification::MessageRequest)
-        );
-        conversation.request = false;
-        conversation.thread_key = "accepted-two-peer-thread".into();
-        assert_eq!(notifier.for_conversation(&conversation), None);
-        *notifier.visible_conversation.lock().unwrap() = Some(conversation.id.clone());
-        conversation.last_message.as_mut().unwrap().id = "visible-post-accept-message".into();
-        assert_eq!(notifier.for_conversation(&conversation), None);
-        notifier.set_away(true);
-        conversation.last_message.as_mut().unwrap().id = "background-post-accept-message".into();
-        assert_eq!(
-            notifier.for_conversation(&conversation),
-            Some(Notification::Message)
-        );
-    }
-
-    #[test]
-    fn group_invitation_without_a_message_alerts_once() {
-        let notifier = Notifier::default();
-        let mut conversation = private_conversation();
-        conversation.request = true;
-        conversation.last_message = None;
-        conversation.unread = 0;
-        assert_eq!(
-            notifier.for_conversation(&conversation),
-            Some(Notification::GroupInvitation)
-        );
-        assert_eq!(notifier.for_conversation(&conversation), None);
-    }
-
-    #[test]
-    fn opaque_routing_survives_restart_and_is_bounded() {
-        let mut targets = Targets::default();
-        let id = targets.insert("private-conversation-id");
+    fn ids_are_never_reused_across_restarts_corruption_and_overflow() {
+        let dir = temp_dir("routes");
+        let path = dir.join("notification-targets.json");
+        let (mut routes, fresh) = Routes::load(&path);
+        assert!(fresh, "nothing on disk: clear what might be delivered");
+        let (id, _) = routes.add(Route { target: "x".into(), thread: "t".into(), key: "k".into() });
         assert!(id > 0);
-        let saved = serde_json::to_vec(&targets).unwrap();
-        let mut restarted: Targets = serde_json::from_slice(&saved).unwrap();
-        assert_eq!(
-            restarted.entries.get(&id).map(String::as_str),
-            Some("private-conversation-id")
-        );
+        write_durably(&path, &serde_json::to_vec(&routes).unwrap()).unwrap();
+        assert!(!dir.join("notification-targets.json.tmp").exists());
+        let (mut restarted, fresh) = Routes::load(&path);
+        assert!(!fresh);
+        assert_eq!(restarted.entries[&id].target, "x");
+        // Bounded, oldest first; evicted alerts are taken off the screen.
+        let mut evicted = vec![];
         for n in 0..300 {
-            restarted.insert(&format!("conversation-{n}"));
+            evicted.extend(restarted.add(Route { target: format!("{n}"), thread: "t".into(), key: format!("{n}") }).1.ids);
         }
-        assert_eq!(restarted.entries.len(), 256);
-        assert!(!restarted.entries.contains_key(&id));
-        // Old retained notifications become unrouteable, never another chat.
-        assert!(restarted.insert("last-chat") > id);
+        assert_eq!(restarted.entries.len(), MAX_ROUTES);
+        assert!(evicted.contains(&id) && !restarted.entries.contains_key(&id));
+        assert!(restarted.add(Route { target: "y".into(), thread: "t".into(), key: "y".into() }).0 > id);
+        // A corrupt table (or one from an older version) starts over: every
+        // delivered alert is cleared and ids start at a random point.
+        std::fs::write(&path, b"{\"last_id\":0,\"entries\":{\"1\":\"old-chat\"}}").unwrap();
+        let (reset, fresh) = Routes::load(&path);
+        assert!(fresh && reset.entries.is_empty());
+        assert!(reset.last_id > 0 && reset.last_id <= 1 << 30);
+        // Overflow also clears everything before ids start again.
+        let mut full = Routes { last_id: i32::MAX, entries: BTreeMap::new() };
+        full.entries.insert(i32::MAX, Route { target: "z".into(), thread: "t".into(), key: "z".into() });
+        let (id, removal) = full.add(Route { target: "w".into(), thread: "t".into(), key: "w".into() });
+        assert_eq!((id, removal.all, full.entries.len()), (1, true, 1));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shell_events_are_queued_without_blocking() {
+        let notifier = notifier();
+        let (tx, rx) = mpsc::channel();
+        *notifier.jobs.lock().unwrap() = Some(tx);
+        notifier.on_event(&Event::Alert { alert: alert(AlertKind::Message, "t", "message:t") });
+        notifier.on_event(&Event::AlertWithdrawn { thread: "t".into(), key: None });
+        notifier.on_event(&Event::ContactsChanged);
+        let jobs: Vec<Job> = rx.try_iter().collect();
+        assert!(matches!(jobs.as_slice(), [Job::Show(_), Job::Withdraw { key: None, .. }]));
     }
 
     #[cfg(not(target_os = "android"))]
     #[test]
     fn permission_prompt_requires_foreground_and_never_reprompts_denied() {
         use tauri_plugin_notification::PermissionState;
-        let notifier = Notifier::default();
+        let notifier = notifier();
         notifier.set_away(true);
         assert!(!notifier.should_request_permission(PermissionState::Prompt));
         notifier.set_away(false);
@@ -798,112 +630,5 @@ mod tests {
         assert!(!notifier.should_request_permission(PermissionState::Denied));
         assert!(notifier.should_request_permission(PermissionState::Prompt));
         assert!(!notifier.should_request_permission(PermissionState::Prompt));
-    }
-
-    fn incoming_call() -> CallInfo {
-        CallInfo {
-            id: "private-call-id".into(),
-            conversation: "private-conversation-id".into(),
-            group: false,
-            title: None,
-            peer: "private-peer-id".into(),
-            peer_name: "Sensitive name".into(),
-            direction: CallDirection::Incoming,
-            state: CallPhase::Ringing,
-            end_reason: None,
-            error: None,
-            started_at: 0,
-            connected_at: None,
-            duration_ms: 0,
-            participants: vec![],
-            joined_count: 0,
-            active_speaker: None,
-            path: None,
-            bitrate: 0,
-            muted: false,
-            remote_muted: false,
-            level: 0.0,
-            remote_level: 0.0,
-            echo_cancellation: false,
-            stats: Default::default(),
-            video: Default::default(),
-        }
-    }
-
-    #[test]
-    fn call_alerts_cover_unanswered_calls_without_duplicates_or_declined_alerts() {
-        let notifier = Notifier::default();
-        let mut call = incoming_call();
-        assert_eq!(notifier.for_call(&call, true), None); // foreground call UI
-        notifier.set_away(true);
-        assert_eq!(
-            notifier.for_call(&call, true),
-            Some(Notification::IncomingCall)
-        );
-        assert_eq!(notifier.for_call(&call, true), None);
-        call.state = CallPhase::Ended;
-        call.end_reason = Some(CallEndReason::Missed);
-        assert_eq!(
-            notifier.for_call(&call, false),
-            Some(Notification::MissedCall)
-        );
-        assert_eq!(notifier.for_call(&call, false), None);
-        call.id = "group-missed".into();
-        call.group = true;
-        call.state = CallPhase::Joinable;
-        assert_eq!(
-            notifier.for_call(&call, false),
-            Some(Notification::MissedCall)
-        );
-        for reason in [
-            CallEndReason::Declined,
-            CallEndReason::HungUp,
-            CallEndReason::RemoteHungUp,
-        ] {
-            call.id = format!("not-missed-{reason:?}");
-            call.state = CallPhase::Ended;
-            call.end_reason = Some(reason);
-            assert_eq!(notifier.for_call(&call, false), None);
-        }
-        call.direction = CallDirection::Outgoing;
-        call.state = CallPhase::Ringing;
-        assert_eq!(notifier.for_call(&call, true), None);
-    }
-
-    #[test]
-    fn conversation_notification_filters_and_seen_state_are_preserved() {
-        let notifier = Notifier::default();
-        let mut conversation = private_conversation();
-
-        // Reading while focused also marks this message as seen.
-        *notifier.visible_conversation.lock().unwrap() = Some(conversation.thread_key.clone());
-        assert_eq!(notifier.for_conversation(&conversation), None);
-        notifier.set_away(true);
-        assert_eq!(notifier.for_conversation(&conversation), None);
-
-        conversation.last_message.as_mut().unwrap().id = "fresh-message".into();
-        assert_eq!(
-            notifier.for_conversation(&conversation),
-            Some(Notification::Message)
-        );
-        assert_eq!(notifier.for_conversation(&conversation), None);
-
-        for excluded in ["mine", "deleted", "read"] {
-            let mut conversation = private_conversation();
-            let message = conversation.last_message.as_mut().unwrap();
-            message.id = excluded.into();
-            message.is_mine = excluded == "mine";
-            message.deleted = excluded == "deleted";
-            conversation.unread = if excluded == "read" { 0 } else { 1 };
-            assert_eq!(notifier.for_conversation(&conversation), None);
-            // Even excluded events retain the original seen-state update.
-            conversation.last_message.as_mut().unwrap().is_mine = false;
-            conversation.last_message.as_mut().unwrap().deleted = false;
-            conversation.unread = 1;
-            assert_eq!(notifier.for_conversation(&conversation), None);
-        }
-
-        conversation.last_message = None;
-        assert_eq!(notifier.for_conversation(&conversation), None);
     }
 }

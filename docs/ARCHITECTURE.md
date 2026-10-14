@@ -173,7 +173,7 @@ Building blocks:
 
 | Kit | Provides | Used by |
 |---|---|---|
-| **Chat** | threads, replies, reactions, edits/deletes, read receipts | Messaging, Newsroom (story chat), Docs (comments), RPG (party chat) |
+| **Chat** | threads, replies, reactions, edits/deletes, read receipts; one chat per person across independently created spaces (`thread`); which changes deserve a private local alert (`alerts`) | Messaging, Newsroom (story chat), Docs (comments), RPG (party chat) |
 | **RichText** | ProseMirror ↔ Automerge, marks, comments anchored to text, suggestions | Docs, Newsroom |
 | **Workflow** | role-gated state machines, sign-offs, audit trail | Newsroom, Docs (approvals), RPG (turn phases) |
 | **Presence** | cursors, who's-here, typing, selection | all four |
@@ -183,6 +183,7 @@ Building blocks:
 ### L6 Host ("the browser")
 One native shell runs many apps:
 - **Shared** identity, devices, contacts, keepers, notifications and invites across all apps.
+- **Notifications are app-agnostic:** a kit decides what is news and emits an opaque alert (kind, thread, key, target); the host only shows one fixed sentence per kind, routes taps through OS ids it never reuses, suppresses alerts about what's on screen, and handles permissions. No names, text or IDs reach the OS.
 - **Apps are sandboxed web bundles** plus a manifest declaring which SDK capabilities they need. Apps never touch keys or the network directly.
 - **Each app can also ship as a standalone Tauri binary** by embedding the same core. The host model is the default because it keeps the SDK boundary honest.
 

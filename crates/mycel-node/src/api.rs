@@ -237,6 +237,38 @@ pub enum Notice {
     StorageFailing { error: String },
 }
 
+/// What a local alert is about. A native shell shows each kind as one fixed,
+/// generic sentence: no names, message text or IDs ever reach the OS.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AlertKind {
+    Message,
+    MessageRequest,
+    GroupInvitation,
+    IncomingCall,
+    MissedCall,
+}
+
+/// A private local alert for the native shell. The chat layer has already
+/// decided it is news; every string here is an opaque local key.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Alert {
+    pub kind: AlertKind,
+    /// What the alert is about (a conversation's stable thread key). A
+    /// thread's alerts are withdrawn together and suppressed while it is on
+    /// screen (`Runtime::alert_thread` maps what the app shows to a thread).
+    pub thread: String,
+    /// A later alert with the same key replaces this one.
+    pub key: String,
+    /// What a tap opens, resolved again through `Runtime::alert_route` when
+    /// tapped (it may have moved, or be gone).
+    pub target: String,
+    /// Also show it while the app is focused on something else. False when
+    /// the app has its own UI for it (an incoming call rings in the app).
+    pub foreground: bool,
+}
+
 /// Pushed to UIs (Tauri event `mycel://event`).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -269,4 +301,20 @@ pub enum Event {
     CallUpdated { call: CallInfo },
     /// The list of [`Notice`]s changed: fetch it again with `notices`.
     NoticesChanged,
+    /// For the native shell, not apps (hosts don't forward it): show a
+    /// private local alert.
+    #[serde(rename_all = "camelCase")]
+    Alert { alert: Alert },
+    /// For the native shell: take back delivered alerts, all of `thread`'s,
+    /// or only the one with `key`.
+    #[serde(rename_all = "camelCase")]
+    AlertWithdrawn { thread: String, key: Option<String> },
+}
+
+impl Event {
+    /// Shell-only events (alerts) that hosts handle themselves instead of
+    /// forwarding to apps.
+    pub fn is_for_shell(&self) -> bool {
+        matches!(self, Event::Alert { .. } | Event::AlertWithdrawn { .. })
+    }
 }

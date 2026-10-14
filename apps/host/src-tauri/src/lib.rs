@@ -58,22 +58,18 @@ pub(crate) fn set_window_title(app: &AppHandle, name: &str) {
     }
 }
 
-/// Forward runtime events to the webview until the runtime shuts down, and
-/// turn new messages and calls into notifications while nobody's looking.
+/// Forward runtime events to the webview until the runtime shuts down. The
+/// chat layer's alerts go to the notification bridge instead (never blocks).
 fn forward_events(app: AppHandle, runtime: Rt, notifier: Arc<notify::Notifier>) {
     // Subscribe before spawning so nothing emitted after startup is missed.
     let mut rx = runtime.subscribe();
     tauri::async_runtime::spawn(async move {
         loop {
             match rx.recv().await {
+                Ok(event) if event.is_for_shell() => notifier.on_event(&event),
                 Ok(event) => {
                     if let Err(e) = app.emit(EVENT, &event) {
                         eprintln!("mycel-host: failed to emit event: {e}");
-                    }
-                    // A notification problem must never stop the events.
-                    let notify = std::panic::AssertUnwindSafe(|| notifier.on_event(&app, &runtime, &event));
-                    if std::panic::catch_unwind(notify).is_err() {
-                        eprintln!("mycel-host: notifying about an event failed");
                     }
                 }
                 Err(RecvError::Lagged(skipped)) => {
@@ -630,7 +626,7 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
 
     allow_attachment_files(app, &data_dir)?;
 
-    let notifier = Arc::new(notify::Notifier::new(&runtime));
+    let notifier = notify::Notifier::start(app.handle().clone(), &data_dir);
     forward_events(app.handle().clone(), runtime.clone(), notifier.clone());
     app.manage(notifier);
     app.manage(runtime);
