@@ -44,7 +44,7 @@ export function ChatView({
   visible?: boolean;
 }) {
   const mycel = useMycel();
-  const { messages, loading, hasMore, loadOlder, error } = useMessages(summary.id, undefined, threadKeyOf(summary));
+  const { messages, loading, hasMore, loadOlder, hasNewer, loadNewer, showMessage, showLatest, error } = useMessages(summary.id, undefined, threadKeyOf(summary));
   const typingPeers = useTyping(summary.id);
   const [replyTo, setReplyTo] = useState<MessageView | null>(null);
   const [editing, setEditing] = useState<MessageView | null>(null);
@@ -233,6 +233,11 @@ export function ChatView({
         error={error}
         hasMore={hasMore}
         onLoadOlder={loadOlder}
+        hasNewer={hasNewer}
+        onLoadNewer={loadNewer}
+        onShowMessage={showMessage}
+        onShowLatest={showLatest}
+        onJumpRequest={setJumpToId}
         onReply={canPost ? startReply : undefined}
         onEdit={canPost ? startEdit : undefined}
         editingId={editing?.id ?? null}

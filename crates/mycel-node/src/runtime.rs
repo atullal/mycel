@@ -314,6 +314,11 @@ impl Threads {
     }
 }
 
+/// Where a message is in a conversation's histories: (source, index).
+fn locate(views: &[Arc<ChatView>], id: &Hash32) -> Option<(usize, usize)> {
+    views.iter().enumerate().find_map(|(s, view)| Some((s, view.index_of(id)?)))
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1604,39 +1609,73 @@ impl Runtime {
         self.logical_summary(&self.conversation_spaces(&space))
     }
 
+    /// Up to `limit` visible messages (oldest → newest): the newest ones, or
+    /// with `before`, the newest older than that message. Costs the page, not
+    /// the history: a cursor reaches any depth.
     pub fn messages(
         &self,
         id: ConversationId,
         limit: Option<u32>,
         before: Option<MessageId>,
     ) -> Result<Vec<MessageView>> {
-        let space = parse_space(&id)?;
-        let mut entries = self.message_entries(&space)?;
-        let end = match before {
-            Some(b) => {
-                let target = parse_hash(&b)?;
-                entries.iter().position(|(_, view, index)| view.messages[*index].id == target)
-                    .unwrap_or(entries.len())
-            }
-            None => entries.len(),
-        };
-        entries.truncate(end);
+        let (spaces, views) = self.timeline(&parse_space(&id)?)?;
+        let sources = self.sources(&spaces, &views);
+        let anchor = before.map(|b| parse_hash(&b)).transpose()?.and_then(|b| locate(&views, &b));
         let hidden = self.hidden_messages.lock();
-        // Select visible messages before applying the page size. Hidden rows do
-        // not shrink pages or prevent the UI from reaching older history.
-        let mut selected: Vec<_> = entries.into_iter()
-            .rev()
-            .filter(|(source, view, index)| !hidden.contains(&(*source, view.messages[*index].id)))
+        let visible = |&(s, i): &(usize, usize)| !hidden.contains(&(spaces[s], views[s].messages[i].id));
+        // Hidden rows don't shrink pages or keep the UI from older history.
+        let mut page: Vec<_> = chat_thread::newest_first(&sources, anchor)
+            .filter(visible)
             .take(limit.unwrap_or(200).min(10_000) as usize)
             .collect();
-        selected.reverse();
-        Ok(selected
-            .into_iter()
-            .map(|(source, view, index)| self.message_view(&source, &view, &view.messages[index], &HashSet::new()))
-            .collect())
+        drop(hidden);
+        page.reverse();
+        Ok(page.into_iter().map(|(s, i)| self.message_view(&spaces[s], &views[s], &views[s].messages[i], &HashSet::new())).collect())
+    }
+
+    /// The visible messages around one (it included, unless hidden here):
+    /// up to `before` older and `after` newer, and whether more exist on
+    /// either side. For opening a conversation at a search hit or a quoted
+    /// message, at any depth, for the cost of the window.
+    pub fn messages_around(
+        &self,
+        id: ConversationId,
+        message: MessageId,
+        before: Option<u32>,
+        after: Option<u32>,
+    ) -> Result<MessageWindow> {
+        let (spaces, views) = self.timeline(&parse_space(&id)?)?;
+        let sources = self.sources(&spaces, &views);
+        let anchor = locate(&views, &parse_hash(&message)?).context("unknown message")?;
+        let (before, after) = (before.unwrap_or(25).min(10_000) as usize, after.unwrap_or(25).min(10_000) as usize);
+        let hidden = self.hidden_messages.lock();
+        let visible = |&(s, i): &(usize, usize)| !hidden.contains(&(spaces[s], views[s].messages[i].id));
+        let mut earlier: Vec<_> = chat_thread::newest_first(&sources, Some(anchor)).filter(visible).take(before + 1).collect();
+        let mut later: Vec<_> = chat_thread::oldest_first(&sources, anchor).filter(visible).take(after + 1).collect();
+        let shown = visible(&anchor);
+        drop(hidden);
+        let has_earlier = earlier.len() > before;
+        let has_later = later.len() > after;
+        earlier.truncate(before);
+        later.truncate(after);
+        earlier.reverse();
+        let window = earlier.into_iter().chain(shown.then_some(anchor)).chain(later);
+        Ok(MessageWindow {
+            messages: window.map(|(s, i)| self.message_view(&spaces[s], &views[s], &views[s].messages[i], &HashSet::new())).collect(),
+            has_earlier,
+            has_later,
+        })
+    }
+
+    /// A logical conversation's spaces and their current views.
+    fn timeline(&self, space: &SpaceId) -> Result<(Vec<SpaceId>, Vec<Arc<ChatView>>)> {
+        let spaces = self.conversation_spaces(space);
+        let views = spaces.iter().map(|s| self.view(s)).collect::<Result<Vec<_>>>()?;
+        Ok((spaces, views))
     }
 
     /// A logical conversation's merged timeline (`chat_thread::merge`).
+    #[cfg(test)]
     fn message_entries(&self, space: &SpaceId) -> Result<Vec<(SpaceId, Arc<ChatView>, usize)>> {
         let spaces = self.conversation_spaces(space);
         let views = spaces.iter().map(|s| self.view(s)).collect::<Result<Vec<_>>>()?;
@@ -1651,21 +1690,20 @@ impl Runtime {
         query: String,
         limit: Option<u32>,
     ) -> Result<Vec<MessageView>> {
-        let space = parse_space(&id)?;
-        let entries = self.message_entries(&space)?;
         let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
         if terms.is_empty() {
             return Ok(Vec::new());
         }
+        let (spaces, views) = self.timeline(&parse_space(&id)?)?;
+        let sources = self.sources(&spaces, &views);
         let hidden = self.hidden_messages.lock();
-        Ok(entries.into_iter()
-            .rev()
-            .filter(|(source, view, index)| {
-                let m = &view.messages[*index];
-                !m.deleted && !hidden.contains(&(*source, m.id))
+        let hits: Vec<_> = chat_thread::newest_first(&sources, None)
+            .filter(|&(s, i)| {
+                let m = &views[s].messages[i];
+                !m.deleted && !hidden.contains(&(spaces[s], m.id))
             })
-            .filter(|(_, view, index)| {
-                let m = &view.messages[*index];
+            .filter(|&(s, i)| {
+                let m = &views[s].messages[i];
                 let content = std::iter::once(m.body.as_str())
                     .chain(m.attachments.iter().map(|a| a.name.as_str()))
                     .collect::<Vec<_>>()
@@ -1674,8 +1712,9 @@ impl Runtime {
                 terms.iter().all(|term| content.contains(term))
             })
             .take(limit.unwrap_or(100).min(1_000) as usize)
-            .map(|(source, view, index)| self.message_view(&source, &view, &view.messages[index], &HashSet::new()))
-            .collect())
+            .collect();
+        drop(hidden);
+        Ok(hits.into_iter().map(|(s, i)| self.message_view(&spaces[s], &views[s], &views[s].messages[i], &HashSet::new())).collect())
     }
 
     pub async fn send_message(
@@ -3475,6 +3514,137 @@ mod tests {
         let latest = runtime.messages(space.to_string(), Some(1), None).unwrap();
         assert_eq!(latest[0].body, "new");
         assert_eq!(runtime.history_reads.load(Relaxed), reads);
+        finish(runtime, dir).await;
+    }
+
+    #[tokio::test]
+    async fn cursors_page_through_merged_aliases_at_any_depth() {
+        use super::*;
+        let (runtime, dir) = scratch_runtime("paging").await;
+        let peer = DeviceKeys::generate().public();
+        let (a, b) = (direct_space(&runtime, peer), direct_space(&runtime, peer));
+        let mut hidden = String::new();
+        for n in 0..30 {
+            let id = say(&runtime, if n % 3 == 0 { b } else { a }, &format!("m{n}"));
+            if n == 17 {
+                hidden = id;
+            }
+        }
+        let id = runtime.logical_id(&a);
+        runtime.delete_message_local(id.clone(), hidden.clone()).unwrap();
+        let full: Vec<String> = runtime
+            .message_entries(&a)
+            .unwrap()
+            .into_iter()
+            .map(|(_, view, i)| view.messages[i].body.clone())
+            .collect();
+        let expected: Vec<String> = full.iter().filter(|body| *body != "m17").cloned().collect();
+        assert_eq!(expected.len(), 29);
+        // "Show earlier messages", one page at a time, to the beginning.
+        let mut paged: Vec<MessageView> = vec![];
+        loop {
+            let before = paged.first().map(|m| m.id.clone());
+            let page = runtime.messages(id.clone(), Some(7), before).unwrap();
+            if page.is_empty() {
+                break;
+            }
+            assert!(page.len() == 7 || paged.len() + page.len() == 29);
+            paged.splice(0..0, page);
+        }
+        assert_eq!(paged.iter().map(|m| m.body.clone()).collect::<Vec<_>>(), expected);
+        // A window around any message, through either alias.
+        for (at, message) in paged.iter().enumerate() {
+            let window = runtime.messages_around(b.to_string(), message.id.clone(), Some(3), Some(4)).unwrap();
+            let start = at.saturating_sub(3);
+            let end = (at + 5).min(paged.len());
+            assert_eq!(window.messages, paged[start..end].to_vec(), "around {}", message.body);
+            assert_eq!((window.has_earlier, window.has_later), (start > 0, end < paged.len()));
+        }
+        // Around a message hidden on this device: its neighbours, without it.
+        let window = runtime.messages_around(id.clone(), hidden, Some(1), Some(1)).unwrap();
+        let at = full.iter().position(|body| body == "m17").unwrap();
+        assert_eq!(window.messages.iter().map(|m| m.body.clone()).collect::<Vec<_>>(), [full[at - 1].clone(), full[at + 1].clone()]);
+        assert!(runtime.messages_around(id, "00".repeat(32), None, None).is_err());
+        finish(runtime, dir).await;
+    }
+
+    /// A long chat built straight into a replica (signing dominates).
+    fn long_chat(runtime: &super::Runtime, messages: usize) -> super::SpaceId {
+        use super::*;
+        let peer = DeviceKeys::generate().public();
+        let (mut r, _) = Replica::create(runtime.keys.clone(), None).unwrap();
+        r.add_member(peer, Role::Writer).unwrap();
+        r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode()).unwrap();
+        for n in 0..messages {
+            r.append(messages_feed(), ChatOp::Text { body: format!("message {n}"), reply_to: None, attachments: vec![] }.encode()).unwrap();
+        }
+        let space = runtime.node.insert_replica(r);
+        runtime.invalidate(&space);
+        space
+    }
+
+    /// Pages at any depth and a new message cost the page and the message:
+    /// neither rereads the history.
+    #[tokio::test]
+    async fn deep_pages_and_new_messages_never_reread_history() {
+        use super::*;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (runtime, dir) = scratch_runtime("deep").await;
+        let space = long_chat(&runtime, 1_500);
+        let id = space.to_string();
+        let newest = runtime.messages(id.clone(), Some(50), None).unwrap();
+        let reads = runtime.history_reads.load(Relaxed);
+        let all = runtime.message_entries(&space).unwrap();
+        let deep = all[40].1.messages[40].id.to_string();
+        let page = runtime.messages(id.clone(), Some(50), Some(deep.clone())).unwrap();
+        assert_eq!(page.len(), 40);
+        let window = runtime.messages_around(id.clone(), deep, Some(10), Some(10)).unwrap();
+        assert_eq!((window.messages.len(), window.has_earlier, window.has_later), (21, true, true));
+        for _ in 0..20 {
+            say(&runtime, space, "new");
+            runtime.emit(Event::ConversationUpdated { conversation: id.clone() });
+        }
+        let latest = runtime.messages(id.clone(), Some(50), None).unwrap();
+        assert_eq!(latest[49].body, "new");
+        assert_eq!(latest[29].id, newest[49].id);
+        assert_eq!(runtime.history_reads.load(Relaxed), reads);
+        finish(runtime, dir).await;
+    }
+
+    /// `MYCEL_BENCH_MESSAGES=100000 cargo test -p mycel-node --lib
+    /// a_huge_chat -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "benchmark"]
+    async fn a_huge_chat_pages_and_takes_messages_in_constant_time() {
+        use super::*;
+        let messages = std::env::var("MYCEL_BENCH_MESSAGES").ok().and_then(|v| v.parse().ok()).unwrap_or(100_000);
+        let (runtime, dir) = scratch_runtime("huge").await;
+        let built = Instant::now();
+        let space = long_chat(&runtime, messages);
+        let id = space.to_string();
+        runtime.messages(id.clone(), Some(1), None).unwrap();
+        let built = built.elapsed();
+        let view = runtime.view(&space).unwrap();
+        let time = |f: &mut dyn FnMut()| {
+            let started = Instant::now();
+            for _ in 0..20 {
+                f();
+            }
+            started.elapsed() / 20
+        };
+        let mut pages = vec![];
+        for depth in [100, messages / 2, messages - 100] {
+            let cursor = view.messages[depth].id.to_string();
+            let page = time(&mut || assert_eq!(runtime.messages(id.clone(), Some(50), Some(cursor.clone())).unwrap().len(), 50));
+            let around = time(&mut || assert_eq!(runtime.messages_around(id.clone(), cursor.clone(), Some(25), Some(25)).unwrap().messages.len(), 51));
+            pages.push(format!("depth {depth}: page {page:?}, window {around:?}"));
+        }
+        drop(view);
+        let incoming = time(&mut || {
+            say(&runtime, space, "new");
+            runtime.view(&space).unwrap();
+        });
+        eprintln!("{messages} messages (built and folded in {built:?}): {}; new message + fold {incoming:?}", pages.join("; "));
         finish(runtime, dir).await;
     }
 

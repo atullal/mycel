@@ -701,6 +701,7 @@ pub fn run() {
             commands::get_conversation,
             commands::create_conversation,
             commands::list_messages,
+            commands::messages_around,
             commands::send_message,
             commands::edit_message,
             commands::delete_message,

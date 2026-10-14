@@ -11,13 +11,16 @@
 //!   keys, whichever spaces either device created.
 //! - [`canonical_space`]: where new messages and calls go: the same space on
 //!   both devices once synchronized, so new history stops splitting.
-//! - [`merge`] / [`last`]: one timeline from several histories.
+//! - [`merge`] / [`last`]: one timeline from several histories;
+//!   [`newest_first`] / [`oldest_first`] page through it from any message
+//!   at a cost proportional to the page, not the history.
 //!
 //! They are pure functions of facts the runtime caches per space
 //! ([`Membership`] from the trust graph, the reduced [`ChatView`]), so neither
 //! listing conversations nor handling an event rereads message history.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use mycel_crypto::{Hash32, SignPk};
 use mycel_trust::{Action, Role, SpaceGraph, SpaceId};
@@ -184,6 +187,67 @@ pub fn last(sources: &[Source], mut keep: impl FnMut(usize, &Message) -> bool) -
         .map(|(_, s, i)| (s, i))
 }
 
+/// Index of the first message of source `s` that sorts after `anchor` in
+/// [`merge`] order (O(log n): keys only grow along a history).
+fn split(sources: &[Source], s: usize, anchor: (usize, usize)) -> usize {
+    let (anchor_source, anchor_index) = anchor;
+    if s == anchor_source {
+        return anchor_index + 1;
+    }
+    let (k, ..) = key(sources, anchor_source, anchor_index);
+    let floor = sources[s].floor_ms;
+    sources[s].view.messages.partition_point(|m| (m.order_ms.max(floor), s) < (k, anchor_source))
+}
+
+/// The timeline backwards from just before `anchor` (from the newest
+/// message without one), lazily: O(log n) to start, then O(log sources) per
+/// message, so a page costs its own size whatever the history's length.
+pub fn newest_first<'a>(
+    sources: &'a [Source<'a>],
+    anchor: Option<(usize, usize)>,
+) -> impl Iterator<Item = (usize, usize)> + 'a {
+    let mut heads = BinaryHeap::new();
+    for s in 0..sources.len() {
+        let end = match anchor {
+            None => sources[s].view.messages.len(),
+            Some(a) if a.0 == s => a.1,
+            Some(a) => split(sources, s, a),
+        };
+        if end > 0 {
+            heads.push(key(sources, s, end - 1));
+        }
+    }
+    std::iter::from_fn(move || {
+        let (_, s, i) = heads.pop()?;
+        if i > 0 {
+            heads.push(key(sources, s, i - 1));
+        }
+        Some((s, i))
+    })
+}
+
+/// The timeline forwards from just after `anchor`, lazily (as
+/// [`newest_first`]).
+pub fn oldest_first<'a>(
+    sources: &'a [Source<'a>],
+    anchor: (usize, usize),
+) -> impl Iterator<Item = (usize, usize)> + 'a {
+    let mut heads = BinaryHeap::new();
+    for s in 0..sources.len() {
+        let start = split(sources, s, anchor);
+        if start < sources[s].view.messages.len() {
+            heads.push(Reverse(key(sources, s, start)));
+        }
+    }
+    std::iter::from_fn(move || {
+        let Reverse((_, s, i)) = heads.pop()?;
+        if i + 1 < sources[s].view.messages.len() {
+            heads.push(Reverse(key(sources, s, i + 1)));
+        }
+        Some((s, i))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +376,50 @@ mod tests {
         assert_eq!(newest_of_a, Some((0, 3)));
         assert_eq!(last(&sources, |_, _| false), None);
         assert!(merge(&[]).is_empty());
+    }
+
+    #[test]
+    fn paging_from_any_message_matches_the_merged_timeline() {
+        let a = reduce(&[text(1, 1, 100), text(2, 1, 500), text(3, 2, 150), text(4, 1, 600), text(8, 1, 600)]);
+        let b = reduce(&[text(5, 2, 120), text(6, 2, 550), text(7, 2, 900), text(9, 2, 600)]);
+        for floors in [(0, 0), (0, 580), (700, 0)] {
+            let sources = [Source { view: &a, floor_ms: floors.0 }, Source { view: &b, floor_ms: floors.1 }];
+            let merged = merge(&sources);
+            let newest: Vec<_> = newest_first(&sources, None).collect();
+            assert_eq!(newest, merged.iter().rev().copied().collect::<Vec<_>>());
+            for (at, anchor) in merged.iter().enumerate() {
+                let before: Vec<_> = newest_first(&sources, Some(*anchor)).collect();
+                assert_eq!(before, merged[..at].iter().rev().copied().collect::<Vec<_>>(), "before {anchor:?}");
+                let after: Vec<_> = oldest_first(&sources, *anchor).collect();
+                assert_eq!(after, merged[at + 1..].to_vec(), "after {anchor:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_page_of_a_huge_merged_history_costs_the_page() {
+        fn history(author: u8, len: u64, offset: u64) -> ChatView {
+            let items: Vec<FeedItem> = (0..len)
+                .map(|n| FeedItem {
+                    id: Hash32::digest("test/page", &[&n.to_le_bytes()[..], &[author]].concat()),
+                    author: pk(author),
+                    author_role: Role::Writer,
+                    ts_ms: n * 2 + offset,
+                    deps: vec![],
+                    body: ChatOp::Text { body: String::new(), reply_to: None, attachments: vec![] }.encode(),
+                })
+                .collect();
+            reduce(&items)
+        }
+        let (a, b) = (history(1, 60_000, 0), history(2, 40_000, 1));
+        let sources = [Source { view: &a, floor_ms: 0 }, Source { view: &b, floor_ms: 0 }];
+        let started = std::time::Instant::now();
+        for anchor in [(0, 100), (0, 30_000), (1, 39_999), (0, 59_999)] {
+            assert_eq!(newest_first(&sources, Some(anchor)).take(50).count(), 50);
+            assert_eq!(oldest_first(&sources, (anchor.0, anchor.1 / 2)).take(50).count(), 50);
+        }
+        assert_eq!(newest_first(&sources, None).next(), Some((0, 59_999)));
+        // Merging 100k messages takes far longer than these few pages.
+        assert!(started.elapsed() < std::time::Duration::from_millis(200), "{:?}", started.elapsed());
     }
 }

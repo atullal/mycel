@@ -21,6 +21,7 @@ import type {
   Contact,
   ConversationId,
   ConversationSummary,
+  MessageId,
   MessageView,
   MycelEvent,
   NearbyPeer,
@@ -193,39 +194,56 @@ export function useConversation(id: ConversationId | null | undefined) {
 }
 
 const PAGE = 50;
-/**
- * The runtime returns at most 10 000 messages per call (`messages` in
- * crates/mycel-node/src/runtime.rs); one is the "is there more?" probe.
- */
+/** The runtime returns at most 10 000 messages per call; one is the "is there more?" probe. */
 const MAX_WINDOW = 9_999;
+
+/**
+ * Which messages are loaded: the newest `count` (following new ones), or a
+ * window around `anchor` (a search hit or quoted message at any depth).
+ * Every fetch costs the window, never the history.
+ */
+type MessageRange = { anchor: null; count: number } | { anchor: MessageId; before: number; after: number };
 
 /**
  * Messages of one conversation, oldest -> newest. Refreshes on
  * `conversationUpdated` for it and on `blobReady` for any loaded attachment.
- * `loadOlder()` pages backwards, one page or `count` more messages (grow
- * geometrically when looking for an old message: each step refetches the
- * whole window).
+ *
+ * - `loadOlder()` / `loadNewer()` extend the window by a page (or `count`);
+ *   past the runtime's per-call limit the window re-anchors on the oldest
+ *   (newest) loaded message, so any depth is reachable.
+ * - `showMessage(id)` loads the window around a message that isn't loaded.
+ * - `showLatest()` goes back to the newest messages and follows new ones;
+ *   `following` says whether the window reaches the newest message.
  *
  * `threadKey` (see `threadKeyOf`) keeps the loaded history while the
  * conversation's canonical space changes; it defaults to `id`.
  */
 export function useMessages(id: ConversationId | null | undefined, pageSize = PAGE, threadKey?: string | null) {
-  const [window_, setWindow] = useState(pageSize);
+  const latest = useMemo<MessageRange>(() => ({ anchor: null, count: pageSize }), [pageSize]);
+  const [range, setRange] = useState<MessageRange>(latest);
   const blobsRef = useRef<Set<string>>(new Set());
   threadKey = threadKey || id;
 
-  useEffect(() => setWindow(pageSize), [threadKey, pageSize]);
+  useEffect(() => setRange(latest), [threadKey, latest]);
 
   const q = useMycelQuery(
     async (c) => {
-      if (!id) return { threadKey, messages: [] as MessageView[], hasMore: false };
+      if (!id) return { threadKey, range, messages: [] as MessageView[], hasMore: false, hasNewer: false };
+      if (range.anchor != null) {
+        try {
+          const w = await c.chat.around(id, range.anchor, { before: range.before, after: range.after });
+          return { threadKey, range, messages: w.messages, hasMore: w.hasEarlier, hasNewer: w.hasLater };
+        } catch {
+          // The message is gone (or never was): show the newest instead.
+        }
+      }
+      const count = range.anchor == null ? range.count : pageSize;
       // Ask for one extra to learn whether older history exists.
-      const list = await c.chat.messages(id, { limit: window_ + 1 });
-      const more = list.length > window_;
-      // At the cap there may be older history this window can't reach.
-      return { threadKey, messages: more ? list.slice(1) : list, hasMore: more && window_ < MAX_WINDOW };
+      const list = await c.chat.messages(id, { limit: count + 1 });
+      const more = list.length > count;
+      return { threadKey, range, messages: more ? list.slice(1) : list, hasMore: more, hasNewer: false };
     },
-    [id, window_, threadKey],
+    [id, range, threadKey, pageSize],
     (e) =>
       (e.type === "conversationUpdated" && e.conversation === id) ||
       (e.type === "blobReady" && blobsRef.current.has(e.blob)),
@@ -239,19 +257,69 @@ export function useMessages(id: ConversationId | null | undefined, pageSize = PA
     : q.loading && prev.current?.threadKey === threadKey ? prev.current : undefined;
   const messages = page?.messages ?? [];
   const hasMore = page?.hasMore ?? false;
+  const hasNewer = page?.hasNewer ?? false;
   blobsRef.current = useMemo(
     () => new Set(messages.flatMap((m) => m.attachments.map((a) => a.blob))),
     [messages],
   );
 
+  const loaded = useRef(messages);
+  loaded.current = messages;
+
   const loadOlder = useCallback(
     (count: number = pageSize) => {
-      if (hasMore) setWindow((w) => Math.min(MAX_WINDOW, w + Math.max(1, count)));
+      if (!hasMore) return;
+      const n = Math.max(1, count);
+      setRange((r) => {
+        const oldest = loaded.current[0]?.id;
+        const span = Math.min(MAX_WINDOW, loaded.current.length);
+        if (r.anchor == null) {
+          if (r.count + n <= MAX_WINDOW || !oldest) return { anchor: null, count: Math.min(MAX_WINDOW, r.count + n) };
+          return { anchor: oldest, before: Math.min(MAX_WINDOW, n), after: MAX_WINDOW };
+        }
+        if (r.before + n <= MAX_WINDOW || !oldest) return { ...r, before: Math.min(MAX_WINDOW, r.before + n) };
+        return { anchor: oldest, before: Math.min(MAX_WINDOW, n), after: span };
+      });
     },
     [hasMore, pageSize],
   );
 
-  return { ...q, data: q.data?.threadKey === threadKey ? q.data?.messages : undefined, messages, hasMore, loadOlder };
+  const loadNewer = useCallback(
+    (count: number = pageSize) => {
+      if (!hasNewer) return;
+      const n = Math.max(1, count);
+      setRange((r) => {
+        if (r.anchor == null) return r;
+        const newest = loaded.current[loaded.current.length - 1]?.id;
+        if (r.after + n <= MAX_WINDOW || !newest) return { ...r, after: Math.min(MAX_WINDOW, r.after + n) };
+        return { anchor: newest, before: Math.min(MAX_WINDOW, loaded.current.length), after: Math.min(MAX_WINDOW, n) };
+      });
+    },
+    [hasNewer, pageSize],
+  );
+
+  const showMessage = useCallback(
+    (message: MessageId) => {
+      if (loaded.current.some((m) => m.id === message)) return;
+      setRange({ anchor: message, before: pageSize, after: pageSize });
+    },
+    [pageSize],
+  );
+
+  const showLatest = useCallback(() => setRange(latest), [latest]);
+
+  return {
+    ...q,
+    data: q.data?.threadKey === threadKey ? q.data?.messages : undefined,
+    messages,
+    hasMore,
+    hasNewer,
+    following: !hasNewer,
+    loadOlder,
+    loadNewer,
+    showMessage,
+    showLatest,
+  };
 }
 
 /**

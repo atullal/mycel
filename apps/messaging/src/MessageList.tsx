@@ -31,6 +31,15 @@ interface Props {
   hasMore: boolean;
   /** One more page, or `count` more messages. */
   onLoadOlder: (count?: number) => void;
+  /** Newer messages exist after the loaded window (it was opened at an older message). */
+  hasNewer?: boolean;
+  onLoadNewer?: () => void;
+  /** Load the window around a message that isn't loaded (any depth). */
+  onShowMessage?: (id: string) => void;
+  /** Back to the newest messages, following new ones. */
+  onShowLatest?: () => void;
+  /** Go to a message (a quoted one that isn't loaded, say). */
+  onJumpRequest?: (id: string) => void;
   onReply?: (m: MessageView) => void;
   onEdit?: (m: MessageView) => void;
   editingId: string | null;
@@ -39,7 +48,7 @@ interface Props {
   onJumped?: () => void;
 }
 
-export function MessageList({ me, summary, messages, loading, error, hasMore, onLoadOlder, onReply, onEdit, editingId, onDeleted, jumpToId, onJumped }: Props) {
+export function MessageList({ me, summary, messages, loading, error, hasMore, onLoadOlder, hasNewer = false, onLoadNewer, onShowMessage, onShowLatest, onJumpRequest, onReply, onEdit, editingId, onDeleted, jumpToId, onJumped }: Props) {
   const mycel = useMycel();
   const [undo, setUndo] = useState<MessageView | null>(null);
   const [undoError, setUndoError] = useState<string | null>(null);
@@ -96,28 +105,44 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
     onLoadOlder();
   };
 
-  // Going to a message that isn't loaded (a search hit far back): double
-  // what's loaded each step, so reaching it takes a few fetches, not one
-  // per page. (Each fetch returns the whole window.)
-  const loadedCount = messages.length;
-
   const jumpTo = (id: string) => {
     const node = scroller.current?.querySelector(`[data-mid="${id}"]`);
-    if (!node) return;
+    if (!node) {
+      // Not loaded (a quoted message far back): load the window around it.
+      onJumpRequest?.(id);
+      return;
+    }
     node.scrollIntoView({ block: "center", behavior: "smooth" });
     setFlash(id);
     setTimeout(() => setFlash((f) => (f === id ? null : f)), 1400);
   };
 
+  // Going to a message that isn't loaded (a search hit far back): one fetch
+  // of the window around it, at any depth.
+  const requested = useRef<string | null>(null);
   useEffect(() => {
     if (!jumpToId || loading || error) return;
     if (byId.has(jumpToId)) {
+      requested.current = null;
       stickToBottom.current = false;
       jumpTo(jumpToId);
       onJumped?.();
-    } else if (hasMore) onLoadOlder(Math.max(loadedCount, 1));
-    else onJumped?.();
-  }, [jumpToId, byId, loading, error, hasMore, onLoadOlder, onJumped, loadedCount]);
+    } else if (onShowMessage && requested.current !== jumpToId) {
+      requested.current = jumpToId;
+      onShowMessage(jumpToId);
+    } else {
+      // Its window is loaded and it isn't there: it's gone.
+      requested.current = null;
+      onJumped?.();
+    }
+  }, [jumpToId, byId, loading, error, onShowMessage, onJumped]);
+
+  const showLatest = () => {
+    stickToBottom.current = true;
+    if (hasNewer) onShowLatest?.();
+    const el = scroller.current;
+    if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+  };
 
   return (
     <div className="mx-messages-area">
@@ -195,9 +220,16 @@ export function MessageList({ me, summary, messages, loading, error, hasMore, on
             </Fragment>
           );
         })}
+        {hasNewer && (
+          <div className="mx-older">
+            <button className="mx-btn mx-btn-quiet" onClick={() => onLoadNewer?.()}>
+              Show newer messages
+            </button>
+          </div>
+        )}
       </div>
     </div>
-    {away && <button className="mx-latest" aria-label="Jump to latest message" onClick={() => { const el = scroller.current; if (el) el.scrollTo({ top: el.scrollHeight, behavior: "smooth" }); }}><Icon.Down /></button>}
+    {(away || hasNewer) && <button className="mx-latest" aria-label="Jump to latest message" onClick={showLatest}><Icon.Down /></button>}
     {undo && <div className="mx-delete-undo" role="status"><span>Message deleted for you</span><button className="mx-btn mx-btn-quiet" onClick={() => {
       const message = undo; setUndo(null); setUndoError(null);
       void mycel.chat.restoreLocal(message.conversation, message.id).catch((e) => setUndoError(errorText(e)));
@@ -337,8 +369,7 @@ const MessageRow = memo(function MessageRow({
                   <button
                     className="mx-quote"
                     onClick={() => m.replyTo && onJump(m.replyTo)}
-                    disabled={!quoted}
-                    title={quoted ? "Go to message" : undefined}
+                    title="Go to message"
                   >
                     <span className="mx-quote-author">{quoted ? (quoted.isMine ? "You" : quoted.authorName) : "Reply"}</span>
                     <span className="mx-quote-text">{quoted ? previewText(quoted) : "Earlier message"}</span>

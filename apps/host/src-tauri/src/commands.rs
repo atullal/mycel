@@ -10,7 +10,7 @@
 //! main (UI) thread.
 
 use mycel_node::api::{
-    CallInfo, Contact, ConversationId, ConversationSummary, MessageId, MessageView, NearbyPeer,
+    CallInfo, Contact, ConversationId, ConversationSummary, MessageId, MessageView, MessageWindow, NearbyPeer,
     NetworkMode, NetworkStatus, PeerId, Profile,
 };
 use tauri::{AppHandle, State};
@@ -116,6 +116,17 @@ pub async fn list_messages(
     before: Option<MessageId>,
 ) -> Res<Vec<MessageView>> {
     rt.messages(id, limit, before).map_err(err)
+}
+
+#[tauri::command]
+pub async fn messages_around(
+    rt: State<'_, Rt>,
+    id: ConversationId,
+    message: MessageId,
+    before: Option<u32>,
+    after: Option<u32>,
+) -> Res<MessageWindow> {
+    rt.messages_around(id, message, before, after).map_err(err)
 }
 
 #[tauri::command]

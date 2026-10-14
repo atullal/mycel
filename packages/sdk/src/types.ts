@@ -116,6 +116,15 @@ export interface MessageView {
   delivery: Delivery;
 }
 
+/** Messages around one (`messages_around`), oldest -> newest. */
+export interface MessageWindow {
+  messages: MessageView[];
+  /** Older messages exist before the window. */
+  hasEarlier: boolean;
+  /** Newer messages exist after it (the window doesn't reach the latest). */
+  hasLater: boolean;
+}
+
 /**
  * - `local`: loopback only (tests).
  * - `lan`: local paths only (same network, peer-to-peer Wi-Fi, Bluetooth); never the internet.
