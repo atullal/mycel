@@ -194,6 +194,17 @@ workflow (`libwebkit2gtk-4.1-dev`, `libdbus-1-dev`, `libasound2-dev`, …) and r
 - The host window opens only after the runtime is ready (`"create": false` in
   `tauri.conf.json`, built in `setup`): phones load the page faster than the
   runtime opens.
+- The profile lock is `flock(2)` on every Unix (std's `File::try_lock` isn't
+  implemented on Android) and `LockFileEx` on Windows. The identity's
+  no-clobber install is `renameatx_np(RENAME_EXCL)` on Apple platforms and
+  `renameat2(RENAME_NOREPLACE)` on Linux and Android 11+, else a hard link,
+  else an exclusive copy (Android 10 denies links in app data; older Android
+  may not allow `renameat2`). On Android the data folder is the app's data
+  root, so only Mycel's own files say a profile exists.
+- Backups: iOS excludes the profile folder from iCloud and computer backups;
+  Android sets `allowBackup="false"` and data extraction rules
+  (`res/xml/data_extraction_rules.xml`) so nothing is backed up or moved to a
+  new phone. The identity is the device's own; peers sync conversations back.
 - Safe areas: the page pads itself with `--safe-*` (theme.css), from
   `env(safe-area-inset-*)` on iOS and from `MainActivity`'s inset reports on
   Android.
