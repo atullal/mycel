@@ -667,8 +667,16 @@ mod tests {
                 assert!(ops.get(key).unwrap().is_none());
             }
         }
+        // Set aside once: the next start finds nothing new, but still reports
+        // the notice until the user dismisses it.
+        let set_aside = crate::api::Notice::RecordsSetAside { count: 3 };
         let runtime = crate::Runtime::open(&dir, crate::api::NetworkMode::Local, None).await.unwrap();
-        assert!(runtime.notices().is_empty(), "set aside once");
+        assert_eq!(runtime.notices(), vec![set_aside.clone()], "set aside once");
+        runtime.dismiss_notice(set_aside).unwrap();
+        runtime.shutdown().await.unwrap();
+        drop(runtime);
+        let runtime = crate::Runtime::open(&dir, crate::api::NetworkMode::Local, None).await.unwrap();
+        assert!(runtime.notices().is_empty(), "dismissed for good");
         runtime.shutdown().await.unwrap();
         drop(runtime);
         std::fs::remove_dir_all(dir).unwrap();

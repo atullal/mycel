@@ -380,7 +380,9 @@ async fn video_pauses_on_bluetooth() {
     // (video starts at 320×180 and ramps up)
     tokio::time::sleep(Duration::from_secs(7)).await;
     assert!(fps(&bob_sees, 1.0) > 25.0, "video over peer-to-peer Wi-Fi ({:.1} fps)", fps(&bob_sees, 1.0));
-    assert_eq!(alice.call(&id).unwrap().video.send_height, 480, "480p on peer-to-peer Wi-Fi");
+    // the 480p rung (848×480) with the 16:9 camera fitted in, unstretched
+    let video = alice.call(&id).unwrap().video;
+    assert_eq!((video.send_width, video.send_height), (848, 476), "480p on peer-to-peer Wi-Fi");
 
     wifi.cut();
     // (the call's path shows within a second of the video noticing)

@@ -320,3 +320,26 @@ async fn a_data_mule_carries_a_message_across_partitions() {
     // C's receipt clears the mule's copy
     eventually("the mule drops its delivered copy", 10, || mule.mesh().unwrap().dtn_stats().handed_on >= 1).await;
 }
+
+/// A contact with many bundles to pass on: all of them go over, a few at
+/// a time (each one gets through whole), the next starting as soon as one
+/// ends rather than at the next tick. None is turned away for having too
+/// many streams open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_contact_hands_over_many_bundles() {
+    let _radios = RADIOS.lock().await;
+    let dir = MemDirectory::new();
+    let here = ble(9);
+    let a = device("a", &[&here], false, &dir).await;
+    let mule = device("mule", &[&here], false, &dir).await;
+    let c = DeviceKeys::generate().sign_pk();
+    const N: u64 = 60;
+    for i in 0..N {
+        let payload = bytes::Bytes::from(vec![i as u8; 2048]);
+        a.mesh().unwrap().send_bundle(c, payload, Duration::from_secs(600)).unwrap();
+    }
+    let t = Instant::now();
+    eventually("the mule takes every bundle", 30, || mule.mesh().unwrap().dtn_stats().accepted >= N).await;
+    eprintln!("{N} bundles handed over in {:?}; {:?}", t.elapsed(), mule.mesh().unwrap().dtn_stats());
+    assert_eq!(mule.mesh().unwrap().dtn_stats().refused, 0);
+}

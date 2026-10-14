@@ -11,6 +11,7 @@ import type {
   NearbyPeer,
   NetworkMode,
   NetworkStatus,
+  Notice,
   PeerId,
   Profile,
 } from "./types.ts";
@@ -31,6 +32,8 @@ export interface Commands {
   set_network_mode: [{ mode: NetworkMode }, NetworkStatus];
   /** Native host only: relaunch the app. */
   restart_app: [Record<string, never>, null];
+  list_notices: [Record<string, never>, Notice[]];
+  dismiss_notice: [{ notice: Notice }, null];
   list_conversations: [Record<string, never>, ConversationSummary[]];
   get_conversation: [{ id: ConversationId }, ConversationSummary];
   create_conversation: [{ title?: string | null; members: PeerId[] }, ConversationSummary];

@@ -27,6 +27,18 @@ opt-level = 3
 # (the AEAD's generic code is instantiated here)
 [profile.dev.package.mycel-crypto]
 opt-level = 3
+# Every membership op and envelope is signature-checked, and documents are
+# Automerge: unoptimized, tests with long histories or large documents crawl.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.automerge]
+opt-level = 3
+[profile.dev.package.hexane]
+opt-level = 3
+[profile.dev.package.zlib-rs]
+opt-level = 3
 # Live calls encode and decode audio in real time: the Opus codec and the call
 # pipeline must be optimized even in debug builds.
 [profile.dev.package.unsafe-libopus]
@@ -71,3 +83,5 @@ swift-rs = { path = "vendor/swift-rs" }
 noq = { path = "vendor/noq" }
 noq-proto = { path = "vendor/noq-proto" }
 tauri-plugin-notification = { path = "vendor/tauri-plugin-notification" }
+# standard DNS-SD interop for LAN discovery (vendor/swarm-discovery/MYCEL_PATCH.md)
+swarm-discovery = { path = "vendor/swarm-discovery" }

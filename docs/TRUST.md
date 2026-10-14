@@ -93,6 +93,12 @@ Every peer computes the valid op set and the resulting state with the same algor
 
 Ops whose parents are unknown are **pending** and are not evaluated until the parents arrive.
 
+**Heads.** The authoring frontier (`heads()`: the `parents` of a new op, and the `auth_heads` of a new envelope) is the set of causally maximal **valid** ops. Invalid ops are still stored, still count for ancestry, and still sync, but they never become heads. Otherwise anyone able to sign an op (a Reader, or a member being removed) could append a fan-out of more than `MAX_PARENTS` (64) invalid ops; every admin op would then need more parents than an op may carry, and nobody could revoke the attacker. Because ancestry still runs through every stored op, a valid op written after an invalid one keeps it in its past. A genuinely concurrent *valid* frontier wider than 64 ops is never truncated; authoring fails instead (a known protocol limit).
+
+**Pending caps.** Pending ops are held in memory before anyone can tell whether they are authorized, so the pool is bounded: at most `MAX_PENDING` (4,096) in total and `MAX_PENDING_PER_AUTHOR` (256) per author. The per-author cap stops one member (or one stolen key) from filling the shared pool and starving everyone else's out-of-order ops; ops whose parents are all known bypass the pool entirely, so a full pool never blocks a ready admin op such as a revocation. An op refused by a full pool is not lost: it is offered again by the next sync. To keep honest syncs inside these caps, peers send ops in resolution order (`op_ids()`/`all_ops()`: topological, then pending ops by id), so a receiver normally admits every op directly; a new member receives a single admin's 10,000-op history in one exchange.
+
+**Cost.** Resolution keeps a running state while history is linear (each op's past contains every valid op before it), so a long run of one admin's ops resolves in linear time; only ops concurrent with others replay their own past.
+
 ## 6. Epochs and encryption keys
 
 - **Each peer keeps a keyring:** `EpochId → key`. It fills it by unsealing lockboxes addressed to itself from valid ops only, and verifies each key against its commitment.
@@ -126,7 +132,10 @@ ciphertext = XChaCha20-Poly1305(key = epoch key, nonce, aad = "mycel/v0/content"
 **After decrypting** (members only):
 7. the Automerge change's actor ID must equal `header.author`. Authors cannot write under someone else's actor.
 
-**Materialization:** a document = the valid, decryptable changes, applied in causal order. If a newly arrived revocation invalidates envelopes that were already applied, the peer **rebuilds** the document from its envelope store. Every peer holding the same graph and envelopes arrives at the same document.
+8. the change must be consistent with its **declared history** (its `deps` and their ancestors), never with whatever else a peer happens to hold: its actor sequence number is exactly one more than that actor's latest change in that history; its operation counters start above every counter in that history and fit in 32 bits; every actor in its actor table wrote something in that history; and every object, list/text element and predecessor its operations name exists in that history (or earlier in the same change) with the right shape (objects are maps, lists or text; elements are insertions into that same object). A change that fails is rejected for good. Checking this uses a per-document causal index (author, sequence, counter range and run-length operation summary per change, plus a sparse vector clock), so it costs the size of the change plus a logarithmic lookup per reference — no replay.
+9. **resource limits** (before Automerge parses anything): at most 16 MiB after decompression, 1,048,576 operations, and a logical expansion of run-length/group-encoded columns of at most 64 values (or string bytes) per byte of change body, never below 4M (deleting a long run encodes in a few bytes) and never above 16M values / 16 MiB of strings. Writers stay far inside this: a local edit is written as changes of at most 65,536 operations and 512 KiB each, so a multi-megabyte paste becomes several consecutive changes that every released version accepts.
+
+**Materialization:** a document = the valid, decryptable changes, applied in causal order. A change waits, still encrypted, until its dependencies are applied; validated changes reach Automerge in batches. Equivocation (two changes for one actor sequence number) is resolved by the lowest envelope ID, on every peer; if a lower-ID fork displaces a change that was already applied, the document is re-derived once per received batch, however many forks the batch carries. If a newly arrived revocation invalidates envelopes that were already applied, the peer **rebuilds** the document from its envelope store; other membership changes only touch envelopes whose validity or decryptability changed. Every peer holding the same graph and envelopes arrives at the same document.
 
 ## 7b. Attachments (blobs)
 
@@ -260,7 +269,8 @@ An independent adversarial review found these issues. All are fixed, each with a
 
 ## 10. Known v0 gaps (tracked)
 - **Post-quantum:** lockboxes are long-lived ciphertext stored on keepers, so they are exposed to harvest-now-decrypt-later attacks. Move to X-Wing (hybrid ML-KEM + X25519, already supported by `hpke` 0.14) once the IETF draft is final.
-- **Performance:** resolution is O(n²) in membership ops, which is fine for hundreds of ops. Envelope validity is recomputed on every ingest, which is fine for thousands of envelopes. Incremental resolution is planned for phase 1.
+- **Performance:** resolution is linear for linear history but still O(n²) for heavily concurrent membership ops, and envelope validity is recomputed for every envelope on each membership change. Incremental resolution is planned for phase 1.
+- **Equivocation:** each batch carrying a lower-ID fork of an already-applied change costs one linear rebuild of that document, and the displaced change's descendants are dropped (as for revocations). Bounding this to once per slot would need a different canonical-fork rule.
 - **Sync efficiency:** sync sends full ID inventories. Replace with range-based set reconciliation (Negentropy-style).
 - Multi-device agents and device revocation (phase 1).
 - Rotation cost is O(n) lockboxes per rotation. Fine for groups up to a few hundred; switch to TreeKEM/BeeKEM-style rotation later.

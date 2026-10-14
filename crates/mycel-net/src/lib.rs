@@ -69,11 +69,10 @@ use wire::*;
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 /// A pooled connection unused (no stream open from our side) this long is closed.
 pub const POOL_IDLE: Duration = Duration::from_secs(60);
-const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 /// A sync not through by now is also handed to store-and-forward carriers
 /// (the live attempt keeps going): a stale connection to a peer that moved
-/// away only times out at [`SESSION_TIMEOUT`], and a passer-by who could
-/// carry it may be gone by then.
+/// away only fails once the peer has had [`resources::REPLY_TIMEOUT`] to
+/// answer, and a passer-by who could carry it may be gone by then.
 const BUNDLE_AFTER: Duration = Duration::from_secs(10);
 const PERIODIC_SYNC: Duration = Duration::from_secs(15);
 /// How long shutting down waits for peers to acknowledge the close.
@@ -140,6 +139,12 @@ pub struct NodeOptions {
     pub extra_protocols: Vec<ExtraProtocol>,
     /// Multi-hop relaying through nearby devices (`mesh.rs`); `None` = off.
     pub mesh: Option<MeshOptions>,
+    /// The largest ephemeral payload sent or taken ([`MAX_EPHEMERAL`] by
+    /// default; at most [`wire::MAX_FRAME`] less overhead). A device drops
+    /// bigger ones unread, so an app that needs more raises it on every
+    /// device. What is queued for the app (up to 1024 events) can hold
+    /// that much per event.
+    pub max_ephemeral: usize,
 }
 
 /// Another protocol served on the node's endpoint: incoming connections with
@@ -167,6 +172,7 @@ impl NodeOptions {
             ip: true,
             extra_protocols: Vec::new(),
             mesh: None,
+            max_ephemeral: MAX_EPHEMERAL,
         }
     }
 }
@@ -265,6 +271,12 @@ struct Inner {
     blob_served: AtomicU64,
     /// The last store-and-forward bundle sent per (member, space).
     bundled: Mutex<HashMap<(SignPk, SpaceId), Hash32>>,
+    /// See [`NodeOptions::max_ephemeral`].
+    max_ephemeral: usize,
+    /// Memory for what devices send us: those we share a space with, and
+    /// the rest (`resources.rs`).
+    member_frames: resources::Frames,
+    stranger_frames: resources::Frames,
 }
 
 /// How many QUIC connections (handshakes) a node has made.
@@ -444,6 +456,24 @@ impl Inner {
         p.last_fail = Some(Instant::now());
     }
 
+    /// The memory budget for what `peer` sends us on a stream it opened: a
+    /// share of the members' pool if we share a space with it (now: it may
+    /// just have joined one), of the strangers' otherwise.
+    fn frames(&self, peer: &SignPk) -> resources::PeerFrames {
+        if self.spaces.lock().values().any(|r| r.is_member(peer)) {
+            self.member_frames.peer(peer)
+        } else {
+            self.stranger_frames.peer(peer)
+        }
+    }
+
+    /// ... and for its answers to us: we chose to ask it (a device we were
+    /// just invited by may not be a member yet in our copy of the space, and
+    /// its first answer is the space's whole history).
+    fn reply_frames(&self, peer: &SignPk) -> resources::PeerFrames {
+        self.member_frames.peer(peer)
+    }
+
     fn with_space<R>(&self, space: &SpaceId, f: impl FnOnce(&mut Replica) -> R) -> Result<R> {
         let mut spaces = self.spaces.lock();
         let r = spaces.get_mut(space).ok_or_else(|| anyhow!("unknown space"))?;
@@ -612,31 +642,26 @@ impl ProtocolHandler for Handler {
 
 /// Serve every stream a peer opens on one connection, for as long as it
 /// lives: each stream is one exchange, handled concurrently with the others.
+/// How many it may have open at once is QUIC's per-connection stream limit
+/// (`link::transport_config`): beyond it the peer waits for its turn.
 async fn serve_conn(inner: &Arc<Inner>, conn: Connection) {
     inner.accepted.fetch_add(1, Ordering::Relaxed);
     let peer = to_sign_pk(&conn.remote_id());
-    let admission = resources::Admission::new();
     loop {
         tokio::select! {
             bi = conn.accept_bi() => {
                 let Ok((tx, rx)) = bi else { break };
-                let Some(permit) = admission.try_acquire() else { drop((tx, rx)); continue };
                 let (inner, conn) = (inner.clone(), conn.clone());
-                let frames = admission.frames();
-                tokio::spawn(resources::with_frames(frames, async move {
-                    let _permit = permit;
+                tokio::spawn(async move {
                     let _ = serve_bi(&inner, &conn, peer, tx, rx).await;
-                }));
+                });
             }
             uni = conn.accept_uni() => {
                 let Ok(rx) = uni else { break };
-                let Some(permit) = admission.try_acquire() else { drop(rx); continue };
                 let inner = inner.clone();
-                let frames = admission.frames();
-                tokio::spawn(resources::with_frames(frames, async move {
-                    let _permit = permit;
+                tokio::spawn(async move {
                     let _ = serve_uni(&inner, peer, rx).await;
-                }));
+                });
             }
         }
     }
@@ -644,7 +669,7 @@ async fn serve_conn(inner: &Arc<Inner>, conn: Connection) {
 
 async fn stream_kind(rx: &mut RecvStream) -> Result<StreamKind> {
     let mut b = [0u8; 1];
-    resources::header(rx.read_exact(&mut b)).await?;
+    resources::first(rx.read_exact(&mut b)).await?;
     StreamKind::from_byte(b[0]).ok_or_else(|| anyhow!("unknown stream kind {}", b[0]))
 }
 
@@ -652,7 +677,9 @@ async fn serve_bi(inner: &Arc<Inner>, conn: &Connection, peer: SignPk, tx: SendS
     let kind = stream_kind(&mut rx).await?;
     tx.set_priority(kind.priority()).ok();
     match kind {
-        StreamKind::Sync => tokio::time::timeout(SESSION_TIMEOUT, serve_sync(inner, conn, peer, tx, rx)).await?,
+        // No total deadline: over a slow link a large sync takes minutes,
+        // and each wait inside is bounded while bytes keep moving.
+        StreamKind::Sync => serve_sync(inner, conn, peer, tx, rx).await,
         StreamKind::Card => serve_card(inner, tx).await,
         StreamKind::Blob => blobs::serve(inner, peer, tx, rx).await,
         StreamKind::Ephemeral => bail!("ephemeral messages use uni-streams"),
@@ -673,7 +700,7 @@ async fn serve_sync(
     mut tx: SendStream,
     mut rx: RecvStream,
 ) -> Result<()> {
-    let (mut msg, mut msg_permit) = recv_held::<SyncMsg>(&mut rx).await?;
+    let (mut msg, mut msg_permit) = recv_held::<SyncMsg>(&mut rx, resources::FIRST_FRAME, &inner.frames(&peer)).await?;
     loop {
         let SyncMsg::Hello { space, inv, invite } = msg else {
             bail!("expected Hello");
@@ -682,10 +709,10 @@ async fn serve_sync(
         if !known {
             match invite {
                 None => {
-                    send(&mut tx, &SyncMsg::NeedInvite).await?;
+                    let len = send_len(&mut tx, &SyncMsg::NeedInvite).await?;
                     drop(inv);
                     drop(msg_permit);
-                    (msg, msg_permit) = recv_held(&mut rx).await?;
+                    (msg, msg_permit) = recv_held(&mut rx, resources::reply_timeout(len), &inner.frames(&peer)).await?;
                     continue;
                 }
                 Some(ops) => {
@@ -713,11 +740,12 @@ async fn serve_sync(
             tx.finish()?;
             return Ok(());
         };
-        send(&mut tx, &reply).await?;
+        let len = send_len(&mut tx, &reply).await?;
         drop(reply);
         drop(inv);
         drop(msg_permit);
-        let (msg, _data_permit) = recv_held(&mut rx).await?;
+        // (a member now, if this was an invitation)
+        let (msg, _data_permit) = recv_held(&mut rx, resources::reply_timeout(len), &inner.frames(&peer)).await?;
         let SyncMsg::DataAndWant { data, want } = msg else {
             bail!("expected DataAndWant");
         };
@@ -790,7 +818,7 @@ async fn serve_card(inner: &Arc<Inner>, mut tx: SendStream) -> Result<()> {
 }
 
 async fn serve_eph(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) -> Result<()> {
-    let (msg, _permit) = recv_ephemeral(&mut rx).await?;
+    let (msg, _permit) = recv_ephemeral(&mut rx, &inner.frames(&peer), inner.max_ephemeral).await?;
     let data = inner.with_space(&msg.space, |r| {
         if !r.is_member(&peer) {
             return None;
@@ -847,9 +875,10 @@ macro_rules! on_conn {
 }
 pub(crate) use on_conn;
 
-/// Open a bi-stream of `kind` (labelled and prioritised).
+/// Open a bi-stream of `kind` (labelled and prioritised). Waits while the
+/// peer already has as many of our streams open as it allows.
 pub(crate) async fn open_bi(conn: &Connection, kind: StreamKind) -> Result<(SendStream, RecvStream)> {
-    let (mut tx, rx) = conn.open_bi().await?;
+    let (mut tx, rx) = resources::within(resources::REPLY_TIMEOUT, "no stream", conn.open_bi()).await?;
     tx.set_priority(kind.priority()).ok();
     tx.write_all(&[kind as u8]).await?;
     Ok((tx, rx))
@@ -873,12 +902,12 @@ async fn sync_exchange(
     ops: Vec<SignedOp>,
 ) -> Result<SyncStats> {
     let (mut tx, mut rx) = open_bi(conn, StreamKind::Sync).await?;
-    send(&mut tx, &SyncMsg::Hello { space, inv: inv.clone(), invite: None }).await?;
-    let (mut reply, mut reply_permit) = recv_held::<SyncMsg>(&mut rx).await?;
+    let len = send_len(&mut tx, &SyncMsg::Hello { space, inv: inv.clone(), invite: None }).await?;
+    let (mut reply, mut reply_permit) = recv_held::<SyncMsg>(&mut rx, resources::reply_timeout(len), &inner.reply_frames(&peer)).await?;
     if matches!(reply, SyncMsg::NeedInvite) {
-        send(&mut tx, &SyncMsg::Hello { space, inv, invite: Some(ops) }).await?;
+        let len = send_len(&mut tx, &SyncMsg::Hello { space, inv, invite: Some(ops) }).await?;
         drop(reply_permit);
-        (reply, reply_permit) = recv_held(&mut rx).await?;
+        (reply, reply_permit) = recv_held(&mut rx, resources::reply_timeout(len), &inner.reply_frames(&peer)).await?;
     }
     let (their_inv, their_want) = match reply {
         SyncMsg::Accept { inv, want } => (inv, want),
@@ -904,13 +933,13 @@ async fn sync_exchange(
         SyncMsg::DataAndWant { data, .. } => data.envelopes.iter().map(|e| e.id()).collect(),
         _ => vec![],
     };
-    send(&mut tx, &out).await?;
+    let len = send_len(&mut tx, &out).await?;
     tx.finish()?;
     drop(out);
     drop(their_inv);
     drop(their_want);
     drop(reply_permit);
-    let (msg, _data_permit) = recv_held(&mut rx).await?;
+    let (msg, _data_permit) = recv_held(&mut rx, resources::reply_timeout(len), &inner.reply_frames(&peer)).await?;
     let SyncMsg::Data { data } = msg else {
         bail!("expected Data");
     };
@@ -930,7 +959,9 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
     }
     let _slot = inner.sync_slots.acquire().await;
     loop {
-        let session = tokio::time::timeout(SESSION_TIMEOUT, sync_session(&inner, peer, space, false));
+        // No total deadline (a large sync over Bluetooth takes minutes):
+        // every wait inside is bounded, and a dead connection fails it.
+        let session = sync_session(&inner, peer, space, false);
         tokio::pin!(session);
         let res = tokio::select! {
             r = &mut session => r,
@@ -939,7 +970,7 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
                 session.await
             }
         };
-        let ok = matches!(res, Ok(Ok(_)));
+        let ok = res.is_ok();
         if ok {
             inner.mark_ok(peer);
         } else {
@@ -1137,7 +1168,14 @@ impl Node {
                 }
             }
         }
-        let mdns = if opts.mode != NetMode::Local {
+        // LAN discovery (`_mycel._udp`): iroh's mDNS sends its own multicast,
+        // which iOS allows only with Apple's multicast entitlement, so on iOS
+        // the system's Bonjour responder discovers and advertises instead
+        // (native_mdns.rs). Only one of the two runs, or they would claim the
+        // same instance name. They interoperate: vendor/swarm-discovery.
+        let native_lan = cfg!(target_os = "ios")
+            || cfg!(target_os = "macos") && std::env::var_os("MYCEL_NATIVE_MDNS").is_some_and(|v| v == "1");
+        let mdns = if opts.mode != NetMode::Local && !native_lan {
             let mdns = MdnsAddressLookup::builder()
                 .service_name("mycel")
                 .build(endpoint.id())?;
@@ -1147,7 +1185,7 @@ impl Node {
             None
         };
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let native_mdns = if opts.mode != NetMode::Local && opts.ip {
+        let native_mdns = if opts.mode != NetMode::Local && opts.ip && native_lan {
             let sockets = endpoint.bound_sockets();
             let port = sockets.iter().find(|a| a.is_ipv4()).or_else(|| sockets.first()).map_or(0, |a| a.port());
             match native_mdns::NativeMdns::start(endpoint.id(), port) {
@@ -1185,6 +1223,9 @@ impl Node {
             accepted: AtomicU64::new(0),
             blob_served: AtomicU64::new(0),
             bundled: Mutex::default(),
+            max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
+            member_frames: resources::Frames::members(),
+            stranger_frames: resources::Frames::strangers(),
         });
         let mut router = Router::builder(endpoint).accept(ALPN, Handler { inner: inner.clone() });
         for p in opts.extra_protocols {
@@ -1433,10 +1474,10 @@ impl Node {
     /// Fetch a device's self-signed contact card (anyone may ask).
     pub async fn fetch_card(&self, peer: SignPk) -> Result<ContactCard> {
         let inner = &self.inner;
-        let (card, _permit) = on_conn!(inner, &peer, |conn| async {
+        let card: ContactCard = on_conn!(inner, &peer, |conn| async {
             let (mut tx, mut rx) = open_bi(&conn, StreamKind::Card).await?;
             tx.finish()?;
-            recv_held::<ContactCard>(&mut rx).await
+            recv_small(&mut rx, resources::REPLY_TIMEOUT, &inner.reply_frames(&peer)).await
         })?;
         card.verify()?;
         if card.keys.sign_pk != peer {
@@ -1446,9 +1487,9 @@ impl Node {
     }
 
     /// Fire-and-forget an encrypted ephemeral message to online members.
-    /// Typing/presence payloads are limited to [`MAX_EPHEMERAL`] bytes.
+    /// Payloads are limited to [`NodeOptions::max_ephemeral`] bytes.
     pub fn send_ephemeral(&self, space: SpaceId, data: Vec<u8>) -> Result<()> {
-        anyhow::ensure!(data.len() <= MAX_EPHEMERAL, "ephemeral message too large");
+        anyhow::ensure!(data.len() <= self.inner.max_ephemeral, "ephemeral message too large");
         let me = self.id();
         let (msg, members) = self.with_space(&space, |r| {
             let sealed = r.seal_ephemeral(&eph_aad(&space, &me.0), &data);
@@ -1474,7 +1515,7 @@ impl Node {
             let msg = msg.clone();
             tokio::spawn(async move {
                 let _ = on_conn!(&inner, &pk, |conn| async {
-                    let mut tx = conn.open_uni().await?;
+                    let mut tx = resources::within(resources::REPLY_TIMEOUT, "no stream", conn.open_uni()).await?;
                     tx.set_priority(StreamKind::Ephemeral.priority()).ok();
                     tx.write_all(&[StreamKind::Ephemeral as u8]).await?;
                     send(&mut tx, &*msg).await?;

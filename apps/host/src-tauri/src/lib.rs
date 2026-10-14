@@ -79,6 +79,7 @@ fn forward_events(app: AppHandle, runtime: Rt, notifier: Arc<notify::Notifier>) 
                         Event::ContactsChanged,
                         Event::NearbyChanged,
                         Event::NetworkChanged,
+                        Event::NoticesChanged,
                     ];
                     refresh.extend(
                         runtime
@@ -693,6 +694,8 @@ pub fn run() {
             commands::remove_contact,
             commands::list_contacts,
             commands::list_nearby,
+            commands::list_notices,
+            commands::dismiss_notice,
             commands::network_status,
             commands::set_network_mode,
             commands::restart_app,

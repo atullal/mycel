@@ -48,7 +48,7 @@ pub mod directory;
 pub mod dtn;
 pub mod wire;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -284,6 +284,32 @@ struct Driver {
     carrier: Option<Mutex<dtn::Carrier>>,
     /// Where bundles for us go (the node ingests them).
     bundle_sink: Mutex<Option<mpsc::UnboundedSender<(SignPk, Bytes)>>>,
+    /// Bundles being handed to each neighbour now ([`SENDS_PER_NEIGHBOUR`]).
+    sending: Mutex<HashMap<SignPk, HashSet<Hash32>>>,
+    /// One of them ended: plan the next without waiting for the tick.
+    dtn_due: AtomicBool,
+    /// Memory for what neighbours send us (`resources.rs`).
+    frames: crate::resources::Frames,
+}
+
+/// A bundle being handed to a neighbour; ending lets the next one start.
+struct SendSlot {
+    d: Arc<Driver>,
+    to: SignPk,
+    id: Hash32,
+}
+
+impl Drop for SendSlot {
+    fn drop(&mut self) {
+        let mut sending = self.d.sending.lock();
+        if let Some(ids) = sending.get_mut(&self.to) {
+            ids.remove(&self.id);
+            if ids.is_empty() {
+                sending.remove(&self.to);
+            }
+        }
+        self.d.dtn_due.store(true, Ordering::Relaxed);
+    }
 }
 
 impl std::fmt::Debug for Driver {
@@ -762,48 +788,34 @@ impl Driver {
     // ───────────── store and forward ─────────────
 
     /// Streams a neighbour opens on the hop connection: summaries and
-    /// bundles (datagrams carry routing and packets).
+    /// bundles (datagrams carry routing and packets). QUIC's stream limits
+    /// make a neighbour with too many open wait for its turn.
     async fn serve_streams(self: Arc<Self>, peer: SignPk, conn: Connection) {
-        let admission = crate::resources::Admission::new();
         loop {
             tokio::select! {
                 bi = conn.accept_bi() => {
                     let Ok((tx, rx)) = bi else { break };
-                    let Some(permit) = admission.try_acquire() else { drop((tx, rx)); continue };
                     let me = self.clone();
-                    let frames = admission.frames();
-                    tokio::spawn(crate::resources::with_frames(frames, async move {
-                        let _permit = permit;
+                    tokio::spawn(async move {
                         let _ = me.on_bundle_stream(peer, tx, rx).await;
-                    }));
+                    });
                 }
                 uni = conn.accept_uni() => {
                     let Ok(rx) = uni else { break };
-                    let Some(permit) = admission.try_acquire() else { drop(rx); continue };
                     let me = self.clone();
-                    let frames = admission.frames();
-                    tokio::spawn(crate::resources::with_frames(frames, async move {
-                        let _permit = permit;
-                        let _ = tokio::time::timeout(crate::SESSION_TIMEOUT, me.on_summary_stream(peer, rx)).await;
-                    }));
+                    tokio::spawn(async move {
+                        let _ = me.on_summary_stream(peer, rx).await;
+                    });
                 }
             }
         }
     }
 
     async fn on_summary_stream(self: Arc<Self>, from: SignPk, mut rx: iroh::endpoint::RecvStream) -> Result<()> {
-        let _permit = crate::resources::frame_bytes(MAX_SUMMARY)?;
-        let mut bytes = Vec::new();
-        loop {
-            let chunk = if bytes.is_empty() {
-                crate::resources::header(rx.read_chunk(16 * 1024)).await?
-            } else {
-                crate::resources::idle(rx.read_chunk(16 * 1024)).await?
-            };
-            let Some(chunk) = chunk else { break };
-            anyhow::ensure!(bytes.len() + chunk.len() <= MAX_SUMMARY, "summary too large");
-            bytes.extend_from_slice(&chunk);
-        }
+        // (it ends with the stream: no length first)
+        let permit = self.frames.peer(&from).admit(MAX_SUMMARY).await?;
+        let idle = crate::resources::IDLE_TIMEOUT;
+        let (bytes, _permit) = crate::resources::read_body(&mut rx, MAX_SUMMARY, true, permit, idle).await?;
         let Some((&K_SUMMARY, body)) = bytes.split_first() else { return Ok(()) };
         let w: WireSummary = postcard::from_bytes(body)?;
         let s = dtn::Summary {
@@ -832,7 +844,8 @@ impl Driver {
         mut rx: iroh::endpoint::RecvStream,
     ) -> Result<()> {
         let Some(c) = &self.carrier else { return Ok(()) };
-        let (head, _head_permit) = read_frame(&mut rx, MAX_OFFER).await?;
+        let frames = self.frames.peer(&from);
+        let (head, _head_permit) = read_frame(&mut rx, MAX_OFFER, crate::resources::FIRST_FRAME, &frames).await?;
         let Some((&K_OFFER, body)) = head.split_first() else { return Ok(()) };
         let w: WireOffer = postcard::from_bytes(body)?;
         let o = dtn::Offer {
@@ -850,26 +863,44 @@ impl Driver {
             c.set_clock(self.now(), wall_ms());
             c.offered(from, &o, self.now(), verify_offer)
         };
+        // Room for the payload before asking for it: the neighbour's share
+        // for all of it, the pool for what is in memory (the partial kept
+        // from before, then what arrives).
+        let want = usize::try_from(o.size)?;
+        let permit = match answer {
+            dtn::Answer::Take { .. } => Some(frames.admit(want).await?),
+            _ => None,
+        };
         write_frame(&mut tx, &crate::wire::encode_bounded(&WireAnswer::from(answer), 64)?).await?;
-        let dtn::Answer::Take { from: at } = answer else {
+        let (dtn::Answer::Take { from: at }, Some(mut permit)) = (answer, permit) else {
             tx.finish()?;
             return Ok(());
         };
-        // Account for the retained partial and incoming payload before copying.
-        let _payload_permit = crate::resources::frame_bytes(usize::try_from(o.size)?)?;
+        permit.hold(at as usize).await?;
         // the payload from `at`: keep what arrives even if the link drops
-        let mut payload = c.lock().partial(&o.id).map_or_else(Vec::new, |p| p.to_vec());
-        payload.truncate(at as usize);
+        let mut payload = c.lock().partial(&o.id).map_or_else(Vec::new, |p| p[..p.len().min(at as usize)].to_vec());
         if payload.len() as u64 != at {
             return Ok(()); // dropped meanwhile: the next offer starts over
         }
-        let want = o.size as usize;
+        let idle = crate::resources::IDLE_TIMEOUT;
         let cut = loop {
-            match crate::resources::idle(rx.read_chunk(want.saturating_sub(payload.len()).clamp(1, 64 * 1024))).await {
-                Ok(Some(chunk)) if payload.len() + chunk.len() <= want => payload.extend_from_slice(&chunk),
-                Ok(Some(_)) => return Ok(()), // more than offered: not that bundle
-                Ok(None) => break false,
-                Err(_) => break true,
+            let deadline = permit.deadline(payload.len() - at as usize, idle);
+            let n = want.saturating_sub(payload.len()).clamp(1, 64 * 1024);
+            match tokio::time::timeout_at(deadline, rx.read_chunk(n)).await {
+                Ok(Ok(Some(chunk))) if payload.len() + chunk.len() <= want => {
+                    let need = payload.len() + chunk.len();
+                    if payload.capacity() < need {
+                        let target = need.next_power_of_two().min(want);
+                        if permit.hold(target).await.is_err() {
+                            break true;
+                        }
+                        payload.reserve_exact(target - payload.len());
+                    }
+                    payload.extend_from_slice(&chunk)
+                }
+                Ok(Ok(Some(_))) => return Ok(()), // more than offered: not that bundle
+                Ok(Ok(None)) => break false,
+                Ok(Err(_)) | Err(_) => break true,
             }
         };
         if cut || payload.len() < want {
@@ -931,7 +962,9 @@ impl Driver {
             msg.extend_from_slice(&body);
             let me = self.clone();
             self.keep(tokio::spawn(async move {
-                let sent = match crate::resources::header(conn.open_uni()).await {
+                // (opening waits while the neighbour has as many streams from us as it allows)
+                let open = crate::resources::within(crate::resources::REPLY_TIMEOUT, "no stream", conn.open_uni());
+                let sent = match open.await {
                     Ok(mut tx) => crate::resources::write_all(&mut tx, &msg).await.is_ok() && tx.finish().is_ok(),
                     Err(_) => false,
                 };
@@ -963,7 +996,21 @@ impl Driver {
             }
             plan
         };
+        // (deliveries first: the plan is in order of importance)
         for t in plan {
+            let slot = {
+                let mut sending = self.sending.lock();
+                let ids = sending.entry(t.to).or_default();
+                if ids.contains(&t.id) {
+                    continue; // still on its way there (a slow link)
+                }
+                (ids.len() < SENDS_PER_NEIGHBOUR && ids.insert(t.id)).then(|| SendSlot { d: self.clone(), to: t.to, id: t.id })
+            };
+            let Some(slot) = slot else {
+                // its turn comes when one of those ends
+                c.lock().transferred(t.to, t.id, t.copies, false, now);
+                continue;
+            };
             let Some(b) = c.lock().bundle(&t.id).cloned() else { continue };
             let Some(conn) = self.conn(&t.to) else {
                 c.lock().transferred(t.to, t.id, t.copies, false, now);
@@ -971,7 +1018,9 @@ impl Driver {
             };
             let me = self.clone();
             self.keep(tokio::spawn(async move {
-                let sent = send_bundle(&conn, &b, t.copies).await.unwrap_or(Sent::Failed);
+                let _slot = slot;
+                let frames = me.frames.peer(&t.to);
+                let sent = send_bundle(&conn, &b, t.copies, &frames).await.unwrap_or(Sent::Failed);
                 if let Some(c) = &me.carrier {
                     let mut c = c.lock();
                     match sent {
@@ -1033,6 +1082,7 @@ async fn run(d: Arc<Driver>) {
     let tick = Duration::from_millis(20);
     let mut next_slow = Instant::now();
     let mut next_dtn = Instant::now();
+    let mut last_dtn = Instant::now();
     loop {
         tokio::time::sleep(tick).await;
         if d.stopped.load(Ordering::Relaxed) {
@@ -1061,8 +1111,11 @@ async fn run(d: Arc<Driver>) {
             d.dial_missing();
             d.measure();
         }
-        if Instant::now() >= next_dtn {
-            next_dtn = Instant::now() + DTN_EVERY;
+        let soon = d.dtn_due.load(Ordering::Relaxed) && last_dtn.elapsed() >= DTN_SOON;
+        if soon || Instant::now() >= next_dtn {
+            d.dtn_due.store(false, Ordering::Relaxed);
+            last_dtn = Instant::now();
+            next_dtn = last_dtn + DTN_EVERY;
             d.dtn_tick();
         }
     }
@@ -1119,6 +1172,9 @@ impl Mesh {
             records_published: Default::default(),
             carrier,
             bundle_sink: Mutex::default(),
+            sending: Mutex::default(),
+            dtn_due: AtomicBool::new(false),
+            frames: crate::resources::Frames::neighbours(),
         });
         Mesh { d }
     }
@@ -1315,6 +1371,13 @@ const K_OFFER: u8 = 3;
 const MAX_SUMMARY: usize = 256 * 1024;
 const MAX_OFFER: usize = 1024;
 const DTN_EVERY: Duration = Duration::from_secs(1);
+/// ... or this soon after a transfer ended, to start the next one.
+const DTN_SOON: Duration = Duration::from_millis(100);
+/// Bundles handed to one neighbour at once. More would only share its link:
+/// over a slow radio, bundles sent a few at a time get through whole before
+/// the contact ends, where all at once each would get a part. (QUIC's stream
+/// limit would only make the rest wait, unplanned work for nobody.)
+const SENDS_PER_NEIGHBOUR: usize = 8;
 
 /// A bundle offered before its payload.
 #[derive(Serialize, Deserialize)]
@@ -1395,7 +1458,7 @@ enum Sent {
 
 /// Hand a bundle over a hop connection: offer it, and send the payload
 /// (the rest of it, if an earlier transfer was cut) only if it is wanted.
-async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8) -> Result<Sent> {
+async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8, frames: &crate::resources::PeerFrames) -> Result<Sent> {
     let offer = WireOffer {
         id: b.id,
         src: b.src,
@@ -1408,9 +1471,10 @@ async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8) -> Result<S
     };
     let mut msg = vec![K_OFFER];
     msg.extend_from_slice(&crate::wire::encode_bounded(&offer, MAX_OFFER - 1)?);
-    let (mut tx, mut rx) = crate::resources::header(conn.open_bi()).await?;
+    // (waits while the neighbour has as many streams from us as it allows)
+    let (mut tx, mut rx) = crate::resources::within(crate::resources::REPLY_TIMEOUT, "no stream", conn.open_bi()).await?;
     write_frame(&mut tx, &msg).await?;
-    let (answer, _answer_permit) = tokio::time::timeout(Duration::from_secs(10), read_frame(&mut rx, 64)).await??;
+    let (answer, _answer_permit) = read_frame(&mut rx, 64, crate::resources::reply_timeout(4 + msg.len()), frames).await?;
     let at = match postcard::from_bytes::<WireAnswer>(&answer)? {
         WireAnswer::Duplicate => return Ok(Sent::Took),
         WireAnswer::Refuse(full) => return Ok(Sent::Refused(full)),
@@ -1418,7 +1482,9 @@ async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8) -> Result<S
     };
     crate::resources::write_all(&mut tx, &b.payload[at..]).await?;
     tx.finish()?;
-    let ack = tokio::time::timeout(Duration::from_secs(30), rx.read_to_end(1)).await??;
+    // The payload written may still be queued for a slow link.
+    let wait = crate::resources::reply_timeout(b.payload.len() - at);
+    let ack = crate::resources::within(wait, "no receipt", rx.read_to_end(1)).await?;
     Ok(if ack.first() == Some(&1) { Sent::Took } else { Sent::Refused(false) })
 }
 
@@ -1430,15 +1496,19 @@ async fn write_frame(tx: &mut iroh::endpoint::SendStream, body: &[u8]) -> Result
     Ok(())
 }
 
-async fn read_frame(rx: &mut iroh::endpoint::RecvStream, max: usize) -> Result<(Vec<u8>, crate::resources::FramePermit)> {
+/// `wait`: for its first bytes (see [`crate::wire::recv_held`]).
+async fn read_frame(
+    rx: &mut iroh::endpoint::RecvStream,
+    max: usize,
+    wait: Duration,
+    frames: &crate::resources::PeerFrames,
+) -> Result<(Vec<u8>, crate::resources::FramePermit)> {
     let mut len = [0u8; 4];
-    crate::resources::header(rx.read_exact(&mut len)).await?;
+    crate::resources::within(wait, "no answer", rx.read_exact(&mut len)).await?;
     let len = u32::from_be_bytes(len) as usize;
     anyhow::ensure!(len <= max, "frame of {len} bytes");
-    let permit = crate::resources::frame_bytes(len)?;
-    let mut body = vec![0u8; len];
-    crate::resources::idle(rx.read_exact(&mut body)).await?;
-    Ok((body, permit))
+    let permit = frames.admit(len).await?;
+    crate::resources::read_body(rx, len, false, permit, crate::resources::IDLE_TIMEOUT).await
 }
 
 /// An Iroh address lookup: for a device beyond our mesh, one mesh address

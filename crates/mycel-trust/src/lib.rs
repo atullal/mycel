@@ -225,6 +225,15 @@ impl SignedOp {
     }
 }
 
+/// The key an op names as founder or added member, if any.
+fn names(op: &SignedOp) -> Option<SignPk> {
+    match &op.op.action {
+        Action::Genesis { founder, .. } => Some(founder.sign_pk),
+        Action::Add { member, .. } => Some(member.sign_pk),
+        _ => None,
+    }
+}
+
 /// HPKE `info` for an epoch lockbox: binds epoch and recipient.
 fn lockbox_info(epoch: &EpochId, recipient: &SignPk) -> Vec<u8> {
     [CTX_LOCKBOX.as_bytes(), &epoch.0, &recipient.0].concat()
@@ -315,7 +324,7 @@ impl MemberState {
             .map(|e| e.id)
     }
 
-    fn admin_count(&self) -> usize {
+    pub(crate) fn admin_count(&self) -> usize {
         self.members.values().filter(|m| m.role.is_admin()).count()
     }
 }
@@ -358,6 +367,10 @@ pub struct SpaceGraph {
     space: SpaceId,
     ops: HashMap<OpId, SignedOp>,
     pending: HashMap<OpId, SignedOp>,
+    /// Unresolved ops per author, for the per-author pending quota.
+    pending_by_author: HashMap<SignPk, usize>,
+    /// Every key any known op (valid or not) names as founder or added member.
+    named: HashSet<SignPk>,
     res: Resolution,
     state_cache: Mutex<HashMap<Vec<OpId>, MemberState>>,
 }
@@ -391,6 +404,8 @@ impl SpaceGraph {
             return Err(TrustError::Malformed("first op must be genesis"));
         }
         let space = genesis.id();
+        let mut named = HashSet::new();
+        named.extend(names(&genesis));
         let mut ops = HashMap::new();
         ops.insert(space, genesis);
         let res = resolve::resolve(&ops);
@@ -398,6 +413,8 @@ impl SpaceGraph {
             space,
             ops,
             pending: HashMap::new(),
+            pending_by_author: HashMap::new(),
+            named,
             res,
             state_cache: Mutex::new(HashMap::new()),
         })
@@ -411,8 +428,13 @@ impl SpaceGraph {
         self.ops.contains_key(id) || self.pending.contains_key(id)
     }
 
+    /// Every known op id in causal (resolution) order, then unresolved ops
+    /// by id. Peers that send ops in this order let a receiver admit each op
+    /// directly, without parking it in the bounded pending pool.
     pub fn op_ids(&self) -> Vec<OpId> {
-        self.ops.keys().chain(self.pending.keys()).copied().collect()
+        let mut pending: Vec<OpId> = self.pending.keys().copied().collect();
+        pending.sort();
+        self.res.order.iter().copied().chain(pending).collect()
     }
 
     pub fn get(&self, id: &OpId) -> Option<&SignedOp> {
@@ -486,26 +508,26 @@ impl SpaceGraph {
             return Err(TrustError::NotAuthorized("author was never added to this space"));
         }
         if op.op.parents.iter().all(|parent| self.ops.contains_key(parent)) {
+            self.named.extend(names(&op));
             self.ops.insert(op.id(), op);
             return Ok(true);
         }
         if self.pending.len() >= MAX_PENDING {
             return Err(TrustError::Malformed("too many pending ops"));
         }
-        if self.pending.values().filter(|p| p.op.author == op.op.author).count() >= MAX_PENDING_PER_AUTHOR {
+        let by_author = self.pending_by_author.entry(op.op.author).or_default();
+        if *by_author >= MAX_PENDING_PER_AUTHOR {
             return Err(TrustError::Malformed("too many pending ops by author"));
         }
+        *by_author += 1;
+        self.named.extend(names(&op));
         self.pending.insert(op.id(), op);
         Ok(false)
     }
 
     /// Has any known op (valid or not) named `pk` as founder or added member?
     pub fn ever_named(&self, pk: &SignPk) -> bool {
-        self.ops.values().chain(self.pending.values()).any(|o| match &o.op.action {
-            Action::Genesis { founder, .. } => founder.sign_pk == *pk,
-            Action::Add { member, .. } => member.sign_pk == *pk,
-            _ => false,
-        })
+        self.named.contains(pk)
     }
 
     fn reresolve(&mut self) {
@@ -527,6 +549,12 @@ impl SpaceGraph {
             }
             for id in ready {
                 let op = self.pending.remove(&id).unwrap();
+                if let Some(n) = self.pending_by_author.get_mut(&op.op.author) {
+                    *n -= 1;
+                    if *n == 0 {
+                        self.pending_by_author.remove(&op.op.author);
+                    }
+                }
                 self.ops.insert(id, op);
                 promoted.insert(id);
             }
