@@ -89,8 +89,9 @@ if [ "$MODE" = testflight ]; then
   (cd apps/host && cargo tauri ios build --target aarch64 --archive-only --build-number "$BUILD")
   ARCHIVE="$APPLE/build/mycel-host_iOS.xcarchive"
   [ -d "$ARCHIVE" ] || { echo "no archive found" >&2; exit 1; }
-  # where the Organizer lists archives
-  DEST="$HOME/Library/Developer/Xcode/Archives/$(date +%Y-%m-%d)/Mycel $VERSION ($BUILD).xcarchive"
+  # where the Organizer lists archives (a fresh name each time: the
+  # Organizer caches an archive's details by its path)
+  DEST="$HOME/Library/Developer/Xcode/Archives/$(date +%Y-%m-%d)/Mycel $VERSION ($BUILD) $(date +%H.%M.%S).xcarchive"
   mkdir -p "$(dirname "$DEST")" && rm -rf "$DEST" && ditto "$ARCHIVE" "$DEST"
   open "$DEST"
   echo
