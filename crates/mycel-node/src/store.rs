@@ -6,9 +6,10 @@
 //! Everything else (documents, feeds, keys) is derived from these inputs.
 
 use std::collections::HashMap;
-use std::path::Path;
-use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mycel_crypto::Hash32;
@@ -20,35 +21,90 @@ const OPS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ops");
 const ENVS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("envelopes");
 const KV: TableDefinition<&str, &[u8]> = TableDefinition::new("kv");
 
+/// Synced records buffered for the next commit. Past this, a healthy store
+/// makes writers wait for the flusher; a failing one stops buffering them.
+const MAX_BUFFERED_BYTES: usize = 64 << 20;
+/// Backoff between commit retries after a failure.
+const RETRY_FIRST: Duration = Duration::from_millis(250);
+const RETRY_MAX: Duration = Duration::from_secs(30);
+
 enum Write {
     Op(Vec<u8>, Vec<u8>),
     Env(Vec<u8>, Vec<u8>),
     Kv(String, Option<Vec<u8>>),
 }
 
+impl Write {
+    fn size(&self) -> usize {
+        match self {
+            Write::Op(k, v) | Write::Env(k, v) => k.len() + v.len(),
+            Write::Kv(k, v) => k.len() + v.as_ref().map_or(0, Vec::len),
+        }
+    }
+}
+
 #[derive(Default)]
 struct Pending {
     queue: Vec<Write>,
+    /// Size of `queue`.
+    bytes: usize,
     closed: bool,
-    // Store callbacks cannot return errors. Keep failures sticky so that every
-    // subsequent barrier/read reports them instead of claiming durability.
+    // Store callbacks cannot return errors. While commits fail, every barrier
+    // and read reports the failure instead of claiming durability, and the
+    // flusher retries the queued writes, in order, until a commit succeeds.
     error: Option<String>,
+    retry_at: Option<Instant>,
+    backoff: Duration,
+    /// Synced records not buffered because saving was failing and the buffer
+    /// was full. Their replicas still hold them, and peers resend them.
+    dropped: u64,
 }
 
+type Listener = Arc<dyn Fn() + Send + Sync>;
+
 struct Shared {
+    path: PathBuf,
+    /// `None` only while a failed database is being reopened.
+    db: RwLock<Option<Database>>,
     pending: Mutex<Pending>,
     cv: Condvar,
     // Held from before draining the queue through transaction completion.
     commit_gate: Mutex<()>,
+    max_buffered: AtomicUsize,
+    /// Called when saving starts failing or works again.
+    listener: Mutex<Option<Listener>>,
     #[cfg(test)]
-    fail_next_commit: std::sync::atomic::AtomicBool,
+    fail_commits: AtomicUsize,
+}
+
+impl Shared {
+    fn with_db<R>(&self, f: impl FnOnce(&Database) -> Result<R>) -> Result<R> {
+        let db = self.db.read().unwrap();
+        f(db.as_ref().context("storage is unavailable")?)
+    }
+
+    /// redb latches an I/O failure (every later operation reports it) until
+    /// the database is opened again, which also repairs it.
+    fn reopen(&self) -> Result<()> {
+        let mut db = self.db.write().unwrap();
+        // Close first: the file is locked while open.
+        *db = None;
+        *db = Some(Database::create(&self.path).context("reopen storage")?);
+        Ok(())
+    }
+
+    fn health_changed(&self) {
+        let listener = self.listener.lock().unwrap().clone();
+        if let Some(listener) = listener {
+            listener();
+        }
+    }
 }
 
 /// Everything stored for one space: its ops (incl. genesis) and envelopes.
 pub type StoredSpace = (Vec<SignedOp>, Vec<Envelope>);
 
 pub struct DbStore {
-    db: Arc<Database>,
     shared: Arc<Shared>,
     flusher: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -87,99 +143,203 @@ fn commit(db: &Database, batch: &[Write]) -> Result<()> {
     Ok(())
 }
 
-fn commit_pending(db: &Database, shared: &Shared, extra: Vec<Write>) -> Result<()> {
+/// Commit everything queued plus `extra`. While saving is failing, barriers
+/// (`retry == false`) report the failure without trying; the flusher and
+/// `close` retry. Every write is idempotent (content-addressed records and
+/// whole key-value values), so retrying a batch whose outcome was unclear
+/// is safe, and queue order is kept, so later values still win.
+fn commit_pending(shared: &Shared, extra: Vec<Write>, retry: bool) -> Result<()> {
     let _gate = shared.commit_gate.lock().unwrap();
-    let batch = {
+    let (mut batch, taken, failing) = {
         let mut pending = shared.pending.lock().unwrap();
-        if let Some(error) = &pending.error {
+        if let Some(error) = &pending.error
+            && !retry
+        {
             bail!("storage durability failed: {error}");
         }
         if pending.closed && !extra.is_empty() {
             bail!("storage is closed");
         }
-        pending.queue.extend(extra);
-        std::mem::take(&mut pending.queue)
-    };
-    #[cfg(test)]
-    let outcome = if shared
-        .fail_next_commit
-        .swap(false, std::sync::atomic::Ordering::SeqCst)
-    {
-        Err(anyhow!("injected commit failure"))
-    } else {
-        commit(db, &batch)
-    };
-    #[cfg(not(test))]
-    let outcome = commit(db, &batch);
-    if let Err(error) = outcome {
-        let mut pending = shared.pending.lock().unwrap();
-        // Retain the failed batch before later writes for diagnosis. A sticky
-        // error disallows retries because transaction outcome can be uncertain.
-        let later = std::mem::replace(&mut pending.queue, batch);
-        pending.queue.extend(later);
-        pending.error = Some(format!("{error:#}"));
+        let mut batch = std::mem::take(&mut pending.queue);
+        pending.bytes = 0;
+        // Writers waiting for buffer space can continue.
         shared.cv.notify_all();
-        return Err(error);
+        let taken = batch.len();
+        batch.extend(extra);
+        (batch, taken, pending.error.is_some())
+    };
+    let outcome = (|| {
+        #[cfg(test)]
+        if shared
+            .fail_commits
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            bail!("injected commit failure");
+        }
+        if failing {
+            shared.reopen()?;
+        }
+        shared.with_db(|db| commit(db, &batch))
+    })();
+    let mut pending = shared.pending.lock().unwrap();
+    match outcome {
+        Ok(()) => {
+            let recovered = pending.error.take().is_some();
+            pending.retry_at = None;
+            pending.backoff = Duration::ZERO;
+            drop(pending);
+            if recovered {
+                shared.health_changed();
+            }
+            Ok(())
+        }
+        Err(error) => {
+            // Keep the buffered writes ahead of later ones. A barrier's own
+            // writes are not kept: its caller was told they failed and does
+            // not publish them, so they must not land later behind its back.
+            batch.truncate(taken);
+            let later = std::mem::replace(&mut pending.queue, batch);
+            pending.queue.extend(later);
+            pending.bytes = pending.queue.iter().map(Write::size).sum();
+            let first = pending.error.is_none();
+            pending.error = Some(format!("{error:#}"));
+            pending.backoff = if first { RETRY_FIRST } else { (pending.backoff * 2).min(RETRY_MAX) };
+            pending.retry_at = Some(Instant::now() + pending.backoff);
+            shared.cv.notify_all();
+            drop(pending);
+            if first {
+                eprintln!("mycel: saving failed ({error:#}); retrying");
+                shared.health_changed();
+            }
+            Err(error)
+        }
     }
-    Ok(())
 }
 
 impl DbStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<Self>> {
-        let db = Arc::new(Database::create(path)?);
+        let path = path.as_ref().to_path_buf();
+        let db = Database::create(&path)?;
         // make sure tables exist
         commit(&db, &[Write::Kv("__init".into(), Some(vec![]))])?;
         let shared = Arc::new(Shared {
+            path,
+            db: RwLock::new(Some(db)),
             pending: Mutex::new(Pending::default()),
             cv: Condvar::new(),
             commit_gate: Mutex::new(()),
+            max_buffered: AtomicUsize::new(MAX_BUFFERED_BYTES),
+            listener: Mutex::new(None),
             #[cfg(test)]
-            fail_next_commit: std::sync::atomic::AtomicBool::new(false),
+            fail_commits: AtomicUsize::new(0),
         });
-        let (db2, sh2) = (db.clone(), shared.clone());
+        let sh2 = shared.clone();
         let flusher = std::thread::spawn(move || {
             loop {
                 {
-                    let p = sh2.pending.lock().unwrap();
-                    let (p, _) = sh2
-                        .cv
-                        .wait_timeout_while(p, Duration::from_millis(100), |p| {
-                            p.queue.is_empty() && !p.closed && p.error.is_none()
-                        })
-                        .unwrap();
-                    if p.error.is_some() || (p.closed && p.queue.is_empty()) {
-                        return;
+                    let mut p = sh2.pending.lock().unwrap();
+                    loop {
+                        // `close` makes the final attempt itself.
+                        if p.closed {
+                            return;
+                        }
+                        match p.retry_at {
+                            Some(at) => match at.checked_duration_since(Instant::now()) {
+                                Some(wait) if !wait.is_zero() => {
+                                    p = sh2.cv.wait_timeout(p, wait).unwrap().0;
+                                }
+                                _ => break,
+                            },
+                            None if !p.queue.is_empty() => break,
+                            None => p = sh2.cv.wait_timeout(p, Duration::from_millis(100)).unwrap().0,
+                        }
                     }
                 }
-                if commit_pending(&db2, &sh2, Vec::new()).is_err() {
-                    // The failure is retained and surfaced by every barrier/read.
-                    return;
-                }
+                // A failure is retained, surfaced by every barrier and read,
+                // reported to the listener, and retried after a backoff.
+                let _ = commit_pending(&sh2, Vec::new(), true);
             }
         });
         Ok(Arc::new(DbStore {
-            db,
             shared,
             flusher: Mutex::new(Some(flusher)),
         }))
     }
 
+    /// `listener` is called whenever saving starts failing or works again
+    /// (see [`DbStore::failure`]).
+    pub fn on_health_change(&self, listener: Arc<dyn Fn() + Send + Sync>) {
+        *self.shared.listener.lock().unwrap() = Some(listener);
+    }
+
+    /// Why saving is failing right now, if it is.
+    pub fn failure(&self) -> Option<String> {
+        let pending = self.shared.pending.lock().unwrap();
+        let error = pending.error.clone()?;
+        Some(match pending.dropped {
+            0 => error,
+            n => format!("{error} ({n} received records will be fetched again)"),
+        })
+    }
+
+    /// Fail now, rather than buffer a local change that can't be saved.
+    pub fn check_writable(&self) -> Result<()> {
+        match self.failure() {
+            Some(error) => bail!("Mycel can't save to this device right now: {error}"),
+            None => Ok(()),
+        }
+    }
+
     fn enqueue(&self, w: Write) {
-        let mut pending = self.shared.pending.lock().unwrap();
+        let shared = &self.shared;
+        let mut pending = shared.pending.lock().unwrap();
         if pending.closed {
             pending
                 .error
                 .get_or_insert_with(|| "storage is closed".into());
-        } else {
-            pending.queue.push(w);
+            return;
         }
-        self.shared.cv.notify_one();
+        if let Write::Kv(key, _) = &w {
+            // A newer value supersedes a queued one: the queue is committed
+            // whole, so the result is the same and repeated settings writes
+            // can't grow the buffer.
+            if let Some(i) = pending
+                .queue
+                .iter()
+                .position(|q| matches!(q, Write::Kv(k, _) if k == key))
+            {
+                let old = pending.queue.remove(i);
+                pending.bytes -= old.size();
+            }
+        } else {
+            let limit = shared.max_buffered.load(Ordering::Relaxed);
+            // Healthy but behind: wait for the flusher (backpressure).
+            while pending.error.is_none()
+                && !pending.closed
+                && !pending.queue.is_empty()
+                && pending.bytes + w.size() > limit
+            {
+                shared.cv.notify_all();
+                pending = shared.cv.wait_timeout(pending, Duration::from_millis(100)).unwrap().0;
+            }
+            // Failing: never grow without bound. The record stays in memory in
+            // its replica and peers send it again; local changes are refused
+            // up front while failing (`check_writable`).
+            if pending.error.is_some() && pending.bytes + w.size() > limit {
+                pending.dropped += 1;
+                return;
+            }
+        }
+        pending.bytes += w.size();
+        pending.queue.push(w);
+        shared.cv.notify_all();
     }
 
     /// Barrier covering every write enqueued before this call, including any
     /// batch already drained by the background flusher.
     pub fn flush(&self) -> Result<()> {
-        commit_pending(&self.db, &self.shared, Vec::new())
+        commit_pending(&self.shared, Vec::new(), false)
     }
 
     /// Apply a group of key-value changes in one durable transaction. Prior
@@ -187,7 +347,7 @@ impl DbStore {
     /// changes only after this succeeds.
     pub fn kv_batch_durable(&self, entries: Vec<(String, Option<Vec<u8>>)>) -> Result<()> {
         let writes = entries.into_iter().map(|(k, v)| Write::Kv(k, v)).collect();
-        commit_pending(&self.db, &self.shared, writes)
+        commit_pending(&self.shared, writes, false)
     }
 
     pub fn close(&self) -> Result<()> {
@@ -196,7 +356,8 @@ impl DbStore {
         if let Some(h) = self.flusher.lock().unwrap().take() {
             h.join().map_err(|_| anyhow!("storage flusher panicked"))?;
         }
-        self.flush()
+        // One last attempt, even after a failure.
+        commit_pending(&self.shared, Vec::new(), true)
     }
 
     /// Absence is allowed; malformed persisted security state is an error.
@@ -215,9 +376,11 @@ impl DbStore {
 
     pub fn kv_get(&self, k: &str) -> Result<Option<Vec<u8>>> {
         self.flush()?;
-        let txn = self.db.begin_read()?;
-        let t = txn.open_table(KV)?;
-        Ok(t.get(k)?.map(|v| v.value().to_vec()))
+        self.shared.with_db(|db| {
+            let txn = db.begin_read()?;
+            let t = txn.open_table(KV)?;
+            Ok(t.get(k)?.map(|v| v.value().to_vec()))
+        })
     }
 
     pub fn kv_put(&self, k: &str, v: Vec<u8>) {
@@ -231,7 +394,8 @@ impl DbStore {
     /// Every stored space: (genesis + other ops, envelopes).
     pub fn load_spaces(&self) -> Result<HashMap<SpaceId, StoredSpace>> {
         self.flush()?;
-        let txn = self.db.begin_read()?;
+        let db = self.shared.db.read().unwrap();
+        let txn = db.as_ref().context("storage is unavailable")?.begin_read()?;
         let mut out: HashMap<SpaceId, StoredSpace> = HashMap::new();
         let space_of = |k: &[u8]| -> Result<Hash32> {
             if k.len() != 64 {
@@ -306,22 +470,72 @@ mod tests {
         fs_cleanup(path);
     }
 
-    #[test]
-    fn failed_commit_is_retained_and_every_barrier_stays_failed() {
+    async fn eventually(mut f: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("condition did not become true");
+    }
+
+    #[tokio::test]
+    async fn failed_commits_are_retried_in_order_and_failed_barriers_are_not() {
         let (path, store) = test_store();
-        store
-            .shared
-            .fail_next_commit
-            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let changes = Arc::new(AtomicUsize::new(0));
+        let counter = changes.clone();
+        store.on_health_change(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        store.shared.fail_commits.store(1, Ordering::SeqCst);
+        store.kv_put("name", vec![1]);
+        // Fails, either itself or because the background commit just did.
         assert!(
             store
                 .kv_batch_durable(vec![("request".into(), Some(vec![1]))])
                 .is_err()
         );
-        assert_eq!(store.shared.pending.lock().unwrap().queue.len(), 1);
+        assert!(store.failure().is_some());
         assert!(store.flush().is_err());
-        assert!(store.kv_get("request").is_err());
-        assert!(store.close().is_err());
+        assert!(store.check_writable().is_err());
+        assert!(store.kv_get("name").is_err());
+        store.kv_put("name", vec![2]);
+        eventually(|| store.failure().is_none()).await;
+        assert_eq!(store.kv_get("name").unwrap(), Some(vec![2]));
+        assert_eq!(store.kv_get("request").unwrap(), None, "a failed barrier never lands later");
+        assert_eq!(changes.load(Ordering::SeqCst), 2, "failing, then working again");
+        store.check_writable().unwrap();
+        store.close().unwrap();
+        drop(store);
+        fs_cleanup(path);
+    }
+
+    #[tokio::test]
+    async fn buffer_is_bounded_while_failing_and_kept_records_land_in_order() {
+        let (path, store) = test_store();
+        store.shared.max_buffered.store(2_000, Ordering::SeqCst);
+        store.shared.fail_commits.store(usize::MAX, Ordering::SeqCst);
+        let space: SpaceId = Hash32([7; 32]);
+        store.enqueue(Write::Op(key(&space, &Hash32([0; 32])), vec![0; 100]));
+        eventually(|| store.failure().is_some()).await;
+        for n in 1..=100u8 {
+            store.enqueue(Write::Op(key(&space, &Hash32([n; 32])), vec![n; 100]));
+            store.kv_put("name", vec![n]);
+        }
+        {
+            let pending = store.shared.pending.lock().unwrap();
+            assert!(pending.bytes <= 2_000 + 64, "{}", pending.bytes);
+            assert_eq!(pending.queue.iter().filter(|w| matches!(w, Write::Kv(..))).count(), 1);
+            assert!(pending.dropped > 0);
+        }
+        assert!(store.failure().unwrap().contains("fetched again"));
+        store.shared.fail_commits.store(0, Ordering::SeqCst);
+        eventually(|| store.failure().is_none()).await;
+        assert_eq!(store.kv_get("name").unwrap(), Some(vec![100]));
+        let kept = store.shared.with_db(|db| Ok(db.begin_read()?.open_table(OPS)?.iter()?.count())).unwrap();
+        assert!((1..100).contains(&kept), "{kept}");
+        store.close().unwrap();
         drop(store);
         fs_cleanup(path);
     }
@@ -341,7 +555,7 @@ mod tests {
         });
         started_rx.recv().unwrap();
         assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
-        commit(&store.db, &batch).unwrap();
+        store.shared.with_db(|db| commit(db, &batch)).unwrap();
         drop(gate);
         assert!(done_rx.recv_timeout(Duration::from_secs(2)).unwrap());
         waiter.join().unwrap();

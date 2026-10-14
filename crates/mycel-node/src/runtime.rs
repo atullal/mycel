@@ -525,6 +525,10 @@ impl Runtime {
         }
 
         let (events, _) = broadcast::channel(1024);
+        let health_events = events.clone();
+        store.on_health_change(Arc::new(move || {
+            let _ = health_events.send(Event::NoticesChanged);
+        }));
         let me = keys.sign_pk();
         let rt = Arc::new_cyclic(|weak| Runtime {
             data_dir: dir,
@@ -594,7 +598,11 @@ impl Runtime {
 
     /// Problems the user should know about (see [`Notice`]).
     pub fn notices(&self) -> Vec<Notice> {
-        self.notices.lock().clone()
+        let mut notices = self.notices.lock().clone();
+        if let Some(error) = self.store.failure() {
+            notices.push(Notice::StorageFailing { error });
+        }
+        notices
     }
 
     pub fn node(&self) -> &Node {
@@ -894,6 +902,8 @@ impl Runtime {
     }
 
     fn post(&self, space: SpaceId, op: ChatOp) -> Result<Hash32> {
+        // Don't sign what can't be saved: a peer could hold it while we lose it.
+        self.store.check_writable()?;
         let (_, env) = self
             .node
             .with_space(&space, |r| r.append(messages_feed(), op.encode()))??;
@@ -1245,6 +1255,7 @@ impl Runtime {
         if direct && let Some(existing) = self.existing_direct_conversation(keys[0].sign_pk) {
             return Ok(existing);
         }
+        self.store.check_writable()?;
         let (space, _) = self.node.create_space()?;
         let name = self.name.lock().clone();
         self.node.with_space(&space, |r| -> Result<()> {
