@@ -27,6 +27,16 @@ opt-level = 3
 # (the AEAD's generic code is instantiated here)
 [profile.dev.package.mycel-crypto]
 opt-level = 3
+# Every membership op and envelope is signature-checked, and documents are
+# Automerge: unoptimized, tests with long histories or large documents crawl.
+[profile.dev.package.curve25519-dalek]
+opt-level = 3
+[profile.dev.package.ed25519-dalek]
+opt-level = 3
+[profile.dev.package.automerge]
+opt-level = 3
+[profile.dev.package.hexane]
+opt-level = 3
 # Live calls encode and decode audio in real time: the Opus codec and the call
 # pipeline must be optimized even in debug builds.
 [profile.dev.package.unsafe-libopus]

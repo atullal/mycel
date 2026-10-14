@@ -105,6 +105,12 @@ pub(crate) fn resolve(ops: &HashMap<OpId, SignedOp>) -> Resolution {
         anc.push(set);
     }
     let op_at = |i: usize| &ops[&order[i]];
+    let author: Vec<SignPk> = (0..n).map(|i| op_at(i).op.author).collect();
+    let target: Vec<Option<SignPk>> = (0..n).map(|i| revocation_target(op_at(i))).collect();
+    let mut by_author: HashMap<SignPk, Vec<usize>> = HashMap::new();
+    for (i, pk) in author.iter().enumerate() {
+        by_author.entry(*pk).or_default().push(i);
+    }
 
     // 2. Seniority from ops that pass authorization ignoring concurrency.
     let pre_valid = validate(ops, &order, &index, &anc, &BitSet::new(n));
@@ -122,29 +128,27 @@ pub(crate) fn resolve(ops: &HashMap<OpId, SignedOp>) -> Resolution {
     }
     let rank = |pk: &SignPk| seniority.get(pk).copied().unwrap_or(usize::MAX);
 
-    let mut candidates: Vec<usize> = (0..n)
-        .filter(|&i| revocation_target(op_at(i)).is_some())
-        .collect();
-    candidates.sort_by_key(|&i| (rank(&op_at(i).op.author), i));
+    let mut candidates: Vec<usize> = (0..n).filter(|&i| target[i].is_some()).collect();
+    candidates.sort_by_key(|&i| (rank(&author[i]), i));
 
     loop {
         // 3. Revocation winners in seniority order.
         let mut winners: Vec<usize> = Vec::new();
+        let mut won_against: HashMap<SignPk, Vec<usize>> = HashMap::new();
         for &r in &candidates {
-            let author = op_at(r).op.author;
-            let loses = winners.iter().any(|&w| {
-                revocation_target(op_at(w)) == Some(author) && concurrent(&anc, w, r)
-            });
+            let loses = won_against
+                .get(&author[r])
+                .is_some_and(|ws| ws.iter().any(|&w| concurrent(&anc, w, r)));
             if !loses {
                 winners.push(r);
+                won_against.entry(target[r].unwrap()).or_default().push(r);
             }
         }
         // 4. Ops by a revoked member, concurrent with the winning revocation, are invalid.
         let mut excluded = BitSet::new(n);
         for &w in &winners {
-            let target = revocation_target(op_at(w)).unwrap();
-            for i in 0..n {
-                if op_at(i).op.author == target && concurrent(&anc, i, w) {
+            for &i in by_author.get(&target[w].unwrap()).into_iter().flatten() {
+                if concurrent(&anc, i, w) {
                     excluded.set(i);
                 }
             }
@@ -177,6 +181,11 @@ pub(crate) fn resolve(ops: &HashMap<OpId, SignedOp>) -> Resolution {
 
 /// Walk ops in topo order; each op is valid iff its author was authorized in
 /// the state built from valid ops in its causal past.
+///
+/// `running` is the state of every valid op so far. When an op's causal past
+/// already contains all of them (any linear stretch of history, e.g. one
+/// admin's sequence of changes) that state is used directly, so such history
+/// resolves in linear time. Otherwise the op's own past is replayed.
 fn validate(
     ops: &HashMap<OpId, SignedOp>,
     order: &[OpId],
@@ -186,14 +195,20 @@ fn validate(
 ) -> BitSet {
     let n = order.len();
     let mut valid = BitSet::new(n);
+    let mut running = MemberState::default();
     for i in 0..n {
         if excluded.get(i) {
             continue;
         }
-        let past = anc[i].intersect(&valid);
-        let st = replay(ops, order, index, anc, &past);
-        if authorized(&ops[&order[i]], i, &st) {
+        let ok = if anc[i].contains_all(&valid) {
+            authorized(&ops[&order[i]], i, &running)
+        } else {
+            let st = replay(ops, order, index, anc, &anc[i].intersect(&valid));
+            authorized(&ops[&order[i]], i, &st)
+        };
+        if ok {
             valid.set(i);
+            apply(&mut running, ops, order, index, anc, i);
         }
     }
     valid
@@ -205,6 +220,24 @@ fn recipients(r: &Rotation) -> BTreeSet<SignPk> {
 
 fn fresh_epoch(st: &MemberState, r: &Rotation) -> bool {
     st.epoch(&r.epoch).is_none()
+}
+
+/// Readers after `member` changes to `role` (`None` = leaves the space).
+fn readers_after(st: &MemberState, member: &SignPk, role: Option<Role>) -> BTreeSet<SignPk> {
+    let mut readers = st.readers();
+    if role.is_some_and(Role::can_read) {
+        readers.insert(*member);
+    } else {
+        readers.remove(member);
+    }
+    readers
+}
+
+/// Admins after `member` changes to `role` (`None` = leaves the space).
+fn admins_after(st: &MemberState, member: &SignPk, role: Option<Role>) -> usize {
+    let before = st.role(member).is_some_and(Role::is_admin);
+    let after = role.is_some_and(Role::is_admin);
+    st.admin_count() + usize::from(after) - usize::from(before)
 }
 
 fn authorized(op: &SignedOp, idx: usize, st: &MemberState) -> bool {
@@ -225,29 +258,23 @@ fn authorized(op: &SignedOp, idx: usize, st: &MemberState) -> bool {
                 return false;
             };
             let loses_read = prior.can_read() && !role.can_read();
-            let mut after = st.clone();
-            after.members.get_mut(member).unwrap().role = *role;
             is_admin
                 && *role != prior
                 && revocation.is_some() == (*role < prior)
                 && rotation.is_some() == loses_read
-                && rotation
-                    .as_ref()
-                    .is_none_or(|r| fresh_epoch(st, r) && recipients(r) == after.readers())
-                && after.admin_count() > 0
+                && rotation.as_ref().is_none_or(|r| {
+                    fresh_epoch(st, r) && recipients(r) == readers_after(st, member, Some(*role))
+                })
+                && admins_after(st, member, Some(*role)) > 0
         }
         Action::Remove {
             member, rotation, ..
         } => {
-            if !st.members.contains_key(member) {
-                return false;
-            }
-            let mut after = st.clone();
-            after.members.remove(member);
-            is_admin
+            st.members.contains_key(member)
+                && is_admin
                 && fresh_epoch(st, rotation)
-                && recipients(rotation) == after.readers()
-                && after.admin_count() > 0
+                && recipients(rotation) == readers_after(st, member, None)
+                && admins_after(st, member, None) > 0
         }
         Action::Rotate { rotation } => {
             author_role.is_some_and(Role::can_write)
@@ -255,9 +282,7 @@ fn authorized(op: &SignedOp, idx: usize, st: &MemberState) -> bool {
                 && recipients(rotation) == st.readers()
         }
         Action::Leave { .. } => {
-            let mut after = st.clone();
-            after.members.remove(&op.op.author);
-            author_role.is_some() && after.admin_count() > 0
+            author_role.is_some() && admins_after(st, &op.op.author, None) > 0
         }
     }
 }
@@ -279,63 +304,75 @@ fn replay(
     anc: &[BitSet],
     set: &BitSet,
 ) -> MemberState {
-    let index_of = |id: &OpId| index.get(id).copied();
     let mut st = MemberState::default();
     for i in set.iter() {
-        let id = order[i];
-        let op = &ops[&id].op;
-        match &op.action {
-            Action::Genesis { founder, rotation } => {
-                st.members.insert(
-                    founder.sign_pk,
-                    Member {
-                        keys: *founder,
-                        role: Role::Admin,
-                    },
-                );
-                push_epoch(&mut st, rotation, id);
-            }
-            Action::Add { member, role, .. } => {
-                st.members.insert(
-                    member.sign_pk,
-                    Member {
-                        keys: *member,
-                        role: *role,
-                    },
-                );
-                if role.can_read() {
-                    // The keyring covers exactly the epochs in the adder's causal past.
-                    for e in st.epochs.iter_mut() {
-                        if index_of(&e.created_by).is_some_and(|ei| anc[i].get(ei)) {
-                            e.recipients.insert(member.sign_pk);
-                        }
+        apply(&mut st, ops, order, index, anc, i);
+    }
+    st
+}
+
+/// Apply the op at topo index `i` to `st`.
+fn apply(
+    st: &mut MemberState,
+    ops: &HashMap<OpId, SignedOp>,
+    order: &[OpId],
+    index: &HashMap<OpId, usize>,
+    anc: &[BitSet],
+    i: usize,
+) {
+    let index_of = |id: &OpId| index.get(id).copied();
+    let id = order[i];
+    let op = &ops[&id].op;
+    match &op.action {
+        Action::Genesis { founder, rotation } => {
+            st.members.insert(
+                founder.sign_pk,
+                Member {
+                    keys: *founder,
+                    role: Role::Admin,
+                },
+            );
+            push_epoch(st, rotation, id);
+        }
+        Action::Add { member, role, .. } => {
+            st.members.insert(
+                member.sign_pk,
+                Member {
+                    keys: *member,
+                    role: *role,
+                },
+            );
+            if role.can_read() {
+                // The keyring covers exactly the epochs in the adder's causal past.
+                for e in st.epochs.iter_mut() {
+                    if index_of(&e.created_by).is_some_and(|ei| anc[i].get(ei)) {
+                        e.recipients.insert(member.sign_pk);
                     }
                 }
             }
-            Action::SetRole {
-                member,
-                role,
-                rotation,
-                ..
-            } => {
-                if let Some(m) = st.members.get_mut(member) {
-                    m.role = *role;
-                }
-                if let Some(r) = rotation {
-                    push_epoch(&mut st, r, id);
-                }
+        }
+        Action::SetRole {
+            member,
+            role,
+            rotation,
+            ..
+        } => {
+            if let Some(m) = st.members.get_mut(member) {
+                m.role = *role;
             }
-            Action::Remove {
-                member, rotation, ..
-            } => {
-                st.members.remove(member);
-                push_epoch(&mut st, rotation, id);
-            }
-            Action::Rotate { rotation } => push_epoch(&mut st, rotation, id),
-            Action::Leave { .. } => {
-                st.members.remove(&op.author);
+            if let Some(r) = rotation {
+                push_epoch(st, r, id);
             }
         }
+        Action::Remove {
+            member, rotation, ..
+        } => {
+            st.members.remove(member);
+            push_epoch(st, rotation, id);
+        }
+        Action::Rotate { rotation } => push_epoch(st, rotation, id),
+        Action::Leave { .. } => {
+            st.members.remove(&op.author);
+        }
     }
-    st
 }
