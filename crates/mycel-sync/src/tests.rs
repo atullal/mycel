@@ -700,3 +700,167 @@ fn causal_operation_counters_allow_gaps_but_reject_overlap_and_overflow() {
     assert_eq!(empty.len(), 0);
     assert!(Replica::causal_metadata_valid(None, &empty));
 }
+
+// ───────────── incremental feed order ─────────────
+
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+fn feed_item(n: u64, ts_ms: u64, deps: Vec<EnvelopeId>) -> FeedItem {
+    FeedItem {
+        id: Hash32::digest("test/feed-item", &n.to_le_bytes()),
+        author: SignPk([7; 32]),
+        author_role: Role::Writer,
+        ts_ms,
+        deps,
+        body: vec![],
+    }
+}
+
+/// A history with concurrent branches and skewed clocks: each entry depends
+/// on one or two earlier ones, mostly recent.
+fn random_history(seed: u64, len: u64) -> Vec<FeedItem> {
+    let mut rng = seed;
+    let mut items: Vec<FeedItem> = Vec::new();
+    for n in 0..len {
+        let mut deps = vec![];
+        for _ in 0..(1 + xorshift(&mut rng) % 2) {
+            if !items.is_empty() {
+                let back = (xorshift(&mut rng) % 4).min(items.len() as u64 - 1) as usize;
+                deps.push(items[items.len() - 1 - back].id);
+            }
+        }
+        let ts = n * 10 + xorshift(&mut rng) % 40; // clocks disagree
+        items.push(feed_item(n, ts, deps));
+    }
+    items
+}
+
+fn order_from_scratch(items: &[FeedItem]) -> Vec<EnvelopeId> {
+    let mut all = FeedState::default();
+    for item in items {
+        all.items.insert(item.id, item.clone());
+    }
+    all.reorder();
+    all.order
+}
+
+#[test]
+fn incremental_feed_order_matches_a_full_recompute_in_any_arrival_order() {
+    for seed in 1..40u64 {
+        let items = random_history(seed * 7919, 60);
+        // Arrival order: mostly in order, with parents sometimes late.
+        let mut arrival = items.clone();
+        let mut rng = seed;
+        for i in 0..arrival.len() {
+            if xorshift(&mut rng).is_multiple_of(5) {
+                let j = (i + 1 + (xorshift(&mut rng) % 6) as usize).min(arrival.len() - 1);
+                arrival.swap(i, j);
+            }
+        }
+        let mut feed = FeedState::default();
+        let mut cursor = FeedCursor::default();
+        let mut mirror: Vec<EnvelopeId> = vec![];
+        for (n, item) in arrival.into_iter().enumerate() {
+            feed.insert(item);
+            // A reader applying only the changes always ends up with the
+            // order, whether it reads after every entry or now and then.
+            if n % (1 + seed as usize % 4) == 0 {
+                let changes = feed.changes_since(cursor);
+                mirror.truncate(changes.from);
+                mirror.extend(changes.items.iter().map(|i| i.id));
+                cursor = changes.cursor;
+                assert_eq!(mirror, feed.order);
+            }
+        }
+        assert_eq!(feed.sorted(), order_from_scratch(&items), "seed {seed}");
+        let referenced: HashSet<EnvelopeId> = items.iter().flat_map(|i| i.deps.clone()).collect();
+        let mut heads: Vec<EnvelopeId> = items.iter().map(|i| i.id).filter(|id| !referenced.contains(id)).collect();
+        heads.sort();
+        assert_eq!(feed.heads(), heads);
+    }
+}
+
+#[test]
+fn feed_changes_report_appends_inserts_and_rebuilds() {
+    let a = feed_item(1, 100, vec![]);
+    let b = feed_item(2, 200, vec![a.id]);
+    let c = feed_item(3, 300, vec![b.id]);
+    let mut feed = FeedState::default();
+    feed.insert(a.clone());
+    feed.insert(c.clone()); // its parent b isn't here yet
+    let cursor = feed.changes_since(FeedCursor::default()).cursor;
+    assert_eq!(feed.changes_since(cursor).from, 2, "nothing new");
+    assert!(!feed.unsorted);
+    feed.insert(feed_item(4, 400, vec![c.id]));
+    let appended = feed.changes_since(cursor);
+    assert_eq!((appended.from, appended.items.len()), (2, 1), "an append is just the new entry");
+    // b arrives: c listed it, so c must now follow it.
+    feed.insert(b.clone());
+    let reordered = feed.changes_since(appended.cursor);
+    assert_eq!(reordered.from, 1);
+    assert_eq!(reordered.items.iter().map(|i| i.id).collect::<Vec<_>>()[..2], [b.id, c.id]);
+    // A reader too far behind, or of an older incarnation, starts over.
+    let mut stale = cursor;
+    stale.version = 0;
+    for n in 0..FEED_CHANGES_KEPT as u64 {
+        feed.insert(feed_item(10 + n, 1_000 + n, vec![]));
+    }
+    assert_eq!(feed.changes_since(stale).from, 0);
+    assert_eq!(FeedState::default().changes_since(reordered.cursor).from, 0);
+}
+
+#[test]
+fn a_sync_batch_in_any_order_sorts_once() {
+    // 20k entries of a chain, arriving newest first: every one is a parent
+    // its children already listed.
+    let mut items = vec![];
+    let mut last: Option<EnvelopeId> = None;
+    for n in 0..20_000u64 {
+        let item = feed_item(n, n, last.into_iter().collect());
+        last = Some(item.id);
+        items.push(item);
+    }
+    let mut feed = FeedState::default();
+    let started = std::time::Instant::now();
+    for item in items.iter().rev() {
+        feed.insert(item.clone());
+    }
+    let changes = feed.changes_since(FeedCursor::default());
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_eq!(changes.items.iter().map(|i| i.id).collect::<Vec<_>>(), items.iter().map(|i| i.id).collect::<Vec<_>>());
+}
+
+#[test]
+fn a_new_entry_costs_the_same_in_a_long_feed() {
+    // 100k entries, each following the previous one (a busy chat).
+    let mut feed = FeedState::default();
+    let mut last = None;
+    for n in 0..100_000u64 {
+        let item = feed_item(n, n, last.into_iter().collect());
+        last = Some(item.id);
+        feed.insert(item);
+    }
+    let cursor = feed.changes_since(FeedCursor::default()).cursor;
+    let started = std::time::Instant::now();
+    for n in 100_000..101_000u64 {
+        let item = feed_item(n, n, last.into_iter().collect());
+        last = Some(item.id);
+        feed.insert(item);
+    }
+    let elapsed = started.elapsed();
+    let changes = feed.changes_since(cursor);
+    assert_eq!((changes.from, changes.items.len()), (100_000, 1_000));
+    // A full reorder per entry took about 100 ms here; this is microseconds.
+    assert!(elapsed < std::time::Duration::from_secs(1), "1,000 appends took {elapsed:?}");
+    // A concurrent entry (an older clock) lands just before the tail it
+    // races, and only the tail moves.
+    let racer = feed_item(999_999, 100_997, vec![feed.order[100_997]]);
+    feed.insert(racer.clone());
+    assert_eq!(feed.changes_since(changes.cursor).from, 100_998);
+    assert_eq!(feed.order[100_998], racer.id);
+}

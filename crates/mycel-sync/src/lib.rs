@@ -7,8 +7,9 @@
 //! Keepers run the same `Replica` with the Relay role: they validate and store
 //! envelopes but hold no keys, so they never materialize anything.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use automerge::{ActorId, AutoCommit};
 use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, Sig, SignPk, random};
@@ -213,51 +214,189 @@ struct DocState {
     seqs: HashMap<(Vec<u8>, u64), (automerge::ChangeHash, EnvelopeId)>,
 }
 
-#[derive(Default)]
+/// A reader's position in one feed: which incarnation of it, and how much of
+/// it the reader has applied (see [`Replica::feed_changes`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FeedCursor {
+    instance: u64,
+    version: u64,
+    len: usize,
+}
+
+/// What changed in a feed since a [`FeedCursor`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FeedChanges {
+    /// The first position (in causal order) that differs from what the
+    /// reader applied: everything before it is unchanged. The reader's length
+    /// when entries were only appended; 0 when the feed was rebuilt.
+    pub from: usize,
+    /// The feed from `from` on, in causal order.
+    pub items: Vec<FeedItem>,
+    pub cursor: FeedCursor,
+}
+
+/// Feed incarnations: a feed rebuilt from scratch (it lost entries, or the
+/// rules changed) is a new one, and its readers start over.
+static FEED_INSTANCES: AtomicU64 = AtomicU64::new(1);
+
+/// Recent changes remembered per feed, for readers catching up.
+const FEED_CHANGES_KEPT: usize = 4096;
+/// A new entry is placed in the order directly only if it lands among the
+/// newest this many; otherwise (a long-offline branch, a parent arriving
+/// after its children) the order is recomputed once, when next read, so a
+/// sync batch in any order costs one sort rather than one per entry.
+const FEED_PLACE_WITHIN: usize = 1024;
+
 struct FeedState {
+    instance: u64,
     items: HashMap<EnvelopeId, FeedItem>,
-    order: Option<Vec<EnvelopeId>>,
+    /// Deterministic causal order (Kahn over known deps, ties by (ts, id)),
+    /// maintained as entries arrive rather than recomputed.
+    order: Vec<EnvelopeId>,
+    position: HashMap<EnvelopeId, usize>,
+    /// Missing dep → entries that listed it. Its arrival can reorder them.
+    waiting: HashMap<EnvelopeId, Vec<EnvelopeId>>,
+    /// Every dep listed by an entry; heads are the entries not among them.
+    referenced: HashSet<EnvelopeId>,
+    heads: BTreeSet<EnvelopeId>,
+    /// Entries arrived that `order` doesn't place yet (see `FEED_PLACE_WITHIN`).
+    unsorted: bool,
+    /// One more per inserted entry.
+    version: u64,
+    /// (version, first position that changed), oldest first.
+    changes: VecDeque<(u64, usize)>,
+    /// Changes up to this version may have been forgotten.
+    forgotten: u64,
+}
+
+impl Default for FeedState {
+    fn default() -> Self {
+        FeedState {
+            instance: FEED_INSTANCES.fetch_add(1, Ordering::Relaxed),
+            items: HashMap::new(),
+            order: Vec::new(),
+            position: HashMap::new(),
+            waiting: HashMap::new(),
+            referenced: HashSet::new(),
+            heads: BTreeSet::new(),
+            unsorted: false,
+            version: 0,
+            changes: VecDeque::new(),
+            forgotten: 0,
+        }
+    }
 }
 
 impl FeedState {
-    /// Deterministic causal order: Kahn over known deps, ties by (ts, id).
-    fn ordered(&mut self) -> &[EnvelopeId] {
-        if self.order.is_none() {
-            let mut indeg: HashMap<EnvelopeId, usize> = HashMap::new();
-            let mut children: HashMap<EnvelopeId, Vec<EnvelopeId>> = HashMap::new();
-            for (id, item) in &self.items {
-                let known: HashSet<&EnvelopeId> =
-                    item.deps.iter().filter(|d| self.items.contains_key(d)).collect();
-                indeg.insert(*id, known.len());
-                for d in known {
-                    children.entry(*d).or_default().push(*id);
-                }
+    fn key(&self, id: &EnvelopeId) -> (u64, EnvelopeId) {
+        (self.items[id].ts_ms, *id)
+    }
+
+    /// Add an entry where the deterministic order puts it. Usually O(1): a
+    /// new entry follows its deps, and Kahn's choices up to them can't
+    /// change; from there it goes before the first entry with a greater
+    /// (ts, id). An entry that others already listed as a dep can reorder
+    /// them, and one far from the end would shift much of the order: both
+    /// leave the order to be recomputed once, when next read.
+    fn insert(&mut self, item: FeedItem) {
+        let id = item.id;
+        let key = (item.ts_ms, id);
+        for dep in &item.deps {
+            self.referenced.insert(*dep);
+            self.heads.remove(dep);
+            if !self.items.contains_key(dep) {
+                self.waiting.entry(*dep).or_default().push(id);
             }
-            let key = |id: &EnvelopeId| (self.items[id].ts_ms, *id);
-            let mut ready: BTreeSet<(u64, EnvelopeId)> =
-                indeg.iter().filter(|(_, d)| **d == 0).map(|(id, _)| key(id)).collect();
-            let mut order = Vec::with_capacity(self.items.len());
-            while let Some((_, id)) = ready.pop_first() {
-                order.push(id);
-                for c in children.get(&id).into_iter().flatten() {
-                    let d = indeg.get_mut(c).unwrap();
-                    *d -= 1;
-                    if *d == 0 {
-                        ready.insert(key(c));
-                    }
-                }
-            }
-            self.order = Some(order);
         }
-        self.order.as_deref().unwrap()
+        if !self.referenced.contains(&id) {
+            self.heads.insert(id);
+        }
+        let after = item.deps.iter().filter_map(|d| self.position.get(d)).max().map_or(0, |p| p + 1);
+        self.items.insert(id, item);
+        self.version += 1;
+        let waited = self.waiting.remove(&id).is_some();
+        if self.unsorted || waited || self.order.len() - after.min(self.order.len()) > FEED_PLACE_WITHIN {
+            self.unsorted = true;
+            return;
+        }
+        let at = (after..self.order.len())
+            .find(|&i| self.key(&self.order[i]) > key)
+            .unwrap_or(self.order.len());
+        self.order.insert(at, id);
+        for (i, entry) in self.order[at..].iter().enumerate() {
+            self.position.insert(*entry, at + i);
+        }
+        self.record(at);
+    }
+
+    fn record(&mut self, at: usize) {
+        self.changes.push_back((self.version, at));
+        if self.changes.len() > FEED_CHANGES_KEPT
+            && let Some((version, _)) = self.changes.pop_front()
+        {
+            self.forgotten = version;
+        }
+    }
+
+    /// The order, recomputed first if entries arrived it doesn't place.
+    fn sorted(&mut self) -> &[EnvelopeId] {
+        if self.unsorted {
+            self.unsorted = false;
+            let first = self.reorder();
+            self.record(first);
+        }
+        &self.order
+    }
+
+    /// Recompute the order from scratch; the first position that moved.
+    fn reorder(&mut self) -> usize {
+        let mut indeg: HashMap<EnvelopeId, usize> = HashMap::new();
+        let mut children: HashMap<EnvelopeId, Vec<EnvelopeId>> = HashMap::new();
+        for (id, item) in &self.items {
+            let known: HashSet<&EnvelopeId> = item.deps.iter().filter(|d| self.items.contains_key(d)).collect();
+            indeg.insert(*id, known.len());
+            for d in known {
+                children.entry(*d).or_default().push(*id);
+            }
+        }
+        let mut ready: BTreeSet<(u64, EnvelopeId)> =
+            indeg.iter().filter(|(_, d)| **d == 0).map(|(id, _)| self.key(id)).collect();
+        let mut order = Vec::with_capacity(self.items.len());
+        while let Some((_, id)) = ready.pop_first() {
+            order.push(id);
+            for c in children.get(&id).into_iter().flatten() {
+                let d = indeg.get_mut(c).unwrap();
+                *d -= 1;
+                if *d == 0 {
+                    ready.insert(self.key(c));
+                }
+            }
+        }
+        let first = self.order.iter().zip(&order).take_while(|(a, b)| a == b).count();
+        self.position = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        self.order = order;
+        first
     }
 
     fn heads(&self) -> Vec<EnvelopeId> {
-        let referenced: HashSet<&EnvelopeId> = self.items.values().flat_map(|i| &i.deps).collect();
-        let mut heads: Vec<EnvelopeId> =
-            self.items.keys().filter(|id| !referenced.contains(id)).copied().collect();
-        heads.sort();
-        heads
+        self.heads.iter().copied().collect()
+    }
+
+    fn changes_since(&mut self, since: FeedCursor) -> FeedChanges {
+        self.sorted();
+        let cursor = FeedCursor { instance: self.instance, version: self.version, len: self.order.len() };
+        let from = if since.instance != self.instance || since.version > self.version || since.version < self.forgotten {
+            0
+        } else {
+            self.changes
+                .iter()
+                .filter(|(v, _)| *v > since.version)
+                .map(|(_, at)| *at)
+                .fold(since.len, usize::min)
+                .min(self.order.len())
+        };
+        let items = self.order[from..].iter().map(|id| self.items[id].clone()).collect();
+        FeedChanges { from, items, cursor }
     }
 }
 
@@ -270,6 +409,9 @@ pub struct Replica {
     /// author → seq → envelope ids (more than one = equivocation)
     chains: HashMap<SignPk, BTreeMap<u64, Vec<EnvelopeId>>>,
     status: HashMap<EnvelopeId, Status>,
+    /// The envelopes whose status is pending (a subset of `status`), so a new
+    /// envelope rechecks only those, not every envelope ever received.
+    pending: HashSet<EnvelopeId>,
     /// Valid envelopes per stream (whether or not we can decrypt them).
     valid_by_stream: HashMap<StreamId, BTreeSet<EnvelopeId>>,
     docs: HashMap<StreamId, DocState>,
@@ -338,6 +480,7 @@ impl Replica {
             envelopes: HashMap::new(),
             chains: HashMap::new(),
             status: HashMap::new(),
+            pending: HashSet::new(),
             valid_by_stream: HashMap::new(),
             docs: HashMap::new(),
             feeds: HashMap::new(),
@@ -634,6 +777,7 @@ impl Replica {
     fn full_refresh(&mut self) {
         let ids: Vec<EnvelopeId> = self.envelopes.keys().copied().collect();
         self.status = ids.iter().map(|id| (*id, self.compute_status(id))).collect();
+        self.pending = self.status.iter().filter(|(_, s)| matches!(s, Status::Pending(_))).map(|(id, _)| *id).collect();
         let mut by_stream: HashMap<StreamId, BTreeSet<EnvelopeId>> = HashMap::new();
         for (id, st) in &self.status {
             if *st == Status::Valid {
@@ -674,12 +818,7 @@ impl Replica {
     /// New envelopes arrived: evaluate them and anything pending that they may unblock.
     fn incremental(&mut self, new: &[EnvelopeId]) {
         let mut todo: Vec<EnvelopeId> = new.to_vec();
-        todo.extend(
-            self.status
-                .iter()
-                .filter(|(_, s)| matches!(s, Status::Pending(_)))
-                .map(|(id, _)| *id),
-        );
+        todo.extend(self.pending.iter().copied());
         loop {
             let mut progressed = false;
             let mut still = Vec::new();
@@ -690,11 +829,15 @@ impl Replica {
                     let stream = self.envelopes[&id].header.stream;
                     self.valid_by_stream.entry(stream).or_default().insert(id);
                     self.status.insert(id, st);
+                    self.pending.remove(&id);
                     self.materialize(&id);
                     progressed = true;
                 } else {
                     if matches!(st, Status::Pending(_)) {
                         still.push(id);
+                        self.pending.insert(id);
+                    } else {
+                        self.pending.remove(&id);
                     }
                     self.status.insert(id, st);
                 }
@@ -714,6 +857,9 @@ impl Replica {
             self.refresh_doc(stream);
             return;
         }
+        if self.feeds.get(&stream).is_some_and(|f| f.items.contains_key(id)) {
+            return; // already applied: don't decrypt again on a refresh
+        }
         let Some(key) = self.ring.get(&env.header.epoch) else {
             return; // opaque (e.g. we are a keeper, or joined after this epoch)
         };
@@ -724,9 +870,6 @@ impl Replica {
         match stream.kind {
             StreamKind::Doc => unreachable!("documents use refresh_doc"),
             StreamKind::Feed => {
-                if self.feeds.get(&stream).is_some_and(|f| f.items.contains_key(id)) {
-                    return;
-                }
                 let Ok(entry) = postcard::from_bytes::<FeedEntry>(&plain) else {
                     return;
                 };
@@ -749,9 +892,7 @@ impl Replica {
                     deps: entry.deps,
                     body: entry.body,
                 };
-                let feed = self.feeds.entry(stream).or_default();
-                feed.items.insert(*id, item);
-                feed.order = None;
+                self.feeds.entry(stream).or_default().insert(item);
             }
         }
     }
@@ -957,12 +1098,16 @@ impl Replica {
 
     /// Feed entries in deterministic causal order.
     pub fn feed(&mut self, feed: &StreamId) -> Vec<FeedItem> {
+        self.feed_changes(feed, FeedCursor::default()).items
+    }
+
+    /// What changed in a feed since `since` (`FeedCursor::default()`: all of
+    /// it), and the cursor to pass next time. Costs O(what changed): a new
+    /// entry usually lands at the end, so a reader applies just that.
+    pub fn feed_changes(&mut self, feed: &StreamId, since: FeedCursor) -> FeedChanges {
         match self.feeds.get_mut(feed) {
-            Some(f) => {
-                let order = f.ordered().to_vec();
-                order.iter().map(|id| f.items[id].clone()).collect()
-            }
-            None => Vec::new(),
+            Some(f) => f.changes_since(since),
+            None => FeedChanges::default(),
         }
     }
 
