@@ -1168,7 +1168,14 @@ impl Node {
                 }
             }
         }
-        let mdns = if opts.mode != NetMode::Local {
+        // LAN discovery (`_mycel._udp`): iroh's mDNS sends its own multicast,
+        // which iOS allows only with Apple's multicast entitlement, so on iOS
+        // the system's Bonjour responder discovers and advertises instead
+        // (native_mdns.rs). Only one of the two runs, or they would claim the
+        // same instance name. They interoperate: vendor/swarm-discovery.
+        let native_lan = cfg!(target_os = "ios")
+            || cfg!(target_os = "macos") && std::env::var_os("MYCEL_NATIVE_MDNS").is_some_and(|v| v == "1");
+        let mdns = if opts.mode != NetMode::Local && !native_lan {
             let mdns = MdnsAddressLookup::builder()
                 .service_name("mycel")
                 .build(endpoint.id())?;
@@ -1178,7 +1185,7 @@ impl Node {
             None
         };
         #[cfg(any(target_os = "macos", target_os = "ios"))]
-        let native_mdns = if opts.mode != NetMode::Local && opts.ip {
+        let native_mdns = if opts.mode != NetMode::Local && opts.ip && native_lan {
             let sockets = endpoint.bound_sockets();
             let port = sockets.iter().find(|a| a.is_ipv4()).or_else(|| sockets.first()).map_or(0, |a| a.port());
             match native_mdns::NativeMdns::start(endpoint.id(), port) {
