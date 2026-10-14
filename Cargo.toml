@@ -71,3 +71,5 @@ swift-rs = { path = "vendor/swift-rs" }
 noq = { path = "vendor/noq" }
 noq-proto = { path = "vendor/noq-proto" }
 tauri-plugin-notification = { path = "vendor/tauri-plugin-notification" }
+# standard DNS-SD interop for LAN discovery (vendor/swarm-discovery/MYCEL_PATCH.md)
+swarm-discovery = { path = "vendor/swarm-discovery" }
