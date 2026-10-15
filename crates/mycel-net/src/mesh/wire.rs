@@ -273,7 +273,7 @@ mod tests {
     fn announcements_round_trip_and_verify() {
         let k = DeviceKeys::generate();
         let o = Origination { seq: 1_700_000_000_000, flags: 1, scope: 2, uplink: 345 };
-        let mut a = sign_announce(&k, o, "Atul’s MacBook Pro with a long name");
+        let mut a = sign_announce(&k, o, "Alice’s MacBook Pro with a long name");
         assert!(a.name.len() <= MAX_NAME);
         a.hops = 3;
         a.cost = 1234;
