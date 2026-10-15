@@ -91,7 +91,7 @@ What is built is in [§7](#7-what-is-built).
 - **Paths (multipath QUIC):** one connection keeps several paths open and moves between them without reconnecting: IP paths (same network, or direct over the internet), the internet relay, and **links**, non-IP paths that are Iroh custom transports (`mycel_net::link::Link`). The links are:
   - **peer-to-peer Wi-Fi** on macOS and iOS: Apple's AWDL (what AirDrop uses) through Network.framework, found by the Bonjour service `_mycel-p2p._udp`; no shared Wi-Fi network needed, only Wi-Fi switched on (`crates/mycel-link-awdl`);
   - **Bluetooth LE**: L2CAP channels through CoreBluetooth on macOS and iOS, and through BlueZ (`bluer`) on Linux, wire-compatible (same service and characteristic UUIDs, GATT info, PSM, framing and state machine), so a Linux machine and a Mac link with each other (`crates/mycel-link-ble`);
-  - **other network interfaces** (`crates/mycel-link-iface`, below), including Wi-Fi Direct groups that Linux forms on its own when turned on;
+  - **other network interfaces** (`crates/mycel-link-iface`, below), including Wi-Fi Direct groups, which Mycel forms with other Mycel devices on Linux when turned on;
   - the **mesh** (§8).
 
   Verification: the Bluetooth link has run between a real iPhone and Macs. Peer-to-peer Wi-Fi, BlueZ and Wi-Fi Direct group formation are built and tested on emulated links (and, for the Linux code, in CI builds), but have not been tested between real devices.
