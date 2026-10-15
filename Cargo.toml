@@ -54,7 +54,7 @@ suspicious_xor_used_as_pow = "warn"
 try_err = "warn"
 unnecessary_self_imports = "warn"
 
-# Keep build artifacts small (disk is nearly full); line tables still give useful backtraces.
+# Line tables only: keeps target/ small and still gives useful backtraces.
 [profile.dev]
 debug = "line-tables-only"
 
