@@ -4,7 +4,7 @@
 #   scripts/package-mac.sh              # this Mac's architecture (arm64 or x86_64)
 #   scripts/package-mac.sh --universal  # one app that runs on Apple silicon AND Intel Macs
 #
-# The app is unsigned. See docs/TWO_LAPTOPS.md for how to open it on another Mac.
+# The app is unsigned. See docs/USER_GUIDE.md for how to open it on another Mac.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
