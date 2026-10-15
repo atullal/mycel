@@ -201,7 +201,7 @@ pub struct DtnConfig {
     pub spray: Spray,
     pub gradient: Gradient,
     /// The gradient discounts a neighbour by how few more bundles of this
-    /// size its free room takes (fewer than [`ROOM_HEADROOM`]): a full
+    /// size its free room takes (fewer than `ROOM_HEADROOM`): a full
     /// gateway draws bundles it can only hold briefly. On by default: it
     /// takes The ONE's Helsinki with tram gateways (heavy) from 37.2% to
     /// 52.7% and changes nothing elsewhere (docs/BENCHMARKS.md §6.5).

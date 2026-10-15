@@ -13,10 +13,10 @@
 //! - **Never cancel a BLE connection to a node we have a live channel with.**
 //!   Between two Macs both directions share one radio link, and cancelling our
 //!   side of it can take down the channel the *peer* opened. A connection we
-//!   don't need right now is kept as a spare ([`Phase::Spare`]); when the
+//!   don't need right now is kept as a spare (`Phase::Spare`); when the
 //!   channel dies, a new one opens over the spare at once.
 //! - **Two live channels to one node** (both dialed at once): both ends keep
-//!   the one dialed by the lower key ([`Core::keep_new`]). Only the side that
+//!   the one dialed by the lower key (`Core::keep_new`). Only the side that
 //!   dialed the loser closes it; the other side just stops using it (and
 //!   closes it itself after [`DUPLICATE_GRACE`]), so the survivor is never
 //!   touched and nobody sees the peer lost.

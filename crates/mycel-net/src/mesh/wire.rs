@@ -173,7 +173,7 @@ pub fn encode_announces(anns: &[Announce], max: usize) -> Vec<Bytes> {
     out
 }
 
-/// The announcements in a [`T_OGMS`] datagram (none if any is malformed).
+/// The announcements in a `T_OGMS` datagram (none if any is malformed).
 pub fn decode_announces(b: &[u8]) -> Vec<Announce> {
     let mut out = Vec::new();
     let Some((&T_OGMS, mut rest)) = b.split_first() else { return out };

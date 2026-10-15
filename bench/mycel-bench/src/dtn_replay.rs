@@ -36,10 +36,13 @@
 //! writes every message's latency, for "delivered within" comparisons.
 //!
 //! Usage:
-//!   dtn-replay --contacts c.csv --messages m.csv [--gateways 0-16]
-//!              [--speed 250000] [--buffer 5000000] [--ttl-min 300]
-//!              [--copies N] [--knobs k=v,...] [--no-resume] [--end <s>]
-//!              [--label name] [--latencies out.csv] [--step-ms 1000]
+//!
+//! ```text
+//! dtn-replay --contacts c.csv --messages m.csv [--gateways 0-16]
+//!            [--speed 250000] [--buffer 5000000] [--ttl-min 300]
+//!            [--copies N] [--knobs k=v,...] [--no-resume] [--end <s>]
+//!            [--label name] [--latencies out.csv] [--step-ms 1000]
+//! ```
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 

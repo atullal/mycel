@@ -7,7 +7,7 @@
 //! hops lead there over links that are up now? It reports how often the
 //! router agrees, and how often it holds a stale route.
 //!
-//! Usage: route-check <contacts.csv> <start s> <duration s>
+//! Usage: `route-check <contacts.csv> <start s> <duration s>`
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};

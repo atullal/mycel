@@ -165,9 +165,10 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # TODO: set RUSTDOCFLAGS=-D warnings once the existing broken intra-doc
-      # links and unescaped HTML in doc comments are fixed.
+      # Broken intra-doc links and stray HTML in doc comments fail the build.
       - run: cargo doc --locked --no-deps --workspace --exclude mycel-host
+        env:
+          RUSTDOCFLAGS: -D warnings
 
   rules:
     name: Rules (WebAssembly)
