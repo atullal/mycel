@@ -3612,7 +3612,6 @@ dependencies = [
  "bytes",
  "mycel-crypto",
  "mycel-net",
- "serde_json",
 ]
 
 [[package]]
