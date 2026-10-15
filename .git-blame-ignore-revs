@@ -5,5 +5,5 @@
 #
 # One full commit SHA per line, with a comment saying what it was.
 
-# The first repository-wide `cargo fmt` (rustfmt.toml): SHA to be added once
-# that commit is on main.
+# The first repository-wide `cargo fmt` (rustfmt.toml).
+35a800b2b1ba0032ec01b5f00baa5e4634e1bca6
