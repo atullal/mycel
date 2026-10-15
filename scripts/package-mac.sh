@@ -22,6 +22,9 @@ cargo tauri --version >/dev/null 2>&1 || { echo "cargo-tauri not found: cargo in
 cd "$ROOT"
 # Frontend deps (the frontend itself is built by tauri.conf.json's beforeBuildCommand).
 [ -d node_modules ] || npm install
+# Keep this machine's paths (home directory, Cargo registry, toolchain) out of
+# the binaries.
+source "$ROOT/scripts/remap-paths.sh"
 
 cd "$ROOT/apps/host"
 if [ -n "$TARGET" ]; then

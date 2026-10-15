@@ -41,6 +41,9 @@ cargo tauri --version >/dev/null 2>&1 || { echo "cargo-tauri not found: cargo in
 
 cd "$ROOT"
 [ -d node_modules ] || npm install
+# Keep this machine's paths (home directory, Cargo registry, toolchain) out of
+# the binaries.
+source "$ROOT/scripts/remap-paths.sh"
 
 GEN="$ROOT/apps/host/src-tauri/gen/android"
 VERSION="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$ROOT/apps/host/src-tauri/tauri.conf.json" | head -1)"
