@@ -231,5 +231,12 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           notes="Builds of $TAG. Check a download against SHA256SUMS, and its provenance with: gh attestation verify <file> --repo $GH_REPO"
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --verify-tag --prerelease --title "$TAG" --notes "$notes"
-          gh release upload "$TAG" --clobber dist/*
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A release made by hand before this run: add the files to it.
+            gh release upload "$TAG" --clobber dist/*
+          else
+            # Created as a draft with every file, then published, so it also
+            # works with immutable releases (no files added after publishing).
+            gh release create "$TAG" --draft --verify-tag --prerelease --title "$TAG" --notes "$notes" dist/*
+            gh release edit "$TAG" --draft=false
+          fi
