@@ -5,12 +5,13 @@
 
 mod common;
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::*;
-use mycel_call::audio::{TestAudio, TestSource};
+use mycel_call::audio::{AudioDiag, AudioHandle, AudioIo, AudioPorts, TestAudio, TestSource};
 use mycel_call::proto::{self, CallRef, Ctrl, call_id};
-use mycel_call::{ALPN_CALL, CallPhase, EndReason};
+use mycel_call::{ALPN_CALL, CallEvent, CallPhase, EndReason};
 use mycel_crypto::Hash32;
 use mycel_net::MeshOptions;
 use mycel_net::link::{MemNet, PathKind};
@@ -197,7 +198,6 @@ async fn both_call_at_once_become_one_call() {
 
     let (a, b) = tokio::join!(alice.calls.start(space), bob.calls.start(space));
     let (a, b) = (a.unwrap(), b.unwrap());
-    assert_ne!(a.id, b.id);
     let winner = eventually("one active call on both sides", 15, || {
         let al = alice.live();
         let bl = bob.live();
@@ -210,14 +210,112 @@ async fn both_call_at_once_become_one_call() {
     })
     .await;
     assert!(winner == a.id || winner == b.id);
-    // the losing call ended as replaced, without ringing anyone
-    let loser = if winner == a.id { &b.id } else { &a.id };
-    let lost = alice.call(loser).or_else(|| bob.call(loser)).unwrap();
-    assert_eq!(lost.end_reason, Some(EndReason::Replaced));
+    // Two calls were placed: the losing one ended as replaced, without
+    // ringing anyone. (Or one's ring got there before the other placed a
+    // call, and pressing call answered it: one call all along.)
+    if a.id != b.id {
+        let loser = if winner == a.id { &b.id } else { &a.id };
+        let lost = alice.call(loser).or_else(|| bob.call(loser)).unwrap();
+        assert_eq!(lost.end_reason, Some(EndReason::Replaced));
+    }
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert!((alice.heard(1.0).unwrap() - 660.0).abs() < 8.0);
     assert!((bob.heard(1.0).unwrap() - 440.0).abs() < 8.0);
     alice.calls.end(&winner).unwrap();
+    eventually("both hung up", 5, || (alice.live().is_empty() && bob.live().is_empty()).then_some(())).await;
+
+    // Nothing left over from the glare answers the next call by itself (a
+    // lost glare has the higher key expect the lower key's call): the
+    // lower key calls again, and the other device rings.
+    let (lo, hi) = if alice.node.id() < bob.node.id() { (&alice, &bob) } else { (&bob, &alice) };
+    let again = lo.calls.start(space).await.unwrap();
+    let ring = eventually("it rings", 10, || hi.incoming().filter(|r| r.id == again.id)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(hi.call(&ring.id).unwrap().state, CallPhase::Ringing, "rings, isn't answered by itself");
+    lo.calls.end(&again.id).unwrap();
+}
+
+/// Audio whose microphone check (`prepare`, which runs before a call is
+/// placed) takes a while: a permission prompt, or a loaded machine slow to
+/// run the check's thread. It lasts until `until()` (at most 5 s).
+struct SlowPrepare {
+    inner: Arc<TestAudio>,
+    until: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl AudioIo for SlowPrepare {
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+    fn prepare(&self) -> anyhow::Result<()> {
+        let end = Instant::now() + Duration::from_secs(5);
+        while !(self.until)() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.inner.prepare()
+    }
+    fn open(&self, ports: AudioPorts) -> anyhow::Result<AudioHandle> {
+        self.inner.open(ports)
+    }
+    fn diagnostics(&self) -> AudioDiag {
+        self.inner.diagnostics()
+    }
+}
+
+/// Both press call at once, but one of them is slow to place the call: the
+/// other's ring gets there while it is still checking the microphone (on a
+/// loaded machine a few milliseconds' lag does it). `lower_first`: the
+/// faster one has the lower key (its call is the one that wins a glare),
+/// else the higher.
+async fn glare_one_side_slow(lower_first: bool) {
+    let alice = device("alice", sine(440.0), true, &[]).await;
+    let bob = device("bob", sine(660.0), true, &[]).await;
+    alice.node.add_peer_addr(bob.node.addr());
+    bob.node.add_peer_addr(alice.node.addr());
+    let space = shared_space(&alice, &bob).await;
+    let (fast, slow) = if (alice.node.id() < bob.node.id()) == lower_first { (&alice, &bob) } else { (&bob, &alice) };
+    let events = slow.events.clone();
+    let rung = move || events.lock().iter().any(|e| matches!(e, CallEvent::Incoming(_)));
+    slow.calls.set_audio(Arc::new(SlowPrepare { inner: slow.audio.clone(), until: Box::new(rung) }));
+
+    let (f, s) = tokio::join!(fast.calls.start(space), slow.calls.start(space));
+    let (f, s) = (f.unwrap(), s.unwrap());
+    let winner = eventually("one active call on both sides", 15, || {
+        match (fast.live().as_slice(), slow.live().as_slice()) {
+            ([x], [y]) if x.id == y.id && x.state == CallPhase::Active && y.state == CallPhase::Active => {
+                Some(x.id.clone())
+            }
+            _ => None,
+        }
+    })
+    .await;
+    for d in [fast, slow] {
+        let other: Vec<_> = d.status().into_iter().filter(|c| c.id != winner).map(|c| (c.id, c.end_reason)).collect();
+        assert!(other.is_empty(), "no second call, missed or replaced: {other:?}");
+    }
+    // pressing call answered the call that was already ringing
+    assert_eq!((winner.as_str(), s.id.as_str()), (f.id.as_str(), f.id.as_str()));
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!((alice.heard(1.0).unwrap() - 660.0).abs() < 8.0);
+    assert!((bob.heard(1.0).unwrap() - 440.0).abs() < 8.0);
+    fast.calls.end(&winner).unwrap();
+}
+
+/// The lower key's ring comes while the higher key is still placing its
+/// call. This used to hang: the higher key's call went out anyway and lost
+/// the glare, while the winning call just rang on its device, unanswered
+/// (the call glare flake on Windows CI).
+#[tokio::test(flavor = "multi_thread")]
+async fn both_call_at_once_higher_key_slow_to_place_it() {
+    glare_one_side_slow(true).await;
+}
+
+/// The higher key's ring comes while the lower key is still placing its
+/// call. This used to place a second call anyway: one call in the end, but
+/// the first one rang and was then shown as missed.
+#[tokio::test(flavor = "multi_thread")]
+async fn both_call_at_once_lower_key_slow_to_place_it() {
+    glare_one_side_slow(false).await;
 }
 
 /// No IP at all: the call starts on peer-to-peer Wi-Fi, then that link is
