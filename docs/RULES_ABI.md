@@ -1,14 +1,14 @@
 # Mycel rules ABI v1 (L4)
 
-> Status: implemented 2026-10-07 in `crates/mycel-rules` (host), `crates/mycel-rules-abi` (shared `no_std` types), and `rules/` (guest SDK + example bundles). See [ARCHITECTURE.md §L4](ARCHITECTURE.md#l4-rules-the-part-that-makes-apps-cheap).
+Implemented in `crates/mycel-rules` (host), `crates/mycel-rules-abi` (shared `no_std` types), and `rules/` (guest SDK and example bundles). See [ARCHITECTURE.md, L4](ARCHITECTURE.md#l4-rules).
 
-App rules (validators and action reducers) are written in Rust, compiled to `wasm32-unknown-unknown`, and run by every peer with the [`wasmi`](https://github.com/wasmi-labs/wasmi) interpreter. A Space pins the hash of its rules bundle. The goal is the L2 invariant extended to app logic: **every honest peer reaches the same accept/reject decision for the same input.**
+App rules (validators and action reducers) are written in Rust, compiled to `wasm32-unknown-unknown`, and run by every peer with the [`wasmi`](https://github.com/wasmi-labs/wasmi) interpreter. A bundle is identified by its hash. The goal is the trust layer's invariant extended to app logic: **every honest peer reaches the same accept/reject decision for the same input.**
 
 ## 1. Bundle identity and limits
 
 - `RulesHash = BLAKE3::derive_key("mycel/v0/rules-bundle", wasm_bytes)`.
 - `Limits::V1`: **fuel 20,000,000 per call**, **memory 16 MiB**, **module ≤ 4 MiB**. Interpreter stack limits are fixed in the crate (recursion depth 1000, value stack 1 MB).
-- **Consensus parameters:** the bundle bytes, the `Limits`, the wasmi version (pinned `=2.0.0`; its fuel cost model is part of consensus, guarded by the test `fuel_cost_model_is_pinned`), and the ABI version. Changing any of them can change verdicts near the limits, so it must ship as a new pinned rules version.
+- **Consensus parameters:** the bundle bytes, the `Limits`, the wasmi version (pinned `=2.0.0`, with its portable loop dispatch at every optimisation level; its fuel cost model is part of consensus, guarded by the test `fuel_cost_model_is_pinned`), and the ABI version. Changing any of them can change verdicts near the limits, so every peer must run the same ones.
 
 ## 2. Module restrictions (checked at load)
 
@@ -48,7 +48,7 @@ Fuel covers `mycel_alloc` plus the entry point.
 
 ```
 RuleInput {
-  author:      [u8; 32]   // 32 raw bytes: the Agent key
+  author:      [u8; 32]   // 32 raw bytes: the author's device key
   author_role: RoleTag    // 1 byte: Relay=0, Reader=1, Writer=2, Admin=3
   stream:      StreamTag { kind: 1 byte (Doc=0, Feed=1), id: 16 raw bytes }
   payload:     bytes      // varint len ‖ bytes: the decrypted entry / action
@@ -134,12 +134,10 @@ Payloads must decode exactly (no trailing bytes); ops are only valid on Feed str
 
 Cost: a maximum-size (16 KiB) message uses about 57k fuel (0.3% of the budget). In a release build a small validate takes about 6 µs, a 16 KiB one about 17 µs, and loading a module about 170 µs. Burning the full 20M budget takes about 5–7 ms.
 
-## 7. Integration with ingest (guidance)
+## 7. How the runtime uses it
 
-1. **Pipeline position:** verify signature → resolve author (Device→Agent) → envelope validity (TRUST §7 rules 1–6) → decrypt → actor check (§7 rule 7) → **`RulesEngine::validate`** → apply, or quarantine. Keepers cannot decrypt, so they enforce header validity only. A rejection is handled like an invalid envelope: never applied, and dependents are rejected too. Keep the `Reason` for UI and debugging.
-2. **`RuleInput` fields:** `author` = the Agent key. `author_role` = the role in `state(valid ∩ past(auth_heads))`, the same causal state as §7 rule 3, never the receiver's current view. `payload` = the decrypted entry bytes.
-3. **`context`, if a rule needs it,** must be derived only from the envelope's causal past. A missing dependency means *pending*, not reject. Prefer designs that need no context: chat moved author-only edits into the reducer for this reason.
-4. **Which rules apply:** pin `(RulesHash, Limits)` with an admin op in the membership graph and evaluate each envelope against the rules in effect in its causal past. A missing bundle → the envelope stays pending (fetch the bundle by hash, then `load_pinned`). A host that can't load the bundle (e.g. a newer ABI) → read-only for that Space.
-5. **Caching:** keep one `RulesEngine` per `RulesHash`. Verdicts are pure functions of (bundle, limits, encoded input), so they can be cached by that key. They must be recomputed when a revocation rebuild changes `author_role`.
-6. **Reducers:** fold actions in the deterministic order (causal, then Lamport clock, then author key). A rejected action leaves the state unchanged.
-7. **DoS:** a malicious Writer can cost each peer at most one full fuel budget (≈ 5–7 ms) per envelope. Rate-limit per author.
+1. **Pipeline position:** verify signature → resolve author → envelope validity (TRUST.md §7 rules 1–6) → decrypt → **`FeedValidator`** (here, `RulesEngine::validate`) → apply. Keepers cannot decrypt, so they enforce header validity only. An entry the rules reject never enters the feed on any peer; its envelope stays stored and is skipped.
+2. **`RuleInput` fields:** `author` = the author's device key. `author_role` = the role in `state(valid ∩ past(auth_heads))`, the same causal state as TRUST.md §7 rule 3, never the receiver's current view. `payload` = the decrypted entry body. `context` is empty.
+3. **Which rules apply:** the runtime embeds the chat rules bundle (`crates/mycel-rules/fixtures/chat_rules.wasm`, built from `rules/chat-rules`; `mycel_node::chat_rules_hash()` gives its hash) and runs it on the chat feed of every space. Other streams are not checked by rules. A space doesn't record which bundle it uses, so every peer must run the same build.
+4. **Reducers:** the chat kit's reducer is native Rust (`mycel_kit_chat::reduce`), folding entries in the feed's deterministic order. `mycel_reduce` is part of the ABI and exercised by `rules/counter-rules` in tests.
+5. **DoS:** a malicious Writer can cost each peer at most one full fuel budget (≈ 5–7 ms) per entry.
