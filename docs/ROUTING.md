@@ -190,6 +190,45 @@ something changes.
     using it after missed path pings (~1 s keep-alive, 5 s idle) or on
     loss, and traffic continues on the others. Routing convergence only
     decides which routes to *add*. Measured in `tests/mesh.rs`.
+12. **Short queues under the hops, so control traffic gets through.**
+    Announcements, seqno requests, keep-alives and the end-to-end
+    connections' acknowledgements share each hop with the bulk data, and
+    below QUIC that hop is a first-in, first-out queue nobody can reorder:
+    the radio's or the Bluetooth controller's send buffer. The hop
+    connection's congestion control (Cubic) fills that buffer until it
+    overflows. On the 400 kB/s test radios a saturated hop's queue held
+    170 ms on average (250 ms, full, at worst) and dropped ~1.5% of what
+    reached it, control included. End-to-end paths through two such hops
+    ran at 300–600 ms RTT, and a path that lost packets grew its window
+    back by about one packet per RTT, too slowly to recover within a
+    transfer. That, not lost announcements (each relay's arrived at the
+    full rate, at most 400 ms late), is why two routes sometimes carried
+    only 1.2–1.4× one route.
+    - So each relay runs CoDel (RFC 8289) on every hop to a device in
+      range, with the hop's smoothed RTT above its lowest standing in for
+      the queueing delay. When it stays more than a target above for an
+      interval (100 ms, or the hop's RTT if longer: no sender can react
+      sooner), a data frame is dropped, then more often while it stays
+      above. The end-to-end connections slow down before the buffer
+      fills.
+    - The target is the time to send 3 full packets at the rate the hop
+      delivers, at least 20 ms (radio jitter isn't a queue) and at most
+      250 ms: 20 ms at 400 kB/s, ~180 ms at Bluetooth's 20 kB/s.
+    - Never dropped: announcements, seqno requests, control frames, and
+      packets of 400 bytes or less (acknowledgements, voice).
+    - Not on internet hops (their queues are shared with the rest of the
+      internet). And when a second of dropping doesn't drain a queue,
+      someone else's traffic fills it or the link got slower: the delay
+      becomes the new base instead of starving our traffic.
+    - Measured (`control_traffic_crosses_a_saturated_hop`): at 400 kB/s,
+      a small exchange across a saturated two-hop route takes 40–60 ms
+      (median) instead of ~560 ms, and the radio queue holds 20–40 ms
+      instead of 180 ms. At 20 kB/s it takes ~400 ms instead of 650–830 ms
+      (once 6.6 s), for ~5% of the bulk throughput. Two routes carry
+      1.84–1.97× one route (`two_routes_aggregate_and_fail_over`, 20 runs
+      interleaved with the old build, which spread 1.79–2.19×).
+    - No wire change: it only decides which frames a device puts on its
+      own hops.
 
 ## 7. Beyond one mesh
 

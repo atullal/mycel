@@ -707,6 +707,26 @@ struct Shape {
     latency: Duration,
     /// When the radio finishes sending what is already queued.
     busy_until: Option<Instant>,
+    stats: RadioStats,
+}
+
+/// What a rate-limited [`MemNet`] did with the packets handed to it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RadioStats {
+    pub sent: u64,
+    /// Dropped: the send queue was full.
+    pub dropped: u64,
+    /// Longest time a packet waited in the queue.
+    pub max_wait: Duration,
+    /// Total time packets waited.
+    pub total_wait: Duration,
+}
+
+impl RadioStats {
+    /// How long a packet sent waited in the queue, on average.
+    pub fn mean_wait(&self) -> Duration {
+        self.total_wait / self.sent.max(1) as u32
+    }
 }
 
 /// More queued than this and packets are dropped (a congested radio).
@@ -747,6 +767,11 @@ impl MemNet {
         s.busy_until = None;
     }
 
+    /// What the rate-limited radio carried, dropped and queued so far.
+    pub fn radio_stats(&self) -> RadioStats {
+        self.shape.lock().stats
+    }
+
     /// Add a fixed one-way delay to every packet.
     pub fn set_latency(&self, latency: Duration) {
         self.shape.lock().latency = latency;
@@ -760,8 +785,13 @@ impl MemNet {
         let now = Instant::now();
         let start = s.busy_until.filter(|b| *b > now).unwrap_or(now);
         if start - now > MEM_MAX_QUEUE {
+            s.stats.dropped += 1;
             return None;
         }
+        let wait = start - now;
+        s.stats.sent += 1;
+        s.stats.max_wait = s.stats.max_wait.max(wait);
+        s.stats.total_wait += wait;
         let done = start + Duration::from_secs_f64(len as f64 / rate as f64);
         s.busy_until = Some(done);
         Some(done - now + s.latency)

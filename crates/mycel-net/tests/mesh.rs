@@ -269,6 +269,83 @@ async fn two_routes_aggregate_and_fail_over() {
     assert_eq!(c.peers()[&a.id()].mesh.as_ref().map(|m| m.via), Some(d.id()));
 }
 
+/// What got across a saturated A–B–C line while A pushed C a bulk transfer.
+struct Saturated {
+    /// Round trips of small exchanges between A and C meanwhile.
+    small: Vec<Duration>,
+    /// A lost its route to C at some point.
+    route_lost: bool,
+    /// Bulk bytes per second.
+    bulk_rate: f64,
+    /// The first hop's radio (A–B), which the bulk transfer saturates.
+    radio: mycel_net::link::RadioStats,
+}
+
+async fn saturated_line(n0: u64, kind: PathKind, rate: u64, bulk: u64) -> Saturated {
+    let edge = |n| {
+        let e = MemNet::radio(n, kind);
+        e.set_rate_limit(Some(rate));
+        e
+    };
+    let (ab, bc) = (edge(n0), edge(n0 + 1));
+    let a = device("a", &[&ab], fast()).await;
+    let _b = device("b", &[&ab, &bc], fast()).await;
+    let c = device("c", &[&bc], fast()).await;
+    mesh_route(&a, &c).await;
+    // the small exchanges have a connection of their own, over the same route
+    let small = a.connect(c.id(), BULK).await.unwrap();
+    push(&small, 1).await;
+    let conn = a.connect(c.id(), BULK).await.unwrap();
+    let transfer = tokio::spawn(async move { push(&conn, bulk).await });
+    tokio::time::sleep(Duration::from_secs(2)).await; // the queues fill
+    let cid = c.id();
+    let mut rtts = Vec::new();
+    let mut route_lost = false;
+    while !transfer.is_finished() {
+        rtts.push(push(&small, 1).await);
+        route_lost |= !a.peers().get(&cid).is_some_and(|p| p.links.contains(&PathKind::Mesh));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let took = transfer.await.unwrap();
+    rtts.sort();
+    Saturated { small: rtts, route_lost, bulk_rate: bulk as f64 / took.as_secs_f64(), radio: ab.radio_stats() }
+}
+
+/// A bulk transfer saturates a two-hop route, on fast radios and on
+/// Bluetooth-speed ones. The queues below the hops stay short, so the
+/// small exchanges, announcements and acknowledgements sharing them don't
+/// wait behind (and get dropped with) a full radio queue: on the fast
+/// radios a small exchange crosses in tens of milliseconds where it took
+/// half a second. The route stays up, and the bulk data still gets the
+/// link.
+#[tokio::test(flavor = "multi_thread")]
+async fn control_traffic_crosses_a_saturated_hop() {
+    let _measuring = MEASURING.lock().await;
+    let ms = Duration::from_millis;
+    // (name, radios, kind, rate, bulk bytes, small exchanges' median at most,
+    // first radio's mean queueing at most, share of the rate for bulk at least)
+    for (name, n0, kind, rate, bulk, max_median, max_wait, min_share) in [
+        ("400 kB/s", 10, PathKind::PeerWifi, 400_000, 2_500_000, ms(150), ms(80), 0.6),
+        ("Bluetooth, 20 kB/s", 12, PathKind::Bluetooth, 20_000, 120_000, ms(700), ms(250), 0.5),
+    ] {
+        let s = saturated_line(n0, kind, rate, bulk).await;
+        let median = s.small[s.small.len() / 2];
+        eprintln!(
+            "{name}: bulk {:.0} B/s; {} small exchanges, median {median:?}, max {:?}; first radio: {} dropped, mean wait {:?}, max {:?}",
+            s.bulk_rate,
+            s.small.len(),
+            s.small.last().unwrap(),
+            s.radio.dropped,
+            s.radio.mean_wait(),
+            s.radio.max_wait
+        );
+        assert!(!s.route_lost, "{name}: the route went down under load");
+        assert!(median < max_median, "{name}: small exchanges took {median:?} (median) across the saturated route");
+        assert!(s.radio.mean_wait() < max_wait, "{name}: packets waited {:?} in the radio's queue", s.radio.mean_wait());
+        assert!(s.bulk_rate > rate as f64 * min_share, "{name}: bulk data got {:.0} B/s of {rate}", s.bulk_rate);
+    }
+}
+
 /// A–B–C–D–E in a line: E is reachable from A four hops away, and each hop
 /// adds little latency of its own.
 #[tokio::test(flavor = "multi_thread")]

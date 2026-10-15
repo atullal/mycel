@@ -138,3 +138,59 @@ async fn a_hop_the_neighbour_dialed_has_a_cost_and_a_window() {
         c.close(0u32.into(), b"done");
     }
 }
+
+/// The queue management on a hop ([`super::Aqm`]), on a fake clock: a brief
+/// or short queue gets no drops; a standing one gets its first drop after
+/// an interval and then more, faster; a queue the drops don't drain (not
+/// ours) is taken as the base instead of starving our traffic; and a slow
+/// link is allowed a few packets' time of queue.
+#[test]
+fn hop_queue_management_drops_only_for_a_standing_queue() {
+    use super::Aqm;
+    let ms = Duration::from_millis;
+    let t0 = Instant::now();
+    let mut q = Aqm::new(t0);
+    q.rate = 400_000.0; // 20 ms target, 100 ms interval
+    assert!(!q.drop_now(ms(5), t0), "base 5 ms");
+    // 15 ms of queue for a second, or 200 ms of it for half an interval
+    assert!((1..=100).all(|i| !q.drop_now(ms(20), t0 + ms(10 * i))));
+    assert!((1..=9).all(|i| !q.drop_now(ms(205), t0 + ms(1000 + 5 * i))));
+    assert!(!q.drop_now(ms(10), t0 + ms(1050)));
+
+    // 50 ms of queue that stays: a drop after an interval, then closer ones
+    let start = t0 + ms(1100);
+    let drops: Vec<u64> = (0..100).filter(|i| q.drop_now(ms(55), start + ms(5 * i))).map(|i| 5 * i).collect();
+    assert_eq!(drops.first(), Some(&100), "{drops:?}");
+    assert!(drops.len() >= 5, "{drops:?}");
+    let gaps: Vec<u64> = drops.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(gaps.windows(2).all(|g| g[1] <= g[0]), "drops come faster: {drops:?}");
+
+    // it doesn't drain: someone else's queue. After a second, no more drops
+    // at that delay; it is the base now.
+    let later = start + ms(1200);
+    assert!((0..400).filter(|i| q.drop_now(ms(55), later + ms(5 * i))).count() <= 1);
+    assert!(q.base.is_some_and(|b| b >= ms(50)), "{:?}", q.base);
+    // ... and the base comes back down once it does drain
+    assert!(!q.drop_now(ms(6), later + ms(2100)));
+    assert_eq!(q.base, Some(ms(6)));
+
+    // a burst that the drops do drain, a quarter every half second: they
+    // go on until it's gone, and the base stays
+    let mut d = Aqm::new(t0);
+    d.rate = 400_000.0;
+    assert!(!d.drop_now(ms(5), t0));
+    let mut rtt = 300.0_f64;
+    let mut dropped = 0;
+    for i in 1..=600 {
+        dropped += d.drop_now(Duration::from_secs_f64(rtt / 1000.0), t0 + ms(5 * i)) as u32;
+        rtt = (rtt * 0.9971).max(5.0); // -25% per 100 steps (0.5 s)
+    }
+    assert!(dropped >= 10, "{dropped} drops");
+    assert!(d.base.is_some_and(|b| b < ms(6)), "{:?}", d.base);
+
+    // a 20 kB/s link: three packets' time of queue (180 ms) is fine
+    let mut slow = Aqm::new(t0);
+    slow.rate = 20_000.0;
+    assert!(!slow.drop_now(ms(10), t0));
+    assert!((1..=300).all(|i| !slow.drop_now(ms(160), t0 + ms(10 * i))));
+}

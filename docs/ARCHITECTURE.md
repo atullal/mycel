@@ -416,6 +416,8 @@ In a six-device ring each device sends about 13 announcements a second (2 of its
 
 **MTU.** End-to-end packets on the mesh are capped at QUIC's 1200-byte minimum. A frame that doesn't fit a hop's datagram is split in two and reassembled at the destination; relays can split again. Larger inner packets were tried: when a hop fell back to its base MTU after loss, every large packet was lost until the end-to-end path re-learnt its MTU, and throughput collapsed. Each hop also drops from the tail beyond 1/8 of its congestion window queued (at least 16 KiB), so a slow hop doesn't build seconds of delay and the end-to-end connection sees congestion early. A quarter window and a full window were measured too: throughput across two routes was more variable.
 
+**Short queues under the hops.** Below QUIC, each hop to a device in range is a first-in, first-out send buffer (a radio's, a Bluetooth controller's) that the hop's own congestion control fills until it overflows, and announcements, keep-alives and acknowledgements wait in it with the bulk data. So each device runs CoDel on its hops: when a hop's smoothed RTT stays more than a target (3 packets' time at the hop's rate, 20–250 ms) above its lowest for 100 ms (or the hop's RTT, if longer), it drops a data frame, then more often while that lasts, and the end-to-end connections slow down before the buffer fills. Control frames and packets of 400 bytes or less are never dropped this way, internet hops don't have it, and a queue that a second of dropping doesn't drain is taken as the hop's new base. On a saturated two-hop route at 400 kB/s a small exchange then takes ~50 ms instead of ~560 ms (ROUTING.md §6.12).
+
 **Store-and-forward.** Members of a conversation store and forward for each other through CRDT sync and keepers. Strangers carry bundles too (§13): already-encrypted envelopes, moved along live segments, toward connectivity, held in mailboxes at gateways.
 
 **Measured** (in-memory links, `cargo test -p mycel-net --test mesh -- --nocapture`):
@@ -423,7 +425,8 @@ In a six-device ring each device sends about 13 announcements a second (2 of its
 | Test | Result |
 |---|---|
 | Relaying overhead | ≈0.1 ms per hop on a round trip (5-device line: 1 hop 0.08–0.35 ms … 4 hops 0.38–0.70 ms) |
-| Two disjoint relays, each over 400 KB/s links | 1.8–1.9× one relay's throughput (4 MB, five runs); transfer survives losing a relay |
+| Two disjoint relays, each over 400 KB/s links | 1.84–1.97× one relay's throughput (4 MB, 20 runs); transfer survives losing a relay |
+| A small exchange across a two-hop route a bulk transfer saturates (400 KB/s links) | ≈40–60 ms (median), ≈560 ms without the hops' queue management |
 | Route heal | ≈5 s after the middle device of a line leaves, over a longer route |
 | Call through one relay (test tones, `mycel-call`) | 0 % loss, ≈95 ms mouth-to-ear (jitter buffer included) |
 | Relay capped at 100 KB/s | 500 KB took 4.3 s |

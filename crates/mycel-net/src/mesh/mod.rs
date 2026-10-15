@@ -88,6 +88,30 @@ const INBOX: usize = 4096;
 /// were measured too: more variable throughput across two routes).
 const MIN_QUEUE: usize = 16 * 1024;
 const QUEUE_CWND_DIV: usize = 8;
+/// Active queue management on each hop ([`Aqm`]): the queueing delay
+/// allowed below QUIC is the time to send this many full packets at the
+/// rate the hop delivers (on 20 kB/s Bluetooth-speed radios, 2 took
+/// another 6% of bulk data's throughput, and 5 left small exchanges
+/// waiting a third longer) ...
+const AQM_PACKETS: f64 = 3.0;
+/// ... but at least this (radio jitter isn't a queue; Wi-Fi drivers' own
+/// AQM uses 20 ms) and at most this.
+const AQM_TARGET_MIN: Duration = Duration::from_millis(20);
+const AQM_TARGET_MAX: Duration = Duration::from_millis(250);
+/// The delay must stay above target this long before a frame is dropped
+/// (CoDel's interval: about an end-to-end round trip, so the senders have
+/// time to slow down on the first drop); on slow links, twice the target
+/// plus the base RTT if that is longer, and never shorter than the hop's
+/// RTT now.
+const AQM_INTERVAL: Duration = Duration::from_millis(100);
+/// Frames this size or smaller are never dropped by it: acknowledgements,
+/// voice, small messages. Dropping them would empty no queue.
+const AQM_SMALL: usize = 400;
+/// The base RTT may drift up this much per second (a link that got slower).
+const AQM_BASE_DRIFT: f64 = 0.01;
+/// Dropping for this long (or 8 intervals) without the RTT falling: the
+/// queue isn't ours to drain, so stop.
+const AQM_GIVE_UP: Duration = Duration::from_secs(1);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 /// The higher key dials only if the lower one hasn't after this long.
 const DIAL_DEFER: Duration = Duration::from_secs(2);
@@ -241,6 +265,8 @@ struct Hop {
     path: Option<PathId>,
     /// Largest datagram buffer space seen = the buffer's size.
     dgram_cap: usize,
+    /// Keeps the queue below the hop short.
+    aqm: Aqm,
     dialing: bool,
     /// We opened it (it counts toward `max_neighbours`).
     dialed_by_us: bool,
@@ -256,6 +282,7 @@ impl Hop {
             conn: None,
             path: None,
             dgram_cap: 0,
+            aqm: Aqm::new(now),
             dialing: false,
             dialed_by_us: false,
             next_dial: now,
@@ -265,6 +292,173 @@ impl Hop {
 
     fn live(&self) -> Option<&Connection> {
         self.conn.as_ref().filter(|c| c.close_reason().is_none())
+    }
+}
+
+/// Active queue management for the data a hop carries (CoDel, RFC 8289,
+/// with the hop's RTT standing in for the time packets wait).
+///
+/// A hop connection's congestion controller keeps sending until a buffer
+/// *below* QUIC overflows: a radio's send queue, a Bluetooth controller's,
+/// a busy relay's socket. That queue is first in, first out, and everything
+/// on the hop waits in it: the announcements and sequence-number requests
+/// that keep routes alive, the acknowledgements of the connections the hop
+/// carries, keep-alives. On a saturated hop they waited as long as the data
+/// (on the 400 kB/s test radios, 170 ms on average, the full 250 ms queue
+/// at worst) and were dropped with it, and the end-to-end connections over
+/// it ran at RTTs of 300–600 ms, so they took seconds to recover from a
+/// loss. QUIC can't put control ahead of data in a queue it doesn't own.
+///
+/// So the driver keeps that queue short, as a router's AQM does: when the
+/// hop's RTT has stayed more than a target above its base for an interval,
+/// it drops a data frame, and then more often while it stays there. The
+/// end-to-end connections slow down on the loss before the queue below
+/// fills, and control traffic waits at most about the target (20 ms on
+/// fast radios, a few packets' time on slow ones). Control frames,
+/// announcements and small packets (acknowledgements, voice) are never
+/// dropped this way. Only hops to devices in range have it: an internet
+/// hop's queues belong to the internet, shared with everyone else's
+/// traffic. And when dropping doesn't drain a queue (someone else's
+/// traffic fills it, or the link got slower), it stops and takes that
+/// delay as the new base, rather than starve our traffic.
+#[derive(Debug)]
+struct Aqm {
+    /// The path these figures are for (a hop moving to another link starts
+    /// over).
+    path: Option<PathId>,
+    /// The hop's RTT with an empty queue: the lowest seen, drifting up.
+    base: Option<Duration>,
+    base_at: Instant,
+    /// Bytes per second the hop delivered (its busiest recent sample,
+    /// decaying slowly), and the counter it was last sampled from.
+    rate: f64,
+    delivered: u64,
+    sampled: Instant,
+    /// Since when the delay has been above target.
+    above_since: Option<Instant>,
+    dropping: bool,
+    /// When dropping last made progress (the RTT fell by a quarter from
+    /// its peak), and the RTT since then at its highest.
+    progress_at: Instant,
+    progress_rtt: Duration,
+    drop_next: Instant,
+    count: u32,
+    last_count: u32,
+}
+
+impl Aqm {
+    fn new(now: Instant) -> Self {
+        Aqm {
+            path: None,
+            base: None,
+            base_at: now,
+            rate: 0.0,
+            delivered: 0,
+            sampled: now,
+            above_since: None,
+            dropping: false,
+            progress_at: now,
+            progress_rtt: Duration::ZERO,
+            drop_next: now,
+            count: 0,
+            last_count: 0,
+        }
+    }
+
+    /// Follow the hop's path: figures for another path don't apply.
+    fn on_path(&mut self, path: Option<PathId>, now: Instant) {
+        if self.path != path {
+            *self = Aqm::new(now);
+            self.path = path;
+        }
+    }
+
+    /// The path delivered `delivered` bytes so far (sent − lost): sample
+    /// its rate. A busier sample replaces the estimate; quieter ones lower
+    /// it slowly, so a burst after a pause is judged by what the hop can
+    /// carry, not by how idle it was.
+    fn sample_rate(&mut self, delivered: u64, now: Instant) {
+        let dt = now.duration_since(self.sampled).as_secs_f64();
+        if delivered < self.delivered {
+            self.delivered = delivered;
+        }
+        if dt >= 0.2 {
+            let r = (delivered - self.delivered) as f64 / dt;
+            self.rate = if r > self.rate { r } else { 0.97 * self.rate + 0.03 * r };
+            (self.delivered, self.sampled) = (delivered, now);
+        }
+    }
+
+    /// The RTT the hop has now: update the base.
+    fn sample_rtt(&mut self, rtt: Duration, now: Instant) -> Duration {
+        let dt = now.duration_since(self.base_at).as_secs_f64();
+        self.base_at = now;
+        let base = match self.base {
+            Some(b) => b.mul_f64(1.0 + AQM_BASE_DRIFT * dt).min(rtt),
+            None => rtt,
+        };
+        self.base = Some(base);
+        base
+    }
+
+    /// Queueing delay allowed: a few packets' worth at the hop's rate.
+    fn target(&self) -> Duration {
+        if self.rate <= 0.0 {
+            return AQM_TARGET_MAX;
+        }
+        Duration::from_secs_f64(AQM_PACKETS * MIN_QUIC_MTU as f64 / self.rate).clamp(AQM_TARGET_MIN, AQM_TARGET_MAX)
+    }
+
+    /// Whether to drop a data frame now, the hop's smoothed RTT being `rtt`.
+    fn drop_now(&mut self, rtt: Duration, now: Instant) -> bool {
+        let base = self.sample_rtt(rtt, now);
+        let target = self.target();
+        // (an end-to-end round trip through this hop takes at least the
+        // hop's own RTT: the senders can't react to a drop any faster)
+        let interval = AQM_INTERVAL.max(2 * target + base).max(rtt);
+        if rtt.saturating_sub(base) < target {
+            self.above_since = None;
+            self.dropping = false;
+            return false;
+        }
+        if self.dropping {
+            if rtt < self.progress_rtt.mul_f64(0.75) {
+                (self.progress_at, self.progress_rtt) = (now, rtt);
+            } else if rtt > self.progress_rtt {
+                self.progress_rtt = rtt; // still rising: progress is from its peak
+            } else if now.duration_since(self.progress_at) > AQM_GIVE_UP.max(8 * interval) {
+                // Dropping didn't drain it: the queue isn't (only) ours,
+                // other traffic shares the link, or the link got slower.
+                // Take this delay as the hop's base; the lowest RTT seen
+                // brings the base back down once the queue does drain.
+                self.base = Some(rtt);
+                self.dropping = false;
+                self.above_since = None;
+                return false;
+            }
+            if now < self.drop_next {
+                return false;
+            }
+            if self.drop_next + interval < now {
+                self.drop_next = now; // a lull: no burst of drops to catch up
+            }
+            self.count += 1;
+            self.drop_next += interval.div_f64((self.count as f64).sqrt());
+            return true;
+        }
+        let since = *self.above_since.get_or_insert(now);
+        if now.duration_since(since) < interval {
+            return false;
+        }
+        // Above target for a whole interval: start dropping, faster at
+        // once if we were dropping a moment ago (the queue came back).
+        self.dropping = true;
+        (self.progress_at, self.progress_rtt) = (now, rtt);
+        let delta = self.count.saturating_sub(self.last_count);
+        self.count = if delta > 1 && now.saturating_duration_since(self.drop_next) < 16 * interval { delta } else { 1 };
+        self.last_count = self.count;
+        self.drop_next = now + interval.div_f64((self.count as f64).sqrt());
+        true
     }
 }
 
@@ -423,7 +617,8 @@ impl Driver {
     }
 
     /// Put a frame on a hop connection: split to the hop's datagram size,
-    /// tail-dropped if the hop is already backed up.
+    /// tail-dropped if the hop is already backed up, and data dropped now
+    /// and then while the queue below the hop stands too long ([`Aqm`]).
     fn send_frame(&self, to: &SignPk, f: &core::Frame) {
         let mut hops = self.hops.lock();
         let Some(h) = hops.get_mut(to) else { return };
@@ -449,6 +644,10 @@ impl Driver {
             self.dropped_queue.fetch_add(1, Ordering::Relaxed);
             return;
         }
+        if !f.control && f.payload.len() > AQM_SMALL && self.aqm_drops(to, &conn) {
+            self.dropped_queue.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         for d in datagrams {
             if conn.send_datagram(d).is_err() {
                 self.dropped_queue.fetch_add(1, Ordering::Relaxed);
@@ -471,6 +670,23 @@ impl Driver {
             h.path = used;
         }
         used.and_then(window).unwrap_or(0)
+    }
+
+    /// Whether the hop's queue calls for dropping a data frame now ([`Aqm`]).
+    fn aqm_drops(&self, to: &SignPk, conn: &Connection) -> bool {
+        let mut hops = self.hops.lock();
+        let Some(h) = hops.get_mut(to) else { return false };
+        if !h.live().is_some_and(|c| c.stable_id() == conn.stable_id()) {
+            return false;
+        }
+        if !h.direct {
+            return false; // an internet hop: its queues are the internet's
+        }
+        let Some(path) = h.path else { return false };
+        let Some(rtt) = conn.rtt(path).filter(|r| !r.is_zero()) else { return false };
+        let now = Instant::now();
+        h.aqm.on_path(Some(path), now);
+        h.aqm.drop_now(rtt, now)
     }
 
     // ───────────── neighbours ─────────────
@@ -523,6 +739,7 @@ impl Driver {
             }
             h.conn = Some(conn.clone());
             h.path = None;
+            h.aqm = Aqm::new(Instant::now());
             h.dialed_by_us = conn.side().is_client();
             h.dgram_cap = conn.datagram_send_buffer_space();
             h.failures = 0;
@@ -664,11 +881,20 @@ impl Driver {
     fn hop_costs(&self) -> Vec<(SignPk, u32)> {
         let mut hops = self.hops.lock();
         let mut costs = Vec::new();
+        let now = Instant::now();
         for (pk, h) in hops.iter_mut() {
             let Some(conn) = h.live().cloned() else { continue };
-            let used = hop_path(&conn);
-            h.path = used.map(|(id, _)| id);
-            if let Some(cost) = used.and_then(|(id, rtt)| hop_cost(&conn, id, rtt)) {
+            // (path, RTT, bytes delivered)
+            let used = path_in_use(&conn.paths()).map(|p| {
+                let s = p.stats();
+                (p.id(), s.rtt, s.udp_tx.bytes.saturating_sub(s.lost_bytes))
+            });
+            h.path = used.map(|(id, ..)| id);
+            h.aqm.on_path(h.path, now);
+            if let Some((.., delivered)) = used {
+                h.aqm.sample_rate(delivered, now);
+            }
+            if let Some(cost) = used.and_then(|(id, rtt, _)| hop_cost(&conn, id, rtt)) {
                 costs.push((*pk, cost));
             }
         }
