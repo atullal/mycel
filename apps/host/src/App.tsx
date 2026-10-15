@@ -10,33 +10,9 @@ import { Avatar } from "./panels/common.tsx";
 import { useNativeNotifications } from "./notifications.ts";
 import { NoticeBanner } from "./Notices.tsx";
 
-type AppId = "messaging" | "docs" | "newsroom" | "game";
 type PanelId = "profile" | "contacts" | "nearby" | "network";
 
-const APPS: { id: AppId; name: string; glyph: keyof typeof Glyph; ready: boolean; blurb: string }[] = [
-  { id: "messaging", name: "Messages", glyph: "Chat", ready: true, blurb: "" },
-  {
-    id: "docs",
-    name: "Docs",
-    glyph: "Doc",
-    ready: false,
-    blurb: "Write together in real time, with comments and suggestions, on documents that live only on your collaborators' devices.",
-  },
-  {
-    id: "newsroom",
-    name: "Newsroom",
-    glyph: "News",
-    ready: false,
-    blurb: "Take a story from tip to published with editors, legal sign-off and an audit trail, without a server that could leak your sources.",
-  },
-  {
-    id: "game",
-    name: "Game",
-    glyph: "Dice",
-    ready: false,
-    blurb: "A co-op narrative game played turn by turn with friends: hidden character sheets, fair dice and a shared story.",
-  },
-];
+const APPS: { id: string; name: string; glyph: keyof typeof Glyph }[] = [{ id: "messaging", name: "Messages", glyph: "Chat" }];
 
 const PANELS: Record<PanelId, string> = {
   profile: "Profile",
@@ -47,7 +23,6 @@ const PANELS: Record<PanelId, string> = {
 
 export function App() {
   const mycel = useMycel();
-  const [app, setApp] = useState<AppId>("messaging");
   const [panel, setPanel] = useState<PanelId | null>(null);
   const { profile } = useProfile();
   const { conversations } = useConversations();
@@ -56,7 +31,6 @@ export function App() {
   const demo = mycel.transport.kind === "mock";
   const [openRequest, setOpenRequest] = useState<{ id: string; token: number } | null>(null);
   const openNotification = useCallback((id: string) => {
-    setApp("messaging");
     setPanel(null);
     setOpenRequest((previous) => ({ id, token: (previous?.token ?? 0) + 1 }));
   }, []);
@@ -81,7 +55,6 @@ export function App() {
   const newNearby = nearby.filter((n) => !n.isContact).length;
   const online = status?.onlinePeers.length ?? 0;
   const toggle = (p: PanelId) => setPanel((cur) => (cur === p ? null : p));
-  const current = APPS.find((a) => a.id === app)!;
 
   return (
     <div className="host">
@@ -95,15 +68,7 @@ export function App() {
             const G = Glyph[a.glyph];
             return (
               <li key={a.id}>
-                <button
-                  className={`rail-app${app === a.id ? " is-active" : ""}${a.ready ? "" : " is-soon"}`}
-                  onClick={() => {
-                    setApp(a.id);
-                    setPanel(null);
-                  }}
-                  aria-current={app === a.id ? "page" : undefined}
-                  title={a.ready ? a.name : `${a.name} (coming soon)`}
-                >
+                <button className="rail-app is-active" onClick={() => setPanel(null)} aria-current="page" title={a.name}>
                   <span className="rail-app-icon">
                     <G />
                     {a.id === "messaging" && unread > 0 && <span className="rail-count">{unread > 9 ? "9+" : unread}</span>}
@@ -154,16 +119,12 @@ export function App() {
       <div className="stage">
         <NoticeBanner onOpenNetwork={() => setPanel("network")} />
         <div className="stage-app" inert={panel ? true : undefined}>
-          {current.ready ? (
-            <MessagingApp
-              onOpenContacts={() => setPanel("contacts")}
-              visible={!panel}
-              openRequest={openRequest}
-              onVisibleConversationChange={notifications.setVisibleConversation}
-            />
-          ) : (
-            <ComingSoon name={current.name} glyph={current.glyph} blurb={current.blurb} />
-          )}
+          <MessagingApp
+            onOpenContacts={() => setPanel("contacts")}
+            visible={!panel}
+            openRequest={openRequest}
+            onVisibleConversationChange={notifications.setVisibleConversation}
+          />
         </div>
 
         {panel && (
@@ -205,21 +166,5 @@ function RailButton({
     <button className={`rail-btn${active ? " is-active" : ""}`} onClick={onClick} title={label} aria-label={label} aria-pressed={active}>
       {children}
     </button>
-  );
-}
-
-function ComingSoon({ name, glyph, blurb }: { name: string; glyph: keyof typeof Glyph; blurb: string }) {
-  const G = Glyph[glyph];
-  return (
-    <div className="soon">
-      <span className="soon-icon">
-        <G />
-      </span>
-      <h1>{name} is on its way</h1>
-      <p>{blurb}</p>
-      <p className="soon-note">
-        It will use the same identity, contacts and keepers you already have here. Nothing new to set up.
-      </p>
-    </div>
   );
 }
