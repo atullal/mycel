@@ -1,0 +1,19 @@
+# Reviewers requested automatically. With branch protection's "Require review
+# from Code Owners", these paths need the owner's approval.
+# https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/about-code-owners
+
+*                       @atullal
+
+# Security-critical: cryptography, trust, sync, vendored code, the supply chain
+# and CI. Listed separately so they keep an owner if the default changes.
+/crates/mycel-crypto/   @atullal
+/crates/mycel-trust/    @atullal
+/crates/mycel-sync/     @atullal
+/crates/mycel-rules/    @atullal
+/vendor/                @atullal
+/.github/               @atullal
+/deny.toml              @atullal
+/rust-toolchain.toml    @atullal
+/Cargo.lock             @atullal
+/package-lock.json      @atullal
+/SECURITY.md            @atullal

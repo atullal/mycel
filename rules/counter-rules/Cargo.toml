@@ -4,6 +4,11 @@ description = "Minimal Mycel rules bundle with an action reducer (exercises myce
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
 
 [lib]
 crate-type = ["cdylib"]
@@ -11,3 +16,6 @@ crate-type = ["cdylib"]
 [dependencies]
 mycel-rules-guest = { path = "../mycel-rules-guest" }
 serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+
+[lints]
+workspace = true

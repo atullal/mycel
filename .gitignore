@@ -1,8 +1,37 @@
+# Build output
 /target
 node_modules/
-.claude/
 dist/
 apps/host/src-tauri/target/
 apps/host/src-tauri/gen/schemas/
 /dist-release/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Signing material and secrets. Release keys live outside the repository
+# (scripts/package-android.sh keeps its key in ~/.mycel-signing/).
+*.p8
+*.p12
+*.pfx
+*.pem
+*.key
+*.jks
+*.keystore
+*.mobileprovision
+*.provisionprofile
+key.properties
+keystore.properties
+.env
+.env.*
+!.env.example
+
+# Logs, profiles and local tool state
+*.log
+*.profraw
+perf.data*
+.claude/
+.idea/
+*.swp
 .DS_Store

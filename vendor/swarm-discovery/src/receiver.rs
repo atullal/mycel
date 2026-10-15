@@ -1,3 +1,5 @@
+// Modified by the Mycel contributors (Apache-2.0 section 4(b)): changes are marked
+// `MYCEL PATCH` and described in vendor/swarm-discovery/MYCEL_PATCH.md.
 use crate::{sender::MdnsMsg, Peer, TxtData};
 use acto::{ActoCell, ActoRef, ActoRuntime};
 use hickory_proto::{

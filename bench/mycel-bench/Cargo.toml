@@ -1,9 +1,14 @@
 [package]
 name = "mycel-bench"
-version = "0.0.1"
-edition = "2024"
-publish = false
 description = "Replays external benchmark inputs (contact traces) through Mycel's sans-IO routing and store-and-forward cores."
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
 
 [[bin]]
 name = "dtn-replay"
@@ -17,3 +22,6 @@ path = "src/route_check.rs"
 bytes = "1.12"
 mycel-crypto = { version = "0.1.0", path = "../../crates/mycel-crypto" }
 mycel-net = { version = "0.1.0", path = "../../crates/mycel-net" }
+
+[lints]
+workspace = true

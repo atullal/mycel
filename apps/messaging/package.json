@@ -2,6 +2,12 @@
   "name": "@mycel/messaging",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/atullal/mycel.git",
+    "directory": "apps/messaging"
+  },
   "description": "Mycel Messaging: end-to-end encrypted direct and group chat, built only on @mycel/sdk.",
   "type": "module",
   "exports": {

@@ -1,0 +1,43 @@
+# Text files are stored with LF and checked out with LF on every platform,
+# Windows included: the sources, scripts and tests that compare text expect LF.
+* text=auto eol=lf
+
+# Windows batch scripts need CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Python's csv writer emits CRLF; benchmark results are kept byte-exact.
+bench/results/**/*.csv -text
+
+# Binary assets: never convert, never diff as text.
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.webp binary
+*.ico  binary
+*.icns binary
+*.pdf  binary
+*.ttf  binary
+*.otf  binary
+*.woff  binary
+*.woff2 binary
+*.wasm binary
+*.jar  binary
+*.zip  binary
+*.gz   binary
+
+# GitHub Linguist: vendored and generated files are collapsed in pull request
+# diffs and left out of the language statistics. Lockfile diffs stay one click
+# away; review them for dependency changes.
+vendor/** linguist-vendored
+Cargo.lock linguist-generated
+rules/Cargo.lock linguist-generated
+package-lock.json linguist-generated
+crates/mycel-rules/fixtures/*.wasm linguist-generated
+apps/host/src-tauri/gen/apple/mycel-host.xcodeproj/** linguist-generated
+apps/host/src-tauri/gen/apple/Sources/mycel-host/bindings/** linguist-generated
+apps/host/src-tauri/gen/android/gradlew linguist-generated
+apps/host/src-tauri/gen/android/gradlew.bat linguist-generated
+bench/results/** linguist-generated
