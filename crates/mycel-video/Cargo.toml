@@ -34,3 +34,6 @@ objc2-foundation = { version = "0.3.2", features = ["NSString", "NSDictionary", 
 [dev-dependencies]
 tokio = { version = "1.53.2", features = ["full"] }
 mycel-crypto = { version = "0.1.0", path = "../mycel-crypto" }
+
+[lints]
+workspace = true

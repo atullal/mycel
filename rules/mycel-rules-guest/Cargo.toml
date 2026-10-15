@@ -11,3 +11,6 @@ homepage.workspace = true
 
 [dependencies]
 mycel-rules-abi = { path = "../../crates/mycel-rules-abi" }
+
+[lints]
+workspace = true

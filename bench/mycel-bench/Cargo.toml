@@ -27,3 +27,6 @@ bytes = "1.12"
 serde_json = "1.0.151"
 mycel-crypto = { version = "0.1.0", path = "../../crates/mycel-crypto" }
 mycel-net = { version = "0.1.0", path = "../../crates/mycel-net" }
+
+[lints]
+workspace = true

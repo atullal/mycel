@@ -16,3 +16,6 @@ crate-type = ["cdylib"]
 [dependencies]
 mycel-rules-guest = { path = "../mycel-rules-guest" }
 mycel-rules-abi = { path = "../../crates/mycel-rules-abi", features = ["chat"] }
+
+[lints]
+workspace = true

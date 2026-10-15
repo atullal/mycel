@@ -29,3 +29,6 @@ mycel-rules-abi = { version = "0.1.0", path = "../mycel-rules-abi", features = [
 mycel-crypto = { version = "0.1.0", path = "../mycel-crypto" }
 mycel-kit-chat = { path = "../mycel-kit-chat" }
 wat = { version = "1.228.0", default-features = false }
+
+[lints]
+workspace = true

@@ -33,3 +33,6 @@ mycel-sync = { version = "0.1.0", path = "../mycel-sync" }
 mycel-trust = { version = "0.1.0", path = "../mycel-trust" }
 serde_json = "1.0.151"
 tokio = { version = "1.53.2", features = ["full"] }
+
+[lints]
+workspace = true

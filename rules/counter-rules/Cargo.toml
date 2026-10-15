@@ -16,3 +16,6 @@ crate-type = ["cdylib"]
 [dependencies]
 mycel-rules-guest = { path = "../mycel-rules-guest" }
 serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+
+[lints]
+workspace = true

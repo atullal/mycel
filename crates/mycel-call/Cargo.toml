@@ -47,3 +47,6 @@ parking_lot = "0.12.5"
 mycel-sync = { version = "0.1.0", path = "../mycel-sync" }
 mycel-trust = { version = "0.1.0", path = "../mycel-trust" }
 tokio = { version = "1.53.2", features = ["full"] }
+
+[lints]
+workspace = true

@@ -14,6 +14,41 @@ authors = ["The Mycel contributors"]
 repository = "https://github.com/atullal/mycel"
 homepage = "https://github.com/atullal/mycel"
 
+# The main workspace's lints (../Cargo.toml), except clippy::mem_forget: the
+# guest hands memory to the host on purpose.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+non_ascii_idents = "deny"
+explicit_outlives_requirements = "warn"
+macro_use_extern_crate = "warn"
+meta_variable_misuse = "warn"
+redundant_lifetimes = "warn"
+unit_bindings = "warn"
+unused_extern_crates = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+checked_conversions = "warn"
+debug_assert_with_mut_call = "warn"
+empty_drop = "warn"
+float_cmp_const = "warn"
+fn_to_numeric_cast_any = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+lossy_float_literal = "warn"
+mixed_read_write_in_expression = "warn"
+rc_mutex = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+string_lit_as_bytes = "warn"
+suspicious_xor_used_as_pow = "warn"
+try_err = "warn"
+unnecessary_self_imports = "warn"
+
 [profile.release]
 opt-level = "z"
 lto = true

@@ -55,3 +55,6 @@ anyhow = "1.0.104"
 mycel-sync = { path = "../mycel-sync" }
 serde_json = "1.0.151"
 tokio = { version = "1.53.2", features = ["full"] }
+
+[lints]
+workspace = true
