@@ -10,10 +10,10 @@ section says otherwise. Simulation and benchmark results are in
 ```sh
 cargo test --workspace --exclude mycel-host   # about 500 Rust tests
 cargo test -p mycel-host --lib                # the host's own tests (needs the webview libraries)
-cargo clippy --workspace --all-targets        # kept clean
+cargo clippy --workspace --all-targets -- -D warnings
 npm install && npm run typecheck && npm test  # SDK, Messaging and host (Node 22.18 or later)
 npm run build                                 # the UI
-scripts/security-check.sh                     # security regressions, npm audit, cargo audit
+scripts/security-check.sh                     # security regressions, npm audit, RustSec advisories
 ```
 
 - `cargo test -p mycel-sim` runs the simulator's scenarios at CI size;
@@ -32,16 +32,21 @@ scripts/security-check.sh                     # security regressions, npm audit,
   (`PathKind`), so path selection, aggregation and failover are tested
   between media the test machine doesn't have.
 
-**In CI** (`.github/workflows/`), the core crates' tests run in optimised
-builds on Linux and Windows runners, and the Linux job also runs the web
-checks and the host's tests. On those small machines, one timing test
+**In CI** (`.github/workflows/ci.yml`, on every pull request and push to
+`main`): rustfmt; clippy with `-D warnings` and the tests, in optimised
+builds, on Linux, macOS and Windows; the security regression tests with no
+retries; rustdoc with `-D warnings`; the WebAssembly rules; cargo-deny
+(advisories, licences, duplicate and unknown sources, `deny.toml`); the web
+checks; spelling; and the workflows themselves (actionlint, zizmor). The
+Apps workflow builds and launches the Linux and Windows apps. CodeQL and
+OpenSSF Scorecard run on their own schedules. On the small CI machines, one timing test
 usually misses its deadline somewhere in a run, a different one each time:
 CI retries a failed test twice (`scripts/ci/retry-failed.py`) and flags one
 that then passes as a "Flaky test" warning; one that fails three times fails
 the run.
 
 **Before merging to `main`:** the workspace tests pass twice in a row, clippy
-is clean, and `npm run build` passes if TypeScript changed. Iroh, noq,
+is clean with `-D warnings`, `cargo fmt --all --check` passes, and `npm run build` passes if TypeScript changed. Iroh, noq,
 swarm-discovery, swift-rs and the notification plugin are vendored with
 small patches: read the `MYCEL_PATCH.md` next to each before touching them.
 Built apps (`dist-release/`) and contact-trace data (`bench/data/`) are never

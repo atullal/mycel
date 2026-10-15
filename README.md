@@ -188,8 +188,8 @@ docs/               the documents below
 See [CONTRIBUTING.md](CONTRIBUTING.md) and the
 [Code of Conduct](CODE_OF_CONDUCT.md). In short: `main` stays green. A change
 merges through a reviewed pull request with CI passing, after the workspace
-tests pass twice in a row and `cargo clippy --workspace --all-targets` is
-clean ([TESTING.md](docs/TESTING.md)).
+tests pass twice in a row, with rustfmt and clippy (`-D warnings`) clean
+([TESTING.md](docs/TESTING.md)).
 
 ## Security
 
