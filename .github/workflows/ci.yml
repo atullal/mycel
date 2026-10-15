@@ -248,6 +248,34 @@ jobs:
         with:
           fail-on-severity: low
 
+  dco:
+    name: Sign-off (DCO)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # Every commit in the pull request needs a Signed-off-by line
+      # (`git commit -s`; CONTRIBUTING.md).
+      - name: Every commit is signed off
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          status=0
+          for commit in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            if ! git show -s --format=%B "$commit" | grep -qE '^Signed-off-by: .+ <[^>]+>$'; then
+              echo "::error::commit $commit has no Signed-off-by line: amend it with git commit --amend -s, or git rebase --signoff"
+              status=1
+            fi
+          done
+          exit "$status"
+
   typos:
     name: Spelling
     runs-on: ubuntu-latest
@@ -304,7 +332,7 @@ jobs:
   result:
     name: CI result
     if: always()
-    needs: [fmt, clippy, test, security, docs, rules, deny, web, dependency-review, typos, workflows, gradle-wrapper]
+    needs: [fmt, clippy, test, security, docs, rules, deny, web, dependency-review, dco, typos, workflows, gradle-wrapper]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
