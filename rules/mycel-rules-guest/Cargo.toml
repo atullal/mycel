@@ -10,7 +10,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-mycel-rules-abi = { path = "../../crates/mycel-rules-abi" }
+mycel-rules-abi = { version = "0.1.0", path = "../../crates/mycel-rules-abi" }
 
 [lints]
 workspace = true
