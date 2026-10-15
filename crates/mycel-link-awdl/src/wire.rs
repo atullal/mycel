@@ -155,13 +155,13 @@ mod tests {
     #[test]
     fn advert_roundtrip() {
         let me = key(0x5a);
-        let e = txt_entries(&me, "Atul's MacBook");
+        let e = txt_entries(&me, "Alice's MacBook");
         let get = |k: &str| e.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_slice());
         assert_eq!(
             parse_advert(get(TXT_KEY), get(TXT_NAME)),
             Some(Advert {
                 key: me,
-                name: Some("Atul's MacBook".into())
+                name: Some("Alice's MacBook".into())
             })
         );
         assert_eq!(parse_advert(get(TXT_KEY), None).unwrap().name, None);
