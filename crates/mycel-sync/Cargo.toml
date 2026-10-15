@@ -1,7 +1,13 @@
 [package]
 name = "mycel-sync"
+description = "Mycel data and sync: signed, encrypted envelopes materialized into Automerge Docs and Feeds"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 # Pinned: bounded_change.rs, change_resources.rs and change_ops.rs re-implement

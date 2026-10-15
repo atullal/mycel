@@ -5,7 +5,12 @@ members = ["crates/*", "apps/host/src-tauri", "bench/mycel-bench"]
 [workspace.package]
 edition = "2024"
 version = "0.0.1"
+# Kept equal to the toolchain pinned in rust-toolchain.toml: bump both together.
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
+authors = ["The Mycel contributors"]
+repository = "https://github.com/atullal/mycel"
+homepage = "https://github.com/atullal/mycel"
 
 # Keep build artifacts small (disk is nearly full); line tables still give useful backtraces.
 [profile.dev]

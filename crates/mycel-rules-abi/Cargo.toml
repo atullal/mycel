@@ -1,8 +1,13 @@
 [package]
 name = "mycel-rules-abi"
-version = "0.1.0"
-edition = "2024"
 description = "Shared no_std ABI types between the Mycel rules host (mycel-rules) and wasm guests."
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [features]
 # Example payload types for the messaging app's message feed (used by chat-rules and host tests).

@@ -1,8 +1,16 @@
 {
-  "name": "am",
-  "version": "1.0.0",
+  "name": "mycel",
+  "version": "0.0.1",
   "private": true,
-  "description": "",
+  "description": "Mycel: a fully decentralised, end-to-end encrypted peer-to-peer platform",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/atullal/mycel.git"
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
   "type": "module",
   "workspaces": [
     "packages/*",
@@ -14,10 +22,6 @@
     "build": "npm run build -w @mycel/host",
     "typecheck": "npm run typecheck --workspaces --if-present"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "main": "index.js",
   "dependencies": {
     "@automerge/automerge": "^3.5.0",
     "@automerge/automerge-repo": "^2.6.0-alpha.3",

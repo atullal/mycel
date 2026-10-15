@@ -1,7 +1,13 @@
 [package]
 name = "mycel-trust"
+description = "Mycel trust layer: Spaces as DAGs of signed membership ops, resolved deterministically"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
 mycel-crypto = { version = "0.1.0", path = "../mycel-crypto" }

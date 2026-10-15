@@ -1,9 +1,16 @@
 [package]
 name = "mycel-call"
 description = "Live voice calls for Mycel: Opus over QUIC datagrams on the multipath fabric"
-edition.workspace = true
 version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# Never published: it builds against the patched crates in vendor/, which a
+# crates.io copy would silently replace with unpatched upstream.
+publish = false
 
 [dependencies]
 anyhow = "1.0.104"
