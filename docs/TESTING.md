@@ -59,6 +59,7 @@ committed.
 | `mycel-call` | **Live calls.** Unit: Opus round trip keeps a 440 Hz tone, 12 kbps fits ~1.5 KB/s, PLC and FEC; frame codec and stream fallback framing under arbitrary splits; **jitter buffer**: prebuffering, reorder, loss → FEC from the next frame, late and duplicate frames dropped, target grows with jitter but never past 120 ms, underrun → conceal → rebuffer → resume, bursts trimmed; **bitrate controller** (path ceilings, loss/RTT step-down, slow recovery, FEC loss %); resampler pitch/length across rates; call id binds space + caller + nonce; **state machine**: answer and hang-up from either side, decline, ring timeout on both sides, setup timeout, busy, **both call at once → one call**. Integration (real nodes, real QUIC, test audio): audio both ways with measured latency, mute, hang-up by either side; decline / no answer / missed / busy / **forged rings from a non-member refused**; simultaneous calls merge; **no IP: a call starts on a fast in-memory link, the link is cut, the same call continues over a 20 KB/s Bluetooth-like link at 12 kbps**; datagram → stream fallback; **a call through a mesh relay** (no direct link; 0 % loss, ≈95 ms); group calls (below); video calls both ways, recovery from lost frames, adapting to a slow link |
 | `mycel-video` | Rate controller (a budget for every kind of path, ramp-up, back-off when frames queue, pacing, path changes), frame and control wire formats, receiver reordering and keyframe recovery; on Apple platforms, VideoToolbox encode and decode, and camera frames keeping their shape in portrait, landscape and 4:3 |
 | `mycel-node` | Full messaging API on real storage: DMs, delivery → read, replies, reactions, edits, deletes, attachments, **restart persistence**, **keeper delivery while the sender is offline**, group admin removal, **L4 rules rejecting a forged op**, **message requests + declined/blocked strangers stay out**, **contact-code address hints connect without discovery**, **hostile attachment names neutralised**; **voice call refused while the conversation is a message request, then rings, answers, carries audio, mutes and hangs up through the JSON command table**; **120 MiB attachment byte-exact between two nodes with upload/download progress**, **legacy one-shot attachments still open**, **folders sent as .zip via a `file://` URL**, `file://` decoding, **unreadable files explain why** (missing, permission denied → macOS privacy hint); one chat per person across separately created spaces, paging and search, local hide and restore across restarts, attachment consent across restarts, identity and storage fault injection |
+| `mycel-link-awdl` | Control datagrams, TXT records, interface filtering; plus 2 ignored Bonjour loopback tests (`-- --ignored`) |
 | `mycel-link-ble` | Framing, bounded queues, connection state machine (who dials, duplicates, timeouts, backoff, address rotation), fake-radio sync between real nodes with IP off, hours of simulated faults between two devices, macOS stream code over in-process pipes |
 | `mycel-link-iface` | Interface classification (medium from type and name, software interfaces skipped, ordinary NICs left to IP), environment overrides, beacons; a sync over a real interface with IP off, one path per interface |
 | `mycel-kit-chat` | Author-only edits/deletes, reactions, receipts/unread, admin-only meta, garbage tolerance, thread merging, alerts |
@@ -192,6 +193,19 @@ In the real UI, a 300 MB file attached with the file picker was delivered in
 about 7 s; Bob's download, with a progress bar, took about 5 s, sha256
 identical, with Bob's process at 39 MB of memory.
 
+### Peer-to-peer Wi-Fi, two processes on one Mac
+
+Two devices with `MYCEL_IP=0` (no Wi-Fi/Ethernet IP transport at all, only
+links):
+- each found the other over the Bonjour peer-to-peer service;
+  `network_status` showed `available: ["peerWifi"]`, `via: "peerWifi"`;
+- a message and a 20 MB attachment went A → B; the file's sha256 matched,
+  and A's message went to *delivered*;
+- `lsof` on B: the only peer sockets were UDP on `fe80…%awdl0`, plus mDNS.
+
+On one Mac the AWDL traffic loops locally, so this doesn't test the radio
+between two devices.
+
 ## Multipath aggregation, connection reuse, multi-source downloads
 
 **Aggregation** (`crates/mycel-net/tests/aggregate.rs`, two endpoints with no IP, joined only by rate-limited in-memory links with 5 ms latency; one QUIC stream, debug build; `cargo test -p mycel-net --test aggregate -- --nocapture --test-threads=1`):
@@ -277,11 +291,14 @@ and the app's log, and the on-screen keyboard with an XCUITest
 
 - **Macs:** the app on the LAN; a Mac's Bluetooth advertising, L2CAP
   publishing and scanning (a Mac can't connect to itself, so a link needs two
-  devices).
+  devices); peer-to-peer Wi-Fi between two processes on one Mac (above).
 - **iPhone:** LAN discovery through the system's Bonjour, found by Macs and
   finding them; Bluetooth links between the iPhone and Macs.
+- **Not tested between real devices:** peer-to-peer Wi-Fi (AWDL) on macOS
+  and iOS; Bluetooth through BlueZ on Linux; Wi-Fi Direct group formation on
+  Linux; the interface link with UWB or 802.15.4 hardware. These are built
+  and tested on emulated links, and the Linux code in CI.
 - **Not run on real hardware:** the iPhone camera, Android on a physical
-  phone, the Windows and Linux apps on desktop machines, and the interface
-  link with UWB, 802.15.4 or Wi-Fi Direct hardware. Bluetooth on real radios
-  has had far less time than over emulated links, and real sessions have
-  seen channels drop and be redialed.
+  phone, and the Windows and Linux apps on desktop machines.
+- Bluetooth on real radios has had far less time than over emulated links,
+  and real sessions have seen channels drop and be redialed.

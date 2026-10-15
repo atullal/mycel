@@ -18,7 +18,8 @@ Installing, permissions, logs and troubleshooting: [USER_GUIDE.md](USER_GUIDE.md
 | Same Wi-Fi / LAN discovery | mDNS | Bonjour¹ | mDNS² | mDNS | mDNS |
 | Internet (relays, hole punching, DHT lookup) | yes | yes | yes | yes | yes |
 | Mesh routing and store-and-forward through other devices | yes | yes | yes | yes | yes |
-| Bluetooth LE link | yes | yes³ | no | no | no |
+| Peer-to-peer Wi-Fi with no network (AWDL) | yes¹⁰ | yes¹⁰ | no | no | Wi-Fi Direct groups, off by default¹⁰ |
+| Bluetooth LE link | yes | yes³ | no | no | BlueZ¹⁰ |
 | Other network interfaces as their own paths⁴ | yes | yes | yes | no | yes |
 | Voice calls | echo cancelled | echo cancelled | echo cancelled⁵ | no echo cancellation⁶ | no echo cancellation⁶ |
 | Sending video | yes | yes, camera untested on a device³ | yes⁸ | yes⁸ | yes, with GStreamer's H.264 encoders⁸ |
@@ -28,7 +29,8 @@ Installing, permissions, logs and troubleshooting: [USER_GUIDE.md](USER_GUIDE.md
 
 **How each was tested:**
 - **macOS:** the full Rust test suite; the app on real Macs, on the LAN and
-  over Bluetooth to an iPhone.
+  over Bluetooth to an iPhone. Peer-to-peer Wi-Fi only on emulated links
+  and on one Mac.
 - **iPhone and iPad:** the iOS Simulator (iPhone and iPad layouts, an
   XCUITest for the on-screen keyboard), and a real iPhone: LAN discovery
   through Bonjour, and Bluetooth links to Macs.
@@ -39,7 +41,8 @@ Installing, permissions, logs and troubleshooting: [USER_GUIDE.md](USER_GUIDE.md
 - **Windows and Linux:** GitHub Actions runners only: the core tests, a
   launch test (the runtime opens and the UI renders in WebView2 /
   WebKitGTK), and a video probe without a camera. Neither app has run on a
-  desktop machine or with a real camera.
+  desktop machine or with a real camera, and Linux's Bluetooth and Wi-Fi
+  Direct code has been compiled and tested on emulated links only.
 
 1. iOS uses the system's Bonjour (no multicast entitlement needed); the other
    platforms run Iroh's mDNS, and a patched `swarm-discovery`
@@ -47,12 +50,12 @@ Installing, permissions, logs and troubleshooting: [USER_GUIDE.md](USER_GUIDE.md
    iOS asks for Local Network access the first time; without it, only
    internet paths work.
 2. `MainActivity` holds a Wi-Fi multicast lock so mDNS packets get through.
-3. The Mac code (CoreBluetooth, AVFoundation and VideoToolbox) runs on iOS
-   too, with the front camera and upright frames for a phone held in
-   portrait. Bluetooth has been run between a real iPhone and Macs; the
-   camera only in the Simulator, which has no camera and no Bluetooth
-   (Bluetooth reports "Unsupported" and the app carries on). iOS only allows
-   these in the foreground.
+3. The Mac code (Network.framework, CoreBluetooth, AVFoundation and
+   VideoToolbox) runs on iOS too, with the front camera and upright frames
+   for a phone held in portrait. Bluetooth has run between a real iPhone and
+   Macs; the camera and peer-to-peer Wi-Fi haven't run on a device (the
+   Simulator has no camera and no radios: Bluetooth reports "Unsupported"
+   and the app carries on). iOS only allows these in the foreground.
 4. `crates/mycel-link-iface`: a cable between two computers, a second NIC, or
    any interface with only link-local addresses becomes a path of its own.
    Windows has no interface link. Tested on macOS (loopback and Wi-Fi/Ethernet
@@ -91,6 +94,15 @@ Installing, permissions, logs and troubleshooting: [USER_GUIDE.md](USER_GUIDE.md
    others use Tauri's notification plugin. On iPhone and iPad a tap opens
    the conversation it is about. Notifications say only what happened ("New
    message", "Incoming call"), never names or text.
+10. Built and tested on emulated links; not tested between real devices.
+    Peer-to-peer Wi-Fi is Apple's AWDL (what AirDrop uses), through
+    Network.framework: two Macs, iPhones or iPads with Wi-Fi switched on,
+    and no shared network. On Linux, Bluetooth uses BlueZ and is
+    wire-compatible with the Apple code, so a Linux machine and a Mac can
+    link. Linux forms Wi-Fi Direct groups with other Mycel devices only when
+    turned on (`MYCEL_WIFI_DIRECT=1` or `MYCEL_LINKS=all,wifidirect`), since
+    it takes over the radio's P2P side; it needs wpa_supplicant with D-Bus.
+    See [USER_GUIDE.md](USER_GUIDE.md) §6 for trying them.
 
 The on-screen keyboard: on Android the page shrinks above it and the tab bar
 hides. iOS slides the page under the keyboard instead of shrinking it, so the
@@ -193,7 +205,7 @@ and an MSI, both unsigned. To build on a Windows machine:
 The CI job builds a `.deb`, an `.rpm` and an `.AppImage` on Ubuntu 22.04
 (glibc 2.35 or newer). To build on Linux, install the libraries the Linux job
 in `.github/workflows/apps.yml` installs (`libwebkit2gtk-4.1-dev`,
-`libasound2-dev`, …) and run `cargo tauri build` in `apps/host`.
+`libdbus-1-dev`, `libasound2-dev`, …) and run `cargo tauri build` in `apps/host`.
 
 ## Testing on simulators
 

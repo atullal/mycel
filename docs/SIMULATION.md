@@ -1,16 +1,14 @@
 # Simulation: real-world scenarios, scale and routing
 
 `crates/mycel-sim` tests Mycel against the networks people actually have
-(Bluetooth, Wi-Fi LAN, 802.11s mesh, Ethernet, UWB, Thread, peer-to-peer
-Wi-Fi, cellular, the internet with NAT and relays) and at global scale, with
+(Bluetooth, AWDL, Wi-Fi Direct, Wi-Fi LAN, 802.11s mesh, Ethernet, UWB,
+Thread, cellular, the internet with NAT and relays) and at global scale, with
 a focus on hops and routing: *does a message from a Bluetooth-only phone in
 the US reach a Bluetooth-only phone in Europe, and is the path it takes the
 fastest one that existed?*
 
-The simulator emulates more media than the app has links for. Mycel's real
-paths are IP networks, Bluetooth LE (macOS and iOS), other network
-interfaces and the mesh; AWDL and Wi-Fi Direct appear here only as emulated
-media, so routing and path selection are tested across them.
+Every medium here is emulated. Which of Mycel's links have also run
+between real devices is in [TESTING.md](TESTING.md#real-hardware).
 
 ```
 cargo run --release -p mycel-sim -- list

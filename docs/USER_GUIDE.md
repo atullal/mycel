@@ -64,8 +64,8 @@ recognise. On a desktop the window title shows it too.
 ## 4. Add each other
 
 - **Nearby (easiest).** Open **Nearby** (the radar button). Within a few
-  seconds devices running Mycel on the same network, or in Bluetooth range,
-  appear by name. Click **Add**. Adding on one side is enough for that side
+  seconds devices running Mycel on the same network, or in peer-to-peer
+  Wi-Fi or Bluetooth range, appear by name. Click **Add**. Adding on one side is enough for that side
   to start a chat.
 - **Contact codes.** On one device, **Profile > Your contact code**: copy it
   or show the QR code. On the other, **Contacts > Add by contact code**,
@@ -108,9 +108,9 @@ me** removes any message from this device's history only, with an undo.
 
 ## 6. Paths, and no internet
 
-The **Network** panel shows each path (same network, Bluetooth, other
-network interfaces, internet relay, mesh), whether it works, and which path
-each person is reached by right now.
+The **Network** panel shows each path (same network, peer-to-peer Wi-Fi,
+Bluetooth, other network interfaces, internet relay, mesh), whether it
+works, and which path each person is reached by right now.
 
 By default Mycel uses **every path** (*All paths*), including encrypted
 internet relays when the internet is there. **Local only** never contacts
@@ -123,28 +123,83 @@ hotspot with mobile data off, or connect two computers with a cable (they
 get link-local addresses, and discovery works across it). A website should
 then fail to load on both.
 
-**Bluetooth** (macOS, iPhone and iPad) needs no shared network. With Wi-Fi
-off and Bluetooth on, Mycel falls back to it. It is slow (roughly 15–60
-KB/s): fine for text, slow for photos, impractical for big files. Range is
-about 10 m. When a faster path comes back, Mycel moves to it by itself. A
-transfer in progress moves to the next path when the current one dies,
-after about 5 seconds of detecting it.
+### No shared network: peer-to-peer Wi-Fi and Bluetooth
+
+Two devices don't need to share a network. Bluetooth has run between a real
+iPhone and Macs, with far less mileage than on emulated links. **Peer-to-peer
+Wi-Fi, and Linux's Bluetooth and Wi-Fi Direct, have been tested only on
+emulated links, not between real devices**, so trying them on real devices
+is the most useful testing there is. Watch the Network panel's *Talking to*
+list say which path is used:
+
+1. **Leave the Wi-Fi network but keep Wi-Fi on** (Macs, iPhones and iPads:
+   disconnect from or forget the network; unplug Ethernet). Mycel should
+   switch to **Peer-to-peer Wi-Fi**, the Apple radio link AirDrop uses, at
+   Wi-Fi speed, within a few seconds. Range is roughly a room or two.
+2. **Turn Wi-Fi off, keep Bluetooth on.** Mycel falls back to
+   **Bluetooth**: slow (roughly 15–60 KB/s), fine for text, slow for photos,
+   impractical for big files. Range is about 10 m.
+3. **Turn Wi-Fi back on or rejoin the network.** Mycel moves back to the
+   faster path by itself.
+
+A transfer or call in progress moves to the next path when the current one
+dies, after about 5 seconds of detecting it.
 
 If a path doesn't come up, the Network panel's *Paths* list says why (for
-example "Bluetooth is off", or a permission to allow).
+example "Bluetooth is off", or a permission to allow). If peer-to-peer Wi-Fi
+or Bluetooth doesn't connect between two Macs, run Mycel from Terminal with
+`MYCEL_AWDL_DEBUG=1 MYCEL_BLE_LOG=2 /Applications/Mycel.app/Contents/MacOS/mycel-host`
+and keep the log.
+
+### Cables, other interfaces and Linux
+
+Mycel uses every network interface a computer has: each becomes its own
+path, shown in the *Paths* list by what it is ("Cable bridge0", "Wi-Fi
+Direct p2p-wlan0-0", "UWB lowpan0", "Thread / 802.15.4 wpan0"). A faster
+path wins and slower ones stay as backups.
+
+- **A cable between two Macs** (Thunderbolt or USB-C): the Thunderbolt
+  bridge gets a link-local address and becomes a *Cable* path, even with no
+  network at all.
+- **To see what Mycel makes of your interfaces:**
+  `cargo run -p mycel-link-iface --example ifaces` (add `-- --no-ip` for what
+  it does with `MYCEL_IP=0`). It only reads the interface list.
+- **Say what an interface is** when its name doesn't:
+  `MYCEL_IFACE_MEDIUM=wpan0=uwb,mesh0=other`. Use only some interfaces:
+  `MYCEL_IFACES=lowpan0,p2p-wlan0-0`. Log what the interface link does:
+  `MYCEL_IFACE_LOG=1`. Interfaces need no special permission (the link binds
+  to each interface's IPv6 link-local address); interfaces with IPv6
+  disabled can't be used.
+- **UWB:** Macs have no UWB radio. On Linux a UWB (IEEE 802.15.4z) radio
+  carries data only if its driver exposes it through the kernel's
+  ieee802154 stack as a 6LoWPAN interface
+  (`ip link add link wpan0 name lowpan0 type lowpan`); most UWB chips only
+  do ranging.
+- **Bluetooth on Linux** uses BlueZ and links with Macs too. `bluetoothd`
+  must be running and your user allowed to advertise: on distributions
+  whose BlueZ D-Bus policy uses the `bluetooth` group, add yourself
+  (`sudo usermod -aG bluetooth $USER`, then log in again). No pairing is
+  needed.
+- **Wi-Fi Direct on Linux** is off by default; turn it on with
+  `MYCEL_WIFI_DIRECT=1` (or `MYCEL_LINKS=all,wifidirect`). It needs
+  wpa_supplicant running with D-Bus (`-u`), a Wi-Fi driver with P2P support,
+  and permission to use wpa_supplicant's D-Bus API (root, or the `netdev`
+  group on Debian and Ubuntu). Mycel devices find each other and form a
+  group with no prompt; the group's `p2p-*` interface then shows up as a
+  path. NetworkManager may also try to manage that interface.
 
 ## 7. Calls
 
 - **Voice:** the **phone** button in a conversation's header. The other side
   sees **Accept** or **Decline**. The call bar shows the time, the path in
-  use, the bitrate (32 kbps on a network, 24 kbps through a relay or the
-  mesh, 12 kbps over Bluetooth), a level meter for each person, **mute** and
+  use, the bitrate (32 kbps on a network or peer-to-peer Wi-Fi, 24 kbps
+  through a relay or the mesh, 12 kbps over Bluetooth), a level meter for each person, **mute** and
   **hang up**. A call keeps going when its path changes, with a few seconds
   of silence if the old path died.
 - **Video:** the **camera** button. The other side can accept with video,
   with voice only (turning the camera on later), or decline. Video starts
   small and sharpens within seconds: up to 720p on the same network or a
-  cable, 360p through a relay. Over Bluetooth or the multi-hop mesh, video
+  cable, 480p over peer-to-peer Wi-Fi, 360p through a relay. Over Bluetooth or the multi-hop mesh, video
   pauses on both sides ("Video paused: slow connection") while the voice
   carries on, and comes back by itself on a faster path.
 - **Groups:** the phone button rings everyone in the group; up to 8 people
@@ -231,7 +286,8 @@ background, with a quiet "Mycel is connected" notification.
   is `mycel.log.1`). Started from a terminal, it logs to the terminal: on a
   Mac, `/Applications/Mycel.app/Contents/MacOS/mycel-host`.
 - **More detail** (environment variables when started from a terminal):
-  `MYCEL_BLE_LOG=1` (or `2`) for the Bluetooth link, `MYCEL_PATH_DEBUG=1`
+  `MYCEL_BLE_LOG=1` (or `2`) for the Bluetooth link, `MYCEL_AWDL_DEBUG=1`
+  for peer-to-peer Wi-Fi, `MYCEL_PATH_DEBUG=1`
   for every path's measurements, `MYCEL_CALL_DEBUG=1` for each call's paths,
   `MYCEL_VIDEO_DEBUG=1` for video, `MYCEL_IFACE_LOG=1` for the interface
   link. On a phone, a file named `link-diagnostics` in the data folder
@@ -259,10 +315,12 @@ MYCEL_DATA_DIR=/tmp/mycel-b MYCEL_NAME="Laptop B" MYCEL_NET=lan "$APP" &
 - `MYCEL_NET`: `internet` (every path, the default), `lan` (local paths
   only, never the internet) or `local` (this computer only). Overrides the
   Network panel.
-- `MYCEL_LINKS`: `all` (the default), `none`, or a list of `ble` and
-  `iface` (every other network interface).
-- `MYCEL_IP=0`: no ordinary Wi-Fi or Ethernet IP, leaving Bluetooth and
-  other interfaces, to show those paths work on their own.
+- `MYCEL_LINKS`: `all` (the default), `none`, or a list of `awdl`, `ble`
+  and `iface` (every other network interface); on Linux add `wifidirect` to
+  form Wi-Fi Direct groups.
+- `MYCEL_IP=0`: no ordinary Wi-Fi or Ethernet IP, leaving peer-to-peer
+  Wi-Fi, Bluetooth and other interfaces, to show those paths work on their
+  own.
 - `MYCEL_MESH=0`: no multi-hop mesh. `MYCEL_MESH_RELAY=0`: use the mesh but
   relay nothing for others.
 

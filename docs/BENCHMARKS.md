@@ -336,7 +336,7 @@ only Mycel (and Direct Delivery with gateways) have rows there.
   often than these traces show.
 - Links are 250 kB/s with no loss, no contention between parallel contacts,
   and one transfer per device at a time, as in The ONE. Real BLE L2CAP
-  gives ~40–100 kB/s, and Wi-Fi far more.
+  gives ~40–100 kB/s, and AWDL gives far more.
 - In the `-gw` variants, "the internet" is an always-up clique of 250 kB/s
   links between the gateways. Both sides get it: The ONE as permanent
   connections at t = 0, Mycel through the same `--gateways` list. Mycel

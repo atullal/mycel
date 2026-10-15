@@ -39,8 +39,8 @@ we built, and why.
    Mycel signing key, and the routing identity. A second key system
    (Reticulum destinations, cjdns IPv6-from-key, libp2p PeerIds) would mean
    a second trust problem.
-3. **Any medium, mixed.** BLE L2CAP (tens of kB/s), the LAN, cables and
-   other interfaces (Wi-Fi Direct, UWB, 802.15.4), the internet. Costs must be measured, not
+3. **Any medium, mixed.** BLE L2CAP (tens of kB/s), AWDL, LAN, Wi-Fi
+   Direct, UWB / 802.15.4, the internet. Costs must be measured, not
    hard-coded, and comparable across media.
 4. **Multipath.** Several routes to one destination become several QUIC
    paths, which noq aggregates and fails over between. That needs routes
@@ -118,7 +118,7 @@ something changes.
    Bluetooth a connection event, per announcement.
 2. **Cost** = Σ per hop (smoothed RTT in 0.1 ms units + 2 ms per hop). The
    driver feeds each hop connection's measured RTT, plus a throughput term
-   (time to move 64 KiB at the hop's cwnd/RTT rate). So Bluetooth, Wi-Fi and
+   (time to move 64 KiB at the hop's cwnd/RTT rate). So BLE, AWDL and
    cable hops rank themselves. For gateways, each announcement carries an
    **uplink cost** (the gateway's measured internet RTT and throughput
    term). A device without the internet picks the gateway with the lowest
