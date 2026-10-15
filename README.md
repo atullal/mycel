@@ -5,9 +5,9 @@ device keeps its own keys, encrypts end to end, and checks everything it
 receives; every device is also a router. Devices reach each other over the
 same network, over the internet by key, over Bluetooth and peer-to-peer
 Wi-Fi, and through other devices running Mycel, and messages for someone
-who is offline are carried toward them by devices that can't read them. It runs as one app on macOS,
-iPhone and iPad, Android, Windows and Linux, with Messaging (chat, files,
-voice and video calls) built on it.
+who is offline are carried toward them by devices that can't read them. It
+runs as one app on macOS, iPhone and iPad, Android, Windows and Linux, with
+Messaging (chat, files, voice and video calls) built on it.
 
 > **Experimental.** The cryptography and the trust layer have not had an
 > external audit. Don't rely on Mycel to keep anything secret or safe yet.
