@@ -12,6 +12,10 @@ Messaging (chat, files, voice and video calls) built on it.
 > **Experimental.** The cryptography and the trust layer have not had an
 > external audit. Don't rely on Mycel to keep anything secret or safe yet.
 
+<p align="center">
+  <img src="docs/screenshots/01-chat.png" width="840" alt="Mycel Messaging on a desktop: a one-to-one chat with Ines Duarte showing a shared map photo, a quoted reply that was edited, read receipts and the Encrypted badge. The conversation list on the left shows a message request from someone who is not a contact, a group, and which people are nearby or online.">
+</p>
+
 ## What works today
 
 - **Messaging:** direct chats and groups, message requests from strangers
@@ -47,6 +51,19 @@ Messaging (chat, files, voice and video calls) built on it.
 
 What is built, layer by layer, and its limitations:
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §7.
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/02-group-dark.png" width="76%" alt="A group chat in the dark theme with its members panel open: four people with their roles (admin or member) and whether each is online or nearby, a section for adding a keeper, and messages with a shared text file, a reaction and a deleted message.">
+  <img src="docs/screenshots/04-phone-chat.png" width="22%" alt="The same group chat in the phone layout, light theme: messages from three people, a shared file, a reaction and delivery ticks.">
+</p>
+<p align="center">
+  <img src="docs/screenshots/03-network.png" width="76%" alt="The Network panel: a map of the people this device can reach and how (nearby, connected, or not reachable), the Local only connection mode, and the paths in use (same network, peer-to-peer Wi-Fi, Bluetooth, a cable).">
+  <img src="docs/screenshots/05-phone-call.png" width="22%" alt="An incoming voice call on a phone, dark theme, reached over the local network, with buttons to decline, answer with video or answer with voice.">
+</p>
+
+All screenshots are from the browser demo (`npm run dev`), with simulated people.
 
 ## Platforms
 
