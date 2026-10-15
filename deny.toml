@@ -2,7 +2,11 @@
 # https://embarkstudios.github.io/cargo-deny/
 #
 #   cargo deny check
-#   cargo deny --manifest-path rules/Cargo.toml check --target wasm32-unknown-unknown
+#   cargo deny --manifest-path rules/Cargo.toml --target wasm32-unknown-unknown check \
+#     -A license-exception-not-encountered -A license-not-encountered -A advisory-not-detected
+#
+# (The rules workspace shares this policy; the -A flags silence the
+# exceptions it has no use for.) CI runs both: .github/workflows/ci.yml.
 #
 # Every exception below says why it is there. Remove it when the reason goes.
 

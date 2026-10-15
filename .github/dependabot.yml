@@ -1,0 +1,68 @@
+# Weekly dependency updates, grouped so each ecosystem opens one pull request
+# for minor and patch updates. Security updates are separate and immediate.
+# New releases wait a week before they are proposed (cooldown), so a bad or
+# malicious release has time to be caught and yanked first.
+version: 2
+
+updates:
+  - package-ecosystem: cargo
+    directories: ["/", "/rules"]
+    exclude-paths: ["vendor/**"]
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps(cargo)"
+    groups:
+      cargo:
+        update-types: [minor, patch]
+    ignore:
+      # Patched copies in vendor/ replace these through [patch.crates-io]. A
+      # newer requirement would silently build against unpatched upstream:
+      # update them by re-vendoring (vendor/*/MYCEL_PATCH.md).
+      - dependency-name: iroh
+      - dependency-name: noq
+      - dependency-name: noq-proto
+      - dependency-name: swarm-discovery
+      - dependency-name: swift-rs
+      - dependency-name: tauri-plugin-notification
+      # The tauri crates and the @tauri-apps npm packages must stay on the
+      # same minor version: update them together, by hand.
+      - dependency-name: "tauri*"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+
+  - package-ecosystem: npm
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "deps(npm)"
+    groups:
+      npm:
+        update-types: [minor, patch]
+    ignore:
+      # Same minor version as the tauri crates (see above); the notification
+      # plugin matches the vendored Rust crate exactly.
+      - dependency-name: "@tauri-apps/*"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      - dependency-name: "@tauri-apps/plugin-notification"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(actions)"
+    groups:
+      actions:
+        patterns: ["*"]
