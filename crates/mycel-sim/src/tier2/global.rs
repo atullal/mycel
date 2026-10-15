@@ -44,8 +44,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use mycel_crypto::{Sig, SignPk};
 use mycel_crypto::Hash32;
+use mycel_crypto::{Sig, SignPk};
 use mycel_net::mesh::core::{self as mc, Announce, Config, Out, SeqReq};
 use mycel_net::mesh::dtn::{Accepted, Answer, Bundle, Carrier, DtnConfig, Offer, Receipt, Summary as DtnSummary};
 
@@ -86,9 +86,18 @@ pub enum Frame {
     /// Store-and-forward: a bundle offered before its payload, the
     /// answer, then the bundle with `copies` copies (custody if all).
     Offer(Offer),
-    Answer { id: Hash32, copies: u8, answer: Answer },
+    Answer {
+        id: Hash32,
+        copies: u8,
+        answer: Answer,
+    },
     Bundle(Bundle, u8),
-    BundleAck { id: Hash32, copies: u8, ok: bool, stored: bool },
+    BundleAck {
+        id: Hash32,
+        copies: u8,
+        ok: bool,
+        stored: bool,
+    },
     Summary(Rc<DtnSummary>),
 }
 
@@ -222,7 +231,13 @@ impl Global {
 
     fn note_buffer(&mut self, cx: &Cx<Frame>) {
         let Some(c) = &self.dtn else { return };
-        let bytes: u64 = c.held().iter().filter_map(|id| c.bundle(id)).filter(|b| b.src != self.pk).map(|b| b.payload.len() as u64).sum();
+        let bytes: u64 = c
+            .held()
+            .iter()
+            .filter_map(|id| c.bundle(id))
+            .filter(|b| b.src != self.pk)
+            .map(|b| b.payload.len() as u64)
+            .sum();
         let now = cx.now();
         self.buffer_area += self.buffer_now as f64 * now.saturating_sub(self.buffer_at) as f64;
         self.buffer_at = now;
@@ -533,7 +548,11 @@ impl Router for Global {
             Frame::Bundle(b, _) => b.payload.len() as u32 + 80,
             Frame::BundleAck { .. } => 80,
             Frame::Summary(s) => {
-                (16 + 32 * s.ids.len() + 96 * s.receipts.len() + 36 * s.preds.len() + 16 * s.evictable.len() + 32 * s.wants.len()) as u32
+                (16 + 32 * s.ids.len()
+                    + 96 * s.receipts.len()
+                    + 36 * s.preds.len()
+                    + 16 * s.evictable.len()
+                    + 32 * s.wants.len()) as u32
             }
         }
     }
@@ -659,7 +678,8 @@ impl Router for Global {
                 self.dtn_plan(cx);
             }
             Frame::Offer(o) => {
-                let answer = self.dtn.as_mut().map_or(Answer::Refuse("not carrying"), |c| c.offered(fpk, &o, now, |_| true));
+                let answer =
+                    self.dtn.as_mut().map_or(Answer::Refuse("not carrying"), |c| c.offered(fpk, &o, now, |_| true));
                 self.send_to(cx, from, Frame::Answer { id: o.id, copies: o.copies, answer }, None);
             }
             Frame::Answer { id, copies, answer } => {
@@ -711,7 +731,8 @@ impl Router for Global {
                 if self.role == Role::Replayer && self.old.len() >= 100 {
                     // recordings an hour old (seqnos are the origin's wall clock;
                     // signatures are stubbed here, a real recording keeps its own)
-                    let old: Vec<Announce> = self.old.drain(..50).map(|a| Announce { seq: a.seq.saturating_sub(3_600_000), ..a }).collect();
+                    let old: Vec<Announce> =
+                        self.old.drain(..50).map(|a| Announce { seq: a.seq.saturating_sub(3_600_000), ..a }).collect();
                     for nb in cx.neighbours() {
                         for a in &old {
                             self.send_to(cx, nb.0, Frame::Ann(a.clone()), None);
@@ -772,7 +793,8 @@ impl Router for Global {
                 }
                 // anything in flight longer than the RTO is lost: resend, back off
                 let rto = o.rto;
-                let lost: Vec<u16> = o.inflight.iter().filter(|(_, t)| now_us.saturating_sub(**t) >= rto).map(|(p, _)| *p).collect();
+                let lost: Vec<u16> =
+                    o.inflight.iter().filter(|(_, t)| now_us.saturating_sub(**t) >= rto).map(|(p, _)| *p).collect();
                 if !lost.is_empty() {
                     for p in lost {
                         o.inflight.remove(&p);

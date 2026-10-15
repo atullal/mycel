@@ -18,8 +18,7 @@ pub fn open(app: &AppHandle, data_dir: &Path, path: &str) -> Result<(), String> 
 }
 
 fn attachment_path(data_dir: &Path, path: &str) -> Result<PathBuf, String> {
-    let files = std::fs::canonicalize(data_dir.join("files"))
-        .map_err(|e| format!("no attachments folder: {e}"))?;
+    let files = std::fs::canonicalize(data_dir.join("files")).map_err(|e| format!("no attachments folder: {e}"))?;
     let file = std::fs::canonicalize(path).map_err(|e| format!("can't open {path}: {e}"))?;
     if !file.starts_with(&files) || !file.is_file() {
         return Err(format!("{path} is not a downloaded attachment"));
@@ -30,9 +29,7 @@ fn attachment_path(data_dir: &Path, path: &str) -> Result<PathBuf, String> {
 #[cfg(desktop)]
 fn platform_open(app: &AppHandle, path: PathBuf) -> Result<(), String> {
     use tauri_plugin_opener::OpenerExt;
-    app.opener()
-        .open_path(path.to_string_lossy(), None::<&str>)
-        .map_err(|e| e.to_string())
+    app.opener().open_path(path.to_string_lossy(), None::<&str>).map_err(|e| e.to_string())
 }
 
 #[cfg(target_os = "ios")]

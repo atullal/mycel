@@ -62,7 +62,11 @@ impl Measured {
             .skip(1)
             .filter_map(|l| {
                 let f = fields(l);
-                Some(Server { id: f.first()?.parse().ok()?, name: f.get(2)?.clone(), latlon: (f.get(8)?.parse().ok()?, f.get(9)?.parse().ok()?) })
+                Some(Server {
+                    id: f.first()?.parse().ok()?,
+                    name: f.get(2)?.clone(),
+                    latlon: (f.get(8)?.parse().ok()?, f.get(9)?.parse().ok()?),
+                })
             })
             .collect();
         let text = std::fs::read_to_string(dir.join("pings.csv")).context("pings.csv")?;
@@ -144,18 +148,44 @@ pub fn fit(m: &Measured) -> Fit {
     }
     let slope = (n * sxy - sx * sy) / (n * sxx - sx * sx);
     let intercept = (sy - slope * sx) / n;
-    let names = [("New York", "London"), ("New York", "Los Angeles"), ("London", "Frankfurt"), ("London", "Tokyo"), ("Sydney", "Singapore"), ("Sao Paulo", "Miami")];
+    let names = [
+        ("New York", "London"),
+        ("New York", "Los Angeles"),
+        ("London", "Frankfurt"),
+        ("London", "Tokyo"),
+        ("Sydney", "Singapore"),
+        ("Sao Paulo", "Miami"),
+    ];
     let mut examples = Vec::new();
     for (x, y) in names {
-        let find = |name: &str| m.servers.iter().find(|s| s.name.replace('_', " ").eq_ignore_ascii_case(name) || s.name.eq_ignore_ascii_case(&name.replace(' ', "")));
+        let find = |name: &str| {
+            m.servers.iter().find(|s| {
+                s.name.replace('_', " ").eq_ignore_ascii_case(name)
+                    || s.name.eq_ignore_ascii_case(&name.replace(' ', ""))
+            })
+        };
         if let (Some(sa), Some(sb)) = (find(x), find(y))
             && let Some((mn, av)) = m.rtt.get(&(sa.id.min(sb.id), sa.id.max(sb.id)))
         {
             let d = km(sa.latlon, sb.latlon);
-            examples.push((x.to_string(), y.to_string(), d, *mn, *av, 2.0 * crate::models::backbone(d).as_secs_f64() * 1000.0));
+            examples.push((
+                x.to_string(),
+                y.to_string(),
+                d,
+                *mn,
+                *av,
+                2.0 * crate::models::backbone(d).as_secs_f64() * 1000.0,
+            ));
         }
     }
-    Fit { pairs: n as usize, inflation: Summary::of(&infl), intercept_ms: intercept, slope_us_per_km: slope * 1000.0, model_over_measured: Summary::of(&ratio), examples }
+    Fit {
+        pairs: n as usize,
+        inflation: Summary::of(&infl),
+        intercept_ms: intercept,
+        slope_us_per_km: slope * 1000.0,
+        model_over_measured: Summary::of(&ratio),
+        examples,
+    }
 }
 
 static MEASURED: OnceLock<Option<Measured>> = OnceLock::new();

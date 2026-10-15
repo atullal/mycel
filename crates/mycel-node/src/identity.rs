@@ -22,20 +22,11 @@ const LEGACY_SEED_TEMP: &str = "identity.tmp";
 /// and set-aside profiles.
 /// (On Android the profile folder is the app's data root, so the attachment
 /// folder `files/` is also the platform's own and proves nothing.)
-const PROFILE_STATE: &[&str] = &[
-    SEED,
-    MARKER,
-    "mycel.redb",
-    "network-mode",
-    "blobs",
-    "uploads",
-    "http-token",
-    "notification-targets.json",
-];
+const PROFILE_STATE: &[&str] =
+    &[SEED, MARKER, "mycel.redb", "network-mode", "blobs", "uploads", "http-token", "notification-targets.json"];
 
 const ALREADY_OPEN: &str = "this Mycel profile is already open in another process";
-const CANNOT_LOCK: &str =
-    "cannot lock the Mycel profile folder (its file system may not support file locks)";
+const CANNOT_LOCK: &str = "cannot lock the Mycel profile folder (its file system may not support file locks)";
 
 /// A process-wide, OS-released profile lease, held until the runtime is dropped.
 /// Never remove this file: unlinking a locked inode defeats mutual exclusion.
@@ -56,12 +47,8 @@ impl ProfileLock {
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(dir)
                 .context("open real profile directory")?;
-            directory
-                .set_permissions(fs::Permissions::from_mode(0o700))
-                .context("restrict profile permissions")?;
-            directory
-                .sync_all()
-                .context("persist private profile permissions")?;
+            directory.set_permissions(fs::Permissions::from_mode(0o700)).context("restrict profile permissions")?;
+            directory.sync_all().context("persist private profile permissions")?;
         }
         // Before anything is written: the profile is bound to this device's
         // Keychain, and encrypted conversations stay out of cloud backups.
@@ -128,9 +115,7 @@ fn private_options(options: &mut OpenOptions) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     #[cfg(windows)]
     {
@@ -183,9 +168,7 @@ pub(crate) fn read_optional(path: &Path, limit: usize) -> Result<Option<Vec<u8>>
 
 fn sync_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
-    File::open(dir)?
-        .sync_all()
-        .context("persist profile directory")?;
+    File::open(dir)?.sync_all().context("persist profile directory")?;
     #[cfg(not(unix))]
     let _ = dir;
     Ok(())
@@ -198,24 +181,18 @@ fn sync_dir(dir: &Path) -> Result<()> {
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8], replace: bool) -> Result<()> {
     let dir = path.parent().context("file has no parent")?;
     reject_nonregular(path)?;
-    let name = path
-        .file_name()
-        .context("file has no name")?
-        .to_str()
-        .context("identity/settings filename is not UTF-8")?;
+    let name =
+        path.file_name().context("file has no name")?.to_str().context("identity/settings filename is not UTF-8")?;
     let temporary = dir.join(format!(".{name}-tmp-{}", hex::encode(random::<16>())));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     private_options(&mut options);
-    let mut file = options
-        .open(&temporary)
-        .context("create private temporary file")?;
+    let mut file = options.open(&temporary).context("create private temporary file")?;
     // On error, leave recoverable bytes rather than hiding an incomplete
     // provisioning attempt. `DiskProfile::recover` resolves what a crash in
     // our own protocol can leave; anything else fails closed.
     file.write_all(bytes)?;
-    file.sync_all()
-        .context("persist identity/settings contents")?;
+    file.sync_all().context("persist identity/settings contents")?;
     drop(file);
     reject_nonregular(path)?;
     if replace {
@@ -235,13 +212,7 @@ fn install_new(temporary: &Path, path: &Path, _bytes: &[u8]) -> Result<()> {
     // An atomic exclusive rename avoids a crash window with an extra seed
     // hard link that would survive iOS Keychain migration cleanup.
     let result = unsafe {
-        libc::renameatx_np(
-            libc::AT_FDCWD,
-            source.as_ptr(),
-            libc::AT_FDCWD,
-            destination.as_ptr(),
-            libc::RENAME_EXCL,
-        )
+        libc::renameatx_np(libc::AT_FDCWD, source.as_ptr(), libc::AT_FDCWD, destination.as_ptr(), libc::RENAME_EXCL)
     };
     if result != 0 {
         return Err(std::io::Error::last_os_error()).context(NO_CLOBBER);
@@ -308,23 +279,14 @@ fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<bool> {
     const RENAME_NOREPLACE: libc::c_uint = 1;
     // SAFETY: NUL-terminated paths relative to the working directory.
     let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            libc::AT_FDCWD,
-            from.as_ptr(),
-            libc::AT_FDCWD,
-            to.as_ptr(),
-            RENAME_NOREPLACE,
-        )
+        libc::syscall(libc::SYS_renameat2, libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), RENAME_NOREPLACE)
     };
     if result == 0 {
         return Ok(true);
     }
     let error = std::io::Error::last_os_error();
     match error.raw_os_error() {
-        Some(libc::ENOSYS | libc::EINVAL | libc::EPERM | libc::EACCES | libc::EOPNOTSUPP) => {
-            Ok(false)
-        }
+        Some(libc::ENOSYS | libc::EINVAL | libc::EPERM | libc::EACCES | libc::EOPNOTSUPP) => Ok(false),
         _ => Err(error),
     }
 }
@@ -409,8 +371,7 @@ trait ProfileStorage {
 /// What an interrupted no-clobber install left at `path`: nothing yet, or a
 /// prefix of its temporary (some file systems zero-fill after a crash).
 fn interrupted_copy(installed: &[u8], temporary: &[u8]) -> bool {
-    installed.len() < temporary.len()
-        && (temporary.starts_with(installed) || installed.iter().all(|b| *b == 0))
+    installed.len() < temporary.len() && (temporary.starts_with(installed) || installed.iter().all(|b| *b == 0))
 }
 
 struct DiskProfile<'a>(&'a Path);
@@ -473,23 +434,17 @@ impl ProfileStorage for DiskProfile<'_> {
             let name = entry?.file_name();
             let name = name.to_string_lossy();
             if name.starts_with(".identity.key-tmp-") || name == LEGACY_SEED_TEMP {
-                bail!(
-                    "interrupted identity provisioning requires recovery; existing files were preserved"
-                );
+                bail!("interrupted identity provisioning requires recovery; existing files were preserved");
             }
         }
         read_optional(&self.0.join(SEED), 32)?
-            .map(|b| {
-                b.try_into()
-                    .map_err(|_| anyhow::anyhow!("identity.key is corrupt"))
-            })
+            .map(|b| b.try_into().map_err(|_| anyhow::anyhow!("identity.key is corrupt")))
             .transpose()
     }
     fn read_marker(&self) -> Result<Option<Marker>> {
         read_optional(&self.0.join(MARKER), 4096)?
             .map(|b| {
-                let marker: Marker =
-                    serde_json::from_slice(&b).context("corrupt identity marker")?;
+                let marker: Marker = serde_json::from_slice(&b).context("corrupt identity marker")?;
                 marker.validate()?;
                 Ok(marker)
             })
@@ -517,10 +472,7 @@ impl ProfileStorage for DiskProfile<'_> {
     }
     #[cfg(any(target_os = "ios", test))]
     fn set_aside(&mut self) -> Result<PathBuf> {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let kept = (0..)
             .map(|n| match n {
                 0 => self.0.join(format!("unrecoverable-{secs}")),
@@ -539,8 +491,7 @@ impl ProfileStorage for DiskProfile<'_> {
                 || text.starts_with(".identity.key-tmp-")
                 || text.starts_with(".identity-state.json-tmp-");
             if ours {
-                fs::rename(self.0.join(&name), kept.join(&name))
-                    .with_context(|| format!("set aside {text}"))?;
+                fs::rename(self.0.join(&name), kept.join(&name)).with_context(|| format!("set aside {text}"))?;
             }
         }
         sync_dir(&kept)?;
@@ -561,8 +512,7 @@ pub(crate) fn load(dir: &Path, _lease: &ProfileLock) -> Result<Identity> {
     let mut profile = DiskProfile(dir);
     profile.recover()?;
     #[cfg(target_os = "ios")]
-    return load_keychain(&mut profile, &mut ios::Keychain)
-        .map(|(keys, replaced)| Identity { keys, replaced });
+    return load_keychain(&mut profile, &mut ios::Keychain).map(|(keys, replaced)| Identity { keys, replaced });
     #[cfg(not(target_os = "ios"))]
     load_file(&mut profile).map(|keys| Identity { keys, replaced: None })
 }
@@ -588,9 +538,7 @@ fn load_file(profile: &mut impl ProfileStorage) -> Result<DeviceKeys> {
         if marker.backend != Backend::File {
             bail!("this identity requires the iOS Keychain");
         }
-        let seed = profile
-            .read_seed()?
-            .context("identity missing from existing profile")?;
+        let seed = profile.read_seed()?.context("identity missing from existing profile")?;
         return marker.verify(seed);
     }
     let seed = initial_seed(profile)?;
@@ -636,8 +584,7 @@ fn load_keychain(
          kept that profile in {} and started a new identity",
         kept.display()
     );
-    let keys = provision_keychain(profile, secrets)?
-        .context("a new identity could not be created")?;
+    let keys = provision_keychain(profile, secrets)?.context("a new identity could not be created")?;
     Ok((keys, Some(kept)))
 }
 
@@ -655,9 +602,7 @@ fn provision_keychain(
         Some(marker) if marker.backend == Backend::IosKeychain => marker,
         file_marker => {
             let seed = if let Some(marker) = &file_marker {
-                let seed = profile
-                    .read_seed()?
-                    .context("identity missing from existing profile")?;
+                let seed = profile.read_seed()?.context("identity missing from existing profile")?;
                 marker.verify(seed)?;
                 seed
             } else {
@@ -676,10 +621,7 @@ fn provision_keychain(
             marker
         }
     };
-    let account = marker
-        .account
-        .as_deref()
-        .context("missing Keychain account reference")?;
+    let account = marker.account.as_deref().context("missing Keychain account reference")?;
     let legacy = profile.read_seed()?;
     if let Some(seed) = legacy {
         marker.verify(seed)?;
@@ -705,9 +647,7 @@ fn provision_keychain(
         (Some(seed), _) => seed,
         (None, Some(seed)) => {
             secrets.add(account, seed)?;
-            secrets
-                .read(account)?
-                .context("committed Keychain identity could not be restored")?
+            secrets.read(account)?.context("committed Keychain identity could not be restored")?
         }
         (None, None) => return Ok(None),
     };
@@ -724,9 +664,7 @@ fn provision_keychain(
 #[cfg(target_os = "ios")]
 mod ios {
     use super::*;
-    use core_foundation::{
-        base::TCFType, data::CFData, dictionary::CFDictionary, string::CFString,
-    };
+    use core_foundation::{base::TCFType, data::CFData, dictionary::CFDictionary, string::CFString};
     use security_framework::access_control::{ProtectionMode, SecAccessControl};
     use security_framework::passwords::{PasswordOptions, generic_password};
     use security_framework_sys::{
@@ -779,11 +717,7 @@ mod ios {
         }
         fn read(&self, account: &str) -> Result<Option<[u8; 32]>> {
             match generic_password(options(account)) {
-                Ok(bytes) => {
-                    Ok(Some(bytes.try_into().map_err(|_| {
-                        anyhow::anyhow!("corrupt Keychain identity")
-                    })?))
-                }
+                Ok(bytes) => Ok(Some(bytes.try_into().map_err(|_| anyhow::anyhow!("corrupt Keychain identity"))?)),
                 Err(e) if e.code() == errSecItemNotFound => Ok(None),
                 Err(e) => bail!("Keychain identity unavailable (status {})", e.code()),
             }
@@ -837,10 +771,7 @@ mod tests {
     struct TestDir(PathBuf);
     impl TestDir {
         fn new() -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "mycel-identity-test-{}",
-                hex::encode(random::<16>())
-            ));
+            let dir = std::env::temp_dir().join(format!("mycel-identity-test-{}", hex::encode(random::<16>())));
             fs::create_dir(&dir).unwrap();
             Self(dir)
         }
@@ -1093,14 +1024,8 @@ mod tests {
         fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755)).unwrap();
         let lease = ProfileLock::acquire(&dir.0).unwrap();
         load(&dir.0, &lease).unwrap();
-        assert_eq!(
-            fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777,
-            0o700
-        );
-        assert_eq!(
-            fs::metadata(dir.0.join(SEED)).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        assert_eq!(fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(dir.0.join(SEED)).unwrap().permissions().mode() & 0o777, 0o600);
         fs::remove_file(dir.0.join(SEED)).unwrap();
         let victim = dir.0.join("victim");
         fs::write(&victim, [1; 32]).unwrap();
@@ -1135,20 +1060,13 @@ mod tests {
     fn network_mode_absence_corruption_and_atomic_save() {
         let dir = TestDir::new();
         let path = dir.0.join("network-mode");
-        assert!(
-            crate::Runtime::saved_network_mode(&dir.0)
-                .unwrap()
-                .is_none()
-        );
+        assert!(crate::Runtime::saved_network_mode(&dir.0).unwrap().is_none());
         assert_eq!(
             crate::Runtime::launch_network_mode(&dir.0, crate::api::NetworkMode::Internet),
             crate::api::NetworkMode::Internet
         );
         atomic_write(&path, b"lan", true).unwrap();
-        assert_eq!(
-            crate::Runtime::saved_network_mode(&dir.0).unwrap(),
-            Some(crate::api::NetworkMode::Lan)
-        );
+        assert_eq!(crate::Runtime::saved_network_mode(&dir.0).unwrap(), Some(crate::api::NetworkMode::Lan));
         atomic_write(&path, b"garbage", true).unwrap();
         assert!(crate::Runtime::saved_network_mode(&dir.0).is_err());
         for default in [crate::api::NetworkMode::Internet, crate::api::NetworkMode::Lan] {
@@ -1234,18 +1152,10 @@ mod tests {
         fn write_marker(&mut self, marker: &Marker, replace: bool) -> Result<()> {
             assert!(replace || self.marker.is_none());
             self.marker = Some(marker.clone());
-            self.mutate(if marker.state == State::Pending {
-                "pending"
-            } else {
-                "committed"
-            })
+            self.mutate(if marker.state == State::Pending { "pending" } else { "committed" })
         }
         fn remove_seed(&mut self) -> Result<()> {
-            assert!(
-                self.marker
-                    .as_ref()
-                    .is_some_and(|m| m.state == State::Committed)
-            );
+            assert!(self.marker.as_ref().is_some_and(|m| m.state == State::Committed));
             self.seed = None;
             self.mutate("removed")
         }
@@ -1290,28 +1200,16 @@ mod tests {
 
     #[test]
     fn migration_roundtrip_preserves_key_and_stable_reference() {
-        let mut profile = MemoryProfile {
-            seed: Some([71; 32]),
-            ..Default::default()
-        };
+        let mut profile = MemoryProfile { seed: Some([71; 32]), ..Default::default() };
         let mut secrets = MemorySecrets::default();
         let expected = DeviceKeys::from_seed([71; 32]).sign_pk();
-        assert_eq!(
-            load_keychain(&mut profile, &mut secrets).unwrap().0.sign_pk(),
-            expected
-        );
+        assert_eq!(load_keychain(&mut profile, &mut secrets).unwrap().0.sign_pk(), expected);
         let account = profile.marker.as_ref().unwrap().account.clone();
         assert_eq!(profile.events, ["pending", "committed", "removed"]);
         assert!(profile.seed.is_none());
         // The marker can move into a new container; the path is never used.
         let mut moved_profile = profile.clone();
-        assert_eq!(
-            load_keychain(&mut moved_profile, &mut secrets)
-                .unwrap()
-                .0
-                .sign_pk(),
-            expected
-        );
+        assert_eq!(load_keychain(&mut moved_profile, &mut secrets).unwrap().0.sign_pk(), expected);
         assert_eq!(moved_profile.marker.unwrap().account, account);
         assert_eq!(secrets.adds, 1);
     }
@@ -1319,10 +1217,7 @@ mod tests {
     #[test]
     fn every_durable_provisioning_boundary_resumes_without_identity_change() {
         for boundary in 1..=4 {
-            let mut profile = MemoryProfile {
-                crash_after: Some(boundary),
-                ..Default::default()
-            };
+            let mut profile = MemoryProfile { crash_after: Some(boundary), ..Default::default() };
             let mut secrets = MemorySecrets::default();
             assert!(load_keychain(&mut profile, &mut secrets).is_err());
             let expected = profile
@@ -1330,14 +1225,7 @@ mod tests {
                 .as_ref()
                 .map(|m| m.public_key)
                 .unwrap_or_else(|| DeviceKeys::from_seed(profile.seed.unwrap()).sign_pk().0);
-            assert_eq!(
-                load_keychain(&mut profile, &mut secrets)
-                    .unwrap()
-                    .0
-                    .sign_pk()
-                    .0,
-                expected
-            );
+            assert_eq!(load_keychain(&mut profile, &mut secrets).unwrap().0.sign_pk().0, expected);
             assert!(profile.seed.is_none());
         }
     }
@@ -1345,15 +1233,8 @@ mod tests {
     #[test]
     fn add_crash_and_failed_readback_preserve_legacy_seed_and_resume() {
         for read_failure in [false, true] {
-            let mut profile = MemoryProfile {
-                seed: Some([18; 32]),
-                ..Default::default()
-            };
-            let mut secrets = MemorySecrets {
-                crash_after_add: !read_failure,
-                read_failure,
-                ..Default::default()
-            };
+            let mut profile = MemoryProfile { seed: Some([18; 32]), ..Default::default() };
+            let mut secrets = MemorySecrets { crash_after_add: !read_failure, read_failure, ..Default::default() };
             assert!(load_keychain(&mut profile, &mut secrets).is_err());
             assert_eq!(profile.seed, Some([18; 32]));
             assert!(profile.marker.as_ref().unwrap().state == State::Pending);
@@ -1369,14 +1250,8 @@ mod tests {
 
     #[test]
     fn denied_missing_conflicting_and_unknown_keychain_state_never_fallback() {
-        let mut profile = MemoryProfile {
-            seed: Some([4; 32]),
-            ..Default::default()
-        };
-        let mut secrets = MemorySecrets {
-            denied: true,
-            ..Default::default()
-        };
+        let mut profile = MemoryProfile { seed: Some([4; 32]), ..Default::default() };
+        let mut secrets = MemorySecrets { denied: true, ..Default::default() };
         assert!(load_keychain(&mut profile, &mut secrets).is_err());
         assert_eq!(profile.seed, Some([4; 32]));
         let account = profile.marker.as_ref().unwrap().account.clone().unwrap();
@@ -1408,20 +1283,13 @@ mod tests {
 
     #[test]
     fn restored_profile_without_its_keychain_identity_is_kept_and_replaced() {
-        let mut profile = MemoryProfile {
-            seed: Some([31; 32]),
-            ..Default::default()
-        };
+        let mut profile = MemoryProfile { seed: Some([31; 32]), ..Default::default() };
         let mut secrets = MemorySecrets::default();
         let old = load_keychain(&mut profile, &mut secrets).unwrap().0.sign_pk();
         let marker = profile.marker.clone().unwrap();
         // A restore onto another device: the marker came back, the
         // device-only Keychain item did not.
-        let mut restored = MemoryProfile {
-            marker: Some(marker.clone()),
-            established: true,
-            ..Default::default()
-        };
+        let mut restored = MemoryProfile { marker: Some(marker.clone()), established: true, ..Default::default() };
         let mut other_device = MemorySecrets::default();
         let (keys, replaced) = load_keychain(&mut restored, &mut other_device).unwrap();
         assert_eq!(replaced, Some(PathBuf::from("unrecoverable")));
@@ -1433,26 +1301,15 @@ mod tests {
         assert_eq!(again.sign_pk(), keys.sign_pk());
         assert!(replaced.is_none());
         // A Keychain that is merely unavailable never triggers a replacement.
-        let mut locked = MemoryProfile {
-            marker: Some(marker),
-            established: true,
-            ..Default::default()
-        };
-        let mut unavailable = MemorySecrets {
-            read_failure: true,
-            ..Default::default()
-        };
+        let mut locked = MemoryProfile { marker: Some(marker), established: true, ..Default::default() };
+        let mut unavailable = MemorySecrets { read_failure: true, ..Default::default() };
         assert!(load_keychain(&mut locked, &mut unavailable).is_err());
         assert!(locked.kept.is_none() && locked.marker.is_some());
     }
 
     #[test]
     fn pending_without_seed_requires_matching_existing_slot() {
-        let mut profile = MemoryProfile {
-            seed: Some([5; 32]),
-            crash_after: Some(1),
-            ..Default::default()
-        };
+        let mut profile = MemoryProfile { seed: Some([5; 32]), crash_after: Some(1), ..Default::default() };
         let mut secrets = MemorySecrets::default();
         assert!(load_keychain(&mut profile, &mut secrets).is_err());
         let account = profile.marker.as_ref().unwrap().account.clone().unwrap();

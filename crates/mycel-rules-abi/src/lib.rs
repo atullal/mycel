@@ -210,24 +210,12 @@ mod tests {
 
     #[test]
     fn validate_encoding_roundtrip() {
-        for v in [
-            Verdict::Accept,
-            Verdict::reject(0),
-            Verdict::reject(7),
-            Verdict::reject(u32::MAX),
-        ] {
+        for v in [Verdict::Accept, Verdict::reject(0), Verdict::reject(7), Verdict::reject(u32::MAX)] {
             assert_eq!(decode_validate(encode_validate(v)), v);
         }
-        assert_eq!(
-            encode_validate(Verdict::Reject(Reason::Trap)),
-            VALIDATE_INVALID
-        );
+        assert_eq!(encode_validate(Verdict::Reject(Reason::Trap)), VALIDATE_INVALID);
         for bad in [-1i64, 2 << 32, i64::MIN, i64::MAX, 1] {
-            assert_eq!(
-                decode_validate(bad),
-                Verdict::Reject(Reason::BadAbi),
-                "{bad}"
-            );
+            assert_eq!(decode_validate(bad), Verdict::Reject(Reason::BadAbi), "{bad}");
         }
     }
 
@@ -243,10 +231,7 @@ mod tests {
         let input = RuleInput {
             author: [7; 32],
             author_role: RoleTag::Writer,
-            stream: StreamTag {
-                kind: StreamKind::Feed,
-                id: [9; 16],
-            },
+            stream: StreamTag { kind: StreamKind::Feed, id: [9; 16] },
             payload: alloc::vec![1, 2, 3],
             context: alloc::vec![],
         };

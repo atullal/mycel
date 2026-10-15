@@ -175,8 +175,8 @@ pub fn classify(i: &IfaceInfo, rules: &Rules) -> Decision {
     if i.loopback || i.hw == Hw::Loopback {
         return Decision::Use { kind: PathKind::Other, label: label("Loopback") };
     }
-    let lowpan = matches!(i.hw, Hw::Ieee802154 | Hw::Lowpan)
-        || ["wpan", "lowpan", "thread"].iter().any(|p| name.starts_with(p));
+    let lowpan =
+        matches!(i.hw, Hw::Ieee802154 | Hw::Lowpan) || ["wpan", "lowpan", "thread"].iter().any(|p| name.starts_with(p));
     if name.contains("uwb") {
         return Decision::Use { kind: PathKind::Uwb, label: label("UWB") };
     }
@@ -203,7 +203,9 @@ pub fn classify(i: &IfaceInfo, rules: &Rules) -> Decision {
     }
     match i.hw {
         Hw::Wifi => Decision::Use { kind: PathKind::Network, label: label("Wi-Fi") },
-        Hw::Ethernet if cfg!(target_os = "linux") => Decision::Use { kind: PathKind::Ethernet, label: label("Ethernet") },
+        Hw::Ethernet if cfg!(target_os = "linux") => {
+            Decision::Use { kind: PathKind::Ethernet, label: label("Ethernet") }
+        }
         // macOS reports Wi-Fi as Ethernet too
         _ => Decision::Use { kind: PathKind::Network, label: label("Network") },
     }

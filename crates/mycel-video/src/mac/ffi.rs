@@ -114,7 +114,12 @@ unsafe extern "C" {
         flags: u32,
         out: *mut CMBlockBufferRef,
     ) -> OSStatus;
-    pub fn CMBlockBufferReplaceDataBytes(src: *const c_void, dst: CMBlockBufferRef, offset: usize, len: usize) -> OSStatus;
+    pub fn CMBlockBufferReplaceDataBytes(
+        src: *const c_void,
+        dst: CMBlockBufferRef,
+        offset: usize,
+        len: usize,
+    ) -> OSStatus;
     pub fn CMSampleBufferCreateReady(
         allocator: *const c_void,
         data: CMBlockBufferRef,
@@ -190,7 +195,12 @@ unsafe extern "C" {
     pub fn VTDecompressionSessionWaitForAsynchronousFrames(session: VTSessionRef) -> OSStatus;
     pub fn VTDecompressionSessionInvalidate(session: VTSessionRef);
     pub fn VTSessionSetProperty(session: VTSessionRef, key: CFStringRef, value: CFTypeRef) -> OSStatus;
-    pub fn VTSessionCopyProperty(session: VTSessionRef, key: CFStringRef, alloc: *const c_void, out: *mut CFTypeRef) -> OSStatus;
+    pub fn VTSessionCopyProperty(
+        session: VTSessionRef,
+        key: CFStringRef,
+        alloc: *const c_void,
+        out: *mut CFTypeRef,
+    ) -> OSStatus;
 
     pub static kVTCompressionPropertyKey_RealTime: CFStringRef;
     pub static kVTCompressionPropertyKey_ProfileLevel: CFStringRef;

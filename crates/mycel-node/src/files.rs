@@ -101,10 +101,7 @@ pub fn zip_dir(dir: &Path, out: &Path) -> Result<()> {
     }
     let file = File::create(out).with_context(|| format!("can't create {}", out.display()))?;
     let mut zip = zip::ZipWriter::new(BufWriter::with_capacity(1 << 20, file));
-    let root = dir
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "folder".into());
+    let root = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "folder".into());
     add_to_zip(&mut zip, dir, &root)?;
     zip.finish()?.flush()?;
     Ok(())

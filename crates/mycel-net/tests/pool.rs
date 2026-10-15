@@ -45,7 +45,11 @@ async fn syncs_reuse_one_connection_and_redial_after_restart() {
         bob.sync_with(alice.id(), space, false).await.unwrap();
         later += t.elapsed();
         // (bob's own background push may have fetched it a moment earlier)
-        assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(), json!({"n": i}), "sync {i} carried the change");
+        assert_eq!(
+            bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(),
+            json!({"n": i}),
+            "sync {i} carried the change"
+        );
     }
     eprintln!("first sync (with handshake) {first:?}, then {:?} per sync on the pooled connection", later / N as u32);
     // Card and ephemeral messages ride the same connection.
@@ -102,7 +106,6 @@ async fn syncs_reuse_one_connection_and_redial_after_restart() {
     alice.shutdown().await.unwrap();
     bob.shutdown().await.unwrap();
 }
-
 
 /// Many exchanges at once on the one connection: chats are one space each
 /// and a device syncs up to 16 at a time, a download takes several streams.

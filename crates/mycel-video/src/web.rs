@@ -222,7 +222,6 @@ struct WebCamera;
 
 struct CameraOn;
 
-
 impl Drop for CameraOn {
     fn drop(&mut self) {
         WEB.sink.lock().take();

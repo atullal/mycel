@@ -97,10 +97,17 @@ pub enum Input {
     InfoFailed(Pid),
     /// An L2CAP channel opened: dialed by us over `pid`, or (`pid: None`)
     /// accepted by our peripheral.
-    ChannelOpened { chan: ChanId, pid: Option<Pid> },
+    ChannelOpened {
+        chan: ChanId,
+        pid: Option<Pid>,
+    },
     OpenFailed(Pid),
     /// The first frame on a channel named the node at the other end.
-    Hello { chan: ChanId, key: SignPk, name: String },
+    Hello {
+        chan: ChanId,
+        key: SignPk,
+        name: String,
+    },
     /// The platform saw the channel close (stream ended or failed, or went
     /// silent). Channels *we* close are not reported back.
     ChannelClosed(ChanId),
@@ -127,11 +134,21 @@ pub enum Cmd {
     /// Stop and restart scanning.
     Rescan,
     /// Packets for `key` go out on `chan` from now on.
-    Route { key: SignPk, chan: ChanId },
-    Unroute { key: SignPk },
+    Route {
+        key: SignPk,
+        chan: ChanId,
+    },
+    Unroute {
+        key: SignPk,
+    },
     /// Tell the node: `key` is reachable / no longer reachable.
-    Found { key: SignPk, name: String },
-    Lost { key: SignPk },
+    Found {
+        key: SignPk,
+        name: String,
+    },
+    Lost {
+        key: SignPk,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -614,7 +631,9 @@ impl Core {
                     self.active.insert(key, chan);
                     out.push(Cmd::Route { key, chan });
                 }
-                let by = |c: &Chan, me: &SignPk| if c.pid.is_some() { "us".to_string() } else { short(&c.key.unwrap_or(*me)) };
+                let by = |c: &Chan, me: &SignPk| {
+                    if c.pid.is_some() { "us".to_string() } else { short(&c.key.unwrap_or(*me)) }
+                };
                 info(format_args!(
                     "two channels to {}: keeping {winner} (dialed by {}), dropping {loser} (dialed by {})",
                     short(&key),
@@ -881,7 +900,13 @@ mod tests {
 
     /// Run two cores against each other with instant delivery: what one
     /// closes, the other sees closed.
-    fn exchange(lo: &mut Core, hi: &mut Core, t: Instant, lo_in: Vec<Input>, hi_in: Vec<Input>) -> (Vec<Cmd>, Vec<Cmd>) {
+    fn exchange(
+        lo: &mut Core,
+        hi: &mut Core,
+        t: Instant,
+        lo_in: Vec<Input>,
+        hi_in: Vec<Input>,
+    ) -> (Vec<Cmd>, Vec<Cmd>) {
         let (mut lo_out, mut hi_out) = (Vec::new(), Vec::new());
         for i in lo_in {
             lo_out.extend(lo.handle(t, i));

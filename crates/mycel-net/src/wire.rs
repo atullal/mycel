@@ -75,16 +75,26 @@ pub(crate) const fn max_ephemeral_frame(max_plain: usize) -> usize {
 
 /// Count encoded bytes without allocating, stopping at the caller's budget.
 pub(crate) fn encoded_size<T: Serialize + ?Sized>(msg: &T, max: usize) -> Result<usize> {
-    struct Count { len: usize, max: usize }
+    struct Count {
+        len: usize,
+        max: usize,
+    }
     impl postcard::ser_flavors::Flavor for Count {
         type Output = usize;
-        fn try_push(&mut self, _: u8) -> postcard::Result<()> { self.try_extend(&[0]) }
+        fn try_push(&mut self, _: u8) -> postcard::Result<()> {
+            self.try_extend(&[0])
+        }
         fn try_extend(&mut self, bytes: &[u8]) -> postcard::Result<()> {
-            self.len = self.len.checked_add(bytes.len()).filter(|n| *n <= self.max)
+            self.len = self
+                .len
+                .checked_add(bytes.len())
+                .filter(|n| *n <= self.max)
                 .ok_or(postcard::Error::SerializeBufferFull)?;
             Ok(())
         }
-        fn finalize(self) -> postcard::Result<usize> { Ok(self.len) }
+        fn finalize(self) -> postcard::Result<usize> {
+            Ok(self.len)
+        }
     }
     Ok(postcard::serialize_with_flavor(msg, Count { len: 0, max })?)
 }
@@ -140,30 +150,49 @@ pub(crate) async fn recv_held<T: DeserializeOwned>(
 
 /// [`recv_held`] for messages that are always small (blob requests and
 /// answers, contact cards): a bigger declared length is refused outright.
-pub(crate) async fn recv_small<T: DeserializeOwned>(r: &mut RecvStream, wait: Duration, frames: &PeerFrames) -> Result<T> {
+pub(crate) async fn recv_small<T: DeserializeOwned>(
+    r: &mut RecvStream,
+    wait: Duration,
+    frames: &PeerFrames,
+) -> Result<T> {
     Ok(recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, MAX_SMALL_FRAME, frames).await?.0)
 }
 
 /// An ephemeral message of up to `max_plain` bytes: sizes are checked
 /// before anything is decrypted.
 pub(crate) async fn recv_ephemeral<R: AsyncRead + Unpin>(
-    r: &mut R, frames: &PeerFrames, max_plain: usize,
+    r: &mut R,
+    frames: &PeerFrames,
+    max_plain: usize,
 ) -> Result<(EphMsg, FramePermit)> {
     let (msg, permit): (EphMsg, _) = recv_frame(
-        r, crate::resources::FIRST_FRAME, crate::resources::IDLE_TIMEOUT, max_ephemeral_frame(max_plain), frames,
-    ).await?;
-    if msg.ciphertext.len() > max_ephemeral_ciphertext(max_plain) { bail!("ephemeral message too large"); }
+        r,
+        crate::resources::FIRST_FRAME,
+        crate::resources::IDLE_TIMEOUT,
+        max_ephemeral_frame(max_plain),
+        frames,
+    )
+    .await?;
+    if msg.ciphertext.len() > max_ephemeral_ciphertext(max_plain) {
+        bail!("ephemeral message too large");
+    }
     Ok((msg, permit))
 }
 
 async fn recv_frame<T: DeserializeOwned, R: AsyncRead + Unpin>(
-    r: &mut R, wait: Duration, idle: Duration, max: usize, frames: &PeerFrames,
+    r: &mut R,
+    wait: Duration,
+    idle: Duration,
+    max: usize,
+    frames: &PeerFrames,
 ) -> Result<(T, FramePermit)> {
     use tokio::io::AsyncReadExt;
     let mut len = [0u8; 4];
     crate::resources::within(wait, "no answer", r.read_exact(&mut len)).await?;
     let len = u32::from_le_bytes(len) as usize;
-    if len > max.min(MAX_FRAME) { bail!("frame too large"); }
+    if len > max.min(MAX_FRAME) {
+        bail!("frame too large");
+    }
     // A length prefix takes the peer's share, never a length-sized
     // allocation: the buffer (and the node's pool) grow as bytes arrive.
     let permit = frames.admit(len).await?;
@@ -205,12 +234,22 @@ pub enum SyncMsg {
     },
     Denied,
     /// You were removed: here is the proof (revocation + its causal past).
-    Removed { ops: Vec<SignedOp> },
+    Removed {
+        ops: Vec<SignedOp>,
+    },
     /// Server doesn't know the space; resend Hello with `invite`.
     NeedInvite,
-    Accept { inv: Inventory, want: Inventory },
-    DataAndWant { data: Data, want: Inventory },
-    Data { data: Data },
+    Accept {
+        inv: Inventory,
+        want: Inventory,
+    },
+    DataAndWant {
+        data: Data,
+        want: Inventory,
+    },
+    Data {
+        data: Data,
+    },
 }
 
 /// A device's public, self-signed contact card.
@@ -233,11 +272,7 @@ impl ContactCard {
 
     pub fn verify(&self) -> Result<()> {
         self.keys.verify_binding()?;
-        self.keys.sign_pk.verify(
-            CTX_CARD,
-            &[&postcard::to_allocvec(&self.keys)?, self.name.as_bytes()],
-            &self.sig,
-        )?;
+        self.keys.sign_pk.verify(CTX_CARD, &[&postcard::to_allocvec(&self.keys)?, self.name.as_bytes()], &self.sig)?;
         Ok(())
     }
 }
@@ -279,14 +314,21 @@ pub enum BlobReq {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum BlobResp {
     /// Followed by `len` raw bytes.
-    Found { len: u64 },
+    Found {
+        len: u64,
+    },
     NotFound,
     Denied,
     Stored,
     /// Followed by bytes `[offset, total)`. `offset` may be lower than asked.
-    Range { total: u64, offset: u64 },
+    Range {
+        total: u64,
+        offset: u64,
+    },
     /// Send bytes `[offset, len)` (we already hold the first `offset`).
-    SendFrom { offset: u64 },
+    SendFrom {
+        offset: u64,
+    },
     /// Accepting it would leave too little free disk space.
     NoSpace,
     /// Another transfer of this blob is in progress.
@@ -310,7 +352,11 @@ mod security_tests {
 
     const SHORT: Duration = Duration::from_millis(25);
 
-    async fn recv_from<T: DeserializeOwned, R: AsyncRead + Unpin>(r: &mut R, wait: Duration, idle: Duration) -> Result<T> {
+    async fn recv_from<T: DeserializeOwned, R: AsyncRead + Unpin>(
+        r: &mut R,
+        wait: Duration,
+        idle: Duration,
+    ) -> Result<T> {
         Ok(recv_frame(r, wait, idle, MAX_FRAME, &PeerFrames::unbudgeted()).await?.0)
     }
 
@@ -414,8 +460,15 @@ mod security_tests {
                 struct Visitor;
                 impl<'de> serde::de::Visitor<'de> for Visitor {
                     type Value = ByteCount;
-                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { f.write_str("bytes") }
-                    fn visit_borrowed_bytes<E: serde::de::Error>(self, v: &'de [u8]) -> std::result::Result<ByteCount, E> { Ok(ByteCount(v.len())) }
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        f.write_str("bytes")
+                    }
+                    fn visit_borrowed_bytes<E: serde::de::Error>(
+                        self,
+                        v: &'de [u8],
+                    ) -> std::result::Result<ByteCount, E> {
+                        Ok(ByteCount(v.len()))
+                    }
                 }
                 deserializer.deserialize_bytes(Visitor)
             }
@@ -485,7 +538,8 @@ mod security_tests {
         };
         let idle = crate::resources::IDLE_TIMEOUT;
         let mut slow = trickle(256 << 10);
-        let slow = tokio::spawn(async move { recv_frame::<Vec<u8>, _>(&mut slow, SHORT, idle, MAX_FRAME, &stranger).await });
+        let slow =
+            tokio::spawn(async move { recv_frame::<Vec<u8>, _>(&mut slow, SHORT, idle, MAX_FRAME, &stranger).await });
         tokio::time::sleep(Duration::from_secs(1)).await;
         assert!(frames.available() > (1 << 20) - 1024, "only what arrived is held");
         // another peer's full-size frame comes in at once
@@ -544,19 +598,21 @@ mod security_tests {
     async fn security_ephemeral_ciphertext_and_frame_limits_precede_decryption() {
         let ciphertext_max = max_ephemeral_ciphertext(MAX_EPHEMERAL);
         for length in [ciphertext_max, ciphertext_max + 1] {
-            let msg = EphMsg { space: Hash32([0; 32]), epoch: EpochId([1; 16]), nonce: [0; 24], ciphertext: vec![0; length] };
+            let msg =
+                EphMsg { space: Hash32([0; 32]), epoch: EpochId([1; 16]), nonce: [0; 24], ciphertext: vec![0; length] };
             let encoded = postcard::to_allocvec(&msg).unwrap();
             let bytes = [(encoded.len() as u32).to_le_bytes().as_slice(), &encoded].concat();
-            let received = recv_ephemeral(&mut std::io::Cursor::new(bytes), &PeerFrames::unbudgeted(), MAX_EPHEMERAL).await;
+            let received =
+                recv_ephemeral(&mut std::io::Cursor::new(bytes), &PeerFrames::unbudgeted(), MAX_EPHEMERAL).await;
             assert_eq!(received.is_ok(), length == ciphertext_max);
         }
         // Reject the declaration alone, before allocating/decoding its body.
         let bytes = ((max_ephemeral_frame(MAX_EPHEMERAL) + 1) as u32).to_le_bytes().to_vec();
-        let error = match recv_ephemeral(&mut std::io::Cursor::new(bytes), &PeerFrames::unbudgeted(), MAX_EPHEMERAL).await {
-            Err(error) => error,
-            Ok(_) => panic!("oversized ephemeral frame accepted"),
-        };
+        let error =
+            match recv_ephemeral(&mut std::io::Cursor::new(bytes), &PeerFrames::unbudgeted(), MAX_EPHEMERAL).await {
+                Err(error) => error,
+                Ok(_) => panic!("oversized ephemeral frame accepted"),
+            };
         assert_eq!(error.to_string(), "frame too large");
     }
-
 }

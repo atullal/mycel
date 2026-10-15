@@ -28,10 +28,10 @@ use crate::api::{CallInfo, CallPhase, CallStats, Direction, EndReason, Participa
 use crate::audio::{AudioIo, default_audio};
 use crate::bitrate::{BitrateController, Observation};
 use crate::engine::{LegMedia, Media, TrackSink, tier};
-use crate::video::VideoHub;
-use mycel_video::{UiFrame, VideoSource};
 use crate::proto::{self, CallId, CallRef, Ctrl, MAX_PARTICIPANTS, VERSION};
 use crate::state::{CALLEE_RING_SLACK, LiveCall, RING_TIMEOUT, RingDecision, SETUP_TIMEOUT, on_ring};
+use crate::video::VideoHub;
+use mycel_video::{UiFrame, VideoSource};
 
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
@@ -206,12 +206,30 @@ enum Cmd {
 enum Ev {
     Cmd(Cmd),
     /// Our dial went through: connected, first message sent.
-    Dialed { peer: SignPk, serial: u64, conn: Connection },
+    Dialed {
+        peer: SignPk,
+        serial: u64,
+        conn: Connection,
+    },
     /// A leg someone dialed to us for this call (`Join` or `Watch`).
-    Incoming { peer: SignPk, serial: u64, conn: Connection, out: mpsc::UnboundedSender<Ctrl>, first: Ctrl },
-    Msg { peer: SignPk, serial: u64, msg: Ctrl },
+    Incoming {
+        peer: SignPk,
+        serial: u64,
+        conn: Connection,
+        out: mpsc::UnboundedSender<Ctrl>,
+        first: Ctrl,
+    },
+    Msg {
+        peer: SignPk,
+        serial: u64,
+        msg: Ctrl,
+    },
     /// The leg's control stream or connection ended (or the dial failed).
-    Gone { peer: SignPk, serial: u64, error: Option<String> },
+    Gone {
+        peer: SignPk,
+        serial: u64,
+        error: Option<String>,
+    },
     Timeout,
     Tick,
 }
@@ -355,7 +373,8 @@ impl CallManager {
             bail!("This call already ended.");
         }
         let (hub, cid) = (self.inner.video.clone(), call.id());
-        let r = tokio::task::spawn_blocking(move || hub.set_camera(&cid, on)).await.context("camera failed to start")?;
+        let r =
+            tokio::task::spawn_blocking(move || hub.set_camera(&cid, on)).await.context("camera failed to start")?;
         let i = info(&self.inner, &call);
         self.inner.host.emit(CallEvent::Updated(i.clone()));
         r.map(|()| i)
@@ -451,7 +470,9 @@ impl CallManager {
         let members = mgr.host.members(&space)?;
         // a call here is already ringing us, or going on without us: join it
         let waiting = live_calls(mgr).into_iter().find(|c| {
-            c.cref.space == space && matches!(c.core.lock().phase, CallPhase::Ringing | CallPhase::Joinable) && c.dir == Direction::Incoming
+            c.cref.space == space
+                && matches!(c.core.lock().phase, CallPhase::Ringing | CallPhase::Joinable)
+                && c.dir == Direction::Incoming
         });
         if let Some(c) = waiting {
             return self.accept(&hex(&c.id().0)).await;
@@ -487,7 +508,9 @@ impl CallManager {
     /// Answer a ringing call, or join a group call that's going on.
     pub async fn accept(&self, id: &str) -> Result<CallInfo> {
         let call = self.find(id)?;
-        if !matches!(call.core.lock().phase, CallPhase::Ringing | CallPhase::Joinable) || call.dir != Direction::Incoming {
+        if !matches!(call.core.lock().phase, CallPhase::Ringing | CallPhase::Joinable)
+            || call.dir != Direction::Incoming
+        {
             bail!("This call isn't ringing any more.");
         }
         // Another call in progress? Hang it up first (answering means switching).
@@ -729,10 +752,8 @@ async fn handle_incoming(mgr: &Arc<Mgr>, conn: Connection) -> Result<()> {
         drop(guard);
         return Ok(());
     };
-    let live: Vec<LiveCall> = live_calls(mgr)
-        .iter()
-        .map(|c| LiveCall { call: c.cref, dir: c.dir, phase: c.core.lock().phase })
-        .collect();
+    let live: Vec<LiveCall> =
+        live_calls(mgr).iter().map(|c| LiveCall { call: c.cref, dir: c.dir, phase: c.core.lock().phase }).collect();
     let expecting = {
         let mut e = mgr.expecting.lock();
         e.retain(|_, t| t.elapsed() < Duration::from_secs(15));
@@ -960,7 +981,9 @@ fn handle(mgr: &Arc<Mgr>, call: &Arc<Call>, core: &mut Core, ev: Ev, after: &mut
                 }
                 lobby_or_end(call, core, EndReason::Missed);
             }
-            CallPhase::Connecting | CallPhase::Ringing if call.initiated && !core.ever_joined => end(core, EndReason::NoAnswer),
+            CallPhase::Connecting | CallPhase::Ringing if call.initiated && !core.ever_joined => {
+                end(core, EndReason::NoAnswer)
+            }
             CallPhase::Connecting => end(core, EndReason::ConnectionLost),
             _ => core.deadline = None,
         },
@@ -1009,7 +1032,9 @@ fn handle(mgr: &Arc<Mgr>, call: &Arc<Call>, core: &mut Core, ev: Ev, after: &mut
                 leg.state = LegState::Anchor;
             }
         }
-        Ev::Incoming { peer, serial, conn, out, first } => on_incoming_leg(mgr, call, core, peer, serial, conn, out, first, after),
+        Ev::Incoming { peer, serial, conn, out, first } => {
+            on_incoming_leg(mgr, call, core, peer, serial, conn, out, first, after)
+        }
         Ev::Msg { peer, serial, msg } => {
             if core.legs.get(&peer).is_none_or(|l| l.serial != serial) {
                 return; // from a leg that's been replaced
@@ -1308,9 +1333,10 @@ fn mesh(mgr: &Arc<Mgr>, call: &Arc<Call>, core: &mut Core) {
     let roster = known_roster(core, &me);
     core.missing.retain(|p, _| roster.contains(p));
     for p in roster {
-        let free = core.legs.get(&p).is_none_or(|l| {
-            matches!(l.state, LegState::Done(_)) && l.done_at.is_none_or(|t| t.elapsed() > RETRY)
-        });
+        let free = core
+            .legs
+            .get(&p)
+            .is_none_or(|l| matches!(l.state, LegState::Done(_)) && l.done_at.is_none_or(|t| t.elapsed() > RETRY));
         if !free {
             core.missing.remove(&p);
             continue;
@@ -1332,9 +1358,10 @@ fn check_end(call: &Call, core: &mut Core) {
     if !ours {
         return;
     }
-    let pending = core.legs.values().any(|l| {
-        matches!(l.state, LegState::Dialing(_) | LegState::Ringing | LegState::Joined | LegState::Accepting)
-    });
+    let pending = core
+        .legs
+        .values()
+        .any(|l| matches!(l.state, LegState::Dialing(_) | LegState::Ringing | LegState::Joined | LegState::Accepting));
     if pending {
         return;
     }
@@ -1412,7 +1439,8 @@ fn on_tick(mgr: &Arc<Mgr>, call: &Arc<Call>, core: &mut Core, ticks: u64) {
         media.fec_loss.store(BitrateController::fec_loss_percent(leg.remote_loss) as u32, Ordering::Relaxed);
         // what we received of theirs, last interval
         let js = media.jitter_stats();
-        let (played, missing) = (js.played - leg.last_report.0.min(js.played), js.lost - leg.last_report.1.min(js.lost));
+        let (played, missing) =
+            (js.played - leg.last_report.0.min(js.played), js.lost - leg.last_report.1.min(js.lost));
         leg.last_report = (js.played, js.lost);
         let loss_ppm = (missing * 1_000_000).checked_div(played + missing).unwrap_or(0) as u32;
         leg.send(Ctrl::Report { loss_ppm, jitter_ms: js.jitter_ms as u16, bitrate });
@@ -1644,11 +1672,8 @@ fn info(mgr: &Mgr, c: &Call) -> CallInfo {
         _ => 3,
     };
     participants.sort_by(|a, b| rank(a.state).cmp(&rank(b.state)).then_with(|| a.name.cmp(&b.name)));
-    let active_speaker = participants
-        .iter()
-        .filter(|p| p.speaking)
-        .max_by(|a, b| a.level.total_cmp(&b.level))
-        .map(|p| p.id.clone());
+    let active_speaker =
+        participants.iter().filter(|p| p.speaking).max_by(|a, b| a.level.total_cmp(&b.level)).map(|p| p.id.clone());
     let primary = rows.iter().filter(|r| r.media.is_some()).min_by_key(|r| r.joined_at);
 
     let mut stats = CallStats { audio_device: audio.describe(), ..Default::default() };

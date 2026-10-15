@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use mycel_net::emu::Pos;
 use mycel_net::MeshOptions;
+use mycel_net::emu::Pos;
 use mycel_sim::models::{Env, Tech};
 use mycel_sim::tier1::{DevOpts, Lab, block_on, net, resources};
 
@@ -38,7 +38,12 @@ fn main() {
             if i % 2 == 0 {
                 at.push((&awdl, p));
             }
-            lab.device(&format!("walker{i}"), &at, DevOpts { mesh: Some(MeshOptions::default()), ..Default::default() }).await;
+            lab.device(
+                &format!("walker{i}"),
+                &at,
+                DevOpts { mesh: Some(MeshOptions::default()), ..Default::default() },
+            )
+            .await;
         }
         let (rss1, _) = resources();
         println!("n={n} still={still}: rss {rss0:.0} MB before, {rss1:.0} MB after spawning");
@@ -73,8 +78,14 @@ fn main() {
                 let (rss, _) = resources();
                 let tasks = tokio::runtime::Handle::current().metrics().num_alive_tasks();
                 let s = ble.stats();
-                let neigh: usize = lab.devs.iter().filter_map(|d| d.node.mesh()).map(|m| m.connected_neighbours().len()).sum();
-                let ms = lab.devs.iter().filter_map(|d| d.node.mesh()).map(|m| m.stats()).fold((0u64, 0u64), |a, s| (a.0 + s.announcements_sent, a.1 + s.dropped_queue));
+                let neigh: usize =
+                    lab.devs.iter().filter_map(|d| d.node.mesh()).map(|m| m.connected_neighbours().len()).sum();
+                let ms = lab
+                    .devs
+                    .iter()
+                    .filter_map(|d| d.node.mesh())
+                    .map(|m| m.stats())
+                    .fold((0u64, 0u64), |a, s| (a.0 + s.announcements_sent, a.1 + s.dropped_queue));
                 println!(
                     "t={:>4}s rss {rss:>6.0} MB ({:>5.1} MB/node over spawn)  tasks {tasks:>6}  ble pkts {} delivered {} q-drop {} range-drop {}  neighbours {:.1}/node  ann sent {} hop-q drops {}",
                     t0.elapsed().as_secs(),

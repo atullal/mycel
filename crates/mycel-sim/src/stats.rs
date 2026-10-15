@@ -4,8 +4,10 @@ use serde::{Deserialize, Serialize};
 
 /// Hash maps and sets with a fixed hasher: the same inserts iterate in the
 /// same order on every run, so seeded simulations are reproducible.
-pub type Map<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>>;
-pub type Set<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>>;
+pub type Map<K, V> =
+    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>>;
+pub type Set<K> =
+    std::collections::HashSet<K, std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>>;
 
 /// SplitMix64: tiny, fast, seeded; every run with the same seed is the same.
 #[derive(Clone, Debug)]

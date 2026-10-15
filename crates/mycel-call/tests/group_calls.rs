@@ -65,7 +65,10 @@ fn assert_hears(d: &Device, name: &str, present: &[f32], absent: &[f32]) {
     if !ok {
         for c in d.live() {
             for p in &c.participants {
-                eprintln!("  {name} → {} {:?} level {:.2} bitrate {} path {:?}", p.name, p.state, p.level, p.bitrate, p.path);
+                eprintln!(
+                    "  {name} → {} {:?} level {:.2} bitrate {} path {:?}",
+                    p.name, p.state, p.level, p.bitrate, p.path
+                );
             }
             eprintln!("  {name}: frames lost {} late {}", c.stats.frames_lost, c.stats.frames_late);
         }
@@ -145,7 +148,8 @@ async fn group_call_rings_everyone_late_join_and_leaves() {
     }
     eventually("alice sees three phones ringing", 5, || {
         let c = alice.call(&id)?;
-        (c.state == CallPhase::Ringing && c.participants.iter().filter(|p| p.state == ParticipantState::Ringing).count() == 3)
+        (c.state == CallPhase::Ringing
+            && c.participants.iter().filter(|p| p.state == ParticipantState::Ringing).count() == 3)
             .then_some(())
     })
     .await;
@@ -232,7 +236,8 @@ async fn group_call_rings_everyone_late_join_and_leaves() {
 
     // Carol leaves: Dave is the last one, so the call is over
     carol.calls.end(&id).unwrap();
-    let d = eventually("the last person's call ends", 10, || dave.call(&id).filter(|c| c.state == CallPhase::Ended)).await;
+    let d =
+        eventually("the last person's call ends", 10, || dave.call(&id).filter(|c| c.state == CallPhase::Ended)).await;
     assert_eq!(d.end_reason, Some(EndReason::RemoteHungUp));
     for dev in [&alice, &bob, &carol, &dave] {
         assert!(dev.live().is_empty());
@@ -301,7 +306,11 @@ async fn group_call_over_links_only() {
     let devs = [&alice, &bob, &carol];
     eventually("everyone sees everyone on the link", 15, || {
         devs.iter()
-            .all(|a| devs.iter().filter(|b| b.node.id() != a.node.id()).all(|b| a.node.peers().get(&b.node.id()).is_some_and(|p| !p.links.is_empty())))
+            .all(|a| {
+                devs.iter()
+                    .filter(|b| b.node.id() != a.node.id())
+                    .all(|b| a.node.peers().get(&b.node.id()).is_some_and(|p| !p.links.is_empty()))
+            })
             .then_some(())
     })
     .await;

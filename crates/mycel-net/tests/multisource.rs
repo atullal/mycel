@@ -135,11 +135,8 @@ async fn download_from_three_sources_and_survive_losing_one() {
     c.shutdown().await.unwrap();
     let path = task.await.unwrap().map_err(|e| format!("{e:#}")).expect("download finished without c");
     let secs = t.elapsed().as_secs_f64();
-    let served: Vec<f64> = [&a, &b]
-        .iter()
-        .zip(served_before)
-        .map(|(n, before)| (n.blob_bytes_served() - before) as f64 / MB)
-        .collect();
+    let served: Vec<f64> =
+        [&a, &b].iter().zip(served_before).map(|(n, before)| (n.blob_bytes_served() - before) as f64 / MB).collect();
     eprintln!(
         "three sources: first third in {at_cut:?} ({:.1} MB/s); whole file in {secs:.2} s; \
          served a {:.1} MB, b {:.1} MB, c {:.1} MB (then shut down)",

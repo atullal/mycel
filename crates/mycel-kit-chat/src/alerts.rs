@@ -260,11 +260,14 @@ mod tests {
         let mut t = chat("direct:x", &previous);
         t.unread = 0;
         // After a restart anything may still be delivered: withdraw all keys.
-        assert_eq!(policy.conversation(&t), vec![
-            Action::WithdrawThread("direct:x".into()),
-            Action::WithdrawThread("space-a".into()),
-            Action::WithdrawThread("space-b".into()),
-        ]);
+        assert_eq!(
+            policy.conversation(&t),
+            vec![
+                Action::WithdrawThread("direct:x".into()),
+                Action::WithdrawThread("space-a".into()),
+                Action::WithdrawThread("space-b".into()),
+            ]
+        );
         assert!(policy.conversation(&t).is_empty(), "nothing outstanding: no repeated withdrawals");
         t.unread = 1;
         t.latest = latest(2);
@@ -313,10 +316,13 @@ mod tests {
         assert_eq!(policy.call_ringing("c"), vec![Action::Alert { kind: ChatAlert::IncomingCall, key: call_key("c") }]);
         assert!(policy.call_ringing("c").is_empty());
         assert!(policy.call_changed("c", true, false).is_empty(), "still ringing");
-        assert_eq!(policy.call_changed("c", false, true), vec![
-            Action::Withdraw(call_key("c")),
-            Action::Alert { kind: ChatAlert::MissedCall, key: missed_call_key("c") },
-        ]);
+        assert_eq!(
+            policy.call_changed("c", false, true),
+            vec![
+                Action::Withdraw(call_key("c")),
+                Action::Alert { kind: ChatAlert::MissedCall, key: missed_call_key("c") },
+            ]
+        );
         assert!(policy.call_changed("c", false, true).is_empty());
         // Answered or declined calls only lose the ringing alert.
         policy.call_ringing("d");

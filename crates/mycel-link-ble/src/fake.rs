@@ -346,9 +346,9 @@ impl Air {
                     }
                 }
             }
-            Cmd::CloseChannel(c) => {
-                self.close_where(|p| (p.dialer.node == n && p.dialer.chan == c) || (p.acceptor.node == n && p.acceptor.chan == c))
-            }
+            Cmd::CloseChannel(c) => self.close_where(|p| {
+                (p.dialer.node == n && p.dialer.chan == c) || (p.acceptor.node == n && p.acceptor.chan == c)
+            }),
             Cmd::Disconnect(p) => {
                 let o = idx(&p);
                 let (connected, theirs) = {
@@ -364,7 +364,9 @@ impl Air {
                     return; // a pending connect: cancelled quietly
                 }
                 // One radio link between the two: it goes, with every channel on it.
-                self.close_where(|q| (q.dialer.node, q.acceptor.node) == (n, o) || (q.dialer.node, q.acceptor.node) == (o, n));
+                self.close_where(|q| {
+                    (q.dialer.node, q.acceptor.node) == (n, o) || (q.dialer.node, q.acceptor.node) == (o, n)
+                });
                 self.job(Job::Input(n, Input::Disconnected(p)));
                 if theirs {
                     self.job(Job::Input(o, Input::Disconnected(pid(n))));
@@ -613,7 +615,11 @@ mod tests {
         assert_eq!(drain(&mut links), (2, 0));
         for round in 0..6 {
             let t = std::time::Instant::now();
-            if round % 2 == 0 { air.close_channels() } else { air.drop_links() }
+            if round % 2 == 0 {
+                air.close_channels()
+            } else {
+                air.drop_links()
+            }
             // Count events rather than poll status: a reopen over the spare
             // connection can take only milliseconds.
             let (mut found, mut lost) = (0, 0);

@@ -12,7 +12,7 @@
 
 use crate::stats::Map;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap};
+use std::collections::BinaryHeap;
 
 use serde::{Deserialize, Serialize};
 
@@ -343,7 +343,8 @@ impl<F> Cx<'_, F> {
 
     /// Current radio neighbours.
     pub fn neighbours(&self) -> Vec<(NodeId, Techs)> {
-        let mut v: Vec<(NodeId, Techs)> = self.world.nodes[self.me as usize].nbrs.iter().map(|(k, (t, _))| (*k, *t)).collect();
+        let mut v: Vec<(NodeId, Techs)> =
+            self.world.nodes[self.me as usize].nbrs.iter().map(|(k, (t, _))| (*k, *t)).collect();
         v.sort_unstable_by_key(|x| x.0);
         v
     }
@@ -654,7 +655,12 @@ pub struct Sim<R: Router> {
 
 impl<R: Router> Sim<R> {
     /// Build the world; `make` creates each device's router.
-    pub fn new(areas: Vec<Area>, specs: Vec<NodeSpec>, seed: u64, mut make: impl FnMut(NodeId, &NodeSpec) -> R) -> Self {
+    pub fn new(
+        areas: Vec<Area>,
+        specs: Vec<NodeSpec>,
+        seed: u64,
+        mut make: impl FnMut(NodeId, &NodeSpec) -> R,
+    ) -> Self {
         let n = specs.len();
         let max_range = specs
             .iter()
@@ -982,7 +988,9 @@ impl<R: Router> Sim<R> {
                 Ev::Frame { to, from, over, f, link_since } => {
                     let ok = match over {
                         // the link must still be the same one (not broken and remade)
-                        Over::Radio(_) => self.core.nodes[to as usize].nbrs.get(&from).is_some_and(|x| x.1 <= link_since),
+                        Over::Radio(_) => {
+                            self.core.nodes[to as usize].nbrs.get(&from).is_some_and(|x| x.1 <= link_since)
+                        }
                         Over::Inet => self.core.nodes[to as usize].online && self.core.nodes[to as usize].inet_up,
                     };
                     if !ok {
@@ -1013,7 +1021,12 @@ impl<R: Router> Sim<R> {
                         None // on the internet itself: its own record has its relay address
                     } else {
                         let life = self.core.reach_lifetime;
-                        let mut rec = self.core.reach.get(&subject).filter(|(_, at)| self.now.saturating_sub(*at) < life).map(|(g, _)| g.clone());
+                        let mut rec = self
+                            .core
+                            .reach
+                            .get(&subject)
+                            .filter(|(_, at)| self.now.saturating_sub(*at) < life)
+                            .map(|(g, _)| g.clone());
                         if let Some(sybil) = self.core.dir_poison {
                             rec.get_or_insert_with(Vec::new).insert(0, (sybil, 0));
                         }

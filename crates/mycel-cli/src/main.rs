@@ -26,8 +26,8 @@ use mycel_node::api::NetworkMode;
 use mycel_node::{Runtime, RuntimeOptions, dispatch::dispatch};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tokio::io::AsyncWriteExt;
+use tokio_stream::{StreamExt, wrappers::BroadcastStream};
 use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Parser)]
@@ -250,7 +250,8 @@ async fn api_cmd(
                 .zip(uploads.canonicalize().ok())
                 .is_some_and(|(p, root)| p.starts_with(root));
             if !ok {
-                return (StatusCode::BAD_REQUEST, Json(json!({"error": "attachments must be uploaded first"}))).into_response();
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": "attachments must be uploaded first"})))
+                    .into_response();
             }
         }
     }
@@ -307,15 +308,14 @@ async fn api_upload(State(app): State<Shared>, headers: HeaderMap, Query(q): Que
     if let Err(r) = guard(&app, &headers, None) {
         return r;
     }
-    let fail = |status: StatusCode, e: anyhow::Error| (status, Json(json!({"error": format!("{e:#}")}))).into_response();
+    let fail =
+        |status: StatusCode, e: anyhow::Error| (status, Json(json!({"error": format!("{e:#}")}))).into_response();
     let path = match app.rt.new_upload_path(&q.name) {
         Ok(p) => p,
         Err(e) => return fail(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
-    let expected = headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
+    let expected =
+        headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
     if let Some(len) = expected
         && let Err(e) = mycel_node::net::ensure_free_space(app.rt.data_dir(), len)
     {
@@ -358,13 +358,9 @@ async fn api_file(State(app): State<Shared>, Query(q): Query<FileQ>, req: Reques
         return StatusCode::NOT_FOUND.into_response();
     };
     // Only attachments: never identity.key, the database, or anything else.
-    let allowed = ["files", "uploads"].iter().any(|d| {
-        app.rt
-            .data_dir()
-            .join(d)
-            .canonicalize()
-            .is_ok_and(|root| path.starts_with(root))
-    });
+    let allowed = ["files", "uploads"]
+        .iter()
+        .any(|d| app.rt.data_dir().join(d).canonicalize().is_ok_and(|root| path.starts_with(root)));
     if !allowed || !path.is_file() {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -375,8 +371,9 @@ async fn api_file(State(app): State<Shared>, Query(q): Query<FileQ>, req: Reques
             let h = resp.headers_mut();
             // our own conservative type, not a guess from the extension
             h.insert(header::CONTENT_TYPE, header::HeaderValue::from_static(mime_for(&name)));
-            if let Ok(v) = header::HeaderValue::from_str(&format!("inline; filename=\"{}\"", name.replace(['"', '\\'], "")))
-                .or_else(|_| header::HeaderValue::from_str("inline"))
+            if let Ok(v) =
+                header::HeaderValue::from_str(&format!("inline; filename=\"{}\"", name.replace(['"', '\\'], "")))
+                    .or_else(|_| header::HeaderValue::from_str("inline"))
             {
                 h.insert(header::CONTENT_DISPOSITION, v);
             }
@@ -428,14 +425,10 @@ async fn serve_index(State(app): State<Shared>, headers: HeaderMap) -> Response 
         return (StatusCode::FORBIDDEN, "bad host").into_response();
     }
     match &app.index {
-        Some(html) => (
-            [
-                (header::CONTENT_TYPE, "text/html; charset=utf-8"),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            html.clone(),
-        )
-            .into_response(),
+        Some(html) => {
+            ([(header::CONTENT_TYPE, "text/html; charset=utf-8"), (header::CACHE_CONTROL, "no-store")], html.clone())
+                .into_response()
+        }
         None => (StatusCode::NOT_FOUND, "UI not built: run `npm run build`").into_response(),
     }
 }
@@ -447,7 +440,9 @@ fn default_ui() -> Option<PathBuf> {
     let mut candidates = Vec::new();
     #[cfg(debug_assertions)]
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/host/dist"));
-    if let Some(repo) = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.parent()?.parent()?.to_path_buf())) {
+    if let Some(repo) =
+        std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.parent()?.parent()?.to_path_buf()))
+    {
         candidates.push(repo.join("apps/host/dist"));
     }
     candidates.push(PathBuf::from("apps/host/dist"));
@@ -456,15 +451,15 @@ fn default_ui() -> Option<PathBuf> {
 
 async fn serve(dev: DeviceArgs, http: SocketAddr, ui: Option<PathBuf>) -> Result<()> {
     if !http.ip().is_loopback() {
-        bail!("refusing to serve the API on a non-loopback address ({http}): anyone on the network could use your account");
+        bail!(
+            "refusing to serve the API on a non-loopback address ({http}): anyone on the network could use your account"
+        );
     }
     let rt = open(&dev, false).await?;
     let ui = ui.or_else(default_ui);
     let token = mycel_node::crypto::Hash32(mycel_node::crypto::random()).to_string();
     let index = ui.as_ref().and_then(|d| std::fs::read_to_string(d.join("index.html")).ok()).map(|html| {
-        let boot = format!(
-            "<script>window.__MYCEL_HTTP__=true;window.__MYCEL_TOKEN__=\"{token}\";</script>"
-        );
+        let boot = format!("<script>window.__MYCEL_HTTP__=true;window.__MYCEL_TOKEN__=\"{token}\";</script>");
         html.replace("<script src=\"/api/boot.js\"></script>", "").replacen("<head>", &format!("<head>{boot}"), 1)
     });
     let app: Shared = Arc::new(App { rt: rt.clone(), http, token, index });
@@ -488,9 +483,7 @@ async fn serve(dev: DeviceArgs, http: SocketAddr, ui: Option<PathBuf>) -> Result
     let router = router.with_state(app.clone());
     // let `mycel call` (same user) authenticate: token file readable only by us
     write_private(&rt.data_dir().join("http-token"), &format!("{} {}", http, app.token))?;
-    let listener = tokio::net::TcpListener::bind(http)
-        .await
-        .with_context(|| format!("can't listen on {http}"))?;
+    let listener = tokio::net::TcpListener::bind(http).await.with_context(|| format!("can't listen on {http}"))?;
     let p = rt.profile();
     println!("Mycel device \"{}\" ({:?}) — id {}", p.name, rt.network_status().mode, &p.id[..16]);
     match &ui {
@@ -514,9 +507,8 @@ async fn call(http: SocketAddr, data: &Path, command: &str, args: &str) -> Resul
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let body: Value = serde_json::from_str(args).context("args must be JSON")?;
     let body = body.to_string();
-    let mut s = tokio::net::TcpStream::connect(http)
-        .await
-        .with_context(|| format!("is `mycel serve` running on {http}?"))?;
+    let mut s =
+        tokio::net::TcpStream::connect(http).await.with_context(|| format!("is `mycel serve` running on {http}?"))?;
     let req = format!(
         "POST /api/cmd/{command} HTTP/1.1\r\nHost: {http}\r\nX-Mycel: {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()

@@ -419,7 +419,11 @@ impl RateController {
             }
         } else if !evidence {
             // nothing to go on
-        } else if self.slow_start && delay < DELAY_LOW && since(self.last_increase) > SLOW_START_EVERY && self.target < b.max {
+        } else if self.slow_start
+            && delay < DELAY_LOW
+            && since(self.last_increase) > SLOW_START_EVERY
+            && self.target < b.max
+        {
             self.target = ((self.target as f64 * 1.4) as u32).min(b.max);
             self.last_increase = Some(now);
         } else if delay < DELAY_LOW
@@ -553,7 +557,7 @@ mod tests {
         let mut now = Instant::now();
         // squeeze to the bottom
         c.on_acked(now, 1000);
-            c.on_rtt(now, RTT);
+        c.on_rtt(now, RTT);
         for _ in 0..30 {
             now += Duration::from_millis(100);
             c.on_acked(now, 1000);

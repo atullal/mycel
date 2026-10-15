@@ -96,7 +96,11 @@ pub enum Latency {
     Fixed(Duration),
     /// Positions are (lat, lon): `base` plus great-circle km × `us_per_km` ×
     /// `inflation` (fibre: ~5 µs/km; real routes ~1.5× the great circle).
-    Geo { base: Duration, us_per_km: f64, inflation: f64 },
+    Geo {
+        base: Duration,
+        us_per_km: f64,
+        inflation: f64,
+    },
 }
 
 /// The physics of one medium.
@@ -282,7 +286,15 @@ impl EmuNet {
         EmuNet {
             id: TRANSPORT_TEST_BASE + n,
             medium: Arc::new(medium),
-            st: Arc::new(Mutex::new(State { members: HashMap::new(), pair: None, rng: seed | 1, up: true, fifo: HashMap::new(), queues: HashMap::new(), links: HashMap::new() })),
+            st: Arc::new(Mutex::new(State {
+                members: HashMap::new(),
+                pair: None,
+                rng: seed | 1,
+                up: true,
+                fifo: HashMap::new(),
+                queues: HashMap::new(),
+                links: HashMap::new(),
+            })),
             counters: Arc::default(),
         }
     }
@@ -294,10 +306,10 @@ impl EmuNet {
     /// Attach a device at `pos`.
     pub fn link(&self, me: SignPk, pos: Pos) -> Arc<EmuLink> {
         let (tx, rx) = mpsc::channel(4096);
-        self.st.lock().members.insert(
-            me,
-            Member { pos, up: true, inbox: tx, events: None, told: HashSet::new(), busy_until: None },
-        );
+        self.st
+            .lock()
+            .members
+            .insert(me, Member { pos, up: true, inbox: tx, events: None, told: HashSet::new(), busy_until: None });
         Arc::new(EmuLink { net: self.clone(), me, rx: Arc::new(tokio::sync::Mutex::new(rx)) })
     }
 
@@ -420,7 +432,8 @@ impl EmuNet {
         }
         let now = Instant::now();
         let shape = st.shape(from, to);
-        let airtime = m.rate.map_or(Duration::ZERO, |r| Duration::from_secs_f64(len as f64 * shape.rate_div / r as f64));
+        let airtime =
+            m.rate.map_or(Duration::ZERO, |r| Duration::from_secs_f64(len as f64 * shape.rate_div / r as f64));
         let mut start = now;
         if let (Some(cap), Some(_)) = (m.peer_queue, m.rate) {
             let q = st.links.entry(*from).or_default().entry(*to).or_default();

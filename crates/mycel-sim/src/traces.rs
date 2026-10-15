@@ -64,7 +64,9 @@ pub fn load(path: &Path) -> Result<Trace> {
             if f.len() < 4 {
                 continue;
             }
-            let (Ok(a), Ok(b), Ok(s), Ok(e)) = (f[0].parse(), f[1].parse(), f[2].parse(), f[3].parse()) else { continue };
+            let (Ok(a), Ok(b), Ok(s), Ok(e)) = (f[0].parse(), f[1].parse(), f[2].parse(), f[3].parse()) else {
+                continue;
+            };
             rows.push((a, b, s, e));
         }
     } else {
@@ -75,7 +77,9 @@ pub fn load(path: &Path) -> Result<Trace> {
             if f.len() < 4 {
                 continue;
             }
-            let (Ok(a), Ok(b), Ok(s), Ok(e)) = (f[0].parse::<u32>(), f[1].parse::<u32>(), f[2].parse::<f64>(), f[3].parse::<f64>()) else {
+            let (Ok(a), Ok(b), Ok(s), Ok(e)) =
+                (f[0].parse::<u32>(), f[1].parse::<u32>(), f[2].parse::<f64>(), f[3].parse::<f64>())
+            else {
                 continue;
             };
             if internal.is_some_and(|m| a > m || b > m) {
@@ -101,7 +105,9 @@ fn load_city(dir: &Path) -> Result<Trace> {
             if f.len() < 3 {
                 continue;
             }
-            let (Ok(b), Ok(s), Ok(e)) = (f[0].parse::<u32>(), f[1].parse::<f64>(), f[2].parse::<f64>()) else { continue };
+            let (Ok(b), Ok(s), Ok(e)) = (f[0].parse::<u32>(), f[1].parse::<f64>(), f[2].parse::<f64>()) else {
+                continue;
+            };
             rows.push((rec, b, s, e));
         }
     }

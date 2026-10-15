@@ -69,9 +69,8 @@ mod tests {
     #[test]
     fn frequency_and_meter() {
         let rate = 48_000;
-        let tone: Vec<f32> = (0..rate)
-            .map(|i| 0.3 * (2.0 * std::f32::consts::PI * 523.25 * i as f32 / rate as f32).sin())
-            .collect();
+        let tone: Vec<f32> =
+            (0..rate).map(|i| 0.3 * (2.0 * std::f32::consts::PI * 523.25 * i as f32 / rate as f32).sin()).collect();
         let f = estimate_frequency(&tone, rate).unwrap();
         assert!((f - 523.25).abs() < 0.5, "{f}");
         assert!(goertzel(&tone, 523.25, rate) > 100.0 * goertzel(&tone, 800.0, rate));
@@ -79,7 +78,13 @@ mod tests {
         assert_eq!(meter(&[0.0; 100]), 0.0);
         // tone bursts with silence between them: still the tone's pitch
         let bursts: Vec<f32> = (0..rate)
-            .map(|i| if (i / 4800) % 5 == 0 { 0.5 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / rate as f32).sin() } else { 0.0 })
+            .map(|i| {
+                if (i / 4800) % 5 == 0 {
+                    0.5 * (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / rate as f32).sin()
+                } else {
+                    0.0
+                }
+            })
             .collect();
         let f = estimate_frequency(&bursts, rate).unwrap();
         assert!((f - 1000.0).abs() < 2.0, "{f}");

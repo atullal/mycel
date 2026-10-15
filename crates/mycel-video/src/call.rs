@@ -29,7 +29,12 @@ pub struct VideoCall {
 }
 
 impl VideoCall {
-    pub fn new(me: [u8; 32], source: Arc<dyn VideoSource>, ui: broadcast::Sender<UiFrame>, rt: tokio::runtime::Handle) -> VideoCall {
+    pub fn new(
+        me: [u8; 32],
+        source: Arc<dyn VideoSource>,
+        ui: broadcast::Sender<UiFrame>,
+        rt: tokio::runtime::Handle,
+    ) -> VideoCall {
         VideoCall {
             me,
             source,

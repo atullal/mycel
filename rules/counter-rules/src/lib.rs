@@ -42,11 +42,7 @@ pub fn validate(input: RuleInput) -> Verdict {
 }
 
 pub fn reduce(input: RuleInput, state: &[u8]) -> Result<Vec<u8>, u32> {
-    let current: u64 = if state.is_empty() {
-        0
-    } else {
-        abi::decode_exact(state).ok_or(BAD_STATE)?
-    };
+    let current: u64 = if state.is_empty() { 0 } else { abi::decode_exact(state).ok_or(BAD_STATE)? };
     let next = match authorize(&input)? {
         CounterOp::Add(n) => current.checked_add(u64::from(n)).ok_or(OVERFLOW)?,
         CounterOp::Reset => 0,

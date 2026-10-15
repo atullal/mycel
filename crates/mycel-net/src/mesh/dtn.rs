@@ -317,7 +317,9 @@ impl Offer {
 pub enum Answer {
     /// Send the payload from byte `from` (the bytes before it arrived
     /// earlier).
-    Take { from: u64 },
+    Take {
+        from: u64,
+    },
     /// Already held (the copies offered are added to ours), delivered, or
     /// receipted: nothing to send.
     Duplicate,
@@ -787,7 +789,14 @@ impl Carrier {
 
     /// Whether we would carry a bundle of `size` from `src` for another
     /// device: its expiry, and which carried bundles would make way.
-    fn admit(&self, src: SignPk, size: u64, created: u64, lifetime: u64, now: Time) -> Result<(Time, Vec<Hash32>), &'static str> {
+    fn admit(
+        &self,
+        src: SignPk,
+        size: u64,
+        created: u64,
+        lifetime: u64,
+        now: Time,
+    ) -> Result<(Time, Vec<Hash32>), &'static str> {
         if !self.cfg.carry {
             return Err("not carrying");
         }
@@ -1001,7 +1010,9 @@ impl Carrier {
     /// receipts, if `full`; else what we took and learnt since `last`.
     fn build(&self, nb: Option<&SignPk>, full: bool, last: Option<Sent>, now: Time) -> Summary {
         let ids = match last {
-            Some(l) if !full => self.held.iter().filter(|(_, h)| h.rev > l.rev).map(|(k, _)| *k).take(SUMMARY_IDS).collect(),
+            Some(l) if !full => {
+                self.held.iter().filter(|(_, h)| h.rev > l.rev).map(|(k, _)| *k).take(SUMMARY_IDS).collect()
+            }
             _ => self.held.keys().rev().take(SUMMARY_IDS).copied().collect(),
         };
         // receipts it hasn't heard from us (a summary that may not have
@@ -1032,13 +1043,27 @@ impl Carrier {
         } else {
             (0, Vec::new())
         };
-        Summary { full, ids, receipts, preds: self.preds_for(nb, full, now), free, evictable, wants: self.wanted.clone() }
+        Summary {
+            full,
+            ids,
+            receipts,
+            preds: self.preds_for(nb, full, now),
+            free,
+            evictable,
+            wants: self.wanted.clone(),
+        }
     }
 
     /// A neighbour's summary: what it holds and has room for, receipts
     /// (checked by `verify_receipt`), and its predictabilities (PRoPHET
     /// transitivity).
-    pub fn on_summary(&mut self, from: SignPk, s: Summary, now: Time, mut verify_receipt: impl FnMut(&Receipt) -> bool) {
+    pub fn on_summary(
+        &mut self,
+        from: SignPk,
+        s: Summary,
+        now: Time,
+        mut verify_receipt: impl FnMut(&Receipt) -> bool,
+    ) {
         let ids = s.ids.iter().copied().take(SUMMARY_IDS);
         if s.full && s.ids.len() < SUMMARY_IDS {
             self.nb_has.insert(from, ids.collect());
@@ -1099,7 +1124,12 @@ impl Carrier {
     /// What to offer to whom right now. `toward(dst)` is the router's next
     /// hop for live and partial routes; `neighbours` are those with a hop
     /// connection up.
-    pub fn plan(&mut self, now: Time, mut toward: impl FnMut(&SignPk) -> Toward, neighbours: &[SignPk]) -> Vec<Transfer> {
+    pub fn plan(
+        &mut self,
+        now: Time,
+        mut toward: impl FnMut(&SignPk) -> Toward,
+        neighbours: &[SignPk],
+    ) -> Vec<Transfer> {
         self.in_flight.retain(|_, v| {
             v.retain(|x| now.saturating_sub(x.1) < IN_FLIGHT);
             !v.is_empty()
@@ -1289,7 +1319,8 @@ impl Carrier {
         // forget negligible predictabilities
         self.pred.retain(|_, (p, at)| *p * GAMMA_PER_MIN.powf(now.saturating_sub(*at) as f64 / 60_000.0) > 0.001);
         // and what neighbours long gone told us
-        let gone: Vec<SignPk> = self.nb_heard.iter().filter(|(_, t)| now.saturating_sub(**t) >= NB_FORGET).map(|(k, _)| *k).collect();
+        let gone: Vec<SignPk> =
+            self.nb_heard.iter().filter(|(_, t)| now.saturating_sub(**t) >= NB_FORGET).map(|(k, _)| *k).collect();
         for k in gone {
             self.nb_heard.remove(&k);
             self.nb_wants.remove(&k);

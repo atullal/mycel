@@ -173,11 +173,7 @@ fn commit_pending(shared: &Shared, extra: Vec<Write>, retry: bool) -> Result<()>
     };
     let outcome = (|| {
         #[cfg(test)]
-        if shared
-            .fail_commits
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            .is_ok()
-        {
+        if shared.fail_commits.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
             bail!("injected commit failure");
         }
         if failing {
@@ -264,10 +260,7 @@ impl DbStore {
                 let _ = commit_pending(&sh2, Vec::new(), true);
             }
         });
-        Ok(Arc::new(DbStore {
-            shared,
-            flusher: Mutex::new(Some(flusher)),
-        }))
+        Ok(Arc::new(DbStore { shared, flusher: Mutex::new(Some(flusher)) }))
     }
 
     /// `listener` is called whenever saving starts failing or works again
@@ -304,20 +297,14 @@ impl DbStore {
         let shared = &self.shared;
         let mut pending = shared.pending.lock().unwrap();
         if pending.closed {
-            pending
-                .error
-                .get_or_insert_with(|| "storage is closed".into());
+            pending.error.get_or_insert_with(|| "storage is closed".into());
             return;
         }
         if let Write::Kv(key, _) = &w {
             // A newer value supersedes a queued one: the queue is committed
             // whole, so the result is the same and repeated settings writes
             // can't grow the buffer.
-            if let Some(i) = pending
-                .queue
-                .iter()
-                .position(|q| matches!(q, Write::Kv(k, _) if k == key))
-            {
+            if let Some(i) = pending.queue.iter().position(|q| matches!(q, Write::Kv(k, _) if k == key)) {
                 let old = pending.queue.remove(i);
                 pending.bytes -= old.size();
             }
@@ -373,8 +360,8 @@ impl DbStore {
     pub fn kv_decode<T: serde::de::DeserializeOwned>(&self, k: &str) -> Result<Option<T>> {
         self.kv_get(k)?
             .map(|bytes| {
-                let (value, rest) = postcard::take_from_bytes(&bytes)
-                    .with_context(|| format!("corrupt persisted {k}"))?;
+                let (value, rest) =
+                    postcard::take_from_bytes(&bytes).with_context(|| format!("corrupt persisted {k}"))?;
                 if !rest.is_empty() {
                     bail!("corrupt persisted {k}: trailing bytes");
                 }
@@ -406,7 +393,8 @@ impl DbStore {
         self.flush()?;
         let mut out: HashMap<SpaceId, StoredSpace> = HashMap::new();
         let mut bad: Vec<(&'static str, Vec<u8>, Vec<u8>)> = Vec::new();
-        let space_of = |k: &[u8]| -> Option<Hash32> { Some(Hash32(k.get(..32)?.try_into().ok()?)).filter(|_| k.len() == 64) };
+        let space_of =
+            |k: &[u8]| -> Option<Hash32> { Some(Hash32(k.get(..32)?.try_into().ok()?)).filter(|_| k.len() == 64) };
         self.shared.with_db(|db| {
             let txn = db.begin_read()?;
             for row in txn.open_table(OPS)?.iter()? {
@@ -482,10 +470,8 @@ mod tests {
     use super::*;
 
     fn test_store() -> (std::path::PathBuf, Arc<DbStore>) {
-        let path = std::env::temp_dir().join(format!(
-            "mycel-store-security-{}.redb",
-            hex::encode(mycel_crypto::random::<16>())
-        ));
+        let path = std::env::temp_dir()
+            .join(format!("mycel-store-security-{}.redb", hex::encode(mycel_crypto::random::<16>())));
         let store = DbStore::open(&path).unwrap();
         (path, store)
     }
@@ -494,17 +480,10 @@ mod tests {
     fn corrupt_security_records_are_errors_and_absence_is_distinct() {
         let (path, store) = test_store();
         assert!(store.kv_decode::<Vec<u64>>("blocked").unwrap().is_none());
-        store
-            .kv_batch_durable(vec![("blocked".into(), Some(vec![255]))])
-            .unwrap();
+        store.kv_batch_durable(vec![("blocked".into(), Some(vec![255]))]).unwrap();
         assert!(store.kv_decode::<Vec<u64>>("blocked").is_err());
-        store
-            .kv_batch_durable(vec![("blocked".into(), Some(vec![0, 1]))])
-            .unwrap();
-        assert!(
-            store.kv_decode::<Vec<u64>>("blocked").is_err(),
-            "trailing bytes are corruption"
-        );
+        store.kv_batch_durable(vec![("blocked".into(), Some(vec![0, 1]))]).unwrap();
+        assert!(store.kv_decode::<Vec<u64>>("blocked").is_err(), "trailing bytes are corruption");
         store.close().unwrap();
         drop(store);
         fs_cleanup(path);
@@ -531,11 +510,7 @@ mod tests {
         store.shared.fail_commits.store(1, Ordering::SeqCst);
         store.kv_put("name", vec![1]);
         // Fails, either itself or because the background commit just did.
-        assert!(
-            store
-                .kv_batch_durable(vec![("request".into(), Some(vec![1]))])
-                .is_err()
-        );
+        assert!(store.kv_batch_durable(vec![("request".into(), Some(vec![1]))]).is_err());
         assert!(store.failure().is_some());
         assert!(store.flush().is_err());
         assert!(store.check_writable().is_err());
@@ -609,12 +584,7 @@ mod tests {
     fn atomic_security_batch_survives_reopen() {
         let (path, store) = test_store();
         store.kv_put("requests", vec![1]);
-        store
-            .kv_batch_durable(vec![
-                ("requests".into(), None),
-                ("hidden".into(), Some(vec![2])),
-            ])
-            .unwrap();
+        store.kv_batch_durable(vec![("requests".into(), None), ("hidden".into(), Some(vec![2]))]).unwrap();
         store.close().unwrap();
         drop(store);
         let reopened = DbStore::open(&path).unwrap();
@@ -628,7 +598,9 @@ mod tests {
     #[tokio::test]
     async fn unreadable_records_are_set_aside_and_startup_continues() {
         let dir = std::env::temp_dir().join(format!(
-            "mycel-corrupt-startup-{}-{}", std::process::id(), mycel_crypto::random_u64()
+            "mycel-corrupt-startup-{}-{}",
+            std::process::id(),
+            mycel_crypto::random_u64()
         ));
         let runtime = crate::Runtime::open(&dir, crate::api::NetworkMode::Local, None).await.unwrap();
         let id = runtime.profile().id;

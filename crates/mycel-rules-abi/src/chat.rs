@@ -44,21 +44,13 @@ pub struct AttachmentRef {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChatOp {
     /// 0
-    Text {
-        body: String,
-        reply_to: Option<Hash32>,
-        attachments: Vec<AttachmentRef>,
-    },
+    Text { body: String, reply_to: Option<Hash32>, attachments: Vec<AttachmentRef> },
     /// 1
     Edit { target: Hash32, body: String },
     /// 2
     Delete { target: Hash32 },
     /// 3
-    React {
-        target: Hash32,
-        emoji: String,
-        on: bool,
-    },
+    React { target: Hash32, emoji: String, on: bool },
     /// 4: "I have read everything up to and including `up_to`".
     Receipt { up_to: Hash32 },
     /// 5: the author's display name in this conversation.

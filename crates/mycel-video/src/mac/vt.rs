@@ -110,7 +110,10 @@ impl PixelBuffer {
     pub fn luma(&self) -> Result<(usize, usize, Vec<u8>)> {
         unsafe {
             let fmt = CVPixelBufferGetPixelFormatType(self.0);
-            ensure!(fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || fmt == u32::from_be_bytes(*b"420f"), "not NV12");
+            ensure!(
+                fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange || fmt == u32::from_be_bytes(*b"420f"),
+                "not NV12"
+            );
             CVPixelBufferLockBaseAddress(self.0, kCVPixelBufferLock_ReadOnly);
             let (w, h) = (CVPixelBufferGetWidth(self.0), CVPixelBufferGetHeight(self.0));
             let base = CVPixelBufferGetBaseAddressOfPlane(self.0, 0);
@@ -147,7 +150,13 @@ struct Encoded {
 
 type EncOut = mpsc::Sender<Result<Encoded>>;
 
-unsafe extern "C-unwind" fn on_encoded(refcon: *mut c_void, _src: *mut c_void, status: OSStatus, flags: u32, sb: CMSampleBufferRef) {
+unsafe extern "C-unwind" fn on_encoded(
+    refcon: *mut c_void,
+    _src: *mut c_void,
+    status: OSStatus,
+    flags: u32,
+    sb: CMSampleBufferRef,
+) {
     // SAFETY: refcon is the session's boxed sender, alive until after invalidate.
     let tx = unsafe { &*(refcon as *const EncOut) };
     if std::env::var_os("MYCEL_VIDEO_DEBUG").is_some() {
@@ -185,7 +194,8 @@ unsafe fn read_sample(sb: CMSampleBufferRef) -> Result<Encoded> {
             let desc = CMSampleBufferGetFormatDescription(sb);
             let set = |i: usize| -> Result<Vec<u8>> {
                 let (mut p, mut n, mut count, mut hl) = (null(), 0usize, 0usize, 0i32);
-                let rc = CMVideoFormatDescriptionGetH264ParameterSetAtIndex(desc, i, &mut p, &mut n, &mut count, &mut hl);
+                let rc =
+                    CMVideoFormatDescriptionGetH264ParameterSetAtIndex(desc, i, &mut p, &mut n, &mut count, &mut hl);
                 ensure!(rc == 0 && !p.is_null(), "no H.264 parameter set {i} ({rc})");
                 ensure!(hl == 4, "unexpected NAL length size {hl}");
                 Ok(std::slice::from_raw_parts(p, n).to_vec())
@@ -223,7 +233,11 @@ impl H264Encoder {
         let low = dict(&[(unsafe { kVTVideoEncoderSpecification_EnableLowLatencyRateControl }, &yes)]);
         let mut session: VTSessionRef = null_mut();
         let mut low_latency = false;
-        let specs = if std::env::var_os("MYCEL_VIDEO_NO_LOW_LATENCY").is_some() { vec![null()] } else { vec![cf(&*low), null()] };
+        let specs = if std::env::var_os("MYCEL_VIDEO_NO_LOW_LATENCY").is_some() {
+            vec![null()]
+        } else {
+            vec![cf(&*low), null()]
+        };
         for spec in specs {
             session = null_mut();
             let rc = unsafe {
@@ -266,9 +280,23 @@ impl H264Encoder {
             #[cfg(target_os = "macos")]
             {
                 let mut hw: CFTypeRef = null();
-                let rc = VTSessionCopyProperty(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder, null(), &mut hw);
+                let rc = VTSessionCopyProperty(
+                    session,
+                    kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                    null(),
+                    &mut hw,
+                );
                 if std::env::var_os("MYCEL_VIDEO_DEBUG").is_some() {
-                    eprintln!("[video] hardware query: rc {rc} value {}", if hw.is_null() { "none" } else if hw == kCFBooleanTrue { "true" } else { "false" });
+                    eprintln!(
+                        "[video] hardware query: rc {rc} value {}",
+                        if hw.is_null() {
+                            "none"
+                        } else if hw == kCFBooleanTrue {
+                            "true"
+                        } else {
+                            "false"
+                        }
+                    );
                 }
                 if rc == 0 && !hw.is_null() {
                     enc.hardware = Some(hw == kCFBooleanTrue);
@@ -417,7 +445,9 @@ impl H264Decoder {
         let ptrs = [sps.as_ptr(), pps.as_ptr()];
         let sizes = [sps.len(), pps.len()];
         let mut fmt: CMFormatDescriptionRef = null_mut();
-        let rc = unsafe { CMVideoFormatDescriptionCreateFromH264ParameterSets(null(), 2, ptrs.as_ptr(), sizes.as_ptr(), 4, &mut fmt) };
+        let rc = unsafe {
+            CMVideoFormatDescriptionCreateFromH264ParameterSets(null(), 2, ptrs.as_ptr(), sizes.as_ptr(), 4, &mut fmt)
+        };
         ensure!(rc == 0 && !fmt.is_null(), "bad H.264 parameter sets ({rc})");
         let pf = int(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange as i64);
         let attrs = dict(&[(unsafe { kCVPixelBufferPixelFormatTypeKey }, &pf)]);
@@ -543,11 +573,7 @@ mod tests {
 
     #[test]
     fn portrait_and_four_three_camera_frames_keep_their_shape() {
-        for (source_w, source_h, w, h) in [
-            (720, 1280, 288, 512),
-            (1280, 960, 240, 180),
-            (960, 1280, 192, 256),
-        ] {
+        for (source_w, source_h, w, h) in [(720, 1280, 288, 512), (1280, 960, 240, 180), (960, 1280, 192, 256)] {
             let mut enc = H264Encoder::new(w, h, 30, 350_000).unwrap();
             let mut dec = H264Decoder::default();
             let mut source = draw(0, source_w, source_h);
@@ -571,10 +597,7 @@ mod tests {
             let (lw, lh, luma) = pic.luma().unwrap();
             let horizontal = (0..lw).filter(|x| luma[(lh / 2) * lw + x] > 180).count();
             let vertical = (0..lh).filter(|y| luma[y * lw + lw / 2] > 180).count();
-            assert!(
-                horizontal > 20 && vertical > 20,
-                "circle survives compression"
-            );
+            assert!(horizontal > 20 && vertical > 20, "circle survives compression");
             assert!(
                 horizontal.abs_diff(vertical) <= 4,
                 "{source_w}x{source_h} => {w}x{h}: circle is {horizontal}x{vertical}"

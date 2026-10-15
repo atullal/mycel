@@ -92,10 +92,7 @@ pub fn parse_advert(pk: Option<&[u8]>, name: Option<&[u8]>) -> Option<Advert> {
         .and_then(|n| std::str::from_utf8(n).ok())
         .map(|n| truncate_utf8(n.trim(), MAX_NAME).to_string())
         .filter(|n| !n.is_empty());
-    Some(Advert {
-        key: SignPk(key),
-        name,
-    })
+    Some(Advert { key: SignPk(key), name })
 }
 
 fn truncate_utf8(s: &str, max: usize) -> &str {
@@ -159,10 +156,7 @@ mod tests {
         let get = |k: &str| e.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_slice());
         assert_eq!(
             parse_advert(get(TXT_KEY), get(TXT_NAME)),
-            Some(Advert {
-                key: me,
-                name: Some("Alice's MacBook".into())
-            })
+            Some(Advert { key: me, name: Some("Alice's MacBook".into()) })
         );
         assert_eq!(parse_advert(get(TXT_KEY), None).unwrap().name, None);
         assert_eq!(parse_advert(get(TXT_KEY), Some(b"  ")).unwrap().name, None);
@@ -173,12 +167,7 @@ mod tests {
         assert_eq!(parse_advert(None, Some(b"x")), None);
         assert_eq!(parse_advert(Some(b"abcd"), None), None);
         assert_eq!(parse_advert(Some(&[b'z'; 64]), None), None);
-        assert!(
-            parse_advert(Some(&[b'A'; 64]), Some(&[0xff, 0xfe]))
-                .unwrap()
-                .name
-                .is_none()
-        );
+        assert!(parse_advert(Some(&[b'A'; 64]), Some(&[0xff, 0xfe])).unwrap().name.is_none());
     }
 
     #[test]

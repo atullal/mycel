@@ -31,7 +31,10 @@ use anyhow::{Context as _, Result};
 use bluer::adv::Advertisement;
 use bluer::gatt::local::{Application, Characteristic, CharacteristicRead, Service};
 use bluer::l2cap::{Security, SecurityLevel, Socket, SocketAddr, Stream, StreamListener};
-use bluer::{Adapter, AdapterEvent, AdapterProperty, Address, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport, Uuid};
+use bluer::{
+    Adapter, AdapterEvent, AdapterProperty, Address, DeviceEvent, DeviceProperty, DiscoveryFilter, DiscoveryTransport,
+    Uuid,
+};
 use bytes::Bytes;
 use futures_util::{FutureExt, StreamExt};
 use parking_lot::Mutex;
@@ -315,7 +318,10 @@ impl Driver {
                 Cmd::Connect(pid) => {
                     tokio::spawn(async move {
                         let r = match d.device(&pid) {
-                            Some(dev) => tokio::time::timeout(OP_TIMEOUT, dev.connect()).await.map_err(|_| None).and_then(|r| r.map_err(Some)),
+                            Some(dev) => tokio::time::timeout(OP_TIMEOUT, dev.connect())
+                                .await
+                                .map_err(|_| None)
+                                .and_then(|r| r.map_err(Some)),
                             None => Err(None),
                         };
                         match r {
@@ -324,7 +330,10 @@ impl Driver {
                                 d.input(Input::Connected(pid));
                             }
                             Err(e) => {
-                                info(format_args!("connect to {pid} failed: {}", e.map_or("timed out".into(), |e| e.to_string())));
+                                info(format_args!(
+                                    "connect to {pid} failed: {}",
+                                    e.map_or("timed out".into(), |e| e.to_string())
+                                ));
                                 d.input(Input::ConnectFailed(pid));
                             }
                         }
@@ -482,7 +491,10 @@ impl Driver {
             }
         });
         self.chans.lock().insert(chan, Chan { reader, writer });
-        info(format_args!("L2CAP channel {chan} open ({})", pid.as_deref().map_or("accepted".into(), |p| format!("dialed to {p}"))));
+        info(format_args!(
+            "L2CAP channel {chan} open ({})",
+            pid.as_deref().map_or("accepted".into(), |p| format!("dialed to {p}"))
+        ));
         self.input(Input::ChannelOpened { chan, pid });
     }
 

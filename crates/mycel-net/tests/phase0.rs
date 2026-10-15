@@ -70,9 +70,7 @@ async fn phase0_end_to_end() {
     }
 
     let doc = Replica::new_doc_id();
-    bob.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "headline", "Mayor resigns")))
-        .unwrap()
-        .unwrap();
+    bob.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "headline", "Mayor resigns"))).unwrap().unwrap();
     bob.sync_with(keeper.id(), space, false).await.unwrap();
     keeper
         .with_space(&space, |r| {
@@ -81,15 +79,9 @@ async fn phase0_end_to_end() {
         })
         .unwrap();
     carol.sync_with(keeper.id(), space, false).await.unwrap();
-    assert_eq!(
-        carol.with_space(&space, |r| r.doc_json(&doc)).unwrap(),
-        json!({"headline": "Mayor resigns"})
-    );
+    assert_eq!(carol.with_space(&space, |r| r.doc_json(&doc)).unwrap(), json!({"headline": "Mayor resigns"}));
 
-    let (_, env) = carol
-        .with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "headline", "FAKE")))
-        .unwrap()
-        .unwrap();
+    let (_, env) = carol.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "headline", "FAKE"))).unwrap().unwrap();
     let env_id = env.unwrap().id();
     carol.sync_with(keeper.id(), space, false).await.unwrap();
     alice.sync_with(keeper.id(), space, false).await.unwrap();
@@ -105,10 +97,7 @@ async fn phase0_end_to_end() {
     assert!(err.to_string().contains("denied"), "{err}");
 
     alice.with_space(&space, |r| r.remove_member(bob.id())).unwrap().unwrap();
-    alice
-        .with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "source", "confidential")))
-        .unwrap()
-        .unwrap();
+    alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "source", "confidential"))).unwrap().unwrap();
     alice.sync_with(keeper.id(), space, false).await.unwrap();
     let err = bob.sync_with(keeper.id(), space, false).await.unwrap_err();
     assert!(err.to_string().contains("denied"), "{err}");
@@ -140,10 +129,7 @@ async fn invites_and_live_sync_without_manual_calls() {
         .unwrap()
         .unwrap();
     let feed = StreamId::named(StreamKind::Feed, "messages");
-    alice
-        .with_space(&space, |r| r.append(feed, b"welcome".to_vec()))
-        .unwrap()
-        .unwrap();
+    alice.with_space(&space, |r| r.append(feed, b"welcome".to_vec())).unwrap().unwrap();
     alice.changed(space); // the scheduler pushes the space (invite) to bob & carol
 
     eventually("bob accepts invite", || bob.space_ids().contains(&space)).await;
@@ -157,25 +143,18 @@ async fn invites_and_live_sync_without_manual_calls() {
     .await
     .unwrap();
     assert_eq!(added, (space, alice.id()));
-    eventually("bob has welcome", || {
-        bob.with_space(&space, |r| r.feed_len(&feed)).unwrap() == 1
-    })
-    .await;
+    eventually("bob has welcome", || bob.with_space(&space, |r| r.feed_len(&feed)).unwrap() == 1).await;
 
     // Bob replies; carol gets it with no explicit sync calls.
     bob.with_space(&space, |r| r.append(feed, b"hi from bob".to_vec())).unwrap().unwrap();
     bob.changed(space);
     eventually("carol sees bob", || {
-        carol.space_ids().contains(&space)
-            && carol.with_space(&space, |r| r.feed_len(&feed)).unwrap() == 2
+        carol.space_ids().contains(&space) && carol.with_space(&space, |r| r.feed_len(&feed)).unwrap() == 2
     })
     .await;
     // delivery tracking: bob learns that carol and alice hold his message
     let bob_msg = bob.with_space(&space, |r| r.feed(&feed)[1].id).unwrap();
-    eventually("holders known", || {
-        bob.with_space(&space, |r| r.holders(&bob_msg).len()).unwrap() == 2
-    })
-    .await;
+    eventually("holders known", || bob.with_space(&space, |r| r.holders(&bob_msg).len()).unwrap() == 2).await;
 
     for n in [alice, bob, carol] {
         n.shutdown().await.unwrap();
@@ -196,10 +175,7 @@ async fn invite_policy_can_refuse() {
     let alice = nodes.pop().unwrap();
     alice.add_peer_addr(target.addr());
     let (space, _) = alice.create_space().unwrap();
-    alice
-        .with_space(&space, |r| r.add_member(target.keys().public(), Role::Writer))
-        .unwrap()
-        .unwrap();
+    alice.with_space(&space, |r| r.add_member(target.keys().public(), Role::Writer)).unwrap().unwrap();
     let err = alice.sync_with(target.id(), space, false).await.unwrap_err();
     assert!(err.to_string().contains("denied"), "{err}");
     assert!(target.space_ids().is_empty());
@@ -276,8 +252,7 @@ async fn lan_discovery_via_mdns() {
         .unwrap();
     alice.changed(space);
     eventually("bob got message over LAN", || {
-        bob.space_ids().contains(&space)
-            && bob.with_space(&space, |r| r.feed_len(&feed)).unwrap() == 1
+        bob.space_ids().contains(&space) && bob.with_space(&space, |r| r.feed_len(&feed)).unwrap() == 1
     })
     .await;
     alice.shutdown().await.unwrap();

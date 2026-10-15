@@ -22,11 +22,9 @@ const COMPRESSED_CHANGE: u8 = 2;
 /// Parse a change received from anyone, within the network-wide limits.
 pub(super) fn parse(bytes: &[u8]) -> Result<Change> {
     let raw = preflight(bytes, &READ)?;
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        Change::try_from(raw.as_ref())
-    }))
-    .map_err(|_| SyncError::Encoding)?
-    .map_err(|_| SyncError::Encoding)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| Change::try_from(raw.as_ref())))
+        .map_err(|_| SyncError::Encoding)?
+        .map_err(|_| SyncError::Encoding)
 }
 
 /// Check a locally produced change against `limits` without parsing its ops.
@@ -92,11 +90,7 @@ fn inflate_bounded(compressed: &[u8], max: usize) -> Result<Vec<u8>> {
         let before_out = decoder.total_out() as usize;
         let available = scratch.len().min(max + 1 - output.len());
         let status = decoder
-            .decompress(
-                &compressed[before_in..],
-                &mut scratch[..available],
-                FlushDecompress::None,
-            )
+            .decompress(&compressed[before_in..], &mut scratch[..available], FlushDecompress::None)
             .map_err(|_| SyncError::Encoding)?;
         let produced = decoder.total_out() as usize - before_out;
         output.extend_from_slice(&scratch[..produced]);
@@ -106,11 +100,7 @@ fn inflate_bounded(compressed: &[u8], max: usize) -> Result<Vec<u8>> {
         if status == Status::StreamEnd {
             // A second stream or bytes hidden after the DEFLATE terminator are
             // not part of a single Automerge change.
-            return if decoder.total_in() as usize == compressed.len() {
-                Ok(output)
-            } else {
-                Err(SyncError::Encoding)
-            };
+            return if decoder.total_in() as usize == compressed.len() { Ok(output) } else { Err(SyncError::Encoding) };
         }
         if decoder.total_in() as usize == before_in && produced == 0 {
             return Err(SyncError::Encoding); // truncated or stalled stream
@@ -193,16 +183,8 @@ mod tests {
         trailing.push(0);
         let mut concatenated = plain.clone();
         concatenated.extend_from_slice(&plain);
-        for bytes in [
-            bad_magic,
-            bad_checksum,
-            overflow,
-            unterminated,
-            noncanonical,
-            truncated,
-            trailing,
-            concatenated,
-        ] {
+        for bytes in [bad_magic, bad_checksum, overflow, unterminated, noncanonical, truncated, trailing, concatenated]
+        {
             assert!(matches!(parse(&bytes), Err(SyncError::Encoding)));
         }
     }
@@ -216,16 +198,8 @@ mod tests {
         trailing.extend_from_slice(&[0, 1]);
         let mut concatenated = payload.to_vec();
         concatenated.extend_from_slice(payload);
-        for invalid in [
-            payload[..payload.len() - 1].to_vec(),
-            trailing,
-            concatenated,
-            vec![0xff],
-        ] {
-            assert!(matches!(
-                parse(&frame(COMPRESSED_CHANGE, checksum, &invalid)),
-                Err(SyncError::Encoding)
-            ));
+        for invalid in [payload[..payload.len() - 1].to_vec(), trailing, concatenated, vec![0xff]] {
+            assert!(matches!(parse(&frame(COMPRESSED_CHANGE, checksum, &invalid)), Err(SyncError::Encoding)));
         }
     }
 
@@ -235,14 +209,10 @@ mod tests {
         let mut expanded = base.decode();
         // The change's extra bytes are opaque metadata with no length prefix;
         // compensate for the few extra ULEB bytes in the larger outer frame.
-        expanded
-            .extra_bytes
-            .resize(MAX_DOC_CHANGE_BYTES - base.raw_bytes().len(), 0);
+        expanded.extra_bytes.resize(MAX_DOC_CHANGE_BYTES - base.raw_bytes().len(), 0);
         let candidate = Change::from(expanded.clone());
         let over = candidate.raw_bytes().len() - MAX_DOC_CHANGE_BYTES;
-        expanded
-            .extra_bytes
-            .truncate(expanded.extra_bytes.len() - over);
+        expanded.extra_bytes.truncate(expanded.extra_bytes.len() - over);
         let mut exact = Change::from(expanded.clone());
         assert_eq!(exact.raw_bytes().len(), MAX_DOC_CHANGE_BYTES);
         assert!(parse(exact.raw_bytes()).is_ok());
@@ -250,35 +220,20 @@ mod tests {
         expanded.extra_bytes.push(0);
         let mut oversized = Change::from(expanded);
         assert_eq!(oversized.raw_bytes().len(), MAX_DOC_CHANGE_BYTES + 1);
-        assert!(matches!(
-            parse(oversized.raw_bytes()),
-            Err(SyncError::TooLarge)
-        ));
-        assert!(matches!(
-            parse(&oversized.bytes()),
-            Err(SyncError::TooLarge)
-        ));
+        assert!(matches!(parse(oversized.raw_bytes()), Err(SyncError::TooLarge)));
+        assert!(matches!(parse(&oversized.bytes()), Err(SyncError::TooLarge)));
     }
 
     #[test]
     fn expansion_bomb_is_bounded_before_change_body_parsing() {
-        let mut encoder =
-            flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
-        encoder
-            .write_all(&vec![0; MAX_DOC_CHANGE_BYTES * 4])
-            .unwrap();
+        let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(&vec![0; MAX_DOC_CHANGE_BYTES * 4]).unwrap();
         let compressed = encoder.finish().unwrap();
         assert!(compressed.len() < 128 * 1024);
-        assert!(matches!(
-            parse(&frame(COMPRESSED_CHANGE, &[0; 4], &compressed)),
-            Err(SyncError::TooLarge)
-        ));
+        assert!(matches!(parse(&frame(COMPRESSED_CHANGE, &[0; 4], &compressed)), Err(SyncError::TooLarge)));
         // These types must be rejected without interpreting their body.
         for kind in [0, 3] {
-            assert!(matches!(
-                parse(&frame(kind, &[0; 4], &compressed)),
-                Err(SyncError::Encoding)
-            ));
+            assert!(matches!(parse(&frame(kind, &[0; 4], &compressed)), Err(SyncError::Encoding)));
         }
     }
 
@@ -411,11 +366,13 @@ mod automerge_format {
             let len = read(&mut input) as usize;
             input = &input[len..];
         }
-        (0..read(&mut input)).map(|_| {
-            let spec = read(&mut input);
-            read(&mut input);
-            spec
-        }).collect()
+        (0..read(&mut input))
+            .map(|_| {
+                let spec = read(&mut input);
+                read(&mut input);
+                spec
+            })
+            .collect()
     }
 
     #[test]
@@ -427,9 +384,12 @@ mod automerge_format {
 
     #[test]
     fn automerge_still_writes_the_audited_bytes() {
-        let fresh: Vec<Vec<u8>> =
-            crate::change_ops::tests::fixtures().iter().map(|c| c.raw_bytes().to_vec()).collect();
-        assert_eq!(fresh.iter().map(|b| hex(b)).collect::<Vec<_>>(), stored().iter().map(|b| hex(b)).collect::<Vec<_>>(), "{REAUDIT}");
+        let fresh: Vec<Vec<u8>> = crate::change_ops::tests::fixtures().iter().map(|c| c.raw_bytes().to_vec()).collect();
+        assert_eq!(
+            fresh.iter().map(|b| hex(b)).collect::<Vec<_>>(),
+            stored().iter().map(|b| hex(b)).collect::<Vec<_>>(),
+            "{REAUDIT}"
+        );
     }
 
     #[test]
@@ -458,8 +418,7 @@ mod automerge_format {
         if std::env::var_os("MYCEL_WRITE_FIXTURES").is_none() {
             return;
         }
-        let lines: String =
-            crate::change_ops::tests::fixtures().iter().map(|c| hex(c.raw_bytes()) + "\n").collect();
+        let lines: String = crate::change_ops::tests::fixtures().iter().map(|c| hex(c.raw_bytes()) + "\n").collect();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/src/fixtures/automerge-0.12.0-changes.hex");
         std::fs::write(path, lines).unwrap();
     }

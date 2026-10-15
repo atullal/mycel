@@ -22,10 +22,10 @@ use super::vt::PixelBuffer;
 use crate::source::{Picture, PictureSink, SourceHandle, VideoSource, wall_us};
 
 #[cfg(target_os = "macos")]
-pub const CAMERA_DENIED: &str =
-    "Mycel isn't allowed to use the camera. Allow it in System Settings > Privacy & Security > Camera, then turn the camera on again.";
+pub const CAMERA_DENIED: &str = "Mycel isn't allowed to use the camera. Allow it in System Settings > Privacy & Security > Camera, then turn the camera on again.";
 #[cfg(target_os = "ios")]
-pub const CAMERA_DENIED: &str = "Mycel isn't allowed to use the camera. Turn it on in Settings > Mycel, then turn the camera on again.";
+pub const CAMERA_DENIED: &str =
+    "Mycel isn't allowed to use the camera. Turn it on in Settings > Mycel, then turn the camera on again.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CameraPermission {

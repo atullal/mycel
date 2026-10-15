@@ -3,9 +3,7 @@
 //! Advertisements are untrusted hints. QUIC still authenticates the endpoint key.
 use iroh::{
     EndpointId,
-    address_lookup::{
-        AddressLookup, EndpointData, EndpointInfo, Error, Item, MemoryLookup, UserData,
-    },
+    address_lookup::{AddressLookup, EndpointData, EndpointInfo, Error, Item, MemoryLookup, UserData},
 };
 use iroh_mdns_address_lookup::DiscoveryEvent;
 use n0_future::boxed::BoxStream;
@@ -57,16 +55,7 @@ unsafe extern "C" {
         iface: u32,
         ty: *const c_char,
         domain: *const c_char,
-        cb: unsafe extern "C" fn(
-            Ref,
-            u32,
-            u32,
-            i32,
-            *const c_char,
-            *const c_char,
-            *const c_char,
-            *mut c_void,
-        ),
+        cb: unsafe extern "C" fn(Ref, u32, u32, i32, *const c_char, *const c_char, *const c_char, *mut c_void),
         ctx: *mut c_void,
     ) -> i32;
     fn DNSServiceQueryRecord(
@@ -76,19 +65,7 @@ unsafe extern "C" {
         fullname: *const c_char,
         rrtype: u16,
         rrclass: u16,
-        cb: unsafe extern "C" fn(
-            Ref,
-            u32,
-            u32,
-            i32,
-            *const c_char,
-            u16,
-            u16,
-            u16,
-            *const c_void,
-            u32,
-            *mut c_void,
-        ),
+        cb: unsafe extern "C" fn(Ref, u32, u32, i32, *const c_char, u16, u16, u16, *const c_void, u32, *mut c_void),
         ctx: *mut c_void,
     ) -> i32;
     fn DNSServiceConstructFullName(
@@ -103,16 +80,7 @@ unsafe extern "C" {
         iface: u32,
         protocol: u32,
         host: *const c_char,
-        cb: unsafe extern "C" fn(
-            Ref,
-            u32,
-            u32,
-            i32,
-            *const c_char,
-            *const libc::sockaddr,
-            u32,
-            *mut c_void,
-        ),
+        cb: unsafe extern "C" fn(Ref, u32, u32, i32, *const c_char, *const libc::sockaddr, u32, *mut c_void),
         ctx: *mut c_void,
     ) -> i32;
     fn DNSServiceRegister(
@@ -126,17 +94,7 @@ unsafe extern "C" {
         port: u16,
         txt_len: u16,
         txt: *const c_void,
-        cb: Option<
-            unsafe extern "C" fn(
-                Ref,
-                u32,
-                i32,
-                *const c_char,
-                *const c_char,
-                *const c_char,
-                *mut c_void,
-            ),
-        >,
+        cb: Option<unsafe extern "C" fn(Ref, u32, i32, *const c_char, *const c_char, *const c_char, *mut c_void)>,
         ctx: *mut c_void,
     ) -> i32;
     fn DNSServiceUpdateRecord(
@@ -204,10 +162,7 @@ impl Operation {
             eprintln!("[mycel] native Bonjour operation failed: {err}");
             return None;
         }
-        Some(Self {
-            raw,
-            _context: context,
-        })
+        Some(Self { raw, _context: context })
     }
 }
 // DNS-SD strings are NUL terminated by the system API, not arbitrary packet
@@ -236,9 +191,7 @@ unsafe extern "C" fn browse(
         return;
     }
     let (Some(name), Some(ty), Some(domain)) =
-        (unsafe { string(name) }, unsafe { string(ty) }, unsafe {
-            string(domain)
-        })
+        (unsafe { string(name) }, unsafe { string(ty) }, unsafe { string(domain) })
     else {
         return;
     };
@@ -246,15 +199,7 @@ unsafe extern "C" fn browse(
         return;
     }
     let c = unsafe { &*(ctx as *const Context) };
-    c.send(Event::Browse(
-        ServiceKey {
-            name,
-            ty,
-            domain,
-            iface,
-        },
-        flags & ADD != 0,
-    ));
+    c.send(Event::Browse(ServiceKey { name, ty, domain, iface }, flags & ADD != 0));
 }
 /// An SRV record's target name, from its uncompressed wire format into the
 /// presentation form DNSServiceGetAddrInfo takes.
@@ -312,11 +257,8 @@ unsafe extern "C" fn record(
     if len > 4096 || (len > 0 && rdata.is_null()) {
         return;
     }
-    let rdata = if len == 0 {
-        &[][..]
-    } else {
-        unsafe { std::slice::from_raw_parts(rdata.cast::<u8>(), len as usize) }
-    };
+    let rdata =
+        if len == 0 { &[][..] } else { unsafe { std::slice::from_raw_parts(rdata.cast::<u8>(), len as usize) } };
     let add = flags & ADD != 0;
     match rrtype {
         RR_SRV => {
@@ -359,10 +301,7 @@ unsafe extern "C" fn address(
     };
     // Scoped IPv6 needs an interface-aware address type that Iroh does not
     // expose here. IPv4 and routable IPv6 still work; never publish a bad scope.
-    if ip.is_unspecified()
-        || ip.is_multicast()
-        || matches!(ip,IpAddr::V6(v) if v.is_unicast_link_local())
-    {
+    if ip.is_unspecified() || ip.is_multicast() || matches!(ip,IpAddr::V6(v) if v.is_unicast_link_local()) {
         return;
     }
     c.send(Event::Address(key.clone(), target.clone(), ip, flags & ADD != 0));
@@ -579,332 +518,334 @@ impl NativeMdns {
             use std::os::fd::AsRawFd;
             wake.read.as_raw_fd()
         };
-        let shared = Arc::new(Shared {
-            published: Mutex::new(None),
-            stopped: AtomicBool::new(false),
-            wake,
-        });
+        let shared = Arc::new(Shared { published: Mutex::new(None), stopped: AtomicBool::new(false), wake });
         let memory = MemoryLookup::with_provenance("native_bonjour");
         let (out, rx) = tokio::sync::mpsc::channel(1024);
         let weak = Arc::downgrade(&shared);
         let lookup = memory.clone();
-        std::thread::Builder::new()
-            .name("mycel.bonjour".into())
-            .spawn(move || {
-                let (tx, events) = mpsc::sync_channel(1024);
-                let context = |key: Option<ServiceKey>, target: Option<Target>, overflow: &Arc<AtomicBool>| Context {
-                    overflow: overflow.clone(),
-                    tx: tx.clone(),
-                    key,
-                    target,
+        std::thread::Builder::new().name("mycel.bonjour".into()).spawn(move || {
+            let (tx, events) = mpsc::sync_channel(1024);
+            let context = |key: Option<ServiceKey>, target: Option<Target>, overflow: &Arc<AtomicBool>| Context {
+                overflow: overflow.clone(),
+                tx: tx.clone(),
+                key,
+                target,
+            };
+            let name = CString::new(instance_name(me)).expect("base32 has no NUL");
+            let mut browser: Option<Operation> = None;
+            let mut browse_at = Instant::now();
+            let mut registration: Option<Registration> = None;
+            let mut register_at = Instant::now();
+            let mut register_backoff = Duration::from_secs(5);
+            let mut txt_due: Option<Instant> = None;
+            let mut unregister_due: Option<Instant> = None;
+            let mut peers: BTreeMap<ServiceKey, Peer> = BTreeMap::new();
+            let mut known: BTreeMap<EndpointId, EndpointData> = BTreeMap::new();
+            let mut missing: BTreeMap<EndpointId, Instant> = BTreeMap::new();
+            let overflow = Arc::new(AtomicBool::new(false));
+            loop {
+                let Some(s) = weak.upgrade() else {
+                    break;
                 };
-                let name = CString::new(instance_name(me)).expect("base32 has no NUL");
-                let mut browser: Option<Operation> = None;
-                let mut browse_at = Instant::now();
-                let mut registration: Option<Registration> = None;
-                let mut register_at = Instant::now();
-                let mut register_backoff = Duration::from_secs(5);
-                let mut txt_due: Option<Instant> = None;
-                let mut unregister_due: Option<Instant> = None;
-                let mut peers: BTreeMap<ServiceKey, Peer> = BTreeMap::new();
-                let mut known: BTreeMap<EndpointId, EndpointData> = BTreeMap::new();
-                let mut missing: BTreeMap<EndpointId, Instant> = BTreeMap::new();
-                let overflow = Arc::new(AtomicBool::new(false));
-                loop {
-                    let Some(s) = weak.upgrade() else {
-                        break;
-                    };
-                    if s.stopped.load(Ordering::Acquire) || out.is_closed() {
-                        break;
-                    }
-                    s.wake.drain();
-                    let desired = desired_txt(s.published.lock().as_ref(), bound_port);
-                    drop(s);
-                    let now = Instant::now();
+                if s.stopped.load(Ordering::Acquire) || out.is_closed() {
+                    break;
+                }
+                s.wake.drain();
+                let desired = desired_txt(s.published.lock().as_ref(), bound_port);
+                drop(s);
+                let now = Instant::now();
 
-                    if browser.is_none() && now >= browse_at {
-                        browser = Operation::new(context(None, None, &overflow), |r, c| unsafe {
-                            DNSServiceBrowse(r, 0, 0, SERVICE.as_ptr(), c"local.".as_ptr(), browse, c)
-                        });
-                        browse_at = now + Duration::from_secs(5);
-                    }
+                if browser.is_none() && now >= browse_at {
+                    browser = Operation::new(context(None, None, &overflow), |r, c| unsafe {
+                        DNSServiceBrowse(r, 0, 0, SERVICE.as_ptr(), c"local.".as_ptr(), browse, c)
+                    });
+                    browse_at = now + Duration::from_secs(5);
+                }
 
-                    // Our registration follows `desired`: registered once,
-                    // TXT updated in place (debounced), withdrawn only after
-                    // the addresses have been gone a while.
-                    match (&desired, &mut registration) {
-                        (Some(txt), None) if browser.is_some() && now >= register_at => {
-                            let flags = NO_AUTO_RENAME;
-                            registration = Operation::new(context(None, None, &overflow), |r, c| unsafe {
-                                DNSServiceRegister(
-                                    r,
-                                    flags,
+                // Our registration follows `desired`: registered once,
+                // TXT updated in place (debounced), withdrawn only after
+                // the addresses have been gone a while.
+                match (&desired, &mut registration) {
+                    (Some(txt), None) if browser.is_some() && now >= register_at => {
+                        let flags = NO_AUTO_RENAME;
+                        registration = Operation::new(context(None, None, &overflow), |r, c| unsafe {
+                            DNSServiceRegister(
+                                r,
+                                flags,
+                                0,
+                                name.as_ptr(),
+                                SERVICE.as_ptr(),
+                                c"local.".as_ptr(),
+                                std::ptr::null(),
+                                bound_port.to_be(),
+                                txt.len() as u16,
+                                txt.as_ptr().cast(),
+                                Some(registered),
+                                c,
+                            )
+                        })
+                        .map(|op| Registration { op, txt: txt.clone() });
+                        if registration.is_none() {
+                            register_at = now + register_backoff;
+                        }
+                        txt_due = None;
+                        unregister_due = None;
+                    }
+                    (Some(txt), Some(reg)) => {
+                        unregister_due = None;
+                        if *txt == reg.txt {
+                            txt_due = None;
+                        } else if txt_due.is_some_and(|due| now >= due) {
+                            // An empty TXT record is a single empty string.
+                            let rdata: &[u8] = if txt.is_empty() { &[0] } else { txt };
+                            let err = unsafe {
+                                DNSServiceUpdateRecord(
+                                    reg.op.raw,
+                                    std::ptr::null_mut(),
                                     0,
-                                    name.as_ptr(),
-                                    SERVICE.as_ptr(),
-                                    c"local.".as_ptr(),
-                                    std::ptr::null(),
-                                    bound_port.to_be(),
-                                    txt.len() as u16,
-                                    txt.as_ptr().cast(),
-                                    Some(registered),
-                                    c,
+                                    rdata.len() as u16,
+                                    rdata.as_ptr().cast(),
+                                    0,
                                 )
-                            })
-                            .map(|op| Registration { op, txt: txt.clone() });
-                            if registration.is_none() {
-                                register_at = now + register_backoff;
+                            };
+                            if err == 0 {
+                                reg.txt = txt.clone();
+                            } else {
+                                eprintln!("[mycel] native Bonjour TXT update failed: {err}");
+                                registration = None;
+                                register_at = now;
                             }
                             txt_due = None;
-                            unregister_due = None;
+                        } else if txt_due.is_none() {
+                            txt_due = Some(now + TXT_DEBOUNCE);
                         }
-                        (Some(txt), Some(reg)) => {
-                            unregister_due = None;
-                            if *txt == reg.txt {
-                                txt_due = None;
-                            } else if txt_due.is_some_and(|due| now >= due) {
-                                // An empty TXT record is a single empty string.
-                                let rdata: &[u8] = if txt.is_empty() { &[0] } else { txt };
-                                let err = unsafe {
-                                    DNSServiceUpdateRecord(
-                                        reg.op.raw,
-                                        std::ptr::null_mut(),
-                                        0,
-                                        rdata.len() as u16,
-                                        rdata.as_ptr().cast(),
-                                        0,
-                                    )
-                                };
-                                if err == 0 {
-                                    reg.txt = txt.clone();
-                                } else {
-                                    eprintln!("[mycel] native Bonjour TXT update failed: {err}");
-                                    registration = None;
-                                    register_at = now;
-                                }
-                                txt_due = None;
-                            } else if txt_due.is_none() {
-                                txt_due = Some(now + TXT_DEBOUNCE);
-                            }
-                        }
-                        (None, Some(_)) => match unregister_due {
-                            Some(due) if now >= due => {
-                                registration = None;
-                                unregister_due = None;
-                            }
-                            Some(_) => {}
-                            None => unregister_due = Some(now + UNREGISTER_DELAY),
-                        },
-                        _ => {}
                     }
+                    (None, Some(_)) => match unregister_due {
+                        Some(due) if now >= due => {
+                            registration = None;
+                            unregister_due = None;
+                        }
+                        Some(_) => {}
+                        None => unregister_due = Some(now + UNREGISTER_DELAY),
+                    },
+                    _ => {}
+                }
 
-                    // Each peer: its SRV and TXT records (kept open, so
-                    // changes arrive), and each SRV target's addresses.
-                    for (key, p) in &mut peers {
-                        if (p.srv.is_none() || p.txt.is_none()) && now >= p.retry_at {
-                            if let Some(full) = full_name(key) {
-                                for (slot, rrtype) in [(&mut p.srv, RR_SRV), (&mut p.txt, RR_TXT)] {
-                                    if slot.is_none() {
-                                        *slot = Operation::new(context(Some(key.clone()), None, &overflow), |r, c| unsafe {
-                                            DNSServiceQueryRecord(r, 0, key.iface, full.as_ptr(), rrtype, CLASS_IN, record, c)
+                // Each peer: its SRV and TXT records (kept open, so
+                // changes arrive), and each SRV target's addresses.
+                for (key, p) in &mut peers {
+                    if (p.srv.is_none() || p.txt.is_none()) && now >= p.retry_at {
+                        if let Some(full) = full_name(key) {
+                            for (slot, rrtype) in [(&mut p.srv, RR_SRV), (&mut p.txt, RR_TXT)] {
+                                if slot.is_none() {
+                                    *slot =
+                                        Operation::new(context(Some(key.clone()), None, &overflow), |r, c| unsafe {
+                                            DNSServiceQueryRecord(
+                                                r,
+                                                0,
+                                                key.iface,
+                                                full.as_ptr(),
+                                                rrtype,
+                                                CLASS_IN,
+                                                record,
+                                                c,
+                                            )
                                         });
-                                    }
                                 }
                             }
-                            p.retry_at = now + Duration::from_secs(5);
                         }
-                        for (target, a) in &mut p.targets {
-                            if a.op.is_none() && now >= a.retry_at {
-                                if let Ok(host) = CString::new(target.0.as_str()) {
-                                    a.op = Operation::new(context(Some(key.clone()), Some(target.clone()), &overflow), |r, c| unsafe {
+                        p.retry_at = now + Duration::from_secs(5);
+                    }
+                    for (target, a) in &mut p.targets {
+                        if a.op.is_none() && now >= a.retry_at {
+                            if let Ok(host) = CString::new(target.0.as_str()) {
+                                a.op = Operation::new(
+                                    context(Some(key.clone()), Some(target.clone()), &overflow),
+                                    |r, c| unsafe {
                                         DNSServiceGetAddrInfo(r, 0, key.iface, 3, host.as_ptr(), address, c)
+                                    },
+                                );
+                            }
+                            a.retry_at = now + Duration::from_secs(5);
+                        }
+                    }
+                }
+
+                // Block until the system's responder has something for
+                // us, we're woken (publication, shutdown), or the next
+                // timer is due.
+                let mut deadlines: Vec<Instant> = vec![now + MAX_WAIT];
+                if browser.is_none() {
+                    deadlines.push(browse_at);
+                }
+                if desired.is_some() && registration.is_none() {
+                    deadlines.push(register_at);
+                }
+                deadlines.extend(txt_due);
+                deadlines.extend(unregister_due);
+                for p in peers.values() {
+                    if p.srv.is_none() || p.txt.is_none() {
+                        deadlines.push(p.retry_at);
+                    }
+                    deadlines.extend(p.targets.values().filter(|a| a.op.is_none()).map(|a| a.retry_at));
+                }
+                deadlines.extend(missing.values().map(|since| *since + EXPIRY_GRACE));
+                let wait = deadlines.into_iter().min().unwrap_or(now).saturating_duration_since(now);
+
+                let mut ready = Vec::new();
+                if let Some(b) = &browser {
+                    ready.push(b.raw);
+                }
+                ready.extend(registration.iter().map(|r| r.op.raw));
+                ready.extend(peers.values().flat_map(|p| p.ops().map(|o| o.raw)));
+                let mut fds: Vec<_> = std::iter::once(wake_fd)
+                    .chain(ready.iter().map(|r| unsafe { DNSServiceRefSockFD(*r) }))
+                    .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+                    .collect();
+                let ms = wait.as_millis().clamp(1, MAX_WAIT.as_millis()) as libc::c_int;
+                unsafe {
+                    libc::poll(fds.as_mut_ptr(), fds.len() as _, ms);
+                }
+                let mut failed = BTreeSet::new();
+                for (r, fd) in ready.iter().zip(&fds[1..]) {
+                    if fd.revents != 0
+                        && (fd.revents & libc::POLLIN == 0 || unsafe { DNSServiceProcessResult(*r) } != 0)
+                    {
+                        failed.insert(*r as usize);
+                    }
+                }
+                if browser.as_ref().is_some_and(|b| failed.contains(&(b.raw as usize))) {
+                    browser = None;
+                    peers.clear();
+                }
+                if registration.as_ref().is_some_and(|r| failed.contains(&(r.op.raw as usize))) {
+                    registration = None;
+                    register_at = Instant::now() + register_backoff;
+                }
+                let gone = |o: &Option<Operation>| o.as_ref().is_some_and(|o| failed.contains(&(o.raw as usize)));
+                for p in peers.values_mut() {
+                    if gone(&p.srv) || gone(&p.txt) {
+                        p.srv = None;
+                        p.txt = None;
+                        p.targets.clear();
+                    }
+                    for a in p.targets.values_mut() {
+                        if gone(&a.op) {
+                            a.op = None;
+                            a.ips.clear();
+                        }
+                    }
+                }
+                if overflow.swap(false, Ordering::AcqRel) {
+                    // A dropped callback may have been a removal. Rebuild a
+                    // complete browser snapshot rather than retain stale peers.
+                    browser = None;
+                    peers.clear();
+                    browse_at = Instant::now();
+                    while events.try_recv().is_ok() {}
+                }
+                for ev in events.try_iter().take(1024) {
+                    match ev {
+                        Event::Restart => {
+                            // The browser failed: browse again shortly.
+                            // Our registration is independent of it.
+                            browser = None;
+                            peers.clear();
+                            browse_at = Instant::now() + Duration::from_secs(5);
+                        }
+                        Event::RegisterFailed(conflict) => {
+                            registration = None;
+                            if conflict {
+                                // Another responder already answers for
+                                // our endpoint id (the same identity on a
+                                // second device, or a stale record). Keep
+                                // browsing; try our name again later
+                                // rather than advertise a renamed one.
+                                eprintln!(
+                                    "[mycel] native Bonjour: our name is taken on this network; retrying in {} s",
+                                    register_backoff.as_secs()
+                                );
+                            } else {
+                                eprintln!("[mycel] native Bonjour registration failed; retrying");
+                            }
+                            register_at = Instant::now() + register_backoff;
+                            register_backoff = (register_backoff * 2).min(Duration::from_secs(300));
+                        }
+                        Event::Browse(key, true)
+                            if key.name.parse::<EndpointId>().ok() != Some(me) && peers.len() < MAX_SERVICES =>
+                        {
+                            peers.entry(key).or_insert_with(Peer::new);
+                        }
+                        Event::Browse(key, false) => {
+                            peers.remove(&key);
+                        }
+                        Event::Srv(key, target, add) => {
+                            if let Some(p) = peers.get_mut(&key) {
+                                if !add {
+                                    p.targets.remove(&target);
+                                } else if p.targets.len() < 8 {
+                                    p.targets.entry(target).or_insert_with(|| Addresses {
+                                        op: None,
+                                        ips: BTreeSet::new(),
+                                        retry_at: Instant::now(),
                                     });
                                 }
-                                a.retry_at = now + Duration::from_secs(5);
                             }
                         }
-                    }
-
-                    // Block until the system's responder has something for
-                    // us, we're woken (publication, shutdown), or the next
-                    // timer is due.
-                    let mut deadlines: Vec<Instant> = vec![now + MAX_WAIT];
-                    if browser.is_none() {
-                        deadlines.push(browse_at);
-                    }
-                    if desired.is_some() && registration.is_none() {
-                        deadlines.push(register_at);
-                    }
-                    deadlines.extend(txt_due);
-                    deadlines.extend(unregister_due);
-                    for p in peers.values() {
-                        if p.srv.is_none() || p.txt.is_none() {
-                            deadlines.push(p.retry_at);
+                        Event::Txt(key, user) => {
+                            if let Some(p) = peers.get_mut(&key) {
+                                p.user = user;
+                            }
                         }
-                        deadlines.extend(p.targets.values().filter(|a| a.op.is_none()).map(|a| a.retry_at));
-                    }
-                    deadlines.extend(missing.values().map(|since| *since + EXPIRY_GRACE));
-                    let wait = deadlines.into_iter().min().unwrap_or(now).saturating_duration_since(now);
-
-                    let mut ready = Vec::new();
-                    if let Some(b) = &browser {
-                        ready.push(b.raw);
-                    }
-                    ready.extend(registration.iter().map(|r| r.op.raw));
-                    ready.extend(peers.values().flat_map(|p| p.ops().map(|o| o.raw)));
-                    let mut fds: Vec<_> = std::iter::once(wake_fd)
-                        .chain(ready.iter().map(|r| unsafe { DNSServiceRefSockFD(*r) }))
-                        .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
-                        .collect();
-                    let ms = wait.as_millis().clamp(1, MAX_WAIT.as_millis()) as libc::c_int;
-                    unsafe {
-                        libc::poll(fds.as_mut_ptr(), fds.len() as _, ms);
-                    }
-                    let mut failed = BTreeSet::new();
-                    for (r, fd) in ready.iter().zip(&fds[1..]) {
-                        if fd.revents != 0
-                            && (fd.revents & libc::POLLIN == 0
-                                || unsafe { DNSServiceProcessResult(*r) } != 0)
-                        {
-                            failed.insert(*r as usize);
+                        Event::Address(key, target, ip, add) => {
+                            if let Some(a) = peers.get_mut(&key).and_then(|p| p.targets.get_mut(&target)) {
+                                if add && a.ips.len() < 16 {
+                                    a.ips.insert(ip);
+                                } else if !add {
+                                    a.ips.remove(&ip);
+                                }
+                            }
                         }
-                    }
-                    if browser
-                        .as_ref()
-                        .is_some_and(|b| failed.contains(&(b.raw as usize)))
-                    {
-                        browser = None;
-                        peers.clear();
-                    }
-                    if registration.as_ref().is_some_and(|r| failed.contains(&(r.op.raw as usize))) {
-                        registration = None;
-                        register_at = Instant::now() + register_backoff;
-                    }
-                    let gone = |o: &Option<Operation>| o.as_ref().is_some_and(|o| failed.contains(&(o.raw as usize)));
-                    for p in peers.values_mut() {
-                        if gone(&p.srv) || gone(&p.txt) {
-                            p.srv = None;
-                            p.txt = None;
-                            p.targets.clear();
+                        Event::Failed(key, None) => {
+                            if let Some(p) = peers.get_mut(&key) {
+                                p.srv = None;
+                                p.txt = None;
+                                p.targets.clear();
+                                p.retry_at = Instant::now() + Duration::from_secs(5);
+                            }
                         }
-                        for a in p.targets.values_mut() {
-                            if gone(&a.op) {
+                        Event::Failed(key, Some(target)) => {
+                            if let Some(a) = peers.get_mut(&key).and_then(|p| p.targets.get_mut(&target)) {
                                 a.op = None;
                                 a.ips.clear();
+                                a.retry_at = Instant::now() + Duration::from_secs(5);
                             }
                         }
+                        _ => {}
                     }
-                    if overflow.swap(false, Ordering::AcqRel) {
-                        // A dropped callback may have been a removal. Rebuild a
-                        // complete browser snapshot rather than retain stale peers.
-                        browser = None;
-                        peers.clear();
-                        browse_at = Instant::now();
-                        while events.try_recv().is_ok() {}
-                    }
-                    for ev in events.try_iter().take(1024) {
-                        match ev {
-                            Event::Restart => {
-                                // The browser failed: browse again shortly.
-                                // Our registration is independent of it.
-                                browser = None;
-                                peers.clear();
-                                browse_at = Instant::now() + Duration::from_secs(5);
-                            }
-                            Event::RegisterFailed(conflict) => {
-                                registration = None;
-                                if conflict {
-                                    // Another responder already answers for
-                                    // our endpoint id (the same identity on a
-                                    // second device, or a stale record). Keep
-                                    // browsing; try our name again later
-                                    // rather than advertise a renamed one.
-                                    eprintln!(
-                                        "[mycel] native Bonjour: our name is taken on this network; retrying in {} s",
-                                        register_backoff.as_secs()
-                                    );
-                                } else {
-                                    eprintln!("[mycel] native Bonjour registration failed; retrying");
-                                }
-                                register_at = Instant::now() + register_backoff;
-                                register_backoff = (register_backoff * 2).min(Duration::from_secs(300));
-                            }
-                            Event::Browse(key, true)
-                                if key.name.parse::<EndpointId>().ok() != Some(me)
-                                    && peers.len() < MAX_SERVICES =>
-                            {
-                                peers.entry(key).or_insert_with(Peer::new);
-                            }
-                            Event::Browse(key, false) => {
-                                peers.remove(&key);
-                            }
-                            Event::Srv(key, target, add) => {
-                                if let Some(p) = peers.get_mut(&key) {
-                                    if !add {
-                                        p.targets.remove(&target);
-                                    } else if p.targets.len() < 8 {
-                                        p.targets.entry(target).or_insert_with(|| Addresses {
-                                            op: None,
-                                            ips: BTreeSet::new(),
-                                            retry_at: Instant::now(),
-                                        });
-                                    }
-                                }
-                            }
-                            Event::Txt(key, user) => {
-                                if let Some(p) = peers.get_mut(&key) {
-                                    p.user = user;
-                                }
-                            }
-                            Event::Address(key, target, ip, add) => {
-                                if let Some(a) = peers.get_mut(&key).and_then(|p| p.targets.get_mut(&target)) {
-                                    if add && a.ips.len() < 16 {
-                                        a.ips.insert(ip);
-                                    } else if !add {
-                                        a.ips.remove(&ip);
-                                    }
-                                }
-                            }
-                            Event::Failed(key, None) => {
-                                if let Some(p) = peers.get_mut(&key) {
-                                    p.srv = None;
-                                    p.txt = None;
-                                    p.targets.clear();
-                                    p.retry_at = Instant::now() + Duration::from_secs(5);
-                                }
-                            }
-                            Event::Failed(key, Some(target)) => {
-                                if let Some(a) = peers.get_mut(&key).and_then(|p| p.targets.get_mut(&target)) {
-                                    a.op = None;
-                                    a.ips.clear();
-                                    a.retry_at = Instant::now() + Duration::from_secs(5);
-                                }
-                            }
-                            _ => {}
-                        }
-                    }
-                    if registration.is_some() {
-                        register_backoff = Duration::from_secs(5);
-                    }
-                    let mut current: BTreeMap<EndpointId, EndpointData> = BTreeMap::new();
-                    for (key, p) in &peers {
-                        let addrs: Vec<SocketAddr> = p
-                            .targets
-                            .iter()
-                            .flat_map(|((_, port), a)| a.ips.iter().map(move |ip| SocketAddr::new(*ip, *port)))
-                            .collect();
-                        if !addrs.is_empty()
-                            && let Ok(id) = key.name.parse()
-                        {
-                            let data = current.entry(id).or_default();
-                            data.add_ip_addrs(addrs);
-                            data.set_user_data(p.user.clone());
-                        }
-                    }
-                    hold_departures(&known, &mut current, &mut missing, Instant::now());
-                    deliver_changes(&out, &lookup, &mut known, current);
                 }
-            })?;
+                if registration.is_some() {
+                    register_backoff = Duration::from_secs(5);
+                }
+                let mut current: BTreeMap<EndpointId, EndpointData> = BTreeMap::new();
+                for (key, p) in &peers {
+                    let addrs: Vec<SocketAddr> = p
+                        .targets
+                        .iter()
+                        .flat_map(|((_, port), a)| a.ips.iter().map(move |ip| SocketAddr::new(*ip, *port)))
+                        .collect();
+                    if !addrs.is_empty()
+                        && let Ok(id) = key.name.parse()
+                    {
+                        let data = current.entry(id).or_default();
+                        data.add_ip_addrs(addrs);
+                        data.set_user_data(p.user.clone());
+                    }
+                }
+                hold_departures(&known, &mut current, &mut missing, Instant::now());
+                deliver_changes(&out, &lookup, &mut known, current);
+            }
+        })?;
         Ok((Self { shared, memory }, rx))
     }
 }
@@ -916,16 +857,9 @@ fn deliver_changes(
     known: &mut BTreeMap<EndpointId, EndpointData>,
     current: BTreeMap<EndpointId, EndpointData>,
 ) {
-    let removed: Vec<_> = known
-        .keys()
-        .filter(|id| !current.contains_key(*id))
-        .copied()
-        .collect();
+    let removed: Vec<_> = known.keys().filter(|id| !current.contains_key(*id)).copied().collect();
     for id in removed {
-        if out
-            .try_send(DiscoveryEvent::Expired { endpoint_id: id })
-            .is_ok()
-        {
+        if out.try_send(DiscoveryEvent::Expired { endpoint_id: id }).is_ok() {
             lookup.remove_endpoint_info(id);
             known.remove(&id);
         }
@@ -935,13 +869,7 @@ fn deliver_changes(
             continue;
         }
         let info = EndpointInfo::from_parts(id, data.clone());
-        if out
-            .try_send(DiscoveryEvent::Discovered {
-                endpoint_info: info.clone(),
-                last_updated: None,
-            })
-            .is_ok()
-        {
+        if out.try_send(DiscoveryEvent::Discovered { endpoint_info: info.clone(), last_updated: None }).is_ok() {
             lookup.set_endpoint_info(info);
             known.insert(id, data);
         }
@@ -978,12 +906,7 @@ mod tests {
     fn callback_overflow_requests_complete_resync() {
         let (tx, _rx) = mpsc::sync_channel(1);
         let flag = Arc::new(AtomicBool::new(false));
-        let context = Context {
-            tx,
-            overflow: flag.clone(),
-            key: None,
-            target: None,
-        };
+        let context = Context { tx, overflow: flag.clone(), key: None, target: None };
         context.send(Event::Restart);
         assert!(!flag.load(Ordering::Acquire));
         context.send(Event::Restart);
@@ -994,16 +917,10 @@ mod tests {
     fn undelivered_transient_peer_cannot_leave_a_cached_address() {
         let peer = iroh::SecretKey::generate().public();
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        tx.try_send(DiscoveryEvent::Expired { endpoint_id: peer })
-            .unwrap();
+        tx.try_send(DiscoveryEvent::Expired { endpoint_id: peer }).unwrap();
         let memory = MemoryLookup::new();
         let mut known = BTreeMap::new();
-        deliver_changes(
-            &tx,
-            &memory,
-            &mut known,
-            BTreeMap::from([(peer, EndpointData::default())]),
-        );
+        deliver_changes(&tx, &memory, &mut known, BTreeMap::from([(peer, EndpointData::default())]));
         assert!(known.is_empty());
         assert!(memory.get_endpoint_info(peer).is_none());
         deliver_changes(&tx, &memory, &mut known, BTreeMap::new());
@@ -1017,12 +934,7 @@ mod tests {
         let mut context = Context {
             tx,
             overflow: flag.clone(),
-            key: Some(ServiceKey {
-                name: "peer".into(),
-                ty: "_iroh._udp".into(),
-                domain: "local.".into(),
-                iface: 1,
-            }),
+            key: Some(ServiceKey { name: "peer".into(), ty: "_iroh._udp".into(), domain: "local.".into(), iface: 1 }),
             target: Some(("peer-1.local.".into(), 1)),
         };
         context.send(Event::Restart);
@@ -1041,10 +953,7 @@ mod tests {
                 (&mut context as *mut Context).cast(),
             );
         }
-        assert!(
-            flag.load(Ordering::Acquire),
-            "lost address removal must trigger resync"
-        );
+        assert!(flag.load(Ordering::Acquire), "lost address removal must trigger resync");
     }
 
     #[test]
@@ -1064,9 +973,7 @@ mod tests {
         let b = iroh::SecretKey::generate().public();
         let (first, mut rx) = NativeMdns::start(a, 35490).unwrap();
         let (second, second_rx) = NativeMdns::start(b, 35491).unwrap();
-        let mut data = EndpointData::from(BTreeSet::from(["192.0.2.1:35491"
-            .parse::<SocketAddr>()
-            .unwrap()]));
+        let mut data = EndpointData::from(BTreeSet::from(["192.0.2.1:35491".parse::<SocketAddr>().unwrap()]));
         // A published endpoint can also carry a different external NAT port.
         // It must never create a second Bonjour instance or advertise that port.
         data.add_ip_addrs(vec!["203.0.113.2:54321".parse().unwrap()]);
@@ -1086,16 +993,14 @@ mod tests {
         .await
         .expect("native Bonjour did not find peer");
         assert!(info.data.ip_addrs().all(|a| a.port() == 35491));
-        assert_eq!(
-            info.data.user_data().unwrap().as_ref(),
-            "mycel:Native LAN test"
-        );
+        assert_eq!(info.data.user_data().unwrap().as_ref(), "mycel:Native LAN test");
         data.set_user_data(Some("mycel:Updated LAN test".parse().unwrap()));
         second.publish(&data);
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 if let Some(DiscoveryEvent::Discovered { endpoint_info, .. }) = rx.recv().await
-                    && endpoint_info.endpoint_id == b && endpoint_info .data .user_data() .is_some_and(|u| u.as_ref() == "mycel:Updated LAN test") 
+                    && endpoint_info.endpoint_id == b
+                    && endpoint_info.data.user_data().is_some_and(|u| u.as_ref() == "mycel:Updated LAN test")
                 {
                     break;
                 }
@@ -1171,18 +1076,12 @@ mod tests {
         let native_id = iroh::SecretKey::generate().public();
         let iroh_id = iroh::SecretKey::generate().public();
         let (native, mut native_rx) = NativeMdns::start(native_id, 35492).unwrap();
-        let mut data = EndpointData::from(BTreeSet::from(["192.0.2.1:35492"
-            .parse::<SocketAddr>()
-            .unwrap()]));
+        let mut data = EndpointData::from(BTreeSet::from(["192.0.2.1:35492".parse::<SocketAddr>().unwrap()]));
         data.set_user_data(Some("mycel:Native phone".parse().unwrap()));
         native.publish(&data);
-        let legacy = iroh_mdns_address_lookup::MdnsAddressLookup::builder()
-            .service_name("mycel")
-            .build(iroh_id)
-            .unwrap();
-        let mut legacy_data = EndpointData::from(BTreeSet::from(["192.0.2.2:35493"
-            .parse::<SocketAddr>()
-            .unwrap()]));
+        let legacy =
+            iroh_mdns_address_lookup::MdnsAddressLookup::builder().service_name("mycel").build(iroh_id).unwrap();
+        let mut legacy_data = EndpointData::from(BTreeSet::from(["192.0.2.2:35493".parse::<SocketAddr>().unwrap()]));
         // like a real laptop: its LAN socket and a NAT mapping on another port
         legacy_data.add_ip_addrs(vec!["203.0.113.9:54321".parse().unwrap()]);
         legacy_data.set_user_data(Some("mycel:Iroh laptop".parse().unwrap()));
@@ -1242,11 +1141,6 @@ mod tests {
         data.set_user_data(Some("mycel:Phone".parse().unwrap()));
         assert_eq!(parse_txt(&make_txt(&data)).unwrap().as_ref(), "mycel:Phone");
         assert!(parse_txt(&[250, b'x']).is_none());
-        assert!(
-            parse_txt(&[
-                13, b'u', b's', b'e', b'r', b'-', b'd', b'a', b't', b'a', b'=', 255, 255, 255
-            ])
-            .is_none()
-        );
+        assert!(parse_txt(&[13, b'u', b's', b'e', b'r', b'-', b'd', b'a', b't', b'a', b'=', 255, 255, 255]).is_none());
     }
 }

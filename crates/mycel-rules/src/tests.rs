@@ -7,23 +7,14 @@ const COUNTER_RULES: &[u8] = include_bytes!("../fixtures/counter_rules.wasm");
 
 const ALICE: [u8; 32] = [0xA1; 32];
 const BOB: [u8; 32] = [0xB0; 32];
-const FEED: StreamTag = StreamTag {
-    kind: StreamKind::Feed,
-    id: [7; 16],
-};
+const FEED: StreamTag = StreamTag { kind: StreamKind::Feed, id: [7; 16] };
 
 fn chat() -> RulesEngine {
     RulesEngine::load(CHAT_RULES).expect("chat rules load")
 }
 
 fn input(author: [u8; 32], role: RoleTag, op: &ChatOp, context: &[u8]) -> RuleInput {
-    RuleInput {
-        author,
-        author_role: role,
-        stream: FEED,
-        payload: encode(op),
-        context: context.to_vec(),
-    }
+    RuleInput { author, author_role: role, stream: FEED, payload: encode(op), context: context.to_vec() }
 }
 
 fn op_input(role: RoleTag, op: &ChatOp) -> RuleInput {
@@ -31,30 +22,15 @@ fn op_input(role: RoleTag, op: &ChatOp) -> RuleInput {
 }
 
 fn text(body: &str) -> ChatOp {
-    ChatOp::Text {
-        body: body.into(),
-        reply_to: None,
-        attachments: vec![],
-    }
+    ChatOp::Text { body: body.into(), reply_to: None, attachments: vec![] }
 }
 
 fn attachment(name: &str, mime: &str) -> AttachmentRef {
-    AttachmentRef {
-        blob: [1; 32],
-        key: [2; 32],
-        nonce: [3; 24],
-        name: name.into(),
-        mime: mime.into(),
-        size: 1234,
-    }
+    AttachmentRef { blob: [1; 32], key: [2; 32], nonce: [3; 24], name: name.into(), mime: mime.into(), size: 1234 }
 }
 
 fn with_attachments(atts: Vec<AttachmentRef>) -> ChatOp {
-    ChatOp::Text {
-        body: "see attached".into(),
-        reply_to: None,
-        attachments: atts,
-    }
+    ChatOp::Text { body: "see attached".into(), reply_to: None, attachments: atts }
 }
 
 fn rule(code: u32) -> Verdict {
@@ -89,73 +65,21 @@ fn chat_accepts_valid_ops() {
     let cases = [
         (RoleTag::Writer, text("hello")),
         (RoleTag::Admin, text("hello from admin")),
-        (
-            RoleTag::Writer,
-            ChatOp::Text {
-                body: "re".into(),
-                reply_to: Some(target),
-                attachments: vec![],
-            },
-        ),
+        (RoleTag::Writer, ChatOp::Text { body: "re".into(), reply_to: Some(target), attachments: vec![] }),
         (RoleTag::Writer, text(&"x".repeat(16 * 1024))),
-        (
-            RoleTag::Writer,
-            with_attachments(vec![attachment(&"n".repeat(256), &"m".repeat(256)); 10]),
-        ),
-        (
-            RoleTag::Writer,
-            ChatOp::Edit {
-                target,
-                body: "fixed".into(),
-            },
-        ),
+        (RoleTag::Writer, with_attachments(vec![attachment(&"n".repeat(256), &"m".repeat(256)); 10])),
+        (RoleTag::Writer, ChatOp::Edit { target, body: "fixed".into() }),
         // Edit/Delete of someone else's message passes validation: the chat reducer ignores
         // it (author-only edits are enforced over the causally ordered feed).
         (RoleTag::Writer, ChatOp::Delete { target }),
-        (
-            RoleTag::Writer,
-            ChatOp::React {
-                target,
-                emoji: "👍🏽".into(),
-                on: true,
-            },
-        ),
-        (
-            RoleTag::Writer,
-            ChatOp::React {
-                target,
-                emoji: "x".repeat(32),
-                on: false,
-            },
-        ),
+        (RoleTag::Writer, ChatOp::React { target, emoji: "👍🏽".into(), on: true }),
+        (RoleTag::Writer, ChatOp::React { target, emoji: "x".repeat(32), on: false }),
         (RoleTag::Reader, ChatOp::Receipt { up_to: target }),
         (RoleTag::Writer, ChatOp::Receipt { up_to: target }),
-        (
-            RoleTag::Writer,
-            ChatOp::Profile {
-                name: "n".repeat(64),
-            },
-        ),
-        (
-            RoleTag::Writer,
-            ChatOp::Profile {
-                name: String::new(),
-            },
-        ),
-        (
-            RoleTag::Admin,
-            ChatOp::Meta {
-                title: Some("Book club".into()),
-                direct: false,
-            },
-        ),
-        (
-            RoleTag::Admin,
-            ChatOp::Meta {
-                title: None,
-                direct: true,
-            },
-        ),
+        (RoleTag::Writer, ChatOp::Profile { name: "n".repeat(64) }),
+        (RoleTag::Writer, ChatOp::Profile { name: String::new() }),
+        (RoleTag::Admin, ChatOp::Meta { title: Some("Book club".into()), direct: false }),
+        (RoleTag::Admin, ChatOp::Meta { title: None, direct: true }),
     ];
     for (i, (role, op)) in cases.iter().enumerate() {
         let t = e.validate_traced(&op_input(*role, op));
@@ -171,118 +95,26 @@ fn chat_rejects_invalid_ops() {
         // role checks
         (RoleTag::Reader, text("hi"), codes::NOT_WRITER),
         (RoleTag::Relay, text("hi"), codes::NOT_WRITER),
-        (
-            RoleTag::Reader,
-            ChatOp::Edit {
-                target,
-                body: "x".into(),
-            },
-            codes::NOT_WRITER,
-        ),
-        (
-            RoleTag::Reader,
-            ChatOp::Delete { target },
-            codes::NOT_WRITER,
-        ),
-        (
-            RoleTag::Reader,
-            ChatOp::React {
-                target,
-                emoji: "x".into(),
-                on: true,
-            },
-            codes::NOT_WRITER,
-        ),
-        (
-            RoleTag::Reader,
-            ChatOp::Profile { name: "me".into() },
-            codes::NOT_WRITER,
-        ),
-        (
-            RoleTag::Relay,
-            ChatOp::Receipt { up_to: target },
-            codes::NOT_READER,
-        ),
-        (
-            RoleTag::Writer,
-            ChatOp::Meta {
-                title: None,
-                direct: false,
-            },
-            codes::NOT_ADMIN,
-        ),
-        (
-            RoleTag::Reader,
-            ChatOp::Meta {
-                title: None,
-                direct: false,
-            },
-            codes::NOT_ADMIN,
-        ),
+        (RoleTag::Reader, ChatOp::Edit { target, body: "x".into() }, codes::NOT_WRITER),
+        (RoleTag::Reader, ChatOp::Delete { target }, codes::NOT_WRITER),
+        (RoleTag::Reader, ChatOp::React { target, emoji: "x".into(), on: true }, codes::NOT_WRITER),
+        (RoleTag::Reader, ChatOp::Profile { name: "me".into() }, codes::NOT_WRITER),
+        (RoleTag::Relay, ChatOp::Receipt { up_to: target }, codes::NOT_READER),
+        (RoleTag::Writer, ChatOp::Meta { title: None, direct: false }, codes::NOT_ADMIN),
+        (RoleTag::Reader, ChatOp::Meta { title: None, direct: false }, codes::NOT_ADMIN),
         // size limits
-        (
-            RoleTag::Writer,
-            text(&"x".repeat(16 * 1024 + 1)),
-            codes::BODY_TOO_LONG,
-        ),
-        (
-            RoleTag::Writer,
-            ChatOp::Edit {
-                target,
-                body: "x".repeat(16 * 1024 + 1),
-            },
-            codes::BODY_TOO_LONG,
-        ),
-        (
-            RoleTag::Writer,
-            ChatOp::React {
-                target,
-                emoji: "x".repeat(33),
-                on: true,
-            },
-            codes::BAD_EMOJI,
-        ),
-        (
-            RoleTag::Writer,
-            ChatOp::React {
-                target,
-                emoji: String::new(),
-                on: false,
-            },
-            codes::BAD_EMOJI,
-        ),
-        (
-            RoleTag::Writer,
-            ChatOp::Profile {
-                name: "n".repeat(65),
-            },
-            codes::NAME_TOO_LONG,
-        ),
-        (
-            RoleTag::Admin,
-            ChatOp::Meta {
-                title: Some("t".repeat(257)),
-                direct: false,
-            },
-            codes::NAME_TOO_LONG,
-        ),
+        (RoleTag::Writer, text(&"x".repeat(16 * 1024 + 1)), codes::BODY_TOO_LONG),
+        (RoleTag::Writer, ChatOp::Edit { target, body: "x".repeat(16 * 1024 + 1) }, codes::BODY_TOO_LONG),
+        (RoleTag::Writer, ChatOp::React { target, emoji: "x".repeat(33), on: true }, codes::BAD_EMOJI),
+        (RoleTag::Writer, ChatOp::React { target, emoji: String::new(), on: false }, codes::BAD_EMOJI),
+        (RoleTag::Writer, ChatOp::Profile { name: "n".repeat(65) }, codes::NAME_TOO_LONG),
+        (RoleTag::Admin, ChatOp::Meta { title: Some("t".repeat(257)), direct: false }, codes::NAME_TOO_LONG),
         // attachments
+        (RoleTag::Writer, with_attachments(vec![attachment("a", "b"); 11]), codes::BAD_ATTACHMENT),
+        (RoleTag::Writer, with_attachments(vec![attachment(&"n".repeat(257), "image/png")]), codes::BAD_ATTACHMENT),
         (
             RoleTag::Writer,
-            with_attachments(vec![attachment("a", "b"); 11]),
-            codes::BAD_ATTACHMENT,
-        ),
-        (
-            RoleTag::Writer,
-            with_attachments(vec![attachment(&"n".repeat(257), "image/png")]),
-            codes::BAD_ATTACHMENT,
-        ),
-        (
-            RoleTag::Writer,
-            with_attachments(vec![
-                attachment("ok", "image/png"),
-                attachment("a.png", &"m".repeat(257)),
-            ]),
+            with_attachments(vec![attachment("ok", "image/png"), attachment("a.png", &"m".repeat(257))]),
             codes::BAD_ATTACHMENT,
         ),
     ];
@@ -346,28 +178,14 @@ fn chat_wire_format_matches_mycel_kit_chat() {
             Verdict::Accept,
         ),
         (
-            kit::ChatOp::Text {
-                body: "x".repeat(16 * 1024 + 1),
-                reply_to: None,
-                attachments: vec![],
-            },
-            ChatOp::Text {
-                body: "x".repeat(16 * 1024 + 1),
-                reply_to: None,
-                attachments: vec![],
-            },
+            kit::ChatOp::Text { body: "x".repeat(16 * 1024 + 1), reply_to: None, attachments: vec![] },
+            ChatOp::Text { body: "x".repeat(16 * 1024 + 1), reply_to: None, attachments: vec![] },
             RoleTag::Writer,
             rule(codes::BODY_TOO_LONG),
         ),
         (
-            kit::ChatOp::Edit {
-                target: H([5; 32]),
-                body: "edited".into(),
-            },
-            ChatOp::Edit {
-                target: [5; 32],
-                body: "edited".into(),
-            },
+            kit::ChatOp::Edit { target: H([5; 32]), body: "edited".into() },
+            ChatOp::Edit { target: [5; 32], body: "edited".into() },
             RoleTag::Writer,
             Verdict::Accept,
         ),
@@ -378,30 +196,14 @@ fn chat_wire_format_matches_mycel_kit_chat() {
             rule(codes::NOT_WRITER),
         ),
         (
-            kit::ChatOp::React {
-                target: H([7; 32]),
-                emoji: "🎉".into(),
-                on: true,
-            },
-            ChatOp::React {
-                target: [7; 32],
-                emoji: "🎉".into(),
-                on: true,
-            },
+            kit::ChatOp::React { target: H([7; 32]), emoji: "🎉".into(), on: true },
+            ChatOp::React { target: [7; 32], emoji: "🎉".into(), on: true },
             RoleTag::Writer,
             Verdict::Accept,
         ),
         (
-            kit::ChatOp::React {
-                target: H([7; 32]),
-                emoji: "🎉".into(),
-                on: false,
-            },
-            ChatOp::React {
-                target: [7; 32],
-                emoji: "🎉".into(),
-                on: false,
-            },
+            kit::ChatOp::React { target: H([7; 32]), emoji: "🎉".into(), on: false },
+            ChatOp::React { target: [7; 32], emoji: "🎉".into(), on: false },
             RoleTag::Admin,
             Verdict::Accept,
         ),
@@ -412,36 +214,20 @@ fn chat_wire_format_matches_mycel_kit_chat() {
             Verdict::Accept,
         ),
         (
-            kit::ChatOp::Profile {
-                name: "Alice".into(),
-            },
-            ChatOp::Profile {
-                name: "Alice".into(),
-            },
+            kit::ChatOp::Profile { name: "Alice".into() },
+            ChatOp::Profile { name: "Alice".into() },
             RoleTag::Writer,
             Verdict::Accept,
         ),
         (
-            kit::ChatOp::Meta {
-                title: Some("Team".into()),
-                direct: false,
-            },
-            ChatOp::Meta {
-                title: Some("Team".into()),
-                direct: false,
-            },
+            kit::ChatOp::Meta { title: Some("Team".into()), direct: false },
+            ChatOp::Meta { title: Some("Team".into()), direct: false },
             RoleTag::Writer,
             rule(codes::NOT_ADMIN),
         ),
         (
-            kit::ChatOp::Meta {
-                title: None,
-                direct: true,
-            },
-            ChatOp::Meta {
-                title: None,
-                direct: true,
-            },
+            kit::ChatOp::Meta { title: None, direct: true },
+            ChatOp::Meta { title: None, direct: true },
             RoleTag::Admin,
             Verdict::Accept,
         ),
@@ -455,23 +241,12 @@ fn chat_wire_format_matches_mycel_kit_chat() {
             "case {i}: abi decode of kit bytes"
         );
         assert_eq!(encode(abi_op), bytes, "case {i}: abi encoding differs");
-        assert_eq!(
-            kit::ChatOp::decode(&encode(abi_op)).as_ref(),
-            Some(kit_op),
-            "case {i}: kit decode"
-        );
-        let c = RuleInput {
-            author: ALICE,
-            author_role: *role,
-            stream: FEED,
-            payload: bytes,
-            context: vec![],
-        };
+        assert_eq!(kit::ChatOp::decode(&encode(abi_op)).as_ref(), Some(kit_op), "case {i}: kit decode");
+        let c = RuleInput { author: ALICE, author_role: *role, stream: FEED, payload: bytes, context: vec![] };
         assert_eq!(e.validate(&c), *verdict, "case {i}: verdict");
     }
     // Every kit variant is covered above (keeps this test honest when variants are added).
-    let covered: std::collections::BTreeSet<u8> =
-        cases.iter().map(|(k, ..)| k.encode()[0]).collect();
+    let covered: std::collections::BTreeSet<u8> = cases.iter().map(|(k, ..)| k.encode()[0]).collect();
     assert_eq!(covered, (0..7).collect());
 }
 
@@ -484,22 +259,11 @@ fn chat_fuel_is_well_within_budget() {
     assert!(t.fuel_used > 0);
     eprintln!("chat-rules fuel for a 16 KiB message: {}", t.fuel_used);
     // Max-size message uses well under 1/10 of the budget.
-    assert!(
-        t.fuel_used < Limits::V1.fuel / 10,
-        "fuel used: {}",
-        t.fuel_used
-    );
-    let atts = op_input(
-        RoleTag::Writer,
-        &with_attachments(vec![attachment(&"n".repeat(256), &"m".repeat(256)); 10]),
-    );
+    assert!(t.fuel_used < Limits::V1.fuel / 10, "fuel used: {}", t.fuel_used);
+    let atts = op_input(RoleTag::Writer, &with_attachments(vec![attachment(&"n".repeat(256), &"m".repeat(256)); 10]));
     let t = e.validate_traced(&atts);
     assert_eq!(t.result, Verdict::Accept);
-    assert!(
-        t.fuel_used < Limits::V1.fuel / 10,
-        "fuel used: {}",
-        t.fuel_used
-    );
+    assert!(t.fuel_used < Limits::V1.fuel / 10, "fuel used: {}", t.fuel_used);
 }
 
 #[test]
@@ -519,15 +283,7 @@ fn determinism_repeated_calls_and_fresh_engines() {
         input(ALICE, RoleTag::Writer, &text("hello"), &[]),
         input(ALICE, RoleTag::Reader, &text("hello"), &[]),
         input(ALICE, RoleTag::Writer, &ChatOp::Delete { target }, &[]),
-        input(
-            BOB,
-            RoleTag::Writer,
-            &ChatOp::Meta {
-                title: None,
-                direct: true,
-            },
-            &[],
-        ),
+        input(BOB, RoleTag::Writer, &ChatOp::Meta { title: None, direct: true }, &[]),
         input(ALICE, RoleTag::Writer, &text(&"y".repeat(20_000)), &[]),
     ];
     let reference: Vec<_> = {
@@ -540,10 +296,7 @@ fn determinism_repeated_calls_and_fresh_engines() {
         for (j, i) in inputs.iter().enumerate().rev() {
             let t = e.validate_traced(i);
             assert_eq!(t.result, reference[j].result, "round {round} input {j}");
-            assert_eq!(
-                t.fuel_used, reference[j].fuel_used,
-                "fuel round {round} input {j}"
-            );
+            assert_eq!(t.fuel_used, reference[j].fuel_used, "fuel round {round} input {j}");
         }
     }
     // Fresh engines (and a clone used from another thread).
@@ -552,9 +305,7 @@ fn determinism_repeated_calls_and_fresh_engines() {
         let e2 = e.clone();
         let inputs2 = inputs.clone();
         let from_thread =
-            std::thread::spawn(move || inputs2.iter().map(|i| e2.validate(i)).collect::<Vec<_>>())
-                .join()
-                .unwrap();
+            std::thread::spawn(move || inputs2.iter().map(|i| e2.validate(i)).collect::<Vec<_>>()).join().unwrap();
         for (j, i) in inputs.iter().enumerate() {
             assert_eq!(e.validate(i), reference[j].result);
             assert_eq!(from_thread[j], reference[j].result);
@@ -620,43 +371,21 @@ fn counter_reducer_folds_actions() {
     };
     let mut state = Vec::new();
     for n in [1u32, 2, 39] {
-        state = e
-            .reduce(&act(RoleTag::Writer, &CounterOp::Add(n)), &state)
-            .unwrap();
+        state = e.reduce(&act(RoleTag::Writer, &CounterOp::Add(n)), &state).unwrap();
     }
     assert_eq!(postcard_u64(&state), 42);
     // Rejections leave the caller's state untouched.
-    assert_eq!(
-        e.reduce(&act(RoleTag::Reader, &CounterOp::Add(1)), &state),
-        Err(Reason::Rule(2))
-    );
-    assert_eq!(
-        e.reduce(&act(RoleTag::Writer, &CounterOp::Reset), &state),
-        Err(Reason::Rule(3))
-    );
-    let reset = e
-        .reduce(&act(RoleTag::Admin, &CounterOp::Reset), &state)
-        .unwrap();
+    assert_eq!(e.reduce(&act(RoleTag::Reader, &CounterOp::Add(1)), &state), Err(Reason::Rule(2)));
+    assert_eq!(e.reduce(&act(RoleTag::Writer, &CounterOp::Reset), &state), Err(Reason::Rule(3)));
+    let reset = e.reduce(&act(RoleTag::Admin, &CounterOp::Reset), &state).unwrap();
     assert_eq!(postcard_u64(&reset), 0);
     // Overflow and a corrupt state are deterministic rejections.
     let max = encode(&u64::MAX);
-    assert_eq!(
-        e.reduce(&act(RoleTag::Writer, &CounterOp::Add(1)), &max),
-        Err(Reason::Rule(4))
-    );
-    assert_eq!(
-        e.reduce(&act(RoleTag::Writer, &CounterOp::Add(1)), &[0xff]),
-        Err(Reason::Rule(5))
-    );
+    assert_eq!(e.reduce(&act(RoleTag::Writer, &CounterOp::Add(1)), &max), Err(Reason::Rule(4)));
+    assert_eq!(e.reduce(&act(RoleTag::Writer, &CounterOp::Add(1)), &[0xff]), Err(Reason::Rule(5)));
     // validate agrees with reduce's authorization.
-    assert_eq!(
-        e.validate(&act(RoleTag::Writer, &CounterOp::Reset)),
-        rule(3)
-    );
-    assert_eq!(
-        e.validate(&act(RoleTag::Admin, &CounterOp::Reset)),
-        Verdict::Accept
-    );
+    assert_eq!(e.validate(&act(RoleTag::Writer, &CounterOp::Reset)), rule(3));
+    assert_eq!(e.validate(&act(RoleTag::Admin, &CounterOp::Reset)), Verdict::Accept);
 }
 
 fn postcard_u64(bytes: &[u8]) -> u64 {
@@ -678,24 +407,9 @@ fn reduce_input_ref_encoding_matches_abi_type() {
         input: &'a RuleInput,
         state: &'a [u8],
     }
-    let owned = ReduceInput {
-        input: i.clone(),
-        state: vec![5, 6, 7],
-    };
-    assert_eq!(
-        encode(&ReduceInputRef {
-            input: &i,
-            state: &[5, 6, 7]
-        }),
-        encode(&owned)
-    );
-    assert_eq!(
-        encode(&PlainSeq {
-            input: &i,
-            state: &[5, 6, 7]
-        }),
-        encode(&owned)
-    );
+    let owned = ReduceInput { input: i.clone(), state: vec![5, 6, 7] };
+    assert_eq!(encode(&ReduceInputRef { input: &i, state: &[5, 6, 7] }), encode(&owned));
+    assert_eq!(encode(&PlainSeq { input: &i, state: &[5, 6, 7] }), encode(&owned));
 }
 
 // ───────────────────────────── resource limits ─────────────────────────────
@@ -714,10 +428,7 @@ fn infinite_loop_runs_out_of_fuel_deterministically() {
     }
     assert!(details[0].contains("fuel"), "{}", details[0]);
     // With a smaller budget it still terminates the same way.
-    let small = Limits {
-        fuel: 1000,
-        ..Limits::V1
-    };
+    let small = Limits { fuel: 1000, ..Limits::V1 };
     let e = RulesEngine::new(RulesModule::load_with_limits(&wasm, small).unwrap());
     assert_eq!(e.validate(&c), Verdict::Reject(Reason::Trap));
 }
@@ -763,22 +474,10 @@ fn memory_bomb_is_capped() {
 #[test]
 fn oversized_input_is_a_trap_not_a_crash() {
     let e = RulesEngine::new(
-        RulesModule::load_with_limits(
-            CHAT_RULES,
-            Limits {
-                max_memory_bytes: 2 * 1024 * 1024,
-                ..Limits::V1
-            },
-        )
-        .unwrap(),
+        RulesModule::load_with_limits(CHAT_RULES, Limits { max_memory_bytes: 2 * 1024 * 1024, ..Limits::V1 }).unwrap(),
     );
     // Larger than the whole memory cap: rejected without running the guest.
-    let c = input(
-        ALICE,
-        RoleTag::Writer,
-        &text(&"x".repeat(3 * 1024 * 1024)),
-        &[],
-    );
+    let c = input(ALICE, RoleTag::Writer, &text(&"x".repeat(3 * 1024 * 1024)), &[]);
     assert_eq!(e.validate(&c), Verdict::Reject(Reason::Trap));
     // Fits the cap on its own, but the guest's copies don't: guest allocation fails -> trap.
     let c = input(ALICE, RoleTag::Writer, &text(&"x".repeat(1024 * 1024)), &[]);
@@ -826,10 +525,7 @@ fn out_of_bounds_alloc_is_bad_abi() {
 #[test]
 fn bad_reduce_output_is_bad_abi() {
     // Points the output at a range past the end of memory, then at garbage bytes.
-    for (ret, what) in [
-        ("0x0000fff000000100", "oob"),
-        ("0x0000000000000003", "garbage"),
-    ] {
+    for (ret, what) in [("0x0000fff000000100", "oob"), ("0x0000000000000003", "garbage")] {
         let wasm = wat::parse_str(format!(
             r#"(module (memory (export "memory") 1)
                 (func (export "mycel_abi_version") (result i32) i32.const 1)
@@ -843,12 +539,7 @@ fn bad_reduce_output_is_bad_abi() {
         let e = RulesEngine::load(&wasm).unwrap();
         let (p, l) = unpack_ptr_len(i64::from_str_radix(&ret[2..], 16).unwrap());
         let r = e.reduce_traced(&input(ALICE, RoleTag::Writer, &text("x"), &[]), &[]);
-        assert_eq!(
-            r.result,
-            Err(Reason::BadAbi),
-            "{what} ({p:#x}+{l}): {:?}",
-            r.detail
-        );
+        assert_eq!(r.result, Err(Reason::BadAbi), "{what} ({p:#x}+{l}): {:?}", r.detail);
     }
 }
 
@@ -863,10 +554,7 @@ fn float_ops_rejected_at_load() {
         "(call $f (i64.const 0))",
     );
     let err = load_err(&wasm);
-    assert!(
-        matches!(err, LoadError::Invalid(ref m) if m.contains("float")),
-        "{err}"
-    );
+    assert!(matches!(err, LoadError::Invalid(ref m) if m.contains("float")), "{err}");
     // A float-typed global, never used.
     let wasm = wat_guest("(global f32 (f32.const 0))", "(i64.const 0)");
     assert!(matches!(load_err(&wasm), LoadError::Invalid(_)));
@@ -877,10 +565,7 @@ fn float_ops_rejected_at_load() {
 
 #[test]
 fn simd_rejected_at_load() {
-    let wasm = wat_guest(
-        "(func (result v128) (v128.const i64x2 0 0))",
-        "(i64.const 0)",
-    );
+    let wasm = wat_guest("(func (result v128) (v128.const i64x2 0 0))", "(i64.const 0)");
     assert!(matches!(load_err(&wasm), LoadError::Invalid(_)));
 }
 
@@ -893,10 +578,7 @@ fn imports_rejected_at_load() {
         r#"(import "env" "t" (table 1 funcref))"#,
     ] {
         let wasm = wat_guest(import, "(i64.const 0)");
-        assert!(
-            matches!(load_err(&wasm), LoadError::ForbiddenImport { .. }),
-            "{import}"
-        );
+        assert!(matches!(load_err(&wasm), LoadError::ForbiddenImport { .. }), "{import}");
     }
     let imported_memory = wat::parse_str(
         r#"(module (import "env" "memory" (memory 1)) (export "memory" (memory 0))
@@ -905,10 +587,7 @@ fn imports_rejected_at_load() {
             (func (export "mycel_validate") (param i32 i32) (result i64) i64.const 0))"#,
     )
     .unwrap();
-    assert!(matches!(
-        load_err(&imported_memory),
-        LoadError::ForbiddenImport { .. }
-    ));
+    assert!(matches!(load_err(&imported_memory), LoadError::ForbiddenImport { .. }));
 }
 
 #[test]
@@ -926,18 +605,10 @@ fn abi_shape_enforced_at_load() {
             (func (export "mycel_alloc") (param i32) (result i32) i32.const 0))"#,
     )
     .unwrap();
-    assert!(matches!(
-        load_err(&no_validate),
-        LoadError::MissingExport("mycel_validate")
-    ));
-    let wrong_sig = wat_guest(
-        r#"(func (export "mycel_reduce") (param i32 i32) (result i32) i32.const 0)"#,
-        "(i64.const 0)",
-    );
-    assert!(matches!(
-        load_err(&wrong_sig),
-        LoadError::BadExportType("mycel_reduce")
-    ));
+    assert!(matches!(load_err(&no_validate), LoadError::MissingExport("mycel_validate")));
+    let wrong_sig =
+        wat_guest(r#"(func (export "mycel_reduce") (param i32 i32) (result i32) i32.const 0)"#, "(i64.const 0)");
+    assert!(matches!(load_err(&wrong_sig), LoadError::BadExportType("mycel_reduce")));
     let wrong_version = wat::parse_str(
         r#"(module (memory (export "memory") 1)
             (func (export "mycel_abi_version") (result i32) i32.const 2)
@@ -945,21 +616,9 @@ fn abi_shape_enforced_at_load() {
             (func (export "mycel_validate") (param i32 i32) (result i64) i64.const 0))"#,
     )
     .unwrap();
-    assert!(matches!(
-        load_err(&wrong_version),
-        LoadError::AbiVersion {
-            found: 2,
-            expected: 1
-        }
-    ));
-    let small = Limits {
-        max_module_bytes: 100,
-        ..Limits::V1
-    };
-    assert!(matches!(
-        RulesModule::load_with_limits(CHAT_RULES, small),
-        Err(LoadError::TooLarge { .. })
-    ));
+    assert!(matches!(load_err(&wrong_version), LoadError::AbiVersion { found: 2, expected: 1 }));
+    let small = Limits { max_module_bytes: 100, ..Limits::V1 };
+    assert!(matches!(RulesModule::load_with_limits(CHAT_RULES, small), Err(LoadError::TooLarge { .. })));
 }
 
 // ───────────────────────────── hashing ─────────────────────────────
@@ -972,14 +631,8 @@ fn hash_is_stable_and_domain_separated() {
         RulesHash::of(EMPTY_MODULE).to_string(),
         "80d7dd8898863822f4de644a03204437e2075b0681e72507d542c53a8268d8c4",
     );
-    assert_eq!(
-        RulesHash::of(CHAT_RULES).0,
-        blake3::derive_key("mycel/v0/rules-bundle", CHAT_RULES)
-    );
-    assert_ne!(
-        RulesHash::of(CHAT_RULES).0,
-        *blake3::hash(CHAT_RULES).as_bytes()
-    );
+    assert_eq!(RulesHash::of(CHAT_RULES).0, blake3::derive_key("mycel/v0/rules-bundle", CHAT_RULES));
+    assert_ne!(RulesHash::of(CHAT_RULES).0, *blake3::hash(CHAT_RULES).as_bytes());
 
     let e1 = chat();
     let e2 = chat();

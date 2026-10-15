@@ -95,8 +95,17 @@ pub enum Tech {
 }
 
 impl Tech {
-    pub const ALL: [Tech; 9] =
-        [Tech::Ble, Tech::Awdl, Tech::WifiDirect, Tech::WifiAp, Tech::WifiMesh, Tech::Ethernet, Tech::Uwb, Tech::Thread, Tech::OneBt];
+    pub const ALL: [Tech; 9] = [
+        Tech::Ble,
+        Tech::Awdl,
+        Tech::WifiDirect,
+        Tech::WifiAp,
+        Tech::WifiMesh,
+        Tech::Ethernet,
+        Tech::Uwb,
+        Tech::Thread,
+        Tech::OneBt,
+    ];
 
     pub fn kind(self) -> PathKind {
         match self {
@@ -296,8 +305,12 @@ pub fn backbone(km: f64) -> Duration {
 }
 
 /// Regional relay servers (lat, lon), like n0's: us-east, us-west, eu-central, ap-southeast.
-pub const RELAYS: [(&str, f64, f64); 4] =
-    [("us-east", 39.04, -77.49), ("us-west", 37.34, -121.89), ("eu-central", 50.11, 8.68), ("ap-southeast", 1.35, 103.82)];
+pub const RELAYS: [(&str, f64, f64); 4] = [
+    ("us-east", 39.04, -77.49),
+    ("us-west", 37.34, -121.89),
+    ("eu-central", 50.11, 8.68),
+    ("ap-southeast", 1.35, 103.82),
+];
 
 /// Great-circle km between two (lat, lon) points.
 pub fn km(a: (f64, f64), b: (f64, f64)) -> f64 {
@@ -306,11 +319,7 @@ pub fn km(a: (f64, f64), b: (f64, f64)) -> f64 {
 
 /// The nearest relay to a (lat, lon) point.
 pub fn nearest_relay(p: (f64, f64)) -> (f64, f64) {
-    RELAYS
-        .iter()
-        .map(|(_, la, lo)| (*la, *lo))
-        .min_by(|a, b| km(p, *a).total_cmp(&km(p, *b)))
-        .expect("relays")
+    RELAYS.iter().map(|(_, la, lo)| (*la, *lo)).min_by(|a, b| km(p, *a).total_cmp(&km(p, *b))).expect("relays")
 }
 
 #[cfg(test)]
