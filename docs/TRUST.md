@@ -190,7 +190,7 @@ A relay forwards QUIC packets of a connection between two other devices.
 - *Drop or delay traffic* (denial of service). Mitigations:
   - up to 3 routes per destination, through distinct neighbours, as separate QUIC paths, so traffic moves to the others when one goes dark (dead paths are noticed in about 3 s);
   - direct paths are always preferred.
-- *Claim a low cost to attract traffic* (black hole): costs aren't signed (each hop adds its own). The same mitigations apply. Route attestations (per-hop signatures) would be a later hardening.
+- *Claim a low cost to attract traffic* (black hole): costs aren't signed (each hop adds its own). A claim no honest relay can make (a relayed route with no hops, or under the least each hop adds) gets the neighbour distrusted for 10 minutes: the routes it gave go, the routes it relays are ignored, and it stays reachable itself (`docs/ROUTING.md` §6, item 12). A plausible lie (one hop from everyone, at the least cost) isn't caught: the same mitigations as for dropping apply. Route attestations (per-hop signatures) would be a later hardening.
 - *Replay old announcements of a device that left*, within the 10-minute window, keeping a dead route alive. That costs only failed attempts.
 
 **Load and abuse:**

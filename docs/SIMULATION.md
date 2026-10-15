@@ -103,7 +103,9 @@ marked *(gateways)* were rerun on 15 October with fixed 19, at a load
 average of ~40 (other agents' builds: their wall times are long); it
 leaves every other tier-2 scenario's numbers as they were (compared
 before and after at CI size, and at full size for those with
-gateways). The Mac was
+gateways). The row marked *(lying neighbours)* was rerun on 15 October
+with fixed 20; that fix leaves every other tier-2 scenario's numbers as
+they were, at CI and full size. The Mac was
 heavily loaded throughout the first runs: another agent's
 Java simulations, a host build and other apps, a load average of ~20 on
 18 cores, and 8 of 9 GB swap in use. Wall times are pessimistic, and the
@@ -136,7 +138,7 @@ machine it measured 500 nodes in 1.2 GB (§1).
 | `mailbox` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
 | `global-scale` | 2 | 2,002 devices (0.02) *(gateways)* | ✅ | global core + DTN: 100% delivered, p95 0.690 s, optimality p50 3.96× · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.119 s, p95 0.211 s, optimality p95 2.88× (was 4.45×, fixed 19; 32.2× before fixed 18) · control 706 B/s per device (was 8,470): routing 470, carrier 235 (was 8,004, fixed 17) · CI size (1,499 devices): warm optimality p95 2.65× (was 5.14×, failing) | 119 s |
 | `churn` | 2 | 1,001 devices (scale 0.1) *(gateways)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.5/17.1×; control 698 B/s per device: routing 2,659 → 469, carrier 4,540 → 256 (full size before the carrier fixes: 100%, p95 65.2 s) | 81 s |
-| `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 15.0 s, optimality p50/p95/p99 32.7/718/2015× · global core + DTN: clean 100%, attacked 100%, Sybil gateway 100% | 980 s |
+| `adversarial` | 2 | full *(lying neighbours)* | ✅ | global core + DTN: 100% delivered, p95 0.097 s, optimality p50/p95/p99 1.88/5.97/8.65× (was 82%, p95 1.28 s, 36.6/170/1570×, failing: fixed 20) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (reported, not judged): 76%, p95 91 s (open 14) · CI size (0.1): 100% (was 93%) | 657 s |
 | `trace-replay` | 2 | full *(control)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible, p50 4.7 s, p95 1259 s, optimality p50/p95/p99 1.22/8.38/18.0× (pipelining-aware oracle, fixed 12; 10.1× at 54cc562 after the routing changes), overhead 3.15 · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 103 s |
 | `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 53%, 68%, 83%, 92%, 93% | 0 s |
 
@@ -487,6 +489,37 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    devices (optimality p95 12.6 → 12.5×, control 707 → 698 B/s) move a
    little, the others not at all. What is left of the warm tail is
    open 13.
+20. **Black holes pulled in most traffic at full size** (`adversarial`
+   failed: 82% delivered against 90%; 93% at CI size). Traced per packet
+   (seed 1): all 54 undelivered messages were sent into a black hole,
+   and every retransmission took the same way. The scenario's 15 black
+   holes relay every route at zero cost. An announcement's hops and cost
+   aren't signed, so their neighbours believed them and routed through
+   them (210 of the 300 phones are next to one). Store-and-forward didn't
+   help: bundles followed the same routes, and two black holes next to
+   each other, each believing the other, handed every bundle back and
+   forth until the run ended. At CI size there are 4 black holes among
+   80 phones, and fewer routes cross one.
+
+   Fix (`mesh/core.rs`): a relayed announcement no honest relay can send
+   (zero hops from someone other than the origin, or a cost below 2.1 ms
+   a hop: `MIN_HOP_COST`, the least a hop adds) gets its sender
+   distrusted for 10 minutes. The routes it gave go at once, the routes
+   it relays are ignored (it isn't sent back seqnos it has), and it stays
+   reachable itself. Honest relays never trip it: no device distrusted a
+   neighbour in any other tier-2 scenario, nor in `churn_never_loops`;
+   released builds since dev-2026-10-08 keep the same invariant. No wire
+   change. Test
+   `a_neighbour_relaying_impossible_routes_is_not_routed_through`.
+
+   Full size, seed 1: delivered 82% → 100%, latency p95 1.28 → 0.097 s,
+   optimality p50/p95/p99 36.6/170/1570× → 1.88/5.97/8.65×; the Sybil
+   gateway run 299/300 → 300/300, p95 1.20 → 0.095 s. Control traffic
+   19.7 → 19.5 kB/s per device: routing 14.8 → 18.1 kB/s (the zero-cost
+   routes had cut honest flooding short; the run without attackers sends
+   17.3 kB/s in all), carrier 4.9 → 1.4 kB/s. CI size: 93% → 100%, p95
+   1.20 → 0.079 s. Every other tier-2 scenario gives identical numbers,
+   at CI and full size.
 
 ### Open (with evidence)
 
@@ -584,6 +617,26 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
      budgeted) is a design question, not a bug.
 
    Repro: `mycel-sim global-scale --scale 0.01 --seed 3`.
+14. **Black holes that lie plausibly aren't caught** (after fixed 20). A
+   liar that claims to be one hop from every origin at the least cost an
+   honest relay could report (2.1 ms) passes the check, and still pulls
+   in every route longer than about two hops. `adversarial` now also runs
+   such liars (the same 15 devices, which drop the bundles they take as
+   well) and reports the result without judging it: 76% delivered at
+   full size, p95 91 s; 80% at CI size. Fixed 20 doesn't change it (it
+   can't see them). Nothing in an announcement gives them away, so a
+   defence needs evidence from outside the metric:
+   - data-plane feedback: a source whose packets go unacknowledged moves
+     to another route. The node's Iroh multipath does this across up to 3
+     first hops, but further relays route through liars too when most of
+     the neighbourhood is next to one (70% of the phones here);
+   - store-and-forward that doesn't hand all of a bundle's copies along
+     the live route that just failed (the bundle exists because the live
+     attempt failed);
+   - signed metrics: per-hop route attestations (a wire change;
+     `docs/TRUST.md` §8b).
+
+   Repro: `mycel-sim adversarial` (its notes).
 
 ## 5. Benchmarks against external baselines
 

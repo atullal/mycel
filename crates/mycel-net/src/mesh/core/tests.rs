@@ -359,9 +359,10 @@ fn a_line_routes_hop_by_hop() {
 
 #[test]
 fn forged_stale_and_flooding_announcements_are_rejected() {
+    // relayed by a neighbour: one hop, as an honest relay sends it
     let ann = |origin, seq| Announce {
-        hops: 0,
-        cost: 0,
+        hops: 1,
+        cost: 100,
         origin,
         seq,
         flags: 0,
@@ -581,6 +582,68 @@ fn failed_dials_back_off() {
     r.hop_down(key(50), 7_000);
     r.send(key(50), key(50), Bytes::from_static(b"x"), false, 7_100);
     assert_eq!(dials(&mut r), 1);
+}
+
+/// A black hole claims every device is right next to it: relayed
+/// announcements at no cost (or as the origin itself). No honest relay can
+/// send that (each hop adds at least `MIN_HOP_COST`), so the neighbour is
+/// distrusted: the routes it gave go, the routes it relays are ignored for
+/// a while, and it stays reachable itself. A plausible claim, or a
+/// retraction, is never blamed.
+#[test]
+fn a_neighbour_relaying_impossible_routes_is_not_routed_through() {
+    let ann = |origin, seq, hops, cost| Announce {
+        hops,
+        cost,
+        origin,
+        seq,
+        flags: 0,
+        scope: 8,
+        uplink: 0,
+        name: Arc::from(""),
+        sig: Sig([0; 64]),
+    };
+    let (honest, liar, o, p, q) = (key(2), key(3), key(9), key(10), key(11));
+    let mut r = Router::new(key(1), Config::default());
+    for n in [honest, liar] {
+        r.set_direct(n, true, 0);
+        r.hop_up(n, 0);
+        r.set_cost(n, 100);
+    }
+    let ok = |_: &Announce| true;
+    r.on_announce(honest, ann(o, WALL, 2, 400), 10, WALL, ok);
+    r.on_announce(liar, ann(liar, WALL, 0, 0), 10, WALL, ok);
+    r.on_announce(liar, ann(q, WALL, 1, 50), 10, WALL, ok);
+    r.tick(20);
+    assert_eq!(r.next_hop_local(&o, 20), Some(honest));
+    assert_eq!(r.next_hop_local(&q, 20), Some(liar), "plausible: believed");
+    // a retraction may carry no hops: never blamed
+    r.on_announce(honest, Announce { cost: INFINITY, ..ann(p, WALL, 0, 0) }, 30, WALL, ok);
+    assert_eq!(r.stats().neighbours_distrusted, 0);
+    // "o is right here": impossible two hops out at no cost
+    r.on_announce(liar, ann(o, WALL + 1, 2, 0), 40, WALL, ok);
+    assert_eq!(r.stats().neighbours_distrusted, 1);
+    r.tick(50);
+    assert_eq!(r.next_hop_local(&o, 50), Some(honest));
+    assert_eq!(r.next_hop_local(&q, 50), None, "what it gave before goes too");
+    // what it relays now is ignored, even if plausible; it stays reachable itself
+    r.on_announce(liar, ann(p, WALL + 2, 1, 50), 60, WALL, ok);
+    r.on_announce(liar, ann(liar, WALL + 3, 0, 0), 60, WALL, ok);
+    r.tick(70);
+    assert_eq!(r.next_hop_local(&p, 70), None);
+    assert_eq!(r.route_hops(&liar, &liar), Some(1));
+    // as the origin, claiming no hops from somewhere else: impossible too
+    let mut r2 = Router::new(key(1), Config::default());
+    r2.set_direct(liar, true, 0);
+    r2.hop_up(liar, 0);
+    r2.on_announce(liar, ann(o, WALL, 0, 0), 10, WALL, ok);
+    assert_eq!(r2.stats().neighbours_distrusted, 1);
+    // after a while it gets another chance
+    let later = 40 + DISTRUST + 1;
+    r.tick(later);
+    r.on_announce(liar, ann(p, WALL + later, 1, 50), later, WALL + later, ok);
+    r.tick(later + 10);
+    assert_eq!(r.next_hop_local(&p, later + 10), Some(liar));
 }
 
 /// What a router did with one packet of ours: (dials, lookups, frames sent to).
@@ -917,6 +980,8 @@ fn churn_never_loops() {
     assert_eq!(net.frame_loops, 0);
     assert_eq!(route_loops, 0);
     assert!(delivered > 100);
+    // honest relays never send a route the plausibility check refuses
+    assert!(net.nodes.iter().all(|r| r.stats().neighbours_distrusted == 0 && r.stats().announcements_implausible == 0));
 }
 
 /// Announcements each device sends per second, against mesh size, with
@@ -979,7 +1044,9 @@ fn security_verified_cache_binds_every_signed_field() {
         let mut ann = sign_announce(&owner, Origination { seq: WALL, flags: 0, scope: 8, uplink: 0 }, "original");
         ann.cost = INFINITY;
         router.on_announce(neighbour, ann.clone(), 0, WALL, verify_announce);
-        ann.cost = 0;
+        // relayed: one hop (hops and cost aren't signed)
+        ann.hops = 1;
+        ann.cost = 100;
         match field {
             0 => ann.name = Arc::from("forged"),
             1 => ann.flags = F_GATEWAY,
@@ -1025,7 +1092,9 @@ fn security_verified_cache_stays_bounded_and_can_be_disabled() {
         router.set_direct(neighbour, true, 0);
         router.hop_up(neighbour, 0);
         for i in 0..5 {
-            let ann = sign_announce(&owner, Origination { seq: WALL + i, flags: 0, scope: 8, uplink: 0 }, "original");
+            let mut ann = sign_announce(&owner, Origination { seq: WALL + i, flags: 0, scope: 8, uplink: 0 }, "original");
+            ann.hops = 1;
+            ann.cost = 100;
             router.on_announce(neighbour, ann, i, WALL, verify_announce);
             assert!(router.verified.len() <= limit);
         }

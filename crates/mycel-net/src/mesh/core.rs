@@ -36,6 +36,10 @@
 //!   up, and nothing is relayed internet → internet.
 //! - **Budgets**: transit per neighbour and in total, the mesh ↔ internet
 //!   crossing separately, announcements per neighbour.
+//! - **Lying neighbours**: a relayed announcement no honest relay can send
+//!   (zero hops, or less cost than its hops add) gets its sender distrusted
+//!   for a while: the routes through it go, and the routes it relays are
+//!   ignored.
 //!
 //! # API (for drivers and simulators)
 //!
@@ -92,6 +96,15 @@ pub const INFINITY: u32 = u32::MAX;
 pub const HOP_PENALTY: u32 = 20;
 /// A neighbour's hop cost before it is measured.
 pub const DEFAULT_COST: u32 = 100;
+/// The least a route's cost grows per hop: the hop's measured cost (at
+/// least 1) and [`HOP_PENALTY`]. A relayed announcement claiming less than
+/// this per hop (or no hops at all) came from a liar: honest relays can't
+/// produce it.
+const MIN_HOP_COST: u32 = 1 + HOP_PENALTY;
+/// A neighbour caught sending such an announcement is not routed through
+/// for this long (and at most this many are remembered).
+const DISTRUST: Time = 10 * 60_000;
+const DISTRUST_MAX: usize = 256;
 /// An internet hop's cost before it is measured (100 ms).
 pub const DEFAULT_INTERNET_COST: u32 = 1_000;
 /// Routes much costlier than the best one aren't worth a QUIC path.
@@ -315,6 +328,13 @@ pub struct Announce {
     pub sig: Sig,
 }
 
+/// A relayed announcement (not a retraction) whose hops and cost no honest
+/// relay can produce: each hop adds one hop and at least [`MIN_HOP_COST`],
+/// and only the origin itself sends zero hops.
+fn implausible(from: &SignPk, a: &Announce) -> bool {
+    a.cost != INFINITY && *from != a.origin && (a.hops == 0 || a.cost < MIN_HOP_COST.saturating_mul(a.hops as u32))
+}
+
 /// What the signature cache keeps of a checked announcement: a digest of
 /// every signed field and of the signature itself, so a change to any of
 /// them is checked again; the hops and cost filled in on the way are left
@@ -409,6 +429,11 @@ pub struct Stats {
     pub announcements_stale: u64,
     /// Over a neighbour's announcement rate, or an origin's flood rate.
     pub announcements_limited: u64,
+    /// With a cost no honest relay can send (a route through it is a lie),
+    /// or from a neighbour distrusted for one.
+    pub announcements_implausible: u64,
+    /// Neighbours caught lying about routes (not routed through for a while).
+    pub neighbours_distrusted: u64,
     /// Rebroadcasts skipped as redundant (flood reduction).
     pub announcements_suppressed: u64,
     /// Routes withdrawn at once on a loss, and fresh-seqno requests sent.
@@ -617,6 +642,9 @@ pub struct Router {
     last_reach: Option<Time>,
     /// Gateway side: when we last accepted each origin's record.
     records: Map<SignPk, Time>,
+    /// Neighbours caught lying about routes, until when we ignore the
+    /// routes they relay.
+    distrusted: Map<SignPk, Time>,
     own: Option<Announce>,
     seq: u64,
     originated: u64,
@@ -684,6 +712,7 @@ impl Router {
             reach_due: 0,
             last_reach: None,
             records: Map::default(),
+            distrusted: Map::default(),
             own: None,
             seq: 0,
             originated: 0,
@@ -940,9 +969,16 @@ impl Router {
     /// Routes through `peer` are gone: retract (triggered update) whatever
     /// that leaves us without, and ask for fresh seqnos.
     fn lost_neighbour(&mut self, peer: SignPk, now: Time) {
+        self.drop_routes_via(peer, false, now);
+    }
+
+    /// Forget the routes through `peer` (`but_its_own`: except the route to
+    /// `peer` itself), then retract and ask for fresh seqnos as needed.
+    fn drop_routes_via(&mut self, peer: SignPk, but_its_own: bool, now: Time) {
         let affected: Vec<SignPk> = self
             .origins
             .iter_mut()
+            .filter(|(k, _)| !(but_its_own && **k == peer))
             .filter_map(|(k, o)| {
                 let before = o.via.len();
                 o.via.retain(|(n, _)| *n != peer);
@@ -1045,6 +1081,19 @@ impl Router {
         verify: impl FnOnce(&Announce) -> bool,
     ) {
         let jitter = 10 + self.rand() % 40;
+        if a.origin != from && self.distrusted.get(&from).is_some_and(|t| now < *t) {
+            self.stats.announcements_implausible += 1;
+            // its route counts for nothing, but it has this seqno: don't
+            // send it back (a cost no route can match: never "redundant")
+            if let Some(o) = self.origins.get_mut(&a.origin)
+                && a.seq == o.newest
+                && a.cost != INFINITY
+                && !o.heard.iter().any(|(k, _)| *k == from)
+            {
+                o.heard.push((from, INFINITY));
+            }
+            return;
+        }
         let Some(n) = self.nbs.get_mut(&from) else { return };
         if !n.direct {
             return; // internet hops carry no routing: meshes don't merge
@@ -1065,6 +1114,10 @@ impl Router {
         let far_window = self.cfg.announce_every * 3 * self.cfg.far_every.max(1);
         if self.origins.get(&a.origin).is_some_and(|o| a.seq + far_window < o.newest) {
             self.stats.announcements_stale += 1;
+            return;
+        }
+        if implausible(&from, &a) {
+            self.distrust(from, now);
             return;
         }
         let verified = verified_id(&a);
@@ -1145,6 +1198,31 @@ impl Router {
         }
         // after: it may have become one
         self.touch(origin);
+    }
+
+    /// `peer` sent a route no honest relay could have: a black hole
+    /// pulling traffic toward itself (it costs nothing to claim "every
+    /// device is right next to me", and announcements' hops and cost aren't
+    /// signed). Its routes to others go at once, as if it had left
+    /// (retractions and seqno requests restore the others), and the routes
+    /// it relays are ignored for [`DISTRUST`]. It stays reachable itself:
+    /// its own announcements are signed by it and come over its own
+    /// authenticated hop connection, which is also why only a direct
+    /// neighbour can be blamed.
+    fn distrust(&mut self, peer: SignPk, now: Time) {
+        self.stats.announcements_implausible += 1;
+        if self.distrusted.len() >= DISTRUST_MAX {
+            self.distrusted.retain(|_, t| now < *t);
+            if self.distrusted.len() >= DISTRUST_MAX
+                && let Some(k) = self.distrusted.iter().min_by_key(|(k, t)| (**t, k.0)).map(|(k, _)| *k)
+            {
+                self.distrusted.remove(&k);
+            }
+        }
+        self.distrusted.insert(peer, now + DISTRUST);
+        self.stats.neighbours_distrusted += 1;
+        self.next_sweep = self.next_sweep.min(now + DISTRUST);
+        self.drop_routes_via(peer, true, now);
     }
 
     /// `from` no longer routes to `origin` (as of `seq`).
@@ -1930,6 +2008,7 @@ impl Router {
             }
         }
         self.records.retain(|_, t| now.saturating_sub(*t) < REACH_REFRESH * 2);
+        self.distrusted.retain(|_, t| now < *t);
         // a long-quiet peer starts again from the minimum backoff
         self.backoff.retain(|_, (at, _)| now < *at + DIAL_BACKOFF_MAX);
         let mut next = Time::MAX;
@@ -1938,6 +2017,7 @@ impl Router {
         next = self.reach.values().map(|r| r.until + REACH_STALE).fold(next, Time::min);
         next = self.dialing.values().map(|t| t + DIAL_GIVE_UP).fold(next, Time::min);
         next = self.records.values().map(|t| t + REACH_REFRESH * 2).fold(next, Time::min);
+        next = self.distrusted.values().copied().fold(next, Time::min);
         next = self.backoff.values().map(|(at, _)| at + DIAL_BACKOFF_MAX).fold(next, Time::min);
         next = self.nbs.values().filter(|n| n.internet()).map(|n| n.last_used + INTERNET_IDLE).fold(next, Time::min);
         self.next_sweep = next;

@@ -190,6 +190,21 @@ something changes.
     using it after missed path pings (~1 s keep-alive, 5 s idle) or on
     loss, and traffic continues on the others. Routing convergence only
     decides which routes to *add*. Measured in `tests/mesh.rs`.
+12. **Lying neighbours.** An announcement's hops and cost aren't signed:
+    relays fill them in. A black hole can relay every origin "at no
+    cost" to pull traffic toward itself and drop it. But each honest hop
+    adds one hop and at least 2.1 ms of cost (`MIN_HOP_COST`: a measured
+    cost of at least 0.1 ms plus `HOP_PENALTY`), and only the origin sends
+    zero hops. A relayed announcement below that floor can't come from an
+    honest relay, so its sender, a direct neighbour over its own
+    authenticated hop connection, is **distrusted** for 10 minutes: the
+    routes it gave go at once (retractions and seqno requests restore the
+    others), the routes it relays are ignored, and it stays reachable
+    itself (its own announcements are signed by it). In `adversarial` at
+    full size (300 phones, 15 such black holes) delivery went from 82% to
+    100% (`docs/SIMULATION.md` §4, fixed 20). A liar that claims plausible
+    values (one hop from everyone, at the least cost) isn't caught by
+    this: open 14 there.
 
 ## 7. Beyond one mesh
 

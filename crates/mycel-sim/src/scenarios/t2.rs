@@ -310,6 +310,8 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                         t.announcements_limited += s.announcements_limited;
                         t.announcements_stale += s.announcements_stale;
                         t.announcements_suppressed += s.announcements_suppressed;
+                        t.announcements_implausible += s.announcements_implausible;
+                        t.neighbours_distrusted += s.neighbours_distrusted;
                         t.retractions_sent += s.retractions_sent;
                         t.seqreqs_sent += s.seqreqs_sent;
                         t.infeasible += s.infeasible;
@@ -347,6 +349,7 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                     json!({"loops": sh.loops.get(), "announcements_sent": t.announcements_sent,
                            "announcements_received": t.announcements_received, "announcements_limited": t.announcements_limited,
                            "announcements_stale": t.announcements_stale, "announcements_suppressed": t.announcements_suppressed,
+                           "announcements_implausible": t.announcements_implausible, "neighbours_distrusted": t.neighbours_distrusted,
                            "retractions_sent": t.retractions_sent, "seqreqs_sent": t.seqreqs_sent, "infeasible": t.infeasible,
                            "dropped_no_route": t.dropped_no_route, "dropped_pending": t.dropped_pending, "dropped_ttl": t.dropped_ttl,
                            "dials": t.dials, "resolves": t.resolves, "gateway_out": t.gateway_out,
@@ -1248,8 +1251,15 @@ fn adversarial(o: Opts) -> ScenarioResult {
     let attacked = Plan { roles: roles.clone(), ..plan.clone() };
     let sybil = rng.below(n) as NodeId;
     let sybil_plan = Plan { poison: Some(sybil), roles: [(sybil, Role::BlackHole)].into_iter().collect(), ..plan.clone() };
-    let (clean, ((cand, _), syb)) = rayon::join(
-        || run(Model::of(o.candidate), &w, &plan, o.seed, until, None),
+    // the same devices as black holes that lie plausibly and drop bundles too
+    let liar_plan = Plan { roles: bad.iter().map(|b| (*b, Role::Liar)).collect(), ..plan.clone() };
+    let ((clean, liars), ((cand, _), syb)) = rayon::join(
+        || {
+            rayon::join(
+                || run(Model::of(o.candidate), &w, &plan, o.seed, until, None),
+                || run(Model::of(o.candidate), &w, &liar_plan, o.seed, until, None),
+            )
+        },
         || {
             rayon::join(
                 || compare(&mut r, &o, &w, &attacked, until, None, &[Model::Main, Model::StandIn]),
@@ -1260,20 +1270,31 @@ fn adversarial(o: Opts) -> ScenarioResult {
     let num = |k1: &str, k2: &str| cand.extra.get(k1).or(cand.extra.get(k2)).and_then(|v| v.as_u64()).unwrap_or(0);
     let limited = num("announcements_limited", "ogm_limited");
     let stale = num("announcements_stale", "ogm_stale");
+    let distrusted = num("neighbours_distrusted", "neighbours_distrusted");
     r.at_least("delivery with 5% black holes + a storm + a replayer (of feasible)", 100.0 * cand.m.delivery_ratio, 90.0, "%");
     r.at_least("delivery vs the same run without attackers", 100.0 * cand.m.delivery_ratio / clean.m.delivery_ratio.max(1e-9), 90.0, "%");
     r.check("storm announcements rate-limited", limited > 0, format!("{limited} dropped by per-neighbour limits"));
     r.check("replayed announcements dropped as stale", stale > 0, format!("{stale} stale"));
+    r.check(
+        "black holes' impossible routes refused",
+        o.candidate != Candidate::Global || distrusted > 0,
+        format!("{distrusted} times a device stopped routing through a lying neighbour"),
+    );
     r.headline(format!(
-        "{}: clean {:.0}%, attacked {:.0}%, Sybil gateway {:.0}%",
+        "{}: clean {:.0}%, attacked {:.0}%, Sybil gateway {:.0}%; black holes lying plausibly (reported, not judged) {:.0}%",
         cand.m.model,
         100.0 * clean.m.delivery_ratio,
         100.0 * cand.m.delivery_ratio,
-        100.0 * syb.m.delivery_ratio
+        100.0 * syb.m.delivery_ratio,
+        100.0 * liars.m.delivery_ratio
     ));
     r.note(row(&clean.m));
+    r.note(format!(
+        "Black holes lying plausibly (the same devices claim to be one hop from everyone at the least cost an honest relay could report, and drop packets and bundles alike; nothing an announcement shows gives them away: docs/SIMULATION.md §4, open 14): {}",
+        row(&liars.m)
+    ));
     r.note(format!("Sybil gateway (every lookup also returns a free route via it, and it swallows what it gets): {}", row(&syb.m)));
-    r.note("Forged announcements (bad signatures) are covered by the core's and wire.rs's own tests (the simulator skips signature checks). Black holes here re-announce every route at zero cost and drop all transit. In the real node several routes are open QUIC paths at once; in this simulation a packet takes the core's single best next hop, so the numbers are a worst case for black holes.");
+    r.note("Forged announcements (bad signatures) are covered by the core's and wire.rs's own tests (the simulator skips signature checks). Black holes here re-announce every route at zero cost and drop all transit packets: a cost no honest relay can send, so their neighbours stop routing through them (`mesh/core.rs`, distrust). In the real node several routes are open QUIC paths at once; in this simulation a packet takes the core's single best next hop, so the numbers are a worst case for black holes.");
     if o.candidate == Candidate::Main {
         r.expect_fail(NEEDS_GLOBAL);
     }

@@ -341,8 +341,17 @@ impl Global {
         for o in outs.drain(..) {
             match o {
                 Out::Announce { to, mut ann } => {
-                    if self.role == Role::BlackHole && ann.origin != self.pk && ann.cost != mc::INFINITY {
-                        ann.cost = 0; // "everyone is right here"
+                    if ann.origin != self.pk && ann.cost != mc::INFINITY {
+                        match self.role {
+                            Role::BlackHole => ann.cost = 0, // "everyone is right here"
+                            Role::Liar => {
+                                // "everyone is one hop from me", as cheaply as
+                                // an honest relay could say it
+                                ann.hops = 1;
+                                ann.cost = 1 + mc::HOP_PENALTY;
+                            }
+                            _ => {}
+                        }
                     }
                     self.send_to(cx, node(&to), Frame::Ann(ann), None);
                 }
@@ -350,7 +359,7 @@ impl Global {
                     self.send_to(cx, node(&to), Frame::Req(req), None);
                 }
                 Out::Frame { to, frame, relayed } => {
-                    if relayed && self.role == Role::BlackHole {
+                    if relayed && matches!(self.role, Role::BlackHole | Role::Liar) {
                         continue; // swallowed
                     }
                     let msg = packet_msg(&frame.payload);
@@ -640,6 +649,11 @@ impl Router for Global {
             Frame::Bundle(b, copies) => {
                 let id = b.id;
                 let msg = bundle_msg(&id);
+                if self.role == Role::Liar && b.dst != self.pk {
+                    // takes custody, keeps nothing
+                    self.send_to(cx, from, Frame::BundleAck { id, copies, ok: true, stored: true }, None);
+                    return;
+                }
                 let (ok, stored) = match self.dtn.as_mut().map(|c| c.accept(fpk, b, copies, now, |_| true)) {
                     Some(Accepted::ForMe(b)) => {
                         cx.delivered(msg);
