@@ -215,6 +215,12 @@ something changes.
     relay is immediate; the DHT takes seconds to a minute.
   - Old gateways stop routing to a device they have no mesh route to, so a
     stale record fails fast; the sender re-resolves on path failure.
+  - A looked-up record is trusted for a minute (`REACH_TTL`). After that,
+    the next packet starts a new lookup and, meanwhile, goes on through a
+    gateway of the old record that has a hop up (stale-while-revalidate,
+    for another minute, `REACH_STALE`); an out-of-date record never starts
+    a dial. A gateway relaying a flow used to park it for a lookup (the
+    DHT can take seconds) every minute.
   - When the device gets the internet itself, Iroh's own publisher
     replaces the record with its relay address.
 - **Using a record.** Anyone on the internet resolves a key.
@@ -223,6 +229,18 @@ something changes.
     per gateway, `mesh(dst, via G)`, so each gateway is its own QUIC path.
     Packets go to G over an *internet hop* (a hop connection opened on
     demand, hung up after 60 s idle). G routes them into its mesh.
+  - **Which gateway** (where the core chooses: at a gateway forwarding for
+    its mesh, and for custody hand-offs; Iroh's own paths name theirs):
+    the lowest record cost + internet hop cost. The gateways of one
+    record sit in one mesh around the destination, so a hop not measured
+    yet is costed as the cheapest measured hop to another of them (100 ms
+    only when none is measured), and one that is up wins ties. A
+    measured cost is the round trip *plus* the time to move 64 KiB, well
+    above a flat 100 ms guess, so with the guess every untried gateway
+    looked cheaper than the one carrying the traffic: each was dialled in
+    turn while the traffic waited, and again whenever the unused hop
+    idled out (`global-scale`, warm messages: optimality p95 5.14× →
+    2.65×; `docs/SIMULATION.md` §4, fixed 19).
   - **Replies:** the reply's waypoint is G, so replies return through the
     same gateway.
   - **Sender without the internet:** it uses its own gateways as waypoints
@@ -362,7 +380,7 @@ where it works:
 | Layer | Scope | Mechanism | State per device |
 |---|---|---|---|
 | Local mesh | ≤ 8 hops (≤ 2 most of the time) | signed distance vector | origins in scope |
-| Global lookup | the planet | pkarr records: DHT, n0 relay | none (looked up on demand, cached 60 s) |
+| Global lookup | the planet | pkarr records: DHT, n0 relay | none (looked up on demand, cached 60 s, then refreshed while in use) |
 | Distance | the planet | the internet via gateways | open internet hops (≤ 256) |
 | Time | days | custody bundles, PRoPHET, mailboxes | bounded store |
 

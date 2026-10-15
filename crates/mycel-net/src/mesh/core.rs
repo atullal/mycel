@@ -27,8 +27,11 @@
 //! - **Internet hops**: a device with the internet resolves targets it has
 //!   no route to ([`Out::Resolve`] → [`Router::on_resolved`]). One behind
 //!   gateways is reached through the gateway with the lowest record cost +
-//!   internet hop cost ([`Out::Dial`] if not connected); anyone else
-//!   directly. Frames wait (bounded) meanwhile. Internet hops carry no
+//!   internet hop cost ([`Out::Dial`] if not connected; one not measured
+//!   yet costs what a measured one of the same record does, and one up
+//!   wins ties); anyone else directly. Frames wait (bounded) meanwhile. A
+//!   record a minute old is looked up again, while a hop up to one of its
+//!   gateways keeps carrying the traffic. Internet hops carry no
 //!   routing (meshes don't merge across the internet), idle ones are hung
 //!   up, and nothing is relayed internet → internet.
 //! - **Budgets**: transit per neighbour and in total, the mesh ↔ internet
@@ -136,6 +139,9 @@ const PENDING_TIMEOUT: Time = 8_000;
 /// How long a looked-up record (or the absence of one) is trusted.
 const REACH_TTL: Time = 60_000;
 const NO_RECORD_TTL: Time = 20_000;
+/// After that, for this long, a record is looked up again on use while a
+/// hop to one of its gateways that is up keeps carrying the traffic.
+const REACH_STALE: Time = 60_000;
 /// An internet hop nobody used for this long is hung up.
 pub const INTERNET_IDLE: Time = 60_000;
 /// A dial that hasn't come back after this long has failed.
@@ -549,6 +555,7 @@ struct Reach {
     /// (gateway, its mesh cost to the target). Empty: no record, reach the
     /// target itself over the internet.
     gateways: Vec<(SignPk, u32)>,
+    /// Trusted until then; kept [`REACH_STALE`] longer (see `next_hop`).
     until: Time,
 }
 
@@ -1599,33 +1606,30 @@ impl Router {
                     if r.gateways.is_empty() {
                         return self.dial_or_wait(*target, now);
                     }
-                    // the gateway with the lowest record cost + internet hop cost
-                    let best = r
-                        .gateways
-                        .iter()
-                        .filter(|(g, _)| *g != self.me && Some(g) != from)
-                        .map(|(g, c)| {
-                            let hop = match self.nbs.get(g) {
-                                Some(n) if n.up => n.hop_cost(),
-                                _ => DEFAULT_INTERNET_COST,
-                            };
-                            (c.saturating_add(hop), *g)
-                        })
-                        .min();
-                    match best {
+                    match self.record_gateway(&r.gateways, from, false) {
                         // its gateway backing off: hold on, it has a way in
-                        Some((_, g)) => match self.dial_or_wait(g, now) {
+                        Some(g) => match self.dial_or_wait(g, now) {
                             Next::Unreachable => Next::Drop,
                             n => n,
                         },
                         None => Next::Drop,
                     }
                 }
-                _ => {
-                    if self.resolving.insert(*target) {
-                        self.stats.resolves += 1;
-                        self.out.push(Out::Resolve(*target));
+                Some(r) if r.until.saturating_add(REACH_STALE) > now => {
+                    // Out of date: look it up again, and meanwhile keep
+                    // using a hop to one of its gateways that is up (it was
+                    // working a moment ago; a stale record never starts a
+                    // dial). Traffic through a gateway doesn't stall for a
+                    // lookup every REACH_TTL.
+                    let up = self.record_gateway(&r.gateways, from, true);
+                    self.resolve(*target);
+                    match up {
+                        Some(g) => Next::Via(g),
+                        None => Next::Wait(*target),
                     }
+                }
+                _ => {
+                    self.resolve(*target);
                     Next::Wait(*target)
                 }
             }
@@ -1638,6 +1642,45 @@ impl Router {
                 None => Next::Drop,
             }
         }
+    }
+
+    /// Look `target`'s record up, unless a lookup is under way.
+    fn resolve(&mut self, target: SignPk) {
+        if self.resolving.insert(target) {
+            self.stats.resolves += 1;
+            self.out.push(Out::Resolve(target));
+        }
+    }
+
+    /// Which of a record's gateways to go through: the lowest record cost
+    /// (its mesh cost to the target) + internet hop cost (`only_up`: among
+    /// those we have a hop up to).
+    ///
+    /// The gateways of one record sit in one mesh around the target, so the
+    /// internet between us and each of them is about the same. A hop not
+    /// measured yet (or not up) is costed as the cheapest measured hop to
+    /// one of them, and only without any as [`DEFAULT_INTERNET_COST`]: a
+    /// measured cost includes the round trip *and* the time to move 64 KiB,
+    /// so a flat guess would make every gateway we haven't tried look
+    /// cheaper than the one carrying our traffic, and each one in turn
+    /// would be dialled while that traffic waits. On equal cost, a hop that
+    /// is up wins: no dial.
+    fn record_gateway(&self, gateways: &[(SignPk, u32)], from: Option<&SignPk>, only_up: bool) -> Option<SignPk> {
+        let measured = |g: &SignPk| self.nbs.get(g).filter(|n| n.up && n.cost > 0).map(Nb::hop_cost);
+        let known = gateways.iter().filter(|(g, _)| self.is_internet_hop(g)).filter_map(|(g, _)| measured(g)).min();
+        gateways
+            .iter()
+            .filter(|(g, _)| *g != self.me && Some(g) != from)
+            .filter_map(|(g, c)| {
+                let up = self.nbs.get(g).is_some_and(|n| n.up);
+                if only_up && !up {
+                    return None;
+                }
+                let hop = measured(g).or(known).unwrap_or(DEFAULT_INTERNET_COST);
+                Some((c.saturating_add(hop), !up, *g))
+            })
+            .min()
+            .map(|(_, _, g)| g)
     }
 
     /// Where data for `dst` can be handed on *now*, hop by hop (custody
@@ -1782,7 +1825,7 @@ impl Router {
         gws.truncate(8);
         let ttl = if found { REACH_TTL } else { NO_RECORD_TTL };
         self.reach.insert(target, Reach { gateways: gws, until: now + ttl });
-        self.next_sweep = self.next_sweep.min(now + ttl);
+        self.next_sweep = self.next_sweep.min(now + ttl + REACH_STALE);
         self.release(target, now);
     }
 
@@ -1874,7 +1917,7 @@ impl Router {
             keep
         });
         self.stats.dropped_pending += expired;
-        self.reach.retain(|_, r| r.until > now);
+        self.reach.retain(|_, r| r.until + REACH_STALE > now);
         let gave_up: Vec<SignPk> =
             self.dialing.iter().filter(|(_, t)| now.saturating_sub(**t) >= DIAL_GIVE_UP).map(|(k, _)| *k).collect();
         for pk in gave_up {
@@ -1892,7 +1935,7 @@ impl Router {
         let mut next = Time::MAX;
         next = self.reasm.values().map(|r| r.at + REASM_TIMEOUT).fold(next, Time::min);
         next = self.pending.values().map(|p| p.since + PENDING_TIMEOUT).fold(next, Time::min);
-        next = self.reach.values().map(|r| r.until).fold(next, Time::min);
+        next = self.reach.values().map(|r| r.until + REACH_STALE).fold(next, Time::min);
         next = self.dialing.values().map(|t| t + DIAL_GIVE_UP).fold(next, Time::min);
         next = self.records.values().map(|t| t + REACH_REFRESH * 2).fold(next, Time::min);
         next = self.backoff.values().map(|(at, _)| at + DIAL_BACKOFF_MAX).fold(next, Time::min);

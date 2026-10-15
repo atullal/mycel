@@ -583,6 +583,81 @@ fn failed_dials_back_off() {
     assert_eq!(dials(&mut r), 1);
 }
 
+/// What a router did with one packet of ours: (dials, lookups, frames sent to).
+fn outcome(r: &mut Router) -> (Vec<SignPk>, usize, Vec<SignPk>) {
+    let mut outs = Vec::new();
+    r.drain(&mut outs);
+    let dials = outs.iter().filter_map(|o| if let Out::Dial(k) = o { Some(*k) } else { None }).collect();
+    let resolves = outs.iter().filter(|o| matches!(o, Out::Resolve(_))).count();
+    let frames = outs.iter().filter_map(|o| if let Out::Frame { to, .. } = o { Some(*to) } else { None }).collect();
+    (dials, resolves, frames)
+}
+
+/// A gateway carrying our traffic to a device behind it is kept: the
+/// record's other gateways, not tried yet, are costed like the one we have
+/// measured (they sit in the same mesh), not as a flat guess far below any
+/// measured internet hop. Before, each packet after the first measurement
+/// dialled the other gateway and waited for it.
+#[test]
+fn a_working_gateway_is_kept_over_untried_ones() {
+    let (t, g1, g2) = (key(50), key(60), key(61));
+    let mut r = Router::new(key(1), Config::default());
+    r.set_internet(true);
+    r.send(t, key(1), Bytes::from_static(b"1"), false, 0);
+    assert_eq!(outcome(&mut r).1, 1, "a lookup");
+    r.on_resolved(t, Some(vec![(g1, 300), (g2, 300)]), 150);
+    let (dials, _, _) = outcome(&mut r);
+    assert_eq!(dials, vec![g1], "equal cost: the first");
+    r.hop_up(g1, 300);
+    r.set_cost(g1, 3_000); // a 150 ms round trip and the time to move 64 KiB
+    assert_eq!(outcome(&mut r).2, vec![g1], "the waiting frame goes");
+    r.send(t, key(1), Bytes::from_static(b"2"), false, 1_000);
+    assert_eq!(outcome(&mut r), (vec![], 0, vec![g1]), "no dial to the other gateway");
+    // one that is clearly closer to the target is still worth a dial
+    r.on_resolved(t, Some(vec![(g1, 3_000), (g2, 300)]), 2_000);
+    r.send(t, key(1), Bytes::from_static(b"3"), false, 2_000);
+    assert_eq!(outcome(&mut r).0, vec![g2]);
+}
+
+/// A looked-up record goes out of date after a minute. Traffic through a
+/// gateway of it that is up doesn't wait for the new lookup (it used to
+/// stall on every expiry); a gateway that isn't up isn't dialled from an
+/// out-of-date record; and a record long out of date is looked up first.
+#[test]
+fn an_out_of_date_record_keeps_a_working_gateway_while_it_is_looked_up() {
+    let (t, g1, g2) = (key(50), key(60), key(61));
+    let mut r = Router::new(key(1), Config::default());
+    r.set_internet(true);
+    r.send(t, key(1), Bytes::from_static(b"1"), false, 0);
+    r.on_resolved(t, Some(vec![(g1, 300), (g2, 300)]), 100);
+    r.hop_up(g1, 200);
+    r.set_cost(g1, 3_000);
+    outcome(&mut r);
+    let stale = 100 + REACH_TTL + 1;
+    r.tick(stale);
+    r.send(t, key(1), Bytes::from_static(b"2"), false, stale);
+    assert_eq!(outcome(&mut r), (vec![], 1, vec![g1]), "sent at once, looked up again");
+    r.send(t, key(1), Bytes::from_static(b"3"), false, stale + 10);
+    assert_eq!(outcome(&mut r), (vec![], 0, vec![g1]), "one lookup at a time");
+    r.on_resolved(t, Some(vec![(g2, 100), (g1, 300)]), stale + 200);
+    outcome(&mut r);
+    // without a hop up, an out-of-date record waits for its lookup
+    r.hop_down(g1, stale + 300);
+    let later = stale + 200 + REACH_TTL + 1;
+    r.tick(later);
+    r.send(t, key(1), Bytes::from_static(b"4"), false, later);
+    assert_eq!(outcome(&mut r), (vec![], 1, vec![]), "no dial from an out-of-date record");
+    r.on_resolved(t, Some(vec![(g2, 100), (g1, 300)]), later + 100);
+    assert_eq!(outcome(&mut r).0, vec![g2], "then the fresh one's best");
+    // long out of date: forgotten, looked up before anything moves
+    r.hop_up(g2, later + 200);
+    outcome(&mut r);
+    let gone = later + 100 + REACH_TTL + REACH_STALE + 1;
+    r.tick(gone);
+    r.send(t, key(1), Bytes::from_static(b"5"), false, gone);
+    assert_eq!(outcome(&mut r), (vec![], 1, vec![]));
+}
+
 #[test]
 fn relay_budgets_hold() {
     let cfg = Config { relay_rate_per_neighbour: 1000, relay_rate_total: 1500, ..Config::default() };

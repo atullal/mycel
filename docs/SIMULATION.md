@@ -98,7 +98,12 @@ The scenarios ran as separate processes and were joined with
 `mycel-sim merge`. The rows marked *(carrier)* were rerun on 9 October
 with the store-and-forward fixes from the benchmarks (§4, fixed 8), on a
 less loaded machine. The rows marked *(routing)* were rerun on 9 October
-with finding 1's fixes (§4, fixed 14), at a load average of ~9. The Mac was
+with finding 1's fixes (§4, fixed 14), at a load average of ~9. The rows
+marked *(gateways)* were rerun on 15 October with fixed 19, at a load
+average of ~40 (other agents' builds: their wall times are long); it
+leaves every other tier-2 scenario's numbers as they were (compared
+before and after at CI size, and at full size for those with
+gateways). The Mac was
 heavily loaded throughout the first runs: another agent's
 Java simulations, a host build and other apps, a load average of ~20 on
 18 cores, and 8 of 9 GB swap in use. Wall times are pessimistic, and the
@@ -122,15 +127,15 @@ machine it measured 500 nodes in 1.2 GB (§1).
 | `adversarial-live` | 1 | full | ✅ | messages past a black hole and a storm: 100% delivered, p50 0.275 s, p95 0.308 s, optimality p50/p95/p99 3.66/4.11/4.11× | 16 s |
 | `multipath` | 1 | full | ✅ | 3 links 8.0 MB/s, 1 link 2.9 MB/s (2.76×) | 21 s |
 | `mixed-room` | 1 | full | ✅ | Ethernet→Some(Ethernet), Wi-Fi Direct→Some(WifiDirect), UWB→Some(Uwb), Bluetooth LE→Some(Bluetooth) | 26 s |
-| `us-eu` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 0.799 s, optimality p50/p95/p99 1.29/2.29/4.19× | 1 s |
-| `gateway-choice` | 2 | full *(stability)* | ✅ | global core + DTN: 100% delivered, p95 1.12 s, optimality p50/p95/p99 6.29/9.06/9.18× (100 KB and 1 MB messages now against the pipelining bound) · 100% of relayed bytes via the far fibre gateway | 0 s |
+| `us-eu` | 2 | full *(gateways)* | ✅ | global core + DTN: 100% delivered, p95 0.725 s, optimality p50/p95/p99 1.22/2.15/2.38× | 1 s |
+| `gateway-choice` | 2 | full *(gateways)* | ✅ | global core + DTN: 100% delivered, p95 1.11 s, optimality p50/p95/p99 6.26/9.12/9.19× (100 KB and 1 MB messages now against the pipelining bound) · 100% of relayed bytes via the far fibre gateway | 0 s |
 | `routing-convergence` | 2 | full *(routing)* | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never | 15 s |
 | `flood-scaling` | 2 | full *(routing)* | ✅ | largest N: global core 8.4% of BLE in steady state, 100% of pairs routed (before: 67.0%, 85% routed), main 136.1% | 839 s |
 | `partial-route` | 2 | full *(carrier)* | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.5 s; sender-holds 100% p50 98.2 s · gap 300 m: global core + DTN 100%; stand-in custody 0% p50 0 s; sender-holds 0% p50 0 s | 0 s |
 | `disaster-dtn` | 2 | full, judged on seeds 1–12 *(control)* | ✅ | **global core + DTN: mean 80.3% delivered** (target ≥ 80%; per seed 60–92%; seeds 13–24 mean 86.6%; open 12) · seed 1: 60%, p95 7220 s, optimality p50/p95/p99 1.01/4.62/4.65×, 18.3 replicas and 25.6 hand-offs per message (budget 32) · PRoPHET 58%, spray-and-wait (L=8) 32%, epidemic 100% (seed 1) · CI size (0.1): 100% | 55 s |
 | `mailbox` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
-| `global-scale` | 2 | 2,002 devices (0.02) *(control)* | ✅ | global core + DTN: 100% delivered, p95 0.690 s · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.130 s, p95 0.286 s, optimality p95 4.45× (was 32.2×, fixed 18) · control 727 B/s per device (was 8,470): routing 470, carrier 257 (was 8,004, fixed 17) | 14 s |
-| `churn` | 2 | 1,001 devices (scale 0.1) *(control)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.6/17.1×; control 707 B/s per device: routing 2,659 → 471, carrier 4,540 → 264 (full size before the carrier fixes: 100%, p95 65.2 s) | 10 s |
+| `global-scale` | 2 | 2,002 devices (0.02) *(gateways)* | ✅ | global core + DTN: 100% delivered, p95 0.690 s, optimality p50 3.96× · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.119 s, p95 0.211 s, optimality p95 2.88× (was 4.45×, fixed 19; 32.2× before fixed 18) · control 706 B/s per device (was 8,470): routing 470, carrier 235 (was 8,004, fixed 17) · CI size (1,499 devices): warm optimality p95 2.65× (was 5.14×, failing) | 119 s |
+| `churn` | 2 | 1,001 devices (scale 0.1) *(gateways)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.5/17.1×; control 698 B/s per device: routing 2,659 → 469, carrier 4,540 → 256 (full size before the carrier fixes: 100%, p95 65.2 s) | 81 s |
 | `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 15.0 s, optimality p50/p95/p99 32.7/718/2015× · global core + DTN: clean 100%, attacked 100%, Sybil gateway 100% | 980 s |
 | `trace-replay` | 2 | full *(control)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible, p50 4.7 s, p95 1259 s, optimality p50/p95/p99 1.22/8.38/18.0× (pipelining-aware oracle, fixed 12; 10.1× at 54cc562 after the routing changes), overhead 3.15 · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 103 s |
 | `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 53%, 68%, 83%, 92%, 93% | 0 s |
@@ -428,13 +433,67 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
      out at once. Quitting the app no longer hangs on a slow radio either.
    - `shutdown` at full size: 502 s → 49–123 s wall; `conference` 24
      seats: 96 s → 15–20 s.
+19. **Warm messages to a device behind gateways paid a lookup and a dial
+   again** (`global-scale` at its CI size, 1,499 devices, failed: warm
+   optimality p95 5.14× against 5×; the same on e6a972b, 77 commits
+   earlier). Traced per packet (seed 1): of the 13 warm messages
+   over 5×, 10 went from a device with the internet to one behind
+   gateways, and their internet hop took as long as at first contact
+   (0.4–0.8 s, against an optimum of 0.07–0.15 s for the whole way; the
+   other 3 are open 13). Two causes in the routing core's choice among a
+   record's gateways (`next_hop`, `mesh/core.rs`):
+   - **An untried gateway looked cheaper than the working one.** It was
+     costed as a flat 100 ms (`DEFAULT_INTERNET_COST`). A measured hop
+     costs its round trip *plus* the time to move 64 KiB: 160–320 ms
+     between continents in the simulator, more in the node (RTT ×
+     (1 + 64 KiB ÷ cwnd)). So once the first gateway's hop was measured,
+     the next packet dialled the record's other gateway and waited for it
+     (n365 → n217: dial n229 at +0 ms, connected at +271 ms), and again
+     whenever the unused hop idled out after a minute.
+   - **The record had just expired.** A looked-up record is trusted for
+     60 s, and the warm message came a minute after the first. When the
+     dial was through, the record was out of date, so the packet waited
+     for a second lookup (+190 ms). In the node, a gateway relaying a
+     long flow parked it for a lookup every minute.
+
+   Fix: an untried gateway is costed as the cheapest measured hop to
+   another gateway of the same record (they sit in one mesh around the
+   destination; 100 ms only when none is measured), and one with a hop
+   up wins ties. A record out of date is looked up again on use while a
+   hop up to one of its gateways keeps carrying the traffic, for another
+   minute (`REACH_STALE`); it never starts a dial. Tests
+   `a_working_gateway_is_kept_over_untried_ones` and
+   `an_out_of_date_record_keeps_a_working_gateway_while_it_is_looked_up`
+   (`mesh/core/tests.rs`). No wire change.
+
+   `global-scale`, warm messages, optimality p95 (p99):
+
+   | Size, seed | Before | After |
+   |---|---|---|
+   | 1,499 devices (CI), seed 1 | 5.14× (8.54×) | 2.65× (5.14×) |
+   | 1,499 devices, seed 2 | 5.89× (10.9×) | 2.69× (4.58×) |
+   | 1,499 devices, seed 3 | 5.48× (10.7×) | 3.37× (7.61×) |
+   | 2,002 devices, seed 1 | 4.45× (11.2×) | 2.88× (3.40×) |
+
+   Warm latency p95 0.512 → 0.211 s (CI) and 0.286 → 0.211 s (2,002
+   devices); all messages, optimality p50 4.42 → 3.26× (CI). Dials
+   322 → 240 at 2,002 devices; control traffic 739 → 730 B/s per device
+   (CI), 727 → 706 (2,002). First contact is unchanged (p50 6.4×): it
+   pays a lookup and a handshake the oracle doesn't. At CI size every
+   other tier-2 scenario gives the same numbers but `churn` (latency p95
+   40.0 → 39.0 s, optimality p95 13.8 → 13.9×, control 653 → 646 B/s);
+   at full size `us-eu` (latency p50 0.409 → 0.387 s, control 1,069 →
+   1,048 B/s), `gateway-choice` (p95 1.12 → 1.11 s) and `churn` at 1,001
+   devices (optimality p95 12.6 → 12.5×, control 707 → 698 B/s) move a
+   little, the others not at all. What is left of the warm tail is
+   open 13.
 
 ### Open (with evidence)
 
 1. **Bluetooth control traffic: what is left after fixed 14, 15 and 17.**
    - *(Carrier summaries: fixed 17. `conference` latency: fixed 15, the
-     emulator's Bluetooth queue.)* `global-scale` is at 727 B/s per device
-     (routing 470, carrier 257) against its 1 KB/s target; the 300-seat
+     emulator's Bluetooth queue.)* `global-scale` is at 706 B/s per device
+     (routing 470, carrier 235) against its 1 KB/s target; the 300-seat
      `conference` hasn't been rerun since.
 
    Repro: `mycel-sim global-scale --scale 0.02`, `mycel-sim conference
@@ -503,6 +562,28 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    100%. Still open: which interaction makes single runs this sensitive.
    Repro: `mycel-sim disaster-dtn` (runs seeds 1–12),
    `mycel-sim disaster-dtn --seed 13` (13–24).
+13. **The warm tail left in `global-scale` is pairs in one neighbourhood
+   whose mesh route crosses Bluetooth** (after fixed 19, at CI size: all
+   3 warm messages over 5× with seed 1, at 15×, 11× and 5.1×; 6 of the 7
+   with seed 3). Phones with
+   AWDL and phones with Wi-Fi Direct share only Bluetooth, so a route
+   between those islands (or around a gap in one) takes a 40–55 ms
+   Bluetooth hop or two, while the oracle goes over the internet between
+   two devices of the neighbourhood (10–20 ms). Two cases:
+   - *Both ends have the internet:* the node's Iroh connection has the
+     direct (or relayed) internet path beside the mesh path, and its
+     path selector takes the faster. The tier-2 driver
+     (`Global::send_packet`) sends through the core whenever it has a
+     mesh route, so it measures the mesh path alone here: a gap in the
+     model, not in the node.
+   - *One end or neither has the internet:* the core keeps traffic on a
+     local mesh route by design (a mesh route beats gateways, and
+     `gateway_addrs` offers no gateways for a device the mesh reaches),
+     even when the internet through the destination's gateways would be
+     faster. Trading a slow local route for gateway traffic (metered,
+     budgeted) is a design question, not a bug.
+
+   Repro: `mycel-sim global-scale --scale 0.01 --seed 3`.
 
 ## 5. Benchmarks against external baselines
 
