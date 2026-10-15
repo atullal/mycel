@@ -441,11 +441,16 @@ async fn serve_index(State(app): State<Shared>, headers: HeaderMap) -> Response 
 }
 
 fn default_ui() -> Option<PathBuf> {
-    // repo checkout: <repo>/apps/host/dist next to the binary's workspace
-    let candidates = [
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/host/dist"),
-        PathBuf::from("apps/host/dist"),
-    ];
+    // repo checkout: <repo>/apps/host/dist, found from <repo>/target/<profile>/mycel
+    // or the working directory. Only debug builds look in the source tree:
+    // release binaries carry no build-machine paths.
+    let mut candidates = Vec::new();
+    #[cfg(debug_assertions)]
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../apps/host/dist"));
+    if let Some(repo) = std::env::current_exe().ok().and_then(|exe| Some(exe.parent()?.parent()?.parent()?.to_path_buf())) {
+        candidates.push(repo.join("apps/host/dist"));
+    }
+    candidates.push(PathBuf::from("apps/host/dist"));
     candidates.into_iter().find(|p| p.join("index.html").exists())
 }
 
