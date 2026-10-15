@@ -1,4 +1,4 @@
-# Mycel Runtime API (v0 contract)
+# Mycel Runtime API
 
 The Rust runtime (`mycel_node::Runtime`) exposes this API. The Tauri host wraps each method as a command, and `@mycel/sdk` (TypeScript) wraps each command. Types are defined in `crates/mycel-node/src/api.rs`; JSON field names are **camelCase**, enum values are **camelCase** strings, and all ids are lowercase hex strings.
 
@@ -20,6 +20,7 @@ impl Runtime {
     pub fn nearby(&self) -> Vec<NearbyPeer>;
     pub fn network_status(&self) -> NetworkStatus;
     pub fn notices(&self) -> Vec<Notice>;                                  // problems to tell the user about
+    pub fn set_network_mode(&self, mode: NetworkMode) -> Result<NetworkStatus>; // lan or internet, from the next start
 
     // messaging (chat kit)
     pub fn conversations(&self) -> Vec<ConversationSummary>;               // newest activity first
@@ -27,9 +28,12 @@ impl Runtime {
     pub fn create_conversation(&self, title: Option<String>, members: Vec<PeerId>) -> Result<ConversationSummary>;
     pub fn messages(&self, id: ConversationId, limit: Option<u32>, before: Option<MessageId>) -> Result<Vec<MessageView>>; // oldest → newest
     pub fn messages_around(&self, id: ConversationId, message: MessageId, before: Option<u32>, after: Option<u32>) -> Result<MessageWindow>;
+    pub fn search_messages(&self, id: ConversationId, query: String, limit: Option<u32>) -> Result<Vec<MessageView>>; // newest first
     pub async fn send_message(&self, id: ConversationId, body: String, reply_to: Option<MessageId>, attachments: Vec<String> /* file paths */) -> Result<MessageView>;
     pub fn edit_message(&self, id: ConversationId, message: MessageId, body: String) -> Result<()>;
-    pub fn delete_message(&self, id: ConversationId, message: MessageId) -> Result<()>;
+    pub fn delete_message(&self, id: ConversationId, message: MessageId) -> Result<()>;          // own message, for everyone
+    pub fn delete_message_local(&self, id: ConversationId, message: MessageId) -> Result<()>;    // any message, this device only
+    pub fn restore_message_local(&self, id: ConversationId, message: MessageId) -> Result<()>;   // undo the above
     pub fn toggle_reaction(&self, id: ConversationId, message: MessageId, emoji: String) -> Result<()>;
     pub fn mark_read(&self, id: ConversationId) -> Result<()>;
     pub fn set_typing(&self, id: ConversationId) -> Result<()>;
@@ -75,14 +79,18 @@ impl Runtime {
 | `network_status` | — | `NetworkStatus` |
 | `list_notices` | — | `Notice[]` |
 | `dismiss_notice` | `notice` | `null` |
+| `set_network_mode` | `{ mode }` (`lan` or `internet`) | `NetworkStatus`; takes effect at the next start |
 | `list_conversations` | — | `ConversationSummary[]` |
 | `get_conversation` | `{ id }` | `ConversationSummary` |
 | `create_conversation` | `{ title?, members }` | `ConversationSummary` |
 | `list_messages` | `{ id, limit?, before? }` | `MessageView[]` |
 | `messages_around` | `{ id, message, before?, after? }` | `MessageWindow` (`{ messages, hasEarlier, hasLater }`) |
+| `search_messages` | `{ id, query, limit? }` | `MessageView[]`, newest first: every whitespace-separated term, case-insensitive, in the text or an attachment name |
 | `send_message` | `{ id, body, replyTo?, attachments? }` | `MessageView` |
 | `edit_message` | `{ id, message, body }` | `null` |
 | `delete_message` | `{ id, message }` | `null` |
+| `delete_message_local` | `{ id, message }` | `null` |
+| `restore_message_local` | `{ id, message }` | `null` |
 | `toggle_reaction` | `{ id, message, emoji }` | `null` |
 | `mark_read` | `{ id }` | `null` |
 | `set_typing` | `{ id }` | `null` |
@@ -103,6 +111,7 @@ impl Runtime {
 | `end_call` | `{ call }` | `null` |
 | `set_muted` | `{ call, muted }` | `CallInfo` |
 | `call_status` | — | `CallInfo[]` |
+| `sync_now` | — | `null` (syncs every space with every reachable peer) |
 
 `stage_file` is host-only (Tauri). It is for pasted images and other files without a path. The SDK calls it through `files.stage()`.
 
@@ -167,7 +176,7 @@ rings every other member, and up to 8 people can be in the call at once.
 | `participants` | everyone else in, or rung for, the call (1:1: the other person), joined first: `{ id, name, state, muted, level, speaking, path, bitrate, rttMs, lossPct }`. `state`: `ringing`, `connecting`, `joined`, `declined`, `missed`, `busy`, `unavailable`, `left`. `path` and `bitrate` are per person |
 | `joinedCount` | people in the call now, you included if you're in it |
 | `activeSpeaker` | the loudest person talking right now (a participant `id`), or `null` |
-| `path` | the path carrying the call now: `network`, `peerWifi`, `bluetooth`, `relay`, `mesh` (through other nearby devices), or another medium (group: to the first person who joined; see `participants`) |
+| `path` | the path carrying the call now: `network`, `bluetooth`, `relay`, `mesh` (through other nearby devices), or another medium (`ethernet`, `wifiDirect`, `uwb`, `ieee802154`, `other`) (group: to the first person who joined; see `participants`) |
 | `bitrate` | our Opus bitrate (bits/s): 32k on fast paths, 24k via relay, 12k on Bluetooth, lower under loss (group: see `participants`) |
 | `muted`, `remoteMuted` | `remoteMuted`: 1:1 only (group: each participant's `muted`) |
 | `level`, `remoteLevel` | 0..1 meters: yours (0 while muted), and everything you hear mixed |
@@ -178,7 +187,7 @@ rings every other member, and up to 8 people can be in the call at once.
 Semantics:
 - **Ringing needs only the devices online.** The caller dials each other
   device's key directly (ALPN `mycel/call/1` on the node's endpoint, so every
-  path: network, peer-to-peer Wi-Fi, relay, Bluetooth). If nobody can be
+  path: network, Bluetooth, relay, mesh). If nobody can be
   reached within a few seconds the call ends `unavailable`.
 - **Group calls are a full mesh.** Everyone in the call has their own
   connection to everyone else. Each frame is encoded once per bitrate tier
@@ -212,11 +221,15 @@ Semantics:
 
 ### Video
 Video rides the same call (the same QUIC connection, so every path and the
-same moves between them). Our camera is captured and encoded by the runtime
-(H.264 in hardware through VideoToolbox); **the webview only decodes**, with
-WebCodecs `VideoDecoder`, which needs Safari 16.4 or later (on macOS 11+,
-update Safari). `@mycel/sdk` does it for you: `useVideoCanvas(ref, { call,
-source, peer })` in React, or `videoCanvas(canvas)` + `mycel.calls.onVideo`.
+same moves between them). On macOS, iPhone and iPad our camera is captured
+and encoded by the runtime (H.264 in hardware through VideoToolbox). On
+Android, Windows and Linux the web view captures and encodes it (WebCodecs;
+`webCameraStream` in the SDK) and hands each frame to the runtime with the
+Tauri-only `video_push`, asking `video_targets` what to encode. Received
+video is decoded in the web view with WebCodecs `VideoDecoder`, which on a
+Mac needs Safari 16.4 or later (on macOS 11+, update Safari). `@mycel/sdk`
+does it for you: `useVideoCanvas(ref, { call, source, peer })` in React, or
+`videoCanvas(canvas)` + `mycel.calls.onVideo`.
 
 - **Starting:** `start_call { video: true }` / `accept_call { video: true }`,
   or `set_camera { call, on }` at any time (also before the call is
@@ -229,7 +242,7 @@ source, peer })` in React, or `videoCanvas(canvas)` + `mycel.calls.onVideo`.
   says whose; show one tile each), encoded at the quality the path to that
   person allows; `participants[].video` has each one's numbers both ways.
 - **What's sent** follows the path: up to 720p30 on cable, a Wi-Fi network or
-  UWB; 480p30 on peer-to-peer Wi-Fi / Wi-Fi Direct; 360p via a relay; and
+  UWB; 480p30 on Wi-Fi Direct; 360p via a relay; and
   nothing under 1 Mbit/s (Bluetooth, Thread/802.15.4) or over the multi-hop mesh: `video.paused` on our
   side and `video.remotePaused` on theirs ("Video paused: slow connection"),
   resuming by itself when a faster path returns. Under that ceiling a
@@ -275,7 +288,7 @@ When someone who isn't your contact adds you, the conversation arrives with `req
 - `accept_request` makes the inviter a contact.
 - `decline_request {block: true}` also refuses future invites from that key at the network layer.
 
-## Answers to contract questions (v0)
+## Contract details
 - **Leaving:** call `remove_member(id, myId)`. Anyone can leave; the last admin can't. Leaving doesn't rotate keys itself; the next writer automatically rotates to a key the leaver doesn't have.
 - **Contact codes** are opaque strings: `mycel:` + base64url(signed contact card). Paste them as-is.
 - **Untitled groups** show the members' names. Renaming makes a conversation a group. `create_conversation` always creates a new conversation.
