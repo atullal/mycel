@@ -263,7 +263,12 @@ async fn two_routes_aggregate_and_fail_over() {
     ab.cut();
     bc.cut();
     let took = tokio::time::timeout(Duration::from_secs(60), transfer).await.expect("finishes without B").unwrap();
-    eprintln!("lost relay B; the rest of the transfer took {:?} (whole: {took:?})", cut.elapsed());
+    let rest = cut.elapsed();
+    eprintln!("lost relay B; the rest of the transfer took {rest:?} (whole: {took:?})");
+    // ~2 MB left at one route's rate is ~6.5 s. A path that dies used to hold
+    // what it carried, and the ACKs, for its idle timeout and more (5-20 s
+    // stalls; vendor/noq-proto/MYCEL_PATCH.md §3).
+    assert!(rest < Duration::from_secs(15), "the rest took {rest:?} after losing B");
     let space = shared(&a, &c).await;
     write_and_sync(&a, &c, space, "after B left").await;
     assert_eq!(c.peers()[&a.id()].mesh.as_ref().map(|m| m.via), Some(d.id()));
@@ -406,8 +411,18 @@ async fn route_heals_when_a_middle_device_leaves() {
     .await;
     write_and_sync(&a, &c, space, "via d and x").await;
     eprintln!("healed in {:?}", t.elapsed());
-    let route = c.peers()[&a.id()].mesh.clone().expect("mesh route");
-    assert_eq!(route.hops, 3);
+    // The exchange moved to the new route as soon as the old path stopped
+    // answering; Iroh's selection (which `peers()` reports) follows once that
+    // path has been silent for a few seconds.
+    let hops = || c.peers()[&a.id()].mesh.as_ref().map(|m| m.hops);
+    for i in 0..30 {
+        if hops() == Some(3) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        write_and_sync(&a, &c, space, &format!("via d and x, {i}")).await;
+    }
+    assert_eq!(hops(), Some(3));
 }
 
 /// Six devices in a ring: announcements stay bounded (each passed on once,

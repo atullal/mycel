@@ -186,10 +186,19 @@ something changes.
     keep-alives and a share of every announcement. Direct traffic between
     two devices in range doesn't need one: it uses the link itself.
 11. **Failover without waiting for routing.** Up to 3 routes per
-    destination are open QUIC paths at once. When one breaks, noq stops
-    using it after missed path pings (~1 s keep-alive, 5 s idle) or on
-    loss, and traffic continues on the others. Routing convergence only
-    decides which routes to *add*. Measured in `tests/mesh.rs`.
+    destination are open QUIC paths at once. When one breaks, traffic
+    continues on the others within about a probe timeout, not the path's
+    5 s idle timeout. That needs the vendored noq patch
+    (`vendor/noq-proto/MYCEL_PATCH.md` §3):
+    - a path that stopped both acknowledging and hearing gets no new data,
+      and its in-flight packets are retransmitted on the others;
+    - ACKs move off a path that went quiet, so the peer isn't left hearing
+      nothing;
+    - stale ACKs don't inflate its RTT.
+
+    Before the patch, losing a relay mid-transfer stalled the rest for 5–20 s
+    in about 1 run in 4. Routing convergence only decides which routes to
+    *add*. Measured in `tests/mesh.rs`.
 12. **Short queues under the hops, so control traffic gets through.**
     Announcements, seqno requests, keep-alives and the end-to-end
     connections' acknowledgements share each hop with the bulk data, and

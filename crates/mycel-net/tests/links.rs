@@ -93,6 +93,16 @@ async fn sync_over_links_and_fall_back_to_bluetooth() {
         .unwrap();
     bob.sync_with(alice.id(), space, false).await.unwrap();
     assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(), json!({"msg": "over bluetooth"}));
+    // The data moves to Bluetooth within a probe timeout of the cut; Iroh's
+    // selection (what `via` reports) follows once the dead path has been
+    // silent for a few seconds.
+    for _ in 0..50 {
+        if bob.peers()[&alice.id()].via == Some(PathKind::Bluetooth) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        bob.sync_with(alice.id(), space, false).await.unwrap();
+    }
     assert_eq!(bob.peers()[&alice.id()].via, Some(PathKind::Bluetooth));
     assert!(alice.link_status().iter().any(|s| s.kind == PathKind::Bluetooth && s.active));
 }
@@ -181,8 +191,17 @@ async fn live_connection_moves_to_another_link() {
         .unwrap();
     assert_eq!(u64::from_le_bytes(got.try_into().unwrap()), total, "every byte arrived");
     eprintln!("failover + rest of transfer took {:?}", cut_at.unwrap().elapsed());
-    let selected = conn.paths().iter().find(|p| p.is_selected()).map(|p| PathKind::of(p.remote_addr()));
-    assert_eq!(selected, Some(PathKind::Bluetooth), "finished on the backup link");
+    // The rest went over Bluetooth as soon as the Wi-Fi path stopped answering
+    // (noq moves a dead path's data within a probe timeout); Iroh's selection
+    // follows once that path has been silent for a few seconds.
+    let selected = || conn.paths().iter().find(|p| p.is_selected()).map(|p| PathKind::of(p.remote_addr()));
+    for _ in 0..50 {
+        if selected() == Some(PathKind::Bluetooth) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert_eq!(selected(), Some(PathKind::Bluetooth), "finished on the backup link");
     conn.close(0u32.into(), b"done");
     router.shutdown().await.unwrap();
 }
