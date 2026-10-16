@@ -304,9 +304,12 @@ async fn a_data_mule_carries_a_message_across_partitions() {
     // A's live sync to C fails (no path): it becomes a bundle
     a.changed(space);
     eventually("A makes a bundle for C", 30, || a.mesh().unwrap().dtn_stats().originated >= 1).await;
-    // and a short-lived one, to see carriers drop expired bundles
+    // and a short-lived one, to see carriers drop expired bundles. Only
+    // once A has a hop to the mule: before that it has no carrier, and a
+    // bundle this short could expire at A before the next hand-off round
+    eventually("A meets the mule", 20, || a.mesh().unwrap().connected_neighbours().contains(&mule.id())).await;
     let short =
-        a.mesh().unwrap().send_bundle(c_id, bytes::Bytes::from_static(b"stale soon"), Duration::from_secs(3)).unwrap();
+        a.mesh().unwrap().send_bundle(c_id, bytes::Bytes::from_static(b"stale soon"), Duration::from_secs(5)).unwrap();
     eventually("the mule takes copies", 20, || {
         let s = mule.mesh().unwrap().dtn_stats();
         s.accepted >= 2
@@ -316,9 +319,10 @@ async fn a_data_mule_carries_a_message_across_partitions() {
 
     // the mule walks: out of A's range, into C's
     here.cut();
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    assert!(!mule.mesh().unwrap().holds_bundle(&short), "the short-lived bundle expired at the carrier");
-    assert!(mule.mesh().unwrap().dtn_stats().expired >= 1);
+    eventually("the short-lived bundle expires at the carrier", 15, || {
+        !mule.mesh().unwrap().holds_bundle(&short) && mule.mesh().unwrap().dtn_stats().expired >= 1
+    })
+    .await;
     let c = device_with_keys(c_keys, "c", &[&there], &dir).await;
     c.join_space(genesis).unwrap();
     let t = Instant::now();
