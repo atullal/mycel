@@ -551,3 +551,71 @@ async fn hops_over_peer_wifi_and_bluetooth() {
     write_and_sync(&c, &a, space, "and back").await;
     assert_eq!(a.peers()[&c.id()].via, Some(PathKind::Mesh));
 }
+
+/// A relay that keeps announcing its route to C but drops everything to and
+/// from C (a black hole that lies plausibly: nothing in its announcements
+/// gives it away). A's connection to C hears nothing back on that path;
+/// what QUIC authenticated is the evidence (`mesh/watch.rs`), so A suspects
+/// the relay for C and offers the route through the other relay instead.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_that_drops_one_destination_is_routed_around() {
+    // a — b — c and a — d — c, one route (QUIC path) offered per destination
+    let one = MeshOptions { routes: 1, ..fast() };
+    let (ab, bc, ad, dc) = (edge(0), edge(1), edge(2), edge(3));
+    let a = device("a", &[&ab, &ad], one).await;
+    let b = device("b", &[&ab, &bc], fast()).await;
+    let d = device("d", &[&ad, &dc], fast()).await;
+    let c = device("c", &[&bc, &dc], fast()).await;
+    mesh_route(&a, &c).await;
+    let (am, cid) = (a.mesh().unwrap(), c.id());
+    eventually("a route offered", 20, || am.offered(&cid).len() == 1).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await; // both routes announced
+    let conn = a.connect(cid, BULK).await.unwrap();
+    push(&conn, 100_000).await;
+    let first = am.offered(&cid)[0];
+    let (hole, other) = if first == b.id() { (&b, d.id()) } else { (&d, b.id()) };
+    assert!(first == b.id() || first == d.id(), "{first:?}");
+    hole.mesh().unwrap().set_black_hole(Some(cid));
+    let t = Instant::now();
+    eventually("the route moves to the other relay", 30, || am.offered(&cid) == [other]).await;
+    let moved = t.elapsed();
+    eprintln!("route moved off the black hole after {moved:?}: {:?}", am.stats());
+    assert_eq!(am.stats().hops_suspected, 1);
+    assert!(moved < Duration::from_secs(15), "{moved:?}");
+    // and C is reached again, through the other relay
+    let conn = a.connect(cid, BULK).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(30), push(&conn, 100_000)).await.expect("through the other relay");
+    let relayed = |n: &mycel_net::Node| n.mesh().unwrap().stats().bytes_relayed;
+    eprintln!("relayed: black hole {}, other {}", relayed(hole), relayed(if first == b.id() { &d } else { &b }));
+}
+
+/// Ordinary loss and a slow radio aren't a black hole: over two hops of a
+/// Bluetooth-like 20 kB/s link with 30 ms of latency, whose short queue
+/// drops what doesn't fit, a transfer completes and no hop is suspected.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slow_lossy_route_is_not_suspected() {
+    let _measuring = MEASURING.lock().await;
+    let slow = |n| {
+        let e = edge(n);
+        e.set_rate_limit(Some(20_000));
+        e.set_latency(Duration::from_millis(30));
+        e
+    };
+    let (ab, bc) = (slow(4), slow(5));
+    let a = device("a", &[&ab], fast()).await;
+    let b = device("b", &[&ab, &bc], fast()).await;
+    let c = device("c", &[&bc], fast()).await;
+    mesh_route(&a, &c).await;
+    let conn = a.connect(c.id(), BULK).await.unwrap();
+    // three pushes, each long enough to fill the queue and lose packets
+    for _ in 0..3 {
+        push(&conn, 60_000).await;
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await; // idle: keep-alives only
+    push(&conn, 20_000).await;
+    for n in [&a, &b, &c] {
+        let s = n.mesh().unwrap().stats();
+        assert_eq!(s.hops_suspected, 0, "{s:?}");
+    }
+    assert_eq!(a.mesh().unwrap().offered(&c.id()), vec![b.id()]);
+}

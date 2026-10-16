@@ -15,15 +15,16 @@ we built, and why.
   internet, crosses the internet in milliseconds, and descends through the
   far side's gateway.
 - **When there is no live path,** store-and-forward moves it toward
-  connectivity: delivery predictability toward "the internet" and the
-  destination, hop-by-hop custody, mailboxes at the far gateways, and
-  signed receipts. Random spraying is only the fallback.
+  connectivity: spare copies go to the likeliest neighbours first, then a
+  single copy climbs by delivery predictability toward "the internet",
+  with hop-by-hop custody, mailboxes at the far gateways, and signed
+  receipts.
 - **What we reuse and what is ours.** We reuse Iroh (QUIC, multipath,
   relays, hole punching, custom transports), the pkarr record format, and
   the Mainline DHT (via `n0-mainline`, the crate Iroh's own DHT lookup uses).
   We reuse *ideas* from Babel, B.A.T.M.A.N., OLSR, fisheye routing,
   PRoPHET, Spray-and-Wait and MaxProp. The routing core itself is ours
-  (`crates/mycel-net/src/mesh/core.rs`, ~1.5k lines, sans-IO), because
+  (`crates/mycel-net/src/mesh/core.rs`, ~2k lines, sans-IO), because
   nothing existing routes *QUIC packets between Iroh endpoints over
   arbitrary links* with our identities. No new transport library is needed.
 
@@ -72,9 +73,9 @@ we built, and why.
 |---|---|---|---|---|
 | **Yggdrasil** | Spanning tree gives each node tree coordinates; a DHT maps keys to coordinates; greedy routing on the tree. Encrypted IPv6 overlay. | Scales to large networks without global flooding. Keys are addresses. | Path stretch. Root dependence and tree instability under mobile churn. Go and TUN-based: it is its own transport. | **Idea reused**: key-based lookup instead of global flooding. Code rejected (req. 1, 2). |
 | **cjdns** | Kademlia-style DHT over key distance, source-routed labels, encrypted. | Pioneered key = address. | Complex, slow to converge, its own crypto, C, little activity. | **Rejected.** |
-| **Reticulum** | Destinations are key hashes; *announces* propagate path information, rate-limited; *transport nodes* keep path tables and forward; works down to LoRa and serial at tiny bitrates. Rust ports exist (`reticulum-rs` 0.9.x in LXMF-rs, and Beechat's). | Best-in-class for very low-bandwidth links. Announce-based path discovery with strict rate limits. | Its own transport, crypto and identities; not QUIC; the Rust ports say they are not drop-in compatible with Python Reticulum yet. | **Ideas reused**: announce rate limiting, relays as "transport nodes". Code rejected (req. 1, 2). Interop: a future Reticulum *link* (bridging at the edge) is possible. |
+| **Reticulum** | Destinations are key hashes; *announces* propagate path information, rate-limited; *transport nodes* keep path tables and forward; works down to LoRa and serial at tiny bitrates. Rust ports exist (`reticulum-rs` 0.9.x in LXMF-rs, and Beechat's). | Best-in-class for very low-bandwidth links. Announce-based path discovery with strict rate limits. | Its own transport, crypto and identities; not QUIC; the Rust ports say they are not drop-in compatible with Python Reticulum yet. | **Ideas reused**: announce rate limiting, relays as "transport nodes". Code rejected (req. 1, 2). |
 | **BitChat** | BLE mesh: every message flooded with TTL 7; store-and-forward cache for offline peers; Nostr relays bridge to the internet (geohash channels); Noise for E2E. | Zero setup, works in crowds. | Flooding every message doesn't scale past a crowd. The internet bridge is a public relay network: metadata goes to third parties. | **Ideas reused**: TTL scoping, store-and-forward, an internet bridge. We route instead of flooding data, and our bridge is any Mycel device with the internet. |
-| **Meshtastic** | LoRa *managed flooding*: rebroadcast delayed by SNR (far nodes first), cancelled if a neighbour was heard rebroadcasting; hop limit 3–7; MQTT gateways to the internet. | Flood suppression that works on real radios. | A central MQTT broker for the internet. | **Ideas reused**: jittered, suppressible rebroadcast (§6.5). Central broker rejected; gateways publish to a DHT instead. |
+| **Meshtastic** | LoRa *managed flooding*: rebroadcast delayed by SNR (far nodes first), cancelled if a neighbour was heard rebroadcasting; hop limit 3–7; MQTT gateways to the internet. | Flood suppression that works on real radios. | A central MQTT broker for the internet. | **Ideas reused**: jittered rebroadcast (§6.1); suppression tried and turned off over unicast hops (§6.9). Central broker rejected; gateways publish to a DHT instead. |
 | **Briar / Bramble** | Sync between contacts over Tor, Bluetooth and Wi-Fi; a *mailbox* (a spare device) holds messages for an offline user. | Sound security model; mailbox concept. | No multi-hop routing through strangers. | **Idea reused**: mailboxes at the destination's gateways (§7.4). |
 | **libp2p** | Kademlia for peer routing, circuit relay v2 (reservations, limited relayed bandwidth), gossipsub, AutoNAT. Mature Rust implementation. | Proven components. | Duplicates Iroh (transport, identity, relays, NAT traversal); a second stack in the app. | **Ideas reused**: relay budgets and reservations (our gateway budgets). Code rejected. |
 
@@ -86,14 +87,14 @@ we built, and why.
 | **Relays** (n0 or self-hosted) and hole punching | **Adopted** for internet-connected devices. They reach each other, and gateways, as usual. |
 | **pkarr** records (signed DNS packets), n0 DNS relay | **Adopted.** Gateway reachability records use the same format, so any pkarr resolver can read them. |
 | **Mainline DHT** (`iroh-mainline-address-lookup` 0.6, built on `n0-mainline`) | **Adopted** (`n0-mainline` directly, behind the `dht` feature). The crate only publishes the endpoint's *own* record; a gateway publishes *someone else's* (already signed) record, which is a few lines on top of `n0-mainline`. |
-| **iroh-gossip** (HyParView membership + PlumTree broadcast trees) | **Not for routing.** It broadcasts within a topic swarm; route tables need scoped, per-neighbour state, not global broadcast. Candidate later for group presence. |
+| **iroh-gossip** (HyParView membership + PlumTree broadcast trees) | **Not for routing.** It broadcasts within a topic swarm; route tables need scoped, per-neighbour state, not global broadcast. |
 | **iroh-blobs** | Evaluated earlier; not used (different hash ids, no multi-source ranges). |
 
 ## 5. Store-and-forward (DTN)
 
 | Work | What it does | Decision |
 |---|---|---|
-| **Bundle Protocol v7** (RFC 9171); `bp7` 0.9 (CBOR encoding), `dtn7-rs` 0.18 (daemon with TCP/HTTP convergence layers) | Bundles with lifetime, source/destination endpoint ids, status reports. Custody transfer was split out of BPv7 into separate work. | **Ideas reused**: lifetime, hop-by-hop custody, status reports become our signed delivery receipts. **Code rejected for now.** `dtn7` is a daemon with its own convergence layers and routing, not an embeddable core. BPSec would duplicate our envelope signatures and encryption. Our payloads are already signed, encrypted and content-addressed Mycel envelopes. A bp7 encoding of our bundles is a cheap interop step later. |
+| **Bundle Protocol v7** (RFC 9171); `bp7` 0.9 (CBOR encoding), `dtn7-rs` 0.18 (daemon with TCP/HTTP convergence layers) | Bundles with lifetime, source/destination endpoint ids, status reports. Custody transfer was split out of BPv7 into separate work. | **Ideas reused**: lifetime, hop-by-hop custody, status reports become our signed delivery receipts. **Code rejected.** `dtn7` is a daemon with its own convergence layers and routing, not an embeddable core. BPSec would duplicate our envelope signatures and encryption. Our payloads are already signed, encrypted and content-addressed Mycel envelopes. |
 | **PRoPHET** (RFC 6693) | *Delivery predictability* P(a,b): raised on each encounter, aged over time, transitive through intermediaries. Forward to nodes with higher P. | **Adopted** (§7.2). The virtual destination "the internet" lets copies climb toward connectivity. |
 | **Spray-and-Wait** (Spyropoulos et al., 2005) | L copies, binary spray, then wait for direct delivery. | **Adopted, steered**: the copies are sprayed first, each to the likeliest neighbour without one; then a single copy follows the gradient toward the internet (as in Spray-and-Focus, same authors, 2007). L depends on the bundle's size. |
 | **MaxProp** (Burgess et al., 2006) | Priority by path likelihood; flooded acks clear buffers. | **Idea reused**: signed receipts flood among carriers and free their copies. |
@@ -201,7 +202,77 @@ something changes.
     Before the patch, losing a relay mid-transfer stalled the rest for 5–20 s
     in about 1 run in 4. Routing convergence only decides which routes to
     *add*. Measured in `tests/mesh.rs`.
-12. **Short queues under the hops, so control traffic gets through.**
+12. **Lying neighbours.** An announcement's hops and cost aren't signed:
+    relays fill them in. A black hole can relay every origin "at no
+    cost" to pull traffic toward itself and drop it. But each honest hop
+    adds one hop and at least 2.1 ms of cost (`MIN_HOP_COST`: a measured
+    cost of at least 0.1 ms plus `HOP_PENALTY`), and only the origin sends
+    zero hops. A relayed announcement below that floor can't come from an
+    honest relay, so its sender, a direct neighbour over its own
+    authenticated hop connection, is **distrusted** for 10 minutes: the
+    routes it gave go at once (retractions and seqno requests restore the
+    others), the routes it relays are ignored, and it stays reachable
+    itself (its own announcements are signed by it). In `adversarial` at
+    full size (300 phones, 15 such black holes) delivery went from 82% to
+    100% (`docs/SIMULATION.md` §4, fixed 20). A liar that claims plausible
+    values (one hop from everyone, at the least cost) isn't caught by
+    this; item 13 is what stops it.
+13. **End-to-end feedback.** What a liar can't fake is the destination's
+    acknowledgements. The transport tells the router (`Router::feedback`)
+    when a whole retransmission timeout passes with nothing acknowledged
+    for our packets to a destination, and when an acknowledgement comes
+    back. Its timeout follows the measured round trip, so a slow path isn't
+    a dead one. After two timeouts in a row through the same next hop, on
+    a mesh route that still claims to reach the destination and over a hop
+    that is still up, and a silence of at least 1.5 s plus twice the
+    route's cost (slow or busy routes get longer), that hop is
+    **suspected** for that destination for 2 minutes:
+    - our packets, and those we relay to it, take the next feasible route
+      (any feasible route is loop-free, not only the best); with every
+      route suspected, still the best: dropping can't deliver, and
+      suspicion can be wrong;
+    - the store-and-forward carrier stops trusting that route with every
+      copy of our bundle (§7.3).
+
+    One acknowledgement clears the count. Routes through gateways or the
+    internet aren't judged: the destination may just be offline. Custody
+    hand-offs aren't steered by it: on a trace of brief contacts, where
+    routes stop delivering for ordinary reasons, that cost more than it
+    saved. At most 1,024 destinations and 4 suspects each are kept. Relays
+    can't judge on their own: the acknowledgements are inside the
+    end-to-end encryption, and the reverse path needn't pass them. In
+    `adversarial` at full size, 15 such liars (dropping bundles too) took
+    delivery to 76%; with this and §7.3's split, 94%
+    (`docs/SIMULATION.md` §4, fixed 21).
+
+    **In the node** (`mesh/watch.rs`) the evidence comes per QUIC path.
+    Every end-to-end connection (pooled, dialled for another protocol, or
+    accepted) is watched: a path `mesh(dst, via)` we keep sending on that
+    has had no frame back for 3 s (both ends send keep-alives every 1.5 s),
+    or that QUIC gives up while still silent (after 5 s), is reported to
+    `Router::path_feedback`; frames arriving again clear it. Only frames
+    QUIC counted after decrypting the packet carrying them count, so a
+    relay can drop them but can't fake them; nothing at the mesh layer (a
+    packet merely claiming to come from the destination) counts. The same
+    rules apply: two silences scaled to the route's cost, mesh routes
+    only. A suspected hop's route stops being offered as a QUIC path for
+    that destination (`RouteDown`), the next one is (`RouteUp`), and if
+    every other route is infeasible because we advertised the cheap one,
+    a fresh seqno is asked for, not through the suspect, as after a loss.
+    The node's carrier is told (`Carrier::doubt`). Measured with real
+    nodes (`tests/mesh.rs`): a relay that keeps announcing a destination
+    and drops everything to and from it is routed around in 6.6 s, and two
+    hops at 20 kB/s with 30 ms of latency and queue drops suspect nothing.
+
+    **Next protocol version: signed route attestations.** Feedback finds a
+    liar only by losing traffic to it first, and only at sources. The
+    planned fix is to sign what relays add: each hop signs (origin, seqno,
+    the hops and cost it advertises, the neighbour it sends to), so a
+    relay can't claim to be nearer than the signed chain it received
+    (SEAD and Ariadne's idea, with our Ed25519 keys). It changes the
+    announcement format and costs a signature per hop, so it waits for the
+    next protocol version; `docs/TRUST.md` §8b.
+14. **Short queues under the hops, so control traffic gets through.**
     Announcements, seqno requests, keep-alives and the end-to-end
     connections' acknowledgements share each hop with the bulk data, and
     below QUIC that hop is a first-in, first-out queue nobody can reorder:
@@ -265,6 +336,12 @@ something changes.
     relay is immediate; the DHT takes seconds to a minute.
   - Old gateways stop routing to a device they have no mesh route to, so a
     stale record fails fast; the sender re-resolves on path failure.
+  - A looked-up record is trusted for a minute (`REACH_TTL`). After that,
+    the next packet starts a new lookup and, meanwhile, goes on through a
+    gateway of the old record that has a hop up (stale-while-revalidate,
+    for another minute, `REACH_STALE`); an out-of-date record never starts
+    a dial. A gateway relaying a flow used to park it for a lookup (the
+    DHT can take seconds) every minute.
   - When the device gets the internet itself, Iroh's own publisher
     replaces the record with its relay address.
 - **Using a record.** Anyone on the internet resolves a key.
@@ -273,6 +350,18 @@ something changes.
     per gateway, `mesh(dst, via G)`, so each gateway is its own QUIC path.
     Packets go to G over an *internet hop* (a hop connection opened on
     demand, hung up after 60 s idle). G routes them into its mesh.
+  - **Which gateway** (where the core chooses: at a gateway forwarding for
+    its mesh, and for custody hand-offs; Iroh's own paths name theirs):
+    the lowest record cost + internet hop cost. The gateways of one
+    record sit in one mesh around the destination, so a hop not measured
+    yet is costed as the cheapest measured hop to another of them (100 ms
+    only when none is measured), and one that is up wins ties. A
+    measured cost is the round trip *plus* the time to move 64 KiB, well
+    above a flat 100 ms guess, so with the guess every untried gateway
+    looked cheaper than the one carrying the traffic: each was dialled in
+    turn while the traffic waited, and again whenever the unused hop
+    idled out (`global-scale`, warm messages: optimality p95 5.14× →
+    2.65×; `docs/SIMULATION.md` §4, fixed 19).
   - **Replies:** the reply's waypoint is G, so replies return through the
     same gateway.
   - **Sender without the internet:** it uses its own gateways as waypoints
@@ -380,6 +469,14 @@ lifetime, copies) is signed by the source.
 - **Copies in flight** aren't given again: a single copy on its way to
   one neighbour isn't also offered to another.
 - **Rate limits:** per neighbour and per source.
+- **A route that just failed gets one share.** When our live packets to
+  the destination have just gone unacknowledged along a mesh route (§6,
+  item 13: the router tells the carrier, `Carrier::doubt`), our own
+  bundles for it send half their copies along the live route and the rest
+  to other neighbours, the likeliest first, one share each, keeping the
+  last copy for the next route. A black hole on the route can take custody
+  of one share, not all of them. Without that evidence custody moves whole
+  along a live route, as before.
 - **Hand-off order:** deliveries first, then live routes, the gradient,
   and spraying last: contacts end, and a 1 MB spray queued ahead of a
   delivery can cost the delivery.
@@ -411,8 +508,8 @@ where it works:
 
 | Layer | Scope | Mechanism | State per device |
 |---|---|---|---|
-| Local mesh | ≤ 8 hops (≤ 2 most of the time) | signed distance vector | origins in scope |
-| Global lookup | the planet | pkarr records: DHT, n0 relay | none (looked up on demand, cached 60 s) |
+| Local mesh | ≤ 10 hops (≤ 2 most of the time) | signed distance vector | origins in scope |
+| Global lookup | the planet | pkarr records: DHT, n0 relay | none (looked up on demand, cached 60 s, then refreshed while in use) |
 | Distance | the planet | the internet via gateways | open internet hops (≤ 256) |
 | Time | days | custody bundles, PRoPHET, mailboxes | bounded store |
 
@@ -424,8 +521,7 @@ where it works:
 | Mesh as a transport | **Iroh custom transport** (ours: `mesh/mod.rs`) |
 | Local routing | **Our sans-IO core** (`mesh/core.rs`). Ideas from Babel, B.A.T.M.A.N., OLSR and fisheye. No Rust library routes opaque QUIC packets by Ed25519 key over arbitrary links. |
 | Global lookup | **pkarr records** (`iroh-dns`), the n0 relay via Iroh's `PkarrRelayClient`, and the **Mainline DHT** via `n0-mainline` |
-| Store-and-forward | **Our sans-IO carrier** (`mesh/dtn.rs`): steered spraying + a PRoPHET gradient toward the internet + custody + offers, resume and receipts. bp7 encoding later, for interop. |
-| Broadcast (later) | **iroh-gossip**, for group presence, not routing |
+| Store-and-forward | **Our sans-IO carrier** (`mesh/dtn.rs`): steered spraying + a PRoPHET gradient toward the internet + custody + offers, resume and receipts. |
 
 ## 10. What the tests measure
 

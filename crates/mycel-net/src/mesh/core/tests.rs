@@ -360,9 +360,10 @@ fn a_line_routes_hop_by_hop() {
 
 #[test]
 fn forged_stale_and_flooding_announcements_are_rejected() {
+    // relayed by a neighbour: one hop, as an honest relay sends it
     let ann = |origin, seq| Announce {
-        hops: 0,
-        cost: 0,
+        hops: 1,
+        cost: 100,
         origin,
         seq,
         flags: 0,
@@ -579,6 +580,257 @@ fn failed_dials_back_off() {
     r.hop_down(key(50), 7_000);
     r.send(key(50), key(50), Bytes::from_static(b"x"), false, 7_100);
     assert_eq!(dials(&mut r), 1);
+}
+
+/// A black hole claims every device is right next to it: relayed
+/// announcements at no cost (or as the origin itself). No honest relay can
+/// send that (each hop adds at least `MIN_HOP_COST`), so the neighbour is
+/// distrusted: the routes it gave go, the routes it relays are ignored for
+/// a while, and it stays reachable itself. A plausible claim, or a
+/// retraction, is never blamed.
+#[test]
+fn a_neighbour_relaying_impossible_routes_is_not_routed_through() {
+    let ann = |origin, seq, hops, cost| Announce {
+        hops,
+        cost,
+        origin,
+        seq,
+        flags: 0,
+        scope: 8,
+        uplink: 0,
+        name: Arc::from(""),
+        sig: Sig([0; 64]),
+    };
+    let (honest, liar, o, p, q) = (key(2), key(3), key(9), key(10), key(11));
+    let mut r = Router::new(key(1), Config::default());
+    for n in [honest, liar] {
+        r.set_direct(n, true, 0);
+        r.hop_up(n, 0);
+        r.set_cost(n, 100);
+    }
+    let ok = |_: &Announce| true;
+    r.on_announce(honest, ann(o, WALL, 2, 400), 10, WALL, ok);
+    r.on_announce(liar, ann(liar, WALL, 0, 0), 10, WALL, ok);
+    r.on_announce(liar, ann(q, WALL, 1, 50), 10, WALL, ok);
+    r.tick(20);
+    assert_eq!(r.next_hop_local(&o, 20), Some(honest));
+    assert_eq!(r.next_hop_local(&q, 20), Some(liar), "plausible: believed");
+    // a retraction may carry no hops: never blamed
+    r.on_announce(honest, Announce { cost: INFINITY, ..ann(p, WALL, 0, 0) }, 30, WALL, ok);
+    assert_eq!(r.stats().neighbours_distrusted, 0);
+    // "o is right here": impossible two hops out at no cost
+    r.on_announce(liar, ann(o, WALL + 1, 2, 0), 40, WALL, ok);
+    assert_eq!(r.stats().neighbours_distrusted, 1);
+    r.tick(50);
+    assert_eq!(r.next_hop_local(&o, 50), Some(honest));
+    assert_eq!(r.next_hop_local(&q, 50), None, "what it gave before goes too");
+    // what it relays now is ignored, even if plausible; it stays reachable itself
+    r.on_announce(liar, ann(p, WALL + 2, 1, 50), 60, WALL, ok);
+    r.on_announce(liar, ann(liar, WALL + 3, 0, 0), 60, WALL, ok);
+    r.tick(70);
+    assert_eq!(r.next_hop_local(&p, 70), None);
+    assert_eq!(r.route_hops(&liar, &liar), Some(1));
+    // as the origin, claiming no hops from somewhere else: impossible too
+    let mut r2 = Router::new(key(1), Config::default());
+    r2.set_direct(liar, true, 0);
+    r2.hop_up(liar, 0);
+    r2.on_announce(liar, ann(o, WALL, 0, 0), 10, WALL, ok);
+    assert_eq!(r2.stats().neighbours_distrusted, 1);
+    // after a while it gets another chance
+    let later = 40 + DISTRUST + 1;
+    r.tick(later);
+    r.on_announce(liar, ann(p, WALL + later, 1, 50), later, WALL + later, ok);
+    r.tick(later + 10);
+    assert_eq!(r.next_hop_local(&p, later + 10), Some(liar));
+}
+
+/// A black hole that lies plausibly can't be refuted from announcements,
+/// but the destination's acknowledgements don't come back through it: two
+/// timeouts in a row with nothing acknowledged through one next hop, and the
+/// source takes the next route for that destination. One acknowledgement in
+/// between clears the count (a slow or lossy link isn't dropped), and the
+/// suspicion runs out.
+#[test]
+fn unacknowledged_packets_move_a_destination_off_its_next_hop() {
+    let ann = |origin, seq, hops, cost| Announce {
+        hops,
+        cost,
+        origin,
+        seq,
+        flags: 0,
+        scope: 8,
+        uplink: 0,
+        name: Arc::from(""),
+        sig: Sig([0; 64]),
+    };
+    let (liar, honest, d) = (key(2), key(3), key(9));
+    let mut r = Router::new(key(1), Config::default());
+    for n in [liar, honest] {
+        r.set_direct(n, true, 0);
+        r.hop_up(n, 0);
+        r.set_cost(n, 100);
+    }
+    let ok = |_: &Announce| true;
+    r.on_announce(liar, ann(d, WALL, 1, 21), 10, WALL, ok);
+    r.on_announce(honest, ann(d, WALL, 3, 500), 10, WALL, ok);
+    r.tick(20);
+    let send = |r: &mut Router, t: Time| {
+        r.send(d, key(1), Bytes::from_static(b"x"), false, t);
+        outcome(r).2
+    };
+    assert_eq!(send(&mut r, 100), vec![liar], "the cheapest claim wins");
+    r.feedback(d, false, 1_100);
+    r.feedback(d, true, 1_500); // an ack: the count starts again
+    r.feedback(d, false, 2_100);
+    assert_eq!(send(&mut r, 2_200), vec![liar], "one timeout at a time is a slow link");
+    r.feedback(d, false, 4_200);
+    assert_eq!(r.stats().hops_suspected, 1);
+    assert_eq!(send(&mut r, 4_300), vec![honest]);
+    // the honest route works; nothing more is suspected
+    r.feedback(d, true, 4_400);
+    r.feedback(d, false, 6_000);
+    assert_eq!(send(&mut r, 6_100), vec![honest]);
+    // every route suspected: still the best (dropping can't deliver)
+    r.feedback(d, false, 9_000);
+    assert_eq!(r.stats().hops_suspected, 2);
+    assert_eq!(send(&mut r, 9_100), vec![liar]);
+    // suspicion runs out
+    let later = 9_000 + SUSPECT_FOR + 1;
+    r.on_announce(liar, ann(d, WALL + later, 1, 21), later, WALL + later, ok);
+    r.tick(later + 10);
+    assert_eq!(send(&mut r, later + 20), vec![liar]);
+}
+
+/// The node's evidence comes per QUIC path: `mesh(d, via)` silent while
+/// we send on it. Two such silences, long enough for the route, and the
+/// route offered for `d` moves to another first hop (RouteDown, RouteUp);
+/// a path that isn't a mesh route through a neighbour isn't judged.
+#[test]
+fn a_silent_path_moves_the_offered_route() {
+    let ann = |origin, seq, hops, cost| Announce {
+        hops,
+        cost,
+        origin,
+        seq,
+        flags: 0,
+        scope: 8,
+        uplink: 0,
+        name: Arc::from(""),
+        sig: Sig([0; 64]),
+    };
+    let (liar, honest, d, stranger) = (key(2), key(3), key(9), key(7));
+    let mut r = Router::new(key(1), Config { routes: 1, ..Config::default() });
+    for n in [liar, honest] {
+        r.set_direct(n, true, 0);
+        r.hop_up(n, 0);
+        r.set_cost(n, 100);
+    }
+    let ok = |_: &Announce| true;
+    r.on_announce(liar, ann(d, WALL, 1, 21), 10, WALL, ok);
+    r.on_announce(honest, ann(d, WALL, 3, 500), 10, WALL, ok);
+    r.tick(20);
+    assert_eq!(r.offered(&d), vec![liar]);
+    assert!(!r.path_feedback(d, stranger, Some(100), 3_100), "not a route of ours");
+    assert!(r.path_feedback(d, liar, Some(100), 3_100));
+    r.path_feedback(d, liar, None, 3_200); // it answered: start again
+    r.path_feedback(d, liar, Some(4_000), 7_000);
+    r.tick(7_010);
+    assert_eq!(r.offered(&d), vec![liar], "one silence isn't enough");
+    r.path_feedback(d, liar, Some(4_000), 9_000); // it closed, still silent
+    let mut outs = Vec::new();
+    r.drain(&mut outs);
+    // we advertised the cheap route, so the other is infeasible: a fresh
+    // seqno is asked for (not through the suspect) ...
+    assert!(outs.iter().any(|o| matches!(o, Out::SeqReq { to, req } if *to == honest && req.origin == d)));
+    assert!(!outs.iter().any(|o| matches!(o, Out::SeqReq { to, .. } if *to == liar)));
+    // ... and once it comes, the route moves
+    r.on_announce(honest, ann(d, WALL + 9_005, 3, 500), 9_005, WALL + 9_005, ok);
+    r.tick(9_010);
+    r.drain(&mut outs);
+    assert_eq!(r.offered(&d), vec![honest]);
+    assert!(outs.iter().any(|o| matches!(o, Out::RouteDown { dst, via } if *dst == d && *via == liar)));
+    assert!(outs.iter().any(|o| matches!(o, Out::RouteUp { dst, via, .. } if *dst == d && *via == honest)));
+    // when the suspicion runs out, the cheaper route is offered again
+    let later = 9_000 + SUSPECT_FOR + 1;
+    r.on_announce(liar, ann(d, WALL + later, 1, 21), later, WALL + later, ok);
+    r.on_announce(honest, ann(d, WALL + later, 3, 500), later, WALL + later, ok);
+    r.tick(later + 10);
+    assert_eq!(r.offered(&d), vec![liar]);
+}
+
+/// What a router did with one packet of ours: (dials, lookups, frames sent to).
+fn outcome(r: &mut Router) -> (Vec<SignPk>, usize, Vec<SignPk>) {
+    let mut outs = Vec::new();
+    r.drain(&mut outs);
+    let dials = outs.iter().filter_map(|o| if let Out::Dial(k) = o { Some(*k) } else { None }).collect();
+    let resolves = outs.iter().filter(|o| matches!(o, Out::Resolve(_))).count();
+    let frames = outs.iter().filter_map(|o| if let Out::Frame { to, .. } = o { Some(*to) } else { None }).collect();
+    (dials, resolves, frames)
+}
+
+/// A gateway carrying our traffic to a device behind it is kept: the
+/// record's other gateways, not tried yet, are costed like the one we have
+/// measured (they sit in the same mesh), not as a flat guess far below any
+/// measured internet hop. Before, each packet after the first measurement
+/// dialled the other gateway and waited for it.
+#[test]
+fn a_working_gateway_is_kept_over_untried_ones() {
+    let (t, g1, g2) = (key(50), key(60), key(61));
+    let mut r = Router::new(key(1), Config::default());
+    r.set_internet(true);
+    r.send(t, key(1), Bytes::from_static(b"1"), false, 0);
+    assert_eq!(outcome(&mut r).1, 1, "a lookup");
+    r.on_resolved(t, Some(vec![(g1, 300), (g2, 300)]), 150);
+    let (dials, _, _) = outcome(&mut r);
+    assert_eq!(dials, vec![g1], "equal cost: the first");
+    r.hop_up(g1, 300);
+    r.set_cost(g1, 3_000); // a 150 ms round trip and the time to move 64 KiB
+    assert_eq!(outcome(&mut r).2, vec![g1], "the waiting frame goes");
+    r.send(t, key(1), Bytes::from_static(b"2"), false, 1_000);
+    assert_eq!(outcome(&mut r), (vec![], 0, vec![g1]), "no dial to the other gateway");
+    // one that is clearly closer to the target is still worth a dial
+    r.on_resolved(t, Some(vec![(g1, 3_000), (g2, 300)]), 2_000);
+    r.send(t, key(1), Bytes::from_static(b"3"), false, 2_000);
+    assert_eq!(outcome(&mut r).0, vec![g2]);
+}
+
+/// A looked-up record goes out of date after a minute. Traffic through a
+/// gateway of it that is up doesn't wait for the new lookup (it used to
+/// stall on every expiry); a gateway that isn't up isn't dialled from an
+/// out-of-date record; and a record long out of date is looked up first.
+#[test]
+fn an_out_of_date_record_keeps_a_working_gateway_while_it_is_looked_up() {
+    let (t, g1, g2) = (key(50), key(60), key(61));
+    let mut r = Router::new(key(1), Config::default());
+    r.set_internet(true);
+    r.send(t, key(1), Bytes::from_static(b"1"), false, 0);
+    r.on_resolved(t, Some(vec![(g1, 300), (g2, 300)]), 100);
+    r.hop_up(g1, 200);
+    r.set_cost(g1, 3_000);
+    outcome(&mut r);
+    let stale = 100 + REACH_TTL + 1;
+    r.tick(stale);
+    r.send(t, key(1), Bytes::from_static(b"2"), false, stale);
+    assert_eq!(outcome(&mut r), (vec![], 1, vec![g1]), "sent at once, looked up again");
+    r.send(t, key(1), Bytes::from_static(b"3"), false, stale + 10);
+    assert_eq!(outcome(&mut r), (vec![], 0, vec![g1]), "one lookup at a time");
+    r.on_resolved(t, Some(vec![(g2, 100), (g1, 300)]), stale + 200);
+    outcome(&mut r);
+    // without a hop up, an out-of-date record waits for its lookup
+    r.hop_down(g1, stale + 300);
+    let later = stale + 200 + REACH_TTL + 1;
+    r.tick(later);
+    r.send(t, key(1), Bytes::from_static(b"4"), false, later);
+    assert_eq!(outcome(&mut r), (vec![], 1, vec![]), "no dial from an out-of-date record");
+    r.on_resolved(t, Some(vec![(g2, 100), (g1, 300)]), later + 100);
+    assert_eq!(outcome(&mut r).0, vec![g2], "then the fresh one's best");
+    // long out of date: forgotten, looked up before anything moves
+    r.hop_up(g2, later + 200);
+    outcome(&mut r);
+    let gone = later + 100 + REACH_TTL + REACH_STALE + 1;
+    r.tick(gone);
+    r.send(t, key(1), Bytes::from_static(b"5"), false, gone);
+    assert_eq!(outcome(&mut r), (vec![], 1, vec![]));
 }
 
 #[test]
@@ -863,6 +1115,8 @@ fn churn_never_loops() {
     assert_eq!(net.frame_loops, 0);
     assert_eq!(route_loops, 0);
     assert!(delivered > 100);
+    // honest relays never send a route the plausibility check refuses
+    assert!(net.nodes.iter().all(|r| r.stats().neighbours_distrusted == 0 && r.stats().announcements_implausible == 0));
 }
 
 /// Announcements each device sends per second, against mesh size, with
@@ -925,7 +1179,9 @@ fn security_verified_cache_binds_every_signed_field() {
         let mut ann = sign_announce(&owner, Origination { seq: WALL, flags: 0, scope: 8, uplink: 0 }, "original");
         ann.cost = INFINITY;
         router.on_announce(neighbour, ann.clone(), 0, WALL, verify_announce);
-        ann.cost = 0;
+        // relayed: one hop (hops and cost aren't signed)
+        ann.hops = 1;
+        ann.cost = 100;
         match field {
             0 => ann.name = Arc::from("forged"),
             1 => ann.flags = F_GATEWAY,
@@ -971,7 +1227,10 @@ fn security_verified_cache_stays_bounded_and_can_be_disabled() {
         router.set_direct(neighbour, true, 0);
         router.hop_up(neighbour, 0);
         for i in 0..5 {
-            let ann = sign_announce(&owner, Origination { seq: WALL + i, flags: 0, scope: 8, uplink: 0 }, "original");
+            let mut ann =
+                sign_announce(&owner, Origination { seq: WALL + i, flags: 0, scope: 8, uplink: 0 }, "original");
+            ann.hops = 1;
+            ann.cost = 100;
             router.on_announce(neighbour, ann, i, WALL, verify_announce);
             assert!(router.verified.len() <= limit);
         }

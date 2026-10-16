@@ -1264,7 +1264,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
         }),
       onlinePeers: [...people.values()].filter((p) => p.contact && p.online).map((p) => p.id),
       nearbyPeers: [...people.values()].filter((p) => p.nearby).length,
-      addresses: ["192.168.1.24:51820", "[fe80::1c2a:8ff:fe3d:91b2]:51820", "127.0.0.1:51820"],
+      addresses: ["192.0.2.24:51820", "[2001:db8::24]:51820", "127.0.0.1:51820"],
     }),
     list_conversations: () =>
       [...convs.values()].filter((c) => !c.hidden).sort((a, b) => b.activity - a.activity).map(summary),

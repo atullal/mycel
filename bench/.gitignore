@@ -4,7 +4,6 @@
 /traces/out
 /one/gen
 results/helsinki-capture/
-results/meshtasticator/*.json
 results/one/*/run.log
 results/*.log
 # per-message latencies (regenerable; the summaries keep the numbers)

@@ -7,11 +7,14 @@ a focus on hops and routing: *does a message from a Bluetooth-only phone in
 the US reach a Bluetooth-only phone in Europe, and is the path it takes the
 fastest one that existed?*
 
+Every medium here is emulated. Which of Mycel's links have also run
+between real devices is in [TESTING.md](TESTING.md#real-hardware).
+
 ```
 cargo run --release -p mycel-sim -- list
 cargo run --release -p mycel-sim -- all                    # everything, full size
 cargo run --release -p mycel-sim -- us-eu,mailbox --scale 0.1 --seed 7
-cargo run --release -p mycel-sim -- t2 --candidate main    # hold main's old mesh to the same objectives
+cargo run --release -p mycel-sim -- t2 --candidate main    # hold the earlier mesh design to the same objectives
 cargo test -p mycel-sim                                    # CI sizes; `-- --ignored` for the rest
 ```
 
@@ -28,10 +31,10 @@ recorded (a known gap, or a finding with evidence).
 
 | | Tier 1: emulation | Tier 2: discrete-event simulation |
 |---|---|---|
-| What runs | Real `Node`s: iroh QUIC, multipath, the mesh (GLOBAL's routing core and carrier inside the node), sync, calls with test-tone "microphones" | GLOBAL's sans-IO routing core (`mesh/core.rs`) and store-and-forward carrier (`mesh/dtn.rs`), the real code, plus models and baselines |
+| What runs | Real `Node`s: iroh QUIC, multipath, the mesh (the routing core and carrier inside the node), sync, calls with test-tone "microphones" | The sans-IO routing core (`mesh/core.rs`) and store-and-forward carrier (`mesh/dtn.rs`), the real code, plus models and baselines |
 | Network | `mycel_net::emu::EmuNet`: shared media with positions, range, rate, airtime (half-duplex, one collision domain per radio), latency, jitter (in-order), loss, per-pair rules (NAT, access latency, 802.11s hops), discovery, devices coming and going | Per-hop latency + size/rate per radio, the internet with geography, NAT and relays, a record directory, mobility, churn, contact traces |
 | Time | Real time (iroh, noq and the mesh read `std::time`; paused tokio time gave no speed-up and mixed clocks, measured) | Virtual (µs), one event queue |
-| Scale on this Mac (18 cores, 24 GB) | ~2–2.5 MB and ~1% of a core per node: 500 nodes measured (1.2 GB) | ~1.1 M events/s on one core. 2,002 devices × 12 min: 116 s, 840 MB. 10,003 devices: 33 min, 2.15 GB (on a loaded, swapping machine). 100k: not run (≈ 5 h and 15–20 GB by extrapolation) |
+| Scale on one Mac (18 cores, 24 GB) | ~2–2.5 MB and ~1% of a core per node: 500 nodes measured (1.2 GB) | ~1.1 M events/s on one core. 2,002 devices × 12 min: 116 s, 840 MB. 10,003 devices: 33 min, 2.15 GB (on a loaded, swapping machine) |
 
 **Messages** in tier 1 are real Mycel sync (a change to a shared document,
 timed until the recipient's replica shows it). In tier 2 a message is split
@@ -52,9 +55,9 @@ ratio measures routing (path choice, lookups); for large ones it also measures
 QUIC slow start over long round trips; and in tier 1 it includes Mycel sync's
 own round trips (a 32 ms message on a 5 ms LAN path is 6×).
 
-**Candidates.** Tier-2 objectives judge `--candidate global` (default: GLOBAL's
-routing core + carrier), `main` (the mesh before GLOBAL, modelled), or
-`stand-in` (an earlier model of the GLOBAL design, kept as a reference).
+**Candidates.** Tier-2 objectives judge `--candidate global` (default: the
+routing core and carrier), `main` (the earlier flooding mesh, modelled), or
+`stand-in` (an earlier model of the current design, kept as a reference).
 
 ## 2. Models and sources
 
@@ -90,56 +93,49 @@ under load.
 
 ## 3. Scenarios and results
 
-Seed 1, full size unless noted, run on 8 October 2026. Candidate: the GLOBAL
-core and carrier (tier 2), the real node (tier 1). ✅ pass, ⏳ fails as
-expected (reason in the report: a known gap or a finding), ❌ fail.
+Seed 1, full size unless noted. Candidate: the routing core and carrier
+(tier 2), the real node (tier 1). ✅ pass, ⏳ fails as expected (reason in
+the report: a known gap or a finding), ❌ fail.
 
 The scenarios ran as separate processes and were joined with
-`mycel-sim merge`. The rows marked *(carrier)* were rerun on 9 October
-with the store-and-forward fixes from the benchmarks (§4, fixed 8), on a
-less loaded machine. The rows marked *(routing)* were rerun on 9 October
-with finding 1's fixes (§4, fixed 14), at a load average of ~9. The Mac was
-heavily loaded throughout the first runs: another agent's
-Java simulations, a host build and other apps, a load average of ~20 on
-18 cores, and 8 of 9 GB swap in use. Wall times are pessimistic, and the
-real-time tier-1 latencies (calls especially) carry that load. The ONE
-trace replays are in §5. `scale-ceiling` (50 → 500 real nodes) didn't
-finish within 40 minutes under this load and was stopped. On a quieter
-machine it measured 500 nodes in 1.2 GB (§1).
+`mycel-sim merge`, with the fixes of §4 in place. The machine was loaded
+(load averages of 9 to 40 on 18 cores, with other simulations and builds
+running), so wall times are pessimistic, and the real-time tier-1 latencies
+(calls especially) carry that load. Trace replays are in §5.
 
 | Scenario | Tier | Size | Status | Result | Wall |
 |---|---|---|---|---|---:|
 | `cafe` | 1 | full | ✅ | messages: 100% delivered, p50 0.032 s, p95 0.039 s, optimality p50/p95/p99 5.77/7.00/7.22× · call: setup 0.051 s, loss 0.0%, latency 101 ms, path Some(Network) | 18 s |
 | `office` | 1 | full | ✅ | messages: 100% delivered, p50 0.032 s, p95 0.034 s, optimality p50/p95/p99 6.00/59.3/60.6× | 10 s |
 | `apartment-80211s` | 1 | full | ✅ | messages: 100% delivered, p50 0.083 s, p95 0.095 s, optimality p50/p95/p99 5.63/6.98/6.98× · bulk: next flat 8.2 MB/s, 7 flats away 2.2 MB/s | 10 s |
-| `conference` | 1 | 24 seats (scale 0.08), seeds 1–5; 30 and 100 seats, seed 1 *(tier 1; 300 not rerun)* | ✅ | 24 seats: messages 100% delivered every seed, p95 0.20 / 1.19 / 0.89 / 0.48 / 0.60 s; 0 Bluetooth packets dropped (was 15–25%, p95 up to 8.2 s, fixed 15) · 30 seats: 100%, p95 0.411 s · 100 seats (a seat hears ~49, 12 hop connections each): 100%, p50 0.463 s, p95 1.10 s, 26 of 169,243 Bluetooth packets dropped, +272 MB (2.7 MB per node; 100 seats didn't finish in 30 min before) | 15–20 s (24), 38 s (100) |
+| `conference` | 1 | 24 seats (scale 0.08), seeds 1–5; 30 and 100 seats, seed 1 | ✅ | 24 seats: messages 100% delivered every seed, p95 0.20 / 1.19 / 0.89 / 0.48 / 0.60 s; 0 Bluetooth packets dropped (was 15–25%, p95 up to 8.2 s, fixed 15) · 30 seats: 100%, p95 0.411 s · 100 seats (a seat hears ~49, 12 hop connections each): 100%, p50 0.463 s, p95 1.10 s, 26 of 169,243 Bluetooth packets dropped, +272 MB (2.7 MB per node; 100 seats didn't finish in 30 min before) | 15–20 s (24), 38 s (100) |
 | `city-block` | 1 | full | ✅ | 8 hops: 100% delivered, p50 0.973 s, p95 0.978 s, optimality p50/p95/p99 3.24/3.26/3.26× · 9 hops: delivered (max_hops = 10) | 24 s |
-| `shutdown` | 1 | full, seeds 1–4 *(tier 1)* | ✅ | messages (connected at the time): 100 / 90 / 100 / 100% delivered, p95 0.59 / 0.78 / 0.76 / 6.97 s · call between two walkers: heard every seed, loss 0.0%, setup 0.58–1.02 s, over the mesh or Bluetooth (fixed 15) · memory +69–87 MB for 30 nodes | 49–123 s (was 502 s, fixed 16) |
-| `disaster-live` | 1 | full *(carrier)* | ✅ | member mule: 49 s; stranger mule: 50 s (it never arrived before fixed 2) | 60 s |
+| `shutdown` | 1 | full, seeds 1–4 | ✅ | messages (connected at the time): 100 / 90 / 100 / 100% delivered, p95 0.59 / 0.78 / 0.76 / 6.97 s · call between two walkers: heard every seed, loss 0.0%, setup 0.58–1.02 s, over the mesh or Bluetooth (fixed 15) · memory +69–87 MB for 30 nodes | 49–123 s (was 502 s, fixed 16) |
+| `disaster-live` | 1 | full | ✅ | member mule: 49 s; stranger mule: 50 s (it never arrived before fixed 2) | 60 s |
 | `rural-line` | 1 | full | ✅ | messages: 100% delivered, p50 0.100 s, p95 0.120 s, optimality p50/p95/p99 5.73/6.87/6.87× · bulk: next house 6.7 MB/s, 5 hops 0.70 MB/s | 18 s |
-| `us-eu-live` | 1 | full *(routing)* | ✅ | messages: 100% delivered, p50 0.788 s, p95 0.805 s, optimality p50/p95/p99 4.17/4.26/4.26× · call: setup 1.63 s, loss 0.0%, latency 435 ms, path Some(Mesh) | 20 s |
+| `us-eu-live` | 1 | full | ✅ | messages: 100% delivered, p50 0.788 s, p95 0.805 s, optimality p50/p95/p99 4.17/4.26/4.26× · call: setup 1.63 s, loss 0.0%, latency 435 ms, path Some(Mesh) | 20 s |
 | `nat-relay` | 1 | full | ✅ | messages: 100% delivered, p50 0.233 s, p95 0.488 s, optimality p50/p95/p99 3.32/4.57/4.80× · during the relay outage: 100% delivered, p50 0.263 s, p95 0.772 s, optimality p50/p95/p99 3.32/6.39/130× | 23 s |
 | `adversarial-live` | 1 | full | ✅ | messages past a black hole and a storm: 100% delivered, p50 0.275 s, p95 0.308 s, optimality p50/p95/p99 3.66/4.11/4.11× | 16 s |
 | `multipath` | 1 | full | ✅ | 3 links 8.0 MB/s, 1 link 2.9 MB/s (2.76×) | 21 s |
 | `mixed-room` | 1 | full | ✅ | Ethernet→Some(Ethernet), Wi-Fi Direct→Some(WifiDirect), UWB→Some(Uwb), Bluetooth LE→Some(Bluetooth) | 26 s |
-| `us-eu` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 0.799 s, optimality p50/p95/p99 1.29/2.29/4.19× | 1 s |
-| `gateway-choice` | 2 | full *(stability)* | ✅ | global core + DTN: 100% delivered, p95 1.12 s, optimality p50/p95/p99 6.29/9.06/9.18× (100 KB and 1 MB messages now against the pipelining bound) · 100% of relayed bytes via the far fibre gateway | 0 s |
-| `routing-convergence` | 2 | full *(routing)* | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never | 15 s |
-| `flood-scaling` | 2 | full *(routing)* | ✅ | largest N: global core 8.4% of BLE in steady state, 100% of pairs routed (before: 67.0%, 85% routed), main 136.1% | 839 s |
-| `partial-route` | 2 | full *(carrier)* | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.5 s; sender-holds 100% p50 98.2 s · gap 300 m: global core + DTN 100%; stand-in custody 0% p50 0 s; sender-holds 0% p50 0 s | 0 s |
-| `disaster-dtn` | 2 | full, judged on seeds 1–12 *(control)* | ✅ | **global core + DTN: mean 80.3% delivered** (target ≥ 80%; per seed 60–92%; seeds 13–24 mean 86.6%; open 12) · seed 1: 60%, p95 7220 s, optimality p50/p95/p99 1.01/4.62/4.65×, 18.3 replicas and 25.6 hand-offs per message (budget 32) · PRoPHET 58%, spray-and-wait (L=8) 32%, epidemic 100% (seed 1) · CI size (0.1): 100% | 55 s |
-| `mailbox` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
-| `global-scale` | 2 | 2,002 devices (0.02) *(control)* | ✅ | global core + DTN: 100% delivered, p95 0.690 s · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.130 s, p95 0.286 s, optimality p95 4.45× (was 32.2×, fixed 18) · control 727 B/s per device (was 8,470): routing 470, carrier 257 (was 8,004, fixed 17) | 14 s |
-| `churn` | 2 | 1,001 devices (scale 0.1) *(control)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.6/17.1×; control 707 B/s per device: routing 2,659 → 471, carrier 4,540 → 264 (full size before the carrier fixes: 100%, p95 65.2 s) | 10 s |
-| `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 15.0 s, optimality p50/p95/p99 32.7/718/2015× · global core + DTN: clean 100%, attacked 100%, Sybil gateway 100% | 980 s |
-| `trace-replay` | 2 | full *(control)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible, p50 4.7 s, p95 1259 s, optimality p50/p95/p99 1.22/8.38/18.0× (pipelining-aware oracle, fixed 12; 10.1× at 54cc562 after the routing changes), overhead 3.15 · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 103 s |
+| `us-eu` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.725 s, optimality p50/p95/p99 1.22/2.15/2.38× | 1 s |
+| `gateway-choice` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 1.11 s, optimality p50/p95/p99 6.26/9.12/9.19× (100 KB and 1 MB messages now against the pipelining bound) · 100% of relayed bytes via the far fibre gateway | 0 s |
+| `routing-convergence` | 2 | full | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never | 15 s |
+| `flood-scaling` | 2 | full | ✅ | largest N: global core 8.4% of BLE in steady state, 100% of pairs routed (before: 67.0%, 85% routed), main 136.1% | 839 s |
+| `partial-route` | 2 | full | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.5 s; sender-holds 100% p50 98.2 s · gap 300 m: global core + DTN 100%; stand-in custody 0% p50 0 s; sender-holds 0% p50 0 s | 0 s |
+| `disaster-dtn` | 2 | full, judged on seeds 1–12 | ✅ | **global core + DTN: mean 87.2% delivered** (target ≥ 80%; per seed 77–98%; seeds 2–13 mean 87.1%, 3–14 mean 86.9%; was 80.3% on worlds that moved with the routing: fixed 22) · seed 1: 90%, p95 7625 s, optimality p50/p95/p99 1.43/6.11/6.81×, 21.2 replicas and 32.9 hand-offs per message (budget 32) · PRoPHET 67%, spray-and-wait (L=8) 27%, epidemic 100%, now on the same world (seed 1, 60 of 60 messages feasible for every router) · CI size (0.1): 89% | 95 s |
+| `mailbox` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
+| `global-scale` | 2 | 2,002 devices (0.02) | ✅ | global core + DTN: 100% delivered, p95 0.690 s, optimality p50 3.96× · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.119 s, p95 0.211 s, optimality p95 2.88× (was 4.45×, fixed 19; 32.2× before fixed 18) · control 706 B/s per device (was 8,470): routing 470, carrier 235 (was 8,004, fixed 17) · CI size (1,499 devices): warm optimality p95 2.65× (was 5.14×, failing) | 119 s |
+| `churn` | 2 | 1,001 devices (scale 0.1) | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.5/17.1×; control 698 B/s per device: routing 2,659 → 469, carrier 4,540 → 256 (full size before the carrier fixes: 100%, p95 65.2 s) | 81 s |
+| `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.097 s, optimality p50/p95/p99 1.88/5.97/8.65× (was 82%, p95 1.28 s, 36.6/170/1570×, failing: fixed 20) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (judged, ≥ 90%): 94%, p95 29 s (was 76%, p95 91 s: fixed 21), but ❌ 76% with seed 2 and 87% with seed 3 (open 15) · CI size (0.1): 100% (was 93%), lying plausibly 97% (was 80%), and passes with seeds 2 and 3 | 142 s |
+| `trace-replay` | 2 | full | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.5% of feasible (3,983 of 4,000 sent, was 3,982), p50 4.7 s, p95 1245 s, optimality p50/p95/p99 1.22/7.55/46.9× (was 8.38/18.0×: fixed 21; pipelining-aware oracle, fixed 12; 10.1× at 54cc562 after the routing changes), overhead 3.26 (was 3.15); seeds 2 and 3: 99.8% and 99.0%, optimality p99 19.9× and 25.5× · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 49 s |
 | `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 53%, 68%, 83%, 92%, 93% | 0 s |
 
 ## 4. Findings
 
 Each with the evidence and how to reproduce it (`--seed 1` unless noted).
 
-### Fixed (in this branch)
+### Findings that changed the code
 
 1. **The routing core's `tick` did a full pass every 10–20 ms.** It
    re-ran route publishing for every origin (allocating a new map),
@@ -235,29 +231,11 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    - `a_source_over_its_share_makes_way_with_its_own`;
    - `copies_by_size`, `spray_modes`;
    - `copies_in_flight_are_not_given_twice`.
-9. **A panic in the QUIC stack killed the whole process** (was open 7).
-   `conference` at 300 real nodes aborted in `noq-proto` 1.3.0,
-   `discard_space`, with "PathId::ZERO is alive while Initial/Handshake
-   spaces exist". Cause:
-   - A multipath client is Established one round trip before HANDSHAKE_DONE.
-   - noq sends HANDSHAKE_DONE and the server's path CIDs in different
-     packets. If the first is lost, the client opens path 1 anyway; path 0
-     is then abandoned and discarded, and the retransmitted HANDSHAKE_DONE
-     arrives on path 1.
-   - The panic poisoned the connection's lock. Stream handles lock it in
-     `Drop`, so unwinding panicked again and aborted.
-   - Fix (vendored noq and noq-proto, `vendor/noq-proto/MYCEL_PATCH.md`):
-     the late HANDSHAKE_DONE skips the cleanup of a path that is gone. The
-     driver now turns any state-machine panic into closing that one
-     connection with INTERNAL_ERROR, and a poisoned lock is recovered.
-   - Tests:
-     - `late_handshake_done_after_path_zero_discarded` reproduces the exact
-       upstream panic (mod.rs:4172).
-     - `driver_panic_closes_only_that_connection`: upstream aborts with
-       SIGABRT; patched, the connection closes and a new one works.
-   - Draft upstream report: `vendor/noq-proto/UPSTREAM_ISSUE.md`. Not
-     filed: it is probably remotely triggerable.
-   - The 300-seat `conference` wasn't rerun (it needs ~36 GB).
+9. **A panic in the QUIC stack aborted the whole process** (was open 7),
+   in a 300-node tier-1 `conference` run. The vendored `noq` and
+   `noq-proto` carry a fix with regression tests
+   (`vendor/noq-proto/MYCEL_PATCH.md`); a state-machine panic now closes
+   only that connection.
 10. **Walking devices grew memory without bound** (was open 8). `shutdown`
    peaked at 30 GB of physical footprint (resident size read +4.8 GB:
    under memory pressure it leaves out compressed and swapped pages).
@@ -293,7 +271,6 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    ratio is below 1 any more.
 13. **Neighbours' predictability tables** are sorted vectors, half the
    size of the hash maps (was part of open 6). They hold the same values.
-   Not remeasured at 10k devices.
 
 14. **Announcements no longer overload Bluetooth** (was open finding 1).
    Every device re-flooded a signed ~120-byte announcement every 2 s,
@@ -338,6 +315,47 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    Tests: `new_neighbours_are_greeted_and_lone_devices_announce_fully`,
    `flood_reduction_is_off_and_floods_reach_everyone` (`mesh/core/tests.rs`),
    `announcements_batch_into_datagrams` (`mesh/wire.rs`).
+15. **The emulator's Bluetooth model queued a whole radio in one FIFO**
+   (was open 1's `conference` latency and open 11). `EmuNet` gave each
+   radio one transmit queue bounded at 250 ms (10 KB at 40 kB/s) for all
+   its peers, so a burst to one peer (a QUIC handshake, a sync) dropped
+   packets to every other peer: 15–25% of Bluetooth packets in
+   `conference`, whatever the announcement settings. The real link isn't
+   like that: `mycel-link-ble` opens one L2CAP channel per peer, each with
+   its own 16 KiB drop-tail queue (`OUT_QUEUE_BYTES`), and the controller
+   serves its connections in turn, one connection event each (Bluetooth
+   Core 5.4, Vol 6, Part B, §4.5.1).
+   - Fix: `Medium::peer_queue` gives each link its own byte-bounded queue
+     and shares the radio's rate between the links with data queued at
+     either end; `Tech::Ble` uses 16 KiB (`crates/mycel-net/src/emu.rs`,
+     test `peer_queues_share_the_radio`). `MYCEL_SIM_BLE_QUEUE=radio`
+     brings back the old model for comparison.
+   - `conference`, 24 seats, seeds 1–5: Bluetooth drops 15–25% → 0%, p95
+     1.4–8.2 s → 0.20–1.19 s (target 3 s); 30 seats: p95 0.41 s; 100
+     seats: p95 1.10 s in 38 s of wall time (it didn't finish in 30 min
+     before, with the path-queue leak of fixed 10).
+   - `shutdown`, full size, seed 1: old model p95 10.2 s and the call
+     never rang; now p95 0.59 s and the tone is heard (seeds 1–4: heard
+     every time, loss 0%, over the mesh or straight over Bluetooth).
+   - Every other Bluetooth scenario passes at full size with it
+     (`city-block`, `rural-line`, `us-eu-live`, `disaster-live`,
+     `mixed-room`, `adversarial-live`, `multipath`).
+   - No change was needed in the node: with the real queueing, a burst to
+     one neighbour no longer costs the others, and nothing is dropped.
+     Limit: the real controller's total throughput falls somewhat with
+     many connections (more connection-event overhead); 40 kB/s for the
+     whole radio is already about a third of one good L2CAP link.
+16. **Shutting the lab down took minutes.** A node's endpoint close
+   waits for every peer to acknowledge CONNECTION_CLOSE, up to 3 probe
+   timeouts per connection; to peers on a slow radio or already gone,
+   that is seconds per node, and the lab closed nodes one after another
+   (30 walkers: ~4 minutes; a 24-seat conference: 70 s).
+   - Fix: the lab closes every node at once, and `Node::shutdown` waits
+     at most 2 s (`SHUTDOWN_GRACE`) for the acks; the close frames still go
+     out at once. Quitting the app no longer hangs on a slow radio either.
+   - `shutdown` at full size: 502 s → 49–123 s wall; `conference` 24
+     seats: 96 s → 15–20 s.
+
 17. **Carrier summaries went to every neighbour every 10 s, whole** (was
    open 1, first bullet). Each listed everything held, the latest 256
    receipts and up to 64 predictabilities (36 B each), whether anything had
@@ -388,54 +406,178 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    internet hop up). Warm: p95 1.69 → 0.286 s, optimality p95 32.2 →
    4.45× (target 5×); first contact unchanged (p95 0.741 s).
 
-15. **The emulator's Bluetooth model queued a whole radio in one FIFO**
-   (was open 1's `conference` latency and open 11). `EmuNet` gave each
-   radio one transmit queue bounded at 250 ms (10 KB at 40 kB/s) for all
-   its peers, so a burst to one peer (a QUIC handshake, a sync) dropped
-   packets to every other peer: 15–25% of Bluetooth packets in
-   `conference`, whatever the announcement settings. The real link isn't
-   like that: `mycel-link-ble` opens one L2CAP channel per peer, each with
-   its own 16 KiB drop-tail queue (`OUT_QUEUE_BYTES`), and the controller
-   serves its connections in turn, one connection event each (Bluetooth
-   Core 5.4, Vol 6, Part B, §4.5.1).
-   - Fix: `Medium::peer_queue` gives each link its own byte-bounded queue
-     and shares the radio's rate between the links with data queued at
-     either end; `Tech::Ble` uses 16 KiB (`crates/mycel-net/src/emu.rs`,
-     test `peer_queues_share_the_radio`). `MYCEL_SIM_BLE_QUEUE=radio`
-     brings back the old model for comparison.
-   - `conference`, 24 seats, seeds 1–5: Bluetooth drops 15–25% → 0%, p95
-     1.4–8.2 s → 0.20–1.19 s (target 3 s); 30 seats: p95 0.41 s; 100
-     seats: p95 1.10 s in 38 s of wall time (it didn't finish in 30 min
-     before, with the path-queue leak of fixed 10).
-   - `shutdown`, full size, seed 1: old model p95 10.2 s and the call
-     never rang; now p95 0.59 s and the tone is heard (seeds 1–4: heard
-     every time, loss 0%, over the mesh or straight over Bluetooth).
-   - Every other Bluetooth scenario passes at full size with it
-     (`city-block`, `rural-line`, `us-eu-live`, `disaster-live`,
-     `mixed-room`, `adversarial-live`, `multipath`).
-   - No change was needed in the node: with the real queueing, a burst to
-     one neighbour no longer costs the others, and nothing is dropped.
-     Limit: the real controller's total throughput falls somewhat with
-     many connections (more connection-event overhead); 40 kB/s for the
-     whole radio is already about a third of one good L2CAP link.
-16. **Shutting the lab down took minutes.** A node's endpoint close
-   waits for every peer to acknowledge CONNECTION_CLOSE, up to 3 probe
-   timeouts per connection; to peers on a slow radio or already gone,
-   that is seconds per node, and the lab closed nodes one after another
-   (30 walkers: ~4 minutes; a 24-seat conference: 70 s).
-   - Fix: the lab closes every node at once, and `Node::shutdown` waits
-     at most 2 s (`SHUTDOWN_GRACE`) for the acks; the close frames still go
-     out at once. Quitting the app no longer hangs on a slow radio either.
-   - `shutdown` at full size: 502 s → 49–123 s wall; `conference` 24
-     seats: 96 s → 15–20 s.
+19. **Warm messages to a device behind gateways paid a lookup and a dial
+   again** (`global-scale` at its CI size, 1,499 devices, failed: warm
+   optimality p95 5.14× against 5×; the same on e6a972b, 77 commits
+   earlier). Traced per packet (seed 1): of the 13 warm messages
+   over 5×, 10 went from a device with the internet to one behind
+   gateways, and their internet hop took as long as at first contact
+   (0.4–0.8 s, against an optimum of 0.07–0.15 s for the whole way; the
+   other 3 are open 13). Two causes in the routing core's choice among a
+   record's gateways (`next_hop`, `mesh/core.rs`):
+   - **An untried gateway looked cheaper than the working one.** It was
+     costed as a flat 100 ms (`DEFAULT_INTERNET_COST`). A measured hop
+     costs its round trip *plus* the time to move 64 KiB: 160–320 ms
+     between continents in the simulator, more in the node (RTT ×
+     (1 + 64 KiB ÷ cwnd)). So once the first gateway's hop was measured,
+     the next packet dialled the record's other gateway and waited for it
+     (n365 → n217: dial n229 at +0 ms, connected at +271 ms), and again
+     whenever the unused hop idled out after a minute.
+   - **The record had just expired.** A looked-up record is trusted for
+     60 s, and the warm message came a minute after the first. When the
+     dial was through, the record was out of date, so the packet waited
+     for a second lookup (+190 ms). In the node, a gateway relaying a
+     long flow parked it for a lookup every minute.
 
-### Open (with evidence)
+   Fix: an untried gateway is costed as the cheapest measured hop to
+   another gateway of the same record (they sit in one mesh around the
+   destination; 100 ms only when none is measured), and one with a hop
+   up wins ties. A record out of date is looked up again on use while a
+   hop up to one of its gateways keeps carrying the traffic, for another
+   minute (`REACH_STALE`); it never starts a dial. Tests
+   `a_working_gateway_is_kept_over_untried_ones` and
+   `an_out_of_date_record_keeps_a_working_gateway_while_it_is_looked_up`
+   (`mesh/core/tests.rs`). No wire change.
+
+   `global-scale`, warm messages, optimality p95 (p99):
+
+   | Size, seed | Before | After |
+   |---|---|---|
+   | 1,499 devices (CI), seed 1 | 5.14× (8.54×) | 2.65× (5.14×) |
+   | 1,499 devices, seed 2 | 5.89× (10.9×) | 2.69× (4.58×) |
+   | 1,499 devices, seed 3 | 5.48× (10.7×) | 3.37× (7.61×) |
+   | 2,002 devices, seed 1 | 4.45× (11.2×) | 2.88× (3.40×) |
+
+   Warm latency p95 0.512 → 0.211 s (CI) and 0.286 → 0.211 s (2,002
+   devices); all messages, optimality p50 4.42 → 3.26× (CI). Dials
+   322 → 240 at 2,002 devices; control traffic 739 → 730 B/s per device
+   (CI), 727 → 706 (2,002). First contact is unchanged (p50 6.4×): it
+   pays a lookup and a handshake the oracle doesn't. At CI size every
+   other tier-2 scenario gives the same numbers but `churn` (latency p95
+   40.0 → 39.0 s, optimality p95 13.8 → 13.9×, control 653 → 646 B/s);
+   at full size `us-eu` (latency p50 0.409 → 0.387 s, control 1,069 →
+   1,048 B/s), `gateway-choice` (p95 1.12 → 1.11 s) and `churn` at 1,001
+   devices (optimality p95 12.6 → 12.5×, control 707 → 698 B/s) move a
+   little, the others not at all. What is left of the warm tail is
+   open 13.
+20. **Black holes pulled in most traffic at full size** (`adversarial`
+   failed: 82% delivered against 90%; 93% at CI size). Traced per packet
+   (seed 1): all 54 undelivered messages were sent into a black hole,
+   and every retransmission took the same way. The scenario's 15 black
+   holes relay every route at zero cost. An announcement's hops and cost
+   aren't signed, so their neighbours believed them and routed through
+   them (210 of the 300 phones are next to one). Store-and-forward didn't
+   help: bundles followed the same routes, and two black holes next to
+   each other, each believing the other, handed every bundle back and
+   forth until the run ended. At CI size there are 4 black holes among
+   80 phones, and fewer routes cross one.
+
+   Fix (`mesh/core.rs`): a relayed announcement no honest relay can send
+   (zero hops from someone other than the origin, or a cost below 2.1 ms
+   a hop: `MIN_HOP_COST`, the least a hop adds) gets its sender
+   distrusted for 10 minutes. The routes it gave go at once, the routes
+   it relays are ignored (it isn't sent back seqnos it has), and it stays
+   reachable itself. Honest relays never trip it: no device distrusted a
+   neighbour in any other tier-2 scenario, nor in `churn_never_loops`;
+   released builds since dev-2026-10-08 keep the same invariant. No wire
+   change. Test
+   `a_neighbour_relaying_impossible_routes_is_not_routed_through`.
+
+   Full size, seed 1: delivered 82% → 100%, latency p95 1.28 → 0.097 s,
+   optimality p50/p95/p99 36.6/170/1570× → 1.88/5.97/8.65×; the Sybil
+   gateway run 299/300 → 300/300, p95 1.20 → 0.095 s. Control traffic
+   19.7 → 19.5 kB/s per device: routing 14.8 → 18.1 kB/s (the zero-cost
+   routes had cut honest flooding short; the run without attackers sends
+   17.3 kB/s in all), carrier 4.9 → 1.4 kB/s. CI size: 93% → 100%, p95
+   1.20 → 0.079 s. Every other tier-2 scenario gives identical numbers,
+   at CI and full size.
+21. **Black holes that lie plausibly** (was open 14). A liar that claims
+   to be one hop from every origin at the least cost an honest relay
+   could report (2.1 ms) passes fixed 20's check and pulls in every
+   route longer than about two hops. `adversarial` runs 15 of them (the
+   same devices as its black holes; they drop the bundles they take too):
+   76% delivered at full size, p95 91 s. Nothing in an announcement gives
+   them away, but the destination's acknowledgements don't come back.
+   Two defences, both without a wire change:
+   - **End-to-end feedback** (`Router::feedback`, `mesh/core.rs`). The
+     transport reports a retransmission timeout with nothing acknowledged,
+     and each acknowledgement. Two timeouts in a row through one next hop,
+     on a mesh route that still claims the destination, over a silence of
+     at least 1.5 s plus twice the route's cost, and that hop is
+     suspected for that destination for 2 minutes: packets (ours and those
+     we relay to it) take the next feasible route, which is loop-free
+     like the best; with every route suspected, still the best. One
+     acknowledgement clears the count; routes via gateways or the internet
+     aren't judged. Bounded: 1,024 destinations, 4 suspects each.
+   - **One share down a route that just failed** (`Carrier::doubt`,
+     `mesh/dtn.rs`). When feedback judged a mesh route, our own bundles
+     for that destination send half their copies along the live route and
+     the rest to other neighbours, one share each, keeping the last. Without
+     that evidence custody moves whole, as before.
+
+   Full size, seed 1: 76% → 94% delivered, p95 91 → 31 s; 1.0 → 3.8
+   replicas per message; control 21.5 → 23.3 kB/s per device in that run.
+   CI size: 80% → 97%, p95 91 → 7.1 s. The run is now judged: ≥ 90%.
+
+   What was tried and measured on the full-size synthetic `trace-replay`
+   (brief Bluetooth contacts, 1 MB messages, where routes stop delivering
+   for ordinary reasons; before: optimality p95/p99 8.38/18.0×):
+   - steering custody hand-offs off a suspected hop too, and dropping
+     packets once every route was suspected: 7.59/53.7×, and no better
+     against the liars (93% at full size); not kept;
+   - feedback without the bundle split: 10.5/54.3×;
+   - a 3 s minimum silence, or 3 strikes: 9.18/36.8×, and the liars got
+     through more (93%);
+   - kept: 8.24/36.8×, 3,985 of 4,000 delivered (was 3,982), overhead
+     3.21 (was 3.15). The p99 is the 5th-slowest of the 400 messages the
+     oracle checks: four more messages now miss a contact and wait 1–4
+     minutes, others finish sooner. Every other tier-2 scenario gives the
+     same numbers, at CI and full size.
+
+   The tier-2 driver feeds both from its acknowledgements. The node feeds
+   them from what QUIC authenticated on each mesh path of its connections
+   (`mesh/watch.rs`, `Router::path_feedback`; `docs/ROUTING.md` §6, item
+   13): with real nodes, a relay that keeps announcing a destination and
+   drops everything to and from it is routed around in 6.6 s
+   (`a_relay_that_drops_one_destination_is_routed_around`), and a slow,
+   lossy two-hop route suspects nothing
+   (`a_slow_lossy_route_is_not_suspected`). When a suspicion leaves no
+   feasible route (we advertised the cheap one), a fresh seqno is asked
+   for. Signed per-hop route attestations would stop the lie itself; they
+   change the announcement format, so they are planned for the next
+   protocol version (`docs/ROUTING.md` §6, item 13). Tests
+   `unacknowledged_packets_move_a_destination_off_its_next_hop`
+   (`mesh/core/tests.rs`), `a_doubted_route_gets_one_share_of_our_bundle`
+   (`mesh/dtn/tests.rs`).
+
+22. **Every router now sees the same world** (was open 12's main
+   cause). Waypoint mobility drew its targets from the random stream that
+   also draws every radio frame's jitter and the routers' own randomness,
+   so anything that changed what was sent changed where everyone walked
+   and who met whom. In `disaster-dtn` at CI size, seed 1, the seven
+   routers compared side by side each had a different world: 3, 11, 5, 11,
+   3, 7 and 12 of the 12 messages had any path at all. Walking devices now
+   have their own stream, seeded from the scenario's (`tier2/engine.rs`):
+   all seven see the same 9 there, and a routing change no longer moves
+   the world. Only `disaster-dtn` has walking devices. Its numbers on the
+   fixed worlds, full size: seeds 1–12 mean 87.2% (was 80.3%), 2–13 mean
+   87.1%, 3–14 mean 86.9% (per seed 77–98%); PRoPHET 67%, spray-and-wait
+   27% and epidemic 100% at seed 1 on the same world as GLOBAL's 90%.
+   Every tier-2 scenario was rerun at CI and full size with seeds 1, 2
+   and 3. Every threshold holds on all three except two:
+   - `adversarial`'s plausible-liar run (open 15);
+   - at CI size only, `disaster-dtn` with seeds 2 and 3 (75% and 75%:
+     6 of 8 and 9 of 12 messages; seed 3 failed on the old worlds too)
+     and `flood-hop-limit` with seed 3 (reach falls from 99% to 95% at
+     hop 7; the same on 4aab57a, before any of this work). The CI tests
+     run seed 1.
+
+### Open findings
 
 1. **Bluetooth control traffic: what is left after fixed 14, 15 and 17.**
    - *(Carrier summaries: fixed 17. `conference` latency: fixed 15, the
-     emulator's Bluetooth queue.)* `global-scale` is at 727 B/s per device
-     (routing 470, carrier 257) against its 1 KB/s target; the 300-seat
-     `conference` hasn't been rerun since.
+     emulator's Bluetooth queue.)* `global-scale` is at 706 B/s per device
+     (routing 470, carrier 235) against its 1 KB/s target.
 
    Repro: `mycel-sim global-scale --scale 0.02`, `mycel-sim conference
    --scale 0.1`. Old routing settings for comparison:
@@ -466,43 +608,54 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
 7. *(fixed 9: the QUIC panic)*
 8. *(fixed 10: memory with walking devices)*
 9. **`us-eu-live`'s call lost 66.7% of its audio** at full size on the
-   loaded machine (0% at CI size earlier). On 9 October at a load of ~9:
-   0% loss, messages p95 0.88 s. The scenario sets its own 1 s
-   announcement period, so the loss was most likely CPU starvation, not
-   announcements. Watch it on the next loaded run.
+   loaded machine (0% at CI size). At a load of ~9: 0% loss, messages p95
+   0.88 s. The scenario sets its own 1 s announcement period, so the loss
+   was most likely CPU starvation, not announcements.
 10. *(fixed 12: the oracle's bound for multi-packet messages)*
 11. *(fixed 15 and 16: `shutdown`'s call and messages were the emulator's
    one-queue Bluetooth model; its slow teardown was sequential closes.)*
-   Still worth watching: at seed 4 one message of 20 took 7.0 s, at seed
+   Remaining variation: at seed 4 one message of 20 took 7.0 s, at seed
    2 one wasn't delivered within 20 s. The walkers separate mid-delivery
    (1.4 m/s, 60 m Bluetooth range); both are within the 80% / 10 s
    targets.
-12. **`disaster-dtn` swings with timing, seed to seed and change to
-   change.** Full size, since fixed 17, seeds 1–12: 60, 90, 82, 73, 92,
-   82, 83, 88, 67, 85, 72, 90% (mean 80.3%); seeds 13–24: mean 86.6%
-   (63–98%), so 83.5% over 24 seeds. At 54cc562, before fixed 17, seeds
-   1–12 averaged 88.8%. What I could tie it to:
-   - **Not what carriers know.** Instrumented, not one receipt was
-     missed: every receipt a device learnt from a summary, it learnt from
-     the first summary that carried it. Repeating the latest receipts in
-     every full summary told receivers nothing new, yet moved the 12-seed
-     mean to 87.0%.
-   - **Timing alone moves it.** 7 meaningless bytes per summary moved the
-     12-seed mean to 86.2%, 200 bytes to 81.7%. Its noise floor is about
-     ±3–6 points.
-   - **Not offers queued behind summaries.** Offers, answers, bundles and
-     their acks wait 7–11 ms on average for the radio (max 0.9–1.9 s;
-     seeds 1 and 9), and none was lost to a link breaking. Contacts here
-     last minutes. Giving them priority over summaries (summaries use only
-     airtime they leave, as a lower-priority QUIC stream would) cut the
-     mean wait to 6.9–9.0 ms. It gave 86.8% on seeds 1–12, but 87.3%
-     against 86.6% on seeds 13–24, so it is noise; not adopted.
+12. *(fixed 22: `disaster-dtn`'s swings from change to change were
+   mostly the world moving with the routing. Seed to seed it still
+   varies, 77–98% at full size, which is why it is judged on the mean of
+   12 seeds.)*
+13. **The warm tail left in `global-scale` is pairs in one neighbourhood
+   whose mesh route crosses Bluetooth** (after fixed 19, at CI size: all
+   3 warm messages over 5× with seed 1, at 15×, 11× and 5.1×; 6 of the 7
+   with seed 3). Phones with
+   AWDL and phones with Wi-Fi Direct share only Bluetooth, so a route
+   between those islands (or around a gap in one) takes a 40–55 ms
+   Bluetooth hop or two, while the oracle goes over the internet between
+   two devices of the neighbourhood (10–20 ms). Two cases:
+   - *Both ends have the internet:* the node's Iroh connection has the
+     direct (or relayed) internet path beside the mesh path, and its
+     path selector takes the faster. The tier-2 driver
+     (`Global::send_packet`) sends through the core whenever it has a
+     mesh route, so it measures the mesh path alone here: a gap in the
+     model, not in the node.
+   - *One end or neither has the internet:* the core keeps traffic on a
+     local mesh route by design (a mesh route beats gateways, and
+     `gateway_addrs` offers no gateways for a device the mesh reaches),
+     even when the internet through the destination's gateways would be
+     faster. Trading a slow local route for gateway traffic (metered,
+     budgeted) is a design question, not a bug.
 
-   The full scenario is now judged on the mean of 12 seeds (≥ 80%), with
-   the per-seed spread in its notes. The CI size (0.1, one seed) delivers
-   100%. Still open: which interaction makes single runs this sensitive.
-   Repro: `mycel-sim disaster-dtn` (runs seeds 1–12),
-   `mycel-sim disaster-dtn --seed 13` (13–24).
+   Repro: `mycel-sim global-scale --scale 0.01 --seed 3`.
+14. *(fixed 21: black holes that lie plausibly, in the simulator and the
+   node; signed route attestations wait for the next protocol version.)*
+15. **The plausible-liar target holds on seed 1 only.** `adversarial`
+   judges its plausible black holes at ≥ 90%, set from seed 1 (94%, 281
+   of 300). With seed 2 they take delivery to 76% (227 of 300, latency
+   p50 1.04 s, p95 61 s), with seed 3 to 87% (262 of 300); the naive
+   black holes, the storm, the replayer and the Sybil gateway stay at
+   100% on all three. The defences of fixed 21 aren't enough where most of
+   a destination's neighbourhood sits next to a liar: every alternative
+   leads to one too. The target isn't lowered; whether to lower it
+   (seeds 1–3 support about 75%) or strengthen the defence is open.
+   Repro: `mycel-sim adversarial --seed 2`.
 
 ## 5. Benchmarks against external baselines
 
@@ -517,8 +670,9 @@ it hears another rebroadcast). All have a FIFO-drop buffer and a TTL.
 **Real contact traces.** `traces.rs` reads CRAWDAD cambridge/haggle
 (`contacts.ExpN.dat`: Intel, Cambridge, Infocom 2005/2006; Cambridge city
 per-node files) and a generic CSV (e.g. NUS Bluetooth via
-`bench/traces/nus_to_csv.py`). Licence: "cite, don't re-identify, don't
-re-share", so they are not in the repository. `bench/fetch.sh traces` puts
+`bench/traces/nus_to_csv.py`). You download the traces yourself, under
+CRAWDAD's terms (cite the dataset, don't try to identify people, don't
+re-share it); they are never redistributed in this repository. `bench/fetch.sh traces` puts
 the Haggle contact files in `bench/data/` (the same files the benchmarks
 replay), and `bench/fetch.sh dataport <archives>` unpacks the full IEEE
 DataPort archives (free account) into `bench/data/dataport/`. Then
@@ -548,22 +702,21 @@ Metrics: delivery ratio, latency distribution, The ONE's overhead ratio
 | Synthetic, same shape (40 devices, 72 h, 17,562 contacts) | spray-and-wait (L=6) | 56.5% | 146 s | 7,224 s | 7.2 | 2522 kB |
 | Synthetic, same shape (40 devices, 72 h, 17,562 contacts) | managed flooding (7 hops) | 61.9% | 25 s | 48 s | – | – |
 
-Run on this Mac with the real traces (`MYCEL_TRACE=…/contacts.Exp3.dat` and
+Run with the real traces (`MYCEL_TRACE=…/contacts.Exp3.dat` and
 `contacts.Exp6.dat`), seed 1. Overhead is The ONE's (relayed − delivered) ÷
 delivered. Managed flooding only forwards to devices in contact now, so it
 has no buffer. Epidemic is buffer-bound at 5 MB: it floods the buffers and
-evicts. With the carrier fixes (§4, fixed 8) GLOBAL's carrier leads on
+evicts. With the carrier fixes (§4, fixed 8) the carrier leads on
 Infocom 2006 and trails PRoPHET by 3 points on Infocom 2005, at a fraction
 of its latency and overhead (open finding 2). On the synthetic trace it
 delivers the most, fastest. The ONE's own routers on the same traces (Epidemic, PRoPHET,
-Spray-and-Wait, MaxProp) are in `docs/BENCHMARKS.md` (the bench work); its
+Spray-and-Wait, MaxProp) are in `docs/BENCHMARKS.md`; its
 link model differs: whole messages over contacts that must last.
 
-**Flooding baseline vs Meshtasticator.** Meshtastic's simulator reports, for
-LoRa meshes, that reach rises with the hop limit and levels off around 3–5,
-while each extra hop adds redundant rebroadcasts (hence the default of 3).
-`flood-hop-limit` reproduces the shape on a 100-device Bluetooth
-neighbourhood:
+**Flooding baseline.** Meshtastic reports, for LoRa meshes, that reach
+rises with the hop limit and levels off around 3–5, while each extra hop
+adds redundant rebroadcasts (hence its default of 3). `flood-hop-limit`
+reproduces the shape on a 100-device Bluetooth neighbourhood:
 
 | Hop limit | Reach, delayed suppressible rebroadcast | New devices per transmission | Reach, rebroadcast always | New devices per transmission |
 |---:|---:|---:|---:|---:|
@@ -575,11 +728,11 @@ neighbourhood:
 | 6 | 92% | 3.10 | 100% | 1.06 |
 | 7 | 93% | 2.94 | 100% | 1.00 |
 
-100 BLE devices outdoors, one per 625 m² (~18 in range); one broadcast from a random device, averaged over runs. Reach rises with the hop limit and levels off, while each extra hop adds redundant transmissions: Meshtasticator's published shape, and why Meshtastic defaults to 3.
+100 BLE devices outdoors, one per 625 m² (~18 in range); one broadcast from a random device, averaged over runs. Reach rises with the hop limit and levels off, while each extra hop adds redundant transmissions: the shape Meshtastic reports, and why it defaults to 3.
 
 **Announcement overhead vs mesh size** (`flood-scaling`, full size: Bluetooth-only phones, one per 900 m², ~12 neighbours). Control bytes per device per second in steady state (over one full fisheye cycle after a first one), as a share of one BLE radio (40 kB/s), and the share of sampled pairs within 8 hops that have a route. In brackets: the first cycle, everyone starting at once.
 
-| Devices | Now (16 s, full scope of 10 hops every 8th) | Now + flood reduction | Now, fisheye off | Before (2 s, 8 hops every 4th, flood reduction) | Mesh before GLOBAL (40 s) |
+| Devices | Now (16 s, full scope of 10 hops every 8th) | Now + flood reduction | Now, fisheye off | Before (2 s, 8 hops every 4th, flood reduction) | Earlier flooding mesh (40 s) |
 |---:|---:|---:|---:|---:|---:|
 | 250 | 2.5 kB/s (6.3%) [3.5], 100% routed | 2.0 kB/s (4.9%), 100% | 9.4 kB/s (23%), 100% | 18.3 kB/s (46%) [30.4], 92% | 48.0 kB/s (120%) |
 | 500 | 2.8 kB/s (7.0%) [4.3], 100% | 2.3 kB/s (5.8%), 100% | 12.2 kB/s (31%), 100% | 22.1 kB/s (55%) [35.4], 90% | 49.6 kB/s (124%) |
@@ -588,8 +741,8 @@ neighbourhood:
 
 Fisheye cuts traffic 4–5×. Flood reduction would save another 18% here, where every device sees every flood from several sides, but it leaves pairs unrouted in sparser meshes (`routing-convergence`), so it stays off. All variants greet new neighbours. Traffic grows slowly with N: the near scope costs the same at any size; the full scope reaches more devices.
 
-Qualitative only: this model has no collisions (Meshtasticator's LoRa model
-does), so usefulness falls through redundancy, not loss.
+Qualitative only: this model has no collisions, so usefulness falls through
+redundancy, not loss.
 
 **Internet latency from measured data.** WonderNetwork's public sample of a
 day of global pings (19–20 July 2020, 246 servers, 2.9 M rows; credit:
@@ -617,39 +770,11 @@ So 1.4× fits well-cabled corridors (the transatlantic routes the US–Europe
 scenarios use) within 10%, and underestimates the median pair by ~30%: use
 `MYCEL_PINGS` for global numbers.
 
-## 6. To run on Linux (Docker or a Linux machine)
-
-The external tools have one home, `bench/` (`docs/BENCHMARKS.md`); what
-needs Linux is in `bench/linux/` with its own README, and hasn't run yet.
-What each adds to this simulator:
-
-- **The ONE** (runs anywhere Java does; already run, `docs/BENCHMARKS.md`
-  §3): its routers on the same CRAWDAD traces through `bench/run.py`.
-  `mycel-sim export-trace` writes any trace this simulator reads (the
-  synthetic one included) as the benchmarks' contacts CSV, which
-  `bench/traces/convert.py` turns into a workload and The ONE's events.
-- **Shadow** (real Mycel CLI processes, real syscalls, simulated network):
-  `bench/linux/shadow/make_config.py` builds the world graph with this
-  simulator's fibre model, or WonderNetwork's measured RTTs with
-  `--measured`. A traffic driver through the local API is the missing
-  piece. It covers the IP side at scale with the real binary.
-- **Mininet-WiFi** (mac80211_hwsim, real 802.11 MAC, kernels' routing):
-  `bench/linux/mininet_wifi_mesh.py --proto batman_adv|olsrd|babeld|mycel`
-  builds an ad-hoc line (`--spacing 40` is `city-block`'s) and compares
-  Mycel's mesh with batman-adv, olsrd and babeld on identical topologies,
-  with collisions and rate adaptation EmuNet lacks.
-- **CORE / EMANE**: the same topologies with EMANE's 802.11abg, TDMA and LTE
-  radio models for PHY-level realism.
-- **quic-network-simulator**: an endpoint image for Mycel's QUIC so the
-  ns-3-based interop scenarios (handshake loss, blackholes, rebinding,
-  migration, drop and corruption rates) run against it and against
-  quinn/quiche.
-
-## 7. Wiring other routing cores
+## 6. Wiring other routing cores
 
 Tier 2 drives any sans-IO router through `tier2::engine::Router` (frames,
 links, internet, timers, a directory). `tier2/global.rs` is the adapter for
-GLOBAL's core and carrier and the template for others: translate the core's
+the routing core and carrier and the template for others: translate the core's
 effects (`Out`) into `Cx` calls (`send_radio`, `send_inet`, `set_timer`,
 `reach_put`/`reach_get`, `delivered`, `receipt`) and its inputs from the
 `Router` callbacks.

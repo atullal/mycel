@@ -745,9 +745,11 @@ mod ios {
             )
         };
         if ok == 0 {
-            let reason = (!error.is_null())
-                .then(|| unsafe { CFError::wrap_under_create_rule(error) }.description().to_string())
-                .unwrap_or_default();
+            let reason = if error.is_null() {
+                String::new()
+            } else {
+                unsafe { CFError::wrap_under_create_rule(error) }.description().to_string()
+            };
             eprintln!("mycel: can't exclude the profile from backups: {reason}");
         }
     }

@@ -72,6 +72,11 @@ pub enum Role {
     Honest,
     /// Claims zero-cost routes to everyone, then drops what it gets.
     BlackHole,
+    /// A black hole that lies plausibly: claims to be one hop from everyone
+    /// at the least cost an honest relay could report, then drops what it
+    /// gets, packets and store-and-forward bundles alike (tier-2 GLOBAL core
+    /// only).
+    Liar,
     /// Announces every 10 ms.
     Storm,
     /// Re-sends announcements it heard long ago.

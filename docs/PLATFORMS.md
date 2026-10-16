@@ -8,34 +8,61 @@ to the phone layout (tab bar at the bottom).
 **Every device must run the same build.** The wire format still changes between
 builds.
 
+Installing, permissions, logs and troubleshooting: [USER_GUIDE.md](USER_GUIDE.md).
+
 ## What works where
 
 | | macOS | iPhone / iPad | Android | Windows | Linux |
 |---|---|---|---|---|---|
 | Messages, groups, files of any size | yes | yes | yes | yes | yes |
-| Same Wi-Fi / LAN (mDNS) | yes | yes¹ | yes² | yes | yes |
+| Same Wi-Fi / LAN discovery | mDNS | Bonjour¹ | mDNS² | mDNS | mDNS |
 | Internet (relays, hole punching, DHT lookup) | yes | yes | yes | yes | yes |
 | Mesh routing and store-and-forward through other devices | yes | yes | yes | yes | yes |
-| Peer-to-peer Wi-Fi with no network (AWDL) | yes | on, untested³ | not yet (Wi-Fi Direct) | no | Wi-Fi Direct code, off by default |
-| Bluetooth LE link | yes | on, untested³ | not yet | not yet | BlueZ, never run on hardware |
-| Voice calls | echo cancelled | echo cancelled | echo cancelled⁴ | no echo cancellation⁵ | no echo cancellation⁵ |
-| Sending video | yes | on, untested³ | yes⁷ | yes⁷ | yes, with GStreamer's H.264 encoders⁷ |
+| Peer-to-peer Wi-Fi with no network (AWDL) | yes¹⁰ | yes¹⁰ | no | no | Wi-Fi Direct groups, off by default¹⁰ |
+| Bluetooth LE link | yes | yes³ | no | no | BlueZ¹⁰ |
+| Other network interfaces as their own paths⁴ | yes | yes | yes | no | yes |
+| Voice calls | echo cancelled | echo cancelled | echo cancelled⁵ | no echo cancellation⁶ | no echo cancellation⁶ |
+| Sending video | yes | yes, camera untested on a device³ | yes⁸ | yes⁸ | yes, with GStreamer's H.264 encoders⁸ |
 | Opening a received file | default app | share sheet | "Open with" | default app | default app |
-| Keeps running in the background | yes | during calls⁶ | yes⁶ | yes | yes |
-| Notifications (new messages, incoming calls)⁸ | yes | yes, while running | yes | yes | yes |
+| Keeps running in the background | yes | during calls⁷ | yes⁷ | yes | yes |
+| Notifications (new messages, incoming calls)⁹ | yes | yes, while running | yes | yes | yes |
 
-1. iOS asks for Local Network access the first time; without it, only internet
-   paths work.
+**How each was tested:**
+- **macOS:** the full Rust test suite; the app on real Macs, on the LAN and
+  over Bluetooth to an iPhone. Peer-to-peer Wi-Fi only on emulated links
+  and on one Mac.
+- **iPhone and iPad:** the iOS Simulator (iPhone and iPad layouts, an
+  XCUITest for the on-screen keyboard), and a real iPhone: LAN discovery
+  through Bonjour, and Bluetooth links to Macs.
+- **Android:** the Android 14 emulator, through the real UI: messages both
+  ways, the on-screen keyboard, attachments both ways, notifications,
+  running in the background and after being swiped away, and video calls
+  both ways. Not on a physical phone.
+- **Windows and Linux:** GitHub Actions runners only: the core tests, a
+  launch test (the runtime opens and the UI renders in WebView2 /
+  WebKitGTK), and a video probe without a camera. Neither app has run on a
+  desktop machine or with a real camera, and Linux's Bluetooth and Wi-Fi
+  Direct code has been compiled and tested on emulated links only.
+
+1. iOS uses the system's Bonjour (no multicast entitlement needed); the other
+   platforms run Iroh's mDNS, and a patched `swarm-discovery`
+   (`vendor/swarm-discovery/MYCEL_PATCH.md`) lets the two see each other.
+   iOS asks for Local Network access the first time; without it, only
+   internet paths work.
 2. `MainActivity` holds a Wi-Fi multicast lock so mDNS packets get through.
 3. The Mac code (Network.framework, CoreBluetooth, AVFoundation and
-   VideoToolbox) now runs on iOS too, with the front camera and upright
-   frames for a phone held in portrait. It hasn't been tried on an iPhone or
-   iPad yet; the Simulator has neither radio (Bluetooth reports
-   "Unsupported" and the app carries on). iOS only allows these in the
-   foreground.
-4. AAudio's voice-communication input preset (`crates/mycel-call/src/android.rs`).
-5. Plain devices through `cpal`: use headphones, or the far end hears itself.
-6. **Android:** a foreground service (`MycelService`, a quiet "Mycel is
+   VideoToolbox) runs on iOS too, with the front camera and upright frames
+   for a phone held in portrait. Bluetooth has run between a real iPhone and
+   Macs; the camera and peer-to-peer Wi-Fi haven't run on a device (the
+   Simulator has no camera and no radios: Bluetooth reports "Unsupported"
+   and the app carries on). iOS only allows these in the foreground.
+4. `crates/mycel-link-iface`: a cable between two computers, a second NIC, or
+   any interface with only link-local addresses becomes a path of its own.
+   Windows has no interface link. Tested on macOS (loopback and Wi-Fi/Ethernet
+   interfaces on one Mac).
+5. AAudio's voice-communication input preset (`crates/mycel-call/src/android.rs`).
+6. Plain devices through `cpal`: use headphones, or the far end hears itself.
+7. **Android:** a foreground service (`MycelService`, a quiet "Mycel is
    connected" notification) keeps the runtime running with the app in the
    background or swiped away from recents; opening it again gets a new
    window on the same runtime. Tested on the emulator. **iPhone and iPad:**
@@ -45,7 +72,7 @@ builds.
    through a keeper or store-and-forward on other devices. Waking a
    suspended iPhone needs Apple's push service, which needs a server; Mycel
    has none.
-7. Android, Windows and Linux have no VideoToolbox, so the web view captures
+8. Android, Windows and Linux have no VideoToolbox, so the web view captures
    the camera (`getUserMedia`) and encodes H.264 with WebCodecs, in hardware
    where the platform has it, and the runtime sends those frames like a
    Mac's (`crates/mycel-video/src/web.rs`, `packages/sdk/src/webcam.ts`).
@@ -58,15 +85,24 @@ builds.
    WebKitGTK's camera capture, and encodes through a canvas (WebKitGTK fails
    on frames taken straight from a camera); H.264 needs GStreamer's x264 or
    openh264 encoder (`gstreamer1.0-plugins-ugly` or `-bad`, which the deb
-   and rpm recommend). Neither has been tried with a real camera. Where the
-   web view can't capture or encode, the camera turns off and the call
-   stays voice-only from that side; it still shows the other side's video.
-8. Shown when nobody is looking: the window isn't focused, the app is in
+   and rpm recommend). Where the web view can't capture or encode, the
+   camera turns off and the call stays voice-only from that side; it still
+   shows the other side's video.
+9. Shown when nobody is looking: the window isn't focused, the app is in
    the background, or (Android) it was swiped away. Tested on the Android
    emulator. Android uses its own notification from `MycelService`; the
-   others use Tauri's notification plugin.
-
-"Not yet" means the app builds and runs there without that feature.
+   others use Tauri's notification plugin. On iPhone and iPad a tap opens
+   the conversation it is about. Notifications say only what happened ("New
+   message", "Incoming call"), never names or text.
+10. Built and tested on emulated links; not tested between real devices.
+    Peer-to-peer Wi-Fi is Apple's AWDL (what AirDrop uses), through
+    Network.framework: two Macs, iPhones or iPads with Wi-Fi switched on,
+    and no shared network. On Linux, Bluetooth uses BlueZ and is
+    wire-compatible with the Apple code, so a Linux machine and a Mac can
+    link. Linux forms Wi-Fi Direct groups with other Mycel devices only when
+    turned on (`MYCEL_WIFI_DIRECT=1` or `MYCEL_LINKS=all,wifidirect`), since
+    it takes over the radio's P2P side; it needs wpa_supplicant with D-Bus.
+    See [USER_GUIDE.md](USER_GUIDE.md) §6 for trying them.
 
 The on-screen keyboard: on Android the page shrinks above it and the tab bar
 hides. iOS slides the page under the keyboard instead of shrinking it, so the
@@ -77,32 +113,38 @@ keyboard (below).
 ## Building
 
 All of these run on a Mac except Linux and Windows, which build on GitHub
-Actions (`.github/workflows/apps.yml`, on every push to `main` or
-`platforms`, and on demand). Each run attaches the installers as artifacts:
+Actions (`.github/workflows/apps.yml`, on every push to `main`, on tags, and
+on demand). Each run attaches the installers as artifacts:
 
 ```sh
 gh run list --workflow Apps
 gh run download <run-id> --dir dist-release/ci
 ```
 
+Every build needs Rust (stable), Node.js 22 and the Tauri CLI
+(`cargo install tauri-cli --version '^2' --locked`).
+
 ### macOS
 
-`scripts/package-mac.sh --universal` builds `dist-release/Mycel_<v>_universal.dmg`.
-See [TWO_LAPTOPS.md](TWO_LAPTOPS.md) for opening an unsigned app.
+`scripts/package-mac.sh --universal` builds `dist-release/Mycel_<v>_universal.dmg`
+(without `--universal`: this Mac's architecture only). The app is unsigned;
+see [USER_GUIDE.md](USER_GUIDE.md) for opening it on another Mac.
 
 ### iPhone and iPad
 
 One app for both (`TARGETED_DEVICE_FAMILY = 1,2`), iOS 16.4 or later. Its
-bundle ID is `com.atullal.mycel` (`tauri.ios.conf.json`, registered to the
-team); the other platforms still use `dev.mycel.host`. Needs
-Xcode, rustup's `llvm-tools` component (the script adds it), and for devices
-an Apple ID signed in to Xcode for the team in `tauri.conf.json`
-(`bundle > iOS > developmentTeam`).
+bundle ID is `com.atullal.mycel` (`tauri.ios.conf.json`); the other
+platforms use `dev.mycel.host`. Needs Xcode, rustup's `llvm-tools`
+component (the script adds it), and for devices an Apple ID signed in to
+Xcode for the team in `tauri.conf.json` (`bundle > iOS > developmentTeam`).
+To build with your own account, set your team there and pick a bundle ID
+you own.
 
 ```sh
 scripts/package-ios.sh --simulator   # dist-release/ios-simulator/Mycel.app
 scripts/package-ios.sh               # dist-release/Mycel_<v>_ios.ipa (development-signed)
 scripts/package-ios.sh --install     # ...and install it on the connected iPhone/iPad
+scripts/package-ios.sh --unsigned    # an unsigned .ipa, for re-signing
 ```
 
 **TestFlight:** `scripts/package-ios.sh --testflight N` archives with build
@@ -111,8 +153,7 @@ Xcode's Organizer: Distribute App > TestFlight Internal Only > Distribute.
 The upload has to go through the Organizer: Xcode 27's account sign-in
 (Settings > Apple Accounts) doesn't reach command-line `xcodebuild`, so
 the command line can only sign with profiles Xcode already made. App Store
-Connect needs the app record for `com.atullal.mycel` (Xcode offers to
-create it, or create it at appstoreconnect.apple.com), and asks about encryption
+Connect needs an app record for the bundle ID, and asks about encryption
 (export compliance) before testers can install a build.
 `gen/apple/PrivacyInfo.xcprivacy` is Apple's privacy manifest; the app icons
 must have no alpha channel.
@@ -156,18 +197,15 @@ so files and video frames cross it as base64 (`invokeBytes` in the SDK).
 ### Windows
 
 Windows 10 or later. The CI job builds an NSIS installer (`Mycel_<v>_x64-setup.exe`)
-and an MSI. Both are unsigned, so SmartScreen warns: More info > Run anyway.
-Windows Firewall asks the first time Mycel listens; allow private networks for
-LAN discovery. Video calls need the camera allowed for desktop apps
-(Settings > Privacy & security > Camera). To build on a Windows machine:
+and an MSI, both unsigned. To build on a Windows machine:
 `npm install && cd apps/host && cargo tauri build`.
 
 ### Linux
 
 The CI job builds a `.deb`, an `.rpm` and an `.AppImage` on Ubuntu 22.04
-(glibc 2.35 or newer). To build on Linux, install the libraries listed in the
-workflow (`libwebkit2gtk-4.1-dev`, `libdbus-1-dev`, `libasound2-dev`, …) and run
-`cargo tauri build` in `apps/host`.
+(glibc 2.35 or newer). To build on Linux, install the libraries the Linux job
+in `.github/workflows/apps.yml` installs (`libwebkit2gtk-4.1-dev`,
+`libdbus-1-dev`, `libasound2-dev`, …) and run `cargo tauri build` in `apps/host`.
 
 ## Testing on simulators
 
@@ -185,8 +223,7 @@ workflow (`libwebkit2gtk-4.1-dev`, `libdbus-1-dev`, `libasound2-dev`, …) and r
   instead of the Mac's microphone and camera.
 - **Android settings:** apps get no environment variables, so
   `adb shell setprop debug.mycel.<name> <value>` stands in for `MYCEL_<NAME>`
-  (`audio`, `video_debug`, `net`, `links`, `mesh`, `ble_log`), read when the
-  app starts.
+  (`audio`, `video_debug`, `net`, `links`, `mesh`), read when the app starts.
 - **iPhone UI test:** `apps/host/ios-uitests` drives the installed app with
   XCUITest: it opens a conversation, types on the on-screen keyboard and
   checks the header and composer stay in view. It needs a conversation with
@@ -205,6 +242,9 @@ workflow (`libwebkit2gtk-4.1-dev`, `libdbus-1-dev`, `libasound2-dev`, …) and r
   `netwatch` and `netdev` on iOS.
 - `vendor/swift-rs` fixes linking Tauri's Swift code with Xcode 27
   (`vendor/swift-rs/MYCEL_PATCH.md`).
+- `vendor/tauri-plugin-notification` fixes iOS notification taps after a
+  restart, including a tap that launches the app
+  (`vendor/tauri-plugin-notification/MYCEL_PATCH.md`).
 - The host window opens only after the runtime is ready (`"create": false` in
   `tauri.conf.json`, built in `setup`): phones load the page faster than the
   runtime opens.

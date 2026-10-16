@@ -1,24 +1,16 @@
-# Benchmarks against external simulators
+# Benchmarks against an external simulator
 
-Mycel's routing code, run against the reference implementations other projects
-use, on the same inputs:
+Mycel's store-and-forward code (`crates/mycel-net/src/mesh/dtn.rs`, the real
+`Carrier`) against **The ONE**'s reference routers: Epidemic, PRoPHET,
+binary Spray-and-Wait, MaxProp and Direct Delivery. Both replay the same
+real Bluetooth contact traces and the same message workloads.
 
-- **Store-and-forward** (`crates/mycel-net/src/mesh/dtn.rs`, the real
-  `Carrier`) against **The ONE**'s reference routers: Epidemic, PRoPHET,
-  binary Spray-and-Wait, MaxProp and Direct Delivery. Both replay the same
-  real Bluetooth contact traces and the same message workloads.
-- **Local mesh routing** (`crates/mycel-net/src/mesh/core.rs`, the real
-  `Router`) against **Meshtastic's managed flooding**, as simulated by
-  **Meshtasticator**, on the same topologies and the same direct messages.
-
-Everything here runs on macOS (this Mac: 18 cores, 24 GB). The benchmarks
-that need Linux (Shadow, Mininet-WiFi against batman-adv/OLSR/Babel,
-CORE/EMANE, quic-network-simulator, libp2p perf) are scripted in
-`bench/linux/` but **have not run yet** (see §7).
+Everything here ran on one Mac (18 cores, 24 GB). Simulations of Mycel's own
+routing at scale are in [SIMULATION.md](SIMULATION.md).
 
 ## Headline
 
-Mycel's carrier now has the fixes of §6, applied to `mesh/dtn.rs` and the
+Mycel's carrier has the fixes of §6, applied to `mesh/dtn.rs` and the
 node's protocol, with the defaults chosen in §6.5: spray-first, a single
 copy follows predictability toward the internet, 32 copies for bundles of
 16 KiB or less falling to 4 at 256 KiB, offers before payloads, resume,
@@ -62,25 +54,21 @@ the share of *all* messages created that arrived within an hour.
     more bundles of the size (`room_aware`, §6.5).
   - Spray-and-Wait still gets more there within an hour: 31.3% against
     27.7%.
-- **Local routing against Meshtastic's flooding.** Mycel's routes deliver
-  98–100% of direct messages, against 39–73% for flooding, with 2–3 data
-  transmissions against 6–16. Its announcements don't fit a LoRa channel
-  (§4).
 
 ## 1. Tools, versions and inputs
 
 | | Version | Notes |
 |---|---|---|
 | [The ONE](https://github.com/akeranen/the-one) | `c973bfb`, OpenJDK 27 (Homebrew) | Batch mode (`bench/one/one.sh`). MaxProp needs `-Djava.util.Arrays.useLegacyMergeSort=true`: its comparator isn't transitive and Java 7+ TimSort rejects it. |
-| [Meshtasticator](https://github.com/GUVWAF/Meshtasticator) | `17ceb82`, Python 3.14.6 venv | Its discrete-event simulator without the GUI (`bench/meshtasticator/run.py`). |
-| Mycel | this branch | `bench/mycel-bench`: `dtn-replay`, `mesh-routing`, `route-check`. They link the real `mycel-net` code. |
+| Mycel | this repository | `bench/mycel-bench`: `dtn-replay` and `route-check`. They link the real `mycel-net` code. |
 
 **Contact traces.** These are real Bluetooth sightings between iMotes carried by people (CRAWDAD
 `cambridge/haggle`: Scott, Gass, Crowcroft, Hui, Diot, Chaintreau,
-doi:10.15783/C70011). IEEE DataPort needs a login, so `bench/fetch.sh` takes
-the unmodified files from the mobemu repository, which redistributes them.
-The licence asks users not to re-share them, so they live in the gitignored
-`bench/data/` and are never committed.
+doi:10.15783/C70011). You download them yourself, under CRAWDAD's terms:
+cite the dataset, don't try to identify people, don't re-share it.
+`bench/fetch.sh` fetches the unmodified files (IEEE DataPort needs a login,
+so it takes them from the mobemu repository) into the gitignored
+`bench/data/`; they are never redistributed in this repository.
 
 | Trace | Devices | Contacts | Span | Median contact | Gateways (`-gw` variants) |
 |---|---:|---:|---:|---:|---|
@@ -158,13 +146,10 @@ bench/run.py --routers mycel --force    # Mycel only, all traces: after changing
 bench/run.py --only helsinki --workloads heavy --routers mycel --force   # one case
 bench/run.py --summary-only             # rebuild bench/results/summary.{md,csv}
 bench/ablation.py                       # the carrier's policy knobs (§6.5), one variant at a time
-bench/external/venv/bin/python bench/meshtasticator/run.py   # Meshtasticator sweep
-./target/release/mesh-routing bench/results/meshtasticator/dm-*.json > bench/results/meshtasticator/mycel-routing.csv
-python3 bench/meshtasticator/report.py
 ```
 
 `run.py` resumes a killed ONE batch: only routers without a finished report
-run again. On this Mac every run takes seconds to minutes except Infocom
+run again. Every run takes seconds to minutes except Infocom
 2006 with `chat`, where The ONE takes much longer:
 - Epidemic: about 30 min.
 - PRoPHET: about 20 min.
@@ -176,7 +161,7 @@ Mycel's replay of all twelve runs takes under 5 minutes with 4 jobs
 
 ## 3. Results: store-and-forward on real contact traces
 
-Bold rows are Mycel's carrier as it is on this branch. "Overhead" is The
+Bold rows are Mycel's carrier. "Overhead" is The
 ONE's ratio, (relayed − delivered) / delivered. Latency is over delivered
 messages only.
 
@@ -344,62 +329,29 @@ created messages delivered within a time:
 The ONE's chat runs on Infocom 2006 predate the per-message report, so
 only Mycel (and Direct Delivery with gateways) have rows there.
 
-## 4. Results: local mesh routing against Meshtastic's flooding
+## 4. Limits
 
-`bench/meshtasticator/run.py` runs Meshtasticator's discrete-event simulator
-headless. It uses LONG_FAST and 3GPP suburban path loss over 15 × 15 km,
-with 40-byte payloads, a message per node every 100 s on average, and 30
-minutes per run. Node movement and asymmetric links are off, so the graph
-stays fixed. Each setting runs 3 times, with batchSim.py's seeded
-placement. Each run's topology and direct messages are dumped, and
-`mesh-routing` runs Mycel's real `Router` on the same graph and the same
-messages: it sends signed announcements, builds route tables and forwards
-hop by hop.
-
-**Meshtastic managed flooding, broadcasts (Meshtasticator)**
-
-| Nodes | Hop limit | Reach | Usefulness | Transmissions per message |
-|---:|---:|---:|---:|---:|
-| 10 | 1 | 57 % | 59 % | 2.7 |
-| 10 | 3 | 75 % | 52 % | 4.3 |
-| 10 | 5 | 79 % | 50 % | 4.9 |
-| 10 | 7 | 77 % | 50 % | 4.8 |
-| 25 | 1 | 43 % | 56 % | 3.4 |
-| 25 | 3 | 58 % | 45 % | 6.4 |
-| 25 | 5 | 61 % | 41 % | 7.8 |
-| 25 | 7 | 62 % | 41 % | 8.2 |
-| 50 | 1 | 31 % | 53 % | 3.8 |
-| 50 | 3 | 37 % | 41 % | 7.1 |
-| 50 | 5 | 37 % | 39 % | 8.2 |
-| 50 | 7 | 38 % | 38 % | 8.7 |
-
-**Direct messages: Meshtastic (hop limit 3) vs Mycel's router, same topologies and messages**
-
-| Nodes | Links | Meshtastic delivered | Meshtastic tx per delivered | Mycel delivered | Mycel data tx per delivered | Mycel announcements per node per min | Mycel control traffic per node | Announcement airtime on LoRa LongFast |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 10 | 17 | 73 % | 5.7 | 100.0 % | 2.0 | 150 | 9 kbit/s | 723 % of the channel |
-| 25 | 81 | 58 % | 10.2 | 99.9 % | 2.2 | 242 | 27 kbit/s | 1166 % of the channel |
-| 50 | 239 | 39 % | 16.2 | 97.9 % | 2.9 | 284 | 50 kbit/s | 1366 % of the channel |
-
-- **Broadcasts.** Meshtasticator's flooding reproduces Meshtastic's
-  published shape: reach rises with the hop limit and levels off around
-  3–5, while usefulness (the share of rebroadcasts that reach someone new)
-  falls.
-- **Direct messages.** Flooding delivers 39–73% with 6–16 transmissions per
-  delivered message. Mycel's routes deliver 98–100% with 2–3 data
-  transmissions per message.
-- **The cost.** That gain comes from Mycel's proactive announcements. On a
-  LoRa channel they would need 7–14× more airtime than the channel has.
-  `mesh-routing` models reliable links without collisions or airtime, which
-  flatters Mycel on LoRa. On Mycel's own radios the same control traffic
-  (9–50 kbit/s per device, at 10–50 devices) is small on Wi-Fi. On a BLE
-  link of ~300 kbit/s it is a noticeable share. **Mycel's mesh as designed
-  does not fit LoRa-class radios.** On them, flooding with a hop limit, as Meshtastic
-  does, is the right design.
+- The contact traces are old: iMotes sampled every 120 s, from 2005–2006.
+  Contacts shorter than a scan are invisible, so phones today meet more
+  often than these traces show.
+- Links are 250 kB/s with no loss, no contention between parallel contacts,
+  and one transfer per device at a time, as in The ONE. Real BLE L2CAP
+  gives ~40–100 kB/s, and AWDL gives far more.
+- In the `-gw` variants, "the internet" is an always-up clique of 250 kB/s
+  links between the gateways. Both sides get it: The ONE as permanent
+  connections at t = 0, Mycel through the same `--gateways` list. Mycel
+  additionally knows these devices have the internet (P = 1 toward
+  `INTERNET`, plus a default route toward the nearest one). The ONE's
+  routers only see them as well connected.
+- Mycel is run with signatures off (closures that return true). Its CPU
+  cost is not part of these numbers.
+- Offers cost no link time in the replay. On a real link each is a round
+  trip (tens of milliseconds over BLE); Mycel makes 1.0–1.5 offers per
+  transfer it starts (`offers` and `started` in each run's output).
 
 ## 5. What it shows
 
-- **Frugal and now fast.** Mycel's overhead is 4.7–37 relays per
+- **Frugal and fast.** Mycel's overhead is 4.7–37 relays per
   delivered message, against 6–1,343 for The ONE's routers, and it
   delivers more:
   - Infocom 2006 heavy: 57.0% (43.0% within an hour) at overhead 7, against
@@ -416,10 +368,8 @@ hop by hop.
   route 94.1% of the time one exists. Those hops count in the delivered
   messages' hop counts: 3.6–4.4 on Infocom 2006, against 1.0–2.1 for
   Direct Delivery and Spray-and-Wait.
-- **Local mesh routing** delivers 98–100% of direct messages on
-  Meshtasticator's topologies, against 39–73% for managed flooding (§4).
 
-## 6. Where Mycel loses, why, and the fix
+## 6. Where Mycel lost, why, and the fix
 
 **All of this is now applied** to the real carrier (`mesh/dtn.rs`) and
 the node's protocol (`mesh/mod.rs`); §6.5 has the results and the choice
@@ -564,15 +514,15 @@ never runs.
   delivered and 34.6% within 1 h, against 44.5% and 30.5% for
   Spray-and-Wait.
 
-**Open question: the gradient toward the internet.**
+**The gradient toward the internet, with fast-moving gateways.**
 - On Helsinki-gw, 6 trams with 5 MB stores are the only gateways.
   Climbing toward them funnels heavy bundles into tiny stores: 39.6%
   delivered with `inet`, against 63.4% with no gradient.
 - With chat-sized bundles the same gradient helps: 67.1% within 1 h,
   against 65.5% with no gradient.
 - Real gateways have 64 MiB stores and real uplinks, so this bench is
-  the worst case. The SIM agent's partition and disaster scenarios, where
-  the gradient is meant to pay off, should settle it before it changes.
+  the worst case. The simulator's partition and disaster scenarios, where
+  the gradient is meant to pay off, decided the default (§6.5).
 
 **Chat needs more copies.** On Helsinki chat, MaxProp delivers 98% within
 an hour by copying everywhere, at overhead 90. Four copies cap Mycel at
@@ -581,7 +531,7 @@ size. `all,spray,evict,inet` with `--copies`:
 
 | Helsinki chat | Delivered | ≤ 10 min | ≤ 1 h | Overhead |
 |---|---:|---:|---:|---:|
-| 4 copies (today's default) | 91.3 % | 13.9 % | 60.7 % | 3.3 |
+| 4 copies (the earlier default) | 91.3 % | 13.9 % | 60.7 % | 3.3 |
 | 8 | 95.3 % | 17.4 % | 79.4 % | 7.1 |
 | 16 | 96.5 % | 20.4 % | 89.5 % | 14.3 |
 | 32 | 97.2 % | 18.5 % | 94.7 % | 26.3 |
@@ -594,13 +544,8 @@ point at 32 copies. Cambridge, whose 12 devices share small stores, loses
 A budget such as 32 copies for bundles of 16 KiB or less, falling to 4 at
 256 KiB, gives chat MaxProp-like speed at a third of its overhead.
 
-To reproduce one row:
-
-```sh
-./target/release/dtn-replay --contacts bench/traces/out/helsinki.csv \
-  --messages bench/traces/out/helsinki-chat-msgs.csv --ttl-min 1440 \
-  --carrier fixed --fixes all,spray,evict,inet --copies 32 --latencies /tmp/lat.csv
-```
+These rows come from the retired experimental copy (`bench/results/ablation/`).
+On the real carrier the same choice is the `copies_small` knob, measured in §6.5.
 
 ### 6.4 Speed versus completeness when stores fill
 
@@ -638,8 +583,8 @@ It costs total delivery wherever stores overflow:
 - Infocom 2005: 35.8% → 29.9%
 - Helsinki without spray-first: 66.3% → 49.3%
 
-That trade is a policy choice. Fresh-first suits chat, keep-everything
-suits files, so it could be a per-bundle class.
+That trade is a policy choice: fresh-first suits chat, keep-everything
+suits files.
 
 ### 6.5 Results on the real carrier, and the defaults
 
@@ -669,7 +614,7 @@ only when no neighbour is clearly better) coincide.
 **The defaults, and why:**
 - **Spray-first** (`Spray::First`): while a bundle has copies to spare,
   half go to the likeliest neighbour without one, better than us or not.
-  It wins or ties everywhere. Spray-and-Focus, which the simulator work had
+  It wins or ties everywhere. Spray-and-Focus, which the simulator had first
   chosen, only sprays to neighbours no worse than us; on Helsinki, where
   movement has no social structure, that keeps copies where they are
   (39.5% against 62.9% heavy, 79% against 94% of chat within an hour).
@@ -710,42 +655,3 @@ To reproduce one cell:
   --messages bench/traces/out/helsinki-chat-msgs.csv --ttl-min 1440 \
   --knobs spray=focus,gradient=both --latencies /tmp/lat.csv
 ```
-
-### 6.6 LoRa-class radios
-
-Mycel's proactive announcements don't fit a LoRa channel (§4). That isn't
-a target today. If it becomes one, those radios should use on-demand
-route discovery (AODV- or Reticulum-style) or plain flooding with a hop
-limit, not periodic announcements.
-
-## 7. Not run yet (needs Linux)
-
-`bench/linux/README.md` has the scripts and instructions:
-- **Shadow:** real `mycel` binaries on a simulated internet.
-- **Mininet-WiFi:** Mycel's mesh against batman-adv, olsrd and babeld on
-  identical 802.11 ad-hoc chains.
-- **CORE/EMANE**, **quic-network-simulator** and **libp2p test-plans perf**.
-
-None of these has run: Docker on this Mac is stuck, and no Linux machine
-was reachable. `iroh-netbench` 0.2.0 was skipped, because it needs custom
-glue around a peer session.
-
-## 8. Limits
-
-- The contact traces are old: iMotes sampled every 120 s, from 2005–2006.
-  Contacts shorter than a scan are invisible, so phones today meet more
-  often than these traces show.
-- Links are 250 kB/s with no loss, no contention between parallel contacts,
-  and one transfer per device at a time, as in The ONE. Real BLE L2CAP
-  gives ~40–100 kB/s, and AWDL gives far more.
-- In the `-gw` variants, "the internet" is an always-up clique of 250 kB/s
-  links between the gateways. Both sides get it: The ONE as permanent
-  connections at t = 0, Mycel through the same `--gateways` list. Mycel
-  additionally knows these devices have the internet (P = 1 toward
-  `INTERNET`, plus a default route toward the nearest one). The ONE's
-  routers only see them as well connected.
-- Mycel is run with signatures off (closures that return true). Its CPU
-  cost is not part of these numbers.
-- Offers cost no link time in the replay. On a real link each is a round
-  trip (tens of milliseconds over BLE); Mycel makes 1.0–1.5 offers per
-  transfer it starts (`offers` and `started` in each run's output).

@@ -123,6 +123,9 @@ struct Outgoing {
     srtt: Option<Time>,
     rto: Time,
     started: Time,
+    /// Its last packets went through the mesh (the routing core chose the
+    /// way), not straight to the peer.
+    meshed: bool,
 }
 
 const INITIAL_WINDOW: f64 = 10.0;
@@ -356,8 +359,17 @@ impl Global {
         for o in outs.drain(..) {
             match o {
                 Out::Announce { to, mut ann } => {
-                    if self.role == Role::BlackHole && ann.origin != self.pk && ann.cost != mc::INFINITY {
-                        ann.cost = 0; // "everyone is right here"
+                    if ann.origin != self.pk && ann.cost != mc::INFINITY {
+                        match self.role {
+                            Role::BlackHole => ann.cost = 0, // "everyone is right here"
+                            Role::Liar => {
+                                // "everyone is one hop from me", as cheaply as
+                                // an honest relay could say it
+                                ann.hops = 1;
+                                ann.cost = 1 + mc::HOP_PENALTY;
+                            }
+                            _ => {}
+                        }
                     }
                     self.send_to(cx, node(&to), Frame::Ann(ann), None);
                 }
@@ -365,7 +377,7 @@ impl Global {
                     self.send_to(cx, node(&to), Frame::Req(req), None);
                 }
                 Out::Frame { to, frame, relayed } => {
-                    if relayed && self.role == Role::BlackHole {
+                    if relayed && matches!(self.role, Role::BlackHole | Role::Liar) {
                         continue; // swallowed
                     }
                     let msg = packet_msg(&frame.payload);
@@ -431,6 +443,10 @@ impl Global {
                 let part = u16::from_be_bytes([p[5], p[6]]);
                 let now = cx.now();
                 let Some(o) = self.outbox.get_mut(&msg) else { return };
+                if o.meshed {
+                    // end to end: the way our packets took works
+                    self.core.feedback(key(src), true, now / MS);
+                }
                 if let Some(sent) = o.inflight.remove(&part) {
                     let rtt = now.saturating_sub(sent);
                     let s = o.srtt.map_or(rtt, |s| (7 * s + rtt) / 8);
@@ -478,6 +494,9 @@ impl Global {
             self.conns.remove(&dst);
         }
         let now = Self::ms(cx);
+        if let Some(o) = msg.and_then(|m| self.outbox.get_mut(&m)) {
+            o.meshed = true;
+        }
         self.core.send(pk, self.pk, p, false, now);
         self.effects(cx);
         self.busy(cx);
@@ -659,6 +678,11 @@ impl Router for Global {
             Frame::Bundle(b, copies) => {
                 let id = b.id;
                 let msg = bundle_msg(&id);
+                if self.role == Role::Liar && b.dst != self.pk {
+                    // takes custody, keeps nothing
+                    self.send_to(cx, from, Frame::BundleAck { id, copies, ok: true, stored: true }, None);
+                    return;
+                }
                 let (ok, stored) = match self.dtn.as_mut().map(|c| c.accept(fpk, b, copies, now, |_| true)) {
                     Some(Accepted::ForMe(b)) => {
                         cx.delivered(msg);
@@ -795,12 +819,23 @@ impl Router for Global {
                 let rto = o.rto;
                 let lost: Vec<u16> =
                     o.inflight.iter().filter(|(_, t)| now_us.saturating_sub(**t) >= rto).map(|(p, _)| *p).collect();
-                if !lost.is_empty() {
+                let timed_out = !lost.is_empty();
+                if timed_out {
                     for p in lost {
                         o.inflight.remove(&p);
                     }
                     o.cwnd = (o.cwnd / 2.0).max(2.0);
                     o.rto = (o.rto * 2).min(30 * SEC);
+                }
+                // end to end: a whole timeout through the mesh, nothing acked
+                if timed_out && o.meshed {
+                    let dst = key(o.dst);
+                    o.meshed = false;
+                    if self.core.feedback(dst, false, now)
+                        && let Some(c) = self.dtn.as_mut()
+                    {
+                        c.doubt(dst, now);
+                    }
                 }
                 let next = o.rto;
                 let (dst, size, none_acked) = (o.dst, o.size, o.left == o.parts);
@@ -831,6 +866,7 @@ impl Router for Global {
                 srtt: None,
                 rto: SEC,
                 started: cx.now(),
+                meshed: false,
             },
         );
         self.transmit(cx, msg);

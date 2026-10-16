@@ -720,3 +720,38 @@ fn wants_bring_destination_predictabilities() {
     let plan = ca.plan(2 * SUMMARY_GAP, |_| Toward::Unreachable, &[b]);
     assert_eq!(plan.iter().map(|t| (t.to, t.why)).collect::<Vec<_>>(), vec![(b, Why::Gradient)]);
 }
+
+/// When our live packets to the destination just went unacknowledged along
+/// a mesh route (`doubt`), our own bundle doesn't follow that route with
+/// every copy: a black hole on it would take custody and drop them all.
+/// Half go along the route, the rest to other neighbours, one share each,
+/// and the last stays with us. Without that evidence, custody moves whole.
+#[test]
+fn a_doubted_route_gets_one_share_of_our_bundle() {
+    for doubt in [false, true] {
+        let mut w = World::new(5, |_| DtnConfig::default());
+        let (s, a, b, c, d) = (0, 1, 2, 3, 4);
+        for n in [a, b, c] {
+            w.meet(s, n);
+        }
+        w.routes.insert((s, d), a);
+        let x = bundle(key(s as u32), key(d as u32), 1, 3_600_000);
+        w.nodes[s].originate(x.clone(), 0).unwrap();
+        if doubt {
+            w.nodes[s].doubt(key(d as u32), 0);
+        }
+        for _ in 0..6 {
+            w.step(100);
+        }
+        let from_s: Vec<(usize, Why)> = w.transfers.iter().filter(|t| t.0 == s).map(|t| (t.1, t.2)).collect();
+        if doubt {
+            assert_eq!(from_s.iter().filter(|t| t.0 == a).count(), 1, "one share along the route: {from_s:?}");
+            assert!(from_s.contains(&(a, Why::Route)));
+            assert!(from_s.contains(&(b, Why::Spray)) && from_s.contains(&(c, Why::Spray)), "{from_s:?}");
+            assert!(w.nodes[s].holds(&x.id), "the last copy stays");
+        } else {
+            assert_eq!(from_s, vec![(a, Why::Route)]);
+            assert!(!w.nodes[s].holds(&x.id), "custody moved whole");
+        }
+    }
+}

@@ -1,0 +1,32 @@
+name: Feature request
+description: Suggest a new feature or a change to how something works.
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For a security vulnerability, don't use this form: see SECURITY.md.
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to do, and what gets in the way today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you'd like
+      description: How it could work. Sketches and examples help.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: Other ways to solve it, and why they're worse.
+  - type: textarea
+    id: trust
+    attributes:
+      label: Privacy and trust
+      description: Mycel has no trusted server. Does this need one, or change who can see or change what?

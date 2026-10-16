@@ -13,6 +13,6 @@ cargo test --locked -p mycel-host --lib
 npm run typecheck
 npm run build
 npm audit --audit-level=low
-# Unsound advisories are warnings by default in cargo-audit. Treat them as a
-# failing gate as well; the baseline Linux glib dependency currently fails it.
-cargo audit --deny unsound
+# RustSec advisories, including unsound and unmaintained crates, through the
+# same policy CI uses (deny.toml: each accepted advisory has its reason there).
+cargo deny --locked check advisories

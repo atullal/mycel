@@ -46,24 +46,6 @@ export const Glyph = {
       <path d="M8.5 9h7M8.5 12h4.5" />
     </Svg>
   ),
-  Doc: () => (
-    <Svg>
-      <path d="M14 3.5H7.5A2 2 0 0 0 5.5 5.5v13a2 2 0 0 0 2 2h9a2 2 0 0 0 2-2V8z" />
-      <path d="M14 3.5V8h4.5M8.8 12.5h6.4M8.8 16h4.2" />
-    </Svg>
-  ),
-  News: () => (
-    <Svg>
-      <path d="M4 5.5h12.5v12a2 2 0 0 0 2 2H6a2 2 0 0 1-2-2z" />
-      <path d="M16.5 9.5H20v8a2 2 0 0 1-2 2M7.5 9h5.5M7.5 12.5h5.5M7.5 16h3.5" />
-    </Svg>
-  ),
-  Dice: () => (
-    <Svg>
-      <rect x="4" y="4" width="16" height="16" rx="3.5" />
-      <path d="M8.5 8.5h.01M15.5 8.5h.01M12 12h.01M8.5 15.5h.01M15.5 15.5h.01" strokeWidth={2.6} />
-    </Svg>
-  ),
   Radar: () => (
     <Svg>
       <circle cx="12" cy="12" r="2" />

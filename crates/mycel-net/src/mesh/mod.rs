@@ -48,6 +48,7 @@ pub mod directory;
 pub mod dtn;
 #[cfg(test)]
 mod tests;
+mod watch;
 pub mod wire;
 
 use std::collections::{HashMap, HashSet};
@@ -497,6 +498,10 @@ struct Driver {
     dtn_due: AtomicBool,
     /// Memory for what neighbours send us (`resources.rs`).
     frames: crate::resources::Frames,
+    /// End-to-end connections whose mesh paths are watched (`watch.rs`).
+    watched: Mutex<HashSet<usize>>,
+    /// Tests: relay nothing to or from this device (a black hole).
+    black_hole: Mutex<Option<SignPk>>,
 }
 
 /// A bundle being handed to a neighbour; ending lets the next one start.
@@ -579,6 +584,9 @@ impl Driver {
                     }
                 }
                 Out::Frame { to, frame, relayed } => {
+                    if relayed && self.black_hole.lock().is_some_and(|b| b == frame.dst || b == frame.src) {
+                        continue;
+                    }
                     if relayed && let Some(tap) = self.tap.lock().clone() {
                         tap(&frame.payload);
                     }
@@ -1453,6 +1461,8 @@ impl Mesh {
             sending: Mutex::default(),
             dtn_due: AtomicBool::new(false),
             frames: crate::resources::Frames::neighbours(),
+            watched: Mutex::default(),
+            black_hole: Mutex::default(),
         });
         Mesh { d }
     }

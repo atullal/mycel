@@ -1,0 +1,9 @@
+# Commits that only reformat code, hidden from `git blame`.
+# GitHub's blame view reads this file automatically. Locally:
+#
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# One full commit SHA per line, with a comment saying what it was.
+
+# The first repository-wide `cargo fmt` (rustfmt.toml).
+35a800b2b1ba0032ec01b5f00baa5e4634e1bca6

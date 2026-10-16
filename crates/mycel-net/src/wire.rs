@@ -126,7 +126,7 @@ pub(crate) async fn send_len<T: Serialize>(s: &mut SendStream, msg: &T) -> Resul
 }
 
 /// Receive the answer to a short request (see
-/// [`crate::resources::REPLY_TIMEOUT`]). Outside a node: no memory budget,
+/// `resources::REPLY_TIMEOUT`). Outside a node: no memory budget,
 /// only the frame size limit.
 pub async fn recv<T: DeserializeOwned>(r: &mut RecvStream) -> Result<T> {
     let frames = crate::resources::PeerFrames::unbudgeted();

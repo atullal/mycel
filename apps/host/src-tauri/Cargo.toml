@@ -1,9 +1,13 @@
 [package]
 name = "mycel-host"
-version = "0.1.0"
 description = "The Mycel Host: one native shell for every Mycel app"
-edition = "2024"
-license = "MIT OR Apache-2.0"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
 publish = false
 
 [lib]
@@ -55,3 +59,6 @@ webkit2gtk = { version = "2", features = ["v2_40"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[lints]
+workspace = true

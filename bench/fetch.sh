@@ -6,7 +6,7 @@
 #
 #   bench/fetch.sh            # tools + traces
 #   bench/fetch.sh traces     # CRAWDAD Haggle contact traces only
-#   bench/fetch.sh tools      # The ONE + Meshtasticator only
+#   bench/fetch.sh tools      # The ONE only
 #   bench/fetch.sh latency    # WonderNetwork's global ping sample (mycel-sim's internet latency)
 #   bench/fetch.sh dataport <haggle.tar.gz> [nus.sql.gz]
 #                             # unpack archives downloaded from IEEE DataPort
@@ -22,14 +22,13 @@ WHAT="${1:-all}"
 # Pinned upstream commits (the versions BENCHMARKS.md reports).
 ONE_REPO=https://github.com/akeranen/the-one.git
 ONE_COMMIT=c973bfb892ee3d624549a0142018f4d1dedf17d7
-MESH_REPO=https://github.com/GUVWAF/Meshtasticator.git
-MESH_COMMIT=17ceb8231079d87b070abc6132181e4c6b20202d
 
 # CRAWDAD cambridge/haggle iMote traces (Scott, Gass, Crowcroft, Hui, Diot,
-# Chaintreau; CRAWDAD, doi:10.15783/C70011, CC BY 4.0 per IEEE DataPort).
-# IEEE DataPort needs a login, so we take the unmodified files from the mobemu
-# repository (Ciobanu et al.), which redistributes them. Terms: cite the
-# dataset, don't try to identify people, don't re-share the data.
+# Chaintreau; CRAWDAD, doi:10.15783/C70011). These are CRAWDAD datasets,
+# used under CRAWDAD's terms: you download them yourself with this script,
+# and they are never redistributed in this repository. IEEE DataPort needs a
+# login, so this takes the unmodified files from the mobemu repository
+# (Ciobanu et al.).
 TRACES=https://raw.githubusercontent.com/raduciobanu/mobemu/master/traces
 
 # WonderNetwork / WonderProxy, "A day in the life of the internet" (19-20 July
@@ -68,7 +67,6 @@ fi
 if [ "$WHAT" = all ] || [ "$WHAT" = tools ]; then
   mkdir -p external
   clone "$ONE_REPO" "$ONE_COMMIT" external/the-one
-  clone "$MESH_REPO" "$MESH_COMMIT" external/Meshtasticator
 fi
 
 if [ "$WHAT" = latency ]; then

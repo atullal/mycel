@@ -289,7 +289,11 @@ pub struct WorldCore<F> {
     events: Vec<Option<Ev<F>>>,
     free: Vec<usize>,
     seq: u64,
+    /// Radio jitter and the routers' own randomness.
     pub rng: Rng,
+    /// Where walking devices go: a stream of its own, so the world (who
+    /// meets whom, when) is the same whatever the routers send.
+    mob_rng: Rng,
     pub msgs: Vec<MsgRecord>,
     pub counters: Vec<NodeCounters>,
     pub contacts: Contacts,
@@ -688,6 +692,7 @@ impl<R: Router> Sim<R> {
             free: Vec::new(),
             seq: 0,
             rng: Rng::new(seed),
+            mob_rng: Rng::new(seed ^ 0x6d6f_6269_6c69_7479),
             msgs: Vec::new(),
             counters: vec![NodeCounters::default(); n],
             contacts: Contacts { radio: Map::default(), inet: vec![Vec::new(); n] },
@@ -918,7 +923,7 @@ impl<R: Router> Sim<R> {
                     let target = match self.core.nodes[i].wp_target {
                         Some(t) => t,
                         None => {
-                            let t = (self.core.rng.range(0.0, w), self.core.rng.range(0.0, h));
+                            let t = (self.core.mob_rng.range(0.0, w), self.core.mob_rng.range(0.0, h));
                             self.core.nodes[i].wp_target = Some(t);
                             t
                         }

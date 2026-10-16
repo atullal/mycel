@@ -2698,10 +2698,10 @@ mod tests {
         let old_items =
             alice.node.with_space(&parse_space(&conversation.id).unwrap(), |r| r.feed(&messages_feed())).unwrap();
         let mut events = alice.subscribe();
-        bob.set_name("Manbirs iphone".into()).unwrap();
+        bob.set_name("Bob's iPhone".into()).unwrap();
         // Contact refresh must happen from the sync bridge itself; this poll
         // deliberately does not read the conversation to warm its view.
-        eventually(|| alice.contacts().iter().any(|c| c.id == contact.id && c.name == "Manbirs iphone")).await;
+        eventually(|| alice.contacts().iter().any(|c| c.id == contact.id && c.name == "Bob's iPhone")).await;
         let changed = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if matches!(events.recv().await, Ok(Event::ContactsChanged)) {
@@ -2711,7 +2711,7 @@ mod tests {
         })
         .await;
         assert!(changed.is_ok(), "signed rename refreshes contact subscribers");
-        assert_eq!(alice.conversation(conversation.id.clone()).unwrap().title, "Manbirs iphone");
+        assert_eq!(alice.conversation(conversation.id.clone()).unwrap().title, "Bob's iPhone");
         assert_eq!(alice.create_conversation(None, vec![contact.id.clone()]).unwrap().id, conversation.id);
         let nearby = alice.nearby_from_peers(HashMap::from([(
             bob.keys.sign_pk(),
@@ -2721,13 +2721,13 @@ mod tests {
                 ..Default::default()
             },
         )]));
-        assert_eq!(nearby[0].name, "Manbirs iphone");
-        assert!(alice.network_status().peers.iter().any(|p| p.id == contact.id && p.name == "Manbirs iphone"));
+        assert_eq!(nearby[0].name, "Bob's iPhone");
+        assert!(alice.network_status().peers.iter().any(|p| p.id == contact.id && p.name == "Bob's iPhone"));
         assert!(!alice.learn_profile_names(&old_items), "reading old signed history cannot undo the rename");
         alice.add_contact(imported_code).unwrap();
         assert_eq!(
             alice.contacts()[0].name,
-            "Manbirs iphone",
+            "Bob's iPhone",
             "reimporting an old card cannot override a newer signed profile"
         );
         assert_eq!(alice.contacts()[0].id, contact.id, "display-name changes preserve authenticated identity");
@@ -2736,10 +2736,10 @@ mod tests {
         alice = Runtime::open(&da, NetworkMode::Local, Some("Alice".into())).await.unwrap();
         assert_eq!(
             alice.contacts()[0].name,
-            "Manbirs iphone",
+            "Bob's iPhone",
             "signed name is restored from encrypted history after restart"
         );
-        assert_eq!(alice.conversation(conversation.id).unwrap().title, "Manbirs iphone");
+        assert_eq!(alice.conversation(conversation.id).unwrap().title, "Bob's iPhone");
         alice.shutdown().await.unwrap();
         bob.shutdown().await.unwrap();
         drop((alice, bob));
@@ -2772,27 +2772,27 @@ mod tests {
         let bluetooth = MemNet::new(0, PathKind::Bluetooth);
         let wifi = MemNet::new(1, PathKind::PeerWifi);
         let direct = MemNet::new(2, PathKind::PeerWifi);
-        let manbir = device("Manbir", &[&bluetooth, &direct]).await;
-        let shreya = device("Shreya", &[&wifi, &direct]).await;
+        let alice = device("Alice", &[&bluetooth, &direct]).await;
+        let bob = device("Bob", &[&wifi, &direct]).await;
         // MemLink::start announces peers even when its net is already cut;
         // cut after startup so the test emits the matching Lost events.
         direct.cut();
         eventually(|| {
-            !manbir.peers().get(&shreya.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
-                && !shreya.peers().get(&manbir.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
+            !alice.peers().get(&bob.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
+                && !bob.peers().get(&alice.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
         })
         .await;
         let mac = device("Mac relay", &[&bluetooth, &wifi]).await;
         eventually(|| {
-            manbir.peers().get(&shreya.id()).is_some_and(|p| p.links.contains(&PathKind::Mesh))
-                && shreya.peers().get(&manbir.id()).is_some_and(|p| p.links.contains(&PathKind::Mesh))
+            alice.peers().get(&bob.id()).is_some_and(|p| p.links.contains(&PathKind::Mesh))
+                && bob.peers().get(&alice.id()).is_some_and(|p| p.links.contains(&PathKind::Mesh))
         })
         .await;
-        assert!(!manbir.peers()[&shreya.id()].is_directly_discovered());
-        let (space, genesis) = manbir.create_space().unwrap();
-        manbir
+        assert!(!alice.peers()[&bob.id()].is_directly_discovered());
+        let (space, genesis) = alice.create_space().unwrap();
+        alice
             .with_space(&space, |r| -> Result<()> {
-                r.add_member(shreya.keys().public(), Role::Writer)?;
+                r.add_member(bob.keys().public(), Role::Writer)?;
                 r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode())?;
                 r.append(
                     messages_feed(),
@@ -2803,21 +2803,20 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        shreya.join_space(genesis).unwrap();
-        shreya.sync_with(manbir.id(), space, true).await.unwrap();
-        shreya
-            .with_space(&space, |r| {
-                r.append(
-                    messages_feed(),
-                    ChatOp::Text { body: "WiFi to Bluetooth through Mac".into(), reply_to: None, attachments: vec![] }
-                        .encode(),
-                )
-            })
-            .unwrap()
-            .unwrap();
-        manbir.sync_with(shreya.id(), space, false).await.unwrap();
-        assert_eq!(manbir.peers()[&shreya.id()].via, Some(PathKind::Mesh));
-        for node in [&manbir, &shreya] {
+        bob.join_space(genesis).unwrap();
+        bob.sync_with(alice.id(), space, true).await.unwrap();
+        bob.with_space(&space, |r| {
+            r.append(
+                messages_feed(),
+                ChatOp::Text { body: "WiFi to Bluetooth through Mac".into(), reply_to: None, attachments: vec![] }
+                    .encode(),
+            )
+        })
+        .unwrap()
+        .unwrap();
+        alice.sync_with(bob.id(), space, false).await.unwrap();
+        assert_eq!(alice.peers()[&bob.id()].via, Some(PathKind::Mesh));
+        for node in [&alice, &bob] {
             assert_eq!(node.space_ids(), vec![space]);
             assert_eq!(node.with_space(&space, |r| reduce(&r.feed(&messages_feed())).messages.len()).unwrap(), 2);
         }
@@ -2825,15 +2824,15 @@ mod tests {
 
         direct.restore();
         eventually(|| {
-            manbir.peers().get(&shreya.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
-                && shreya.peers().get(&manbir.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
+            alice.peers().get(&bob.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
+                && bob.peers().get(&alice.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
         })
         .await;
         // End the relay route after direct discovery. The existing chat now
         // travels over peer WiFi without changing the signed space identity.
         bluetooth.cut();
         wifi.cut();
-        manbir
+        alice
             .with_space(&space, |r| {
                 r.append(
                     messages_feed(),
@@ -2847,16 +2846,16 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        shreya.sync_with(manbir.id(), space, false).await.unwrap();
-        assert_eq!(shreya.peers()[&manbir.id()].via, Some(PathKind::PeerWifi));
-        for node in [&manbir, &shreya] {
+        bob.sync_with(alice.id(), space, false).await.unwrap();
+        assert_eq!(bob.peers()[&alice.id()].via, Some(PathKind::PeerWifi));
+        for node in [&alice, &bob] {
             assert_eq!(node.space_ids(), vec![space]);
             assert_eq!(node.with_space(&space, |r| reduce(&r.feed(&messages_feed())).messages.len()).unwrap(), 3);
         }
         assert!(mac.space_ids().is_empty());
-        manbir.shutdown().await.unwrap();
+        alice.shutdown().await.unwrap();
         mac.shutdown().await.unwrap();
-        shreya.shutdown().await.unwrap();
+        bob.shutdown().await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

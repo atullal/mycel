@@ -27,12 +27,19 @@
 //! - **Internet hops**: a device with the internet resolves targets it has
 //!   no route to ([`Out::Resolve`] → [`Router::on_resolved`]). One behind
 //!   gateways is reached through the gateway with the lowest record cost +
-//!   internet hop cost ([`Out::Dial`] if not connected); anyone else
-//!   directly. Frames wait (bounded) meanwhile. Internet hops carry no
+//!   internet hop cost ([`Out::Dial`] if not connected; one not measured
+//!   yet costs what a measured one of the same record does, and one up
+//!   wins ties); anyone else directly. Frames wait (bounded) meanwhile. A
+//!   record a minute old is looked up again, while a hop up to one of its
+//!   gateways keeps carrying the traffic. Internet hops carry no
 //!   routing (meshes don't merge across the internet), idle ones are hung
 //!   up, and nothing is relayed internet → internet.
 //! - **Budgets**: transit per neighbour and in total, the mesh ↔ internet
 //!   crossing separately, announcements per neighbour.
+//! - **Lying neighbours**: a relayed announcement no honest relay can send
+//!   (zero hops, or less cost than its hops add) gets its sender distrusted
+//!   for a while: the routes through it go, and the routes it relays are
+//!   ignored.
 //!
 //! # API (for drivers and simulators)
 //!
@@ -89,6 +96,28 @@ pub const INFINITY: u32 = u32::MAX;
 pub const HOP_PENALTY: u32 = 20;
 /// A neighbour's hop cost before it is measured.
 pub const DEFAULT_COST: u32 = 100;
+/// The least a route's cost grows per hop: the hop's measured cost (at
+/// least 1) and [`HOP_PENALTY`]. A relayed announcement claiming less than
+/// this per hop (or no hops at all) came from a liar: honest relays can't
+/// produce it.
+const MIN_HOP_COST: u32 = 1 + HOP_PENALTY;
+/// A neighbour caught sending such an announcement is not routed through
+/// for this long (and at most this many are remembered).
+const DISTRUST: Time = 10 * 60_000;
+const DISTRUST_MAX: usize = 256;
+/// End-to-end feedback ([`Router::feedback`]): after this many
+/// retransmission timeouts in a row with nothing acknowledged, the next hop
+/// our packets to a destination took is suspected for that destination ...
+const SUSPECT_STRIKES: u8 = 2;
+/// ... and only once the silence has lasted this long plus twice the
+/// route's cost (the time to move 64 KiB along it): a slow route, or one
+/// busy with a big transfer, gets longer before it is blamed.
+const SUSPECT_SILENCE: Time = 1_500;
+/// ... and avoided for it this long (another route is used, or none).
+const SUSPECT_FOR: Time = 2 * 60_000;
+/// Destinations followed for feedback, and suspects kept per destination.
+const FEEDBACK_MAX: usize = 1024;
+const SUSPECTS_PER_DST: usize = 4;
 /// An internet hop's cost before it is measured (100 ms).
 pub const DEFAULT_INTERNET_COST: u32 = 1_000;
 /// Routes much costlier than the best one aren't worth a QUIC path.
@@ -136,6 +165,9 @@ const PENDING_TIMEOUT: Time = 8_000;
 /// How long a looked-up record (or the absence of one) is trusted.
 const REACH_TTL: Time = 60_000;
 const NO_RECORD_TTL: Time = 20_000;
+/// After that, for this long, a record is looked up again on use while a
+/// hop to one of its gateways that is up keeps carrying the traffic.
+const REACH_STALE: Time = 60_000;
 /// An internet hop nobody used for this long is hung up.
 pub const INTERNET_IDLE: Time = 60_000;
 /// A dial that hasn't come back after this long has failed.
@@ -145,7 +177,7 @@ const DIAL_GIVE_UP: Time = 15_000;
 const DIAL_BACKOFF_MIN: Time = 2_000;
 const DIAL_BACKOFF_MAX: Time = 60_000;
 /// A device without the internet republishes its record this often (and
-/// when its gateways change, at most every [`REACH_MIN_GAP`]).
+/// when its gateways change, at most every `REACH_MIN_GAP`).
 pub const REACH_REFRESH: Time = 10 * 60_000;
 /// Records are valid this long (the origin refreshes well before).
 pub const REACH_LIFETIME: Time = 30 * 60_000;
@@ -309,6 +341,25 @@ pub struct Announce {
     pub sig: Sig,
 }
 
+/// Insert into a map kept at most [`FEEDBACK_MAX`] long (an arbitrary entry
+/// makes way: these are hints, rebuilt by the next packets).
+fn bounded_insert<V>(m: &mut Map<SignPk, V>, k: SignPk, v: V) {
+    if m.len() >= FEEDBACK_MAX
+        && !m.contains_key(&k)
+        && let Some(old) = m.keys().next().copied()
+    {
+        m.remove(&old);
+    }
+    m.insert(k, v);
+}
+
+/// A relayed announcement (not a retraction) whose hops and cost no honest
+/// relay can produce: each hop adds one hop and at least [`MIN_HOP_COST`],
+/// and only the origin itself sends zero hops.
+fn implausible(from: &SignPk, a: &Announce) -> bool {
+    a.cost != INFINITY && *from != a.origin && (a.hops == 0 || a.cost < MIN_HOP_COST.saturating_mul(a.hops as u32))
+}
+
 /// What the signature cache keeps of a checked announcement: a digest of
 /// every signed field and of the signature itself, so a change to any of
 /// them is checked again; the hops and cost filled in on the way are left
@@ -403,6 +454,14 @@ pub struct Stats {
     pub announcements_stale: u64,
     /// Over a neighbour's announcement rate, or an origin's flood rate.
     pub announcements_limited: u64,
+    /// With a cost no honest relay can send (a route through it is a lie),
+    /// or from a neighbour distrusted for one.
+    pub announcements_implausible: u64,
+    /// Neighbours caught lying about routes (not routed through for a while).
+    pub neighbours_distrusted: u64,
+    /// Next hops suspected for a destination after our packets to it went
+    /// unacknowledged through them ([`Router::feedback`]).
+    pub hops_suspected: u64,
     /// Rebroadcasts skipped as redundant (flood reduction).
     pub announcements_suppressed: u64,
     /// Routes withdrawn at once on a loss, and fresh-seqno requests sent.
@@ -549,6 +608,7 @@ struct Reach {
     /// (gateway, its mesh cost to the target). Empty: no record, reach the
     /// target itself over the internet.
     gateways: Vec<(SignPk, u32)>,
+    /// Trusted until then; kept [`REACH_STALE`] longer (see `next_hop`).
     until: Time,
 }
 
@@ -610,6 +670,17 @@ pub struct Router {
     last_reach: Option<Time>,
     /// Gateway side: when we last accepted each origin's record.
     records: Map<SignPk, Time>,
+    /// Neighbours caught lying about routes, until when we ignore the
+    /// routes they relay.
+    distrusted: Map<SignPk, Time>,
+    /// The next hop our own packets to each destination last took, for
+    /// [`Router::feedback`] ...
+    sent_via: Map<SignPk, SignPk>,
+    /// ... timeouts in a row with nothing acknowledged through it, since
+    /// when ...
+    strikes: Map<SignPk, (SignPk, u8, Time)>,
+    /// ... and the next hops suspected for a destination, until when.
+    suspects: Map<SignPk, Vec<(SignPk, Time)>>,
     own: Option<Announce>,
     seq: u64,
     originated: u64,
@@ -677,6 +748,10 @@ impl Router {
             reach_due: 0,
             last_reach: None,
             records: Map::default(),
+            distrusted: Map::default(),
+            sent_via: Map::default(),
+            strikes: Map::default(),
+            suspects: Map::default(),
             own: None,
             seq: 0,
             originated: 0,
@@ -933,9 +1008,16 @@ impl Router {
     /// Routes through `peer` are gone: retract (triggered update) whatever
     /// that leaves us without, and ask for fresh seqnos.
     fn lost_neighbour(&mut self, peer: SignPk, now: Time) {
+        self.drop_routes_via(peer, false, now);
+    }
+
+    /// Forget the routes through `peer` (`but_its_own`: except the route to
+    /// `peer` itself), then retract and ask for fresh seqnos as needed.
+    fn drop_routes_via(&mut self, peer: SignPk, but_its_own: bool, now: Time) {
         let affected: Vec<SignPk> = self
             .origins
             .iter_mut()
+            .filter(|(k, _)| !(but_its_own && **k == peer))
             .filter_map(|(k, o)| {
                 let before = o.via.len();
                 o.via.retain(|(n, _)| *n != peer);
@@ -1038,6 +1120,19 @@ impl Router {
         verify: impl FnOnce(&Announce) -> bool,
     ) {
         let jitter = 10 + self.rand() % 40;
+        if a.origin != from && self.distrusted.get(&from).is_some_and(|t| now < *t) {
+            self.stats.announcements_implausible += 1;
+            // its route counts for nothing, but it has this seqno: don't
+            // send it back (a cost no route can match: never "redundant")
+            if let Some(o) = self.origins.get_mut(&a.origin)
+                && a.seq == o.newest
+                && a.cost != INFINITY
+                && !o.heard.iter().any(|(k, _)| *k == from)
+            {
+                o.heard.push((from, INFINITY));
+            }
+            return;
+        }
         let Some(n) = self.nbs.get_mut(&from) else { return };
         if !n.direct {
             return; // internet hops carry no routing: meshes don't merge
@@ -1058,6 +1153,10 @@ impl Router {
         let far_window = self.cfg.announce_every * 3 * self.cfg.far_every.max(1);
         if self.origins.get(&a.origin).is_some_and(|o| a.seq + far_window < o.newest) {
             self.stats.announcements_stale += 1;
+            return;
+        }
+        if implausible(&from, &a) {
+            self.distrust(from, now);
             return;
         }
         let verified = verified_id(&a);
@@ -1138,6 +1237,31 @@ impl Router {
         }
         // after: it may have become one
         self.touch(origin);
+    }
+
+    /// `peer` sent a route no honest relay could have: a black hole
+    /// pulling traffic toward itself (it costs nothing to claim "every
+    /// device is right next to me", and announcements' hops and cost aren't
+    /// signed). Its routes to others go at once, as if it had left
+    /// (retractions and seqno requests restore the others), and the routes
+    /// it relays are ignored for [`DISTRUST`]. It stays reachable itself:
+    /// its own announcements are signed by it and come over its own
+    /// authenticated hop connection, which is also why only a direct
+    /// neighbour can be blamed.
+    fn distrust(&mut self, peer: SignPk, now: Time) {
+        self.stats.announcements_implausible += 1;
+        if self.distrusted.len() >= DISTRUST_MAX {
+            self.distrusted.retain(|_, t| now < *t);
+            if self.distrusted.len() >= DISTRUST_MAX
+                && let Some(k) = self.distrusted.iter().min_by_key(|(k, t)| (**t, k.0)).map(|(k, _)| *k)
+            {
+                self.distrusted.remove(&k);
+            }
+        }
+        self.distrusted.insert(peer, now + DISTRUST);
+        self.stats.neighbours_distrusted += 1;
+        self.next_sweep = self.next_sweep.min(now + DISTRUST);
+        self.drop_routes_via(peer, true, now);
     }
 
     /// `from` no longer routes to `origin` (as of `seq`).
@@ -1321,6 +1445,141 @@ impl Router {
         self.best_route_except(origin, None, now)
     }
 
+    /// `hop` is a direct neighbour that announced a route to `dst` (not `dst`
+    /// itself).
+    fn is_route_via(&self, dst: &SignPk, hop: &SignPk) -> bool {
+        hop != dst && self.origins.get(dst).is_some_and(|o| o.via.iter().any(|(k, _)| k == hop))
+    }
+
+    /// The cheapest route to `dst` not through `except` nor a hop suspected
+    /// for it. Any feasible route is loop-free (Babel), not only the best,
+    /// so taking the next one when the best is suspected keeps that.
+    fn best_unsuspected_route(&self, dst: &SignPk, except: Option<&SignPk>, now: Time) -> Option<(SignPk, Via)> {
+        let Some(sus) = self.suspects.get(dst) else { return self.best_route_except(dst, except, now) };
+        let o = self.origins.get(dst)?;
+        o.via
+            .iter()
+            .filter(|(n, via)| {
+                Some(n) != except
+                    && !sus.iter().any(|(k, until)| k == n && now < *until)
+                    && o.feasible(via)
+                    && self.fresh(o, via, now)
+                    && self.nbs.get(n).is_some_and(|n| n.up && n.direct)
+            })
+            .min_by_key(|(n, via)| (via.cost, n.0))
+            .copied()
+    }
+
+    /// End-to-end feedback from the transport about our own packets to
+    /// `dst`: a whole retransmission timeout went by with nothing
+    /// acknowledged (`acked = false`), or an acknowledgement came back
+    /// (`true`). The driver sees the acknowledgements (relays can't: they're
+    /// inside the end-to-end encryption), and its timeout follows the
+    /// measured round trip, so a slow path isn't mistaken for a dead one.
+    ///
+    /// After [`SUSPECT_STRIKES`] timeouts in a row through the same next
+    /// hop, over at least [`SUSPECT_SILENCE`] plus twice the route's cost,
+    /// that hop is suspected for `dst` for [`SUSPECT_FOR`]: our packets (and
+    /// those we relay to `dst`) take the next feasible route; with none
+    /// left, still the best (dropping can't deliver, and suspicion can be
+    /// wrong), while the store-and-forward carrier spreads the bundle
+    /// (`Carrier::doubt`). Custody hand-offs aren't steered by it: in a
+    /// network of brief contacts that cost more than it saved
+    /// (docs/SIMULATION.md §4, fixed 21). A black hole that lies plausibly
+    /// pulls in routes nothing in an announcement can refute; what it can't
+    /// fake is the destination's acknowledgements. A lost packet on a slow
+    /// link doesn't count: one acknowledgement clears the strikes.
+    ///
+    /// Returns whether the timeout counted against a mesh route (then the
+    /// store-and-forward carrier shouldn't trust that route with every copy
+    /// of a bundle either: `Carrier::doubt`).
+    pub fn feedback(&mut self, dst: SignPk, acked: bool, now: Time) -> bool {
+        if acked {
+            self.strikes.remove(&dst);
+            return false;
+        }
+        let Some(hop) = self.sent_via.get(&dst).copied() else { return false };
+        self.strike(dst, hop, now, now)
+    }
+
+    /// The same evidence from the node's QUIC connections, one path at a
+    /// time: our path to `dst` through first hop `via` (the mesh address
+    /// `mesh(dst, via)`) has had no authenticated packet back since
+    /// `silent_since` while we kept sending on it (`Some`), or carries them
+    /// (`None`). Only packets QUIC decrypted count, so a relay can't fake
+    /// either: it can only drop. A path that says so (two silences, as for
+    /// [`Router::feedback`]) is suspected for `dst`, and the routes offered
+    /// for it ([`Out::RouteUp`]) move to the next route. Returns whether it
+    /// counted against a mesh route.
+    pub fn path_feedback(&mut self, dst: SignPk, via: SignPk, silent_since: Option<Time>, now: Time) -> bool {
+        match silent_since {
+            None => {
+                if self.strikes.get(&dst).is_some_and(|(h, _, _)| *h == via) {
+                    self.strikes.remove(&dst);
+                }
+                false
+            }
+            Some(since) => self.strike(dst, via, since, now),
+        }
+    }
+
+    /// A timeout through `hop` toward `dst`, silent since `since`.
+    fn strike(&mut self, dst: SignPk, hop: SignPk, since: Time, now: Time) -> bool {
+        // only a mesh route that still claims to reach it is judged: a link
+        // that broke, or a destination behind a gateway or the internet
+        // (perhaps offline), says nothing about the hop
+        if !self.is_route_via(&dst, &hop) || !self.nbs.get(&hop).is_some_and(|n| n.up && n.direct) {
+            self.strikes.remove(&dst);
+            return false;
+        }
+        let (n, since) = match self.strikes.get(&dst) {
+            Some((h, n, first)) if *h == hop => (n.saturating_add(1), since.min(*first)),
+            _ => (1, since),
+        };
+        let cost =
+            self.origins.get(&dst).and_then(|o| o.via.iter().find(|(k, _)| *k == hop)).map_or(0, |(_, v)| v.cost);
+        let silence = SUSPECT_SILENCE + 2 * cost as Time / 10;
+        if n < SUSPECT_STRIKES || now.saturating_sub(since) < silence {
+            bounded_insert(&mut self.strikes, dst, (hop, n, since));
+            return true;
+        }
+        self.strikes.remove(&dst);
+        if !self.suspects.contains_key(&dst) && self.suspects.len() >= FEEDBACK_MAX {
+            self.suspects.retain(|_, v| v.iter().any(|(_, t)| now < *t));
+            if self.suspects.len() >= FEEDBACK_MAX
+                && let Some(k) = self.suspects.keys().next().copied()
+            {
+                self.suspects.remove(&k);
+            }
+        }
+        let v = self.suspects.entry(dst).or_default();
+        v.retain(|(k, t)| *k != hop && now < *t);
+        if v.len() >= SUSPECTS_PER_DST {
+            v.remove(0);
+        }
+        v.push((hop, now + SUSPECT_FOR));
+        self.stats.hops_suspected += 1;
+        self.next_sweep = self.next_sweep.min(now + SUSPECT_FOR);
+        self.touch(dst); // the routes offered for it change
+        // The other routes may be infeasible: we advertised the cheap one
+        // (Babel's feasibility distance). A fresh seqno from the origin
+        // makes them usable, as after a loss.
+        if self.best_unsuspected_route(&dst, None, now).is_none() {
+            let targets: Vec<SignPk> = self.direct_up().filter(|k| *k != hop && *k != dst).collect();
+            if let Some(o) = self.origins.get_mut(&dst)
+                && o.last_req.is_none_or(|t| now.saturating_sub(t) >= SEQREQ_GAP)
+            {
+                o.last_req = Some(now);
+                let req = SeqReq { origin: dst, seq: o.newest + 1, hops: SEQREQ_HOPS };
+                for t in targets {
+                    self.stats.seqreqs_sent += 1;
+                    self.out.push(Out::SeqReq { to: t, req });
+                }
+            }
+        }
+        true
+    }
+
     /// The neighbour toward `dst` inside the mesh (no gateways, no internet).
     pub fn next_hop_local(&self, dst: &SignPk, now: Time) -> Option<SignPk> {
         if self.nbs.get(dst).is_some_and(|n| n.up) {
@@ -1433,6 +1692,11 @@ impl Router {
         self.origins.get(pk).is_some_and(|o| o.latest.flags & F_GATEWAY != 0)
     }
 
+    /// The first hops of the routes to `dst` offered as QUIC paths now.
+    pub fn offered(&self, dst: &SignPk) -> Vec<SignPk> {
+        self.published.get(dst).cloned().unwrap_or_default()
+    }
+
     /// Hops to `dst` leaving through `via` (a local route), or `None`.
     pub fn route_hops(&self, dst: &SignPk, via: &SignPk) -> Option<u8> {
         self.origins.get(dst)?.via.iter().find(|(k, _)| k == via).map(|(_, v)| v.hops)
@@ -1448,6 +1712,13 @@ impl Router {
         }
         let current = self.published.get(origin);
         let mut routes = self.routes(origin, now);
+        // not through a hop suspected for it, while another route remains
+        if let Some(sus) = self.suspects.get(origin) {
+            let ok = |n: &SignPk| !sus.iter().any(|(k, until)| k == n && now < *until);
+            if routes.iter().any(|(n, _)| ok(n)) {
+                routes.retain(|(n, _)| ok(n));
+            }
+        }
         let best = routes.first().map(|(_, v)| v.cost)?;
         let limit = best.saturating_mul(ROUTE_COST_FACTOR).saturating_add(ROUTE_COST_SLACK);
         routes.retain(|(_, v)| v.cost <= limit);
@@ -1569,20 +1840,31 @@ impl Router {
             }
         }
         let target = if f.reached { f.dst } else { f.waypoint };
-        match self.next_hop(&target, from.as_ref(), now) {
-            Next::Via(next) => self.forward(f, from, next, now),
+        match self.next_hop(&target, from.as_ref(), true, now) {
+            Next::Via(next) => {
+                // ours, along a mesh route: what `feedback` judges
+                if from.is_none() && !f.control && self.is_route_via(&target, &next) {
+                    bounded_insert(&mut self.sent_via, target, next);
+                }
+                self.forward(f, from, next, now)
+            }
             Next::Wait(key) => self.park(key, f, from, now),
             Next::Drop | Next::Unreachable => self.stats.dropped_no_route += 1,
         }
     }
 
-    fn next_hop(&mut self, target: &SignPk, from: Option<&SignPk>, now: Time) -> Next {
+    /// `avoid`: steer clear of next hops suspected for `target` (packets,
+    /// not custody: [`Router::feedback`]).
+    fn next_hop(&mut self, target: &SignPk, from: Option<&SignPk>, avoid: bool, now: Time) -> Next {
         // 1. a neighbour (direct, or an internet hop already up)
         if Some(target) != from && self.nbs.get(target).is_some_and(|n| n.up) {
             return Next::Via(*target);
         }
-        // 2. a mesh route
-        if let Some((n, _)) = self.best_route_except(target, from, now) {
+        // 2. a mesh route, not through a hop suspected for the target if
+        // there is another (if every one is, the best: dropping can't
+        // deliver, and suspicion can be wrong)
+        let unsuspected = if avoid { self.best_unsuspected_route(target, from, now) } else { None };
+        if let Some((n, _)) = unsuspected.or_else(|| self.best_route_except(target, from, now)) {
             return Next::Via(n);
         }
         let from_internet = from.is_some_and(|f| self.is_internet_hop(f));
@@ -1600,33 +1882,30 @@ impl Router {
                     if r.gateways.is_empty() {
                         return self.dial_or_wait(*target, now);
                     }
-                    // the gateway with the lowest record cost + internet hop cost
-                    let best = r
-                        .gateways
-                        .iter()
-                        .filter(|(g, _)| *g != self.me && Some(g) != from)
-                        .map(|(g, c)| {
-                            let hop = match self.nbs.get(g) {
-                                Some(n) if n.up => n.hop_cost(),
-                                _ => DEFAULT_INTERNET_COST,
-                            };
-                            (c.saturating_add(hop), *g)
-                        })
-                        .min();
-                    match best {
+                    match self.record_gateway(&r.gateways, from, false) {
                         // its gateway backing off: hold on, it has a way in
-                        Some((_, g)) => match self.dial_or_wait(g, now) {
+                        Some(g) => match self.dial_or_wait(g, now) {
                             Next::Unreachable => Next::Drop,
                             n => n,
                         },
                         None => Next::Drop,
                     }
                 }
-                _ => {
-                    if self.resolving.insert(*target) {
-                        self.stats.resolves += 1;
-                        self.out.push(Out::Resolve(*target));
+                Some(r) if r.until.saturating_add(REACH_STALE) > now => {
+                    // Out of date: look it up again, and meanwhile keep
+                    // using a hop to one of its gateways that is up (it was
+                    // working a moment ago; a stale record never starts a
+                    // dial). Traffic through a gateway doesn't stall for a
+                    // lookup every REACH_TTL.
+                    let up = self.record_gateway(&r.gateways, from, true);
+                    self.resolve(*target);
+                    match up {
+                        Some(g) => Next::Via(g),
+                        None => Next::Wait(*target),
                     }
+                }
+                _ => {
+                    self.resolve(*target);
                     Next::Wait(*target)
                 }
             }
@@ -1645,6 +1924,45 @@ impl Router {
         }
     }
 
+    /// Look `target`'s record up, unless a lookup is under way.
+    fn resolve(&mut self, target: SignPk) {
+        if self.resolving.insert(target) {
+            self.stats.resolves += 1;
+            self.out.push(Out::Resolve(target));
+        }
+    }
+
+    /// Which of a record's gateways to go through: the lowest record cost
+    /// (its mesh cost to the target) + internet hop cost (`only_up`: among
+    /// those we have a hop up to).
+    ///
+    /// The gateways of one record sit in one mesh around the target, so the
+    /// internet between us and each of them is about the same. A hop not
+    /// measured yet (or not up) is costed as the cheapest measured hop to
+    /// one of them, and only without any as [`DEFAULT_INTERNET_COST`]: a
+    /// measured cost includes the round trip *and* the time to move 64 KiB,
+    /// so a flat guess would make every gateway we haven't tried look
+    /// cheaper than the one carrying our traffic, and each one in turn
+    /// would be dialled while that traffic waits. On equal cost, a hop that
+    /// is up wins: no dial.
+    fn record_gateway(&self, gateways: &[(SignPk, u32)], from: Option<&SignPk>, only_up: bool) -> Option<SignPk> {
+        let measured = |g: &SignPk| self.nbs.get(g).filter(|n| n.up && n.cost > 0).map(Nb::hop_cost);
+        let known = gateways.iter().filter(|(g, _)| self.is_internet_hop(g)).filter_map(|(g, _)| measured(g)).min();
+        gateways
+            .iter()
+            .filter(|(g, _)| *g != self.me && Some(g) != from)
+            .filter_map(|(g, c)| {
+                let up = self.nbs.get(g).is_some_and(|n| n.up);
+                if only_up && !up {
+                    return None;
+                }
+                let hop = measured(g).or(known).unwrap_or(DEFAULT_INTERNET_COST);
+                Some((c.saturating_add(hop), !up, *g))
+            })
+            .min()
+            .map(|(_, _, g)| g)
+    }
+
     /// Where data for `dst` can be handed on *now*, hop by hop (custody
     /// transfer of store-and-forward bundles): the same choice as for
     /// packets, may start a lookup or a dial.
@@ -1652,7 +1970,7 @@ impl Router {
         if *dst == self.me {
             return Toward::Nowhere;
         }
-        match self.next_hop(dst, None, now) {
+        match self.next_hop(dst, None, false, now) {
             Next::Via(n) => Toward::Hop(n),
             Next::Wait(_) => Toward::Soon,
             Next::Drop => Toward::Nowhere,
@@ -1787,7 +2105,7 @@ impl Router {
         gws.truncate(8);
         let ttl = if found { REACH_TTL } else { NO_RECORD_TTL };
         self.reach.insert(target, Reach { gateways: gws, until: now + ttl });
-        self.next_sweep = self.next_sweep.min(now + ttl);
+        self.next_sweep = self.next_sweep.min(now + ttl + REACH_STALE);
         self.release(target, now);
     }
 
@@ -1885,7 +2203,7 @@ impl Router {
             keep
         });
         self.stats.dropped_pending += expired;
-        self.reach.retain(|_, r| r.until > now);
+        self.reach.retain(|_, r| r.until + REACH_STALE > now);
         let gave_up: Vec<SignPk> =
             self.dialing.iter().filter(|(_, t)| now.saturating_sub(**t) >= DIAL_GIVE_UP).map(|(k, _)| *k).collect();
         for pk in gave_up {
@@ -1898,14 +2216,29 @@ impl Router {
             }
         }
         self.records.retain(|_, t| now.saturating_sub(*t) < REACH_REFRESH * 2);
+        self.distrusted.retain(|_, t| now < *t);
+        let mut lapsed = Vec::new();
+        self.suspects.retain(|k, v| {
+            let before = v.len();
+            v.retain(|(_, t)| now < *t);
+            if v.len() != before {
+                lapsed.push(*k);
+            }
+            !v.is_empty()
+        });
+        for k in lapsed {
+            self.touch(k); // its routes may be offered again
+        }
         // a long-quiet peer starts again from the minimum backoff
         self.backoff.retain(|_, (at, _)| now < *at + DIAL_BACKOFF_MAX);
         let mut next = Time::MAX;
         next = self.reasm.values().map(|r| r.at + REASM_TIMEOUT).fold(next, Time::min);
         next = self.pending.values().map(|p| p.since + PENDING_TIMEOUT).fold(next, Time::min);
-        next = self.reach.values().map(|r| r.until).fold(next, Time::min);
+        next = self.reach.values().map(|r| r.until + REACH_STALE).fold(next, Time::min);
         next = self.dialing.values().map(|t| t + DIAL_GIVE_UP).fold(next, Time::min);
         next = self.records.values().map(|t| t + REACH_REFRESH * 2).fold(next, Time::min);
+        next = self.distrusted.values().copied().fold(next, Time::min);
+        next = self.suspects.values().flatten().map(|(_, t)| *t).fold(next, Time::min);
         next = self.backoff.values().map(|(at, _)| at + DIAL_BACKOFF_MAX).fold(next, Time::min);
         next = self.nbs.values().filter(|n| n.internet()).map(|n| n.last_used + INTERNET_IDLE).fold(next, Time::min);
         self.next_sweep = next;

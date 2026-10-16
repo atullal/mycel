@@ -62,6 +62,8 @@ That connection must close with INTERNAL_ERROR, and a new connection on the
 same endpoint must still work. Upstream 1.3.0 aborts the test process with
 "thread caused non-unwinding panic. aborting."
 
+**Drop §1 and §2** once upstream releases fixes for both.
+
 ## 3. noq-proto: a path that dies stalls the connection for its idle timeout and more
 
 `src/connection/mod.rs` and `src/connection/paths.rs`, every line marked
@@ -157,10 +159,3 @@ transfer after losing a relay in ~6.5 s, where it took 6–25 s before.
 **Drop §3** once upstream sends ACK-only packets on a working path,
 retransmits a dead path's in-flight data promptly, and ignores stale ACK RTT
 samples in multipath.
-
-## Upstream report (draft, not filed)
-
-The text is in `vendor/noq-proto/UPSTREAM_ISSUE.md`.
-
-**Drop §1 and §2** once upstream releases fixes for both (the draft report
-above covers those two; §3 would be a report of its own).

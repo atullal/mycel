@@ -173,7 +173,7 @@ pub fn encode_announces(anns: &[Announce], max: usize) -> Vec<Bytes> {
     out
 }
 
-/// The announcements in a [`T_OGMS`] datagram (none if any is malformed).
+/// The announcements in a `T_OGMS` datagram (none if any is malformed).
 pub fn decode_announces(b: &[u8]) -> Vec<Announce> {
     let mut out = Vec::new();
     let Some((&T_OGMS, mut rest)) = b.split_first() else { return out };
@@ -273,7 +273,7 @@ mod tests {
     fn announcements_round_trip_and_verify() {
         let k = DeviceKeys::generate();
         let o = Origination { seq: 1_700_000_000_000, flags: 1, scope: 2, uplink: 345 };
-        let mut a = sign_announce(&k, o, "Atul’s MacBook Pro with a long name");
+        let mut a = sign_announce(&k, o, "Alice’s MacBook Pro with a long name");
         assert!(a.name.len() <= MAX_NAME);
         a.hops = 3;
         a.cost = 1234;

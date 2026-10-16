@@ -77,6 +77,8 @@ const TICK: Duration = Duration::from_millis(100);
 /// Someone who just left isn't dialed again because a stale roster still
 /// lists them (they dial us themselves if they rejoin).
 const LEFT_GRACE: Duration = Duration::from_secs(10);
+/// How long after our call lost a glare their ring is answered at once.
+const EXPECTING: Duration = Duration::from_secs(15);
 /// A peer we couldn't reach is tried again after this long.
 const RETRY: Duration = Duration::from_secs(3);
 /// Level above which someone counts as speaking.
@@ -300,6 +302,11 @@ struct Mgr {
     /// Video in calls (the default track sink).
     video: Arc<VideoHub>,
     calls: Mutex<HashMap<CallId, Arc<Call>>>,
+    /// Held while deciding what a ring or a press of "call" does and
+    /// creating the call that comes of it, so each sees the other's call:
+    /// a ring and a press in the same conversation (glare) can't both miss
+    /// each other, whatever the timing.
+    placing: Mutex<()>,
     /// Our call in (initiator, space) lost a glare: answer theirs at once.
     expecting: Mutex<HashMap<(SignPk, Hash32), Instant>>,
     ring_timeout: Mutex<Duration>,
@@ -334,6 +341,7 @@ impl CallManager {
                 sink: RwLock::new(Some(video.clone() as Arc<dyn TrackSink>)),
                 video,
                 calls: Mutex::default(),
+                placing: Mutex::default(),
                 expecting: Mutex::default(),
                 ring_timeout: Mutex::new(RING_TIMEOUT),
                 force_stream: AtomicBool::new(false),
@@ -468,38 +476,27 @@ impl CallManager {
     pub async fn start(&self, space: Hash32) -> Result<CallInfo> {
         let mgr = &self.inner;
         let members = mgr.host.members(&space)?;
-        // a call here is already ringing us, or going on without us: join it
-        let waiting = live_calls(mgr).into_iter().find(|c| {
-            c.cref.space == space
-                && matches!(c.core.lock().phase, CallPhase::Ringing | CallPhase::Joinable)
-                && c.dir == Direction::Incoming
-        });
-        if let Some(c) = waiting {
-            return self.accept(&hex(&c.id().0)).await;
-        }
-        if live_calls(mgr).iter().any(|c| engaged(c)) {
-            bail!("You're already in a call.");
+        if let Some(id) = waiting_call(mgr, &space)? {
+            return self.accept(&id).await;
         }
         if members.len() > MAX_RING {
             bail!("This group is too big for calls (at most {} people can be rung).", MAX_RING + 1);
         }
+        // This may wait for the user (microphone permission), or a loaded
+        // machine for a while: a ring may come in meanwhile (they're
+        // calling us too), so look again before placing ours.
         prepare_audio(mgr).await?;
-        let me = mgr.me();
-        let cref = CallRef::new(space, me, mycel_crypto::random());
-        let group = members.len() > 1;
-        let peer = if group { me } else { members[0] };
-        let call = new_call(mgr, cref, group, Direction::Outgoing, peer, CallPhase::Connecting);
-        {
-            let mut core = call.core.lock();
-            let timeout = *mgr.ring_timeout.lock();
-            // a group call ends once every ring is over (each member's own
-            // ring timeout answers `Decline{missed}`); this is a backstop
-            core.deadline = Some(Instant::now() + if group { timeout + CALLEE_RING_SLACK * 2 } else { timeout });
-            for m in members {
-                let leg = dial(mgr, &call, m, Why::Ring, Ctrl::Ring { version: VERSION, call: cref, group });
-                core.legs.insert(m, leg);
+        let placed = {
+            let _placing = mgr.placing.lock();
+            match waiting_call(mgr, &space)? {
+                Some(id) => Err(id),
+                None => Ok(place_call(mgr, space, members)),
             }
-        }
+        };
+        let call = match placed {
+            Ok(call) => call,
+            Err(id) => return self.accept(&id).await,
+        };
         let first = info(mgr, &call);
         mgr.host.emit(CallEvent::Updated(first.clone()));
         Ok(first)
@@ -576,6 +573,46 @@ fn engaged(c: &Call) -> bool {
         CallPhase::Ringing => c.dir == Direction::Outgoing,
         CallPhase::Joinable | CallPhase::Ended => false,
     }
+}
+
+/// Before placing a call in `space`: a call there already ringing us, or
+/// going on without us, to answer or join instead (its id). An error if
+/// we're in another call.
+fn waiting_call(mgr: &Mgr, space: &Hash32) -> Result<Option<String>> {
+    let live = live_calls(mgr);
+    let waiting = live.iter().find(|c| {
+        c.cref.space == *space
+            && c.dir == Direction::Incoming
+            && matches!(c.core.lock().phase, CallPhase::Ringing | CallPhase::Joinable)
+    });
+    if let Some(c) = waiting {
+        return Ok(Some(hex(&c.id().0)));
+    }
+    if live.iter().any(|c| engaged(c)) {
+        bail!("You're already in a call.");
+    }
+    Ok(None)
+}
+
+/// Our new call in `space`, ringing `members` (hold `Mgr::placing`).
+fn place_call(mgr: &Arc<Mgr>, space: Hash32, members: Vec<SignPk>) -> Arc<Call> {
+    let me = mgr.me();
+    let cref = CallRef::new(space, me, mycel_crypto::random());
+    let group = members.len() > 1;
+    let peer = if group { me } else { members[0] };
+    let call = new_call(mgr, cref, group, Direction::Outgoing, peer, CallPhase::Connecting);
+    {
+        let mut core = call.core.lock();
+        let timeout = *mgr.ring_timeout.lock();
+        // a group call ends once every ring is over (each member's own
+        // ring timeout answers `Decline{missed}`); this is a backstop
+        core.deadline = Some(Instant::now() + if group { timeout + CALLEE_RING_SLACK * 2 } else { timeout });
+        for m in members {
+            let leg = dial(mgr, &call, m, Why::Ring, Ctrl::Ring { version: VERSION, call: cref, group });
+            core.legs.insert(m, leg);
+        }
+    }
+    call
 }
 
 async fn prepare_audio(mgr: &Mgr) -> Result<()> {
@@ -752,49 +789,46 @@ async fn handle_incoming(mgr: &Arc<Mgr>, conn: Connection) -> Result<()> {
         drop(guard);
         return Ok(());
     };
-    let live: Vec<LiveCall> =
-        live_calls(mgr).iter().map(|c| LiveCall { call: c.cref, dir: c.dir, phase: c.core.lock().phase }).collect();
-    let expecting = {
-        let mut e = mgr.expecting.lock();
-        e.retain(|_, t| t.elapsed() < Duration::from_secs(15));
-        e.remove(&(peer, cref.space)).is_some()
-    };
-    let auto = match on_ring(&mgr.me(), &peer, &cref, &live, expecting) {
-        RingDecision::Busy => {
-            refuse(&conn, tx, Ctrl::Busy).await;
-            return Ok(());
-        }
-        RingDecision::Glare => {
-            refuse(&conn, tx, Ctrl::Glare).await;
-            return Ok(());
-        }
-        RingDecision::Existing(call) => {
-            refuse(&conn, tx, Ctrl::Existing { call }).await;
-            return Ok(());
-        }
-        RingDecision::Duplicate => {
-            refuse(&conn, tx, Ctrl::Denied).await;
-            bail!("duplicate call");
-        }
-        RingDecision::AutoAccept { replaces } => {
-            if let Some(old) = replaces.and_then(|r| mgr.calls.lock().get(&r).cloned()) {
-                old.send(Ev::Cmd(Cmd::Replaced));
+    // decided, and the call set up, with no call placed here in between
+    // (see `Mgr::placing`)
+    let rung = {
+        let _placing = mgr.placing.lock();
+        let live: Vec<LiveCall> =
+            live_calls(mgr).iter().map(|c| LiveCall { call: c.cref, dir: c.dir, phase: c.core.lock().phase }).collect();
+        let expecting = {
+            let mut e = mgr.expecting.lock();
+            e.retain(|_, t| t.elapsed() < EXPECTING);
+            e.remove(&(peer, cref.space)).is_some()
+        };
+        let auto = match on_ring(&mgr.me(), &peer, &cref, &live, expecting) {
+            RingDecision::Busy => Err(Ctrl::Busy),
+            RingDecision::Glare => Err(Ctrl::Glare),
+            RingDecision::Existing(call) => Err(Ctrl::Existing { call }),
+            RingDecision::Duplicate => Err(Ctrl::Denied),
+            RingDecision::AutoAccept { replaces } => {
+                if let Some(old) = replaces.and_then(|r| mgr.calls.lock().get(&r).cloned()) {
+                    old.send(Ev::Cmd(Cmd::Replaced));
+                }
+                Ok(true)
             }
-            true
+            RingDecision::Ring => Ok(false),
+        };
+        match auto {
+            Ok(auto) => Ok((ring_here(mgr, cref, group, peer, &conn, tx, rx), auto)),
+            Err(msg) => Err((msg, tx)),
         }
-        RingDecision::Ring => false,
     };
-    let call = new_call(mgr, cref, group, Direction::Incoming, peer, CallPhase::Ringing);
-    let serial = mgr.next_serial();
-    let out = attach_incoming(&call.tx, peer, serial, &conn, tx, rx);
-    let _ = out.send(Ctrl::Ringing);
-    {
-        let mut core = call.core.lock();
-        core.deadline = Some(Instant::now() + *mgr.ring_timeout.lock() + CALLEE_RING_SLACK);
-        let mut leg = Leg::new(serial, LegState::Anchor, Some(conn.clone()), out);
-        leg.path = selected_path(&conn).0;
-        core.legs.insert(peer, leg);
-    }
+    let (call, auto) = match rung {
+        Ok(rung) => rung,
+        Err((msg, tx)) => {
+            let duplicate = msg == Ctrl::Denied;
+            refuse(&conn, tx, msg).await;
+            if duplicate {
+                bail!("duplicate call");
+            }
+            return Ok(());
+        }
+    };
     mgr.host.note_connection(&peer, &conn);
     drop(guard);
     if auto {
@@ -807,6 +841,30 @@ async fn handle_incoming(mgr: &Arc<Mgr>, conn: Connection) -> Result<()> {
     Ok(())
 }
 
+/// A call ringing us (or answered at once), with its anchor leg in place
+/// before anyone can answer it (hold `Mgr::placing`).
+fn ring_here(
+    mgr: &Arc<Mgr>,
+    cref: CallRef,
+    group: bool,
+    peer: SignPk,
+    conn: &Connection,
+    tx: SendStream,
+    rx: RecvStream,
+) -> Arc<Call> {
+    let call = new_call(mgr, cref, group, Direction::Incoming, peer, CallPhase::Ringing);
+    let serial = mgr.next_serial();
+    let out = attach_incoming(&call.tx, peer, serial, conn, tx, rx);
+    let _ = out.send(Ctrl::Ringing);
+    let mut core = call.core.lock();
+    core.deadline = Some(Instant::now() + *mgr.ring_timeout.lock() + CALLEE_RING_SLACK);
+    let mut leg = Leg::new(serial, LegState::Anchor, Some(conn.clone()), out);
+    leg.path = selected_path(conn).0;
+    core.legs.insert(peer, leg);
+    drop(core);
+    call
+}
+
 // ─────────────────────────────── the call task ───────────────────────────────
 
 /// Things to do once the call's lock is released.
@@ -815,6 +873,8 @@ struct After {
     start_media: bool,
     /// Our ring was answered with "there's a call already": join it.
     join_existing: Option<(CallRef, SignPk)>,
+    /// Our call lost a glare to this peer's.
+    lost_glare: Option<SignPk>,
 }
 
 /// We're in the call (or, as its initiator, calling out): we count in
@@ -867,6 +927,9 @@ async fn run(mgr: Arc<Mgr>, call: Arc<Call>, mut rx: mpsc::UnboundedReceiver<Ev>
         }
         if let Some((cref, via)) = after.join_existing {
             join_existing(&mgr, cref, via);
+        }
+        if let Some(peer) = after.lost_glare {
+            lost_glare(&mgr, &call, peer);
         }
         if ended {
             finish(&mgr, &call).await;
@@ -1259,8 +1322,11 @@ fn on_msg(mgr: &Arc<Mgr>, call: &Arc<Call>, core: &mut Core, peer: SignPk, msg: 
             }
             _ if !core.ever_joined => {
                 // their call in this conversation wins: drop ours, take theirs
+                // (expected before ours ends, so their ring is answered
+                // whenever it comes)
                 mgr.expecting.lock().insert((peer, call.cref.space), Instant::now());
                 end(core, EndReason::Replaced);
+                after.lost_glare = Some(peer);
             }
             _ => leg_done(core, &peer, ParticipantState::Unavailable),
         },
@@ -1514,6 +1580,7 @@ async fn start_media(mgr: &Arc<Mgr>, call: &Arc<Call>) {
 
 /// Our ring found a call already going on in the conversation: join that one.
 fn join_existing(mgr: &Arc<Mgr>, cref: CallRef, via: SignPk) {
+    let _placing = mgr.placing.lock();
     if mgr.calls.lock().contains_key(&cref.call) {
         return;
     }
@@ -1523,6 +1590,20 @@ fn join_existing(mgr: &Arc<Mgr>, cref: CallRef, via: SignPk) {
     core.deadline = Some(Instant::now() + SETUP_TIMEOUT);
     let leg = dial(mgr, &call, via, Why::Join, Ctrl::Join { version: VERSION, call: cref });
     core.legs.insert(via, leg);
+}
+
+/// Our call lost a glare to `peer`'s. If their ring already came (and was
+/// answered at once, replacing ours), the expectation is used up: drop it,
+/// or a later call of theirs would be answered without ringing.
+fn lost_glare(mgr: &Arc<Mgr>, call: &Call, peer: SignPk) {
+    let _placing = mgr.placing.lock();
+    let space = call.cref.space;
+    let theirs = live_calls(mgr)
+        .iter()
+        .any(|c| c.cref.space == space && c.cref.initiator == peer && c.dir == Direction::Incoming);
+    if theirs {
+        mgr.expecting.lock().remove(&(peer, space));
+    }
 }
 
 /// The call is over: stop audio, tell the app, close the connections, and
