@@ -676,7 +676,7 @@ impl Driver {
     fn aqm_drops(&self, to: &SignPk, conn: &Connection) -> bool {
         let mut hops = self.hops.lock();
         let Some(h) = hops.get_mut(to) else { return false };
-        if !h.live().is_some_and(|c| c.stable_id() == conn.stable_id()) {
+        if h.live().is_none_or(|c| c.stable_id() != conn.stable_id()) {
             return false;
         }
         if !h.direct {
