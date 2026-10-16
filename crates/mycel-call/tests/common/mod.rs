@@ -29,7 +29,11 @@ impl CallHost for Host {
     fn members(&self, space: &Hash32) -> anyhow::Result<Vec<SignPk>> {
         let me = self.node.id();
         let others: Vec<SignPk> = self.node.with_space(space, |r| {
-            r.members().into_iter().filter(|(k, role)| k.sign_pk != me && *role != Role::Relay).map(|(k, _)| k.sign_pk).collect()
+            r.members()
+                .into_iter()
+                .filter(|(k, role)| k.sign_pk != me && *role != Role::Relay)
+                .map(|(k, _)| k.sign_pk)
+                .collect()
         })?;
         if others.is_empty() {
             anyhow::bail!("nobody else here");
@@ -112,7 +116,13 @@ pub async fn device(name: &str, source: TestSource, ip: bool, nets: &[&MemNet]) 
 }
 
 #[allow(dead_code)] // not every test binary uses the mesh
-pub async fn device_with(name: &str, source: TestSource, ip: bool, nets: &[&MemNet], mesh: Option<MeshOptions>) -> Device {
+pub async fn device_with(
+    name: &str,
+    source: TestSource,
+    ip: bool,
+    nets: &[&MemNet],
+    mesh: Option<MeshOptions>,
+) -> Device {
     let keys = Arc::new(DeviceKeys::generate());
     let mut opts = NodeOptions::new(NetMode::Local, name);
     opts.ip = ip;
@@ -154,4 +164,3 @@ pub async fn eventually<T>(what: &str, secs: u64, mut f: impl FnMut() -> Option<
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
-

@@ -79,7 +79,11 @@ const RTMGRP_IPV6_IFADDR: u32 = 0x100;
 fn open() -> io::Result<libc::c_int> {
     // SAFETY: plain socket(2) / bind(2) calls on a zeroed sockaddr_nl.
     unsafe {
-        let fd = libc::socket(libc::AF_NETLINK, libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, libc::NETLINK_ROUTE);
+        let fd = libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::NETLINK_ROUTE,
+        );
         if fd < 0 {
             return Err(io::Error::last_os_error());
         }

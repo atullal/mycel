@@ -56,18 +56,12 @@ async fn sync_over_links_and_fall_back_to_bluetooth() {
     .await;
 
     let (space, genesis) = alice.create_space().unwrap();
-    alice
-        .with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer))
-        .unwrap()
-        .unwrap();
+    alice.with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer)).unwrap().unwrap();
     bob.join_space(genesis).unwrap();
     bob.sync_with(alice.id(), space, true).await.unwrap();
 
     let doc = Replica::new_doc_id();
-    alice
-        .with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "msg", "over peer wifi")))
-        .unwrap()
-        .unwrap();
+    alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "msg", "over peer wifi"))).unwrap().unwrap();
     bob.sync_with(alice.id(), space, false).await.unwrap();
     assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(), json!({"msg": "over peer wifi"}));
     // Path choice needs an RTT sample on each path; a very short exchange
@@ -87,10 +81,7 @@ async fn sync_over_links_and_fall_back_to_bluetooth() {
         bob.peers().get(&alice.id()).is_some_and(|p| !p.links.contains(&PathKind::PeerWifi))
     })
     .await;
-    alice
-        .with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "msg", "over bluetooth")))
-        .unwrap()
-        .unwrap();
+    alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "msg", "over bluetooth"))).unwrap().unwrap();
     bob.sync_with(alice.id(), space, false).await.unwrap();
     assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(), json!({"msg": "over bluetooth"}));
     assert_eq!(bob.peers()[&alice.id()].via, Some(PathKind::Bluetooth));
@@ -144,10 +135,7 @@ async fn live_connection_moves_to_another_link() {
     let b = ep(&kb).alpns(vec![ECHO.to_vec()]).bind().await.unwrap();
     let router = Router::builder(b.clone()).accept(ECHO, Sink).spawn();
 
-    let to_b = EndpointAddr::from_parts(
-        b.id(),
-        [&wifi, &bt].map(|n| TransportAddr::Custom(n.addr_of(&kb.sign_pk()))),
-    );
+    let to_b = EndpointAddr::from_parts(b.id(), [&wifi, &bt].map(|n| TransportAddr::Custom(n.addr_of(&kb.sign_pk()))));
     let conn = a.connect(to_b, ECHO).await.unwrap();
     // the backup path opens alongside the first one
     for _ in 0..50 {

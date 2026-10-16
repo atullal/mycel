@@ -136,7 +136,8 @@ impl Directory for MemDirectory {
             let packet = SignedPacket::from_bytes(&record).map_err(|_| anyhow::anyhow!("not a signed record"))?;
             let node = SignPk(*packet.public_key().as_bytes());
             let mut map = records.lock();
-            let newer = map.get(&node).and_then(|old| timestamp(old)).is_none_or(|t| packet.timestamp().as_micros() > t);
+            let newer =
+                map.get(&node).and_then(|old| timestamp(old)).is_none_or(|t| packet.timestamp().as_micros() > t);
             if newer {
                 map.insert(node, record);
             }
@@ -238,7 +239,8 @@ impl Directory for Arc<PkarrDirectory> {
             #[cfg(feature = "dht")]
             if let Some(dht) = &me.dht
                 && let Ok(Ok(Some(item))) =
-                    tokio::time::timeout(Duration::from_secs(10), dht.get_mutable_most_recent(id.as_bytes(), None)).await
+                    tokio::time::timeout(Duration::from_secs(10), dht.get_mutable_most_recent(id.as_bytes(), None))
+                        .await
                 && let Some(p) = from_item(&item)
             {
                 keep(p);

@@ -91,7 +91,9 @@ async fn a_hop_the_neighbour_dialed_has_a_cost_and_a_window() {
     // Alice's end selects Bluetooth, Bob's peer-to-peer Wi-Fi.
     let a = device(ka, PathKind::Bluetooth, &[&wifi, &bt]).await;
     let b = device(kb, PathKind::PeerWifi, &[&wifi, &bt]).await;
-    let on = |n: &MemNet, d: &Device| EndpointAddr::from_parts(d.ep.id(), [TransportAddr::Custom(n.addr_of(&d.keys.sign_pk()))]);
+    let on = |n: &MemNet, d: &Device| {
+        EndpointAddr::from_parts(d.ep.id(), [TransportAddr::Custom(n.addr_of(&d.keys.sign_pk()))])
+    };
     let selected = |c: &iroh::endpoint::Connection| {
         c.paths().iter().find(|p| p.is_selected()).map(|p| PathKind::of(p.remote_addr()))
     };

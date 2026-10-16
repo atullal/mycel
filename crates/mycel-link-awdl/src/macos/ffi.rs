@@ -65,10 +65,7 @@ unsafe extern "C" {
     pub static _nw_content_context_default_message: nw_object;
 
     pub fn nw_parameters_create() -> nw_object;
-    pub fn nw_parameters_create_secure_udp(
-        configure_dtls: *const c_void,
-        configure_udp: *const c_void,
-    ) -> nw_object;
+    pub fn nw_parameters_create_secure_udp(configure_dtls: *const c_void, configure_udp: *const c_void) -> nw_object;
     pub fn nw_parameters_set_include_peer_to_peer(p: nw_object, include: bool);
     pub fn nw_parameters_prohibit_interface(p: nw_object, iface: nw_object);
 
@@ -89,22 +86,14 @@ unsafe extern "C" {
     pub fn nw_advertise_descriptor_set_txt_record_object(adv: nw_object, txt: nw_object);
 
     pub fn nw_txt_record_create_dictionary() -> nw_object;
-    pub fn nw_txt_record_set_key(
-        txt: nw_object,
-        key: *const c_char,
-        value: *const u8,
-        len: usize,
-    ) -> bool;
+    pub fn nw_txt_record_set_key(txt: nw_object, key: *const c_char, value: *const u8, len: usize) -> bool;
     pub fn nw_txt_record_access_key(
         txt: nw_object,
         key: *const c_char,
         f: &Block<dyn Fn(*const c_char, i32, *const u8, usize) -> CBool + '_>,
     ) -> bool;
 
-    pub fn nw_browse_descriptor_create_bonjour_service(
-        ty: *const c_char,
-        domain: *const c_char,
-    ) -> nw_object;
+    pub fn nw_browse_descriptor_create_bonjour_service(ty: *const c_char, domain: *const c_char) -> nw_object;
     pub fn nw_browse_descriptor_set_include_txt_record(d: nw_object, include: bool);
     pub fn nw_browser_create(d: nw_object, p: nw_object) -> nw_object;
     pub fn nw_browser_set_queue(b: nw_object, q: dispatch_object);
@@ -116,10 +105,7 @@ unsafe extern "C" {
     pub fn nw_browse_result_get_changes(old: nw_object, new: nw_object) -> u64;
     pub fn nw_browse_result_copy_endpoint(r: nw_object) -> nw_object;
     pub fn nw_browse_result_copy_txt_record_object(r: nw_object) -> nw_object;
-    pub fn nw_browse_result_enumerate_interfaces(
-        r: nw_object,
-        f: &Block<dyn Fn(nw_object) -> CBool + '_>,
-    );
+    pub fn nw_browse_result_enumerate_interfaces(r: nw_object, f: &Block<dyn Fn(nw_object) -> CBool + '_>);
 
     pub fn nw_endpoint_get_type(e: nw_object) -> u32;
     pub fn nw_endpoint_get_bonjour_service_name(e: nw_object) -> *const c_char;
@@ -131,22 +117,13 @@ unsafe extern "C" {
     pub fn nw_connection_set_state_changed_handler(c: nw_object, h: &StateBlock);
     pub fn nw_connection_start(c: nw_object);
     pub fn nw_connection_cancel(c: nw_object);
-    pub fn nw_connection_send(
-        c: nw_object,
-        data: dispatch_object,
-        ctx: nw_object,
-        complete: bool,
-        done: &ObjBlock,
-    );
+    pub fn nw_connection_send(c: nw_object, data: dispatch_object, ctx: nw_object, complete: bool, done: &ObjBlock);
     pub fn nw_connection_receive_message(c: nw_object, done: &ReceiveBlock);
     pub fn nw_connection_copy_current_path(c: nw_object) -> nw_object;
     pub fn nw_connection_get_maximum_datagram_size(c: nw_object) -> u32;
 
     pub fn nw_path_get_unsatisfied_reason(path: nw_object) -> u32;
-    pub fn nw_path_enumerate_interfaces(
-        path: nw_object,
-        f: &Block<dyn Fn(nw_object) -> CBool + '_>,
-    );
+    pub fn nw_path_enumerate_interfaces(path: nw_object, f: &Block<dyn Fn(nw_object) -> CBool + '_>);
     pub fn nw_interface_get_name(iface: nw_object) -> *const c_char;
 
     pub fn nw_error_get_error_domain(e: nw_object) -> u32;
@@ -263,12 +240,7 @@ pub fn data_bytes(data: dispatch_object) -> Vec<u8> {
 pub fn data_from(bytes: &[u8]) -> dispatch_object {
     // NULL destructor = DISPATCH_DATA_DESTRUCTOR_DEFAULT: the bytes are copied.
     unsafe {
-        dispatch_data_create(
-            bytes.as_ptr() as *const c_void,
-            bytes.len(),
-            std::ptr::null_mut(),
-            std::ptr::null(),
-        )
+        dispatch_data_create(bytes.as_ptr() as *const c_void, bytes.len(), std::ptr::null_mut(), std::ptr::null())
     }
 }
 
@@ -281,10 +253,7 @@ pub fn error_of(e: nw_object) -> Option<(u32, i32)> {
 pub fn interfaces_of_browse_result(r: nw_object) -> Vec<(String, Nw)> {
     let out = std::cell::RefCell::new(Vec::new());
     let f = block2::StackBlock::new(|iface: nw_object| {
-        if let (Some(name), Some(obj)) = (
-            cstr(unsafe { nw_interface_get_name(iface) }),
-            Nw::retained(iface),
-        ) {
+        if let (Some(name), Some(obj)) = (cstr(unsafe { nw_interface_get_name(iface) }), Nw::retained(iface)) {
             out.borrow_mut().push((name, obj));
         }
         1
@@ -308,15 +277,12 @@ pub fn interfaces_of_path(path: nw_object) -> Vec<String> {
 /// Value of `key` in a TXT record (borrowed), if present and non-empty.
 pub fn txt_value(txt: nw_object, key: &CStr) -> Option<Vec<u8>> {
     let out = std::cell::RefCell::new(None);
-    let f = block2::StackBlock::new(
-        |_k: *const c_char, found: i32, value: *const u8, len: usize| {
-            if found == TXT_NON_EMPTY && !value.is_null() {
-                *out.borrow_mut() =
-                    Some(unsafe { std::slice::from_raw_parts(value, len) }.to_vec());
-            }
-            1
-        },
-    );
+    let f = block2::StackBlock::new(|_k: *const c_char, found: i32, value: *const u8, len: usize| {
+        if found == TXT_NON_EMPTY && !value.is_null() {
+            *out.borrow_mut() = Some(unsafe { std::slice::from_raw_parts(value, len) }.to_vec());
+        }
+        1
+    });
     unsafe { nw_txt_record_access_key(txt, key.as_ptr(), &f) };
     out.into_inner()
 }
@@ -328,8 +294,7 @@ pub fn remote_of(conn: nw_object) -> String {
     };
     let s = unsafe { nw_endpoint_copy_address_string(ep.ptr()) };
     if s.is_null() {
-        return cstr(unsafe { nw_endpoint_get_bonjour_service_name(ep.ptr()) })
-            .unwrap_or_else(|| "?".into());
+        return cstr(unsafe { nw_endpoint_get_bonjour_service_name(ep.ptr()) }).unwrap_or_else(|| "?".into());
     }
     let out = cstr(s).unwrap_or_default();
     unsafe { libc::free(s as *mut c_void) };

@@ -41,7 +41,11 @@ impl CallHost for Host {
     fn members(&self, space: &Hash32) -> anyhow::Result<Vec<SignPk>> {
         let me = self.node.id();
         let others: Vec<SignPk> = self.node.with_space(space, |r| {
-            r.members().into_iter().filter(|(k, role)| k.sign_pk != me && *role != Role::Relay).map(|(k, _)| k.sign_pk).collect()
+            r.members()
+                .into_iter()
+                .filter(|(k, role)| k.sign_pk != me && *role != Role::Relay)
+                .map(|(k, _)| k.sign_pk)
+                .collect()
         })?;
         if others.is_empty() {
             anyhow::bail!("nobody else here");
@@ -305,7 +309,8 @@ async fn slow_link_call(n: u64, video: bool) -> (f64, f64, u64, CallInfo, CallIn
     wifi.set_latency(Duration::from_millis(10));
     let alice = device("alice", bursts(), false, &[&wifi]).await;
     let bob = device("bob", TestSource::Sine { hz: 440.0, amp: 0.5 }, false, &[&wifi]).await;
-    eventually("link up", 15, || alice.node.peers().get(&bob.node.id()).is_some_and(|p| p.online()).then_some(())).await;
+    eventually("link up", 15, || alice.node.peers().get(&bob.node.id()).is_some_and(|p| p.online()).then_some(()))
+        .await;
     let space = shared_space(&alice, &bob).await;
     let bob_sees = watch(bob.calls.video_frames());
     let id = connect_call(&alice, &bob, space, false).await;
@@ -354,7 +359,12 @@ async fn video_on_a_slow_link_leaves_audio_alone() {
     // Measured: +40–80 ms on this half-duplex 600 kbit/s link (and none at
     // all on an unconstrained one); audio jitter and loss don't change.
     assert!(lat_on - lat_off < 0.100, "audio delay {:.0} → {:.0} ms", lat_off * 1000.0, lat_on * 1000.0);
-    assert!(b.stats.jitter_ms < b_off.stats.jitter_ms + 5.0, "audio jitter {} → {} ms", b_off.stats.jitter_ms, b.stats.jitter_ms);
+    assert!(
+        b.stats.jitter_ms < b_off.stats.jitter_ms + 5.0,
+        "audio jitter {} → {} ms",
+        b_off.stats.jitter_ms,
+        b.stats.jitter_ms
+    );
     assert!(fps > 4.0, "video still moving ({fps:.1} fps)");
     assert!(a.video.sent_bitrate < 600_000);
 }
@@ -418,7 +428,8 @@ async fn tiny_video_over_bluetooth_measurement() {
     bt.set_latency(Duration::from_millis(20));
     let alice = device("alice", bursts(), false, &[&bt]).await;
     let bob = device("bob", TestSource::Sine { hz: 440.0, amp: 0.5 }, false, &[&bt]).await;
-    eventually("link up", 15, || alice.node.peers().get(&bob.node.id()).is_some_and(|p| p.online()).then_some(())).await;
+    eventually("link up", 15, || alice.node.peers().get(&bob.node.id()).is_some_and(|p| p.online()).then_some(()))
+        .await;
     let space = shared_space(&alice, &bob).await;
     let bob_sees = watch(bob.calls.video_frames());
     let id = connect_call(&alice, &bob, space, false).await;
@@ -512,7 +523,9 @@ async fn group_video_call_of_three() {
         d.calls.accept(&ring.id).await.unwrap();
     }
     eventually("all three in", 20, || {
-        all.iter().all(|d| d.call(&out.id).is_some_and(|c| c.state == CallPhase::Active && c.joined_count == 3)).then_some(())
+        all.iter()
+            .all(|d| d.call(&out.id).is_some_and(|c| c.state == CallPhase::Active && c.joined_count == 3))
+            .then_some(())
     })
     .await;
     tokio::time::sleep(Duration::from_secs(8)).await;

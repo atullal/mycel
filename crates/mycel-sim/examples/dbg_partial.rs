@@ -35,7 +35,13 @@ fn main() {
     let t2 = t1 + 60 * SEC;
     let t3 = t2 + (walk * SEC as f64) as Time;
     let mut mule = ble_only(0, (d_x + 20.0, 5.0), None);
-    mule.mobility = Mobility::Path(vec![(0, (d_x + 20.0, 5.0)), (t0, (d_x + 20.0, 5.0)), (t1, (90.0, 5.0)), (t2, (90.0, 5.0)), (t3, (d_x + 20.0, 5.0))]);
+    mule.mobility = Mobility::Path(vec![
+        (0, (d_x + 20.0, 5.0)),
+        (t0, (d_x + 20.0, 5.0)),
+        (t1, (90.0, 5.0)),
+        (t2, (90.0, 5.0)),
+        (t3, (d_x + 20.0, 5.0)),
+    ]);
     let m = specs.len() as NodeId;
     specs.push(mule);
     let cfg = Rc::new(Cfg::global());
@@ -49,8 +55,10 @@ fn main() {
     while t < t3 + 120 * SEC {
         t += 10 * SEC;
         sim.run(t);
-        let held: Vec<String> =
-            (0..sim.routers.len()).filter(|i| !sim.routers[*i].held().is_empty()).map(|i| format!("{i}:{:?}", sim.routers[i].held())).collect();
+        let held: Vec<String> = (0..sim.routers.len())
+            .filter(|i| !sim.routers[*i].held().is_empty())
+            .map(|i| format!("{i}:{:?}", sim.routers[i].held()))
+            .collect();
         println!(
             "t={} mule x {:.0} nbrs {:?} held {:?} delivered {:?}",
             t / SEC,

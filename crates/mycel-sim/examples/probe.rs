@@ -12,14 +12,18 @@ use mycel_net::link::{Link, PathKind};
 use mycel_net::{MeshOptions, NetMode, Node, NodeOptions};
 
 fn rss_mb() -> f64 {
-    let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
+    let out =
+        std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
     String::from_utf8_lossy(&out.stdout).trim().parse::<f64>().unwrap_or(0.0) / 1024.0
 }
 
 fn cpu_s() -> f64 {
     let mut u: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
-    u.ru_utime.tv_sec as f64 + u.ru_utime.tv_usec as f64 / 1e6 + u.ru_stime.tv_sec as f64 + u.ru_stime.tv_usec as f64 / 1e6
+    u.ru_utime.tv_sec as f64
+        + u.ru_utime.tv_usec as f64 / 1e6
+        + u.ru_stime.tv_sec as f64
+        + u.ru_stime.tv_usec as f64 / 1e6
 }
 
 fn main() {

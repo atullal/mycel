@@ -1,0 +1,12 @@
+# Stable rustfmt options only (no nightly needed).
+#
+# Wide lines and "Max" small heuristics: of the mainstream configurations,
+# this one is closest to how the code was written (fewest changes when the
+# tree was first formatted).
+#
+# Vendored crates are excluded by vendor/rustfmt.toml. `cargo fmt --all` covers
+# the main workspace; the rules workspace is separate:
+#   cargo fmt --all && cargo fmt --all --manifest-path rules/Cargo.toml
+style_edition = "2024"
+max_width = 120
+use_small_heuristics = "Max"

@@ -21,7 +21,13 @@ async fn main() -> Result<()> {
     let keeper = node("keeper").await?;
     let eve = node("eve").await?;
     let all = [&alice, &bob, &carol, &keeper, &eve];
-    for a in all { for b in all { if a.id() != b.id() { a.add_peer_addr(b.addr()); } } }
+    for a in all {
+        for b in all {
+            if a.id() != b.id() {
+                a.add_peer_addr(b.addr());
+            }
+        }
+    }
 
     println!("\n2. Alice founds a newsroom space: bob=Writer, carol=Reader, keeper=Relay");
     let (space, genesis) = alice.create_space()?;
@@ -33,16 +39,20 @@ async fn main() -> Result<()> {
     for (name, n) in [("bob", &bob), ("carol", &carol), ("keeper", &keeper)] {
         n.join_space(genesis.clone())?;
         let s = n.sync_with(alice.id(), space, true).await?;
-        println!("  {name:<7} joined via invite, got {} membership ops, role={:?}", s.ops,
-            n.with_space(&space, |r| r.my_role())?.unwrap());
+        println!(
+            "  {name:<7} joined via invite, got {} membership ops, role={:?}",
+            s.ops,
+            n.with_space(&space, |r| r.my_role())?.unwrap()
+        );
     }
 
     println!("\n3. Bob writes a story and pushes it ONLY to the keeper");
     let doc = Replica::new_doc_id();
     bob.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "headline", "Mayor resigns")))??;
     bob.sync_with(keeper.id(), space, false).await?;
-    keeper.with_space(&space, |r| println!(
-        "  keeper  stores {} valid envelope(s) it cannot read; doc = {}", r.opaque_count(), r.doc_json(&doc)))?;
+    keeper.with_space(&space, |r| {
+        println!("  keeper  stores {} valid envelope(s) it cannot read; doc = {}", r.opaque_count(), r.doc_json(&doc))
+    })?;
 
     println!("\n4. Carol syncs with the keeper (never talks to Bob)");
     carol.sync_with(keeper.id(), space, false).await?;
@@ -52,8 +62,10 @@ async fn main() -> Result<()> {
     carol.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "headline", "FAKE NEWS")))??;
     carol.sync_with(keeper.id(), space, false).await?;
     alice.sync_with(keeper.id(), space, false).await?;
-    println!("  alice   sees {}  (carol's write rejected by every peer)",
-        alice.with_space(&space, |r| r.doc_json(&doc))?);
+    println!(
+        "  alice   sees {}  (carol's write rejected by every peer)",
+        alice.with_space(&space, |r| r.doc_json(&doc))?
+    );
 
     println!("\n6. Eve (outsider who stole the invite) tries to sync");
     eve.join_space(genesis.clone())?;

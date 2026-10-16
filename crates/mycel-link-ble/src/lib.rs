@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use anyhow::Result;
 use mycel_crypto::SignPk;
-use mycel_net::link::{Link, LinkEvent, LinkStatus, PathKind};
 use mycel_net::link::transports::CustomTransport;
+use mycel_net::link::{Link, LinkEvent, LinkStatus, PathKind};
 use tokio::sync::mpsc;
 
 pub mod core;
@@ -48,8 +48,8 @@ mod fake;
 #[cfg(test)]
 mod sim;
 
-pub use hub::Radio;
 use hub::Hub;
+pub use hub::Radio;
 
 /// The Mycel GATT service, advertised by every device.
 pub const SERVICE_UUID: &str = "8E12485D-50ED-4B8D-A6F0-276C27F29CB6";

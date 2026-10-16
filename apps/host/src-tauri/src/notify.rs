@@ -147,9 +147,14 @@ fn write_durably(path: &Path, data: &[u8]) -> std::io::Result<()> {
 
 enum Job {
     /// Clear delivered alerts the table can't route.
-    Startup { fresh: bool },
+    Startup {
+        fresh: bool,
+    },
     Show(Alert),
-    Withdraw { thread: String, key: Option<String> },
+    Withdraw {
+        thread: String,
+        key: Option<String>,
+    },
 }
 
 pub struct Notifier {
@@ -237,11 +242,8 @@ impl Notifier {
     fn route(&self, alert: &Alert) -> (i32, Removal) {
         let mut routes = self.routes.lock().unwrap_or_else(|e| e.into_inner());
         let replaced = routes.take(|r| r.key == alert.key);
-        let (id, mut removal) = routes.add(Route {
-            target: alert.target.clone(),
-            thread: alert.thread.clone(),
-            key: alert.key.clone(),
-        });
+        let (id, mut removal) =
+            routes.add(Route { target: alert.target.clone(), thread: alert.thread.clone(), key: alert.key.clone() });
         removal.ids.extend(replaced);
         self.persist(&routes);
         (id, removal)
@@ -262,9 +264,8 @@ impl Notifier {
 
     fn persist(&self, routes: &Routes) {
         let Some(path) = &self.path else { return };
-        let saved = serde_json::to_vec(routes)
-            .map_err(std::io::Error::other)
-            .and_then(|data| write_durably(path, &data));
+        let saved =
+            serde_json::to_vec(routes).map_err(std::io::Error::other).and_then(|data| write_durably(path, &data));
         if saved.is_err() {
             eprintln!("mycel-host: cannot persist notification routing");
         }
@@ -359,10 +360,7 @@ impl Notifier {
             return "unavailable".into();
         };
         if self.should_request_permission(state) {
-            return n
-                .request_permission()
-                .map(|state| state.to_string())
-                .unwrap_or_else(|_| "unavailable".into());
+            return n.request_permission().map(|state| state.to_string()).unwrap_or_else(|_| "unavailable".into());
         }
         state.to_string()
     }
@@ -388,10 +386,7 @@ impl Notifier {
 /// `prompt-with-rationale`) or `unavailable`: no permission state to check
 /// here (Android, or a desktop without a notification service).
 #[tauri::command]
-pub async fn prepare_notifications(
-    app: AppHandle,
-    notifier: State<'_, Arc<Notifier>>,
-) -> Result<String, String> {
+pub async fn prepare_notifications(app: AppHandle, notifier: State<'_, Arc<Notifier>>) -> Result<String, String> {
     let notifier = notifier.inner().clone();
     tauri::async_runtime::spawn_blocking(move || notifier.prepare(&app))
         .await
@@ -421,13 +416,8 @@ pub async fn notification_target(
     rt: State<'_, Rt>,
     id: i32,
 ) -> Result<Option<String>, String> {
-    let target = notifier
-        .routes
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entries
-        .get(&id)
-        .map(|route| route.target.clone());
+    let target =
+        notifier.routes.lock().unwrap_or_else(|e| e.into_inner()).entries.get(&id).map(|route| route.target.clone());
     Ok(target.and_then(|target| rt.alert_route(&target)))
 }
 
@@ -436,9 +426,7 @@ pub async fn notification_target(
 pub async fn take_notification_action(app: AppHandle) -> Result<Option<i32>, String> {
     #[cfg(target_os = "ios")]
     return tauri::async_runtime::spawn_blocking(move || {
-        app.notification()
-            .take_pending_action()
-            .map_err(|_| "Notification action unavailable".into())
+        app.notification().take_pending_action().map_err(|_| "Notification action unavailable".into())
     })
     .await
     .map_err(|_| "Notification action unavailable".to_string())?;
@@ -461,28 +449,17 @@ fn android_notify(title: &str, body: &str) -> jni::errors::Result<()> {
     let mut env = vm.attach_current_thread()?;
     // SAFETY: a global reference to the application Context, borrowed.
     let context = unsafe { JObject::from_raw(ctx.context().cast()) };
-    let loader = env
-        .call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
-        .l()?;
+    let loader = env.call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
     let name = env.new_string("dev.mycel.host.MycelService")?;
     let class = env
-        .call_method(
-            &loader,
-            "loadClass",
-            "(Ljava/lang/String;)Ljava/lang/Class;",
-            &[JValue::Object(&name)],
-        )?
+        .call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&name)])?
         .l()?;
     let (title, body) = (env.new_string(title)?, env.new_string(body)?);
     let res = env.call_static_method(
         jni::objects::JClass::from(class),
         "notify",
         "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)V",
-        &[
-            JValue::Object(&context),
-            JValue::Object(&title),
-            JValue::Object(&body),
-        ],
+        &[JValue::Object(&context), JValue::Object(&title), JValue::Object(&body)],
     );
     if res.is_err() {
         let _ = env.exception_clear();
@@ -525,13 +502,16 @@ mod tests {
     #[test]
     fn the_os_only_ever_sees_one_fixed_sentence_per_kind() {
         let sentences: Vec<_> = KINDS.iter().map(|kind| content(*kind)).collect();
-        assert_eq!(sentences, [
-            ("Mycel", "New message"),
-            ("Mycel", "New message request"),
-            ("Mycel", "New group invitation"),
-            ("Mycel", "Incoming call"),
-            ("Mycel", "Missed call"),
-        ]);
+        assert_eq!(
+            sentences,
+            [
+                ("Mycel", "New message"),
+                ("Mycel", "New message request"),
+                ("Mycel", "New group invitation"),
+                ("Mycel", "Incoming call"),
+                ("Mycel", "Missed call"),
+            ]
+        );
         // Alerts carry no names or text to leak: only opaque local keys.
         let json = serde_json::to_value(alert(AlertKind::Message, "t", "k")).unwrap();
         let mut fields: Vec<_> = json.as_object().unwrap().keys().cloned().collect();
@@ -587,7 +567,8 @@ mod tests {
         // Bounded, oldest first; evicted alerts are taken off the screen.
         let mut evicted = vec![];
         for n in 0..300 {
-            evicted.extend(restarted.add(Route { target: format!("{n}"), thread: "t".into(), key: format!("{n}") }).1.ids);
+            evicted
+                .extend(restarted.add(Route { target: format!("{n}"), thread: "t".into(), key: format!("{n}") }).1.ids);
         }
         assert_eq!(restarted.entries.len(), MAX_ROUTES);
         assert!(evicted.contains(&id) && !restarted.entries.contains_key(&id));

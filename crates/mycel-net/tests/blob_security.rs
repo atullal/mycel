@@ -9,18 +9,10 @@ use mycel_net::{NetMode, Node, NodeOptions};
 use mycel_trust::Role;
 
 async fn node() -> (Node, PathBuf) {
-    let dir = std::env::temp_dir().join(format!(
-        "mycel-push-security-{}",
-        mycel_crypto::random_u64()
-    ));
+    let dir = std::env::temp_dir().join(format!("mycel-push-security-{}", mycel_crypto::random_u64()));
     let mut opts = NodeOptions::new(NetMode::Local, "synthetic test node");
     opts.blob_dir = Some(dir.clone());
-    (
-        Node::spawn(Arc::new(DeviceKeys::generate()), opts)
-            .await
-            .unwrap(),
-        dir,
-    )
+    (Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap(), dir)
 }
 
 async fn eventually(mut condition: impl FnMut() -> bool) {
@@ -36,13 +28,7 @@ async fn eventually(mut condition: impl FnMut() -> bool) {
 fn stages(dir: &Path) -> usize {
     std::fs::read_dir(dir)
         .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .contains(".push.")
-        })
+        .filter(|e| e.as_ref().unwrap().file_name().to_string_lossy().contains(".push."))
         .count()
 }
 
@@ -53,10 +39,7 @@ async fn interrupted_and_invalid_eager_pushes_clean_stages_and_preserve_download
     alice.add_peer_addr(bob.addr());
     bob.add_peer_addr(alice.addr());
     let (space, genesis) = alice.create_space().unwrap();
-    alice
-        .with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer))
-        .unwrap()
-        .unwrap();
+    alice.with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer)).unwrap().unwrap();
     bob.join_space(genesis).unwrap();
     bob.sync_with(alice.id(), space, true).await.unwrap();
     let hash = wire::blob_hash(b"expected complete blob");
@@ -71,25 +54,10 @@ async fn interrupted_and_invalid_eager_pushes_clean_stages_and_preserve_download
     for offer in [true, false] {
         let (mut tx, mut rx) = conn.open_bi().await.unwrap();
         tx.write_all(&[StreamKind::Blob as u8]).await.unwrap();
-        let req = if offer {
-            BlobReq::Offer {
-                space,
-                hash,
-                len: 64,
-            }
-        } else {
-            BlobReq::Put {
-                space,
-                hash,
-                len: 64,
-            }
-        };
+        let req = if offer { BlobReq::Offer { space, hash, len: 64 } } else { BlobReq::Put { space, hash, len: 64 } };
         wire::send(&mut tx, &req).await.unwrap();
         if offer {
-            assert!(matches!(
-                wire::recv::<BlobResp>(&mut rx).await.unwrap(),
-                BlobResp::SendFrom { offset: 0 }
-            ));
+            assert!(matches!(wire::recv::<BlobResp>(&mut rx).await.unwrap(), BlobResp::SendFrom { offset: 0 }));
         }
         tx.write_all(b"short").await.unwrap();
         eventually(|| stages(&dir) == 1).await;
@@ -103,20 +71,8 @@ async fn interrupted_and_invalid_eager_pushes_clean_stages_and_preserve_download
     // Full-length bad data must also discard its isolated stage.
     let (mut tx, mut rx) = conn.open_bi().await.unwrap();
     tx.write_all(&[StreamKind::Blob as u8]).await.unwrap();
-    wire::send(
-        &mut tx,
-        &BlobReq::Offer {
-            space,
-            hash,
-            len: 3,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        wire::recv::<BlobResp>(&mut rx).await.unwrap(),
-        BlobResp::SendFrom { offset: 0 }
-    ));
+    wire::send(&mut tx, &BlobReq::Offer { space, hash, len: 3 }).await.unwrap();
+    assert!(matches!(wire::recv::<BlobResp>(&mut rx).await.unwrap(), BlobResp::SendFrom { offset: 0 }));
     tx.write_all(b"bad").await.unwrap();
     tx.finish().unwrap();
     assert!(wire::recv::<BlobResp>(&mut rx).await.is_err());
@@ -127,20 +83,8 @@ async fn interrupted_and_invalid_eager_pushes_clean_stages_and_preserve_download
     // Reset while waiting for bytes exercises cancellation/error cleanup too.
     let (mut tx, mut rx) = conn.open_bi().await.unwrap();
     tx.write_all(&[StreamKind::Blob as u8]).await.unwrap();
-    wire::send(
-        &mut tx,
-        &BlobReq::Offer {
-            space,
-            hash,
-            len: 100,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        wire::recv::<BlobResp>(&mut rx).await.unwrap(),
-        BlobResp::SendFrom { offset: 0 }
-    ));
+    wire::send(&mut tx, &BlobReq::Offer { space, hash, len: 100 }).await.unwrap();
+    assert!(matches!(wire::recv::<BlobResp>(&mut rx).await.unwrap(), BlobResp::SendFrom { offset: 0 }));
     tx.reset(0u32.into()).unwrap();
     rx.stop(0u32.into()).unwrap();
     eventually(|| stages(&dir) == 0).await;
@@ -158,12 +102,7 @@ async fn keeper_push_retains_and_resumes_partial_bytes() {
     alice.add_peer_addr(keeper.addr());
     keeper.add_peer_addr(alice.addr());
     let (space, genesis) = alice.create_space().unwrap();
-    alice
-        .with_space(&space, |r| {
-            r.add_member(keeper.keys().public(), Role::Relay)
-        })
-        .unwrap()
-        .unwrap();
+    alice.with_space(&space, |r| r.add_member(keeper.keys().public(), Role::Relay)).unwrap().unwrap();
     keeper.join_space(genesis).unwrap();
     keeper.sync_with(alice.id(), space, true).await.unwrap();
     let bytes = b"synthetic keeper resume bytes";
@@ -171,54 +110,22 @@ async fn keeper_push_retains_and_resumes_partial_bytes() {
     let conn = alice.connect(keeper.id(), wire::ALPN).await.unwrap();
     let (mut tx, mut rx) = conn.open_bi().await.unwrap();
     tx.write_all(&[StreamKind::Blob as u8]).await.unwrap();
-    wire::send(
-        &mut tx,
-        &BlobReq::Offer {
-            space,
-            hash,
-            len: bytes.len() as u64,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        wire::recv::<BlobResp>(&mut rx).await.unwrap(),
-        BlobResp::SendFrom { offset: 0 }
-    ));
+    wire::send(&mut tx, &BlobReq::Offer { space, hash, len: bytes.len() as u64 }).await.unwrap();
+    assert!(matches!(wire::recv::<BlobResp>(&mut rx).await.unwrap(), BlobResp::SendFrom { offset: 0 }));
     tx.write_all(&bytes[..8]).await.unwrap();
     tx.finish().unwrap();
     assert!(wire::recv::<BlobResp>(&mut rx).await.is_err());
-    let part = keeper_dir
-        .join(space.to_string())
-        .join(format!("{hash}.part"));
+    let part = keeper_dir.join(space.to_string()).join(format!("{hash}.part"));
     assert_eq!(std::fs::read(&part).unwrap(), &bytes[..8]);
 
     let (mut tx, mut rx) = conn.open_bi().await.unwrap();
     tx.write_all(&[StreamKind::Blob as u8]).await.unwrap();
-    wire::send(
-        &mut tx,
-        &BlobReq::Offer {
-            space,
-            hash,
-            len: bytes.len() as u64,
-        },
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        wire::recv::<BlobResp>(&mut rx).await.unwrap(),
-        BlobResp::SendFrom { offset: 8 }
-    ));
+    wire::send(&mut tx, &BlobReq::Offer { space, hash, len: bytes.len() as u64 }).await.unwrap();
+    assert!(matches!(wire::recv::<BlobResp>(&mut rx).await.unwrap(), BlobResp::SendFrom { offset: 8 }));
     tx.write_all(&bytes[8..]).await.unwrap();
     tx.finish().unwrap();
-    assert!(matches!(
-        wire::recv::<BlobResp>(&mut rx).await.unwrap(),
-        BlobResp::Stored
-    ));
-    assert_eq!(
-        std::fs::read(keeper.blob_path(&space, &hash).unwrap()).unwrap(),
-        bytes
-    );
+    assert!(matches!(wire::recv::<BlobResp>(&mut rx).await.unwrap(), BlobResp::Stored));
+    assert_eq!(std::fs::read(keeper.blob_path(&space, &hash).unwrap()).unwrap(), bytes);
     assert!(!part.exists());
     alice.shutdown().await.unwrap();
     keeper.shutdown().await.unwrap();
@@ -244,10 +151,7 @@ async fn a_trickling_stranger_does_not_starve_members() {
         bob.add_peer_addr(n.addr());
     }
     let (space, genesis) = alice.create_space().unwrap();
-    alice
-        .with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer))
-        .unwrap()
-        .unwrap();
+    alice.with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer)).unwrap().unwrap();
     bob.join_space(genesis).unwrap();
     bob.sync_with(alice.id(), space, true).await.unwrap();
 
@@ -275,20 +179,11 @@ async fn a_trickling_stranger_does_not_starve_members() {
 
     let doc = Replica::new_doc_id();
     for i in 0..3i64 {
-        alice
-            .with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "n", i)))
-            .unwrap()
-            .unwrap();
-        let (a, b) = tokio::join!(
-            bob.sync_with(alice.id(), space, false),
-            alice.sync_with(bob.id(), space, false)
-        );
+        alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "n", i))).unwrap().unwrap();
+        let (a, b) = tokio::join!(bob.sync_with(alice.id(), space, false), alice.sync_with(bob.id(), space, false));
         a.unwrap();
         b.unwrap();
-        assert_eq!(
-            bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(),
-            serde_json::json!({ "n": i })
-        );
+        assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(), serde_json::json!({ "n": i }));
     }
     assert_eq!(alice.fetch_card(bob.id()).await.unwrap().name, "synthetic test node");
     drop(trickling);

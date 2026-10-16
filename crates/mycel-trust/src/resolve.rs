@@ -30,11 +30,7 @@ impl Resolution {
         let Some(&ai) = self.index.get(a) else {
             return false;
         };
-        heads.iter().any(|h| {
-            self.index
-                .get(h)
-                .is_some_and(|&hi| hi == ai || self.anc[hi].get(ai))
-        })
+        heads.iter().any(|h| self.index.get(h).is_some_and(|&hi| hi == ai || self.anc[hi].get(ai)))
     }
 
     pub(crate) fn state_at(&self, ops: &HashMap<OpId, SignedOp>, heads: &[OpId]) -> MemberState {
@@ -56,11 +52,7 @@ fn concurrent(anc: &[BitSet], a: usize, b: usize) -> bool {
 fn revocation_target(op: &SignedOp) -> Option<SignPk> {
     match &op.op.action {
         Action::Remove { member, .. } => Some(*member),
-        Action::SetRole {
-            member,
-            revocation: Some(_),
-            ..
-        } => Some(*member),
+        Action::SetRole { member, revocation: Some(_), .. } => Some(*member),
         Action::Leave { .. } => Some(op.op.author),
         _ => None,
     }
@@ -76,11 +68,7 @@ pub(crate) fn resolve(ops: &HashMap<OpId, SignedOp>) -> Resolution {
             children.entry(*p).or_default().push(*id);
         }
     }
-    let mut ready: BTreeSet<OpId> = indegree
-        .iter()
-        .filter(|(_, d)| **d == 0)
-        .map(|(id, _)| *id)
-        .collect();
+    let mut ready: BTreeSet<OpId> = indegree.iter().filter(|(_, d)| **d == 0).map(|(id, _)| *id).collect();
     let mut order = Vec::with_capacity(ops.len());
     while let Some(id) = ready.pop_first() {
         order.push(id);
@@ -136,9 +124,7 @@ pub(crate) fn resolve(ops: &HashMap<OpId, SignedOp>) -> Resolution {
         let mut winners: Vec<usize> = Vec::new();
         let mut won_against: HashMap<SignPk, Vec<usize>> = HashMap::new();
         for &r in &candidates {
-            let loses = won_against
-                .get(&author[r])
-                .is_some_and(|ws| ws.iter().any(|&w| concurrent(&anc, w, r)));
+            let loses = won_against.get(&author[r]).is_some_and(|ws| ws.iter().any(|&w| concurrent(&anc, w, r)));
             if !loses {
                 winners.push(r);
                 won_against.entry(target[r].unwrap()).or_default().push(r);
@@ -244,16 +230,9 @@ fn authorized(op: &SignedOp, idx: usize, st: &MemberState) -> bool {
     let author_role = st.role(&op.op.author);
     let is_admin = author_role.is_some_and(Role::is_admin);
     match &op.op.action {
-        Action::Genesis { founder, rotation } => {
-            idx == 0 && recipients(rotation) == BTreeSet::from([founder.sign_pk])
-        }
+        Action::Genesis { founder, rotation } => idx == 0 && recipients(rotation) == BTreeSet::from([founder.sign_pk]),
         Action::Add { member, .. } => is_admin && !st.members.contains_key(&member.sign_pk),
-        Action::SetRole {
-            member,
-            role,
-            revocation,
-            rotation,
-        } => {
+        Action::SetRole { member, role, revocation, rotation } => {
             let Some(prior) = st.role(member) else {
                 return false;
             };
@@ -262,14 +241,12 @@ fn authorized(op: &SignedOp, idx: usize, st: &MemberState) -> bool {
                 && *role != prior
                 && revocation.is_some() == (*role < prior)
                 && rotation.is_some() == loses_read
-                && rotation.as_ref().is_none_or(|r| {
-                    fresh_epoch(st, r) && recipients(r) == readers_after(st, member, Some(*role))
-                })
+                && rotation
+                    .as_ref()
+                    .is_none_or(|r| fresh_epoch(st, r) && recipients(r) == readers_after(st, member, Some(*role)))
                 && admins_after(st, member, Some(*role)) > 0
         }
-        Action::Remove {
-            member, rotation, ..
-        } => {
+        Action::Remove { member, rotation, .. } => {
             st.members.contains_key(member)
                 && is_admin
                 && fresh_epoch(st, rotation)
@@ -281,19 +258,12 @@ fn authorized(op: &SignedOp, idx: usize, st: &MemberState) -> bool {
                 && fresh_epoch(st, rotation)
                 && recipients(rotation) == st.readers()
         }
-        Action::Leave { .. } => {
-            author_role.is_some() && admins_after(st, &op.op.author, None) > 0
-        }
+        Action::Leave { .. } => author_role.is_some() && admins_after(st, &op.op.author, None) > 0,
     }
 }
 
 fn push_epoch(st: &mut MemberState, r: &Rotation, created_by: OpId) {
-    st.epochs.push(Epoch {
-        id: r.epoch,
-        commitment: r.commitment,
-        created_by,
-        recipients: recipients(r),
-    });
+    st.epochs.push(Epoch { id: r.epoch, commitment: r.commitment, created_by, recipients: recipients(r) });
 }
 
 /// Build state by applying the ops in `set` in topo order.
@@ -325,23 +295,11 @@ fn apply(
     let op = &ops[&id].op;
     match &op.action {
         Action::Genesis { founder, rotation } => {
-            st.members.insert(
-                founder.sign_pk,
-                Member {
-                    keys: *founder,
-                    role: Role::Admin,
-                },
-            );
+            st.members.insert(founder.sign_pk, Member { keys: *founder, role: Role::Admin });
             push_epoch(st, rotation, id);
         }
         Action::Add { member, role, .. } => {
-            st.members.insert(
-                member.sign_pk,
-                Member {
-                    keys: *member,
-                    role: *role,
-                },
-            );
+            st.members.insert(member.sign_pk, Member { keys: *member, role: *role });
             if role.can_read() {
                 // The keyring covers exactly the epochs in the adder's causal past.
                 for e in st.epochs.iter_mut() {
@@ -351,12 +309,7 @@ fn apply(
                 }
             }
         }
-        Action::SetRole {
-            member,
-            role,
-            rotation,
-            ..
-        } => {
+        Action::SetRole { member, role, rotation, .. } => {
             if let Some(m) = st.members.get_mut(member) {
                 m.role = *role;
             }
@@ -364,9 +317,7 @@ fn apply(
                 push_epoch(st, r, id);
             }
         }
-        Action::Remove {
-            member, rotation, ..
-        } => {
+        Action::Remove { member, rotation, .. } => {
             st.members.remove(member);
             push_epoch(st, rotation, id);
         }

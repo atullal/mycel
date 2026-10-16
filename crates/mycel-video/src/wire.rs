@@ -325,7 +325,11 @@ mod tests {
 
     #[test]
     fn ctrl_messages_survive_splits() {
-        let msgs = [VideoCtrl::KeyframeRequest { missing: 7 }, VideoCtrl::State { camera: true, paused: false }, VideoCtrl::KeyframeRequest { missing: u32::MAX }];
+        let msgs = [
+            VideoCtrl::KeyframeRequest { missing: 7 },
+            VideoCtrl::State { camera: true, paused: false },
+            VideoCtrl::KeyframeRequest { missing: u32::MAX },
+        ];
         let wire: Vec<u8> = msgs.iter().flat_map(|m| m.encode().to_vec()).collect();
         for step in [1, 2, 5, 100] {
             let mut d = CtrlDeframer::default();

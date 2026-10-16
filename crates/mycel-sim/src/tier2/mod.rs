@@ -10,7 +10,7 @@ pub mod world;
 
 use serde::{Deserialize, Serialize};
 
-pub use engine::{Action, Area, Inet, MsgId, NodeId, NodeSpec, Router, Sim, Techs, Time, HOUR, MIN, MS, SEC};
+pub use engine::{Action, Area, HOUR, Inet, MIN, MS, MsgId, NodeId, NodeSpec, Router, SEC, Sim, Techs, Time};
 
 use crate::stats::{Summary, jain, max_share};
 
@@ -50,13 +50,19 @@ pub struct T2Metrics {
 }
 
 /// Summarise a finished run (`finish` + oracle annotations done).
-pub fn metrics<R: Router>(sim: &Sim<R>, model: &str, wall_s: f64, only: Option<&dyn Fn(&engine::MsgRecord) -> bool>) -> T2Metrics {
+pub fn metrics<R: Router>(
+    sim: &Sim<R>,
+    model: &str,
+    wall_s: f64,
+    only: Option<&dyn Fn(&engine::MsgRecord) -> bool>,
+) -> T2Metrics {
     let msgs: Vec<&engine::MsgRecord> = sim.core.msgs.iter().filter(|m| only.is_none_or(|f| f(m))).collect();
     let n = sim.core.len();
     let secs = sim.now as f64 / SEC as f64;
     // feasible: of the messages the oracle checked (a sample in big runs),
     // those it found a path for or that got there anyway
-    let feasible: Vec<&&engine::MsgRecord> = msgs.iter().filter(|m| m.checked && (m.optimal.is_some() || m.delivered.is_some())).collect();
+    let feasible: Vec<&&engine::MsgRecord> =
+        msgs.iter().filter(|m| m.checked && (m.optimal.is_some() || m.delivered.is_some())).collect();
     let delivered: Vec<&&engine::MsgRecord> = msgs.iter().filter(|m| m.delivered.is_some()).collect();
     let delivered_feasible = feasible.iter().filter(|m| m.delivered.is_some()).count();
     let lat: Vec<f64> = delivered.iter().map(|m| (m.delivered.unwrap() - m.sent) as f64 / SEC as f64).collect();
@@ -69,14 +75,19 @@ pub fn metrics<R: Router>(sim: &Sim<R>, model: &str, wall_s: f64, only: Option<&
         })
         .collect();
     let rt: Vec<f64> = msgs.iter().filter_map(|m| Some((m.receipt? - m.sent) as f64 / SEC as f64)).collect();
-    let copies = if msgs.is_empty() { 0.0 } else { msgs.iter().map(|m| m.copies as f64).sum::<f64>() / msgs.len() as f64 };
-    let handoffs = if msgs.is_empty() { 0.0 } else { msgs.iter().map(|m| m.handoffs as f64).sum::<f64>() / msgs.len() as f64 };
+    let copies =
+        if msgs.is_empty() { 0.0 } else { msgs.iter().map(|m| m.copies as f64).sum::<f64>() / msgs.len() as f64 };
+    let handoffs =
+        if msgs.is_empty() { 0.0 } else { msgs.iter().map(|m| m.handoffs as f64).sum::<f64>() / msgs.len() as f64 };
     let ctrl_b: u64 = sim.core.counters.iter().map(|c| c.ctrl_bytes).sum();
     let ctrl_f: u64 = sim.core.counters.iter().map(|c| c.ctrl_frames).sum();
     let relay: Vec<f64> = sim.core.counters.iter().map(|c| c.relay_bytes as f64).filter(|b| *b > 0.0).collect();
     if std::env::var_os("MYCEL_SIM_EVENTS").is_some() {
         let k = sim.core.events_by_kind;
-        eprintln!("[events] {model}: frames {} timers {} lookups {} sends {} mobility {} actions {} probes {}", k[0], k[1], k[2], k[3], k[4], k[5], k[6]);
+        eprintln!(
+            "[events] {model}: frames {} timers {} lookups {} sends {} mobility {} actions {} probes {}",
+            k[0], k[1], k[2], k[3], k[4], k[5], k[6]
+        );
     }
     T2Metrics {
         model: model.to_string(),

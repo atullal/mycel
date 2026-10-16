@@ -85,7 +85,8 @@ pub fn internet(slot: u64, seed: u64, ups: Arc<Mutex<HashMap<SignPk, Uplink>>>) 
     n.set_pair(Some(Arc::new(move |a, b| {
         let u = ups.lock();
         let (ua, ub) = (u.get(a)?, u.get(b)?);
-        Nat::direct(ua.nat, ub.nat).then(|| PairShape { latency: ua.access.latency() + ub.access.latency(), rate_div: 1.0 })
+        Nat::direct(ua.nat, ub.nat)
+            .then(|| PairShape { latency: ua.access.latency() + ub.access.latency(), rate_div: 1.0 })
     })));
     n
 }
@@ -103,7 +104,10 @@ pub fn relays(slot: u64, seed: u64, ups: Arc<Mutex<HashMap<SignPk, Uplink>>>) ->
         let (ra, rb) = (nearest_relay(ua.latlon), nearest_relay(ub.latlon));
         let path = backbone(km(ua.latlon, ra)) + backbone(km(ra, rb)) + backbone(km(rb, ub.latlon));
         // relays forward in a few ms
-        Some(PairShape { latency: ua.access.latency() + ub.access.latency() + path + Duration::from_millis(2), rate_div: 1.0 })
+        Some(PairShape {
+            latency: ua.access.latency() + ub.access.latency() + path + Duration::from_millis(2),
+            rate_div: 1.0,
+        })
     })));
     n
 }
@@ -168,7 +172,11 @@ impl CallHost for Host {
     fn members(&self, space: &Hash32) -> anyhow::Result<Vec<SignPk>> {
         let me = self.node.id();
         let others: Vec<SignPk> = self.node.with_space(space, |r| {
-            r.members().into_iter().filter(|(k, role)| k.sign_pk != me && *role != Role::Relay).map(|(k, _)| k.sign_pk).collect()
+            r.members()
+                .into_iter()
+                .filter(|(k, role)| k.sign_pk != me && *role != Role::Relay)
+                .map(|(k, _)| k.sign_pk)
+                .collect()
         })?;
         anyhow::ensure!(!others.is_empty(), "nobody else here");
         Ok(others)
@@ -260,7 +268,8 @@ impl Lab {
         let keys = Arc::new(DeviceKeys::generate());
         let mut opts = NodeOptions::new(NetMode::Local, name);
         opts.ip = false;
-        let links: Vec<(EmuNet, Arc<EmuLink>)> = attach.iter().map(|(n, p)| ((*n).clone(), n.link(keys.sign_pk(), *p))).collect();
+        let links: Vec<(EmuNet, Arc<EmuLink>)> =
+            attach.iter().map(|(n, p)| ((*n).clone(), n.link(keys.sign_pk(), *p))).collect();
         opts.links = links.iter().map(|(_, l)| l.clone() as Arc<dyn Link>).collect();
         opts.mesh = o.mesh.clone().map(|mut m| {
             if m.directory.is_none() {
@@ -305,7 +314,10 @@ impl Lab {
             let addrs: Vec<TransportAddr> = self.devs[y]
                 .links
                 .iter()
-                .filter(|(n, _)| !n.medium().discoverable && self.devs[x].links.iter().any(|(m, _)| format!("{m:?}") == format!("{n:?}")))
+                .filter(|(n, _)| {
+                    !n.medium().discoverable
+                        && self.devs[x].links.iter().any(|(m, _)| format!("{m:?}") == format!("{n:?}"))
+                })
                 .map(|(n, _)| TransportAddr::Custom(n.addr_of(&self.devs[y].node.id())))
                 .collect();
             if !addrs.is_empty() {
@@ -360,7 +372,8 @@ impl Lab {
         let key = format!("m{}", self.seq);
         let t0 = Instant::now();
         let k = key.clone();
-        let _ = self.devs[from].node.with_space(&c.space, move |r| r.change(c.doc, |d| d.put(ROOT, k.as_str(), "hello")));
+        let _ =
+            self.devs[from].node.with_space(&c.space, move |r| r.change(c.doc, |d| d.put(ROOT, k.as_str(), "hello")));
         // what the app does after a local change: push it to the members
         self.devs[from].node.changed(c.space);
         let mut handles = Vec::new();
@@ -369,7 +382,8 @@ impl Lab {
             let key = key.clone();
             handles.push(tokio::spawn(async move {
                 loop {
-                    let seen = node.with_space(&c.space, |r| r.doc_json(&c.doc)).ok().is_some_and(|v| v.get(&key).is_some());
+                    let seen =
+                        node.with_space(&c.space, |r| r.doc_json(&c.doc)).ok().is_some_and(|v| v.get(&key).is_some());
                     if seen {
                         return Some(t0.elapsed());
                     }
@@ -495,7 +509,9 @@ impl Lab {
                     };
                     let shape = m.pair_shape(k, &nb);
                     let air = med.rate.map_or(0.0, |r| size as f64 * shape.rate_div / r as f64);
-                    let us = (lat + shape.latency).as_micros() as u64 + med.jitter.as_micros() as u64 / 2 + (air * 1e6) as u64;
+                    let us = (lat + shape.latency).as_micros() as u64
+                        + med.jitter.as_micros() as u64 / 2
+                        + (air * 1e6) as u64;
                     adj[i].push((j, us));
                 }
             }
@@ -545,10 +561,8 @@ fn tone_of(d: &Dev) -> Option<f32> {
 /// Latency summary in seconds, delivery ratio and optimality of deliveries.
 pub fn summarize(ds: &[Delivery]) -> (f64, Summary, Summary) {
     let lat: Vec<f64> = ds.iter().filter_map(|d| d.latency.map(|l| l.as_secs_f64())).collect();
-    let opt: Vec<f64> = ds
-        .iter()
-        .filter_map(|d| Some(d.latency?.as_secs_f64() / d.optimal?.as_secs_f64().max(1e-4)))
-        .collect();
+    let opt: Vec<f64> =
+        ds.iter().filter_map(|d| Some(d.latency?.as_secs_f64() / d.optimal?.as_secs_f64().max(1e-4))).collect();
     let ratio = if ds.is_empty() { 0.0 } else { lat.len() as f64 / ds.len() as f64 };
     (ratio, Summary::of(&lat), Summary::of(&opt))
 }
@@ -560,7 +574,8 @@ pub fn summarize(ds: &[Delivery]) -> (f64, Summary, Summary) {
 pub fn resources() -> (f64, f64) {
     let rss = footprint_bytes().map_or_else(
         || {
-            let out = std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output();
+            let out =
+                std::process::Command::new("ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output();
             out.ok().and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok()).unwrap_or(0.0) / 1024.0
         },
         |b| b as f64 / (1024.0 * 1024.0),
@@ -568,7 +583,10 @@ pub fn resources() -> (f64, f64) {
     let mut u: libc::rusage = unsafe { std::mem::zeroed() };
     // SAFETY: getrusage fills the struct we pass.
     unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) };
-    let cpu = u.ru_utime.tv_sec as f64 + u.ru_utime.tv_usec as f64 / 1e6 + u.ru_stime.tv_sec as f64 + u.ru_stime.tv_usec as f64 / 1e6;
+    let cpu = u.ru_utime.tv_sec as f64
+        + u.ru_utime.tv_usec as f64 / 1e6
+        + u.ru_stime.tv_sec as f64
+        + u.ru_stime.tv_usec as f64 / 1e6;
     (rss, cpu)
 }
 
@@ -595,5 +613,8 @@ fn footprint_bytes() -> Option<u64> {
 pub fn grid(i: usize, n: usize, w: f64, h: f64) -> Pos {
     let cols = ((n as f64 * w / h).sqrt().ceil() as usize).max(1);
     let rows = n.div_ceil(cols).max(1);
-    Pos::new((i % cols) as f64 * w / cols as f64 + w / cols as f64 / 2.0, (i / cols) as f64 * h / rows as f64 + h / rows as f64 / 2.0)
+    Pos::new(
+        (i % cols) as f64 * w / cols as f64 + w / cols as f64 / 2.0,
+        (i / cols) as f64 * h / rows as f64 + h / rows as f64 / 2.0,
+    )
 }

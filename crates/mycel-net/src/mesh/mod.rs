@@ -46,9 +46,9 @@
 pub mod core;
 pub mod directory;
 pub mod dtn;
-pub mod wire;
 #[cfg(test)]
 mod tests;
+pub mod wire;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -59,8 +59,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bytes::Bytes;
-use iroh::endpoint::{Connection, PathId};
 use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
+use iroh::endpoint::{Connection, PathId};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr};
 use mycel_crypto::{DeviceKeys, Hash32, SignPk};
@@ -68,11 +68,13 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use self::core::{Config, Out, Router, Time};
 pub use self::core::Stats as MeshStats;
-pub use self::wire::{mesh_addr, parse_mesh_addr};
+use self::core::{Config, Out, Router, Time};
 use self::wire::{MIN_QUIC_MTU, T_DATA, T_OGM, T_OGMS, T_SEQREQ};
-use crate::link::{CustomAddr, Link, LinkEvent, LinkStatus, PathKind, TRANSPORT_MESH, n0_watcher, noq_udp, path_in_use};
+pub use self::wire::{mesh_addr, parse_mesh_addr};
+use crate::link::{
+    CustomAddr, Link, LinkEvent, LinkStatus, PathKind, TRANSPORT_MESH, n0_watcher, noq_udp, path_in_use,
+};
 
 /// Hop connections between neighbours (and internet hops to gateways).
 pub const ALPN: &[u8] = b"mycel/mesh/1";
@@ -806,7 +808,8 @@ impl Driver {
             let mut hops = self.hops.lock();
             // at most `max_neighbours` we dialed: each device prefers its own
             // pseudo-random subset of those in range, so the hops spread out
-            let mut ours_up = hops.values().filter(|h| h.direct && h.dialed_by_us && (h.live().is_some() || h.dialing)).count();
+            let mut ours_up =
+                hops.values().filter(|h| h.direct && h.dialed_by_us && (h.live().is_some() || h.dialing)).count();
             let mut want: Vec<(u64, SignPk)> = hops
                 .iter()
                 .filter(|(pk, h)| {
@@ -1268,7 +1271,11 @@ impl Driver {
                 if ids.contains(&t.id) {
                     continue; // still on its way there (a slow link)
                 }
-                (ids.len() < SENDS_PER_NEIGHBOUR && ids.insert(t.id)).then(|| SendSlot { d: self.clone(), to: t.to, id: t.id })
+                (ids.len() < SENDS_PER_NEIGHBOUR && ids.insert(t.id)).then(|| SendSlot {
+                    d: self.clone(),
+                    to: t.to,
+                    id: t.id,
+                })
             };
             let Some(slot) = slot else {
                 // its turn comes when one of those ends
@@ -1729,7 +1736,12 @@ enum Sent {
 
 /// Hand a bundle over a hop connection: offer it, and send the payload
 /// (the rest of it, if an earlier transfer was cut) only if it is wanted.
-async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8, frames: &crate::resources::PeerFrames) -> Result<Sent> {
+async fn send_bundle(
+    conn: &Connection,
+    b: &dtn::Bundle,
+    copies: u8,
+    frames: &crate::resources::PeerFrames,
+) -> Result<Sent> {
     let offer = WireOffer {
         id: b.id,
         src: b.src,
@@ -1743,9 +1755,11 @@ async fn send_bundle(conn: &Connection, b: &dtn::Bundle, copies: u8, frames: &cr
     let mut msg = vec![K_OFFER];
     msg.extend_from_slice(&crate::wire::encode_bounded(&offer, MAX_OFFER - 1)?);
     // (waits while the neighbour has as many streams from us as it allows)
-    let (mut tx, mut rx) = crate::resources::within(crate::resources::REPLY_TIMEOUT, "no stream", conn.open_bi()).await?;
+    let (mut tx, mut rx) =
+        crate::resources::within(crate::resources::REPLY_TIMEOUT, "no stream", conn.open_bi()).await?;
     write_frame(&mut tx, &msg).await?;
-    let (answer, _answer_permit) = read_frame(&mut rx, 64, crate::resources::reply_timeout(4 + msg.len()), frames).await?;
+    let (answer, _answer_permit) =
+        read_frame(&mut rx, 64, crate::resources::reply_timeout(4 + msg.len()), frames).await?;
     let at = match postcard::from_bytes::<WireAnswer>(&answer)? {
         WireAnswer::Duplicate => return Ok(Sent::Took),
         WireAnswer::Refuse(full) => return Ok(Sent::Refused(full)),

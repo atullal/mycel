@@ -35,11 +35,7 @@ async fn node(name: &str, any_interface: bool) -> Node {
     let keys = Arc::new(DeviceKeys::generate());
     let mut opts = NodeOptions::new(NetMode::Lan, name);
     opts.ip = false;
-    opts.links = vec![mycel_link_awdl::link_with(
-        keys.sign_pk(),
-        name,
-        any_interface,
-    )];
+    opts.links = vec![mycel_link_awdl::link_with(keys.sign_pk(), name, any_interface)];
     Node::spawn(keys, opts).await.unwrap()
 }
 
@@ -47,51 +43,25 @@ async fn sync_both_ways(any_interface: bool) {
     let alice = node("alice", any_interface).await;
     let bob = node("bob", any_interface).await;
     eventually("both discover each other over the link", || {
-        alice
-            .peers()
-            .get(&bob.id())
-            .is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
-            && bob
-                .peers()
-                .get(&alice.id())
-                .is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
+        alice.peers().get(&bob.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
+            && bob.peers().get(&alice.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
     })
     .await;
-    assert_eq!(
-        alice.peers()[&bob.id()].name.as_deref(),
-        Some("bob"),
-        "name from the TXT record"
-    );
+    assert_eq!(alice.peers()[&bob.id()].name.as_deref(), Some("bob"), "name from the TXT record");
 
     let (space, genesis) = alice.create_space().unwrap();
-    alice
-        .with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer))
-        .unwrap()
-        .unwrap();
+    alice.with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer)).unwrap().unwrap();
     bob.join_space(genesis).unwrap();
     bob.sync_with(alice.id(), space, true).await.unwrap();
 
     let doc = Replica::new_doc_id();
-    alice
-        .with_space(&space, |r| {
-            r.change(doc, |d| d.put(ROOT, "a", "from alice"))
-        })
-        .unwrap()
-        .unwrap();
+    alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "a", "from alice"))).unwrap().unwrap();
     bob.sync_with(alice.id(), space, false).await.unwrap();
-    assert_eq!(
-        bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(),
-        json!({"a": "from alice"})
-    );
+    assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(), json!({"a": "from alice"}));
 
-    bob.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "b", "from bob")))
-        .unwrap()
-        .unwrap();
+    bob.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "b", "from bob"))).unwrap().unwrap();
     alice.sync_with(bob.id(), space, false).await.unwrap();
-    assert_eq!(
-        alice.with_space(&space, |r| r.doc_json(&doc)).unwrap(),
-        json!({"a": "from alice", "b": "from bob"})
-    );
+    assert_eq!(alice.with_space(&space, |r| r.doc_json(&doc)).unwrap(), json!({"a": "from alice", "b": "from bob"}));
     assert_eq!(alice.peers()[&bob.id()].via, Some(PathKind::PeerWifi));
     assert!(alice.link_status()[0].active, "{:?}", alice.link_status());
 
@@ -99,13 +69,8 @@ async fn sync_both_ways(any_interface: bool) {
     let bob_id = bob.id();
     bob.shutdown().await.unwrap();
     drop(bob);
-    eventually("alice loses bob", || {
-        alice
-            .peers()
-            .get(&bob_id)
-            .is_none_or(|p| !p.links.contains(&PathKind::PeerWifi))
-    })
-    .await;
+    eventually("alice loses bob", || alice.peers().get(&bob_id).is_none_or(|p| !p.links.contains(&PathKind::PeerWifi)))
+        .await;
     assert_eq!(alice.link_status()[0].peers, 0);
     alice.shutdown().await.unwrap();
 }

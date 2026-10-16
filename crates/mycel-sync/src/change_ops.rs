@@ -167,10 +167,7 @@ fn op_ref(counter: i64, actor: u64) -> Result<OpRef> {
 
 /// Call `f(index, row, preds)` for every operation in `change`, in order.
 /// Returns the number of operations.
-pub(crate) fn visit(
-    change: &Change,
-    mut f: impl FnMut(usize, &Row, &[OpRef]) -> Result<()>,
-) -> Result<usize> {
+pub(crate) fn visit(change: &Change, mut f: impl FnMut(usize, &Row, &[OpRef]) -> Result<()>) -> Result<usize> {
     let raw = change.raw_bytes();
     // Chunk header: magic (4), checksum (4), type (1), ULEB body length.
     let mut input = raw.get(9..).ok_or(SyncError::Encoding)?;
@@ -219,8 +216,7 @@ pub(crate) fn visit(
             columns[i] = data;
         }
     }
-    let [obj_actor, obj_ctr, key_actor, key_ctr, key_str, insert, action, group, pred_actor, pred_ctr] =
-        columns;
+    let [obj_actor, obj_ctr, key_actor, key_ctr, key_str, insert, action, group, pred_actor, pred_ctr] = columns;
     // Upstream treats every object as the root unless both columns have data.
     let objs = !obj_actor.is_empty() && !obj_ctr.is_empty();
     let mut obj_actor = Rle::new(obj_actor, unsigned);

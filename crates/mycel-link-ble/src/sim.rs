@@ -218,9 +218,9 @@ impl Sim {
     }
 
     fn link_up(&self, a: usize, b: usize) -> bool {
-        self.refs
-            .iter()
-            .any(|((owner, pid), r)| *r == Ref::Connected && ((*owner == a && target(pid) == b) || (*owner == b && target(pid) == a)))
+        self.refs.iter().any(|((owner, pid), r)| {
+            *r == Ref::Connected && ((*owner == a && target(pid) == b) || (*owner == b && target(pid) == a))
+        })
     }
 
     fn input(&mut self, n: usize, i: Input) {
@@ -250,7 +250,9 @@ impl Sim {
         let pairs: Vec<u64> = self
             .pairs
             .iter()
-            .filter(|(_, p)| p.alive && ({ p.dialer.0 == a && p.acceptor.0 == b } || { p.dialer.0 == b && p.acceptor.0 == a }))
+            .filter(|(_, p)| {
+                p.alive && ({ p.dialer.0 == a && p.acceptor.0 == b } || { p.dialer.0 == b && p.acceptor.0 == a })
+            })
             .map(|(id, _)| *id)
             .collect();
         for id in pairs {
@@ -299,8 +301,12 @@ impl Sim {
                     if self.o.harsh_cancel || !self.link_up(n, o) {
                         self.drop_link(n, o);
                     } else {
-                        let ours: Vec<u64> =
-                            self.pairs.iter().filter(|(_, p)| p.alive && p.via == (n, pid.clone())).map(|(i, _)| *i).collect();
+                        let ours: Vec<u64> = self
+                            .pairs
+                            .iter()
+                            .filter(|(_, p)| p.alive && p.via == (n, pid.clone()))
+                            .map(|(i, _)| *i)
+                            .collect();
                         for id in ours {
                             self.kill_pair(id, true, true);
                         }
@@ -461,7 +467,9 @@ impl Sim {
             let mut v: Vec<u64> = self
                 .pairs
                 .iter()
-                .filter(|(_, p)| p.alive && ((p.dialer.0, p.acceptor.0) == (a, b) || (p.dialer.0, p.acceptor.0) == (b, a)))
+                .filter(|(_, p)| {
+                    p.alive && ((p.dialer.0, p.acceptor.0) == (a, b) || (p.dialer.0, p.acceptor.0) == (b, a))
+                })
                 .map(|(i, _)| *i)
                 .collect();
             v.sort();
@@ -537,7 +545,8 @@ impl Sim {
     fn report(&self) -> String {
         let mut g = self.st.gaps.clone();
         g.sort();
-        let pct = |p: f64| g.get(((g.len() as f64 * p) as usize).min(g.len().saturating_sub(1))).copied().unwrap_or_default();
+        let pct =
+            |p: f64| g.get(((g.len() as f64 * p) as usize).min(g.len().saturating_sub(1))).copied().unwrap_or_default();
         format!(
             "{:?}: faults {} lost {} found {} | first link max {:.1?} | gaps n={} p50 {:.1?} p95 {:.1?} p99 {:.1?} max {:.1?} (lost at {:.0?}) | dup samples {} disagree {} / {}",
             self.o,
@@ -617,7 +626,8 @@ fn gentle_cancel_and_no_hangs_reconnect_within_ten_seconds() {
 #[test]
 fn three_devices_all_pairs_stay_linked() {
     for seed in 20..=21 {
-        let mut sim = Sim::new(Opts { nodes: 3, duration: Duration::from_secs(2 * 3600), fault_every: 40, ..base(seed) });
+        let mut sim =
+            Sim::new(Opts { nodes: 3, duration: Duration::from_secs(2 * 3600), fault_every: 40, ..base(seed) });
         sim.run();
         check(&sim, Duration::from_secs(20));
     }

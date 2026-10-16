@@ -27,8 +27,9 @@ impl BitSet {
     }
     /// Indices in ascending (= topological) order.
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.0.iter().enumerate().flat_map(|(wi, &w)| {
-            (0..64).filter(move |b| w & (1 << b) != 0).map(move |b| wi * 64 + b)
-        })
+        self.0
+            .iter()
+            .enumerate()
+            .flat_map(|(wi, &w)| (0..64).filter(move |b| w & (1 << b) != 0).map(move |b| wi * 64 + b))
     }
 }

@@ -61,10 +61,7 @@ fn reader_writes_are_rejected_everywhere() {
     assert_eq!(r.doc_json(&doc), json!({"title": "Story"}), "reader can read");
 
     let env = put(&mut r, doc, "title", "HACKED");
-    assert_eq!(
-        r.status(&env.id()),
-        Status::Invalid("author not a writer at auth_heads")
-    );
+    assert_eq!(r.status(&env.id()), Status::Invalid("author not a writer at auth_heads"));
     assert_eq!(r.doc_json(&doc), json!({"title": "Story"}), "rolled back locally");
     sync(&mut a, &mut r);
     assert_eq!(a.doc_json(&doc), json!({"title": "Story"}));
@@ -220,10 +217,7 @@ fn demoted_writer_becomes_read_only() {
     a.set_role(bk.sign_pk(), Role::Reader).unwrap();
     sync(&mut a, &mut b);
     let env = put(&mut b, doc, "k", "by reader");
-    assert_eq!(
-        b.status(&env.id()),
-        Status::Invalid("author not a writer at auth_heads")
-    );
+    assert_eq!(b.status(&env.id()), Status::Invalid("author not a writer at auth_heads"));
     put(&mut a, doc, "k2", "admin");
     sync(&mut a, &mut b);
     assert_eq!(b.doc_json(&doc), json!({"k": "by writer", "k2": "admin"}), "still reads");
@@ -295,8 +289,7 @@ fn restore_from_store_reproduces_state() {
     sync(&mut a, &mut b);
     a.append(feed, b"from a".to_vec()).unwrap();
 
-    let ops: Vec<SignedOp> = store.ops.lock().unwrap().iter()
-        .filter(|o| o.id() != genesis.id()).cloned().collect();
+    let ops: Vec<SignedOp> = store.ops.lock().unwrap().iter().filter(|o| o.id() != genesis.id()).cloned().collect();
     let envs = store.envs.lock().unwrap().clone();
     let mut restored = Replica::restore(ak, genesis, ops, envs, None).unwrap();
     assert_eq!(restored.graph().state(), a.graph().state());
@@ -339,8 +332,16 @@ fn doc_equivocation_resolves_identically_everywhere() {
         let plain = d.get_last_local_change().unwrap().bytes().to_vec();
         let epoch = b.graph.state().write_epoch().unwrap();
         let (seq, prev) = b.my_chain_tip();
-        let header = Header { space: b.space_id(), stream: doc, author: bk.sign_pk(),
-            author_seq: seq, author_prev: prev, auth_heads: b.graph.heads(), epoch, nonce: random() };
+        let header = Header {
+            space: b.space_id(),
+            stream: doc,
+            author: bk.sign_pk(),
+            author_seq: seq,
+            author_prev: prev,
+            auth_heads: b.graph.heads(),
+            epoch,
+            nonce: random(),
+        };
         let ct = b.ring.get(&epoch).unwrap().seal(&header.nonce, &content_aad(&header), &plain).unwrap();
         let sig = bk.sign(CTX_ENV_SIG, &[&encode(&header), &ct]);
         Envelope { header, ciphertext: ct, sig }
@@ -361,10 +362,20 @@ fn doc_equivocation_resolves_identically_everywhere() {
 fn invalid_membership_fanout_does_not_block_sealing() {
     let (mut a, reader, rk) = pair(Role::Reader);
     let target = dev();
-    let ops = (0..65).map(|nonce| mycel_trust::SignedOp::sign(&rk, mycel_trust::Op {
-        space: Some(a.space_id()), parents: reader.graph.heads(), author: rk.sign_pk(), nonce,
-        action: mycel_trust::Action::Add { member: target.public(), role: Role::Relay, keyring: None },
-    })).collect();
+    let ops = (0..65)
+        .map(|nonce| {
+            mycel_trust::SignedOp::sign(
+                &rk,
+                mycel_trust::Op {
+                    space: Some(a.space_id()),
+                    parents: reader.graph.heads(),
+                    author: rk.sign_pk(),
+                    nonce,
+                    action: mycel_trust::Action::Add { member: target.public(), role: Role::Relay, keyring: None },
+                },
+            )
+        })
+        .collect();
     let result = a.ingest_batch(ops, vec![]);
     assert_eq!(result.rejected, 0);
     let doc = StreamId::new_doc();
@@ -394,8 +405,14 @@ fn revocation_recomputes_equivocation_from_remaining_valid_changes() {
     a.ingest_op(remove).unwrap();
     assert_eq!(a.status(&x.id()), Status::Invalid("beyond revocation cutoff"));
     assert_eq!(a.status(&y.id()), Status::Valid);
-    let restored = Replica::restore(a.me.clone(), a.op(&a.space_id()).unwrap().clone(), a.all_ops(),
-        a.envelope_ids().iter().map(|id| a.envelope(id).unwrap().clone()).collect(), None).unwrap();
+    let restored = Replica::restore(
+        a.me.clone(),
+        a.op(&a.space_id()).unwrap().clone(),
+        a.all_ops(),
+        a.envelope_ids().iter().map(|id| a.envelope(id).unwrap().clone()).collect(),
+        None,
+    )
+    .unwrap();
     assert_eq!(a.doc_json(&doc), restored.doc_json(&doc));
     assert!(!a.equivocated.contains(&y.id()));
     assert!(a.doc_json(&doc).get("fork").is_some());
@@ -404,8 +421,16 @@ fn revocation_recomputes_equivocation_from_remaining_valid_changes() {
 fn signed_doc_payload(author: &Replica, doc: StreamId, plaintext: &[u8]) -> Envelope {
     let epoch = author.graph.state().write_epoch().unwrap();
     let (author_seq, author_prev) = author.my_chain_tip();
-    let header = Header { space: author.space_id(), stream: doc, author: author.me.sign_pk(),
-        author_seq, author_prev, auth_heads: author.graph.heads(), epoch, nonce: random() };
+    let header = Header {
+        space: author.space_id(),
+        stream: doc,
+        author: author.me.sign_pk(),
+        author_seq,
+        author_prev,
+        auth_heads: author.graph.heads(),
+        epoch,
+        nonce: random(),
+    };
     let ciphertext = author.ring.get(&epoch).unwrap().seal(&header.nonce, &content_aad(&header), plaintext).unwrap();
     let sig = author.me.sign(CTX_ENV_SIG, &[&encode(&header), &ciphertext]);
     Envelope { header, ciphertext, sig }
@@ -455,7 +480,10 @@ fn oversized_local_change_rolls_back_before_next_edit() {
     let doc = StreamId::new_doc();
     put(&mut a, doc, "kept", "small");
     let count = a.envelope_ids().len();
-    assert!(matches!(a.change(doc, |d| d.put(ROOT, "oversized", "z".repeat(MAX_ENVELOPE_CIPHERTEXT + 1))), Err(SyncError::TooLarge)));
+    assert!(matches!(
+        a.change(doc, |d| d.put(ROOT, "oversized", "z".repeat(MAX_ENVELOPE_CIPHERTEXT + 1))),
+        Err(SyncError::TooLarge)
+    ));
     assert_eq!(a.envelope_ids().len(), count);
     assert_eq!(a.doc_json(&doc), json!({"kept": "small"}));
     put(&mut a, doc, "next", "works");
@@ -535,18 +563,14 @@ fn malformed_change_sequence_cannot_unwind_or_poison_document() {
     let mut change = automerge::Change::from(expanded);
     let empty_doc = StreamId::new_doc();
     let empty_malformed = signed_doc_payload(&b, empty_doc, &change.bytes());
-    let empty_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        a.ingest_envelope(empty_malformed)
-    }));
+    let empty_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| a.ingest_envelope(empty_malformed)));
     assert!(matches!(empty_result, Ok(Ok(true))));
     assert!(!a.docs.contains_key(&empty_doc), "failed apply must not create an empty document");
     let malformed = signed_doc_payload(&b, doc, &change.bytes());
     let id = malformed.id();
     let before_applied = a.docs[&doc].applied.clone();
     let before_heads = a.docs[&doc].index.heads();
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        a.ingest_envelope(malformed)
-    }));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| a.ingest_envelope(malformed)));
     assert!(matches!(result, Ok(Ok(true))));
     assert_eq!(a.status(&id), Status::Valid, "auth status stays independent of document payload");
     assert_eq!(a.doc_json(&doc), json!({"kept": "small"}));
@@ -563,7 +587,8 @@ fn malformed_waiting_change_does_not_block_its_real_dependency() {
     let (mut receiver, mut honest, _) = pair(Role::Writer);
     let attacker_keys = dev();
     receiver.add_member(attacker_keys.public(), Role::Writer).unwrap();
-    let mut attacker = Replica::join(attacker_keys.clone(), receiver.op(&receiver.space_id()).unwrap().clone(), None).unwrap();
+    let mut attacker =
+        Replica::join(attacker_keys.clone(), receiver.op(&receiver.space_id()).unwrap().clone(), None).unwrap();
     sync(&mut receiver, &mut attacker);
     sync(&mut receiver, &mut honest);
     let doc = StreamId::new_doc();
@@ -585,8 +610,14 @@ fn malformed_waiting_change_does_not_block_its_real_dependency() {
     let next = put(&mut honest, doc, "next", "works");
     receiver.ingest_envelope(next).unwrap();
     assert_eq!(receiver.doc_json(&doc), json!({"good": "dependency", "next": "works"}));
-    let restored = Replica::restore(receiver.me.clone(), receiver.op(&receiver.space_id()).unwrap().clone(),
-        receiver.all_ops(), receiver.envelope_ids().iter().map(|id| receiver.envelope(id).unwrap().clone()).collect(), None).unwrap();
+    let restored = Replica::restore(
+        receiver.me.clone(),
+        receiver.op(&receiver.space_id()).unwrap().clone(),
+        receiver.all_ops(),
+        receiver.envelope_ids().iter().map(|id| receiver.envelope(id).unwrap().clone()).collect(),
+        None,
+    )
+    .unwrap();
     assert_eq!(receiver.doc_json(&doc), restored.doc_json(&doc));
 }
 
@@ -603,16 +634,28 @@ fn document_changes_delivered_in_reverse_dependency_order_converge() {
     assert_eq!(result.rejected, 0);
     assert_eq!(receiver.docs[&doc].applied.len(), envelopes.len());
     assert_eq!(receiver.doc_json(&doc), writer.doc_json(&doc));
-    let restored = Replica::restore(receiver.me.clone(), receiver.op(&receiver.space_id()).unwrap().clone(),
-        receiver.all_ops(), envelopes, None).unwrap();
+    let restored = Replica::restore(
+        receiver.me.clone(),
+        receiver.op(&receiver.space_id()).unwrap().clone(),
+        receiver.all_ops(),
+        envelopes,
+        None,
+    )
+    .unwrap();
     assert_eq!(restored.doc_json(&doc), writer.doc_json(&doc));
 }
 
 #[test]
 fn lower_id_fork_waiting_on_a_dependency_remains_canonical() {
     let (mut source, writer, wk) = pair(Role::Writer);
-    let mut receiver = Replica::restore(source.me.clone(), source.op(&source.space_id()).unwrap().clone(),
-        source.all_ops(), vec![], None).unwrap();
+    let mut receiver = Replica::restore(
+        source.me.clone(),
+        source.op(&source.space_id()).unwrap().clone(),
+        source.all_ops(),
+        vec![],
+        None,
+    )
+    .unwrap();
     let doc = StreamId::new_doc();
     let dependency = put(&mut source, doc, "base", "present");
     let mut waiting = source.doc(&doc).unwrap().clone().with_actor(ActorId::from(wk.sign_pk().0.to_vec()));
@@ -625,11 +668,13 @@ fn lower_id_fork_waiting_on_a_dependency_remains_canonical() {
     let ready_bytes = ready.get_last_local_change().unwrap().bytes().to_vec();
     // Generate both nonce variants together; this only selects delivery/fork
     // ordering, and does not rely on any particular random ID value.
-    let (x, y) = (0..128).find_map(|_| {
-        let x = signed_doc_payload(&writer, doc, &waiting_bytes);
-        let y = signed_doc_payload(&writer, doc, &ready_bytes);
-        (x.id() < y.id()).then_some((x, y))
-    }).unwrap();
+    let (x, y) = (0..128)
+        .find_map(|_| {
+            let x = signed_doc_payload(&writer, doc, &waiting_bytes);
+            let y = signed_doc_payload(&writer, doc, &ready_bytes);
+            (x.id() < y.id()).then_some((x, y))
+        })
+        .unwrap();
     receiver.ingest_envelope(y).unwrap();
     receiver.ingest_envelope(x).unwrap();
     receiver.ingest_envelope(dependency).unwrap();
@@ -640,8 +685,13 @@ fn empty_copy(r: &Replica) -> Replica {
     Replica::restore(r.me.clone(), r.op(&r.space_id()).unwrap().clone(), r.all_ops(), vec![], None).unwrap()
 }
 
-fn assert_context_independent_rejection(mut receiver: Replica, good: Envelope, bad: Envelope,
-    doc: StreamId, expected: serde_json::Value) {
+fn assert_context_independent_rejection(
+    mut receiver: Replica,
+    good: Envelope,
+    bad: Envelope,
+    doc: StreamId,
+    expected: serde_json::Value,
+) {
     let mut other = empty_copy(&receiver);
     receiver.ingest_envelope(bad.clone()).unwrap();
     receiver.ingest_envelope(good.clone()).unwrap();
@@ -650,8 +700,14 @@ fn assert_context_independent_rejection(mut receiver: Replica, good: Envelope, b
     assert_eq!(receiver.doc_json(&doc), expected);
     assert_eq!(other.doc_json(&doc), expected);
     for envelopes in [vec![bad.clone(), good.clone()], vec![good.clone(), bad.clone()]] {
-        let restored = Replica::restore(receiver.me.clone(), receiver.op(&receiver.space_id()).unwrap().clone(),
-            receiver.all_ops(), envelopes, None).unwrap();
+        let restored = Replica::restore(
+            receiver.me.clone(),
+            receiver.op(&receiver.space_id()).unwrap().clone(),
+            receiver.all_ops(),
+            envelopes,
+            None,
+        )
+        .unwrap();
         assert_eq!(restored.doc_json(&doc), expected);
         assert!(!restored.docs[&doc].applied.contains(&bad.id()));
     }
@@ -715,8 +771,14 @@ fn actor_predecessor_can_be_transitive_through_another_actor() {
     receiver.ingest_batch(vec![], envelopes.clone());
     let expected = json!({"first": "valid", "second": "valid", "third": "valid"});
     assert_eq!(receiver.doc_json(&doc), expected);
-    let restored = Replica::restore(receiver.me.clone(), receiver.op(&receiver.space_id()).unwrap().clone(),
-        receiver.all_ops(), envelopes, None).unwrap();
+    let restored = Replica::restore(
+        receiver.me.clone(),
+        receiver.op(&receiver.space_id()).unwrap().clone(),
+        receiver.all_ops(),
+        envelopes,
+        None,
+    )
+    .unwrap();
     assert_eq!(restored.doc_json(&doc), expected);
 }
 
@@ -814,7 +876,8 @@ fn document_work_scales_with_the_change_not_the_history() {
     assert_eq!(stats.applies, 1);
 
     // Restoring from storage is the same single pass.
-    let restored = Replica::restore(b.me.clone(), b.op(&b.space_id()).unwrap().clone(), b.all_ops(), envelopes, None).unwrap();
+    let restored =
+        Replica::restore(b.me.clone(), b.op(&b.space_id()).unwrap().clone(), b.all_ops(), envelopes, None).unwrap();
     assert_eq!(restored.doc_json(&doc), expected);
     let stats = restored.stats.get();
     assert!(stats.opens <= 2 * (N + 1), "{stats:?}");
@@ -837,10 +900,13 @@ fn bench_document_history() {
         let ingest = t.elapsed();
         assert_eq!(b.doc_json(&doc), a.doc_json(&doc));
         let t = std::time::Instant::now();
-        let r = Replica::restore(a.me.clone(), a.op(&a.space_id()).unwrap().clone(), a.all_ops(), envelopes.clone(), None).unwrap();
+        let r =
+            Replica::restore(a.me.clone(), a.op(&a.space_id()).unwrap().clone(), a.all_ops(), envelopes.clone(), None)
+                .unwrap();
         let restore = t.elapsed();
         assert_eq!(r.doc_json(&doc), a.doc_json(&doc));
-        let mut c = Replica::restore(b.me.clone(), a.op(&a.space_id()).unwrap().clone(), a.all_ops(), vec![], None).unwrap();
+        let mut c =
+            Replica::restore(b.me.clone(), a.op(&a.space_id()).unwrap().clone(), a.all_ops(), vec![], None).unwrap();
         let mut chain = envelopes;
         chain.sort_by_key(|e| e.header.author_seq);
         let t = std::time::Instant::now();
@@ -848,7 +914,9 @@ fn bench_document_history() {
             c.ingest_envelope(env).ok();
         }
         let one_by_one = t.elapsed();
-        eprintln!("{n} edits: local {edits:?}, batch ingest {ingest:?}, restore {restore:?}, one-by-one ingest {one_by_one:?}");
+        eprintln!(
+            "{n} edits: local {edits:?}, batch ingest {ingest:?}, restore {restore:?}, one-by-one ingest {one_by_one:?}"
+        );
     }
 }
 
@@ -868,21 +936,32 @@ fn forks_of_an_old_change_rebuild_at_most_once_per_batch() {
     // with random nonces the original would otherwise win 1 time in 21).
     let lowest = b.envelope_ids().into_iter().min().unwrap();
     let mut forks: Vec<Envelope> = (0..20)
-        .map(|i| loop {
-            let mut fork = AutoCommit::new().with_actor(ActorId::from(bk.sign_pk().0.to_vec()));
-            fork.put(ROOT, "base", format!("fork {i}")).unwrap();
-            fork.commit();
-            let change = fork.get_last_local_change().unwrap();
-            assert_eq!((change.seq(), change.deps()), (first.seq(), first.deps()));
-            let header = Header { author_seq: 0, author_prev: None, ..b.envelope(&b.envelope_ids()[0]).unwrap().header.clone() };
-            let mut header = header;
-            header.stream = doc;
-            header.nonce = random();
-            let ct = b.ring.get(&header.epoch).unwrap().seal(&header.nonce, &content_aad(&header), &fork.get_last_local_change().unwrap().bytes()).unwrap();
-            let sig = bk.sign(CTX_ENV_SIG, &[&encode(&header), &ct]);
-            let env = Envelope { header, ciphertext: ct, sig };
-            if env.id() < lowest {
-                break env;
+        .map(|i| {
+            loop {
+                let mut fork = AutoCommit::new().with_actor(ActorId::from(bk.sign_pk().0.to_vec()));
+                fork.put(ROOT, "base", format!("fork {i}")).unwrap();
+                fork.commit();
+                let change = fork.get_last_local_change().unwrap();
+                assert_eq!((change.seq(), change.deps()), (first.seq(), first.deps()));
+                let header = Header {
+                    author_seq: 0,
+                    author_prev: None,
+                    ..b.envelope(&b.envelope_ids()[0]).unwrap().header.clone()
+                };
+                let mut header = header;
+                header.stream = doc;
+                header.nonce = random();
+                let ct = b
+                    .ring
+                    .get(&header.epoch)
+                    .unwrap()
+                    .seal(&header.nonce, &content_aad(&header), &fork.get_last_local_change().unwrap().bytes())
+                    .unwrap();
+                let sig = bk.sign(CTX_ENV_SIG, &[&encode(&header), &ct]);
+                let env = Envelope { header, ciphertext: ct, sig };
+                if env.id() < lowest {
+                    break env;
+                }
             }
         })
         .collect();
@@ -895,7 +974,8 @@ fn forks_of_an_old_change_rebuild_at_most_once_per_batch() {
     let fork_value = |r: &Replica| r.doc_json(&doc)["base"].clone();
     assert!(fork_value(&a).as_str().unwrap().starts_with("fork "));
     assert_ne!(a.doc_json(&doc), expected_rest);
-    let mut c = Replica::restore(a.me.clone(), a.op(&a.space_id()).unwrap().clone(), a.all_ops(), vec![], None).unwrap();
+    let mut c =
+        Replica::restore(a.me.clone(), a.op(&a.space_id()).unwrap().clone(), a.all_ops(), vec![], None).unwrap();
     let mut reversed = all_envelopes(&a);
     reversed.sort_by_key(|e| e.id());
     c.ingest_batch(vec![], reversed);
@@ -925,15 +1005,18 @@ fn membership_changes_do_not_reopen_documents() {
 fn reference_to_a_concurrent_operation_is_rejected_in_every_delivery_order() {
     let (receiver, mut writer, _) = pair(Role::Writer);
     let doc = StreamId::new_doc();
-    writer.change(doc, |d| {
-        let text = d.put_object(ROOT, "text", automerge::ObjType::Text)?;
-        d.splice_text(&text, 0, 0, "base")
-    }).unwrap();
+    writer
+        .change(doc, |d| {
+            let text = d.put_object(ROOT, "text", automerge::ObjType::Text)?;
+            d.splice_text(&text, 0, 0, "base")
+        })
+        .unwrap();
     let base = writer.doc(&doc).unwrap().clone().get_last_local_change().unwrap();
     let text = automerge::ReadDoc::get(writer.doc(&doc).unwrap(), ROOT, "text").unwrap().unwrap().1;
     let t = text.clone();
     let good = writer.change(doc, move |d| d.splice_text(&t, 4, 0, "B")).unwrap().1.unwrap();
-    let base_env = writer.envelope(&writer.envelope_ids().into_iter().find(|id| *id != good.id()).unwrap()).unwrap().clone();
+    let base_env =
+        writer.envelope(&writer.envelope_ids().into_iter().find(|id| *id != good.id()).unwrap()).unwrap().clone();
     // The receiver's actor inserts after "B" while declaring only `base`.
     let mut full = writer.doc(&doc).unwrap().clone().with_actor(ActorId::from(receiver.me.sign_pk().0.to_vec()));
     full.splice_text(&text, 5, 0, "c").unwrap();

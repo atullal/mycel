@@ -160,7 +160,10 @@ async fn bluetooth_us_to_bluetooth_eu_through_two_gateways() {
     assert_eq!(route.via, g_eu.id(), "the EU phone leaves through its gateway");
     // what crossed which gateway, and the relays saw only ciphertext
     let (gu, ge) = (g_us.mesh().unwrap().stats(), g_eu.mesh().unwrap().stats());
-    eprintln!("US gateway: in {} out {}; EU gateway: in {} out {}", gu.gateway_in, gu.gateway_out, ge.gateway_in, ge.gateway_out);
+    eprintln!(
+        "US gateway: in {} out {}; EU gateway: in {} out {}",
+        gu.gateway_in, gu.gateway_out, ge.gateway_in, ge.gateway_out
+    );
     assert!(gu.gateway_in > 0 && gu.gateway_out > 0 && ge.gateway_in > 0 && ge.gateway_out > 0);
     assert!(a.mesh().unwrap().stats().frames_relayed > 0 && b.mesh().unwrap().stats().frames_relayed > 0);
     for relay in [&a, &b, &g_us, &g_eu] {
@@ -210,7 +213,11 @@ async fn two_gateways_are_two_paths_and_fail_over() {
         tx.finish().unwrap();
     });
     let mesh_tx = |c: &Connection| -> Vec<u64> {
-        c.paths().iter().filter(|p| PathKind::of(p.remote_addr()) == PathKind::Mesh).map(|p| p.stats().udp_tx.bytes).collect()
+        c.paths()
+            .iter()
+            .filter(|p| PathKind::of(p.remote_addr()) == PathKind::Mesh)
+            .map(|p| p.stats().udp_tx.bytes)
+            .collect()
     };
     eventually("half sent", 60, || mesh_tx(&conn).iter().sum::<u64>() >= total / 2).await;
     let per = mesh_tx(&conn);
@@ -244,7 +251,9 @@ async fn two_gateways_are_two_paths_and_fail_over() {
             last_change = Instant::now();
         }
     }
-    eprintln!("failover: longest pause on the surviving gateway path after the cut: {longest:?} (no routing convergence needed)");
+    eprintln!(
+        "failover: longest pause on the surviving gateway path after the cut: {longest:?} (no routing convergence needed)"
+    );
     // bounded by the path idle timeout (5 s): data in flight on the dead
     // path leaves a hole that flow control waits on until loss detection
     assert!(longest < Duration::from_secs(5), "{longest:?}");
@@ -296,7 +305,8 @@ async fn a_data_mule_carries_a_message_across_partitions() {
     a.changed(space);
     eventually("A makes a bundle for C", 30, || a.mesh().unwrap().dtn_stats().originated >= 1).await;
     // and a short-lived one, to see carriers drop expired bundles
-    let short = a.mesh().unwrap().send_bundle(c_id, bytes::Bytes::from_static(b"stale soon"), Duration::from_secs(3)).unwrap();
+    let short =
+        a.mesh().unwrap().send_bundle(c_id, bytes::Bytes::from_static(b"stale soon"), Duration::from_secs(3)).unwrap();
     eventually("the mule takes copies", 20, || {
         let s = mule.mesh().unwrap().dtn_stats();
         s.accepted >= 2
