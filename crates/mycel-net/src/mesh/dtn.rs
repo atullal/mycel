@@ -115,6 +115,11 @@ impl Hasher for WordHash {
     }
 }
 
+/// How long a destination stays doubted ([`Carrier::doubt`]), and how many
+/// are remembered.
+const DOUBT_FOR: Time = 10 * 60_000;
+const DOUBTED_MAX: usize = 1024;
+
 /// The virtual destination "the internet" in predictability tables.
 pub const INTERNET: SignPk = SignPk([0xff; 32]);
 
@@ -413,6 +418,9 @@ struct Held {
     from: Option<SignPk>,
     /// `Carrier::rev` when we took it (what a summary says is new).
     rev: u64,
+    /// Neighbours we gave copies of our own bundle to: each gets one share
+    /// (they may pass it on and forget it, but it went that way).
+    given: Vec<SignPk>,
 }
 
 /// What we last told a neighbour, and when.
@@ -536,6 +544,8 @@ pub struct Carrier {
     /// Offers under way: bundle -> (to, since, copies). Their copies aren't
     /// ours to give again meanwhile (a transfer can take seconds).
     in_flight: Map<Hash32, Vec<(SignPk, Time, u8)>>,
+    /// Destinations whose live route just failed (`doubt`), until when.
+    doubted: Map<SignPk, Time>,
     partial: Map<Hash32, Partial>,
     partial_used: u64,
     housekept: Option<Time>,
@@ -567,6 +577,7 @@ impl Carrier {
             wanted: Vec::new(),
             nb_wants: Map::default(),
             in_flight: Map::default(),
+            doubted: Map::default(),
             partial: Map::default(),
             partial_used: 0,
             housekept: None,
@@ -866,7 +877,7 @@ impl Carrier {
         self.drop_partial(&b.id);
         self.expiry.insert((until, b.id));
         self.rev += 1;
-        self.held.insert(b.id, Held { b, copies, until, from, rev: self.rev });
+        self.held.insert(b.id, Held { b, copies, until, from, rev: self.rev, given: Vec::new() });
         Ok(())
     }
 
@@ -1117,6 +1128,8 @@ impl Carrier {
             })
             .collect();
         let flying = !self.in_flight.is_empty();
+        self.doubted.retain(|_, t| now < *t);
+        let doubted = (!self.doubted.is_empty()).then_some(&self.doubted);
         let mut out = Vec::new();
         let mut unreachable = Vec::new();
         for (id, h) in &self.held {
@@ -1156,7 +1169,32 @@ impl Carrier {
                                     || self.nb_refused.get(&n).is_some_and(|s| s.contains(id))
                             }
                         };
-                        (!busy).then_some((n, copies, Why::Route))
+                        // Our own bundle, and our live packets to its
+                        // destination just went unacknowledged along a mesh
+                        // route (`doubt`): the route may be what failed (a
+                        // black hole on it takes custody and drops
+                        // everything). Half its copies go along the route,
+                        // the rest to other neighbours, the likeliest first,
+                        // one share each, and the last stays with us.
+                        let split = h.b.src == self.me && copies > 1 && doubted.is_some_and(|d| d.contains_key(&dst));
+                        let busy = busy || (split && h.given.contains(&n));
+                        if !busy {
+                            Some((n, if split { copies / 2 } else { copies }, Why::Route))
+                        } else if split && !self.internet {
+                            let room_aware = self.cfg.room_aware;
+                            nbs.iter()
+                                .filter(free)
+                                .filter(|x| x.k != n && !h.given.contains(&x.k))
+                                .map(|x| {
+                                    let u = utility_in(self.cfg.gradient, x.pred, &dst, true);
+                                    let w = if room_aware { x.room.map_or(1.0, |r| r.weight(size)) } else { 1.0 };
+                                    (u * w, x.k)
+                                })
+                                .max_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)))
+                                .map(|(_, k)| (k, copies / 2, Why::Spray))
+                        } else {
+                            None
+                        }
                     }
                     Toward::Soon => None, // a lookup or dial is under way: wait for it
                     _ if !nbs.iter().any(|n| free(&n)) => None,
@@ -1232,6 +1270,21 @@ impl Carrier {
         }
     }
 
+    /// Our live packets to `dst` just went unacknowledged along a mesh
+    /// route (the router's `feedback` says so): for a while, our own
+    /// bundles for `dst` don't trust a live route with all their copies.
+    pub fn doubt(&mut self, dst: SignPk, now: Time) {
+        if !self.doubted.contains_key(&dst) && self.doubted.len() >= DOUBTED_MAX {
+            self.doubted.retain(|_, t| now < *t);
+            if self.doubted.len() >= DOUBTED_MAX
+                && let Some(k) = self.doubted.keys().next().copied()
+            {
+                self.doubted.remove(&k);
+            }
+        }
+        self.doubted.insert(dst, now + DOUBT_FOR);
+    }
+
     /// `to` took (`ok`) or didn't take `copies` copies of `id`.
     pub fn transferred(&mut self, to: SignPk, id: Hash32, copies: u8, ok: bool, now: Time) {
         self.landed(&id, &to);
@@ -1245,6 +1298,9 @@ impl Carrier {
             Some(h) => {
                 if let Some(r) = self.nb_room.get_mut(&to) {
                     r.take(h.b.payload.len() as u64);
+                }
+                if h.b.src == self.me && !h.given.contains(&to) {
+                    h.given.push(to);
                 }
                 h.copies = h.copies.saturating_sub(copies);
                 h.copies == 0

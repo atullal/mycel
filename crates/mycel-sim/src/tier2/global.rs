@@ -809,7 +809,11 @@ impl Router for Global {
                 if timed_out && o.meshed {
                     let dst = key(o.dst);
                     o.meshed = false;
-                    self.core.feedback(dst, false, now);
+                    if self.core.feedback(dst, false, now)
+                        && let Some(c) = self.dtn.as_mut()
+                    {
+                        c.doubt(dst, now);
+                    }
                 }
                 let next = o.rto;
                 let (dst, size, none_acked) = (o.dst, o.size, o.left == o.parts);

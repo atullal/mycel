@@ -1480,18 +1480,22 @@ impl Router {
     /// pulls in routes nothing in an announcement can refute; what it can't
     /// fake is the destination's acknowledgements. A lost packet on a slow
     /// link doesn't count: one acknowledgement clears the strikes.
-    pub fn feedback(&mut self, dst: SignPk, acked: bool, now: Time) {
+    ///
+    /// Returns whether the timeout counted against a mesh route (then the
+    /// store-and-forward carrier shouldn't trust that route with every copy
+    /// of a bundle either: `Carrier::doubt`).
+    pub fn feedback(&mut self, dst: SignPk, acked: bool, now: Time) -> bool {
         if acked {
             self.strikes.remove(&dst);
-            return;
+            return false;
         }
-        let Some(hop) = self.sent_via.get(&dst).copied() else { return };
+        let Some(hop) = self.sent_via.get(&dst).copied() else { return false };
         // only a mesh route that still claims to reach it is judged: a link
         // that broke, or a destination behind a gateway or the internet
         // (perhaps offline), says nothing about the hop
         if !self.is_route_via(&dst, &hop) || !self.nbs.get(&hop).is_some_and(|n| n.up && n.direct) {
             self.strikes.remove(&dst);
-            return;
+            return false;
         }
         let n = match self.strikes.get(&dst) {
             Some((h, n)) if *h == hop => n + 1,
@@ -1499,7 +1503,7 @@ impl Router {
         };
         if n < SUSPECT_STRIKES {
             bounded_insert(&mut self.strikes, dst, (hop, n));
-            return;
+            return true;
         }
         self.strikes.remove(&dst);
         if !self.suspects.contains_key(&dst) && self.suspects.len() >= FEEDBACK_MAX {
@@ -1518,6 +1522,7 @@ impl Router {
         v.push((hop, now + SUSPECT_FOR));
         self.stats.hops_suspected += 1;
         self.next_sweep = self.next_sweep.min(now + SUSPECT_FOR);
+        true
     }
 
     /// The neighbour toward `dst` inside the mesh (no gateways, no internet).
