@@ -363,3 +363,9 @@ check-cfg = ["cfg(fuzzing)"]
 # `cargo test --manifest-path vendor/noq/Cargo.toml` (Mycel's workspace
 # does not build its dev-dependencies).
 [workspace]
+
+# MYCEL PATCH (vendor/noq-proto/MYCEL_PATCH.md §3): build against the vendored
+# noq-proto, as Mycel's workspace does, so noq's own tests see its changes
+# (`PathEvent::Unresponsive`).
+[patch.crates-io]
+noq-proto = { path = "../noq-proto" }

@@ -1869,6 +1869,10 @@ impl State {
                 Path(evt @ PathEvent::RemoteStatus { .. }) => {
                     self.path_events.send(evt).ok();
                 }
+                // MYCEL PATCH (failover, vendor/noq-proto/MYCEL_PATCH.md §3)
+                Path(evt @ PathEvent::Unresponsive { .. }) => {
+                    self.path_events.send(evt).ok();
+                }
                 NatTraversal(update) => {
                     self.nat_traversal_updates.send(update).ok();
                 }

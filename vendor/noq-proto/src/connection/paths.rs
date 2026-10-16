@@ -278,6 +278,10 @@ pub(super) struct PathData {
     /// arrived on this path. Together with a probe timeout this tells a path that went
     /// dead from one that is merely quiet ([`super::Connection::path_unresponsive`]).
     pub(super) last_recv: Option<Instant>,
+    /// MYCEL PATCH (failover, MYCEL_PATCH.md §3): since when the path counts as dead
+    /// (a [`PathEvent::Unresponsive`] was emitted then), until it hears from the peer or
+    /// has something it sent since acknowledged.
+    pub(super) unresponsive_since: Option<Instant>,
 
     /// Snapshot of the qlog recovery metrics
     #[cfg(feature = "qlog")]
@@ -350,6 +354,7 @@ impl PathData {
             permit_idle_reset: true,
             draining: false,
             last_recv: None,
+            unresponsive_since: None,
             #[cfg(feature = "qlog")]
             recovery_metrics: RecoveryMetrics::default(),
             generation,
@@ -399,6 +404,7 @@ impl PathData {
             permit_idle_reset: true,
             draining: false,
             last_recv: None,
+            unresponsive_since: None,
             #[cfg(feature = "qlog")]
             recovery_metrics: prev.recovery_metrics.clone(),
             generation,
@@ -1092,6 +1098,18 @@ pub enum PathEvent {
         id: PathId,
         /// The new status set by the remote
         status: PathStatus,
+    },
+    /// MYCEL PATCH (failover, MYCEL_PATCH.md §3): the path looks dead.
+    ///
+    /// A probe timeout fired on it and nothing arrived on it for a probe timeout either.
+    /// While another path doesn't look dead, this one gets no new data, and what it had in
+    /// flight is retransmitted on the others. Emitted once per such episode, so that path
+    /// selection can move off it at once; `PathStats::unresponsive_from` says whether it
+    /// still is.
+    #[non_exhaustive]
+    Unresponsive {
+        /// The path that looks dead.
+        id: PathId,
     },
     /// Received an observation of our external address from the peer.
     #[non_exhaustive]

@@ -94,22 +94,42 @@ instrumented noq, one run went like this:
 **Fix** (multipath only; single-path connections behave as before):
 
 - **A path that looks dead is passed over** (`path_unresponsive`,
-  `scheduling_info`). It counts as dead when a PTO fired on it (nothing it
-  carried was acknowledged, over any path) *and* nothing arrived on it for a
-  PTO either (new `PathData::last_recv`). Either alone is normal: a path whose
-  packets are acknowledged on another path hears little itself, and a slow path
-  fires a PTO now and then. While another validated path doesn't look dead, it
-  gets no new data and no ACK-only packets. With no alternative, nothing
-  changes.
+  `check_unresponsive`, `scheduling_info`). It counts as dead when nothing it
+  carried was acknowledged, over any path, for about 3 PTOs *and* nothing
+  arrived on it for a PTO (new `PathData::last_recv`). "Not acknowledged" is
+  either two probe timeouts in a row, or, on a path in constant use whose
+  probe timer each send postpones, the oldest unacknowledged packet going out
+  more than 3 PTOs ago.
+  - Each condition alone is normal. A path whose packets are acknowledged on
+    another path hears little itself. A single PTO fires now and then on a
+    healthy path: an ACK held for the peer's max_ack_delay on a fast link is
+    enough.
+  - Once found dead, it stays dead (`unresponsive_since`) until a packet
+    arrives on it or something sent on it *since* is acknowledged. Late ACKs
+    for what it carried before don't revive it.
+  - It is checked on every probe timeout and on every send.
+  - While another validated path doesn't look dead, it gets no new data and no
+    ACK-only packets. With no alternative, nothing changes.
+- **The application is told.** When a path is found dead, the connection emits
+  the new `PathEvent::Unresponsive { id }`. `PathStats` gains `last_recv` and
+  `unresponsive_from` (when it was found dead, or `None`), so a path selector
+  can see it too.
+  - noq forwards the event (`vendor/noq/src/connection.rs`).
+  - Iroh selects again at once on it
+    (`vendor/iroh/src/socket/remote_map/remote_state.rs`).
+  - Mycel's `MycelPathSelector` and `path_in_use` pass over such a path.
+  - `vendor/noq/Cargo.toml` patches `noq-proto` to the vendored copy, so noq's
+    own tests build against these changes.
 - **ACK-only packets move off a quiet path.** They still go on the
-  lowest-numbered path, as upstream, unless nothing arrived on it for a PTO
-  while another path has heard from the peer since; then they go on the path
-  that heard last (`may_send_ack_only`). The receiver of a transfer usually
-  sends nothing ack-eliciting, so it can't see a path die the way a sender
-  does, but it does see it go quiet.
-- **A dead path's data moves at once.** On a PTO on a path that looks dead,
-  while another doesn't, its in-flight packets are declared lost, so their
-  frames are retransmitted on the other paths. A PING goes out on it instead
+  lowest-numbered path that may send data, as upstream, unless nothing arrived
+  on it for a PTO while another path has heard from the peer since. Then they
+  go on the path that heard last, even a backup path, since ACKs aren't data
+  (`is_ack_path`). The receiver of a transfer usually sends nothing
+  ack-eliciting, so it can't see a path die the way a sender does, but it
+  does see it go quiet.
+- **A dead path's data moves at once.** When a path is found dead (and on
+  each later PTO on it) while another isn't, its in-flight packets are
+  declared lost, so their frames are retransmitted on the other paths. A PING goes out on it instead
   of the usual probes, to notice if it comes back. When a path is abandoned
   because it went silent (`TimedOut`) or the network under it changed, its
   in-flight packets are declared lost then too (`lose_in_flight`, factored out
@@ -124,9 +144,12 @@ instrumented noq, one run went like this:
 
 **Test:** `tests::multipath::data_in_flight_on_a_dead_path_moves_to_the_other`.
 Two paths on separate links carry a 1 MB stream. One link silently drops
-everything mid-transfer (`ManyToManyRouting::cut_link`). The rest must arrive
-within 2 s, and the survivor's RTT must stay under 100 ms. Upstream it takes
-the 10 s idle timeout plus the drain (10.2 s); with the patch, 77 ms.
+everything mid-transfer (`ManyToManyRouting::cut_link`).
+- The rest must arrive within 2 s, the survivor's RTT must stay under 100 ms,
+  and the client must get `PathEvent::Unresponsive` for the dead path, with
+  `unresponsive_from` set in its stats.
+- Upstream it takes the 10 s idle timeout plus the drain (10.2 s); with the
+  patch, 0.27 s.
 
 In Mycel, `two_routes_aggregate_and_fail_over` finishes the rest of the
 transfer after losing a relay in ~6.5 s, where it took 6–25 s before.

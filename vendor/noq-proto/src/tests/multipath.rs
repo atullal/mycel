@@ -2415,7 +2415,9 @@ fn late_handshake_done_after_path_zero_discarded() -> TestResult {
 /// the sender heard nothing on either path until the dead one's idle timeout, and the
 /// packets in flight on it were only retransmitted once it was discarded, 3 PTOs after the
 /// peer's PATH_ABANDON, with a PTO that late acknowledgements had inflated. Mycel saw
-/// ~23 s after losing a relay; here it was the 10 s idle timeout plus the drain.
+/// ~23 s after losing a relay; here it was the 10 s idle timeout plus the drain. The
+/// application is also told (`PathEvent::Unresponsive`, `PathStats::unresponsive_from`)
+/// so its path selection moves at once.
 #[test]
 fn data_in_flight_on_a_dead_path_moves_to_the_other() -> TestResult {
     let _guard = subscribe();
@@ -2456,7 +2458,7 @@ fn data_in_flight_on_a_dead_path_moves_to_the_other() -> TestResult {
     assert_eq!(pair.send_stream(Client, s).write(&vec![7u8; LEN]).unwrap(), LEN);
     pair.send_stream(Client, s).finish().unwrap();
     let mut received = 0;
-    let mut read = |pair: &mut ConnPair| {
+    let read = |pair: &mut ConnPair| {
         while let Some(ev) = pair.poll(Server) {
             if matches!(ev, Event::Stream(StreamEvent::Opened { dir: Dir::Uni })) {
                 assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(s));
@@ -2505,6 +2507,16 @@ fn data_in_flight_on_a_dead_path_moves_to_the_other() -> TestResult {
     // The survivor's RTT wasn't inflated by acknowledgements that waited for a way back.
     let rtt = pair.rtt(Client, path1).expect("path 1 lives");
     assert!(rtt < Duration::from_millis(100), "path 1 RTT {rtt:?}");
+    // The application heard that path 0 died, and its stats say so, so path selection
+    // can move off it at once.
+    let mut told = false;
+    while let Some(ev) = pair.poll(Client) {
+        told |= matches!(ev, Event::Path(PathEvent::Unresponsive { id }) if id == PathId::ZERO);
+    }
+    assert!(told, "PathEvent::Unresponsive for path 0");
+    let dead = pair.path_stats(Client, PathId::ZERO).expect("path 0 still open");
+    assert!(dead.unresponsive_from.is_some_and(|t| t <= pair.time));
+    assert!(pair.path_stats(Client, path1).unwrap().unresponsive_from.is_none());
     assert!(!pair.is_closed(Client) && !pair.is_closed(Server));
     Ok(())
 }

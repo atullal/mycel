@@ -82,6 +82,16 @@ Changes (all in `src/socket/remote_map/remote_state.rs`, marked `MYCEL PATCH`):
    - Covered by `crates/mycel-net/tests/mesh.rs`
      (`a_route_found_later_joins_the_live_connection`).
 
+7. **A path QUIC finds dead triggers a new selection**
+   (`RemoteStateActor::handle_path_event`, `NoqPathEvent::Unresponsive`).
+   noq (vendor/noq-proto/MYCEL_PATCH.md §3) emits the event when a path
+   stopped carrying anything and moves its data to the other paths. Iroh then
+   runs the path selector at once instead of at the next one-second tick. The
+   selector sees the path's `PathStats::unresponsive_from` and passes it over.
+   Covered by `crates/mycel-net/tests/links.rs`
+   (`live_connection_moves_to_another_link`): the backup link is selected when
+   the transfer finishes, 0.2–0.3 s after the cut.
+
 Path *selection* policy lives in Mycel: `mycel_net::link::MycelPathSelector`
 picks the selected path and which other paths join the aggregate.
 

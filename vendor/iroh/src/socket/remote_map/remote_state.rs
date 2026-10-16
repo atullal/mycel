@@ -663,6 +663,13 @@ impl RemoteStateActor {
             NoqPathEvent::Discarded { id, path_stats, .. } => {
                 trace!(%id, ?path_stats, "path discarded");
             }
+            // MYCEL PATCH (failover, vendor/noq-proto/MYCEL_PATCH.md §3): a path stopped
+            // carrying anything; select again now (the selector sees it in the path's
+            // stats) instead of at the next tick.
+            NoqPathEvent::Unresponsive { id, .. } => {
+                debug!(%id, "path unresponsive");
+                self.select_path();
+            }
             NoqPathEvent::RemoteStatus { .. } | NoqPathEvent::ObservedAddr { .. } => {
                 // Nothing to do for these events.
             }

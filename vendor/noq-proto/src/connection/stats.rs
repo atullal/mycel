@@ -3,6 +3,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::Duration;
+use crate::Instant;
 use crate::FrameType;
 
 use super::PathId;
@@ -248,6 +249,14 @@ pub struct PathStats {
     pub black_holes_detected: u64,
     /// Largest UDP payload size the path currently supports.
     pub current_mtu: u16,
+    /// MYCEL PATCH (failover, MYCEL_PATCH.md §3): when an authenticated packet last arrived
+    /// on this path.
+    pub last_recv: Option<Instant>,
+    /// MYCEL PATCH (failover, MYCEL_PATCH.md §3): from when this path counts as dead, if a
+    /// probe timeout has fired on it (`None`: it hasn't). It is dead from this instant on,
+    /// a PTO after the last packet arrived on it, unless something arrives first (then the
+    /// next snapshot says so). Compare with the current time.
+    pub unresponsive_from: Option<Instant>,
 }
 
 /// Connection statistics.
@@ -296,6 +305,8 @@ impl std::ops::Add<PathStats> for ConnectionStats {
             lost_plpmtud_probes: _,
             black_holes_detected: _,
             current_mtu: _,
+            last_recv: _,
+            unresponsive_from: _,
         } = rhs;
         Self {
             udp_tx: self.udp_tx + udp_tx,
@@ -329,6 +340,8 @@ impl std::ops::AddAssign<PathStats> for ConnectionStats {
             lost_plpmtud_probes: _,
             black_holes_detected: _,
             current_mtu: _,
+            last_recv: _,
+            unresponsive_from: _,
         } = rhs;
         let Self {
             udp_tx,
