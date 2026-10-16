@@ -703,6 +703,63 @@ fn unacknowledged_packets_move_a_destination_off_its_next_hop() {
     assert_eq!(send(&mut r, later + 20), vec![liar]);
 }
 
+/// The node's evidence comes per QUIC path: `mesh(d, via)` silent while
+/// we send on it. Two such silences, long enough for the route, and the
+/// route offered for `d` moves to another first hop (RouteDown, RouteUp);
+/// a path that isn't a mesh route through a neighbour isn't judged.
+#[test]
+fn a_silent_path_moves_the_offered_route() {
+    let ann = |origin, seq, hops, cost| Announce {
+        hops,
+        cost,
+        origin,
+        seq,
+        flags: 0,
+        scope: 8,
+        uplink: 0,
+        name: Arc::from(""),
+        sig: Sig([0; 64]),
+    };
+    let (liar, honest, d, stranger) = (key(2), key(3), key(9), key(7));
+    let mut r = Router::new(key(1), Config { routes: 1, ..Config::default() });
+    for n in [liar, honest] {
+        r.set_direct(n, true, 0);
+        r.hop_up(n, 0);
+        r.set_cost(n, 100);
+    }
+    let ok = |_: &Announce| true;
+    r.on_announce(liar, ann(d, WALL, 1, 21), 10, WALL, ok);
+    r.on_announce(honest, ann(d, WALL, 3, 500), 10, WALL, ok);
+    r.tick(20);
+    assert_eq!(r.offered(&d), vec![liar]);
+    assert!(!r.path_feedback(d, stranger, Some(100), 3_100), "not a route of ours");
+    assert!(r.path_feedback(d, liar, Some(100), 3_100));
+    r.path_feedback(d, liar, None, 3_200); // it answered: start again
+    r.path_feedback(d, liar, Some(4_000), 7_000);
+    r.tick(7_010);
+    assert_eq!(r.offered(&d), vec![liar], "one silence isn't enough");
+    r.path_feedback(d, liar, Some(4_000), 9_000); // it closed, still silent
+    let mut outs = Vec::new();
+    r.drain(&mut outs);
+    // we advertised the cheap route, so the other is infeasible: a fresh
+    // seqno is asked for (not through the suspect) ...
+    assert!(outs.iter().any(|o| matches!(o, Out::SeqReq { to, req } if *to == honest && req.origin == d)));
+    assert!(!outs.iter().any(|o| matches!(o, Out::SeqReq { to, .. } if *to == liar)));
+    // ... and once it comes, the route moves
+    r.on_announce(honest, ann(d, WALL + 9_005, 3, 500), 9_005, WALL + 9_005, ok);
+    r.tick(9_010);
+    r.drain(&mut outs);
+    assert_eq!(r.offered(&d), vec![honest]);
+    assert!(outs.iter().any(|o| matches!(o, Out::RouteDown { dst, via } if *dst == d && *via == liar)));
+    assert!(outs.iter().any(|o| matches!(o, Out::RouteUp { dst, via, .. } if *dst == d && *via == honest)));
+    // when the suspicion runs out, the cheaper route is offered again
+    let later = 9_000 + SUSPECT_FOR + 1;
+    r.on_announce(liar, ann(d, WALL + later, 1, 21), later, WALL + later, ok);
+    r.on_announce(honest, ann(d, WALL + later, 3, 500), later, WALL + later, ok);
+    r.tick(later + 10);
+    assert_eq!(r.offered(&d), vec![liar]);
+}
+
 /// What a router did with one packet of ours: (dials, lookups, frames sent to).
 fn outcome(r: &mut Router) -> (Vec<SignPk>, usize, Vec<SignPk>) {
     let mut outs = Vec::new();

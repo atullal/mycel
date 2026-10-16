@@ -289,6 +289,14 @@ pub struct ConnectionCounts {
 }
 
 impl Inner {
+    /// Let the mesh watch a connection's mesh paths (end-to-end evidence
+    /// against relays that drop what they announce: `mesh/watch.rs`).
+    fn watch(&self, conn: &Connection) {
+        if let Some(m) = &self.mesh {
+            m.watch(conn);
+        }
+    }
+
     fn prepare(&self, r: &mut Replica) {
         if self.feed_validator.is_some() {
             r.set_feed_validator(self.feed_validator.clone());
@@ -646,6 +654,7 @@ impl ProtocolHandler for Handler {
 /// (`link::transport_config`): beyond it the peer waits for its turn.
 async fn serve_conn(inner: &Arc<Inner>, conn: Connection) {
     inner.accepted.fetch_add(1, Ordering::Relaxed);
+    inner.watch(&conn);
     let peer = to_sign_pk(&conn.remote_id());
     loop {
         tokio::select! {
@@ -838,7 +847,10 @@ async fn serve_eph(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) -> Resu
 async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpn: &[u8]) -> Result<Connection> {
     let addr = inner.addr_of(peer)?;
     match tokio::time::timeout(CONNECT_TIMEOUT, inner.endpoint.connect(addr, alpn)).await {
-        Ok(Ok(c)) => Ok(c),
+        Ok(Ok(c)) => {
+            inner.watch(&c);
+            Ok(c)
+        }
         Ok(Err(e)) => Err(e.into()),
         Err(_) => Err(anyhow!("connect timed out")),
     }
@@ -847,7 +859,9 @@ async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpn: &[u8]) -> Result<Conne
 /// The pooled connection to `peer`, dialed if there is none. One that has
 /// already closed is dropped from the pool and redialed.
 pub(crate) async fn pooled(inner: &Arc<Inner>, peer: &SignPk) -> Result<PooledConn> {
-    inner.pool.get(peer).await
+    let c = inner.pool.get(peer).await?;
+    inner.watch(&c);
+    Ok(c)
 }
 
 /// Run one exchange (`$body`, a future using `$conn`) on the pooled

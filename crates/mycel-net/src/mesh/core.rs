@@ -1499,6 +1499,32 @@ impl Router {
             return false;
         }
         let Some(hop) = self.sent_via.get(&dst).copied() else { return false };
+        self.strike(dst, hop, now, now)
+    }
+
+    /// The same evidence from the node's QUIC connections, one path at a
+    /// time: our path to `dst` through first hop `via` (the mesh address
+    /// `mesh(dst, via)`) has had no authenticated packet back since
+    /// `silent_since` while we kept sending on it (`Some`), or carries them
+    /// (`None`). Only packets QUIC decrypted count, so a relay can't fake
+    /// either: it can only drop. A path that says so (two silences, as for
+    /// [`Router::feedback`]) is suspected for `dst`, and the routes offered
+    /// for it ([`Out::RouteUp`]) move to the next route. Returns whether it
+    /// counted against a mesh route.
+    pub fn path_feedback(&mut self, dst: SignPk, via: SignPk, silent_since: Option<Time>, now: Time) -> bool {
+        match silent_since {
+            None => {
+                if self.strikes.get(&dst).is_some_and(|(h, _, _)| *h == via) {
+                    self.strikes.remove(&dst);
+                }
+                false
+            }
+            Some(since) => self.strike(dst, via, since, now),
+        }
+    }
+
+    /// A timeout through `hop` toward `dst`, silent since `since`.
+    fn strike(&mut self, dst: SignPk, hop: SignPk, since: Time, now: Time) -> bool {
         // only a mesh route that still claims to reach it is judged: a link
         // that broke, or a destination behind a gateway or the internet
         // (perhaps offline), says nothing about the hop
@@ -1507,8 +1533,8 @@ impl Router {
             return false;
         }
         let (n, since) = match self.strikes.get(&dst) {
-            Some((h, n, since)) if *h == hop => (n.saturating_add(1), *since),
-            _ => (1, now),
+            Some((h, n, first)) if *h == hop => (n.saturating_add(1), since.min(*first)),
+            _ => (1, since),
         };
         let cost = self.origins.get(&dst).and_then(|o| o.via.iter().find(|(k, _)| *k == hop)).map_or(0, |(_, v)| v.cost);
         let silence = SUSPECT_SILENCE + 2 * cost as Time / 10;
@@ -1533,6 +1559,23 @@ impl Router {
         v.push((hop, now + SUSPECT_FOR));
         self.stats.hops_suspected += 1;
         self.next_sweep = self.next_sweep.min(now + SUSPECT_FOR);
+        self.touch(dst); // the routes offered for it change
+        // The other routes may be infeasible: we advertised the cheap one
+        // (Babel's feasibility distance). A fresh seqno from the origin
+        // makes them usable, as after a loss.
+        if self.best_unsuspected_route(&dst, None, now).is_none() {
+            let targets: Vec<SignPk> = self.direct_up().filter(|k| *k != hop && *k != dst).collect();
+            if let Some(o) = self.origins.get_mut(&dst)
+                && o.last_req.is_none_or(|t| now.saturating_sub(t) >= SEQREQ_GAP)
+            {
+                o.last_req = Some(now);
+                let req = SeqReq { origin: dst, seq: o.newest + 1, hops: SEQREQ_HOPS };
+                for t in targets {
+                    self.stats.seqreqs_sent += 1;
+                    self.out.push(Out::SeqReq { to: t, req });
+                }
+            }
+        }
         true
     }
 
@@ -1647,6 +1690,11 @@ impl Router {
         self.origins.get(pk).is_some_and(|o| o.latest.flags & F_GATEWAY != 0)
     }
 
+    /// The first hops of the routes to `dst` offered as QUIC paths now.
+    pub fn offered(&self, dst: &SignPk) -> Vec<SignPk> {
+        self.published.get(dst).cloned().unwrap_or_default()
+    }
+
     /// Hops to `dst` leaving through `via` (a local route), or `None`.
     pub fn route_hops(&self, dst: &SignPk, via: &SignPk) -> Option<u8> {
         self.origins.get(dst)?.via.iter().find(|(k, _)| k == via).map(|(_, v)| v.hops)
@@ -1662,6 +1710,13 @@ impl Router {
         }
         let current = self.published.get(origin);
         let mut routes = self.routes(origin, now);
+        // not through a hop suspected for it, while another route remains
+        if let Some(sus) = self.suspects.get(origin) {
+            let ok = |n: &SignPk| !sus.iter().any(|(k, until)| k == n && now < *until);
+            if routes.iter().any(|(n, _)| ok(n)) {
+                routes.retain(|(n, _)| ok(n));
+            }
+        }
         let best = routes.first().map(|(_, v)| v.cost)?;
         let limit = best.saturating_mul(ROUTE_COST_FACTOR).saturating_add(ROUTE_COST_SLACK);
         routes.retain(|(_, v)| v.cost <= limit);
@@ -2150,10 +2205,18 @@ impl Router {
         }
         self.records.retain(|_, t| now.saturating_sub(*t) < REACH_REFRESH * 2);
         self.distrusted.retain(|_, t| now < *t);
-        self.suspects.retain(|_, v| {
+        let mut lapsed = Vec::new();
+        self.suspects.retain(|k, v| {
+            let before = v.len();
             v.retain(|(_, t)| now < *t);
+            if v.len() != before {
+                lapsed.push(*k);
+            }
             !v.is_empty()
         });
+        for k in lapsed {
+            self.touch(k); // its routes may be offered again
+        }
         // a long-quiet peer starts again from the minimum backoff
         self.backoff.retain(|_, (at, _)| now < *at + DIAL_BACKOFF_MAX);
         let mut next = Time::MAX;
