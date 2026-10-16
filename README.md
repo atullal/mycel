@@ -87,12 +87,12 @@ build, because the wire format still changes.
 
 ## Try it
 
-Test builds for every platform are on the
-[dev-2026-10-09-apps pre-release](https://github.com/atullal/mycel/releases/tag/dev-2026-10-09-apps):
-a universal DMG for macOS, an APK for Android, an installer and MSI for
-Windows, and a `.deb`, `.rpm` and AppImage for Linux. Those builds are older
-than the current source and lack its later fixes; to run the current code,
-build from source.
+Test builds are on the [Releases](https://github.com/atullal/mycel/releases)
+page; use the newest pre-release: a universal DMG for macOS, an APK for
+Android, an installer and MSI for Windows, and a `.deb`, `.rpm` and AppImage
+for Linux. Builds from CI come with a `SHA256SUMS` file and a build
+provenance attestation (`gh attestation verify <file> --repo atullal/mycel`).
+To run the current code, build from source.
 
 - **The apps are unsigned.** On a Mac, right-click **Mycel > Open** the first
   time; if macOS says the app is damaged, run
