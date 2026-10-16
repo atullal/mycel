@@ -4,6 +4,13 @@ description = "Guest SDK for Mycel rules bundles: ABI exports, bump allocator, p
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
 
 [dependencies]
-mycel-rules-abi = { path = "../../crates/mycel-rules-abi" }
+mycel-rules-abi = { version = "0.1.0", path = "../../crates/mycel-rules-abi" }
+
+[lints]
+workspace = true

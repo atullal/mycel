@@ -1,7 +1,13 @@
-# Mycel Trust Layer v0 — specification
+# Mycel trust layer: specification
 
-> Status: draft for phase 0 — 2026-10-07. Our own minimal layer; it sits behind the `Trust` abstraction so it can later migrate to Keyhive.
-> **Rule zero: no custom cryptography.** Only standard, widely reviewed primitives. This spec must get an external review before real users depend on it.
+How Mycel decides who may read and write what, with no server to ask. This
+is the layer as implemented in `crates/mycel-crypto`, `crates/mycel-trust`
+and `crates/mycel-sync`; the wire format is version 0 (`mycel/v0/…` context
+strings).
+
+> **Rule zero: no custom cryptography.** Only standard, widely reviewed
+> primitives. **This layer has not had an external review.** Don't rely on
+> it for anything that needs to stay secret until it has.
 
 ## 1. Threat model
 
@@ -16,7 +22,7 @@
 - **Admins are trusted with keys.** A malicious admin can leak keys out-of-band.
 - **A removed member keeps what they already decrypted,** and can read content that partitioned peers keep encrypting under an old epoch before they learn of the removal.
 - **Metadata is visible to keepers:** membership public keys, envelope authors, sizes and timing.
-- **Availability:** keepers can withhold data. Mitigation is multiple keepers. Withholding cannot be detected in v0.
+- **Availability:** keepers can withhold data. Mitigation is multiple keepers. Withholding cannot be detected.
 - **Forward secrecy within an epoch:** not provided. Only post-compromise security on rotation.
 - **A compromised device** can act as its member until removed.
 
@@ -40,7 +46,7 @@
   - `sign`: Ed25519. Also the Iroh node ID, so a transport connection authenticates the device.
   - `kex`: X25519, used for lockboxes.
 - **MemberKeys:** `{ sign_pk, kex_pk, kex_sig }`, where `kex_sig = Sign(sign_sk, "mycel/v0/kex-binding" ‖ kex_pk)`. This proves the device holds both keys, so an attacker cannot substitute a kex key during the invite exchange.
-- **v0 simplification:** member = device. (Multi-device agents arrive in phase 1, as a signed device list under one agent key.)
+- **A member is one device.** Each device has its own keys; one person's devices are separate members of a space.
 
 ## 4. Spaces and the membership graph
 
@@ -152,7 +158,7 @@ aad_i    = "mycel/v0/stream-chunk" ‖ len(A): u32 LE ‖ A ‖ chunk_size: u32 
 
 - The final flag and the index are authenticated, so chunks can't be dropped, reordered, duplicated, truncated at a chunk boundary or extended. An empty file is one empty final chunk. The header's chunk size is bound into every chunk's AAD.
 - Memory is one chunk (plus I/O buffers) whatever the file size. Encryption reads the source once, writing the sealed blob (hashed as it's written) and the sender's plaintext copy in the same pass.
-- **Legacy format:** attachments sent before this used one-shot `XChaCha20-Poly1305(key, nonce, A, plaintext)`. A blob without the magic prefix is opened that way. Only blobs up to 64 MiB are opened like that (the old cap was 50 MiB), so a hostile reference can't make a peer read a huge blob into memory.
+- **Legacy format:** attachments from earlier versions used one-shot `XChaCha20-Poly1305(key, nonce, A, plaintext)`. A blob without the magic prefix is opened that way. Only blobs up to 64 MiB are opened like that, so a hostile reference can't make a peer read a huge blob into memory.
 - Code: `crates/mycel-crypto/src/stream.rs`. Tests cover roundtrip at chunk boundaries (0, 1, chunk − 1, chunk, chunk + 1, many chunks), tampering, wrong key/nonce/AAD, truncation, extension, reordering, duplication and chunk-size changes.
 
 **Transfer.** Blobs are stored per space (`blobs/<space>/<blob>`) and served only to the space's members (stream kind `Blob` on ALPN `mycel/2`). They are streamed between QUIC and disk into `<blob>.part`, in disjoint ranges from every member that has the blob. The receiver checks the BLAKE3 hash of the whole blob before renaming it into place, so a peer can't substitute data. An interrupted transfer resumes from the `.part`, possibly from a different member. The final hash check covers the prefix too, and a bad prefix is discarded and fetched again.
@@ -164,11 +170,11 @@ aad_i    = "mycel/v0/stream-chunk" ‖ len(A): u32 LE ‖ A ‖ chunk_size: u32 
 
 ## 8. Transport rules
 
-- **ALPN** `mycel/2`: one connection per pair of devices; sync, cards, ephemeral messages and blobs are QUIC streams on it, labelled by a stream-kind byte (until 2026-10-08: `mycel/sync/1`, `mycel/card/0`, `mycel/eph/0`, `mycel/blob/0`). Iroh authenticates the remote node ID, which equals the remote `sign_pk`.
+- **ALPN** `mycel/2`: one connection per pair of devices; sync, cards, ephemeral messages and blobs are QUIC streams on it, labelled by a stream-kind byte. Iroh authenticates the remote node ID, which equals the remote `sign_pk`.
 - **Responders serve a space only to its current members**, including Relays. Requests from non-members are refused.
-- **Sync order:** membership ops first, then envelopes (set difference over IDs in v0; range-based reconciliation later).
+- **Sync order:** membership ops first, then envelopes (set difference over full ID inventories).
 - **Everything received is validated by the receiver.** Nothing is trusted because of who sent it.
-- **ALPN** `mycel/mesh/0`: hop connections between nearby devices for multi-hop relaying (ARCHITECTURE.md §12). Accepted from anyone nearby: relaying needs no membership. What crosses a relay is the QUIC traffic of a connection between two *other* devices, so the rules above still apply end to end. See §8b.
+- **ALPN** `mycel/mesh/1`: hop connections between nearby devices for multi-hop relaying ([ARCHITECTURE.md](ARCHITECTURE.md) §8). Accepted from anyone nearby: relaying needs no membership. What crosses a relay is the QUIC traffic of a connection between two *other* devices, so the rules above still apply end to end. See §8b.
 
 ## 8b. Mesh relays: what they can and can't do
 
@@ -190,7 +196,7 @@ A relay forwards QUIC packets of a connection between two other devices.
 - *Drop or delay traffic* (denial of service). Mitigations:
   - up to 3 routes per destination, through distinct neighbours, as separate QUIC paths, so traffic moves to the others when one goes dark (dead paths are noticed in about 3 s);
   - direct paths are always preferred.
-- *Claim a low cost to attract traffic* (black hole): costs aren't signed (each hop adds its own). The same mitigations apply. Route attestations (per-hop signatures) would be a later hardening.
+- *Claim a low cost to attract traffic* (black hole): costs aren't signed (each hop adds its own), and there are no per-hop route attestations. The same mitigations apply.
 - *Replay old announcements of a device that left*, within the 10-minute window, keeping a dead route alive. That costs only failed attempts.
 
 **Load and abuse:**
@@ -219,7 +225,7 @@ A relay forwards QUIC packets of a connection between two other devices.
   - *Remaining:* a device with a single gateway in range depends on it.
 - **Sybil gateways.** Many fake devices near D announce themselves as gateways with a low uplink cost to be chosen.
   - *Mitigations:* each must be a real radio neighbour, rate-limited separately. The uplink cost is signed by the gateway (it can lie, but only about itself). The traffic stays end-to-end encrypted.
-  - *Remaining:* choosing gateways by *measured* end-to-end quality (QUIC's per-path RTT and loss) instead of announced cost would blunt lying further. The multipath selector already does this per connection.
+  - *Remaining:* gateways are chosen by their announced cost, which a gateway can misstate about itself. Once a connection runs, the multipath selector ranks its paths by measured RTT, throughput and loss.
 - **Eclipse.** All of D's neighbours are hostile: they can drop everything and publish nothing for D.
   - *Mitigations:* none at the routing layer. It's the radio-range equivalent of being on a hostile Wi-Fi. Detection: D sees no receipts and no live connections. Content is still never readable or forgeable.
 - **Directory.** Publishing many records for many keys would require many keys; each record costs a signature, and gateways cap what they publish. The n0 relay and the DHT apply their own limits. Lookups can't be forged (signatures), only withheld; the DHT and the relay are independent.
@@ -232,48 +238,125 @@ A relay forwards QUIC packets of a connection between two other devices.
 - **Abuse limits:** a 64 MiB store, 256 KiB bundles, 4 MiB per source, lifetimes up to 7 days, and per-neighbour rate limits. A bundle is never sent back to the device that gave it.
 - **Receipts** are tiny and public: they reveal that D received *something* from S. That is the same metadata the bundle already showed carriers.
 
-## 9. Implementation status (phase 0, 2026-10-07)
+## 8d. Resource limits
 
-| Spec section | Code | Tests |
+Everything a peer sends is bounded before it can cost much. Limits give
+backpressure, not resets: a peer over a limit waits, so a long sync over
+Bluetooth still completes. Code: `crates/mycel-net/src/resources.rs` and
+`link.rs`, `crates/mycel-sync`, `crates/mycel-node`.
+
+- **Streams:** QUIC allows each connection 64 bidirectional and 128
+  unidirectional streams at once. A peer that opens more waits for one to
+  end; nothing is reset.
+- **Frame memory** (encoded bytes a peer can make us hold; the largest frame
+  is 64 MiB):
+  - Devices we share a space with draw on one 128 MiB pool, at most 32 MiB
+    each. Devices we share nothing with get their own 32 MiB pool, 8 MiB
+    each, so a crowd of new keys can't push out the people we talk to. Mesh
+    neighbours have a third pool (32 MiB, 4 MiB each).
+  - The pool is charged only as bytes arrive, so a slow peer delays only its
+    own frames. After a 60-second grace a frame must average 512 B/s to keep
+    its memory. Frames we send are charged to nobody.
+- **Deadlines:** a stream a peer opens must start its first frame within
+  10 s; a reply may take 60 s to start, plus the time our own queued bytes
+  need to drain; bytes under way may stall for at most 30 s. No exchange has
+  a fixed total deadline.
+- **Sync responses** are deduplicated and their encoded size measured
+  before any ciphertext is copied.
+- **Ephemeral messages** (typing, presence): at most 64 KiB of plaintext,
+  checked before decryption.
+- **Document changes:** the limits of §7 rule 9, checked before Automerge
+  parses anything; writers split large edits so every reader accepts them.
+- **Membership:** the pending-op caps of §5 (4,096 in total, 256 per author).
+- **Message requests:** contacts are always admitted and don't count. A
+  stranger can have at most 32 pending requests; when strangers fill all
+  256 slots, the oldest request from the inviter with the most pending is
+  declined, so a flood displaces its own requests first.
+- **Attachments:** see §7b. Concurrent transfers reserve disk space from one
+  shared account, so they can't each count the same free space.
+
+## 9. Code and tests
+
+| Spec section | Code | What the tests cover |
 |---|---|---|
-| §2 primitives | `crates/mycel-crypto` | 14 unit tests: domain separation, framing, kex binding, lockbox info binding, AEAD tamper; streaming attachment AEAD (§7b): chunk boundaries, tamper, truncation, extension, reorder, legacy detection, incremental digest |
-| §3–§6 graph, resolution, epochs | `crates/mycel-trust` (`resolve.rs` = §5) | 13 tests: forged admin ops, pending ops, removal + rotation, concurrent revocation, mutual removal (seniority), delivery-order convergence, rotation recipient checks, bad key commitment, last admin, self-healing rotation |
-| §7 envelopes | `crates/mycel-sync` | 9 tests: replication, reader writes rejected, keeper can't read, outsider/tampered envelopes, forged actor, backdated writes after removal, 3-way convergence, demotion |
-| §8 transport | `crates/mycel-net` | end-to-end over real Iroh QUIC: 5 nodes (admin, writer, reader, keeper, outsider) |
+| §2 primitives | `crates/mycel-crypto` | Domain separation, framing, kex binding, lockbox info binding, AEAD tamper; the streaming attachment AEAD (§7b): chunk boundaries, tamper, truncation, extension, reorder, duplication, chunk-size change, legacy detection, incremental digest |
+| §3–§6 graph, resolution, epochs | `crates/mycel-trust` (`resolve.rs` = §5) | Forged admin ops, pending ops, removal and rotation, concurrent revocation, mutual removal (seniority), delivery-order convergence, rotation recipient checks, bad key commitment, last admin, self-healing rotation, leave, epoch-ID reuse, ops from never-added keys; fan-outs of invalid ops, wide valid frontiers, pending-pool limits and ready admin ops |
+| §7 envelopes | `crates/mycel-sync` | Replication, reader writes rejected, keeper can't read, outsider and tampered envelopes, forged actor, backdated writes after removal, 3-way convergence, demotion, feed causal order, restore from storage, equivocation; decompression and expansion bombs, malformed and deferred changes, declared-history checks (actor, counters, object references), delivery-order and restore consistency |
+| §8–§8d transport, mesh, limits | `crates/mycel-net`, `crates/mycel-node` | End to end over real Iroh QUIC with five nodes (admin, writer, reader, keeper, outsider); forged, renamed and replayed mesh announcements; signed-field cache mutation; stream and frame budgets, stalled and progressing I/O, duplicate requests, invitation validation order, ephemeral limits; attachment consent and disk reservations across restarts |
 
-## 9b. Security review (2026-10-07) — fixed
+`scripts/security-check.sh` runs these security tests without retries, then
+the web checks, `npm audit` and `cargo audit --deny unsound`. The Linux
+build depends on GTK's `glib` 0.18, which has an unsoundness advisory
+(RUSTSEC-2024-0429), so that last gate fails.
 
-An independent adversarial review found these issues. All are fixed, each with a regression test:
+## 9b. Hardening
 
-| # | Severity | Issue | Fix |
-|---|---|---|---|
-| 1 | Critical | Peer-chosen attachment names allowed path traversal on download | Strict basename sanitizer, paths confined to `files/`, macOS quarantine xattr on downloads, opener scope narrowed |
-| 2 | High | Any LAN outsider could push a conversation and impersonate a name | Invites from non-contacts become **message requests** (nothing is trusted or posted until Accept), Decline/Block, blocked keys refused at the network layer, Relay-role invites refused on personal devices |
-| 3 | High | Pre-authentication CPU/RAM exhaustion via junk ops and envelopes | Ops and envelopes from never-added keys are dropped before storage; caps on parents, auth_heads, pending ops, invite size and lockboxes; bounded state cache; index passed to replay |
-| 4 | High | Epoch-ID reuse with a different key could break convergence | `EpochId = H(commitment)`, checked structurally; unlock verifies each key against its own op's commitment |
-| 5 | Medium | Duplicate Automerge (actor, seq) could make docs diverge | Equivocation detected: the lowest envelope ID wins on every peer, and the doc is rebuilt canonically |
-| 6 | Medium | Overflow panic poisoned the global lock (crash loop) | `checked_add`; `parking_lot` mutexes (no poisoning) |
-| 7 | Low | Members who had left could keep posting with backdated heads | `Leave` carries a cutoff and is treated as a revocation |
-| 8 | Low | Blobs weren't scoped to a space, and had no quota | Per-space blob directories. The 2 GiB per-space quota was later replaced (§7b) by refusing unsolicited pushes above 16 MiB on personal devices and refusing any transfer that would leave less than 1 GiB free |
-| 9 | Low | Local HTTP API gaps | Per-run secret token (embedded in the page, `0600` file for the CLI) on every route; file serving limited to attachment folders; browser attachments must come from uploads |
+Adversarial reviews of this code found the issues below. Each is fixed and
+has a regression test that failed against the old code. Described as what
+the code does now:
 
-**Still open:**
-- `NeedInvite` vs `Denied` reveals whether a node holds a space whose 256-bit ID you already know.
-- mDNS and the card protocol reveal device names and public keys on the LAN, by design.
+| Area | Attack or failure | What the code does |
+|---|---|---|
+| Attachment names | A peer-chosen file name could escape the download folder | Names are reduced to a safe basename and confined to `files/`; macOS downloads carry the quarantine flag; the app can only open files there |
+| Strangers | Anyone on the LAN could push a conversation and impersonate a name | Invites from non-contacts are **message requests**: nothing is trusted, posted or stored until Accept. Decline and Block exist; blocked keys are refused at the network layer; personal devices refuse Relay-role invites |
+| Attachment consent | Membership granted by a pending request let a stranger push files before the user accepted | Consent is stored before the invite is admitted and survives restarts; pending and hidden requests can't push files or be downloaded from |
+| Pre-authentication work | Junk ops and envelopes from unknown keys cost CPU and memory | Ops and envelopes from never-added keys are dropped before storage; parents, `auth_heads`, invites and lockboxes are capped; state caches are bounded |
+| Revocation | A fan-out of invalid ops, or a flood of ops with missing parents, could stop an admin from removing a member | Authoring uses the frontier of *valid* ops; the pending pool is capped per author and ready ops bypass it (§5) |
+| Epoch IDs | Reusing an epoch ID with a different key could break convergence | `EpochId = H(commitment)`, checked structurally; each key is checked against its own op's commitment |
+| Equivocation | Two changes for one Automerge (actor, seq) could make documents diverge; a revocation could leave stale exclusions | The lowest envelope ID wins everywhere; exclusions are recomputed from the currently valid changes, so live and restored replicas agree |
+| Change parsing | A malformed change from any writer crashed every member, and kept crashing them after restart; small compressed changes expanded without limit | Decompression and logical expansion are bounded before parsing (§7 rule 9); parser and apply panics are contained; changes apply to a candidate document first; changes waiting for dependencies stay outside Automerge |
+| Change acceptance | Whether a change was accepted could depend on unrelated local history or arrival order | Changes are checked against their declared dependency history only (§7 rule 8) |
+| Mesh announcements | The signature cache was keyed by origin and sequence, so altered signed fields could reuse an earlier check | The cache keys on a digest of every signed field and the signature; only the hop count and cost added on the way may change |
+| Network resources | Unbounded stream tasks; memory allocated up front for a declared 64 MiB frame; no inbound deadlines; repeated IDs in a sync request multiplied copies | The limits of §8d |
+| Crashes | An overflow panic poisoned a global lock (crash loop) | Checked arithmetic; locks that can't be poisoned |
+| Leaving | A member who had left could keep posting with backdated heads | `Leave` carries a cutoff and counts as a revocation |
+| Disk use | Blobs weren't scoped to a space; failed pushes left partial files; concurrent transfers counted the same free space | Blobs are stored per space; pushes stage to disposable files cleaned up on failure; transfers reserve space from one account (§7b, §8d) |
+| Identity | A failed read could silently create a new identity; on iOS the key was a plain file | Reads fail closed and the profile is locked; iOS keeps the key in a device-only Keychain item, moved there only after it is safely stored, with no plaintext fallback |
+| Storage | A save could report success before an earlier batch was written; failed batches were dropped; a damaged setting silently reset | Commits are ordered and failures retried; damaged records are set aside, not deleted; an unreadable network setting becomes Local only, never wider; the user is told (`Notice`) |
+| Notifications and logs | OS notifications showed names, text and file names; logs showed file paths | Notifications say only what happened; Bluetooth diagnostics are opt-in; logs are private to the user on Unix; attachment errors are redacted |
+| Local HTTP API (`mycel serve`) | Any local page could call it | A per-run secret token on every route (embedded in the page; a `0600` file for the CLI); loopback `Host` only; file serving limited to attachment folders; attachments from the browser only as uploads |
 
-**Spec drift fixed in this doc:**
-- The sync protocol runs as `Sync` streams on ALPN `mycel/2` (it was ALPN `mycel/sync/1`).
-- The header field is `stream` (Doc or Feed), not `doc`.
-- Seniority is computed from ops that pass authorization ignoring concurrency.
-- Forks before a cutoff are tolerated but not yet surfaced in the UI.
+## 10. Limitations
 
-## 10. Known v0 gaps (tracked)
-- **Post-quantum:** lockboxes are long-lived ciphertext stored on keepers, so they are exposed to harvest-now-decrypt-later attacks. Move to X-Wing (hybrid ML-KEM + X25519, already supported by `hpke` 0.14) once the IETF draft is final.
-- **Performance:** resolution is linear for linear history but still O(n²) for heavily concurrent membership ops, and envelope validity is recomputed for every envelope on each membership change. Incremental resolution is planned for phase 1.
-- **Equivocation:** each batch carrying a lower-ID fork of an already-applied change costs one linear rebuild of that document, and the displaced change's descendants are dropped (as for revocations). Bounding this to once per slot would need a different canonical-fork rule.
-- **Sync efficiency:** sync sends full ID inventories. Replace with range-based set reconciliation (Negentropy-style).
-- Multi-device agents and device revocation (phase 1).
-- Rotation cost is O(n) lockboxes per rotation. Fine for groups up to a few hundred; switch to TreeKEM/BeeKEM-style rotation later.
-- Honest edits built on top of a removed member's concurrent edits are dropped on rebuild (Automerge needs dependencies). This needs a "re-author" recovery flow.
-- Keepers see metadata. So do mesh relays (who talks to whom, sizes, timing; §8b).
-- Needs a professional cryptographic review before production.
+What this layer does **not** do:
+
+- **No external review.** The design and code have had internal
+  adversarial reviews with regression tests, not an independent
+  cryptographic audit.
+- **No per-message forward secrecy.** Content keys are per epoch, and the
+  history of a document stays readable to its members. A stolen device key
+  plus the stored lockboxes and history exposes the epochs that device
+  could read. Removing a member doesn't erase what they already received.
+- **Not post-quantum.** Lockboxes use X25519 and are stored long-term on
+  keepers, so they are exposed to harvest-now-decrypt-later attacks.
+- **Metadata.** Keepers see membership keys, authors, sizes and timing;
+  mesh relays and gateways see who talks to whom, sizes and timing (§8b–8c).
+  Transport encryption doesn't hide IP addresses or local discovery names,
+  and there is no anonymity.
+- `NeedInvite` vs `Denied` reveals whether a node holds a space whose 256-bit
+  ID you already know. mDNS and the card protocol reveal device names and
+  public keys on the LAN, by design.
+- **One device per member.** There are no multi-device identities and no
+  device revocation for a person: each device is its own member, and the
+  identity key is the account, with no recovery if it is lost.
+- **Keys at rest.** iOS keeps the device key in the Keychain; the other
+  platforms keep `identity.key` as a file (owner-only on Unix; on Windows,
+  the user profile's permissions). Downloaded attachments are plaintext in
+  the app's files folder. There is no database encryption, app lock or
+  app-switcher redaction.
+- **Scale.** Resolution is linear for linear history but O(n²) for heavily
+  concurrent membership ops, and envelope validity is recomputed on each
+  membership change. Rotation sends one lockbox per reader: fine up to a
+  few hundred members. Sync exchanges full ID inventories.
+- **Rebuild costs.** A batch carrying a lower-ID fork of an already-applied
+  change costs one linear rebuild of that document, and the displaced
+  change's descendants are dropped, as for revocations. Honest edits built
+  on a removed member's concurrent edits are dropped on rebuild (Automerge
+  needs their dependencies).
+- **Protocol bound.** A genuinely concurrent valid frontier wider than 64
+  ops can't be authored on (§5).
+- **Resource use** is bounded per peer and per node (§8d), not per process:
+  decoding, history, codecs and the OS network stack cost memory on top.
+  Accepted members' history and attachments have no cumulative storage
+  quota, and a process killed mid-push can leave staging files behind.
+- **Forks before a cutoff** are tolerated but not shown in the UI.

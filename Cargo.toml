@@ -5,9 +5,56 @@ members = ["crates/*", "apps/host/src-tauri", "bench/mycel-bench"]
 [workspace.package]
 edition = "2024"
 version = "0.0.1"
+# Kept equal to the toolchain pinned in rust-toolchain.toml: bump both together.
+rust-version = "1.96"
 license = "MIT OR Apache-2.0"
+authors = ["The Mycel contributors"]
+repository = "https://github.com/atullal/mycel"
+homepage = "https://github.com/atullal/mycel"
 
-# Keep build artifacts small (disk is nearly full); line tables still give useful backtraces.
+# Shared by every first-party crate (`[lints] workspace = true`); the rules
+# workspace has its own copy. CI runs clippy with `-D warnings`, so "warn"
+# fails CI too. Only lints the code passes today: add stricter ones (such as
+# clippy::undocumented_unsafe_blocks) together with the fixes they need.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+# Identifiers are ASCII: no look-alike Unicode names.
+non_ascii_idents = "deny"
+explicit_outlives_requirements = "warn"
+macro_use_extern_crate = "warn"
+meta_variable_misuse = "warn"
+redundant_lifetimes = "warn"
+unit_bindings = "warn"
+unused_extern_crates = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+# Debugging leftovers and unfinished code.
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+# Safety comments and docs must be where they belong.
+unnecessary_safety_comment = "warn"
+unnecessary_safety_doc = "warn"
+# Correctness and clarity.
+checked_conversions = "warn"
+debug_assert_with_mut_call = "warn"
+empty_drop = "warn"
+float_cmp_const = "warn"
+fn_to_numeric_cast_any = "warn"
+implicit_clone = "warn"
+inefficient_to_string = "warn"
+lossy_float_literal = "warn"
+mem_forget = "warn"
+mixed_read_write_in_expression = "warn"
+rc_mutex = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+string_lit_as_bytes = "warn"
+suspicious_xor_used_as_pow = "warn"
+try_err = "warn"
+unnecessary_self_imports = "warn"
+
+# Line tables only: keeps target/ small and still gives useful backtraces.
 [profile.dev]
 debug = "line-tables-only"
 

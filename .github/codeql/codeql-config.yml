@@ -1,0 +1,11 @@
+name: Mycel CodeQL config
+
+# Vendored upstream crates are covered by their upstreams and by RustSec
+# (cargo-deny); Mycel's patches in them are small and listed in each
+# MYCEL_PATCH.md. Build output and benchmark data aren't source.
+paths-ignore:
+  - vendor
+  - target
+  - "**/node_modules"
+  - "**/dist"
+  - bench/results

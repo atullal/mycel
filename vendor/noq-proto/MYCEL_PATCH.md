@@ -62,8 +62,4 @@ That connection must close with INTERNAL_ERROR, and a new connection on the
 same endpoint must still work. Upstream 1.3.0 aborts the test process with
 "thread caused non-unwinding panic. aborting."
 
-## Upstream report (draft, not filed)
-
-The text is in `vendor/noq-proto/UPSTREAM_ISSUE.md`.
-
 **Drop this patch** once upstream releases fixes for both.

@@ -1,7 +1,16 @@
 [package]
 name = "mycel-net"
+description = "Mycel network layer: Spaces over Iroh QUIC, with live sync, discovery, invites and blobs"
 version = "0.1.0"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# Never published: it builds against the patched crates in vendor/, which a
+# crates.io copy would silently replace with unpatched upstream.
+publish = false
 
 [features]
 # Publish and resolve gateway records on the BitTorrent Mainline DHT.
@@ -38,3 +47,6 @@ windows-sys = { version = "0.61", features = ["Win32_Media", "Win32_Storage_File
 serde_json = "1.0.151"
 bytes = "1.12"
 tokio = { version = "1.53.2", features = ["full"] }
+
+[lints]
+workspace = true

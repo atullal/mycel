@@ -2,6 +2,12 @@
   "name": "@mycel/sdk",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/atullal/mycel.git",
+    "directory": "packages/sdk"
+  },
   "description": "TypeScript SDK for Mycel apps: typed client over the Mycel runtime, plus React hooks.",
   "type": "module",
   "sideEffects": [

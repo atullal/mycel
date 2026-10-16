@@ -114,10 +114,7 @@ pub mod __private {
     }
 
     pub fn reduce(ptr: i32, len: i32, f: fn(RuleInput, &[u8]) -> Result<Vec<u8>, u32>) -> i64 {
-        let ReduceInput {
-            input: rule_input,
-            state,
-        } = abi::decode_exact(input(ptr, len)).unwrap_or_else(|| trap());
+        let ReduceInput { input: rule_input, state } = abi::decode_exact(input(ptr, len)).unwrap_or_else(|| trap());
         let out = match f(rule_input, &state) {
             Ok(state) => ReduceOutput::Accept { state },
             Err(code) => ReduceOutput::Reject { code },
@@ -217,10 +214,7 @@ mod wasm_runtime {
     }
 
     #[global_allocator]
-    static ALLOC: Bump = Bump {
-        next: Cell::new(0),
-        end: Cell::new(0),
-    };
+    static ALLOC: Bump = Bump { next: Cell::new(0), end: Cell::new(0) };
 
     #[panic_handler]
     fn panic(_: &core::panic::PanicInfo) -> ! {

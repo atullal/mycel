@@ -42,6 +42,9 @@ rustup component add llvm-tools >/dev/null 2>&1 || true
 
 cd "$ROOT"
 [ -d node_modules ] || npm install
+# Keep this machine's paths (home directory, Cargo registry, toolchain) out of
+# the binaries.
+source "$ROOT/scripts/remap-paths.sh"
 
 VERSION="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$ROOT/apps/host/src-tauri/tauri.conf.json" | head -1)"
 OUT="$ROOT/dist-release"
