@@ -1536,7 +1536,8 @@ impl Router {
             Some((h, n, first)) if *h == hop => (n.saturating_add(1), since.min(*first)),
             _ => (1, since),
         };
-        let cost = self.origins.get(&dst).and_then(|o| o.via.iter().find(|(k, _)| *k == hop)).map_or(0, |(_, v)| v.cost);
+        let cost =
+            self.origins.get(&dst).and_then(|o| o.via.iter().find(|(k, _)| *k == hop)).map_or(0, |(_, v)| v.cost);
         let silence = SUSPECT_SILENCE + 2 * cost as Time / 10;
         if n < SUSPECT_STRIKES || now.saturating_sub(since) < silence {
             bounded_insert(&mut self.strikes, dst, (hop, n, since));
@@ -1631,7 +1632,8 @@ impl Router {
             self.gw_dirty.clear();
         }
         if self.gw_sorted.is_none() {
-            let mut v: Vec<(SignPk, u32, u32, SignPk)> = self.gw_table.iter().map(|(g, (t, m, n))| (*g, *t, *m, *n)).collect();
+            let mut v: Vec<(SignPk, u32, u32, SignPk)> =
+                self.gw_table.iter().map(|(g, (t, m, n))| (*g, *t, *m, *n)).collect();
             v.sort_by_key(|(g, total, _, _)| (*total, g.0));
             self.gw_sorted = Some(v);
         }
@@ -1910,7 +1912,11 @@ impl Router {
         } else {
             // 4. no internet: the default route, to the gateway with the
             // lowest total cost
-            let first = self.gateway_routes_cached(now).iter().find(|(g, _, _, n)| Some(n) != from && Some(g) != from).map(|r| r.3);
+            let first = self
+                .gateway_routes_cached(now)
+                .iter()
+                .find(|(g, _, _, n)| Some(n) != from && Some(g) != from)
+                .map(|r| r.3);
             match first {
                 Some(first) => Next::Via(first),
                 None => Next::Drop,
@@ -2168,7 +2174,13 @@ impl Router {
             for k in gone {
                 self.touch(k);
             }
-            self.next_gc = self.origins.values().filter(|o| o.via.is_empty() && o.pending.is_none()).map(|o| o.seen + gc).min().unwrap_or(Time::MAX);
+            self.next_gc = self
+                .origins
+                .values()
+                .filter(|o| o.via.is_empty() && o.pending.is_none())
+                .map(|o| o.seen + gc)
+                .min()
+                .unwrap_or(Time::MAX);
             self.gc_check = false;
         }
         if now >= self.next_sweep {

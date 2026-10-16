@@ -26,11 +26,7 @@ impl std::fmt::Debug for BleTransport {
 
 impl CustomTransport for BleTransport {
     fn bind(&self) -> io::Result<Box<dyn CustomEndpoint>> {
-        let rx = self
-            .rx
-            .clone()
-            .try_lock_owned()
-            .map_err(|_| io::Error::other("bluetooth link already bound"))?;
+        let rx = self.rx.clone().try_lock_owned().map_err(|_| io::Error::other("bluetooth link already bound"))?;
         let local = addr_of(&self.hub.me);
         Ok(Box::new(BleEndpoint {
             hub: self.hub.clone(),

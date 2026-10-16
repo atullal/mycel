@@ -52,15 +52,31 @@ pub enum ChatOp {
         reply_to: Option<Hash32>,
         attachments: Vec<AttachmentRef>,
     },
-    Edit { target: Hash32, body: String },
-    Delete { target: Hash32 },
-    React { target: Hash32, emoji: String, on: bool },
+    Edit {
+        target: Hash32,
+        body: String,
+    },
+    Delete {
+        target: Hash32,
+    },
+    React {
+        target: Hash32,
+        emoji: String,
+        on: bool,
+    },
     /// "I have read everything up to and including `up_to`."
-    Receipt { up_to: Hash32 },
+    Receipt {
+        up_to: Hash32,
+    },
     /// The author's display name in this conversation.
-    Profile { name: String },
+    Profile {
+        name: String,
+    },
     /// Conversation metadata (admins only).
-    Meta { title: Option<String>, direct: bool },
+    Meta {
+        title: Option<String>,
+        direct: bool,
+    },
 }
 
 impl ChatOp {
@@ -143,10 +159,7 @@ impl ChatView {
     /// Messages by others after my read marker.
     pub fn unread_for(&self, me: &SignPk) -> u32 {
         let start = self.read_upto.get(me).map_or(0, |i| i + 1);
-        self.messages[start.min(self.messages.len())..]
-            .iter()
-            .filter(|m| m.author != *me && !m.deleted)
-            .count() as u32
+        self.messages[start.min(self.messages.len())..].iter().filter(|m| m.author != *me && !m.deleted).count() as u32
     }
 
     pub fn has_read(&self, who: &SignPk, index: usize) -> bool {
@@ -191,12 +204,29 @@ pub struct ChatState {
 enum Undo {
     Nothing,
     /// A new message: remove it and restore its author's read marker.
-    Text { author: SignPk, read: Option<usize> },
+    Text {
+        author: SignPk,
+        read: Option<usize>,
+    },
     /// A message changed: restore it.
-    Message { at: usize, before: Box<Message> },
-    Receipt { who: SignPk, read: Option<usize> },
-    Profile { who: SignPk, name: Option<String>, history: Option<ProfileHistory> },
-    Meta { title: Option<String>, direct: bool, ever_group: bool },
+    Message {
+        at: usize,
+        before: Box<Message>,
+    },
+    Receipt {
+        who: SignPk,
+        read: Option<usize>,
+    },
+    Profile {
+        who: SignPk,
+        name: Option<String>,
+        history: Option<ProfileHistory>,
+    },
+    Meta {
+        title: Option<String>,
+        direct: bool,
+        ever_group: bool,
+    },
 }
 
 impl ChatState {
@@ -462,12 +492,21 @@ mod tests {
     fn deletion_clears_all_media_and_reactions_and_cannot_be_undone_by_later_ops() {
         for (mime, name) in [("image/png", "photo.png"), ("text/plain", "file.txt"), ("audio/mp4", "voice.m4a")] {
             let attachment = AttachmentRef {
-                blob: Hash32([20; 32]), key: [21; 32], nonce: [22; 24],
-                name: name.into(), mime: mime.into(), size: 123,
+                blob: Hash32([20; 32]),
+                key: [21; 32],
+                nonce: [22; 24],
+                name: name.into(),
+                mime: mime.into(),
+                size: 123,
             };
             let target = Hash32([1; 32]);
             let mut items = vec![
-                item(1, 1, Role::Writer, ChatOp::Text { body: "caption".into(), reply_to: None, attachments: vec![attachment.clone()] }),
+                item(
+                    1,
+                    1,
+                    Role::Writer,
+                    ChatOp::Text { body: "caption".into(), reply_to: None, attachments: vec![attachment.clone()] },
+                ),
                 item(2, 2, Role::Writer, ChatOp::React { target, emoji: "test".into(), on: true }),
                 item(3, 2, Role::Admin, ChatOp::Delete { target }),
             ];
@@ -545,7 +584,11 @@ mod tests {
                     None => ChatOp::Profile { name: "x".into() },
                 },
                 5 => match target(next()) {
-                    Some((t, _)) => ChatOp::React { target: t, emoji: ["a", "b"][(next() % 2) as usize].into(), on: next() % 3 != 0 },
+                    Some((t, _)) => ChatOp::React {
+                        target: t,
+                        emoji: ["a", "b"][(next() % 2) as usize].into(),
+                        on: next() % 3 != 0,
+                    },
                     None => ChatOp::Profile { name: "y".into() },
                 },
                 6 => match target(next()) {
@@ -558,7 +601,14 @@ mod tests {
             if matches!(op, ChatOp::Text { .. }) {
                 texts.push((id, author));
             }
-            items.push(FeedItem { id, author: pk(author), author_role: role, ts_ms: n as u64, deps: vec![], body: op.encode() });
+            items.push(FeedItem {
+                id,
+                author: pk(author),
+                author_role: role,
+                ts_ms: n as u64,
+                deps: vec![],
+                body: op.encode(),
+            });
         }
         items
     }
@@ -621,7 +671,14 @@ mod tests {
                 1 => ChatOp::React { target, emoji: "ok".into(), on: true },
                 _ => ChatOp::Receipt { up_to: target },
             };
-            let item = FeedItem { id: Hash32::digest("test/new", &n.to_le_bytes()), author: pk(9), author_role: Role::Writer, ts_ms: 200_000 + n as u64, deps: vec![], body: op.encode() };
+            let item = FeedItem {
+                id: Hash32::digest("test/new", &n.to_le_bytes()),
+                author: pk(9),
+                author_role: Role::Writer,
+                ts_ms: 200_000 + n as u64,
+                deps: vec![],
+                body: op.encode(),
+            };
             state.apply(std::slice::from_ref(&item));
             assert!(state.view().index_of(&item.id).is_some() || n % 3 != 0);
         }

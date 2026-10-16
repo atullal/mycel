@@ -29,10 +29,8 @@
 //! - delivery receipts back to the sender;
 //! - k routes: the sender also sends a copy along its second-best route.
 
-
-
-use crate::stats::{Map, Set};
 use super::engine::{Cx, DirRecord, MS, MsgId, NodeId, Over, Router, SEC, Techs, Time};
+use crate::stats::{Map, Set};
 
 /// Reference size for routing-table costs (one QUIC packet).
 const REF: u32 = 1200;
@@ -331,11 +329,7 @@ impl Mycel {
     /// Expected delay to the internet (the DTN gradient): the gateway cost
     /// if there's a route, else how long ago the last known way out was.
     fn metric(gc: Time, li: Option<Time>, now: Time) -> Time {
-        if gc < NEVER {
-            gc
-        } else {
-            li.map_or(NEVER, |t| now.saturating_sub(t) + 10 * SEC)
-        }
+        if gc < NEVER { gc } else { li.map_or(NEVER, |t| now.saturating_sub(t) + 10 * SEC) }
     }
 
     fn send_ogm_all(&mut self, cx: &mut Cx<Frame>, f: &Frame, except: Option<NodeId>) {
@@ -353,7 +347,15 @@ impl Mycel {
         self.seq += 1;
         let gw = if self.cfg.use_internet && cx.has_inet() { Self::uplink_cost(cx) } else { None };
         self.touch_li(cx);
-        let f = Frame::Ogm { origin: self.me, seq: self.seq, hops: 0, cost: Cost::default(), gw, gc: self.gc(cx), li: self.li };
+        let f = Frame::Ogm {
+            origin: self.me,
+            seq: self.seq,
+            hops: 0,
+            cost: Cost::default(),
+            gw,
+            gc: self.gc(cx),
+            li: self.li,
+        };
         self.send_ogm_all(cx, &f, None);
         if self.role == Role::Replayer && self.old_ogms.len() > 20 {
             let old: Vec<Frame> = self.old_ogms.drain(..10).collect();
@@ -419,7 +421,8 @@ impl Mycel {
                 *r = Route { seq, cost: c, via: from, hops, gw, at: now, rebroadcast: r.rebroadcast, alt };
             }
             None => {
-                self.table.insert(origin, Route { seq, cost: c, via: from, hops, gw, at: now, rebroadcast: 0, alt: None });
+                self.table
+                    .insert(origin, Route { seq, cost: c, via: from, hops, gw, at: now, rebroadcast: 0, alt: None });
             }
         }
         if hops < ttl {
@@ -483,7 +486,9 @@ impl Mycel {
             let size = d.size + HDR;
             let control = d.receipt;
             cx.send_radio(via, Frame::Data(d.clone()), size, control, Some(d.msg));
-            if at_source && self.cfg.k_routes > 1 && !d.receipt
+            if at_source
+                && self.cfg.k_routes > 1
+                && !d.receipt
                 && let Some((alt, _)) = r.alt
                 && alt != via
                 && self.nbrs.contains_key(&alt)
@@ -767,7 +772,8 @@ impl Router for Mycel {
     }
 
     fn on_send(&mut self, cx: &mut Cx<Frame>, msg: MsgId, dst: NodeId, size: u32) {
-        let d = Data { msg, src: self.me, dst, size, ttl: 32, stage: Stage::Mesh, copies: self.cfg.copies, receipt: false };
+        let d =
+            Data { msg, src: self.me, dst, size, ttl: 32, stage: Stage::Mesh, copies: self.cfg.copies, receipt: false };
         cx.copied(msg);
         self.seen.insert((msg, false));
         self.route(cx, d, true);

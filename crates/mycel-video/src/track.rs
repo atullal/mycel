@@ -328,7 +328,12 @@ pub struct PeerVideo {
 impl VideoTrack {
     /// Start video with one peer on `conn`: receive whatever streams are
     /// handed to [`VideoTrack::accept_stream`], send once the camera is on.
-    pub fn start(conn: Connection, ui: broadcast::Sender<UiFrame>, opts: TrackOptions, rt: tokio::runtime::Handle) -> VideoTrack {
+    pub fn start(
+        conn: Connection,
+        ui: broadcast::Sender<UiFrame>,
+        opts: TrackOptions,
+        rt: tokio::runtime::Handle,
+    ) -> VideoTrack {
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             conn: conn.clone(),
@@ -538,26 +543,16 @@ fn reset_seq(e: &ReadError) -> Option<u32> {
 /// Portrait cameras receive a portrait budget; H.264 requires even sizes.
 fn fitted_quality(width: u32, height: u32, budget: Quality) -> Quality {
     let (width, height) = (width.max(2), height.max(2));
-    let (bw, bh) = if height > width {
-        (budget.height, budget.width)
-    } else {
-        (budget.width, budget.height)
-    };
+    let (bw, bh) = if height > width { (budget.height, budget.width) } else { (budget.width, budget.height) };
     let even = |n: u32| (n & !1).max(2);
     let (w, h) = if width <= bw && height <= bh {
         (even(width), even(height))
     } else if u64::from(width) * u64::from(bh) >= u64::from(height) * u64::from(bw) {
         let w = even(bw);
-        (
-            w,
-            even((u64::from(height) * u64::from(w) / u64::from(width)) as u32),
-        )
+        (w, even((u64::from(height) * u64::from(w) / u64::from(width)) as u32))
     } else {
         let h = even(bh);
-        (
-            even((u64::from(width) * u64::from(h) / u64::from(height)) as u32),
-            h,
-        )
+        (even((u64::from(width) * u64::from(h) / u64::from(height)) as u32), h)
     };
     Quality::new(w, h, budget.fps)
 }
@@ -612,7 +607,8 @@ fn encode_loop(sh: Arc<Shared>, out: mpsc::UnboundedSender<EncodedFrame>) {
         // Browser capture fits its own source before encoding. Native
         // VideoToolbox scales directly into these dimensions, so fit here.
         // A camera rotation changes the size and creates a fresh keyframe.
-        let quality = if crate::platform::SOURCE_PACED { quality } else { fitted_quality(pic.width, pic.height, quality) };
+        let quality =
+            if crate::platform::SOURCE_PACED { quality } else { fitted_quality(pic.width, pic.height, quality) };
         let reuse = match &mut encoder {
             Some((_, q, _)) if q.width == quality.width && q.height == quality.height => true,
             // A source that encodes itself (the web view) just gets new
@@ -720,7 +716,13 @@ async fn send_frames(sh: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<EncodedFra
         }
         let wire = f.encode();
         if std::env::var_os("MYCEL_VIDEO_DEBUG").is_some() {
-            eprintln!("[video {:?}] send #{seq} key={key} {} B {}x{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100_000, wire.len(), f.width, f.height);
+            eprintln!(
+                "[video {:?}] send #{seq} key={key} {} B {}x{}",
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() % 100_000,
+                wire.len(),
+                f.width,
+                f.height
+            );
         }
         let Ok(mut tx) = sh.conn.open_uni().await else { return };
         let _ = tx.set_priority(FRAME_PRIORITY);
@@ -871,7 +873,8 @@ async fn tick(sh: Arc<Shared>) {
         // frames stuck too long: give up on them and start over from a keyframe
         {
             let mut o = sh.outstanding.lock();
-            let stale: Vec<u32> = o.iter().filter(|(_, f)| now.duration_since(f.queued) > STALE).map(|(s, _)| *s).collect();
+            let stale: Vec<u32> =
+                o.iter().filter(|(_, f)| now.duration_since(f.queued) > STALE).map(|(s, _)| *s).collect();
             if !stale.is_empty() {
                 for s in stale {
                     if let Some(f) = o.remove(&s) {
@@ -1002,22 +1005,10 @@ mod size_tests {
     fn camera_shape_survives_portrait_landscape_and_rotation() {
         let budget = Quality::new(1280, 720, 30);
         assert_eq!(fitted_quality(1920, 1080, budget), budget);
-        assert_eq!(
-            fitted_quality(1080, 1920, budget),
-            Quality::new(720, 1280, 30)
-        );
-        assert_eq!(
-            fitted_quality(1920, 1440, budget),
-            Quality::new(960, 720, 30)
-        );
-        assert_eq!(
-            fitted_quality(1440, 1920, budget),
-            Quality::new(720, 960, 30)
-        );
-        assert_ne!(
-            fitted_quality(1080, 1920, budget),
-            fitted_quality(1920, 1080, budget)
-        );
+        assert_eq!(fitted_quality(1080, 1920, budget), Quality::new(720, 1280, 30));
+        assert_eq!(fitted_quality(1920, 1440, budget), Quality::new(960, 720, 30));
+        assert_eq!(fitted_quality(1440, 1920, budget), Quality::new(720, 960, 30));
+        assert_ne!(fitted_quality(1080, 1920, budget), fitted_quality(1920, 1080, budget));
     }
 
     #[test]
@@ -1029,8 +1020,7 @@ mod size_tests {
                 assert_eq!(fitted.height % 2, 0);
                 assert!(fitted.width <= w && fitted.height <= h);
                 assert!(fitted.pixels() <= budget.pixels());
-                let shape_error =
-                    (fitted.width as f64 / fitted.height as f64 - w as f64 / h as f64).abs();
+                let shape_error = (fitted.width as f64 / fitted.height as f64 - w as f64 / h as f64).abs();
                 assert!(
                     shape_error <= 2.0 * (1.0 + w as f64 / h as f64) / fitted.height as f64,
                     "{w}x{h} => {fitted:?}"

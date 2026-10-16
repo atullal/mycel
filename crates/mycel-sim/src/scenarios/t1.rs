@@ -15,23 +15,75 @@ use super::{Opts, Scenario};
 use crate::models::{Access, Env, Nat, Tech};
 use crate::report::{ScenarioResult, fmt};
 use crate::stats::{Rng, Summary};
-use crate::tier1::{self, CallOutcome, Delivery, DevOpts, Lab, Uplink, block_on, grid, internet, net, relays, resources, summarize};
+use crate::tier1::{
+    self, CallOutcome, Delivery, DevOpts, Lab, Uplink, block_on, grid, internet, net, relays, resources, summarize,
+};
 
 pub fn scenarios() -> Vec<Scenario> {
     vec![
         Scenario { name: "cafe", title: "Café: one Wi-Fi access point, phones and laptops", tier: 1, run: cafe },
         Scenario { name: "office", title: "Office: Ethernet + Wi-Fi on two floors", tier: 1, run: office },
-        Scenario { name: "apartment-80211s", title: "Apartment building on an 802.11s Wi-Fi mesh", tier: 1, run: apartment },
-        Scenario { name: "conference", title: "Conference hall: dense BLE and AWDL, no Wi-Fi", tier: 1, run: conference },
-        Scenario { name: "city-block", title: "City block, no internet: an 8+ hop Bluetooth chain", tier: 1, run: city_block },
+        Scenario {
+            name: "apartment-80211s",
+            title: "Apartment building on an 802.11s Wi-Fi mesh",
+            tier: 1,
+            run: apartment,
+        },
+        Scenario {
+            name: "conference",
+            title: "Conference hall: dense BLE and AWDL, no Wi-Fi",
+            tier: 1,
+            run: conference,
+        },
+        Scenario {
+            name: "city-block",
+            title: "City block, no internet: an 8+ hop Bluetooth chain",
+            tier: 1,
+            run: city_block,
+        },
         Scenario { name: "shutdown", title: "Internet shutdown: mesh only, people walking", tier: 1, run: shutdown },
-        Scenario { name: "disaster-live", title: "Disaster: two camps and a mule (member vs stranger)", tier: 1, run: disaster_live },
-        Scenario { name: "rural-line", title: "Rural line: houses 120 m apart on Wi-Fi Direct and BLE", tier: 1, run: rural_line },
-        Scenario { name: "us-eu-live", title: "US to Europe with real nodes: BLE → gateway → internet → gateway → BLE", tier: 1, run: us_eu_live },
-        Scenario { name: "nat-relay", title: "NAT types, relay paths, relay outage and failover", tier: 1, run: nat_relay },
-        Scenario { name: "adversarial-live", title: "A black-hole relay and an announcement storm", tier: 1, run: adversarial_live },
-        Scenario { name: "multipath", title: "Several radios between two devices, aggregated", tier: 1, run: multipath },
-        Scenario { name: "mixed-room", title: "UWB, Ethernet, Wi-Fi Direct and BLE in one room: ranking", tier: 1, run: mixed_room },
+        Scenario {
+            name: "disaster-live",
+            title: "Disaster: two camps and a mule (member vs stranger)",
+            tier: 1,
+            run: disaster_live,
+        },
+        Scenario {
+            name: "rural-line",
+            title: "Rural line: houses 120 m apart on Wi-Fi Direct and BLE",
+            tier: 1,
+            run: rural_line,
+        },
+        Scenario {
+            name: "us-eu-live",
+            title: "US to Europe with real nodes: BLE → gateway → internet → gateway → BLE",
+            tier: 1,
+            run: us_eu_live,
+        },
+        Scenario {
+            name: "nat-relay",
+            title: "NAT types, relay paths, relay outage and failover",
+            tier: 1,
+            run: nat_relay,
+        },
+        Scenario {
+            name: "adversarial-live",
+            title: "A black-hole relay and an announcement storm",
+            tier: 1,
+            run: adversarial_live,
+        },
+        Scenario {
+            name: "multipath",
+            title: "Several radios between two devices, aggregated",
+            tier: 1,
+            run: multipath,
+        },
+        Scenario {
+            name: "mixed-room",
+            title: "UWB, Ethernet, Wi-Fi Direct and BLE in one room: ranking",
+            tier: 1,
+            run: mixed_room,
+        },
         Scenario { name: "scale-ceiling", title: "How many real nodes this machine runs", tier: 1, run: scale_ceiling },
     ]
 }
@@ -42,7 +94,13 @@ fn mesh() -> Option<MeshOptions> {
 }
 
 /// Deliveries, latency and optimality objectives, and a headline.
-fn judge(r: &mut ScenarioResult, label: &str, ds: &[Delivery], min_delivery: f64, max_p95: f64) -> (f64, Summary, Summary) {
+fn judge(
+    r: &mut ScenarioResult,
+    label: &str,
+    ds: &[Delivery],
+    min_delivery: f64,
+    max_p95: f64,
+) -> (f64, Summary, Summary) {
     let (ratio, lat, opt) = summarize(ds);
     r.at_least(&format!("{label}: delivery"), 100.0 * ratio, 100.0 * min_delivery, "%");
     r.at_most(&format!("{label}: latency p95"), if lat.n == 0 { f64::INFINITY } else { lat.p95 }, max_p95, "s");
@@ -60,7 +118,11 @@ fn judge(r: &mut ScenarioResult, label: &str, ds: &[Delivery], min_delivery: f64
 
 fn judge_call(r: &mut ScenarioResult, label: &str, c: &CallOutcome, max_setup: f64, max_loss: f32) {
     r.at_most(&format!("{label}: call setup"), c.setup.map_or(f64::INFINITY, |d| d.as_secs_f64()), max_setup, "s");
-    r.check(&format!("{label}: the callee hears the caller's tone"), c.heard_ok, if c.heard_ok { "yes".to_string() } else { format!("no ({:?})", c.error) });
+    r.check(
+        &format!("{label}: the callee hears the caller's tone"),
+        c.heard_ok,
+        if c.heard_ok { "yes".to_string() } else { format!("no ({:?})", c.error) },
+    );
     r.at_most(&format!("{label}: audio loss"), c.loss_pct as f64, max_loss as f64, "%");
     r.headline(format!(
         "{label}: setup {} s, loss {:.1}%, latency {} ms, path {:?}",
@@ -72,7 +134,13 @@ fn judge_call(r: &mut ScenarioResult, label: &str, c: &CallOutcome, max_setup: f
 }
 
 /// Conversations between `pairs`, `k` messages each (waits `gap` between).
-async fn probe(lab: &mut Lab, pairs: &[(usize, usize)], k: usize, gap: Duration, deadline: Duration) -> (Vec<Delivery>, usize) {
+async fn probe(
+    lab: &mut Lab,
+    pairs: &[(usize, usize)],
+    k: usize,
+    gap: Duration,
+    deadline: Duration,
+) -> (Vec<Delivery>, usize) {
     let mut out = Vec::new();
     let mut failed_setup = 0;
     for &(a, b) in pairs {
@@ -183,7 +251,10 @@ fn office(o: Opts) -> ScenarioResult {
         for (floor, wf) in [(0, &f1), (1, &f2)] {
             for i in 0..per {
                 let p = Pos::new(i as f64 * 6.0, floor as f64 * 100.0);
-                laptops.push(lab.device(&format!("f{floor}laptop{i}"), &[(wf, p), (&lan, p), (&ble, p)], DevOpts::default()).await);
+                laptops.push(
+                    lab.device(&format!("f{floor}laptop{i}"), &[(wf, p), (&lan, p), (&ble, p)], DevOpts::default())
+                        .await,
+                );
             }
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -207,7 +278,8 @@ fn office(o: Opts) -> ScenarioResult {
 // ───────────────────────────── apartment (802.11s) ─────────────────────────────
 
 fn apartment(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("apartment-80211s", "Apartment building on an 802.11s Wi-Fi mesh", 1, o.seed, o.scale);
+    let mut r =
+        ScenarioResult::new("apartment-80211s", "Apartment building on an 802.11s Wi-Fi mesh", 1, o.seed, o.scale);
     block_on(async {
         let (rss0, cpu0) = resources();
         let t0 = Instant::now();
@@ -219,9 +291,15 @@ fn apartment(o: Opts) -> ScenarioResult {
         let wm = lab.add_medium(EmuNet::new(0, m, o.seed));
         let n = o.n(8, 4);
         for i in 0..n {
-            lab.device(&format!("flat{i}"), &[(&wm, Pos::new(i as f64 * 25.0, 0.0))], DevOpts { bulk: true, ..Default::default() }).await;
+            lab.device(
+                &format!("flat{i}"),
+                &[(&wm, Pos::new(i as f64 * 25.0, 0.0))],
+                DevOpts { bulk: true, ..Default::default() },
+            )
+            .await;
         }
-        let pos: HashMap<mycel_crypto::SignPk, f64> = lab.devs.iter().enumerate().map(|(i, d)| (d.node.id(), i as f64 * 25.0)).collect();
+        let pos: HashMap<mycel_crypto::SignPk, f64> =
+            lab.devs.iter().enumerate().map(|(i, d)| (d.node.id(), i as f64 * 25.0)).collect();
         wm.set_pair(Some(Arc::new(move |a, b| {
             let hops = ((pos.get(a)? - pos.get(b)?).abs() / 25.0).ceil().max(1.0);
             Some(PairShape { latency: Duration::from_millis(3 * (hops as u64 - 1)), rate_div: hops.min(4.0) })
@@ -235,7 +313,11 @@ fn apartment(o: Opts) -> ScenarioResult {
         let far = lab.bulk(0, n - 1, bytes, Duration::from_secs(60)).await;
         let rate = |d: Option<Duration>| d.map_or(0.0, |d| bytes as f64 / d.as_secs_f64() / 1e6);
         r.at_least("throughput to the next flat", rate(near), 3.0, "MB/s");
-        r.check("the far end is slower (more 802.11s hops)", rate(far) < rate(near), format!("{:.1} vs {:.1} MB/s", rate(far), rate(near)));
+        r.check(
+            "the far end is slower (more 802.11s hops)",
+            rate(far) < rate(near),
+            format!("{:.1} vs {:.1} MB/s", rate(far), rate(near)),
+        );
         r.headline(format!("bulk: next flat {:.1} MB/s, {} flats away {:.1} MB/s", rate(near), n - 1, rate(far)));
         finish(&mut r, t0, n, rss0, cpu0);
         lab.shutdown().await;
@@ -271,13 +353,22 @@ fn conference(o: Opts) -> ScenarioResult {
         judge(&mut r, "messages", &ds, 0.95, 3.0);
         let hop: u64 = lab.devs.iter().filter_map(|d| d.node.mesh().map(|m| m.stats().hop_connections)).sum();
         let deg = ble.neighbours(&lab.devs[0].node.id()).len() + awdl.neighbours(&lab.devs[0].node.id()).len();
-        r.note(format!("Spawned in {:.1} s; a seat hears ~{deg} devices; {hop} mesh hop connections in total ({:.1} per device).", spawned.as_secs_f64(), hop as f64 / n as f64));
+        r.note(format!(
+            "Spawned in {:.1} s; a seat hears ~{deg} devices; {hop} mesh hop connections in total ({:.1} per device).",
+            spawned.as_secs_f64(),
+            hop as f64 / n as f64
+        ));
         let bs = ble.stats();
         let drops = bs.dropped_queue as f64 / bs.packets_sent.max(1) as f64;
         if drops > 0.1 && !r.slos.iter().all(|x| x.pass) {
             r.expect_fail("FINDING (docs/SIMULATION.md §4, fixed 15): with MYCEL_SIM_BLE_QUEUE=radio (one 250 ms queue for the whole radio, not one 16 KiB queue per peer as the real BLE link has), bursts to one peer drop everyone's packets (~23%); the slowest of 10 messages then waits for retransmissions");
         }
-        r.note(format!("Bluetooth medium: {} packets sent, {} dropped at full transmit queues ({:.1}%).", bs.packets_sent, bs.dropped_queue, 100.0 * bs.dropped_queue as f64 / bs.packets_sent.max(1) as f64));
+        r.note(format!(
+            "Bluetooth medium: {} packets sent, {} dropped at full transmit queues ({:.1}%).",
+            bs.packets_sent,
+            bs.dropped_queue,
+            100.0 * bs.dropped_queue as f64 / bs.packets_sent.max(1) as f64
+        ));
         r.note("Each device opens hop connections to at most 6 devices in range (its own pseudo-random pick, so they spread out); others open theirs to it, ~11 in all here. Real BLE radios hold ~10 connections.");
         finish(&mut r, t0, n, rss0, cpu0);
         r.metrics = json!({"hop_connections": hop, "ble_packets": ble.stats().packets_sent, "awdl_packets": awdl.stats().packets_sent, "ble_queue_drops": ble.stats().dropped_queue});
@@ -289,7 +380,8 @@ fn conference(o: Opts) -> ScenarioResult {
 // ───────────────────────────── city block ─────────────────────────────
 
 fn city_block(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("city-block", "City block, no internet: an 8+ hop Bluetooth chain", 1, o.seed, o.scale);
+    let mut r =
+        ScenarioResult::new("city-block", "City block, no internet: an 8+ hop Bluetooth chain", 1, o.seed, o.scale);
     block_on(async {
         let (rss0, cpu0) = resources();
         let t0 = Instant::now();
@@ -298,7 +390,12 @@ fn city_block(o: Opts) -> ScenarioResult {
         // 10 phones 40 m apart: each hears only its neighbours (60 m range)
         let n = 10;
         for i in 0..n {
-            lab.device(&format!("p{i}"), &[(&ble, Pos::new(i as f64 * 40.0, 0.0))], DevOpts { mesh: mesh(), ..Default::default() }).await;
+            lab.device(
+                &format!("p{i}"),
+                &[(&ble, Pos::new(i as f64 * 40.0, 0.0))],
+                DevOpts { mesh: mesh(), ..Default::default() },
+            )
+            .await;
         }
         tokio::time::sleep(Duration::from_secs(10)).await;
         let (d8, _) = probe(&mut lab, &[(0, 8)], o.n(3, 2), Duration::from_millis(300), Duration::from_secs(30)).await;
@@ -370,14 +467,18 @@ fn shutdown(o: Opts) -> ScenarioResult {
         let ps = pairs(&mut rng, n, o.n(10, 4));
         let (ds, failed) = probe(&mut lab, &ps, 2, Duration::from_secs(1), Duration::from_secs(20)).await;
         // live mesh only: devices in different clusters can't talk until they meet
-        let feasible: Vec<Delivery> = ds.iter().copied().filter(|d| d.optimal.is_some() || d.latency.is_some()).collect();
+        let feasible: Vec<Delivery> =
+            ds.iter().copied().filter(|d| d.optimal.is_some() || d.latency.is_some()).collect();
         judge(&mut r, "messages (connected at the time)", &feasible, 0.8, 10.0);
         r.note(format!("{} of {} pairs couldn't even start a conversation (in different clusters at the time); {} messages had no path at all.", failed, ps.len(), ds.len() - feasible.len()));
         let call = match lab.conversation(&[0, 1]).await {
             Ok(c) => lab.call(c, 0, 1, Duration::from_secs(3)).await,
             Err(e) => CallOutcome { error: Some(e.to_string()), ..Default::default() },
         };
-        r.headline(format!("call between two walkers: setup {:?}, heard {}, loss {:.1}%, path {:?}, {:?}", call.setup, call.heard_ok, call.loss_pct, call.path, call.error));
+        r.headline(format!(
+            "call between two walkers: setup {:?}, heard {}, loss {:.1}%, path {:?}, {:?}",
+            call.setup, call.heard_ok, call.loss_pct, call.path, call.error
+        ));
         mover.abort();
         finish(&mut r, t0, n, rss0, cpu0);
         lab.shutdown().await;
@@ -388,7 +489,8 @@ fn shutdown(o: Opts) -> ScenarioResult {
 // ───────────────────────────── disaster (live) ─────────────────────────────
 
 fn disaster_live(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("disaster-live", "Disaster: two camps and a mule (member vs stranger)", 1, o.seed, o.scale);
+    let mut r =
+        ScenarioResult::new("disaster-live", "Disaster: two camps and a mule (member vs stranger)", 1, o.seed, o.scale);
     block_on(async {
         let (rss0, cpu0) = resources();
         let t0 = Instant::now();
@@ -396,10 +498,34 @@ fn disaster_live(o: Opts) -> ScenarioResult {
         let ble = lab.add_medium(net(0, Tech::Ble, Env::Outdoor, o.seed));
         let wd = lab.add_medium(net(1, Tech::WifiDirect, Env::Outdoor, o.seed));
         // camps 400 m apart: out of reach of every radio
-        let a = lab.device("campA", &[(&ble, Pos::new(0.0, 0.0)), (&wd, Pos::new(0.0, 0.0))], DevOpts { mesh: mesh(), ..Default::default() }).await;
-        let b = lab.device("campB", &[(&ble, Pos::new(400.0, 0.0)), (&wd, Pos::new(400.0, 0.0))], DevOpts { mesh: mesh(), ..Default::default() }).await;
-        let member = lab.device("mule-member", &[(&ble, Pos::new(10.0, 5.0)), (&wd, Pos::new(10.0, 5.0))], DevOpts { mesh: mesh(), ..Default::default() }).await;
-        let stranger = lab.device("mule-stranger", &[(&ble, Pos::new(10.0, -5.0)), (&wd, Pos::new(10.0, -5.0))], DevOpts { mesh: mesh(), ..Default::default() }).await;
+        let a = lab
+            .device(
+                "campA",
+                &[(&ble, Pos::new(0.0, 0.0)), (&wd, Pos::new(0.0, 0.0))],
+                DevOpts { mesh: mesh(), ..Default::default() },
+            )
+            .await;
+        let b = lab
+            .device(
+                "campB",
+                &[(&ble, Pos::new(400.0, 0.0)), (&wd, Pos::new(400.0, 0.0))],
+                DevOpts { mesh: mesh(), ..Default::default() },
+            )
+            .await;
+        let member = lab
+            .device(
+                "mule-member",
+                &[(&ble, Pos::new(10.0, 5.0)), (&wd, Pos::new(10.0, 5.0))],
+                DevOpts { mesh: mesh(), ..Default::default() },
+            )
+            .await;
+        let stranger = lab
+            .device(
+                "mule-stranger",
+                &[(&ble, Pos::new(10.0, -5.0)), (&wd, Pos::new(10.0, -5.0))],
+                DevOpts { mesh: mesh(), ..Default::default() },
+            )
+            .await;
         // the conversations need to exist first: create them while everyone is together
         for (n, x) in [(&ble, 400.0), (&wd, 400.0)] {
             n.set_pos(&lab.devs[b].node.id(), Pos::new(20.0, 0.0));
@@ -443,7 +569,11 @@ fn disaster_live(o: Opts) -> ScenarioResult {
         });
         let deadline = Duration::from_secs(o.n(300, 240) as u64);
         let seen = |space, doc, key: &str| {
-            lab.devs[b].node.with_space(&space, |rr| rr.doc_json(&doc)).ok().is_some_and(|v: serde_json::Value| v.get(key).is_some())
+            lab.devs[b]
+                .node
+                .with_space(&space, |rr| rr.doc_json(&doc))
+                .ok()
+                .is_some_and(|v: serde_json::Value| v.get(key).is_some())
         };
         let (mut got_m, mut got_s) = (None, None);
         while t_walk.elapsed() < deadline && (got_m.is_none() || got_s.is_none()) {
@@ -461,9 +591,23 @@ fn disaster_live(o: Opts) -> ScenarioResult {
                 r.note(format!("{} carrier: {:?}", d.name, m.dtn_stats()));
             }
         }
-        r.at_most("a mule who is a member carries it (CRDT sync)", got_m.map_or(f64::INFINITY, |d| d.as_secs_f64()), 100.0, "s");
-        r.at_most("a stranger mule carries it (store-and-forward)", got_s.map_or(f64::INFINITY, |d| d.as_secs_f64()), 200.0, "s");
-        r.headline(format!("member mule: {}; stranger mule: {}", got_m.map_or("never".into(), |d| format!("{:.0} s", d.as_secs_f64())), got_s.map_or("never".into(), |d| format!("{:.0} s", d.as_secs_f64()))));
+        r.at_most(
+            "a mule who is a member carries it (CRDT sync)",
+            got_m.map_or(f64::INFINITY, |d| d.as_secs_f64()),
+            100.0,
+            "s",
+        );
+        r.at_most(
+            "a stranger mule carries it (store-and-forward)",
+            got_s.map_or(f64::INFINITY, |d| d.as_secs_f64()),
+            200.0,
+            "s",
+        );
+        r.headline(format!(
+            "member mule: {}; stranger mule: {}",
+            got_m.map_or("never".into(), |d| format!("{:.0} s", d.as_secs_f64())),
+            got_s.map_or("never".into(), |d| format!("{:.0} s", d.as_secs_f64()))
+        ));
         r.note("Members carry what they're members of: the mule syncs camp A's change when it's in range and hands it to camp B when it arrives (~80 s walk). A stranger can only carry a store-and-forward bundle: camp A offers one when its sync with camp B isn't through within 10 s (the stale connection to B would only time out after 60 s, when the mules are long gone), the stranger takes copies (Spray-and-Focus: it is as good a carrier as camp A), and hands one to camp B on arrival.");
         finish(&mut r, t0, lab.devs.len(), rss0, cpu0);
         lab.shutdown().await;
@@ -474,7 +618,8 @@ fn disaster_live(o: Opts) -> ScenarioResult {
 // ───────────────────────────── rural line ─────────────────────────────
 
 fn rural_line(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("rural-line", "Rural line: houses 120 m apart on Wi-Fi Direct and BLE", 1, o.seed, o.scale);
+    let mut r =
+        ScenarioResult::new("rural-line", "Rural line: houses 120 m apart on Wi-Fi Direct and BLE", 1, o.seed, o.scale);
     block_on(async {
         let (rss0, cpu0) = resources();
         let t0 = Instant::now();
@@ -486,11 +631,18 @@ fn rural_line(o: Opts) -> ScenarioResult {
         let mut x = 0.0;
         for i in 0..n {
             let p = Pos::new(x, 0.0);
-            lab.device(&format!("house{i}"), &[(&wd, p), (&ble, p)], DevOpts { mesh: mesh(), bulk: true, ..Default::default() }).await;
+            lab.device(
+                &format!("house{i}"),
+                &[(&wd, p), (&ble, p)],
+                DevOpts { mesh: mesh(), bulk: true, ..Default::default() },
+            )
+            .await;
             x += rng.range(100.0, 140.0);
         }
         tokio::time::sleep(Duration::from_secs(8)).await;
-        let (ds, _) = probe(&mut lab, &[(0, n - 1), (0, 1)], o.n(4, 2), Duration::from_millis(300), Duration::from_secs(30)).await;
+        let (ds, _) =
+            probe(&mut lab, &[(0, n - 1), (0, 1)], o.n(4, 2), Duration::from_millis(300), Duration::from_secs(30))
+                .await;
         judge(&mut r, "messages", &ds, 1.0, 3.0);
         let bytes = (o.n(4, 1) as u64) << 20;
         let near = lab.bulk(0, 1, bytes, Duration::from_secs(60)).await;
@@ -507,7 +659,13 @@ fn rural_line(o: Opts) -> ScenarioResult {
 // ───────────────────────────── US → EU (live) ─────────────────────────────
 
 fn us_eu_live(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("us-eu-live", "US to Europe with real nodes: BLE → gateway → internet → gateway → BLE", 1, o.seed, o.scale);
+    let mut r = ScenarioResult::new(
+        "us-eu-live",
+        "US to Europe with real nodes: BLE → gateway → internet → gateway → BLE",
+        1,
+        o.seed,
+        o.scale,
+    );
     block_on(async {
         let (rss0, cpu0) = resources();
         let t0 = Instant::now();
@@ -517,24 +675,55 @@ fn us_eu_live(o: Opts) -> ScenarioResult {
         let ups: Arc<Mutex<HashMap<mycel_crypto::SignPk, Uplink>>> = Arc::default();
         let inet = lab.add_medium(internet(2, o.seed, ups.clone()));
         let rel = lab.add_medium(relays(3, o.seed, ups.clone()));
-        let gw_mesh = |up: bool| Some(MeshOptions { announce_every: Duration::from_millis(1000), internet: Some(up), ..MeshOptions::default() });
+        let gw_mesh = |up: bool| {
+            Some(MeshOptions {
+                announce_every: Duration::from_millis(1000),
+                internet: Some(up),
+                ..MeshOptions::default()
+            })
+        };
         // New York: a BLE-only phone 3 hops from an LTE phone
-        let src = lab.device("ny-phone", &[(&ble_us, Pos::new(0.0, 0.0))], DevOpts { mesh: gw_mesh(false), tone: Some(440.0), ..Default::default() }).await;
+        let src = lab
+            .device(
+                "ny-phone",
+                &[(&ble_us, Pos::new(0.0, 0.0))],
+                DevOpts { mesh: gw_mesh(false), tone: Some(440.0), ..Default::default() },
+            )
+            .await;
         for i in 1..3 {
-            lab.device(&format!("ny-relay{i}"), &[(&ble_us, Pos::new(i as f64 * 50.0, 0.0))], DevOpts { mesh: gw_mesh(false), ..Default::default() }).await;
+            lab.device(
+                &format!("ny-relay{i}"),
+                &[(&ble_us, Pos::new(i as f64 * 50.0, 0.0))],
+                DevOpts { mesh: gw_mesh(false), ..Default::default() },
+            )
+            .await;
         }
         let ny = (40.71, -74.01);
         let gw_us = lab
-            .device("ny-gateway", &[(&ble_us, Pos::new(150.0, 0.0)), (&inet, Pos::new(ny.0, ny.1)), (&rel, Pos::new(ny.0, ny.1))], DevOpts { mesh: gw_mesh(true), ..Default::default() })
+            .device(
+                "ny-gateway",
+                &[(&ble_us, Pos::new(150.0, 0.0)), (&inet, Pos::new(ny.0, ny.1)), (&rel, Pos::new(ny.0, ny.1))],
+                DevOpts { mesh: gw_mesh(true), ..Default::default() },
+            )
             .await;
         ups.lock().insert(lab.devs[gw_us].node.id(), Uplink { latlon: ny, access: Access::Lte, nat: Nat::Hard });
         // London: a home gateway and a BLE-only phone
         let ld = (51.51, -0.13);
         let gw_eu = lab
-            .device("london-gateway", &[(&ble_eu, Pos::new(0.0, 0.0)), (&inet, Pos::new(ld.0, ld.1)), (&rel, Pos::new(ld.0, ld.1))], DevOpts { mesh: gw_mesh(true), ..Default::default() })
+            .device(
+                "london-gateway",
+                &[(&ble_eu, Pos::new(0.0, 0.0)), (&inet, Pos::new(ld.0, ld.1)), (&rel, Pos::new(ld.0, ld.1))],
+                DevOpts { mesh: gw_mesh(true), ..Default::default() },
+            )
             .await;
         ups.lock().insert(lab.devs[gw_eu].node.id(), Uplink { latlon: ld, access: Access::Fibre, nat: Nat::Easy });
-        let dst = lab.device("london-phone", &[(&ble_eu, Pos::new(40.0, 0.0))], DevOpts { mesh: gw_mesh(false), tone: Some(660.0), ..Default::default() }).await;
+        let dst = lab
+            .device(
+                "london-phone",
+                &[(&ble_eu, Pos::new(40.0, 0.0))],
+                DevOpts { mesh: gw_mesh(false), tone: Some(660.0), ..Default::default() },
+            )
+            .await;
         inet.set_pair(None);
         let _ = inet;
         lab.introduce(gw_us, gw_eu);
@@ -551,7 +740,11 @@ fn us_eu_live(o: Opts) -> ScenarioResult {
                 judge_call(&mut r, "call", &call, 5.0, 5.0);
             }
             other => {
-                r.check("a conversation between the two BLE-only phones", false, format!("{:?}", other.map(|x| x.map(|_| ()))));
+                r.check(
+                    "a conversation between the two BLE-only phones",
+                    false,
+                    format!("{:?}", other.map(|x| x.map(|_| ()))),
+                );
             }
         }
         r.note("Tier 2 runs the same path with GLOBAL's routing core (`us-eu`); here every hop is real QUIC over emulated Bluetooth, internet and relays.");
@@ -564,7 +757,8 @@ fn us_eu_live(o: Opts) -> ScenarioResult {
 // ───────────────────────────── NAT and relays ─────────────────────────────
 
 fn nat_relay(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("nat-relay", "NAT types, relay paths, relay outage and failover", 1, o.seed, o.scale);
+    let mut r =
+        ScenarioResult::new("nat-relay", "NAT types, relay paths, relay outage and failover", 1, o.seed, o.scale);
     block_on(async {
         let (rss0, cpu0) = resources();
         let t0 = Instant::now();
@@ -616,7 +810,11 @@ fn nat_relay(o: Opts) -> ScenarioResult {
                 wrong.push(format!("{}–{}: {via:?} (direct possible: {direct})", people[a].0, people[b].0));
             }
         }
-        r.check("NAT-blocked pairs use a relay, others go direct", wrong.is_empty(), if wrong.is_empty() { "all as expected".into() } else { wrong.join("; ") });
+        r.check(
+            "NAT-blocked pairs use a relay, others go direct",
+            wrong.is_empty(),
+            if wrong.is_empty() { "all as expected".into() } else { wrong.join("; ") },
+        );
         // the primary relays go down
         primary.set_medium_up(false);
         tokio::time::sleep(Duration::from_secs(1)).await;
@@ -636,20 +834,24 @@ fn nat_relay(o: Opts) -> ScenarioResult {
 // ───────────────────────────── adversarial (live) ─────────────────────────────
 
 fn adversarial_live(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("adversarial-live", "A black-hole relay and an announcement storm", 1, o.seed, o.scale);
+    let mut r =
+        ScenarioResult::new("adversarial-live", "A black-hole relay and an announcement storm", 1, o.seed, o.scale);
     block_on(async {
         let (rss0, cpu0) = resources();
         let t0 = Instant::now();
         let mut lab = Lab::new();
         let ble = lab.add_medium(net(0, Tech::Ble, Env::Outdoor, o.seed));
         // A at the left, C at the right, 100 m apart; two relays in between
-        let a = lab.device("alice", &[(&ble, Pos::new(0.0, 0.0))], DevOpts { mesh: mesh(), ..Default::default() }).await;
+        let a =
+            lab.device("alice", &[(&ble, Pos::new(0.0, 0.0))], DevOpts { mesh: mesh(), ..Default::default() }).await;
         let hole = MeshOptions { relay_rate_total: 0, relay_rate_per_neighbour: 0, ..mesh().expect("mesh") };
-        lab.device("blackhole", &[(&ble, Pos::new(50.0, 10.0))], DevOpts { mesh: Some(hole), ..Default::default() }).await;
+        lab.device("blackhole", &[(&ble, Pos::new(50.0, 10.0))], DevOpts { mesh: Some(hole), ..Default::default() })
+            .await;
         lab.device("honest", &[(&ble, Pos::new(50.0, -10.0))], DevOpts { mesh: mesh(), ..Default::default() }).await;
         let storm = MeshOptions { announce_every: Duration::from_millis(10), ..mesh().expect("mesh") };
         lab.device("storm", &[(&ble, Pos::new(20.0, 30.0))], DevOpts { mesh: Some(storm), ..Default::default() }).await;
-        let c = lab.device("carol", &[(&ble, Pos::new(100.0, 0.0))], DevOpts { mesh: mesh(), ..Default::default() }).await;
+        let c =
+            lab.device("carol", &[(&ble, Pos::new(100.0, 0.0))], DevOpts { mesh: mesh(), ..Default::default() }).await;
         tokio::time::sleep(Duration::from_secs(8)).await;
         let (ds, _) = probe(&mut lab, &[(a, c)], o.n(6, 3), Duration::from_millis(500), Duration::from_secs(30)).await;
         judge(&mut r, "messages past a black hole and a storm", &ds, 1.0, 5.0);
@@ -704,7 +906,13 @@ fn multipath(o: Opts) -> ScenarioResult {
 // ───────────────────────────── mixed room ─────────────────────────────
 
 fn mixed_room(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("mixed-room", "UWB, Ethernet, Wi-Fi Direct and BLE in one room: ranking", 1, o.seed, o.scale);
+    let mut r = ScenarioResult::new(
+        "mixed-room",
+        "UWB, Ethernet, Wi-Fi Direct and BLE in one room: ranking",
+        1,
+        o.seed,
+        o.scale,
+    );
     block_on(async {
         let (rss0, cpu0) = resources();
         let t0 = Instant::now();
@@ -731,7 +939,15 @@ fn mixed_room(o: Opts) -> ScenarioResult {
                 }
                 tokio::time::sleep(Duration::from_millis(300)).await;
             }
-            r.check(&format!("with {} available, the path is {}", order[i..].iter().map(|x| x.1.label()).collect::<Vec<_>>().join(", "), tech.label()), via == Some(tech.kind()), format!("{via:?}"));
+            r.check(
+                &format!(
+                    "with {} available, the path is {}",
+                    order[i..].iter().map(|x| x.1.label()).collect::<Vec<_>>().join(", "),
+                    tech.label()
+                ),
+                via == Some(tech.kind()),
+                format!("{via:?}"),
+            );
             steps.push(format!("{}→{:?}", tech.label(), via));
             media[i].set_medium_up(false);
             tokio::time::sleep(Duration::from_secs(6)).await;

@@ -45,12 +45,7 @@ impl Membership {
     /// Read from the validated membership graph (O(membership ops)).
     pub fn of(graph: &SpaceGraph, me: &SignPk) -> Membership {
         let state = graph.state();
-        let people = state
-            .members
-            .iter()
-            .filter(|(_, m)| m.role != Role::Relay)
-            .map(|(pk, m)| (*pk, m.role))
-            .collect();
+        let people = state.members.iter().filter(|(_, m)| m.role != Role::Relay).map(|(pk, m)| (*pk, m.role)).collect();
         let resolution = graph.resolution();
         let ever_people = resolution
             .order
@@ -323,8 +318,11 @@ mod tests {
         assert_eq!(former, Direct { peer: pk(2), current: false });
         let current = Direct { peer: pk(2), current: true };
         assert_ne!(thread_key(&me, &former), thread_key(&me, &current));
-        assert_eq!(thread_key(&me, &current), thread_key(&pk(2), &Direct { peer: me, current: true }),
-            "both people derive the same key");
+        assert_eq!(
+            thread_key(&me, &current),
+            thread_key(&pk(2), &Direct { peer: me, current: true }),
+            "both people derive the same key"
+        );
     }
 
     #[test]

@@ -232,9 +232,7 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
         }
         "send_message" => {
             let s: Send = args(a)?;
-            ok(rt
-                .send_message(s.id, s.body, s.reply_to, s.attachments.unwrap_or_default())
-                .await?)
+            ok(rt.send_message(s.id, s.body, s.reply_to, s.attachments.unwrap_or_default()).await?)
         }
         "edit_message" => {
             let e: Edit = args(a)?;

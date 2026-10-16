@@ -47,18 +47,11 @@ fn peers_line(node: &Node) -> String {
         })
         .collect();
     out.sort();
-    if out.is_empty() {
-        "none".into()
-    } else {
-        out.join("; ")
-    }
+    if out.is_empty() { "none".into() } else { out.join("; ") }
 }
 
 fn first_link_peer(node: &Node) -> Option<SignPk> {
-    node.peers()
-        .into_iter()
-        .find(|(_, p)| p.links.contains(&PathKind::PeerWifi))
-        .map(|(pk, _)| pk)
+    node.peers().into_iter().find(|(_, p)| p.links.contains(&PathKind::PeerWifi)).map(|(pk, _)| pk)
 }
 
 /// Every `key → text` in every doc of the space.
@@ -78,9 +71,8 @@ fn messages(node: &Node, space: &SpaceId) -> Vec<(String, String)> {
 }
 
 fn post(node: &Node, space: &SpaceId, key: &str, text: &str) -> anyhow::Result<()> {
-    let doc = node
-        .with_space(space, |r| r.doc_ids().into_iter().next())?
-        .unwrap_or_else(mycel_sync::Replica::new_doc_id);
+    let doc =
+        node.with_space(space, |r| r.doc_ids().into_iter().next())?.unwrap_or_else(mycel_sync::Replica::new_doc_id);
     node.with_space(space, |r| r.change(doc, |d| d.put(ROOT, key, text)))??;
     node.changed(*space);
     Ok(())
@@ -102,10 +94,7 @@ async fn main() -> anyhow::Result<()> {
     opts.ip = false; // every packet goes over the AWDL link
     opts.links = vec![mycel_link_awdl::link(keys.sign_pk(), &name)];
     let node = Node::spawn(keys, opts).await?;
-    println!(
-        "[{name}] started as {} (ip transports off)",
-        node.id().short()
-    );
+    println!("[{name}] started as {} (ip transports off)", node.id().short());
     let mut events = node.subscribe();
 
     let mut status = String::new();
@@ -185,21 +174,13 @@ async fn main() -> anyhow::Result<()> {
             node.with_space(&s, |r| r.add_member(card.keys, Role::Writer))??;
             post(&node, &s, &me_key, &format!("hello from {name}"))?;
             let stats = node.sync_with(peer, s, false).await?;
-            println!(
-                "[{name}] created space {s}, invited {} ({stats:?})",
-                peer.short()
-            );
+            println!("[{name}] created space {s}, invited {} ({stats:?})", peer.short());
             space = Some(s);
         }
 
         if let Some(s) = space {
             print_msgs(&name, &node, &s, &mut seen);
-            if invite
-                && !got_reply
-                && seen
-                    .iter()
-                    .any(|(k, _)| k.ends_with(":hello") && *k != me_key)
-            {
+            if invite && !got_reply && seen.iter().any(|(k, _)| k.ends_with(":hello") && *k != me_key) {
                 got_reply = true;
                 println!("[{name}] TWO-WAY SYNC OK: my greeting went out and the reply came back");
                 if big && let Some(peer) = first_link_peer(&node) {

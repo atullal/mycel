@@ -109,8 +109,7 @@ fn mic_allowed() -> Result<bool> {
     // SAFETY: a global reference to the app's Context, borrowed.
     let context = unsafe { jni::objects::JObject::from_raw(ctx.context().cast()) };
     let permission = env.new_string("android.permission.RECORD_AUDIO")?;
-    let granted = env
-        .call_method(&context, "checkSelfPermission", "(Ljava/lang/String;)I", &[(&permission).into()])?
-        .i()?;
+    let granted =
+        env.call_method(&context, "checkSelfPermission", "(Ljava/lang/String;)I", &[(&permission).into()])?.i()?;
     Ok(granted == 0)
 }

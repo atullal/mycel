@@ -22,10 +22,7 @@ pub async fn connect_call(alice: &Device, bob: &Device, space: Hash32) -> String
     let ring = eventually("bob's device rings", 15, || bob.incoming().filter(|r| r.id == out.id)).await;
     assert_eq!(ring.conversation, space.to_string());
     assert_eq!(ring.peer, alice.hex());
-    eventually("alice hears it ringing", 5, || {
-        (alice.call(&out.id)?.state == CallPhase::Ringing).then_some(())
-    })
-    .await;
+    eventually("alice hears it ringing", 5, || (alice.call(&out.id)?.state == CallPhase::Ringing).then_some(())).await;
     bob.calls.accept(&ring.id).await.unwrap();
     eventually("both active", 10, || {
         let a = alice.call(&out.id)?;
@@ -112,10 +109,7 @@ async fn call_carries_audio_both_ways_and_hangs_up() {
 
     // Bob hangs up
     bob.calls.end(&id).unwrap();
-    let a = eventually("alice sees the hang-up", 5, || {
-        alice.call(&id).filter(|c| c.state == CallPhase::Ended)
-    })
-    .await;
+    let a = eventually("alice sees the hang-up", 5, || alice.call(&id).filter(|c| c.state == CallPhase::Ended)).await;
     assert_eq!(a.end_reason, Some(EndReason::RemoteHungUp));
     assert_eq!(bob.call(&id).unwrap().end_reason, Some(EndReason::HungUp));
     assert!(alice.live().is_empty() && bob.live().is_empty());
@@ -175,7 +169,10 @@ async fn decline_timeout_busy_and_strangers() {
         assert_eq!(proto::recv(&mut rx).await.unwrap(), Some(Ctrl::Denied));
         conn.close(0u32.into(), b"");
     }
-    assert!(alice.live().is_empty() && alice.incoming().is_none_or(|c| c.peer != carol.hex()), "nothing rang for carol");
+    assert!(
+        alice.live().is_empty() && alice.incoming().is_none_or(|c| c.peer != carol.hex()),
+        "nothing rang for carol"
+    );
 
     // Busy: Alice is talking to Bob; Carol (in her own conversation with Alice) calls
     let space2 = shared_space(&carol, &alice).await;

@@ -40,11 +40,7 @@ impl Scaled {
 pub(crate) const READ: Limits = Limits {
     bytes: crate::MAX_DOC_CHANGE_BYTES,
     ops: crate::MAX_DOC_CHANGE_OPS,
-    values: Scaled {
-        floor: crate::MAX_DOC_COLUMN_VALUES / 4,
-        ratio: 64,
-        cap: crate::MAX_DOC_COLUMN_VALUES,
-    },
+    values: Scaled { floor: crate::MAX_DOC_COLUMN_VALUES / 4, ratio: 64, cap: crate::MAX_DOC_COLUMN_VALUES },
     strings: Scaled {
         floor: crate::MAX_DOC_COLUMN_STRING_BYTES / 4,
         ratio: 64,
@@ -96,30 +92,18 @@ struct Budget {
 
 impl Budget {
     fn new(limits: &Limits, body: usize) -> Self {
-        Budget {
-            values: 0,
-            strings: 0,
-            max_values: limits.values.limit(body),
-            max_strings: limits.strings.limit(body),
-        }
+        Budget { values: 0, strings: 0, max_values: limits.values.limit(body), max_strings: limits.strings.limit(body) }
     }
 }
 
 fn charge(total: &mut u64, amount: u64, limit: usize) -> Result<()> {
     *total = total.checked_add(amount).ok_or(SyncError::TooLarge)?;
-    if *total > limit as u64 {
-        Err(SyncError::TooLarge)
-    } else {
-        Ok(())
-    }
+    if *total > limit as u64 { Err(SyncError::TooLarge) } else { Ok(()) }
 }
 
 pub(super) fn check(body: &[u8], limits: &Limits) -> Result<()> {
     let mut input = Input(body);
-    let deps = input
-        .unsigned()?
-        .checked_mul(32)
-        .ok_or(SyncError::Encoding)?;
+    let deps = input.unsigned()?.checked_mul(32).ok_or(SyncError::Encoding)?;
     input.take(deps)?;
     input.bytes()?; // author actor
     input.unsigned()?; // sequence
@@ -174,11 +158,7 @@ fn check_column(kind: u32, bytes: &[u8], budget: &mut Budget) -> Result<u64> {
             continue;
         }
         let control = input.signed()?;
-        let count = if control == 0 {
-            input.unsigned()?
-        } else {
-            control.unsigned_abs()
-        };
+        let count = if control == 0 { input.unsigned()? } else { control.unsigned_abs() };
         charge(&mut rows, count, budget.max_values)?;
         charge(&mut budget.values, count, budget.max_values)?;
         if control > 0 {
@@ -196,10 +176,7 @@ fn check_value(kind: u32, input: &mut Input<'_>, repeat: u64, budget: &mut Budge
     match kind {
         0 => {
             // group counts can allocate predecessor vectors inside one op
-            let count = input
-                .unsigned()?
-                .checked_mul(repeat)
-                .ok_or(SyncError::TooLarge)?;
+            let count = input.unsigned()?.checked_mul(repeat).ok_or(SyncError::TooLarge)?;
             charge(&mut budget.values, count, budget.max_values)?;
         }
         3 => {
@@ -207,9 +184,7 @@ fn check_value(kind: u32, input: &mut Input<'_>, repeat: u64, budget: &mut Budge
         } // delta-encoded integers
         5 => {
             let bytes = input.bytes()?;
-            let count = (bytes.len() as u64)
-                .checked_mul(repeat)
-                .ok_or(SyncError::TooLarge)?;
+            let count = (bytes.len() as u64).checked_mul(repeat).ok_or(SyncError::TooLarge)?;
             charge(&mut budget.strings, count, budget.max_strings)?;
         }
         _ => {
@@ -242,32 +217,20 @@ mod tests {
         leb128::write::unsigned(&mut bytes, max as u64).unwrap();
         let mut budget = budget();
         assert_eq!(check_column(4, &bytes, &mut budget).unwrap(), max as u64);
-        assert!(matches!(
-            check_column(4, &[1], &mut budget),
-            Err(SyncError::TooLarge)
-        ));
+        assert!(matches!(check_column(4, &[1], &mut budget), Err(SyncError::TooLarge)));
     }
 
     #[test]
     fn extreme_signed_runs_and_group_multiplication_are_rejected() {
         let mut minimum = Vec::new();
         leb128::write::signed(&mut minimum, i64::MIN).unwrap();
-        assert!(matches!(
-            check_column(2, &minimum, &mut budget()),
-            Err(SyncError::TooLarge)
-        ));
+        assert!(matches!(check_column(2, &minimum, &mut budget()), Err(SyncError::TooLarge)));
         let mut group = Vec::new();
         leb128::write::signed(&mut group, 2).unwrap();
         leb128::write::unsigned(&mut group, u64::MAX).unwrap();
-        assert!(matches!(
-            check_column(0, &group, &mut budget()),
-            Err(SyncError::TooLarge)
-        ));
+        assert!(matches!(check_column(0, &group, &mut budget()), Err(SyncError::TooLarge)));
         let mut null = vec![0];
         leb128::write::unsigned(&mut null, u64::MAX).unwrap();
-        assert!(matches!(
-            check_column(2, &null, &mut budget()),
-            Err(SyncError::TooLarge)
-        ));
+        assert!(matches!(check_column(2, &null, &mut budget()), Err(SyncError::TooLarge)));
     }
 }

@@ -23,6 +23,8 @@
 //! - video (`mycel_video`): the built-in [`engine::TrackSink`], a video
 //!   track on every person's connection
 
+#[cfg(target_os = "android")]
+pub mod android;
 pub mod api;
 pub mod audio;
 pub mod bitrate;
@@ -31,8 +33,6 @@ pub mod engine;
 pub mod frame;
 pub mod jitter;
 pub mod level;
-#[cfg(target_os = "android")]
-pub mod android;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub mod mac;
 mod manager;

@@ -190,7 +190,8 @@ fn main() {
         ev.push((e.saturating_sub(t0), false, x, y));
     }
     ev.sort_by_key(|&(t, up, x, y)| (t, up, x, y));
-    let nodes: Vec<Router> = (0..n).map(|i| Router::new(key(i), Config { seed: i as u64 + 1, ..Config::default() })).collect();
+    let nodes: Vec<Router> =
+        (0..n).map(|i| Router::new(key(i), Config { seed: i as u64 + 1, ..Config::default() })).collect();
     let mut net = Net {
         index: nodes.iter().enumerate().map(|(i, r)| (r.me(), i)).collect(),
         nodes,

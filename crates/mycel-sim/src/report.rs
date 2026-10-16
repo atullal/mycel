@@ -143,11 +143,27 @@ pub fn markdown(results: &[ScenarioResult]) -> String {
     let _ = writeln!(s, "# Mycel simulation results\n");
     let _ = writeln!(s, "| Scenario | Tier | Status | Headline |\n|---|---|---|---|");
     for r in results {
-        let _ = writeln!(s, "| `{}` {} | {} | {} | {} |", r.name, r.title, r.tier, status_label(&r.status), r.headline.join("; "));
+        let _ = writeln!(
+            s,
+            "| `{}` {} | {} | {} | {} |",
+            r.name,
+            r.title,
+            r.tier,
+            status_label(&r.status),
+            r.headline.join("; ")
+        );
     }
     for r in results {
         let _ = writeln!(s, "\n## `{}`: {}\n", r.name, r.title);
-        let _ = writeln!(s, "Tier {} · seed {} · scale {} · {:.1} s wall · {}\n", r.tier, r.seed, r.scale, r.wall_s, status_label(&r.status));
+        let _ = writeln!(
+            s,
+            "Tier {} · seed {} · scale {} · {:.1} s wall · {}\n",
+            r.tier,
+            r.seed,
+            r.scale,
+            r.wall_s,
+            status_label(&r.status)
+        );
         if let Some(why) = &r.expected_fail {
             let _ = writeln!(s, "> Expected to fail until: {why}\n");
         }

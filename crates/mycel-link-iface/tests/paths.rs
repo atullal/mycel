@@ -12,11 +12,11 @@ use std::time::{Duration, Instant};
 use mycel_crypto::DeviceKeys;
 use mycel_link_iface::classify::{Decision, Rules, classify};
 use mycel_link_iface::{IfaceLink, Options, ifaces};
+use mycel_net::PathKind;
 use mycel_net::iroh::endpoint::Connection;
 use mycel_net::iroh::protocol::{AcceptError, ProtocolHandler, Router};
 use mycel_net::iroh::{Endpoint, EndpointAddr, SecretKey, TransportAddr, endpoint::presets};
 use mycel_net::link::{CustomAddr, Link, LinkEvent, MycelPathSelector};
-use mycel_net::PathKind;
 use tokio::sync::mpsc;
 
 const ALPN: &[u8] = b"test/iface";
@@ -110,7 +110,9 @@ async fn one_path_per_interface() {
     let mut addrs: Vec<CustomAddr> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     while addrs.len() < names.len() && Instant::now() < deadline {
-        if let Ok(Some(LinkEvent::Found { addr, .. })) = tokio::time::timeout(Duration::from_millis(200), a.found.recv()).await {
+        if let Ok(Some(LinkEvent::Found { addr, .. })) =
+            tokio::time::timeout(Duration::from_millis(200), a.found.recv()).await
+        {
             addrs.push(addr);
         }
     }

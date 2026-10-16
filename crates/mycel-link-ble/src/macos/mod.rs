@@ -37,12 +37,10 @@ use objc2_core_bluetooth::{
     CBMutableCharacteristic, CBMutableService, CBPeripheral, CBPeripheralDelegate, CBPeripheralManager,
     CBPeripheralManagerDelegate, CBService, CBUUID,
 };
-use objc2_core_foundation::{
-    CFAbsoluteTimeGetCurrent, CFRetained, CFRunLoop, CFRunLoopTimer, kCFRunLoopDefaultMode,
-};
+use objc2_core_foundation::{CFAbsoluteTimeGetCurrent, CFRetained, CFRunLoop, CFRunLoopTimer, kCFRunLoopDefaultMode};
 use objc2_foundation::{
-    NSArray, NSBundle, NSData, NSDefaultRunLoopMode, NSDictionary, NSError, NSInputStream, NSNumber,
-    NSOutputStream, NSRunLoop, NSStream, NSStreamDelegate, NSStreamEvent, NSStreamStatus, NSString,
+    NSArray, NSBundle, NSData, NSDefaultRunLoopMode, NSDictionary, NSError, NSInputStream, NSNumber, NSOutputStream,
+    NSRunLoop, NSStream, NSStreamDelegate, NSStreamEvent, NSStreamStatus, NSString,
 };
 use parking_lot::Mutex;
 
@@ -118,13 +116,18 @@ impl Backend for Mac {
         // An app bundle without the usage string is killed by macOS (SIGABRT,
         // "Namespace TCC") the moment it touches CoreBluetooth: refuse instead.
         if in_app_bundle() && !has_usage_description() {
-            let why = "This app's Info.plist lacks NSBluetoothAlwaysUsageDescription, so macOS won't let it use Bluetooth";
+            let why =
+                "This app's Info.plist lacks NSBluetoothAlwaysUsageDescription, so macOS won't let it use Bluetooth";
             hub.set_radio(Radio::Unavailable(why.into()));
             bail!(why);
         }
         let auth = unsafe { CBManager::authorization_class() };
         info(format_args!("authorization: {}", auth_name(auth)));
-        hub.set_radio(if auth == CBManagerAuthorization::NotDetermined { Radio::AwaitingPermission } else { Radio::Starting });
+        hub.set_radio(if auth == CBManagerAuthorization::NotDetermined {
+            Radio::AwaitingPermission
+        } else {
+            Radio::Starting
+        });
         let driver = Driver::spawn(hub)?;
         driver.on_queue(|d| d.create_managers());
         *slot = Some(driver);
@@ -401,7 +404,8 @@ impl Driver {
                 CBAttributePermissions::Readable,
             )
         };
-        let svc = unsafe { CBMutableService::initWithType_primary(CBMutableService::alloc(), &uuid(SERVICE_UUID), true) };
+        let svc =
+            unsafe { CBMutableService::initWithType_primary(CBMutableService::alloc(), &uuid(SERVICE_UUID), true) };
         let chars: Retained<NSArray<CBCharacteristic>> = NSArray::from_retained_slice(&[ch.into_super()]);
         unsafe { svc.setCharacteristics(Some(&chars)) };
         unsafe { pm.addService(&svc) };
@@ -470,7 +474,13 @@ impl Driver {
     }
 
     /// Carry a channel's traffic over this stream pair (any thread).
-    fn attach(self: &Arc<Self>, chan: ChanId, input: Retained<NSInputStream>, output: Retained<NSOutputStream>, pid: Option<Pid>) {
+    fn attach(
+        self: &Arc<Self>,
+        chan: ChanId,
+        input: Retained<NSInputStream>,
+        output: Retained<NSOutputStream>,
+        pid: Option<Pid>,
+    ) {
         let mut q = OutQueue::new(OUT_QUEUE_BYTES);
         q.push(encode_hello(&self.hub.me, &self.hub.name())); // always the first frame
         let q = Arc::new(Mutex::new(q));
@@ -495,9 +505,7 @@ fn scan_all() -> bool {
 fn advertises_mycel(adv: &NSDictionary<NSString, AnyObject>) -> bool {
     adv.objectForKey(unsafe { CBAdvertisementDataServiceUUIDsKey })
         .and_then(|o| o.downcast::<NSArray>().ok())
-        .is_some_and(|a| {
-            a.iter().any(|u| u.downcast::<CBUUID>().is_ok_and(|u| is_uuid(&u, SERVICE_UUID)))
-        })
+        .is_some_and(|a| a.iter().any(|u| u.downcast::<CBUUID>().is_ok_and(|u| is_uuid(&u, SERVICE_UUID))))
 }
 
 fn scan(central: &CBCentralManager) {
@@ -522,7 +530,8 @@ fn advertise(pm: &CBPeripheralManager) {
     let services = NSArray::from_retained_slice(&[uuid(SERVICE_UUID)]);
     let name = NSString::from_str("Mycel");
     let keys: [&NSString; 2] = unsafe { [CBAdvertisementDataServiceUUIDsKey, CBAdvertisementDataLocalNameKey] };
-    let data = NSDictionary::<NSString, AnyObject>::from_slices(&keys, &[&*services as &AnyObject, &*name as &AnyObject]);
+    let data =
+        NSDictionary::<NSString, AnyObject>::from_slices(&keys, &[&*services as &AnyObject, &*name as &AnyObject]);
     unsafe { pm.startAdvertising(Some(&data)) };
 }
 
@@ -865,7 +874,14 @@ fn install_streams(
     STREAMS.with(|m| {
         m.borrow_mut().insert(
             chan,
-            StreamIo { input, output, _delegate: delegate, rx: ChannelRx::default(), q, last_ping: std::time::Instant::now() },
+            StreamIo {
+                input,
+                output,
+                _delegate: delegate,
+                rx: ChannelRx::default(),
+                q,
+                last_ping: std::time::Instant::now(),
+            },
         )
     });
     pump(d, chan);

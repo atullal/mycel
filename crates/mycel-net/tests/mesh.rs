@@ -164,7 +164,8 @@ async fn a_route_found_later_joins_the_live_connection() {
     mesh_route(&a, &c).await;
     let conn = a.connect(c.id(), BULK).await.unwrap();
     push(&conn, 10_000).await;
-    let mesh_paths = |conn: &Connection| conn.paths().iter().filter(|p| PathKind::of(p.remote_addr()) == PathKind::Mesh).count();
+    let mesh_paths =
+        |conn: &Connection| conn.paths().iter().filter(|p| PathKind::of(p.remote_addr()) == PathKind::Mesh).count();
     assert_eq!(mesh_paths(&conn), 1, "one route so far: {}", path_report(&conn));
 
     // D comes into range of both: a second route, after the connection
@@ -234,7 +235,8 @@ async fn two_routes_aggregate_and_fail_over() {
     let c = device("c", &[&bc, &dc], fast()).await;
     let cid = c.id();
     eventually("both routes known", 20, || {
-        a.mesh().unwrap().reachable().contains(&cid) && a.link_status().iter().any(|s| s.kind == PathKind::Mesh && s.peers >= 1)
+        a.mesh().unwrap().reachable().contains(&cid)
+            && a.link_status().iter().any(|s| s.kind == PathKind::Mesh && s.peers >= 1)
     })
     .await;
     tokio::time::sleep(Duration::from_millis(1500)).await; // both routes announced
@@ -248,7 +250,12 @@ async fn two_routes_aggregate_and_fail_over() {
     let two = (2 * bytes) as f64 / push(&conn, 2 * bytes).await.as_secs_f64();
     let ratio = two / one;
     eprintln!("two routes: {}", path_report(&conn));
-    eprintln!("  a {:?}\n  b {:?}\n  d {:?}", a.mesh().unwrap().stats(), b.mesh().unwrap().stats(), d.mesh().unwrap().stats());
+    eprintln!(
+        "  a {:?}\n  b {:?}\n  d {:?}",
+        a.mesh().unwrap().stats(),
+        b.mesh().unwrap().stats(),
+        d.mesh().unwrap().stats()
+    );
     eprintln!("one route {:.0} kB/s, two routes {:.0} kB/s: {ratio:.2}x", one / 1e3, two / 1e3);
     assert!(ratio > 1.5, "two routes carry {ratio:.2}x one route");
     let (sb, sd) = (b.mesh().unwrap().stats(), d.mesh().unwrap().stats());
@@ -277,7 +284,8 @@ async fn five_device_line_latency_per_hop() {
     let edges: Vec<MemNet> = (0..4).map(edge).collect();
     let mut nodes = Vec::new();
     for i in 0..5 {
-        let mine: Vec<&MemNet> = edges.iter().enumerate().filter(|(e, _)| *e + 1 == i || *e == i).map(|(_, n)| n).collect();
+        let mine: Vec<&MemNet> =
+            edges.iter().enumerate().filter(|(e, _)| *e + 1 == i || *e == i).map(|(_, n)| n).collect();
         nodes.push(device(&format!("n{i}"), &mine, fast()).await);
     }
     let a = &nodes[0];

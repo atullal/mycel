@@ -22,9 +22,7 @@ use anyhow::{Result, bail};
 use block2::RcBlock;
 use bytes::Bytes;
 use mycel_crypto::SignPk;
-use mycel_net::link::transports::{
-    CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit,
-};
+use mycel_net::link::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
 use mycel_net::link::{CustomAddr, TRANSPORT_PEER_WIFI, n0_watcher, noq_udp};
 use mycel_net::{Link, LinkEvent, LinkStatus, PathKind};
 use parking_lot::{Mutex, RwLock};
@@ -68,9 +66,7 @@ fn addr_of(pk: &SignPk) -> CustomAddr {
 }
 
 fn parse_addr(a: &CustomAddr) -> Option<SignPk> {
-    (a.id() == TRANSPORT_PEER_WIFI)
-        .then(|| a.data().try_into().ok().map(SignPk))
-        .flatten()
+    (a.id() == TRANSPORT_PEER_WIFI).then(|| a.data().try_into().ok().map(SignPk)).flatten()
 }
 
 struct Packet {
@@ -131,10 +127,7 @@ impl Flow {
     fn alive(&self, now: Instant) -> bool {
         self.ready.load(Ordering::Acquire)
             && !self.closed.load(Ordering::Acquire)
-            && self
-                .last_rx
-                .lock()
-                .is_some_and(|t| now.duration_since(t) < FLOW_TIMEOUT)
+            && self.last_rx.lock().is_some_and(|t| now.duration_since(t) < FLOW_TIMEOUT)
     }
 
     fn cancel(&self) {
@@ -237,10 +230,7 @@ impl AwdlLink {
             started: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
         });
-        Arc::new(AwdlLink {
-            shared,
-            rx: Arc::new(tokio::sync::Mutex::new(rx)),
-        })
+        Arc::new(AwdlLink { shared, rx: Arc::new(tokio::sync::Mutex::new(rx)) })
     }
 }
 
@@ -250,10 +240,7 @@ impl Link for AwdlLink {
     }
 
     fn transport(&self) -> Arc<dyn CustomTransport> {
-        Arc::new(AwdlTransport {
-            shared: self.shared.clone(),
-            rx: self.rx.clone(),
-        })
+        Arc::new(AwdlTransport { shared: self.shared.clone(), rx: self.rx.clone() })
     }
 
     fn start(&self, events: mpsc::UnboundedSender<LinkEvent>) -> Result<()> {
@@ -264,18 +251,16 @@ impl Link for AwdlLink {
         self.shared.start_listener();
         self.shared.start_browser();
         let weak = Arc::downgrade(&self.shared);
-        std::thread::Builder::new()
-            .name("mycel-awdl".into())
-            .spawn(move || {
-                loop {
-                    std::thread::sleep(Duration::from_millis(500));
-                    let Some(s) = weak.upgrade() else { return };
-                    if s.stopped.load(Ordering::Acquire) {
-                        return;
-                    }
-                    s.tick();
+        std::thread::Builder::new().name("mycel-awdl".into()).spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_millis(500));
+                let Some(s) = weak.upgrade() else { return };
+                if s.stopped.load(Ordering::Acquire) {
+                    return;
                 }
-            })?;
+                s.tick();
+            }
+        })?;
         Ok(())
     }
 
@@ -366,9 +351,7 @@ impl Shared {
             if state == ffi::LISTENER_READY
                 && let Some(l) = &st.listener
             {
-                log!("listening on UDP port {}", unsafe {
-                    ffi::nw_listener_get_port(l.ptr())
-                });
+                log!("listening on UDP port {}", unsafe { ffi::nw_listener_get_port(l.ptr()) });
             }
             if state == ffi::LISTENER_FAILED
                 && let Some(l) = st.listener.take()
@@ -399,15 +382,14 @@ impl Shared {
 
     fn start_browser(self: &Arc<Self>) {
         let ty = service_type();
-        let Some(desc) = Nw::owned(unsafe {
-            ffi::nw_browse_descriptor_create_bonjour_service(ty.as_ptr(), std::ptr::null())
-        }) else {
+        let Some(desc) =
+            Nw::owned(unsafe { ffi::nw_browse_descriptor_create_bonjour_service(ty.as_ptr(), std::ptr::null()) })
+        else {
             self.st.lock().browser_state = ffi::BROWSER_FAILED;
             return;
         };
         unsafe { ffi::nw_browse_descriptor_set_include_txt_record(desc.ptr(), true) };
-        let params =
-            Nw::owned(unsafe { ffi::nw_parameters_create() }).expect("nw_parameters_create");
+        let params = Nw::owned(unsafe { ffi::nw_parameters_create() }).expect("nw_parameters_create");
         unsafe { ffi::nw_parameters_set_include_peer_to_peer(params.ptr(), true) };
         let Some(b) = Nw::owned(unsafe { ffi::nw_browser_create(desc.ptr(), params.ptr()) }) else {
             self.st.lock().browser_state = ffi::BROWSER_FAILED;
@@ -429,13 +411,11 @@ impl Shared {
             }
         });
         let weak = Arc::downgrade(self);
-        let on_results = RcBlock::new(
-            move |old: ffi::nw_object, new: ffi::nw_object, _batch_complete: ffi::CBool| {
-                if let Some(s) = weak.upgrade() {
-                    s.on_browse(old, new);
-                }
-            },
-        );
+        let on_results = RcBlock::new(move |old: ffi::nw_object, new: ffi::nw_object, _batch_complete: ffi::CBool| {
+            if let Some(s) = weak.upgrade() {
+                s.on_browse(old, new);
+            }
+        });
         unsafe {
             ffi::nw_browser_set_queue(b.ptr(), self.queue.ptr());
             ffi::nw_browser_set_state_changed_handler(b.ptr(), &on_state);
@@ -463,10 +443,7 @@ impl Shared {
             }
             self.recompute();
         }
-        let update = ffi::CHANGE_ADDED
-            | ffi::CHANGE_IFACE_ADDED
-            | ffi::CHANGE_IFACE_REMOVED
-            | ffi::CHANGE_TXT;
+        let update = ffi::CHANGE_ADDED | ffi::CHANGE_IFACE_ADDED | ffi::CHANGE_IFACE_REMOVED | ffi::CHANGE_TXT;
         if changes & update != 0 && !new.is_null() {
             self.upsert_service(new);
             self.recompute();
@@ -477,12 +454,11 @@ impl Shared {
         let Some(name) = result_name(result) else {
             return;
         };
-        let advert = Nw::owned(unsafe { ffi::nw_browse_result_copy_txt_record_object(result) })
-            .and_then(|txt| {
-                let pk = ffi::txt_value(txt.ptr(), &cstring(wire::TXT_KEY));
-                let n = ffi::txt_value(txt.ptr(), &cstring(wire::TXT_NAME));
-                wire::parse_advert(pk.as_deref(), n.as_deref())
-            });
+        let advert = Nw::owned(unsafe { ffi::nw_browse_result_copy_txt_record_object(result) }).and_then(|txt| {
+            let pk = ffi::txt_value(txt.ptr(), &cstring(wire::TXT_KEY));
+            let n = ffi::txt_value(txt.ptr(), &cstring(wire::TXT_NAME));
+            wire::parse_advert(pk.as_deref(), n.as_deref())
+        });
         let Some(advert) = advert else {
             log!("service {name}: no usable TXT record yet");
             return;
@@ -490,14 +466,11 @@ impl Shared {
         if advert.key == self.me {
             return; // our own advertisement
         }
-        let Some(endpoint) = Nw::owned(unsafe { ffi::nw_browse_result_copy_endpoint(result) })
-        else {
+        let Some(endpoint) = Nw::owned(unsafe { ffi::nw_browse_result_copy_endpoint(result) }) else {
             return;
         };
         let ifaces = ffi::interfaces_of_browse_result(result);
-        let p2p = ifaces
-            .iter()
-            .any(|(n, _)| wire::is_peer_to_peer_interface(n));
+        let p2p = ifaces.iter().any(|(n, _)| wire::is_peer_to_peer_interface(n));
         let eligible = self.any_iface || p2p || ifaces.is_empty();
         log!(
             "service {name}: {} {:?} on {:?} (eligible: {eligible})",
@@ -505,37 +478,21 @@ impl Shared {
             advert.name,
             ifaces.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
         );
-        let other_ifaces: Vec<Nw> = ifaces
-            .into_iter()
-            .filter(|(n, _)| !wire::is_peer_to_peer_interface(n))
-            .map(|(_, i)| i)
-            .collect();
+        let other_ifaces: Vec<Nw> =
+            ifaces.into_iter().filter(|(n, _)| !wire::is_peer_to_peer_interface(n)).map(|(_, i)| i).collect();
         let mut st = self.st.lock();
         let (mut flow, last_attempt) = match st.services.get(&name) {
             Some(s) => (s.flow, s.last_attempt),
             None => (None, None),
         };
-        let same_key = st
-            .services
-            .get(&name)
-            .is_none_or(|s| s.advert.key == advert.key);
+        let same_key = st.services.get(&name).is_none_or(|s| s.advert.key == advert.key);
         if !(same_key && eligible)
             && let Some(f) = flow.take().and_then(|id| st.flows.get(&id))
         {
             // key changed, or no longer on peer-to-peer Wi-Fi
             f.cancel();
         }
-        st.services.insert(
-            name.clone(),
-            Service {
-                advert,
-                endpoint,
-                other_ifaces,
-                eligible,
-                flow,
-                last_attempt,
-            },
-        );
+        st.services.insert(name.clone(), Service { advert, endpoint, other_ifaces, eligible, flow, last_attempt });
         if eligible && flow.is_none() {
             self.connect(&mut st, &name);
         }
@@ -555,18 +512,13 @@ impl Shared {
                 unsafe { ffi::nw_parameters_prohibit_interface(params.ptr(), i.ptr()) };
             }
         }
-        let Some(conn) =
-            Nw::owned(unsafe { ffi::nw_connection_create(svc.endpoint.ptr(), params.ptr()) })
-        else {
+        let Some(conn) = Nw::owned(unsafe { ffi::nw_connection_create(svc.endpoint.ptr(), params.ptr()) }) else {
             return;
         };
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         svc.flow = Some(id);
         svc.last_attempt = Some(Instant::now());
-        log!(
-            "flow {id}: connecting to {name} ({})",
-            svc.advert.key.short()
-        );
+        log!("flow {id}: connecting to {name} ({})", svc.advert.key.short());
         let flow = Flow::new(id, conn, true, Some(svc.advert.key));
         st.flows.insert(id, flow.clone());
         self.run_flow(&flow);
@@ -607,26 +559,18 @@ impl Shared {
         match state {
             ffi::CONN_READY => {
                 if !self.any_iface {
-                    let ifaces =
-                        Nw::owned(unsafe { ffi::nw_connection_copy_current_path(flow.conn.ptr()) })
-                            .map(|p| ffi::interfaces_of_path(p.ptr()))
-                            .unwrap_or_default();
+                    let ifaces = Nw::owned(unsafe { ffi::nw_connection_copy_current_path(flow.conn.ptr()) })
+                        .map(|p| ffi::interfaces_of_path(p.ptr()))
+                        .unwrap_or_default();
                     if !ifaces.iter().any(|n| wire::is_peer_to_peer_interface(n)) {
-                        log!(
-                            "flow {}: not on peer-to-peer Wi-Fi ({ifaces:?}), closing",
-                            flow.id
-                        );
+                        log!("flow {}: not on peer-to-peer Wi-Fi ({ifaces:?}), closing", flow.id);
                         flow.cancel();
                         return;
                     }
                 }
                 let max = unsafe { ffi::nw_connection_get_maximum_datagram_size(flow.conn.ptr()) };
                 flow.max_datagram.store(max as usize, Ordering::Relaxed);
-                log!(
-                    "flow {}: ready via {} (max datagram {max})",
-                    flow.id,
-                    ffi::remote_of(flow.conn.ptr())
-                );
+                log!("flow {}: ready via {} (max datagram {max})", flow.id, ffi::remote_of(flow.conn.ptr()));
                 flow.ready.store(true, Ordering::Release);
                 self.st.lock().flow_denied = false;
                 if !flow.closed.load(Ordering::Acquire) {
@@ -639,9 +583,8 @@ impl Shared {
             ffi::CONN_WAITING | ffi::CONN_PREPARING => {
                 flow.ready.store(false, Ordering::Release);
                 if state == ffi::CONN_WAITING {
-                    let reason =
-                        Nw::owned(unsafe { ffi::nw_connection_copy_current_path(flow.conn.ptr()) })
-                            .map(|p| unsafe { ffi::nw_path_get_unsatisfied_reason(p.ptr()) });
+                    let reason = Nw::owned(unsafe { ffi::nw_connection_copy_current_path(flow.conn.ptr()) })
+                        .map(|p| unsafe { ffi::nw_path_get_unsatisfied_reason(p.ptr()) });
                     if reason == Some(ffi::UNSATISFIED_LOCAL_NETWORK_DENIED) {
                         log!("flow {}: Local Network access denied", flow.id);
                         self.st.lock().flow_denied = true;
@@ -683,10 +626,7 @@ impl Shared {
     fn receive(self: &Arc<Self>, flow: &Arc<Flow>) {
         let (ws, wf) = (Arc::downgrade(self), Arc::downgrade(flow));
         let done = RcBlock::new(
-            move |content: ffi::dispatch_object,
-                  _ctx: ffi::nw_object,
-                  _complete: ffi::CBool,
-                  err: ffi::nw_object| {
+            move |content: ffi::dispatch_object, _ctx: ffi::nw_object, _complete: ffi::CBool, err: ffi::nw_object| {
                 let (Some(s), Some(f)) = (ws.upgrade(), wf.upgrade()) else {
                     return;
                 };
@@ -746,10 +686,7 @@ impl Shared {
                 };
                 *flow.last_rx.lock() = Some(now);
                 // A full queue drops the packet, like a congested radio.
-                let _ = self.tx.try_send(Packet {
-                    data: Bytes::from(data),
-                    from,
-                });
+                let _ = self.tx.try_send(Packet { data: Bytes::from(data), from });
             }
         }
     }
@@ -775,39 +712,22 @@ impl Shared {
             }
         }
         let name_of = |st: &State, peer: &SignPk| {
-            st.services
-                .values()
-                .find(|s| s.advert.key == *peer)
-                .and_then(|s| s.advert.name.clone())
+            st.services.values().find(|s| s.advert.key == *peer).and_then(|s| s.advert.name.clone())
         };
         // keep the last name we knew if its advertisement is gone for now
-        let now_up: HashMap<SignPk, Option<String>> = best
-            .keys()
-            .map(|p| {
-                (
-                    *p,
-                    name_of(&st, p).or_else(|| st.reported.get(p).cloned().flatten()),
-                )
-            })
-            .collect();
+        let now_up: HashMap<SignPk, Option<String>> =
+            best.keys().map(|p| (*p, name_of(&st, p).or_else(|| st.reported.get(p).cloned().flatten()))).collect();
         *self.routes.write() = best;
         for (peer, name) in &now_up {
             // new, or its name became known (an inbound-only peer we then browsed)
             if st.reported.get(peer) != Some(name) {
                 log!("found {} {name:?}", peer.short());
-                self.emit(LinkEvent::Found {
-                    peer: *peer,
-                    addr: addr_of(peer),
-                    name: name.clone(),
-                });
+                self.emit(LinkEvent::Found { peer: *peer, addr: addr_of(peer), name: name.clone() });
             }
         }
         for peer in st.reported.keys().filter(|p| !now_up.contains_key(p)) {
             log!("lost {}", peer.short());
-            self.emit(LinkEvent::Lost {
-                peer: *peer,
-                addr: addr_of(peer),
-            });
+            self.emit(LinkEvent::Lost { peer: *peer, addr: addr_of(peer) });
         }
         st.reported = now_up;
     }
@@ -823,19 +743,13 @@ impl Shared {
             }
             let heard = f.last_rx.lock().unwrap_or(f.created);
             if now.duration_since(heard) > FLOW_EXPIRE {
-                log!(
-                    "flow {}: silent for {:?}, closing",
-                    f.id,
-                    now.duration_since(heard)
-                );
+                log!("flow {}: silent for {:?}, closing", f.id, now.duration_since(heard));
                 f.cancel();
                 continue;
             }
             if f.outbound
                 && f.ready.load(Ordering::Acquire)
-                && f.last_hello
-                    .lock()
-                    .is_none_or(|t| now.duration_since(t) >= HELLO_EVERY)
+                && f.last_hello.lock().is_none_or(|t| now.duration_since(t) >= HELLO_EVERY)
             {
                 self.hello(f);
             }
@@ -844,26 +758,17 @@ impl Shared {
             .services
             .iter()
             .filter(|(_, s)| {
-                s.eligible
-                    && s.flow.is_none()
-                    && s.last_attempt
-                        .is_none_or(|t| now.duration_since(t) >= RETRY_EVERY)
+                s.eligible && s.flow.is_none() && s.last_attempt.is_none_or(|t| now.duration_since(t) >= RETRY_EVERY)
             })
             .map(|(n, _)| n.clone())
             .collect();
         for name in retry {
             self.connect(&mut st, &name);
         }
-        let restart_listener = st.listener.is_none()
-            && st
-                .listener_failed
-                .take_if(|t| now.duration_since(*t) >= RESTART_EVERY)
-                .is_some();
-        let restart_browser = st.browser.is_none()
-            && st
-                .browser_failed
-                .take_if(|t| now.duration_since(*t) >= RESTART_EVERY)
-                .is_some();
+        let restart_listener =
+            st.listener.is_none() && st.listener_failed.take_if(|t| now.duration_since(*t) >= RESTART_EVERY).is_some();
+        let restart_browser =
+            st.browser.is_none() && st.browser_failed.take_if(|t| now.duration_since(*t) >= RESTART_EVERY).is_some();
         drop(st);
         if restart_listener && !self.stopped.load(Ordering::Acquire) {
             log!("restarting listener");
@@ -886,10 +791,8 @@ impl Shared {
         let started = self.started.load(Ordering::Acquire);
         let stopped = self.stopped.load(Ordering::Acquire);
         let radio = self.any_iface || awdl_up();
-        let ready =
-            st.listener_state == ffi::LISTENER_READY && st.browser_state == ffi::BROWSER_READY;
-        let failed =
-            st.listener_state == ffi::LISTENER_FAILED || st.browser_state == ffi::BROWSER_FAILED;
+        let ready = st.listener_state == ffi::LISTENER_READY && st.browser_state == ffi::BROWSER_READY;
+        let failed = st.listener_state == ffi::LISTENER_FAILED || st.browser_state == ffi::BROWSER_FAILED;
         let detail = if stopped {
             Some("Stopped".to_string())
         } else if !started {
@@ -902,21 +805,14 @@ impl Shared {
             let e = st.listener_err.or(st.browser_err);
             Some(format!(
                 "Peer-to-peer Wi-Fi failed{}",
-                e.map(|(d, c)| format!(" (error {d}/{c})"))
-                    .unwrap_or_default()
+                e.map(|(d, c)| format!(" (error {d}/{c})")).unwrap_or_default()
             ))
         } else if !ready {
             Some("Starting peer-to-peer Wi-Fi…".to_string())
         } else {
             None
         };
-        LinkStatus {
-            kind: PathKind::PeerWifi,
-            label: None,
-            active: detail.is_none(),
-            detail,
-            peers,
-        }
+        LinkStatus { kind: PathKind::PeerWifi, label: None, active: detail.is_none(), detail, peers }
     }
 
     fn stop(&self) {
@@ -936,10 +832,7 @@ impl Shared {
         st.services.clear();
         self.routes.write().clear();
         for peer in std::mem::take(&mut st.reported).into_keys() {
-            self.emit(LinkEvent::Lost {
-                peer,
-                addr: addr_of(&peer),
-            });
+            self.emit(LinkEvent::Lost { peer, addr: addr_of(&peer) });
         }
     }
 }
@@ -969,10 +862,7 @@ fn awdl_up() -> bool {
         if !ifa.ifa_name.is_null() {
             let name = unsafe { CStr::from_ptr(ifa.ifa_name) }.to_bytes();
             let flags = ifa.ifa_flags as libc::c_int;
-            if name.starts_with(b"awdl")
-                && flags & libc::IFF_UP != 0
-                && flags & libc::IFF_RUNNING != 0
-            {
+            if name.starts_with(b"awdl") && flags & libc::IFF_UP != 0 && flags & libc::IFF_RUNNING != 0 {
                 up = true;
                 break;
             }
@@ -998,11 +888,8 @@ impl std::fmt::Debug for AwdlTransport {
 
 impl CustomTransport for AwdlTransport {
     fn bind(&self) -> io::Result<Box<dyn CustomEndpoint>> {
-        let rx = self
-            .rx
-            .clone()
-            .try_lock_owned()
-            .map_err(|_| io::Error::other("peer-to-peer Wi-Fi link already bound"))?;
+        let rx =
+            self.rx.clone().try_lock_owned().map_err(|_| io::Error::other("peer-to-peer Wi-Fi link already bound"))?;
         let local = addr_of(&self.shared.me);
         Ok(Box::new(AwdlEndpoint {
             shared: self.shared.clone(),
@@ -1032,9 +919,7 @@ impl CustomEndpoint for AwdlEndpoint {
     }
 
     fn create_sender(&self) -> Arc<dyn CustomSender> {
-        Arc::new(AwdlSender {
-            shared: self.shared.clone(),
-        })
+        Arc::new(AwdlSender { shared: self.shared.clone() })
     }
 
     fn poll_recv(
@@ -1105,10 +990,7 @@ impl CustomSender for AwdlSender {
         let Some(flow) = self.shared.routes.read().get(&peer).cloned() else {
             return Poll::Ready(Ok(()));
         };
-        let seg = transmit
-            .segment_size
-            .unwrap_or(transmit.contents.len())
-            .max(1);
+        let seg = transmit.segment_size.unwrap_or(transmit.contents.len()).max(1);
         for chunk in transmit.contents.chunks(seg) {
             flow.send(chunk);
         }
@@ -1124,16 +1006,7 @@ mod tests {
     fn custom_addr_is_the_node_key() {
         let pk = SignPk([9; 32]);
         assert_eq!(parse_addr(&addr_of(&pk)), Some(pk));
-        assert_eq!(
-            parse_addr(&CustomAddr::from_parts(TRANSPORT_PEER_WIFI, &[1, 2, 3])),
-            None
-        );
-        assert_eq!(
-            parse_addr(&CustomAddr::from_parts(
-                mycel_net::link::TRANSPORT_BLUETOOTH,
-                &pk.0
-            )),
-            None
-        );
+        assert_eq!(parse_addr(&CustomAddr::from_parts(TRANSPORT_PEER_WIFI, &[1, 2, 3])), None);
+        assert_eq!(parse_addr(&CustomAddr::from_parts(mycel_net::link::TRANSPORT_BLUETOOTH, &pk.0)), None);
     }
 }

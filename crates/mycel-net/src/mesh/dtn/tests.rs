@@ -16,15 +16,7 @@ fn bundle(src: SignPk, dst: SignPk, n: u8, lifetime: u64) -> Bundle {
     idb[0] = n;
     idb[1..5].copy_from_slice(&src.0[..4]);
     idb[5..9].copy_from_slice(&dst.0[..4]);
-    Bundle {
-        id: Hash32(idb),
-        src,
-        dst,
-        created: 0,
-        lifetime,
-        payload: Bytes::from(vec![n; 1000]),
-        sig: Sig([0; 64]),
-    }
+    Bundle { id: Hash32(idb), src, dst, created: 0, lifetime, payload: Bytes::from(vec![n; 1000]), sig: Sig([0; 64]) }
 }
 
 struct World {
@@ -210,7 +202,8 @@ fn a_passer_by_as_good_as_the_holder_gets_a_copy() {
     w.meet(a, mule);
     let x = bundle(key(a as u32), key(b as u32), 4, 3_600_000);
     w.nodes[a].originate(x.clone(), w.now).unwrap();
-    let (pa, pm) = (w.nodes[a].utility(&key(b as u32), true, w.now), w.nodes[mule].utility(&key(b as u32), true, w.now));
+    let (pa, pm) =
+        (w.nodes[a].utility(&key(b as u32), true, w.now), w.nodes[mule].utility(&key(b as u32), true, w.now));
     assert!((pa - pm).abs() < MARGIN, "equally placed: {pa} vs {pm}");
     w.step(1_000);
     assert!(w.nodes[mule].holds(&x.id), "the passer-by carries a copy");
@@ -323,7 +316,10 @@ fn budgets_signatures_and_lifetimes() {
         let r = c.accept(key(2), bundle(s1, key(3), n, 1_000), 1, 0, |_| true);
         assert_eq!(r, if n < 6 && n - 3 < 3 { Accepted::Stored } else { r.clone() });
     }
-    assert_eq!(c.accept(key(2), bundle(s1, key(3), 7, 1_000), 1, 0, |_| true), Accepted::Refused("source over its share"));
+    assert_eq!(
+        c.accept(key(2), bundle(s1, key(3), 7, 1_000), 1, 0, |_| true),
+        Accepted::Refused("source over its share")
+    );
     assert_eq!(c.accept(key(2), bundle(s2, key(3), 8, 1_000), 1, 0, |_| true), Accepted::Stored);
     assert_eq!(c.accept(key(2), bundle(s2, key(3), 9, 1_000), 1, 0, |_| true), Accepted::Stored);
     assert_eq!(c.accept(key(2), bundle(s2, key(3), 10, 1_000), 1, 0, |_| true), Accepted::Refused("store full"));
@@ -378,7 +374,13 @@ fn gradient_beats_spray_and_wait() {
             for _ in 0..2 {
                 let a = rnd(N);
                 let here = a / PER;
-                let there = if here == 0 { 1 } else if here == CLUSTERS - 1 || rnd(2) == 0 { here - 1 } else { here + 1 };
+                let there = if here == 0 {
+                    1
+                } else if here == CLUSTERS - 1 || rnd(2) == 0 {
+                    here - 1
+                } else {
+                    here + 1
+                };
                 let b = there * PER + rnd(PER);
                 w.meet(a, b);
             }

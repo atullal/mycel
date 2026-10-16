@@ -74,14 +74,12 @@ use std::fmt;
 use mycel_rules_abi::{self as abi, ABI_VERSION, exports};
 use serde::{Deserialize, Serialize};
 use wasmi::{
-    CompilationMode, Config, EnforcedLimits, Engine, ExternType, Instance, Memory, Module, Store,
-    StoreLimits, StoreLimitsBuilder, TypedFunc, ValType,
+    CompilationMode, Config, EnforcedLimits, Engine, ExternType, Instance, Memory, Module, Store, StoreLimits,
+    StoreLimitsBuilder, TypedFunc, ValType,
 };
 
 pub use mycel_rules_abi as abi_types;
-pub use mycel_rules_abi::{
-    Reason, ReduceInput, ReduceOutput, RoleTag, RuleInput, StreamKind, StreamTag, Verdict,
-};
+pub use mycel_rules_abi::{Reason, ReduceInput, ReduceOutput, RoleTag, RuleInput, StreamKind, StreamTag, Verdict};
 
 #[cfg(test)]
 mod tests;
@@ -136,11 +134,8 @@ pub struct Limits {
 
 impl Limits {
     /// The default limits for ABI v1.
-    pub const V1: Limits = Limits {
-        fuel: 20_000_000,
-        max_memory_bytes: 16 * 1024 * 1024,
-        max_module_bytes: 4 * 1024 * 1024,
-    };
+    pub const V1: Limits =
+        Limits { fuel: 20_000_000, max_memory_bytes: 16 * 1024 * 1024, max_module_bytes: 4 * 1024 * 1024 };
 }
 
 impl Default for Limits {
@@ -158,10 +153,7 @@ pub enum LoadError {
     #[error("rules bundle is {size} bytes, limit is {limit}")]
     TooLarge { size: usize, limit: usize },
     #[error("rules bundle hash {actual} does not match pinned {expected}")]
-    HashMismatch {
-        expected: RulesHash,
-        actual: RulesHash,
-    },
+    HashMismatch { expected: RulesHash, actual: RulesHash },
     /// Not valid wasm under the deterministic feature set (includes any float usage).
     #[error("invalid or non-deterministic wasm: {0}")]
     Invalid(String),
@@ -250,10 +242,7 @@ impl RulesModule {
     /// Validate and compile a rules bundle with explicit limits.
     pub fn load_with_limits(wasm: &[u8], limits: Limits) -> Result<Self, LoadError> {
         if wasm.len() > limits.max_module_bytes {
-            return Err(LoadError::TooLarge {
-                size: wasm.len(),
-                limit: limits.max_module_bytes,
-            });
+            return Err(LoadError::TooLarge { size: wasm.len(), limit: limits.max_module_bytes });
         }
         let hash = RulesHash::of(wasm);
         let engine = Engine::new(&engine_config());
@@ -269,10 +258,7 @@ impl RulesModule {
             Some(ExternType::Memory(mt)) if !mt.is_64() => {
                 let bytes = mt.minimum().saturating_mul(65536); // custom page sizes are disabled
                 if bytes > limits.max_memory_bytes as u64 {
-                    return Err(LoadError::MemoryTooLarge {
-                        bytes,
-                        limit: limits.max_memory_bytes,
-                    });
+                    return Err(LoadError::MemoryTooLarge { bytes, limit: limits.max_memory_bytes });
                 }
             }
             Some(_) => return Err(LoadError::BadExportType(exports::MEMORY)),
@@ -284,26 +270,15 @@ impl RulesModule {
         check_func(&module, exports::VALIDATE, &[I32, I32], &[I64], true)?;
         let has_reducer = check_func(&module, exports::REDUCE, &[I32, I32], &[I64], false)?;
 
-        let this = RulesModule {
-            engine,
-            module,
-            hash,
-            limits,
-            has_reducer,
-        };
+        let this = RulesModule { engine, module, hash, limits, has_reducer };
         // Trial instantiation: catches data segments that don't fit, memory over the cap, etc.
-        let (mut store, instance) = this
-            .instantiate()
-            .map_err(|e| LoadError::Instantiate(e.to_string()))?;
+        let (mut store, instance) = this.instantiate().map_err(|e| LoadError::Instantiate(e.to_string()))?;
         let found = instance
             .get_typed_func::<(), i32>(&store, exports::ABI_VERSION)
             .and_then(|f| f.call(&mut store, ()))
             .map_err(|e| LoadError::Instantiate(e.to_string()))?;
         if found != ABI_VERSION {
-            return Err(LoadError::AbiVersion {
-                found,
-                expected: ABI_VERSION,
-            });
+            return Err(LoadError::AbiVersion { found, expected: ABI_VERSION });
         }
         Ok(this)
     }
@@ -418,23 +393,15 @@ impl RulesEngine {
                 .map_err(|e| Fail::BadAbi(e.to_string()))?;
             let ret = f.call(&mut call.store, (ptr, len)).map_err(trap)?;
             match abi::decode_validate(ret) {
-                Verdict::Reject(Reason::BadAbi) => Err(Fail::BadAbi(format!(
-                    "invalid mycel_validate return value {ret:#x}"
-                ))),
+                Verdict::Reject(Reason::BadAbi) => {
+                    Err(Fail::BadAbi(format!("invalid mycel_validate return value {ret:#x}")))
+                }
                 v => Ok(v),
             }
         });
         match res {
-            Ok(v) => Trace {
-                result: v,
-                fuel_used,
-                detail: None,
-            },
-            Err(f) => Trace {
-                result: Verdict::Reject(f.reason()),
-                fuel_used,
-                detail: f.detail(),
-            },
+            Ok(v) => Trace { result: v, fuel_used, detail: None },
+            Err(f) => Trace { result: Verdict::Reject(f.reason()), fuel_used, detail: f.detail() },
         }
     }
 
@@ -447,11 +414,7 @@ impl RulesEngine {
     /// [`reduce`](Self::reduce) plus diagnostics.
     pub fn reduce_traced(&self, input: &RuleInput, state: &[u8]) -> Trace<Result<Vec<u8>, Reason>> {
         if !self.module.has_reducer {
-            return Trace {
-                result: Err(Reason::NoReducer),
-                fuel_used: 0,
-                detail: None,
-            };
+            return Trace { result: Err(Reason::NoReducer), fuel_used: 0, detail: None };
         }
         // Same postcard bytes as `ReduceInput { input: input.clone(), state: state.to_vec() }`.
         #[derive(Serialize)]
@@ -462,21 +425,15 @@ impl RulesEngine {
         }
         let bytes = abi::encode(&ReduceInputRef { input, state });
         let (res, fuel_used) = self.run(&bytes, |call, ptr, len| {
-            let f: TypedFunc<(i32, i32), i64> = call
-                .instance
-                .get_typed_func(&call.store, exports::REDUCE)
-                .map_err(|e| Fail::BadAbi(e.to_string()))?;
+            let f: TypedFunc<(i32, i32), i64> =
+                call.instance.get_typed_func(&call.store, exports::REDUCE).map_err(|e| Fail::BadAbi(e.to_string()))?;
             let ret = f.call(&mut call.store, (ptr, len)).map_err(trap)?;
             let (out_ptr, out_len) = abi::unpack_ptr_len(ret);
             let data = call.memory.data(&call.store);
             let out = (out_ptr as usize)
                 .checked_add(out_len as usize)
                 .and_then(|end| data.get(out_ptr as usize..end))
-                .ok_or_else(|| {
-                    Fail::BadAbi(format!(
-                        "reduce output {out_ptr:#x}+{out_len} out of bounds"
-                    ))
-                })?;
+                .ok_or_else(|| Fail::BadAbi(format!("reduce output {out_ptr:#x}+{out_len} out of bounds")))?;
             match abi::decode_exact::<ReduceOutput>(out) {
                 Some(ReduceOutput::Accept { state }) => Ok(Ok(state)),
                 Some(ReduceOutput::Reject { code }) => Ok(Err(Reason::Rule(code))),
@@ -484,55 +441,30 @@ impl RulesEngine {
             }
         });
         match res {
-            Ok(r) => Trace {
-                result: r,
-                fuel_used,
-                detail: None,
-            },
-            Err(f) => Trace {
-                result: Err(f.reason()),
-                fuel_used,
-                detail: f.detail(),
-            },
+            Ok(r) => Trace { result: r, fuel_used, detail: None },
+            Err(f) => Trace { result: Err(f.reason()), fuel_used, detail: f.detail() },
         }
     }
 
     /// Instantiate, copy `input` into guest memory via `mycel_alloc`, then run `f`.
-    fn run<R>(
-        &self,
-        input: &[u8],
-        f: impl FnOnce(&mut Call, i32, i32) -> Result<R, Fail>,
-    ) -> (Result<R, Fail>, u64) {
+    fn run<R>(&self, input: &[u8], f: impl FnOnce(&mut Call, i32, i32) -> Result<R, Fail>) -> (Result<R, Fail>, u64) {
         let limits = self.module.limits;
         let mut store_out = None;
         let res = (|| {
             if input.len() > limits.max_memory_bytes || input.len() > i32::MAX as usize {
-                return Err(Fail::Trap(format!(
-                    "input of {} bytes exceeds memory cap",
-                    input.len()
-                )));
+                return Err(Fail::Trap(format!("input of {} bytes exceeds memory cap", input.len())));
             }
             let (store, instance) = self.module.instantiate().map_err(trap)?;
-            let memory = instance
-                .get_memory(&store, exports::MEMORY)
-                .ok_or_else(|| Fail::BadAbi("no memory".into()))?;
-            let mut call = Call {
-                store,
-                instance,
-                memory,
-            };
+            let memory =
+                instance.get_memory(&store, exports::MEMORY).ok_or_else(|| Fail::BadAbi("no memory".into()))?;
+            let mut call = Call { store, instance, memory };
             let len = input.len() as i32; // checked above
-            let alloc: TypedFunc<i32, i32> = call
-                .instance
-                .get_typed_func(&call.store, exports::ALLOC)
-                .map_err(|e| Fail::BadAbi(e.to_string()))?;
+            let alloc: TypedFunc<i32, i32> =
+                call.instance.get_typed_func(&call.store, exports::ALLOC).map_err(|e| Fail::BadAbi(e.to_string()))?;
             let alloc_res = alloc.call(&mut call.store, len);
             let r = match alloc_res {
                 Err(e) => Err(trap(e)),
-                Ok(ptr) => match call
-                    .memory
-                    .write(&mut call.store, ptr as u32 as usize, input)
-                {
+                Ok(ptr) => match call.memory.write(&mut call.store, ptr as u32 as usize, input) {
                     Err(_) => Err(Fail::BadAbi(format!(
                         "mycel_alloc returned {:#x}, out of bounds for {} bytes",
                         ptr as u32,
@@ -544,9 +476,7 @@ impl RulesEngine {
             store_out = Some(call.store);
             r
         })();
-        let fuel_used = store_out
-            .and_then(|s| s.get_fuel().ok())
-            .map_or(0, |left| limits.fuel - left);
+        let fuel_used = store_out.and_then(|s| s.get_fuel().ok()).map_or(0, |left| limits.fuel - left);
         (res, fuel_used)
     }
 }

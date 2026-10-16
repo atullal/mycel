@@ -20,7 +20,7 @@
 
 use crate::stats::Map;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap};
+use std::collections::BinaryHeap;
 
 use super::engine::{NodeId, Router, SEC, Sim, Time, hop_time};
 use crate::models::Access;

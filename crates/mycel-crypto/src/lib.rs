@@ -13,8 +13,8 @@ use std::fmt;
 
 pub mod stream;
 pub use stream::{
-    STREAM_CHUNK, STREAM_HEADER_LEN, STREAM_MAGIC, StreamOpener, StreamSealer, is_stream, open_stream,
-    seal_stream, sealed_len,
+    STREAM_CHUNK, STREAM_HEADER_LEN, STREAM_MAGIC, StreamOpener, StreamSealer, is_stream, open_stream, seal_stream,
+    sealed_len,
 };
 
 use chacha20poly1305::{
@@ -127,8 +127,7 @@ impl SignPk {
     pub fn verify(&self, ctx: &str, msg: &[&[u8]], sig: &Sig) -> Result<()> {
         let vk = VerifyingKey::from_bytes(&self.0).map_err(|_| CryptoError::BadPublicKey)?;
         let sig = ed25519_dalek::Signature::from_bytes(&sig.0);
-        vk.verify_strict(&framed(ctx, msg), &sig)
-            .map_err(|_| CryptoError::BadSignature)
+        vk.verify_strict(&framed(ctx, msg), &sig).map_err(|_| CryptoError::BadSignature)
     }
 
     pub fn short(&self) -> String {
@@ -161,9 +160,7 @@ impl Serialize for Sig {
 impl<'de> Deserialize<'de> for Sig {
     fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
         let v: Vec<u8> = serde::de::Deserialize::deserialize(d)?;
-        let arr: [u8; 64] = v
-            .try_into()
-            .map_err(|_| serde::de::Error::custom("signature must be 64 bytes"))?;
+        let arr: [u8; 64] = v.try_into().map_err(|_| serde::de::Error::custom("signature must be 64 bytes"))?;
         Ok(Sig(arr))
     }
 }
@@ -191,8 +188,7 @@ const CTX_KEX_BINDING: &str = "mycel/v0/kex-binding";
 
 impl MemberKeys {
     pub fn verify_binding(&self) -> Result<()> {
-        self.sign_pk
-            .verify(CTX_KEX_BINDING, &[&self.kex_pk.0], &self.kex_sig)
+        self.sign_pk.verify(CTX_KEX_BINDING, &[&self.kex_pk.0], &self.kex_sig)
     }
 }
 
@@ -218,27 +214,10 @@ impl DeviceKeys {
         let sign = SigningKey::from_bytes(&seed);
         let kex_ikm = blake3::derive_key("mycel/v0/kex-seed", &seed);
         let (kex_sk, kex_pk) = HpkeKem::derive_keypair(&kex_ikm);
-        let kex_pk = KexPk(
-            kex_pk
-                .to_bytes()
-                .as_slice()
-                .try_into()
-                .expect("x25519 pk is 32 bytes"),
-        );
+        let kex_pk = KexPk(kex_pk.to_bytes().as_slice().try_into().expect("x25519 pk is 32 bytes"));
         let sign_pk = SignPk(sign.verifying_key().to_bytes());
-        let kex_sig = Sig(sign
-            .sign(&framed(CTX_KEX_BINDING, &[&kex_pk.0]))
-            .to_bytes());
-        DeviceKeys {
-            seed,
-            sign,
-            kex_sk,
-            public: MemberKeys {
-                sign_pk,
-                kex_pk,
-                kex_sig,
-            },
-        }
+        let kex_sig = Sig(sign.sign(&framed(CTX_KEX_BINDING, &[&kex_pk.0])).to_bytes());
+        DeviceKeys { seed, sign, kex_sk, public: MemberKeys { sign_pk, kex_pk, kex_sig } }
     }
 
     /// The seed, for persisting in the OS keychain. Handle with care.
@@ -259,8 +238,8 @@ impl DeviceKeys {
     }
 
     pub fn open_lockbox(&self, info: &[u8], lockbox: &Lockbox) -> Result<Vec<u8>> {
-        let encapped = <HpkeKem as hpke::Kem>::EncappedKey::from_bytes(&lockbox.enc)
-            .map_err(|_| CryptoError::Decrypt)?;
+        let encapped =
+            <HpkeKem as hpke::Kem>::EncappedKey::from_bytes(&lockbox.enc).map_err(|_| CryptoError::Decrypt)?;
         hpke::single_shot_open::<HpkeAead, HpkeKdf, HpkeKem>(
             &OpModeR::Base,
             &self.kex_sk,
@@ -283,20 +262,10 @@ pub struct Lockbox {
 }
 
 pub fn seal_lockbox(recipient: &KexPk, info: &[u8], plaintext: &[u8]) -> Result<Lockbox> {
-    let pk = <HpkeKem as hpke::Kem>::PublicKey::from_bytes(&recipient.0)
-        .map_err(|_| CryptoError::BadPublicKey)?;
-    let (enc, ct) = hpke::single_shot_seal::<HpkeAead, HpkeKdf, HpkeKem>(
-        &OpModeS::Base,
-        &pk,
-        info,
-        plaintext,
-        b"",
-    )
-    .map_err(|_| CryptoError::Encrypt)?;
-    Ok(Lockbox {
-        enc: enc.to_bytes().to_vec(),
-        ct,
-    })
+    let pk = <HpkeKem as hpke::Kem>::PublicKey::from_bytes(&recipient.0).map_err(|_| CryptoError::BadPublicKey)?;
+    let (enc, ct) = hpke::single_shot_seal::<HpkeAead, HpkeKdf, HpkeKem>(&OpModeS::Base, &pk, info, plaintext, b"")
+        .map_err(|_| CryptoError::Encrypt)?;
+    Ok(Lockbox { enc: enc.to_bytes().to_vec(), ct })
 }
 
 // ─────────────────────── symmetric content keys ───────────────────────
@@ -345,14 +314,8 @@ mod tests {
         let d = DeviceKeys::generate();
         let sig = d.sign("mycel/v0/test", &[b"hello"]);
         assert!(d.sign_pk().verify("mycel/v0/test", &[b"hello"], &sig).is_ok());
-        assert_eq!(
-            d.sign_pk().verify("mycel/v0/other", &[b"hello"], &sig),
-            Err(CryptoError::BadSignature)
-        );
-        assert_eq!(
-            d.sign_pk().verify("mycel/v0/test", &[b"hellO"], &sig),
-            Err(CryptoError::BadSignature)
-        );
+        assert_eq!(d.sign_pk().verify("mycel/v0/other", &[b"hello"], &sig), Err(CryptoError::BadSignature));
+        assert_eq!(d.sign_pk().verify("mycel/v0/test", &[b"hellO"], &sig), Err(CryptoError::BadSignature));
     }
 
     #[test]

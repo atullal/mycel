@@ -59,7 +59,13 @@ pub fn cellular(rng: &mut Rng) -> Inet {
 
 pub fn home(rng: &mut Rng) -> Inet {
     let access = if rng.chance(0.5) { Access::Fibre } else { Access::Cable };
-    let nat = if rng.chance(0.8) { Nat::Easy } else if rng.chance(0.5) { Nat::Open } else { Nat::Hard };
+    let nat = if rng.chance(0.8) {
+        Nat::Easy
+    } else if rng.chance(0.5) {
+        Nat::Open
+    } else {
+        Nat::Hard
+    };
     Inet { access, nat }
 }
 
@@ -77,11 +83,18 @@ pub fn global(n: usize, per_area: usize, rng: &mut Rng) -> (Vec<Area>, Vec<NodeS
             // neighbourhoods scattered over ~20 km around the centre
             let (dlat, dlon) = (rng.range(-0.09, 0.09), rng.range(-0.12, 0.12));
             let id = areas.len() as u32;
-            areas.push(Area { latlon: (lat + dlat, lon + dlon), env: if a % 3 == 0 { Env::Outdoor } else { Env::Indoor } });
+            areas.push(Area {
+                latlon: (lat + dlat, lon + dlon),
+                env: if a % 3 == 0 { Env::Outdoor } else { Env::Indoor },
+            });
             let here = per_area.min(count - (a * per_area).min(count));
             for _ in 0..here {
                 let xy = (rng.range(0.0, 250.0), rng.range(0.0, 250.0));
-                let inet = if rng.chance(adoption) { Some(if rng.chance(0.25) { home(rng) } else { cellular(rng) }) } else { None };
+                let inet = if rng.chance(adoption) {
+                    Some(if rng.chance(0.25) { home(rng) } else { cellular(rng) })
+                } else {
+                    None
+                };
                 specs.push(phone(id, xy, inet, rng));
             }
         }

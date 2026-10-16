@@ -1,0 +1,6 @@
+# Vendored upstream code is never reformatted: it stays byte-for-byte
+# comparable with the upstream release, so each MYCEL PATCH stays a small diff.
+# rustfmt reads the nearest rustfmt.toml above the file it formats, so this
+# applies to `cargo fmt`, editors and rust-analyzer alike. (`disable_all_formatting`
+# is a stable option; `ignore` is not.)
+disable_all_formatting = true

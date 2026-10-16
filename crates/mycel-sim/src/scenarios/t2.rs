@@ -31,18 +31,65 @@ use crate::tier2::{Action, Area, HOUR, Inet, MIN, MS, NodeId, Router, SEC, Sim, 
 
 pub fn scenarios() -> Vec<Scenario> {
     vec![
-        Scenario { name: "us-eu", title: "US to Europe: BLE-only phones 3–6 hops from a gateway", tier: 2, run: us_eu },
-        Scenario { name: "gateway-choice", title: "Gateway by total cost: near slow uplink vs far fibre", tier: 2, run: gateway_choice },
-        Scenario { name: "routing-convergence", title: "Convergence, loops and re-convergence after a hub fails", tier: 2, run: convergence },
-        Scenario { name: "flood-scaling", title: "Announcement overhead vs size; fisheye and flood reduction", tier: 2, run: flood_scaling },
-        Scenario { name: "partial-route", title: "Partial route, custody at the break, mule completes it", tier: 2, run: partial_route },
-        Scenario { name: "disaster-dtn", title: "Disaster zone: gradient DTN vs spray-and-wait vs epidemic", tier: 2, run: disaster_dtn },
+        Scenario {
+            name: "us-eu", title: "US to Europe: BLE-only phones 3–6 hops from a gateway", tier: 2, run: us_eu
+        },
+        Scenario {
+            name: "gateway-choice",
+            title: "Gateway by total cost: near slow uplink vs far fibre",
+            tier: 2,
+            run: gateway_choice,
+        },
+        Scenario {
+            name: "routing-convergence",
+            title: "Convergence, loops and re-convergence after a hub fails",
+            tier: 2,
+            run: convergence,
+        },
+        Scenario {
+            name: "flood-scaling",
+            title: "Announcement overhead vs size; fisheye and flood reduction",
+            tier: 2,
+            run: flood_scaling,
+        },
+        Scenario {
+            name: "partial-route",
+            title: "Partial route, custody at the break, mule completes it",
+            tier: 2,
+            run: partial_route,
+        },
+        Scenario {
+            name: "disaster-dtn",
+            title: "Disaster zone: gradient DTN vs spray-and-wait vs epidemic",
+            tier: 2,
+            run: disaster_dtn,
+        },
         Scenario { name: "mailbox", title: "Mailbox: destination offline for hours, one drain", tier: 2, run: mailbox },
-        Scenario { name: "global-scale", title: "100k devices on 6 continents, mixed connectivity", tier: 2, run: global_scale },
+        Scenario {
+            name: "global-scale",
+            title: "100k devices on 6 continents, mixed connectivity",
+            tier: 2,
+            run: global_scale,
+        },
         Scenario { name: "churn", title: "Churn: 30% of devices leave and join each minute", tier: 2, run: churn },
-        Scenario { name: "adversarial", title: "Black holes, announcement storm, replays, Sybil gateway", tier: 2, run: adversarial },
-        Scenario { name: "trace-replay", title: "Real contact traces (CRAWDAD Haggle) with The ONE's workload", tier: 2, run: trace_replay },
-        Scenario { name: "flood-hop-limit", title: "Managed flooding: reach vs usefulness by hop limit (Meshtasticator check)", tier: 2, run: flood_hop_limit },
+        Scenario {
+            name: "adversarial",
+            title: "Black holes, announcement storm, replays, Sybil gateway",
+            tier: 2,
+            run: adversarial,
+        },
+        Scenario {
+            name: "trace-replay",
+            title: "Real contact traces (CRAWDAD Haggle) with The ONE's workload",
+            tier: 2,
+            run: trace_replay,
+        },
+        Scenario {
+            name: "flood-hop-limit",
+            title: "Managed flooding: reach vs usefulness by hop limit (Meshtasticator check)",
+            tier: 2,
+            run: flood_hop_limit,
+        },
     ]
 }
 
@@ -111,7 +158,14 @@ pub struct GCfg {
 impl Default for GCfg {
     fn default() -> Self {
         let c = Config::default();
-        GCfg { announce_every_ms: c.announce_every, fisheye: c.fisheye, far_every: c.far_every, max_hops: c.max_hops, flood_reduction: c.flood_reduction, dtn: true }
+        GCfg {
+            announce_every_ms: c.announce_every,
+            fisheye: c.fisheye,
+            far_every: c.far_every,
+            max_hops: c.max_hops,
+            flood_reduction: c.flood_reduction,
+            dtn: true,
+        }
     }
 }
 
@@ -213,7 +267,12 @@ fn go<R: Router>(
         let is_warm = |r: &crate::tier2::engine::MsgRecord| warm_set.contains(&(r.src, r.dst, r.sent));
         (
             Some(metrics(&sim, &format!("{name}, warm"), wall, Some(&is_warm))),
-            Some(metrics(&sim, &format!("{name}, first contact"), wall, Some(&|r: &crate::tier2::engine::MsgRecord| !is_warm(r)))),
+            Some(metrics(
+                &sim,
+                &format!("{name}, first contact"),
+                wall,
+                Some(&|r: &crate::tier2::engine::MsgRecord| !is_warm(r)),
+            )),
         )
     };
     Run { m, extra: extra(&sim), warm, first }
@@ -380,14 +439,25 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                 Model::Flood(h) => Kind::Flood { hops: h, window_ms: 200, suppress: 1 },
                 _ => Kind::Epidemic,
             };
-            let inet: Rc<Vec<NodeId>> = Rc::new((0..w.specs.len() as NodeId).filter(|i| w.specs[*i as usize].inet.is_some()).collect());
+            let inet: Rc<Vec<NodeId>> =
+                Rc::new((0..w.specs.len() as NodeId).filter(|i| w.specs[*i as usize].inet.is_some()).collect());
             let opts = plan.baseline.unwrap_or_default();
             let flood: Rc<crate::tier2::dtn::FloodStats> = Rc::default();
-            go(w, plan, seed, until, sample, &name, |i, _| Dtn::with(i, kind, opts, inet.clone(), flood.clone()), |sim| {
-                let peak = sim.routers.iter().map(|r| r.buffer_peak).max().unwrap_or(0);
-                let avg = sim.routers.iter().map(|r| r.buffer_area / sim.now.max(1) as f64).sum::<f64>() / sim.routers.len().max(1) as f64;
-                json!({"buffer_peak_bytes": peak, "buffer_avg_bytes": avg})
-            })
+            go(
+                w,
+                plan,
+                seed,
+                until,
+                sample,
+                &name,
+                |i, _| Dtn::with(i, kind, opts, inet.clone(), flood.clone()),
+                |sim| {
+                    let peak = sim.routers.iter().map(|r| r.buffer_peak).max().unwrap_or(0);
+                    let avg = sim.routers.iter().map(|r| r.buffer_area / sim.now.max(1) as f64).sum::<f64>()
+                        / sim.routers.len().max(1) as f64;
+                    json!({"buffer_peak_bytes": peak, "buffer_avg_bytes": avg})
+                },
+            )
         }
     }
 }
@@ -437,9 +507,18 @@ fn headline(r: &mut ScenarioResult, m: &T2Metrics) {
 }
 
 /// Run the candidate and the references; report them all.
-fn compare(r: &mut ScenarioResult, o: &Opts, w: &World, plan: &Plan, until: Time, sample: Option<usize>, refs: &[Model]) -> (Run, Vec<Run>) {
+fn compare(
+    r: &mut ScenarioResult,
+    o: &Opts,
+    w: &World,
+    plan: &Plan,
+    until: Time,
+    sample: Option<usize>,
+    refs: &[Model],
+) -> (Run, Vec<Run>) {
     let cand_model = Model::of(o.candidate);
-    let models: Vec<Model> = std::iter::once(cand_model).chain(refs.iter().copied().filter(|m| *m != cand_model)).collect();
+    let models: Vec<Model> =
+        std::iter::once(cand_model).chain(refs.iter().copied().filter(|m| *m != cand_model)).collect();
     let mut others: Vec<Run> = models.par_iter().map(|m| run(*m, w, plan, o.seed, until, sample)).collect();
     let cand = others.remove(0);
     headline(r, &cand.m);
@@ -472,7 +551,8 @@ fn dev(area: u32, xy: (f64, f64), radios: &[Tech], inet: Option<Inet>) -> NodeSp
 /// from the nearest device with internet, messages and calls a
 /// Bluetooth-only phone in Europe behind its own gateway.
 fn us_eu(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("us-eu", "US to Europe: BLE-only phones 3–6 hops from a gateway", 2, o.seed, o.scale);
+    let mut r =
+        ScenarioResult::new("us-eu", "US to Europe: BLE-only phones 3–6 hops from a gateway", 2, o.seed, o.scale);
     let mut rng = Rng::new(o.seed);
     let mut w = World { areas: Vec::new(), specs: Vec::new() };
     let mut sources = Vec::new();
@@ -506,7 +586,12 @@ fn us_eu(o: Opts) -> ScenarioResult {
     let until = 30 * SEC + per as Time * 7 * SEC + 90 * SEC;
     let (cand, _) = compare(&mut r, &o, &w, &plan, until, None, &[Model::Main, Model::StandIn]);
     hold(&mut r, &cand.m, 0.99, 5.0, 3.0);
-    r.at_most("call setup / message round trip p95", if cand.m.round_trip_s.n == 0 { f64::INFINITY } else { cand.m.round_trip_s.p95 }, 3.0, "s");
+    r.at_most(
+        "call setup / message round trip p95",
+        if cand.m.round_trip_s.n == 0 { f64::INFINITY } else { cand.m.round_trip_s.p95 },
+        3.0,
+        "s",
+    );
     expect(&mut r, &o, false);
     r.note("Path: the US phone's packets climb 3–6 Bluetooth hops along its default route to the LTE phone (a gateway by total cost), which resolves the London phone's record (it names the London gateway), dials it over the internet, and the London gateway carries them the last two Bluetooth hops. Main before GLOBAL never crossed the internet, so nothing arrives although the oracle finds a sub-second path.");
     r
@@ -515,9 +600,18 @@ fn us_eu(o: Opts) -> ScenarioResult {
 // ───────────────────────────── gateway-choice ─────────────────────────────
 
 fn gateway_choice(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("gateway-choice", "Gateway by total cost: near slow uplink vs far fibre", 2, o.seed, o.scale);
+    let mut r = ScenarioResult::new(
+        "gateway-choice",
+        "Gateway by total cost: near slow uplink vs far fibre",
+        2,
+        o.seed,
+        o.scale,
+    );
     let mut w = World {
-        areas: vec![Area { latlon: (40.71, -74.0), env: Env::Outdoor }, Area { latlon: (51.51, -0.13), env: Env::Indoor }],
+        areas: vec![
+            Area { latlon: (40.71, -74.0), env: Env::Outdoor },
+            Area { latlon: (51.51, -0.13), env: Env::Indoor },
+        ],
         specs: Vec::new(),
     };
     w.specs.push(dev(0, (0.0, 0.0), &[Tech::Ble, Tech::Awdl], None));
@@ -530,8 +624,14 @@ fn gateway_choice(o: Opts) -> ScenarioResult {
     let dst = w.specs.len() as NodeId;
     // the recipient: a laptop without internet, next to a home server in London
     w.specs.push(dev(1, (0.0, 0.0), &[Tech::Ble, Tech::WifiDirect], None));
-    w.specs.push(dev(1, (10.0, 0.0), &[Tech::Ble, Tech::WifiDirect], Some(Inet { access: Access::Fibre, nat: Nat::Open })));
-    let sizes: Vec<u32> = [1_000u32, 100_000, 1_000_000].iter().flat_map(|s| std::iter::repeat_n(*s, o.n(10, 3))).collect();
+    w.specs.push(dev(
+        1,
+        (10.0, 0.0),
+        &[Tech::Ble, Tech::WifiDirect],
+        Some(Inet { access: Access::Fibre, nat: Nat::Open }),
+    ));
+    let sizes: Vec<u32> =
+        [1_000u32, 100_000, 1_000_000].iter().flat_map(|s| std::iter::repeat_n(*s, o.n(10, 3))).collect();
     let mut plan = Plan::default();
     for (i, s) in sizes.iter().enumerate() {
         plan.sends.push((20 * SEC + i as Time * 3 * SEC, 0, dst, *s, false));
@@ -550,25 +650,38 @@ fn gateway_choice(o: Opts) -> ScenarioResult {
     };
     let (via_far, via_near, sizes_opt) = match cand_model {
         Model::Global(g) => {
-            let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Global::new(i, global_cfg(g, o.seed, i), shared.clone()));
+            let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| {
+                Global::new(i, global_cfg(g, o.seed, i), shared.clone())
+            });
             plan.apply(&mut sim);
             sim.start();
             sim.run(until);
             sim.finish();
             Oracle::new(&sim).annotate(&mut sim, None);
-            let so: Vec<(u32, crate::stats::Summary)> = [1_000u32, 100_000, 1_000_000].iter().map(|s| (*s, by_size(&sim.core.msgs, *s))).collect();
-            (sim.core.counters[far as usize].relay_bytes as f64, sim.core.counters[near as usize].relay_bytes as f64, so)
+            let so: Vec<(u32, crate::stats::Summary)> =
+                [1_000u32, 100_000, 1_000_000].iter().map(|s| (*s, by_size(&sim.core.msgs, *s))).collect();
+            (
+                sim.core.counters[far as usize].relay_bytes as f64,
+                sim.core.counters[near as usize].relay_bytes as f64,
+                so,
+            )
         }
         _ => {
             let cfg = Rc::new(if cand_model == Model::Main { Cfg::main() } else { Cfg::global() });
-            let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Mycel::new(i, cfg.clone(), Role::Honest));
+            let mut sim =
+                Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Mycel::new(i, cfg.clone(), Role::Honest));
             plan.apply(&mut sim);
             sim.start();
             sim.run(until);
             sim.finish();
             Oracle::new(&sim).annotate(&mut sim, None);
-            let so: Vec<(u32, crate::stats::Summary)> = [1_000u32, 100_000, 1_000_000].iter().map(|s| (*s, by_size(&sim.core.msgs, *s))).collect();
-            (sim.core.counters[far as usize].relay_bytes as f64, sim.core.counters[near as usize].relay_bytes as f64, so)
+            let so: Vec<(u32, crate::stats::Summary)> =
+                [1_000u32, 100_000, 1_000_000].iter().map(|s| (*s, by_size(&sim.core.msgs, *s))).collect();
+            (
+                sim.core.counters[far as usize].relay_bytes as f64,
+                sim.core.counters[near as usize].relay_bytes as f64,
+                so,
+            )
         }
     };
     for (size, s) in &sizes_opt {
@@ -579,7 +692,12 @@ fn gateway_choice(o: Opts) -> ScenarioResult {
     r.at_least("delivery (of feasible)", cand.m.delivery_ratio * 100.0, 99.0, "%");
     r.at_least("relayed bytes through the far fibre gateway", 100.0 * share, 95.0, "%");
     let small = sizes_opt.first().map(|x| x.1).unwrap_or_default();
-    r.at_most("optimality p50, 1 KB messages (routing)", if small.n == 0 { f64::INFINITY } else { small.p50 }, 2.0, "×");
+    r.at_most(
+        "optimality p50, 1 KB messages (routing)",
+        if small.n == 0 { f64::INFINITY } else { small.p50 },
+        2.0,
+        "×",
+    );
     expect(&mut r, &o, false);
     r.headline(format!("{:.0}% of relayed bytes via the far fibre gateway", 100.0 * share));
     r.note("Total cost per hop is latency + size/rate and the gateway adds its uplink: for 100 KB the near gateway costs ~2.5 s of Bluetooth + 10 s of uplink, the far one ~30 ms of AWDL + fibre. Optimality compares each message with the oracle's fastest path over the same ground truth. The oracle moves a message whole, hop by hop, with no congestion control: larger messages pay QUIC slow start (10 packets, doubling per ~90 ms round trip) on top, and the first message to a destination pays a record lookup (~150 ms) and a dial; so routing is judged on 1 KB messages, and larger ratios are transport cost.");
@@ -656,7 +774,14 @@ fn bfs(nbrs: &dyn Fn(NodeId) -> Vec<NodeId>, src: NodeId, max: u8) -> Map<NodeId
 }
 
 /// Sampled pairs within `max` radio hops (ground truth).
-fn pairs_within<R: Router>(sim: &Sim<R>, n: usize, max: u8, k: usize, rng: &mut Rng, skip: Option<NodeId>) -> Vec<(NodeId, NodeId, u8)> {
+fn pairs_within<R: Router>(
+    sim: &Sim<R>,
+    n: usize,
+    max: u8,
+    k: usize,
+    rng: &mut Rng,
+    skip: Option<NodeId>,
+) -> Vec<(NodeId, NodeId, u8)> {
     let mut out = Vec::new();
     let nb = |u: NodeId| sim.core.neighbours_of(u);
     let mut tries = 0;
@@ -667,7 +792,8 @@ fn pairs_within<R: Router>(sim: &Sim<R>, n: usize, max: u8, k: usize, rng: &mut 
             continue;
         }
         let d = bfs(&nb, a, max);
-        let mut cands: Vec<(NodeId, u8)> = d.into_iter().filter(|(b, h)| *b != a && *h >= 1 && Some(*b) != skip).collect();
+        let mut cands: Vec<(NodeId, u8)> =
+            d.into_iter().filter(|(b, h)| *b != a && *h >= 1 && Some(*b) != skip).collect();
         if cands.is_empty() {
             continue;
         }
@@ -743,7 +869,8 @@ fn converge<R: Router + NextHop>(mut sim: Sim<R>, n: usize, seed: u64, max_hops:
                 Walk::Loop(path) => {
                     loops += 1;
                     if examples.len() < 10 {
-                        examples.push(format!("t={:.1} s (after the hub failed) {a}→{b}: {path:?}", t as f64 / SEC as f64));
+                        examples
+                            .push(format!("t={:.1} s (after the hub failed) {a}→{b}: {path:?}", t as f64 / SEC as f64));
                     }
                 }
                 Walk::Dead => {}
@@ -775,13 +902,21 @@ fn mesh_world(n: usize, seed: u64, m2_per_device: f64) -> World {
 }
 
 fn convergence(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("routing-convergence", "Convergence, loops and re-convergence after a hub fails", 2, o.seed, o.scale);
+    let mut r = ScenarioResult::new(
+        "routing-convergence",
+        "Convergence, loops and re-convergence after a hub fails",
+        2,
+        o.seed,
+        o.scale,
+    );
     let n = o.n(300, 80);
     // sparse enough that routes are several hops long
     let w = mesh_world(n, o.seed, 2500.0);
     let g = GCfg::routing();
     let shared = Rc::new(Shared::default());
-    let gsim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Global::new(i, global_cfg(g, o.seed, i), shared.clone()));
+    let gsim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| {
+        Global::new(i, global_cfg(g, o.seed, i), shared.clone())
+    });
     let gr = converge(gsim, n, o.seed, 8);
     let cfg = Rc::new(Cfg::main());
     let msim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Mycel::new(i, cfg.clone(), Role::Honest));
@@ -818,7 +953,13 @@ fn convergence(o: Opts) -> ScenarioResult {
 // ───────────────────────────── flood-scaling ─────────────────────────────
 
 fn flood_scaling(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("flood-scaling", "Announcement overhead vs size; fisheye and flood reduction", 2, o.seed, o.scale);
+    let mut r = ScenarioResult::new(
+        "flood-scaling",
+        "Announcement overhead vs size; fisheye and flood reduction",
+        2,
+        o.seed,
+        o.scale,
+    );
     let sizes: Vec<usize> = if o.scale >= 1.0 { vec![250, 500, 1000, 2000] } else { vec![o.n(250, 60)] };
     let ble = Tech::Ble.rate() as f64;
     let now = GCfg::routing();
@@ -852,7 +993,9 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
             let window = cycle.max(32 * SEC);
             let shared = Rc::new(Shared::default());
             let t = Instant::now();
-            let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Global::new(i, global_cfg(g, o.seed, i), shared.clone()));
+            let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| {
+                Global::new(i, global_cfg(g, o.seed, i), shared.clone())
+            });
             sim.start();
             sim.run(warm);
             let ctrl = |sim: &Sim<Global>| sim.core.counters.iter().map(|c| c.ctrl_bytes).sum::<u64>();
@@ -871,7 +1014,8 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
         .par_iter()
         .map(|w| {
             let cfg = Rc::new(Cfg::main());
-            let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Mycel::new(i, cfg.clone(), Role::Honest));
+            let mut sim =
+                Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Mycel::new(i, cfg.clone(), Role::Honest));
             sim.start();
             sim.run(40 * SEC);
             metrics(&sim, "main", 0.0, None).ctrl_bytes_per_node_s
@@ -922,7 +1066,13 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
 // ───────────────────────────── partial-route ─────────────────────────────
 
 fn partial_route(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("partial-route", "Partial route, custody at the break, mule completes it", 2, o.seed, o.scale);
+    let mut r = ScenarioResult::new(
+        "partial-route",
+        "Partial route, custody at the break, mule completes it",
+        2,
+        o.seed,
+        o.scale,
+    );
     let mut metrics_all = Vec::new();
     for gap in [100.0, 300.0] {
         let mut w = World { areas: vec![Area { latlon: (34.05, -118.24), env: Env::Outdoor }], specs: Vec::new() };
@@ -948,7 +1098,13 @@ fn partial_route(o: Opts) -> ScenarioResult {
         let t2 = t1 + 60 * SEC;
         let t3 = t2 + (walk_s * SEC as f64) as Time;
         let mut mule = ble_only(0, (d_x + 20.0, 5.0), None);
-        mule.mobility = Mobility::Path(vec![(0, (d_x + 20.0, 5.0)), (t0, (d_x + 20.0, 5.0)), (t1, (90.0, 5.0)), (t2, (90.0, 5.0)), (t3, (d_x + 20.0, 5.0))]);
+        mule.mobility = Mobility::Path(vec![
+            (0, (d_x + 20.0, 5.0)),
+            (t0, (d_x + 20.0, 5.0)),
+            (t1, (90.0, 5.0)),
+            (t2, (90.0, 5.0)),
+            (t3, (d_x + 20.0, 5.0)),
+        ]);
         w.specs.push(mule);
         let mut plan = Plan::default();
         for b in &bridge {
@@ -958,7 +1114,10 @@ fn partial_route(o: Opts) -> ScenarioResult {
             plan.sends.push((60 * SEC + k as Time * 2 * SEC, 0, e, 2000, false));
         }
         let until = t3 + 120 * SEC;
-        let mut runs: Vec<Run> = [Model::of(o.candidate), Model::StandIn, Model::SenderHolds].par_iter().map(|m| run(*m, &w, &plan, o.seed, until, None)).collect();
+        let mut runs: Vec<Run> = [Model::of(o.candidate), Model::StandIn, Model::SenderHolds]
+            .par_iter()
+            .map(|m| run(*m, &w, &plan, o.seed, until, None))
+            .collect();
         let (holds, stand, cand) = (runs.pop().unwrap(), runs.pop().unwrap(), runs.pop().unwrap());
         r.at_least(&format!("gap {gap} m: delivery"), 100.0 * cand.m.delivery_ratio, 99.0, "%");
         r.at_most(&format!("gap {gap} m: optimality p95"), inf_if_none(&cand.m, cand.m.optimality.p95), 2.0, "×");
@@ -990,7 +1149,10 @@ const DISASTER_SEEDS: u64 = 12;
 fn disaster_world(o: &Opts) -> (World, Vec<(NodeId, NodeId)>) {
     let mut rng = Rng::new(o.seed ^ 0xd15a);
     let mut w = World {
-        areas: vec![Area { latlon: (18.54, -72.34), env: Env::Outdoor }, Area { latlon: (40.71, -74.01), env: Env::Indoor }],
+        areas: vec![
+            Area { latlon: (18.54, -72.34), env: Env::Outdoor },
+            Area { latlon: (40.71, -74.01), env: Env::Indoor },
+        ],
         specs: Vec::new(),
     };
     let camps = [(100.0, 100.0), (1100.0, 150.0), (200.0, 1100.0), (1050.0, 1050.0)];
@@ -1030,7 +1192,13 @@ fn disaster_world(o: &Opts) -> (World, Vec<(NodeId, NodeId)>) {
 }
 
 fn disaster_dtn(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("disaster-dtn", "Disaster zone: gradient DTN vs spray-and-wait vs epidemic", 2, o.seed, o.scale);
+    let mut r = ScenarioResult::new(
+        "disaster-dtn",
+        "Disaster zone: gradient DTN vs spray-and-wait vs epidemic",
+        2,
+        o.seed,
+        o.scale,
+    );
     let plan_for = |pairs: &[(NodeId, NodeId)]| {
         let mut plan = Plan::default();
         for (k, (s, d)) in pairs.iter().enumerate() {
@@ -1052,7 +1220,17 @@ fn disaster_dtn(o: Opts) -> ScenarioResult {
     };
     let full = o.scale >= 1.0;
     let ((cand, others), more) = rayon::join(
-        || compare(&mut r, &o, &w, &plan, until, None, &[Model::Main, Model::StandIn, Model::Prophet, Model::Spray(8), Model::Epidemic, Model::Flood(7)]),
+        || {
+            compare(
+                &mut r,
+                &o,
+                &w,
+                &plan,
+                until,
+                None,
+                &[Model::Main, Model::StandIn, Model::Prophet, Model::Spray(8), Model::Epidemic, Model::Flood(7)],
+            )
+        },
         || if full { (1..DISASTER_SEEDS).into_par_iter().map(more_seeds).collect() } else { Vec::new() },
     );
     let epi = others.iter().find(|x| x.m.model == "epidemic").map(|x| x.m.clone()).unwrap_or_default();
@@ -1061,7 +1239,12 @@ fn disaster_dtn(o: Opts) -> ScenarioResult {
         per_seed.extend(more);
         let mean = per_seed.iter().sum::<f64>() / per_seed.len() as f64;
         let (lo, hi) = per_seed.iter().fold((f64::INFINITY, 0.0f64), |(l, h), x| (l.min(*x), h.max(*x)));
-        r.at_least(&format!("delivery within 3 h (of feasible), mean of seeds {}–{}", o.seed, o.seed + DISASTER_SEEDS - 1), mean, 80.0, "%");
+        r.at_least(
+            &format!("delivery within 3 h (of feasible), mean of seeds {}–{}", o.seed, o.seed + DISASTER_SEEDS - 1),
+            mean,
+            80.0,
+            "%",
+        );
         r.note(format!(
             "{} delivery by seed {}–{}: {} (mean {mean:.1}%, min {lo:.0}%, max {hi:.0}%).",
             cand.m.model,
@@ -1081,7 +1264,12 @@ fn disaster_dtn(o: Opts) -> ScenarioResult {
         "{}: {:.1} replicas and {:.1} carrier-to-carrier hand-offs per message (custody moves make up the difference).",
         cand.m.model, cand.m.copies_per_msg, cand.m.handoffs_per_msg
     ));
-    r.at_most("latency p50 vs epidemic's", inf_if_none(&cand.m, cand.m.latency_s.p50 / epi.latency_s.p50.max(1e-9)), 3.0, "×");
+    r.at_most(
+        "latency p50 vs epidemic's",
+        inf_if_none(&cand.m, cand.m.latency_s.p50 / epi.latency_s.p50.max(1e-9)),
+        3.0,
+        "×",
+    );
     for x in &others {
         headline(&mut r, &x.m);
     }
@@ -1095,7 +1283,10 @@ fn disaster_dtn(o: Opts) -> ScenarioResult {
 fn mailbox(o: Opts) -> ScenarioResult {
     let mut r = ScenarioResult::new("mailbox", "Mailbox: destination offline for hours, one drain", 2, o.seed, o.scale);
     let mut w = World {
-        areas: vec![Area { latlon: (40.71, -74.0), env: Env::Indoor }, Area { latlon: (52.52, 13.40), env: Env::Indoor }],
+        areas: vec![
+            Area { latlon: (40.71, -74.0), env: Env::Indoor },
+            Area { latlon: (52.52, 13.40), env: Env::Indoor },
+        ],
         specs: Vec::new(),
     };
     w.specs.push(ble_only(0, (0.0, 0.0), Some(Inet { access: Access::Lte, nat: Nat::Hard })));
@@ -1118,7 +1309,8 @@ fn mailbox(o: Opts) -> ScenarioResult {
     let (cand, _) = compare(&mut r, &o, &w, &plan, until, None, &[Model::Main, Model::StandIn]);
     r.at_least("delivered after it reappears", cand.m.delivered as f64, n as f64, "messages");
     // the first message waited the longest: its latency minus the wait until `back`
-    let last = if cand.m.delivered == n { cand.m.latency_s.max - (back - first) as f64 / SEC as f64 } else { f64::INFINITY };
+    let last =
+        if cand.m.delivered == n { cand.m.latency_s.max - (back - first) as f64 / SEC as f64 } else { f64::INFINITY };
     r.at_most("everything delivered within (after it reappears)", last.max(0.0), 30.0, "s");
     expect(&mut r, &o, true);
     r.note("The Berlin gateway's record for the recipient outlives its absence; senders' gateways send there and the gateway keeps a mailbox until the recipient's announcements return. Without a mailbox, live routing retries end to end for 10 minutes and gives up.");
@@ -1128,7 +1320,8 @@ fn mailbox(o: Opts) -> ScenarioResult {
 // ───────────────────────────── global-scale ─────────────────────────────
 
 fn global_scale(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("global-scale", "100k devices on 6 continents, mixed connectivity", 2, o.seed, o.scale);
+    let mut r =
+        ScenarioResult::new("global-scale", "100k devices on 6 continents, mixed connectivity", 2, o.seed, o.scale);
     let n = o.n(100_000, 1500);
     let mut rng = Rng::new(o.seed);
     let (areas, specs) = world::global(n, 80, &mut rng);
@@ -1171,7 +1364,12 @@ fn global_scale(o: Opts) -> ScenarioResult {
     }
     expect(&mut r, &o, false);
     let inet = w.specs.iter().filter(|s| s.inet.is_some()).count();
-    r.headline(format!("{n} devices, {:.0}% with internet; {} events in {:.0} s wall", 100.0 * inet as f64 / n as f64, cand.m.events, cand.m.wall_s));
+    r.headline(format!(
+        "{n} devices, {:.0}% with internet; {} events in {:.0} s wall",
+        100.0 * inet as f64 / n as f64,
+        cand.m.events,
+        cand.m.wall_s
+    ));
     r.note(format!(
         "Relay load ({}): {} devices relayed, Jain fairness {:.2}, the busiest carried {:.1}% of relayed bytes.",
         cand.m.model,
@@ -1223,7 +1421,13 @@ fn churn(o: Opts) -> ScenarioResult {
 // ───────────────────────────── adversarial ─────────────────────────────
 
 fn adversarial(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("adversarial", "Black holes, announcement storm, replays, Sybil gateway", 2, o.seed, o.scale);
+    let mut r = ScenarioResult::new(
+        "adversarial",
+        "Black holes, announcement storm, replays, Sybil gateway",
+        2,
+        o.seed,
+        o.scale,
+    );
     let mut rng = Rng::new(o.seed ^ 0xbad);
     let n = o.n(300, 80);
     let mut w = mesh_world(n, o.seed, 900.0);
@@ -1251,7 +1455,8 @@ fn adversarial(o: Opts) -> ScenarioResult {
     let until = 30 * SEC + plan.sends.len() as Time * 300 * MS + 90 * SEC;
     let attacked = Plan { roles: roles.clone(), ..plan.clone() };
     let sybil = rng.below(n) as NodeId;
-    let sybil_plan = Plan { poison: Some(sybil), roles: [(sybil, Role::BlackHole)].into_iter().collect(), ..plan.clone() };
+    let sybil_plan =
+        Plan { poison: Some(sybil), roles: [(sybil, Role::BlackHole)].into_iter().collect(), ..plan.clone() };
     // the same devices as black holes that lie plausibly and drop bundles too
     let liar_plan = Plan { roles: bad.iter().map(|b| (*b, Role::Liar)).collect(), ..plan.clone() };
     let ((clean, liars), ((cand, _), syb)) = rayon::join(
@@ -1272,8 +1477,18 @@ fn adversarial(o: Opts) -> ScenarioResult {
     let limited = num("announcements_limited", "ogm_limited");
     let stale = num("announcements_stale", "ogm_stale");
     let distrusted = num("neighbours_distrusted", "neighbours_distrusted");
-    r.at_least("delivery with 5% black holes + a storm + a replayer (of feasible)", 100.0 * cand.m.delivery_ratio, 90.0, "%");
-    r.at_least("delivery vs the same run without attackers", 100.0 * cand.m.delivery_ratio / clean.m.delivery_ratio.max(1e-9), 90.0, "%");
+    r.at_least(
+        "delivery with 5% black holes + a storm + a replayer (of feasible)",
+        100.0 * cand.m.delivery_ratio,
+        90.0,
+        "%",
+    );
+    r.at_least(
+        "delivery vs the same run without attackers",
+        100.0 * cand.m.delivery_ratio / clean.m.delivery_ratio.max(1e-9),
+        90.0,
+        "%",
+    );
     r.check("storm announcements rate-limited", limited > 0, format!("{limited} dropped by per-neighbour limits"));
     r.check("replayed announcements dropped as stale", stale > 0, format!("{stale} stale"));
     r.at_least(
@@ -1300,7 +1515,10 @@ fn adversarial(o: Opts) -> ScenarioResult {
         "Black holes lying plausibly (the same devices claim to be one hop from everyone at the least cost an honest relay could report, and drop packets and bundles alike; nothing an announcement shows gives them away, but the destination's acknowledgements don't come back: the source moves off a next hop after two timeouts and spreads its bundle's copies; docs/SIMULATION.md §4, fixed 21): {}",
         row(&liars.m)
     ));
-    r.note(format!("Sybil gateway (every lookup also returns a free route via it, and it swallows what it gets): {}", row(&syb.m)));
+    r.note(format!(
+        "Sybil gateway (every lookup also returns a free route via it, and it swallows what it gets): {}",
+        row(&syb.m)
+    ));
     r.note("Forged announcements (bad signatures) are covered by the core's and wire.rs's own tests (the simulator skips signature checks). Black holes here re-announce every route at zero cost and drop all transit packets: a cost no honest relay can send, so their neighbours stop routing through them (`mesh/core.rs`, distrust). In the real node several routes are open QUIC paths at once; in this simulation a packet takes the core's single best next hop, so the numbers are a worst case for black holes.");
     if o.candidate == Candidate::Main {
         r.expect_fail(NEEDS_GLOBAL);
@@ -1327,7 +1545,14 @@ fn trace_world(t: &crate::traces::Trace) -> (World, Vec<(Time, Action)>) {
     let w = World {
         areas: vec![Area { latlon: (52.2, 0.12), env: Env::Indoor }],
         specs: (0..t.nodes)
-            .map(|i| NodeSpec { area: 0, xy: (i as f64 * 1000.0, 0.0), radios: Techs::of(&[Tech::OneBt]), inet: None, mobility: Mobility::Static, online: true })
+            .map(|i| NodeSpec {
+                area: 0,
+                xy: (i as f64 * 1000.0, 0.0),
+                radios: Techs::of(&[Tech::OneBt]),
+                inet: None,
+                mobility: Mobility::Static,
+                online: true,
+            })
             .collect(),
     };
     let bt = Techs::of(&[Tech::OneBt]);
@@ -1340,7 +1565,13 @@ fn trace_world(t: &crate::traces::Trace) -> (World, Vec<(Time, Action)>) {
 }
 
 fn trace_replay(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("trace-replay", "Real contact traces (CRAWDAD Haggle) with The ONE's workload", 2, o.seed, o.scale);
+    let mut r = ScenarioResult::new(
+        "trace-replay",
+        "Real contact traces (CRAWDAD Haggle) with The ONE's workload",
+        2,
+        o.seed,
+        o.scale,
+    );
     let trace = match std::env::var("MYCEL_TRACE") {
         Ok(p) => match crate::traces::load(std::path::Path::new(&p)) {
             Ok(t) => t,
@@ -1409,7 +1640,13 @@ fn trace_replay(o: Opts) -> ScenarioResult {
             headline(&mut r, &x.m);
         }
     }
-    r.headline(format!("trace: {} ({} devices, {} contacts over {:.1} h)", trace.name, trace.nodes, trace.contacts.len(), trace.duration as f64 / HOUR as f64));
+    r.headline(format!(
+        "trace: {} ({} devices, {} contacts over {:.1} h)",
+        trace.name,
+        trace.nodes,
+        trace.contacts.len(),
+        trace.duration as f64 / HOUR as f64
+    ));
     r.note("Workload as The ONE's default settings (MessageEventGenerator: interval 25–35 s, size 500k–1M, msgTtl 300 min; 5 MB buffers; Bluetooth interface 250 kB/s). `cargo run -p mycel-sim -- export-one` writes the same trace as The ONE connection events, so its Epidemic, PRoPHET, SprayAndWait and MaxProp routers can run on identical input (see docs/SIMULATION.md). MaxProp isn't reimplemented here.");
     r.metrics = serde_json::Value::Array(rows);
     r
@@ -1418,7 +1655,13 @@ fn trace_replay(o: Opts) -> ScenarioResult {
 // ───────────────────────────── flooding hop limit ─────────────────────────────
 
 fn flood_hop_limit(o: Opts) -> ScenarioResult {
-    let mut r = ScenarioResult::new("flood-hop-limit", "Managed flooding: reach vs usefulness by hop limit (Meshtasticator check)", 2, o.seed, o.scale);
+    let mut r = ScenarioResult::new(
+        "flood-hop-limit",
+        "Managed flooding: reach vs usefulness by hop limit (Meshtasticator check)",
+        2,
+        o.seed,
+        o.scale,
+    );
     // a neighbourhood mesh: BLE outdoors, one device per 625 m² (~18 in
     // range), about 6 hops across, like the small LoRa meshes Meshtasticator models
     let n = o.n(100, 60);
@@ -1435,7 +1678,9 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
         for suppress in [1u8, 255] {
             let flood: Rc<crate::tier2::dtn::FloodStats> = Rc::default();
             let kind = Kind::Flood { hops: h, window_ms: 200, suppress };
-            let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Dtn::with(i, kind, crate::tier2::dtn::Opts::default(), Rc::default(), flood.clone()));
+            let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| {
+                Dtn::with(i, kind, crate::tier2::dtn::Opts::default(), Rc::default(), flood.clone())
+            });
             for k in 0..msgs {
                 sim.send_at(2 * SEC + k as Time * 2 * SEC, rng.below(n) as NodeId, crate::tier2::dtn::BROADCAST, 200);
             }
@@ -1469,13 +1714,21 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
     // qualitative Meshtasticator check: reach rises with the hop limit and
     // saturates, while each transmission reaches fewer new devices
     let rising = reach_by_h.windows(2).all(|w| w[1] + 0.02 >= w[0]);
-    let gain = |a: usize, b: usize| reach_by_h.get(b).copied().unwrap_or(0.0) - reach_by_h.get(a).copied().unwrap_or(0.0);
+    let gain =
+        |a: usize, b: usize| reach_by_h.get(b).copied().unwrap_or(0.0) - reach_by_h.get(a).copied().unwrap_or(0.0);
     let diminishing = gain(5, 6) < gain(1, 2) / 2.0;
     let falling = useful_by_h.windows(2).all(|w| w[1] <= w[0] + 0.05);
     r.check("reach rises with the hop limit", rising, format!("{reach_by_h:.2?}"));
-    r.check("diminishing returns (hop 6→7 gains < half of 2→3)", diminishing, format!("{:.2} vs {:.2}", gain(5, 6), gain(1, 2)));
+    r.check(
+        "diminishing returns (hop 6→7 gains < half of 2→3)",
+        diminishing,
+        format!("{:.2} vs {:.2}", gain(5, 6), gain(1, 2)),
+    );
     r.check("each transmission reaches fewer new devices as the limit rises", falling, format!("{useful_by_h:.2?}"));
-    r.headline(format!("reach by hop limit 1..7: {}", reach_by_h.iter().map(|x| format!("{:.0}%", 100.0 * x)).collect::<Vec<_>>().join(", ")));
+    r.headline(format!(
+        "reach by hop limit 1..7: {}",
+        reach_by_h.iter().map(|x| format!("{:.0}%", 100.0 * x)).collect::<Vec<_>>().join(", ")
+    ));
     r.note("Meshtasticator (Meshtastic's discrete-event simulator) reports the same shape on LoRa: reach grows with the hop limit and levels off around 3–5 for typical densities, while the share of useful rebroadcasts falls and channel load grows, which is why Meshtastic defaults to 3. This model has no collisions (its LoRa model does), so usefulness here only falls through redundancy, not loss; the comparison is qualitative.");
     r.metrics = serde_json::Value::Array(rows);
     r

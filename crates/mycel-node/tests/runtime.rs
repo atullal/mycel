@@ -58,15 +58,17 @@ async fn direct_chat_creation_reuses_peer_identity_across_concurrent_calls_and_r
 
     let conversations = std::thread::scope(|scope| {
         let barrier = Arc::new(std::sync::Barrier::new(16));
-        let calls: Vec<_> = (0..16).map(|_| {
-            let rt = &alice;
-            let id = b.id.clone();
-            let barrier = barrier.clone();
-            scope.spawn(move || {
-                barrier.wait();
-                rt.create_conversation(None, vec![id]).unwrap().id
+        let calls: Vec<_> = (0..16)
+            .map(|_| {
+                let rt = &alice;
+                let id = b.id.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    rt.create_conversation(None, vec![id]).unwrap().id
+                })
             })
-        }).collect();
+            .collect();
         calls.into_iter().map(|call| call.join().unwrap()).collect::<Vec<_>>()
     });
     assert!(conversations.iter().all(|id| id == &conversations[0]));
@@ -85,8 +87,11 @@ async fn direct_chat_creation_reuses_peer_identity_across_concurrent_calls_and_r
     let multi = alice.create_conversation(None, vec![b.id.clone(), c.id]).unwrap();
     assert_ne!(multi.id, id);
     alice.remove_member(multi.id.clone(), charlie.profile().id).unwrap();
-    assert_eq!(alice.create_conversation(None, vec![b.id.clone()]).unwrap().id, id,
-        "a group reduced to two members must not become the direct chat");
+    assert_eq!(
+        alice.create_conversation(None, vec![b.id.clone()]).unwrap().id,
+        id,
+        "a group reduced to two members must not become the direct chat"
+    );
 
     alice.shutdown().await.unwrap();
     drop(alice);
@@ -97,7 +102,9 @@ async fn direct_chat_creation_reuses_peer_identity_across_concurrent_calls_and_r
     bob.shutdown().await.unwrap();
     charlie.shutdown().await.unwrap();
     drop((alice, bob, charlie));
-    for dir in [da, db, dc] { std::fs::remove_dir_all(dir).unwrap(); }
+    for dir in [da, db, dc] {
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -161,10 +168,7 @@ async fn messaging_end_to_end() {
     .await;
 
     // reply, react, edit, delete
-    let r = bob
-        .send_message(conv.id.clone(), "hey alice".into(), Some(m1.id.clone()), vec![])
-        .await
-        .unwrap();
+    let r = bob.send_message(conv.id.clone(), "hey alice".into(), Some(m1.id.clone()), vec![]).await.unwrap();
     assert_eq!(r.reply_to.as_deref(), Some(m1.id.as_str()));
     bob.toggle_reaction(conv.id.clone(), m1.id.clone(), "❤️".into()).unwrap();
     alice.edit_message(conv.id.clone(), m1.id.clone(), "hi bob! (edited)".into()).unwrap();
@@ -179,19 +183,14 @@ async fn messaging_end_to_end() {
     })
     .await;
     bob.delete_message(conv.id.clone(), r.id.clone()).unwrap();
-    eventually("delete propagates", || {
-        alice.messages(conv.id.clone(), None, None).unwrap()[1].deleted
-    })
-    .await;
+    eventually("delete propagates", || alice.messages(conv.id.clone(), None, None).unwrap()[1].deleted).await;
 
     // attachment
     let file = tmp("photo").with_extension("png");
     let content: Vec<u8> = (0..200_000u32).map(|i| (i * 7 % 256) as u8).collect();
     std::fs::write(&file, &content).unwrap();
-    let sent = alice
-        .send_message(conv.id.clone(), "pic".into(), None, vec![file.to_string_lossy().into()])
-        .await
-        .unwrap();
+    let sent =
+        alice.send_message(conv.id.clone(), "pic".into(), None, vec![file.to_string_lossy().into()]).await.unwrap();
     assert_eq!(sent.attachments[0].mime, "image/png");
     assert!(sent.attachments[0].local_path.is_some());
     let blob = sent.attachments[0].blob.clone();
@@ -258,10 +257,7 @@ async fn keeper_delivers_while_sender_is_offline() {
     let bob = open(&db, "Bob", 0, false).await;
     connect_all(&[&bob, &keeper]);
     eventually("bob gets the message from the keeper", || {
-        bob.messages(conv.id.clone(), None, None)
-            .unwrap()
-            .iter()
-            .any(|m| m.body == "sent while you were away")
+        bob.messages(conv.id.clone(), None, None).unwrap().iter().any(|m| m.body == "sent while you were away")
     })
     .await;
     bob.shutdown().await.unwrap();
@@ -287,10 +283,7 @@ async fn group_admin_removes_member() {
     // Every peer's WASM chat rules reject it; the title is unchanged.
     let space = alice.node().space_ids()[0];
     let forged = mycel_node::chat::ChatOp::Meta { title: Some("pwned".into()), direct: false };
-    bob.node()
-        .with_space(&space, |r| r.append(mycel_node::chat::messages_feed(), forged.encode()))
-        .unwrap()
-        .unwrap();
+    bob.node().with_space(&space, |r| r.append(mycel_node::chat::messages_feed(), forged.encode())).unwrap().unwrap();
     bob.node().changed(space);
     eventually("alice's rules reject bob's forged op", || {
         alice.node().with_space(&space, |r| r.rule_rejected()).unwrap() == 1
@@ -300,21 +293,14 @@ async fn group_admin_removes_member() {
     assert_eq!(bob.node().with_space(&space, |r| r.rule_rejected()).unwrap(), 1);
 
     alice.remove_member(conv.id.clone(), c.id.clone()).unwrap();
-    eventually("carol learns she was removed", || {
-        !carol.conversation(conv.id.clone()).unwrap().active
-    })
-    .await;
+    eventually("carol learns she was removed", || !carol.conversation(conv.id.clone()).unwrap().active).await;
     alice.send_message(conv.id.clone(), "carol can't see this".into(), None, vec![]).await.unwrap();
     eventually("bob sees it", || {
         bob.messages(conv.id.clone(), None, None).unwrap().iter().any(|m| m.body == "carol can't see this")
     })
     .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(!carol
-        .messages(conv.id.clone(), None, None)
-        .unwrap()
-        .iter()
-        .any(|m| m.body == "carol can't see this"));
+    assert!(!carol.messages(conv.id.clone(), None, None).unwrap().iter().any(|m| m.body == "carol can't see this"));
     assert!(carol.send_message(conv.id.clone(), "hello?".into(), None, vec![]).await.is_err());
     for r in [alice, bob, carol] {
         r.shutdown().await.unwrap();
@@ -337,11 +323,10 @@ async fn declined_and_blocked_strangers_stay_out() {
     assert!(victim.conversations().is_empty(), "declined conversations are hidden");
     // A new attempt from the blocked key is refused at the network layer.
     let c2 = mallory.create_conversation(Some("again".into()), vec![v.id.clone()]).unwrap();
-    let _ = mallory.node().sync_with(
-        mycel_node::crypto::SignPk(<[u8; 32]>::try_from(hex_decode(&v.id)).unwrap()),
-        hash_of(&c2.id),
-        false,
-    ).await;
+    let _ = mallory
+        .node()
+        .sync_with(mycel_node::crypto::SignPk(<[u8; 32]>::try_from(hex_decode(&v.id)).unwrap()), hash_of(&c2.id), false)
+        .await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(victim.conversations().is_empty());
     assert!(!victim.node().space_ids().contains(&hash_of(&c2.id)));
@@ -367,10 +352,7 @@ async fn contact_code_address_hints_connect_without_discovery() {
     let b = alice.add_contact(code).unwrap();
     let conv = alice.create_conversation(None, vec![b.id.clone()]).unwrap();
     alice.send_message(conv.id.clone(), "found you by code".into(), None, vec![]).await.unwrap();
-    eventually("bob reached via hints only", || {
-        bob.conversations().iter().any(|c| c.id == conv.id)
-    })
-    .await;
+    eventually("bob reached via hints only", || bob.conversations().iter().any(|c| c.id == conv.id)).await;
     alice.shutdown().await.unwrap();
     bob.shutdown().await.unwrap();
 }
@@ -648,7 +630,8 @@ async fn voice_call_between_runtimes() {
     eventually("both active", || {
         let a = alice.call_status();
         let b = bob.call_status();
-        a.first().is_some_and(|c| c.state == CallPhase::Active) && b.first().is_some_and(|c| c.state == CallPhase::Active)
+        a.first().is_some_and(|c| c.state == CallPhase::Active)
+            && b.first().is_some_and(|c| c.state == CallPhase::Active)
     })
     .await;
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -725,7 +708,8 @@ async fn group_call_between_runtimes() {
         dispatch(rt, "accept_call", json!({ "call": id })).await.unwrap();
     }
     let all_in = |rts: &[&Arc<mycel_node::Runtime>], n: u32| {
-        rts.iter().all(|rt| rt.call_status().first().is_some_and(|c| c.state == CallPhase::Active && c.joined_count == n))
+        rts.iter()
+            .all(|rt| rt.call_status().first().is_some_and(|c| c.state == CallPhase::Active && c.joined_count == n))
     };
     eventually("three in the call", || all_in(&[&alice, &bob, &carol], 3)).await;
     tokio::time::sleep(Duration::from_secs(3)).await;

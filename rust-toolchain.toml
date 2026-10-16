@@ -1,0 +1,12 @@
+# The exact Rust toolchain for development, CI and releases. rustup installs it
+# on first use. Bump it on purpose, together with `rust-version` in Cargo.toml
+# and rules/Cargo.toml, and fix any new clippy findings in the same change.
+#
+# Platform targets for the app packages (iOS, Android, universal macOS) are
+# added by scripts/package-*.sh with `rustup target add`.
+[toolchain]
+channel = "1.96.0"
+profile = "minimal"
+components = ["rustfmt", "clippy"]
+# rules/ builds the WebAssembly rules bundles.
+targets = ["wasm32-unknown-unknown"]

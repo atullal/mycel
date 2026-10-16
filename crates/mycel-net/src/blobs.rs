@@ -530,7 +530,13 @@ struct IncomingPush {
     keeper: bool,
 }
 
-async fn serve_put(inner: &Arc<Inner>, tx: &mut SendStream, rx: &mut RecvStream, path: &Path, push: IncomingPush) -> Result<()> {
+async fn serve_put(
+    inner: &Arc<Inner>,
+    tx: &mut SendStream,
+    rx: &mut RecvStream,
+    path: &Path,
+    push: IncomingPush,
+) -> Result<()> {
     let IncomingPush { hash, len, handshake, keeper } = push;
     if path.exists() {
         return send(tx, &BlobResp::Stored).await;
@@ -640,7 +646,11 @@ struct DlState {
 /// What a source should do next.
 enum Take {
     /// Fetch `[start, end)` as piece `id`.
-    Piece { id: u64, start: u64, end: u64 },
+    Piece {
+        id: u64,
+        start: u64,
+        end: u64,
+    },
     /// Nothing to hand out, but pieces are in flight elsewhere and may come
     /// back (their source fails): wait.
     Wait,
@@ -721,7 +731,14 @@ impl Download {
 }
 
 /// Fetch `[start, end)` of the blob from one source into the `.part` file.
-async fn fetch_range(conn: &Connection, frames: &PeerFrames, dl: &Download, id: u64, start: u64, end: u64) -> Result<()> {
+async fn fetch_range(
+    conn: &Connection,
+    frames: &PeerFrames,
+    dl: &Download,
+    id: u64,
+    start: u64,
+    end: u64,
+) -> Result<()> {
     let (mut tx, mut rx) = open_bi(conn, StreamKind::Blob).await?;
     let (space, hash) = (dl.space, dl.hash);
     send(&mut tx, &BlobReq::GetRange { space, hash, offset: start, len: end - start }).await?;
@@ -816,7 +833,14 @@ enum Step {
 /// Download a blob from every member that has it at once: disjoint ranges
 /// from each (several streams per source), a failed source's ranges go to
 /// the others, and the whole file is checked against its hash at the end.
-async fn download(inner: &Arc<Inner>, sources: Vec<SignPk>, space: SpaceId, hash: Hash32, path: &Path, progress: &Progress) -> Result<()> {
+async fn download(
+    inner: &Arc<Inner>,
+    sources: Vec<SignPk>,
+    space: SpaceId,
+    hash: Hash32,
+    path: &Path,
+    progress: &Progress,
+) -> Result<()> {
     let part = part_path(path);
     let dir = path.parent().context("bad blob path")?;
     tokio::fs::create_dir_all(dir).await?;
@@ -980,9 +1004,8 @@ impl Node {
             return Ok(path); // someone else (a push, another fetch) just finished it
         }
         let me = self.id();
-        let mut members: Vec<SignPk> = self.with_space(&space, |r| {
-            r.members().into_iter().map(|(k, _)| k.sign_pk).filter(|p| *p != me).collect()
-        })?;
+        let mut members: Vec<SignPk> = self
+            .with_space(&space, |r| r.members().into_iter().map(|(k, _)| k.sign_pk).filter(|p| *p != me).collect())?;
         let peers = self.peers();
         members.sort_by_key(|pk| !peers.get(pk).is_some_and(|p| p.online()));
         // A bad copy is only caught by the final hash (it's dropped then):
@@ -991,8 +1014,7 @@ impl Node {
         if res.as_ref().is_err_and(|e| e.is::<HashMismatch>()) {
             res = download(&self.inner, members, space, hash, &path, &progress).await;
         }
-        res.map(|()| path)
-            .map_err(|e| e.context("couldn't download the file from anyone in the conversation"))
+        res.map(|()| path).map_err(|e| e.context("couldn't download the file from anyone in the conversation"))
     }
 }
 #[cfg(test)]
