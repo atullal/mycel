@@ -286,40 +286,64 @@ pub struct Alert {
 pub enum Event {
     /// Anything about a conversation changed (messages, members, receipts).
     #[serde(rename_all = "camelCase")]
-    ConversationUpdated { conversation: ConversationId },
+    ConversationUpdated {
+        conversation: ConversationId,
+    },
     /// We were added to a new conversation.
     #[serde(rename_all = "camelCase")]
-    ConversationAdded { conversation: ConversationId },
+    ConversationAdded {
+        conversation: ConversationId,
+    },
     #[serde(rename_all = "camelCase")]
-    Typing { conversation: ConversationId, peer: PeerId },
+    Typing {
+        conversation: ConversationId,
+        peer: PeerId,
+    },
     ContactsChanged,
     NearbyChanged,
     NetworkChanged,
     #[serde(rename_all = "camelCase")]
-    BlobReady { blob: String },
+    BlobReady {
+        blob: String,
+    },
     /// An attachment transfer moved forward (at most every 250 ms, plus a
     /// final event with `done == total`). `id` is the path passed to
     /// `send_message` for uploads, and the blob id for downloads. `rate` is
     /// bytes per second over the last few seconds.
     #[serde(rename_all = "camelCase")]
-    TransferProgress { direction: TransferDirection, id: String, done: u64, total: u64, rate: u64 },
+    TransferProgress {
+        direction: TransferDirection,
+        id: String,
+        done: u64,
+        total: u64,
+        rate: u64,
+    },
     /// Someone is calling: show Accept / Decline.
     #[serde(rename_all = "camelCase")]
-    CallIncoming { call: CallInfo },
+    CallIncoming {
+        call: CallInfo,
+    },
     /// A call changed: state, path, bitrate, mute; about 10 times a second
     /// while active (for the duration and level meters).
     #[serde(rename_all = "camelCase")]
-    CallUpdated { call: CallInfo },
+    CallUpdated {
+        call: CallInfo,
+    },
     /// The list of [`Notice`]s changed: fetch it again with `notices`.
     NoticesChanged,
     /// For the native shell, not apps (hosts don't forward it): show a
     /// private local alert.
     #[serde(rename_all = "camelCase")]
-    Alert { alert: Alert },
+    Alert {
+        alert: Alert,
+    },
     /// For the native shell: take back delivered alerts, all of `thread`'s,
     /// or only the one with `key`.
     #[serde(rename_all = "camelCase")]
-    AlertWithdrawn { thread: String, key: Option<String> },
+    AlertWithdrawn {
+        thread: String,
+        key: Option<String>,
+    },
 }
 
 impl Event {

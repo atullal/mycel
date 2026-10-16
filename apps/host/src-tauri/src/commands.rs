@@ -150,18 +150,11 @@ pub async fn send_message(
     reply_to: Option<MessageId>,
     attachments: Option<Vec<String>>,
 ) -> Res<MessageView> {
-    rt.send_message(id, body, reply_to, attachments.unwrap_or_default())
-        .await
-        .map_err(err)
+    rt.send_message(id, body, reply_to, attachments.unwrap_or_default()).await.map_err(err)
 }
 
 #[tauri::command]
-pub async fn edit_message(
-    rt: State<'_, Rt>,
-    id: ConversationId,
-    message: MessageId,
-    body: String,
-) -> Res<()> {
+pub async fn edit_message(rt: State<'_, Rt>, id: ConversationId, message: MessageId, body: String) -> Res<()> {
     rt.edit_message(id, message, body).map_err(err)
 }
 
@@ -181,17 +174,17 @@ pub async fn restore_message_local(rt: State<'_, Rt>, id: ConversationId, messag
 }
 
 #[tauri::command]
-pub async fn search_messages(rt: State<'_, Rt>, id: ConversationId, query: String, limit: Option<u32>) -> Res<Vec<MessageView>> {
+pub async fn search_messages(
+    rt: State<'_, Rt>,
+    id: ConversationId,
+    query: String,
+    limit: Option<u32>,
+) -> Res<Vec<MessageView>> {
     rt.search_messages(id, query, limit).map_err(err)
 }
 
 #[tauri::command]
-pub async fn toggle_reaction(
-    rt: State<'_, Rt>,
-    id: ConversationId,
-    message: MessageId,
-    emoji: String,
-) -> Res<()> {
+pub async fn toggle_reaction(rt: State<'_, Rt>, id: ConversationId, message: MessageId, emoji: String) -> Res<()> {
     rt.toggle_reaction(id, message, emoji).map_err(err)
 }
 
@@ -233,11 +226,7 @@ pub async fn accept_request(rt: State<'_, Rt>, id: ConversationId) -> Res<Conver
 }
 
 #[tauri::command]
-pub async fn decline_request(
-    rt: State<'_, Rt>,
-    id: ConversationId,
-    block: Option<bool>,
-) -> Res<()> {
+pub async fn decline_request(rt: State<'_, Rt>, id: ConversationId, block: Option<bool>) -> Res<()> {
     rt.decline_request(id, block.unwrap_or(false)).map_err(err)
 }
 
@@ -395,7 +384,10 @@ static VIDEO_SUBSCRIPTION: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// as raw bytes (layout: `mycel_video::UiFrame`); it decodes them with
 /// WebCodecs. One subscription at a time: a new one (a reload) replaces it.
 #[tauri::command]
-pub async fn video_subscribe(rt: State<'_, Rt>, channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>) -> Res<()> {
+pub async fn video_subscribe(
+    rt: State<'_, Rt>,
+    channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) -> Res<()> {
     use std::sync::atomic::Ordering;
     let me = VIDEO_SUBSCRIPTION.fetch_add(1, Ordering::SeqCst) + 1;
     let mut frames = rt.video_frames();

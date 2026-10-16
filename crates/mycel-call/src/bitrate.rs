@@ -118,7 +118,11 @@ mod tests {
         assert_eq!(c.bitrate(), 32_000);
         assert_eq!(c.update(t, obs(PathKind::Bluetooth, 0.0, 80)), Some(12_000), "Bluetooth: straight down");
         assert_eq!(c.update(t + Duration::from_secs(1), obs(PathKind::Relay, 0.0, 80)), Some(24_000));
-        assert_eq!(c.update(t + Duration::from_secs(2), obs(PathKind::Network, 0.0, 5)), Some(32_000), "back up at once");
+        assert_eq!(
+            c.update(t + Duration::from_secs(2), obs(PathKind::Network, 0.0, 5)),
+            Some(32_000),
+            "back up at once"
+        );
     }
 
     #[test]

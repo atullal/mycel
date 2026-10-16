@@ -39,9 +39,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result};
 use bytes::Bytes;
 use mycel_crypto::SignPk;
+use mycel_net::PathKind;
 use mycel_net::link::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
 use mycel_net::link::{CustomAddr, Link, LinkEvent, LinkStatus, n0_watcher, noq_udp};
-use mycel_net::PathKind;
 use parking_lot::Mutex;
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use tokio::net::UdpSocket;
@@ -189,7 +189,9 @@ impl IfaceLink {
             .peers
             .lock()
             .iter()
-            .map(|((idx, k), (a, _))| (*k, a.kind, active.get(idx).map_or_else(|| idx.to_string(), |x| x.info.name.clone())))
+            .map(|((idx, k), (a, _))| {
+                (*k, a.kind, active.get(idx).map_or_else(|| idx.to_string(), |x| x.info.name.clone()))
+            })
             .collect()
     }
 }
@@ -270,7 +272,13 @@ impl Link for IfaceLink {
             && let Some(wd) = self.shared.wd_status.lock().clone()
         {
             let broken = wd.contains("unavailable");
-            out.push(LinkStatus { kind: PathKind::WifiDirect, label: None, active: !broken, detail: Some(wd), peers: 0 });
+            out.push(LinkStatus {
+                kind: PathKind::WifiDirect,
+                label: None,
+                active: !broken,
+                detail: Some(wd),
+                peers: 0,
+            });
         }
         if out.is_empty()
             && let Some(p) = problem
@@ -300,8 +308,13 @@ impl Shared {
     /// Re-enumerate: open sockets on new interfaces, drop vanished ones (and
     /// the peers heard on them).
     fn rescan(self: &Arc<Self>, disco: &UdpSocket) {
-        let now: Vec<(IfaceInfo, Decision)> =
-            ifaces::list().into_iter().map(|i| { let d = classify::classify(&i, &self.opts.rules); (i, d) }).collect();
+        let now: Vec<(IfaceInfo, Decision)> = ifaces::list()
+            .into_iter()
+            .map(|i| {
+                let d = classify::classify(&i, &self.opts.rules);
+                (i, d)
+            })
+            .collect();
         let want: BTreeMap<u32, (IfaceInfo, PathKind, String)> = now
             .iter()
             .filter_map(|(i, d)| match d {
@@ -468,7 +481,11 @@ async fn read_packets(shared: Arc<Shared>, sock: Arc<UdpSocket>, local: IfaceAdd
         match sock.recv_from(&mut buf).await {
             Ok((n, SocketAddr::V6(from))) => {
                 let from = IfaceAddr { kind: local.kind, index: local.index, ip: *from.ip(), port: from.port() };
-                let p = Packet { data: Bytes::copy_from_slice(&buf[..n]), from: from.to_custom(), local: local_addr.clone() };
+                let p = Packet {
+                    data: Bytes::copy_from_slice(&buf[..n]),
+                    from: from.to_custom(),
+                    local: local_addr.clone(),
+                };
                 let _ = shared.inbound.try_send(p);
             }
             Ok(_) => {}

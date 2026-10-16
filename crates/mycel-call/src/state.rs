@@ -68,12 +68,15 @@ pub fn on_ring(me: &SignPk, from: &SignPk, ring: &CallRef, live: &[LiveCall], ex
     if let Some(c) = here.iter().find(|c| c.phase == CallPhase::Active) {
         return RingDecision::Existing(c.call);
     }
-    let ours = here
-        .iter()
-        .find(|c| c.dir == Direction::Outgoing && c.call.initiator == *me && c.phase != CallPhase::Joinable);
+    let ours =
+        here.iter().find(|c| c.dir == Direction::Outgoing && c.call.initiator == *me && c.phase != CallPhase::Joinable);
     if let Some(ours) = ours {
         // Both calling: the lower key's call survives on both sides.
-        return if me < from { RingDecision::Glare } else { RingDecision::AutoAccept { replaces: Some(ours.call.call) } };
+        return if me < from {
+            RingDecision::Glare
+        } else {
+            RingDecision::AutoAccept { replaces: Some(ours.call.call) }
+        };
     }
     if expecting {
         return RingDecision::AutoAccept { replaces: None };

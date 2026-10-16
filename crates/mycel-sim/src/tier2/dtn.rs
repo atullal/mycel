@@ -41,7 +41,11 @@ pub enum Kind {
     Prophet,
     /// Managed flooding: hop limit, rebroadcast window (ms), cancel after
     /// hearing this many duplicates during the window.
-    Flood { hops: u8, window_ms: u64, suppress: u8 },
+    Flood {
+        hops: u8,
+        window_ms: u64,
+        suppress: u8,
+    },
 }
 
 impl Kind {
@@ -83,7 +87,14 @@ pub struct FloodStats {
 pub enum Frame {
     /// What I hold (and, for PRoPHET, my predictabilities).
     Summary(Rc<Vec<MsgId>>, Rc<Vec<(NodeId, f32)>>),
-    Msg { msg: MsgId, dst: NodeId, size: u32, copies: u8, created: Time, hops: u8 },
+    Msg {
+        msg: MsgId,
+        dst: NodeId,
+        size: u32,
+        copies: u8,
+        created: Time,
+        hops: u8,
+    },
 }
 
 struct Held {
@@ -161,7 +172,8 @@ impl Dtn {
         let mut v: Vec<MsgId> = self.held.keys().copied().chain(self.done.iter().copied()).collect();
         v.sort_unstable();
         let preds = if self.kind == Kind::Prophet {
-            let mut p: Vec<(NodeId, f32)> = self.pred.keys().map(|k| (*k, self.p(*k, now) as f32)).filter(|(_, p)| *p > 0.01).collect();
+            let mut p: Vec<(NodeId, f32)> =
+                self.pred.keys().map(|k| (*k, self.p(*k, now) as f32)).filter(|(_, p)| *p > 0.01).collect();
             p.sort_unstable_by_key(|x| x.0);
             p
         } else {
@@ -172,7 +184,8 @@ impl Dtn {
 
     fn expire(&mut self, now: Time) {
         let ttl = self.opts.ttl;
-        let dead: Vec<MsgId> = self.held.iter().filter(|(_, h)| now.saturating_sub(h.created) >= ttl).map(|(k, _)| *k).collect();
+        let dead: Vec<MsgId> =
+            self.held.iter().filter(|(_, h)| now.saturating_sub(h.created) >= ttl).map(|(k, _)| *k).collect();
         for id in dead {
             self.drop_msg(id);
         }
@@ -192,7 +205,9 @@ impl Dtn {
         if !h.ours {
             // FIFO drop until it fits (The ONE's default policy)
             while self.used + size > self.opts.buffer {
-                let Some(old) = self.order.iter().copied().find(|id| self.held.get(id).is_some_and(|x| !x.ours)) else { return };
+                let Some(old) = self.order.iter().copied().find(|id| self.held.get(id).is_some_and(|x| !x.ours)) else {
+                    return;
+                };
                 self.drop_msg(old);
             }
             self.used += size;
@@ -234,7 +249,11 @@ impl Dtn {
             };
             let (dst, size, created) = (h.dst, h.size, h.created);
             let f = Frame::Msg { msg: id, dst, size, copies: give, created, hops: 0 };
-            let sent = if over_inet { cx.send_inet(nb, f, size + 64, false, Some(id)) } else { cx.send_radio(nb, f, size + 64, false, Some(id)) };
+            let sent = if over_inet {
+                cx.send_inet(nb, f, size + 64, false, Some(id))
+            } else {
+                cx.send_radio(nb, f, size + 64, false, Some(id))
+            };
             if sent {
                 self.nb_has.entry(nb).or_default().insert(id);
                 if let Kind::SprayAndWait(_) = self.kind

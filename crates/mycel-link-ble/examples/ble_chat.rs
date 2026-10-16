@@ -91,7 +91,13 @@ async fn main() -> anyhow::Result<()> {
         if last_status.elapsed() >= status_every {
             last_status = Instant::now();
             for s in node.link_status() {
-                println!("status: {} active={} peers={} {}", s.kind.label(), s.active, s.peers, s.detail.unwrap_or_default());
+                println!(
+                    "status: {} active={} peers={} {}",
+                    s.kind.label(),
+                    s.active,
+                    s.peers,
+                    s.detail.unwrap_or_default()
+                );
             }
         }
         if let Some((pk, p)) = node.peers().into_iter().find(|(_, p)| p.links.contains(&PathKind::Bluetooth)) {

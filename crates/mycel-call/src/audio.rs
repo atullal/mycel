@@ -63,13 +63,16 @@ pub trait AudioIo: Send + Sync + 'static {
 #[cfg(target_os = "macos")]
 pub const MIC_DENIED: &str = "Mycel isn't allowed to use the microphone. Allow it in System Settings > Privacy & Security > Microphone, then call again.";
 #[cfg(target_os = "ios")]
-pub const MIC_DENIED: &str = "Mycel isn't allowed to use the microphone. Turn it on in Settings > Mycel, then call again.";
+pub const MIC_DENIED: &str =
+    "Mycel isn't allowed to use the microphone. Turn it on in Settings > Mycel, then call again.";
 #[cfg(target_os = "android")]
-pub const MIC_DENIED: &str = "Mycel isn't allowed to use the microphone. Allow it in Settings > Apps > Mycel > Permissions, then call again.";
+pub const MIC_DENIED: &str =
+    "Mycel isn't allowed to use the microphone. Allow it in Settings > Apps > Mycel > Permissions, then call again.";
 #[cfg(windows)]
 pub const MIC_DENIED: &str = "Mycel isn't allowed to use the microphone. Allow it in Settings > Privacy & security > Microphone, then call again.";
 #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android", windows)))]
-pub const MIC_DENIED: &str = "Mycel can't use the microphone. Check that one is connected and that Mycel may use it, then call again.";
+pub const MIC_DENIED: &str =
+    "Mycel can't use the microphone. Check that one is connected and that Mycel may use it, then call again.";
 
 /// The audio backend for this device. `MYCEL_AUDIO` picks it:
 /// - unset / `auto`: Apple voice processing with echo cancellation on macOS,
@@ -115,9 +118,16 @@ pub fn default_audio() -> Arc<dyn AudioIo> {
 #[derive(Clone, Copy, Debug)]
 pub enum TestSource {
     Silence,
-    Sine { hz: f32, amp: f32 },
+    Sine {
+        hz: f32,
+        amp: f32,
+    },
     /// `on_ms` of tone every `period_ms`, for latency measurement.
-    Bursts { hz: f32, on_ms: u32, period_ms: u32 },
+    Bursts {
+        hz: f32,
+        on_ms: u32,
+        period_ms: u32,
+    },
     /// Send back what we hear (a remote loopback).
     Echo,
 }
@@ -147,12 +157,7 @@ const TICK_SAMPLES: usize = (SAMPLE_RATE / 100) as usize;
 
 impl TestAudio {
     pub fn new(source: TestSource) -> TestAudio {
-        TestAudio {
-            source,
-            keep: SAMPLE_RATE as usize * 30,
-            recording: Arc::default(),
-            source_start: Arc::default(),
-        }
+        TestAudio { source, keep: SAMPLE_RATE as usize * 30, recording: Arc::default(), source_start: Arc::default() }
     }
 
     pub fn source(&self) -> TestSource {
@@ -333,8 +338,8 @@ impl AudioIo for DeviceAudio {
         let stop = Arc::new(AtomicBool::new(false));
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
         let flag = stop.clone();
-        let thread = std::thread::Builder::new().name("mycel-audio".into()).spawn(move || {
-            match cpal_streams(ports) {
+        let thread =
+            std::thread::Builder::new().name("mycel-audio".into()).spawn(move || match cpal_streams(ports) {
                 Ok(streams) => {
                     let _ = ready_tx.send(Ok(()));
                     while !flag.load(Ordering::Relaxed) {
@@ -345,8 +350,7 @@ impl AudioIo for DeviceAudio {
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
                 }
-            }
-        })?;
+            })?;
         match ready_rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(())) => Ok(AudioHandle::new(StopOnDrop { stop, thread: Some(thread) })),
             Ok(Err(e)) => Err(e),

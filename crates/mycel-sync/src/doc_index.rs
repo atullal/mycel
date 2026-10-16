@@ -181,8 +181,7 @@ impl Index {
     /// invalid with respect to that history — a property of the change and
     /// its dependencies alone, so every replica decides the same.
     pub(crate) fn admit(&self, change: &Change) -> Option<Admitted> {
-        let mut deps: Vec<u32> =
-            change.deps().iter().map(|h| self.by_hash.get(h).copied()).collect::<Option<_>>()?;
+        let mut deps: Vec<u32> = change.deps().iter().map(|h| self.by_hash.get(h).copied()).collect::<Option<_>>()?;
         deps.sort_unstable();
         deps.dedup();
         let actor = change.actor_id();

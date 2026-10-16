@@ -72,9 +72,7 @@ mod unavailable {
     use std::task::{Context, Poll};
 
     use anyhow::{Result, bail};
-    use mycel_net::link::transports::{
-        CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit,
-    };
+    use mycel_net::link::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
     use mycel_net::link::{CustomAddr, n0_watcher, noq_udp};
     use mycel_net::{Link, LinkEvent, LinkStatus, PathKind};
     use tokio::sync::mpsc;
@@ -131,10 +129,7 @@ mod unavailable {
             _src: Option<&CustomAddr>,
             _transmit: &Transmit<'_>,
         ) -> Poll<io::Result<()>> {
-            Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "no peer-to-peer Wi-Fi",
-            )))
+            Poll::Ready(Err(io::Error::new(io::ErrorKind::Unsupported, "no peer-to-peer Wi-Fi")))
         }
     }
 

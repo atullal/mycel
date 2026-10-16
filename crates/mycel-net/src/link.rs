@@ -20,11 +20,11 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use bytes::Bytes;
 use iroh::TransportAddr;
-use iroh::endpoint::{Path, PathList};
 use iroh::endpoint::transports::{
-    Addr, CustomEndpoint, CustomSender, CustomTransport, FourTuple, PathSelection, PathSelectionContext, PathSelectionData,
-    PathSelector, RecvInfo, Transmit,
+    Addr, CustomEndpoint, CustomSender, CustomTransport, FourTuple, PathSelection, PathSelectionContext,
+    PathSelectionData, PathSelector, RecvInfo, Transmit,
 };
+use iroh::endpoint::{Path, PathList};
 use mycel_crypto::SignPk;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -289,7 +289,6 @@ const STREAMS_BIDI: u32 = 64;
 /// Uni-streams: ephemeral messages (presence, cursors, game state), DTN
 /// summaries, and in calls one per video frame.
 const STREAMS_UNI: u32 = 128;
-
 
 /// Paths are ranked by the time a typical exchange of this many bytes takes
 /// on them: RTT + size / throughput. Big enough that throughput matters (the
@@ -868,11 +867,7 @@ impl std::fmt::Debug for MemNet {
 
 impl CustomTransport for MemTransport {
     fn bind(&self) -> io::Result<Box<dyn CustomEndpoint>> {
-        let rx = self
-            .rx
-            .clone()
-            .try_lock_owned()
-            .map_err(|_| io::Error::other("link already bound"))?;
+        let rx = self.rx.clone().try_lock_owned().map_err(|_| io::Error::other("link already bound"))?;
         Ok(Box::new(MemEndpoint {
             net: self.net.clone(),
             me: self.me,
@@ -1015,8 +1010,14 @@ mod tests {
         assert_eq!(PathKind::of_custom_addr(&iface(PathKind::Uwb)), PathKind::Uwb);
         assert_eq!(PathKind::of_custom_addr(&iface(PathKind::WifiDirect)), PathKind::WifiDirect);
         assert_eq!(PathKind::of_custom_addr(&CustomAddr::from_parts(TRANSPORT_IFACE, &[])), PathKind::Other);
-        assert_eq!(PathKind::of_custom_addr(&CustomAddr::from_parts(TRANSPORT_PEER_WIFI, &[0; 32])), PathKind::PeerWifi);
-        assert_eq!(PathKind::of_custom_addr(&CustomAddr::from_parts(TRANSPORT_BLUETOOTH, &[0; 32])), PathKind::Bluetooth);
+        assert_eq!(
+            PathKind::of_custom_addr(&CustomAddr::from_parts(TRANSPORT_PEER_WIFI, &[0; 32])),
+            PathKind::PeerWifi
+        );
+        assert_eq!(
+            PathKind::of_custom_addr(&CustomAddr::from_parts(TRANSPORT_BLUETOOTH, &[0; 32])),
+            PathKind::Bluetooth
+        );
         let net = MemNet::new(3, PathKind::Ieee802154);
         let pk = SignPk([7; 32]);
         assert_eq!(PathKind::of_custom_addr(&net.addr_of(&pk)), PathKind::Ieee802154);

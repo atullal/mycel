@@ -101,8 +101,7 @@ impl Net {
     }
 
     fn connected(&self, a: usize, b: usize) -> bool {
-        self.links.contains(&(a.min(b), a.max(b)))
-            || (self.nodes[a].internet() && self.nodes[b].internet())
+        self.links.contains(&(a.min(b), a.max(b))) || (self.nodes[a].internet() && self.nodes[b].internet())
     }
 
     /// Carry out node `i`'s effects.
@@ -146,12 +145,8 @@ impl Net {
                     }
                 }
                 Out::Resolve(peer) => {
-                    let gws = self
-                        .records
-                        .iter()
-                        .rev()
-                        .find(|(n, _)| self.nodes[*n].me() == peer)
-                        .map(|(_, g)| g.clone());
+                    let gws =
+                        self.records.iter().rev().find(|(n, _)| self.nodes[*n].me() == peer).map(|(_, g)| g.clone());
                     self.nodes[i].on_resolved(peer, gws, now);
                     self.effects(i);
                 }
@@ -287,7 +282,13 @@ impl Net {
         dist[from] = 0;
         while let Some(u) = q.pop_front() {
             for &(a, b) in &self.links {
-                let v = if a == u { b } else if b == u { a } else { continue };
+                let v = if a == u {
+                    b
+                } else if b == u {
+                    a
+                } else {
+                    continue;
+                };
                 if dist[v] == usize::MAX {
                     dist[v] = dist[u] + 1;
                     q.push_back(v);
@@ -445,10 +446,7 @@ fn records_gateways_and_the_default_route() {
     // to someone M has no route to, through a non-gateway waypoint: the
     // default route still finds the gateway, which dials out
     net.send(0, 3, 1, b"default route");
-    assert_eq!(
-        net.delivered.last().map(|(i, _, p)| (*i, p.clone())),
-        Some((3, Bytes::from_static(b"default route")))
-    );
+    assert_eq!(net.delivered.last().map(|(i, _, p)| (*i, p.clone())), Some((3, Bytes::from_static(b"default route"))));
 }
 
 /// Two meshes, each with its gateway, each with a Bluetooth-only device
@@ -650,7 +648,8 @@ fn convergence_time_to_learn_new_routes() {
 #[test]
 fn new_neighbours_are_greeted_and_lone_devices_announce_fully() {
     for greet in [Greet::Near, Greet::Own] {
-        let mut net = Net::new(7, |i| Config { announce_every: 16_000, greet, seed: i as u64 + 1, ..Config::default() });
+        let mut net =
+            Net::new(7, |i| Config { announce_every: 16_000, greet, seed: i as u64 + 1, ..Config::default() });
         for i in 0..5 {
             net.link(i, i + 1);
         }
@@ -670,7 +669,9 @@ fn new_neighbours_are_greeted_and_lone_devices_announce_fully() {
             }
             t_far.is_some() && t_near.is_some()
         });
-        eprintln!("greet {greet:?}: 5 hops away learns the newcomer in {t_far:?} ms, the newcomer learns 2 hops away in {t_near:?} ms");
+        eprintln!(
+            "greet {greet:?}: 5 hops away learns the newcomer in {t_far:?} ms, the newcomer learns 2 hops away in {t_near:?} ms"
+        );
         assert!(t_far.is_some_and(|t| t <= 600), "a lone device's first neighbour: full scope at once ({t_far:?})");
         match greet {
             Greet::Near => assert!(t_near.is_some_and(|t| t <= 100), "{t_near:?}"),
@@ -695,7 +696,17 @@ fn an_announcement_storm_stops_at_the_first_relays() {
         let now = net.now;
         let r = &mut net.nodes[0];
         let o = r.next_announce(WALL + now);
-        let a = Announce { hops: 0, cost: 0, origin: r.me(), seq: o.seq, flags: o.flags, scope: o.scope, uplink: o.uplink, name: Arc::from(""), sig: Sig([0; 64]) };
+        let a = Announce {
+            hops: 0,
+            cost: 0,
+            origin: r.me(),
+            seq: o.seq,
+            flags: o.flags,
+            scope: o.scope,
+            uplink: o.uplink,
+            name: Arc::from(""),
+            sig: Sig([0; 64]),
+        };
         r.originate(a, now);
         net.effects(0);
         net.run(10);
@@ -716,7 +727,12 @@ fn flood_reduction_is_off_and_floods_reach_everyone() {
     assert!(!Config::default().flood_reduction);
     let edges = geometric(60, 100.0, 24.0, 7);
     let coverage = |reduction: bool| {
-        let mut net = Net::new(60, |i| Config { announce_every: 500, flood_reduction: reduction, seed: i as u64 + 1, ..Config::default() });
+        let mut net = Net::new(60, |i| Config {
+            announce_every: 500,
+            flood_reduction: reduction,
+            seed: i as u64 + 1,
+            ..Config::default()
+        });
         for (a, b) in &edges {
             net.link(*a, *b);
         }
@@ -824,7 +840,9 @@ fn churn_never_loops() {
         // traffic between random pairs that have a route
         for _ in 0..5 {
             let (s, d) = (rnd(N), rnd(N));
-            if s != d && let Some(via) = net.nodes[s].next_hop_local(&net.k(d), net.now) {
+            if s != d
+                && let Some(via) = net.nodes[s].next_hop_local(&net.k(d), net.now)
+            {
                 let (dst, now) = (net.k(d), net.now);
                 if !net.nodes[s].is_neighbour(&dst) {
                     net.nodes[s].send(dst, via, Bytes::from_static(b"p"), false, now);
@@ -838,7 +856,10 @@ fn churn_never_loops() {
         }
     }
     let delivered = net.delivered.len();
-    eprintln!("churn: 60 link flaps, {delivered} packets delivered, {} frame loops, {route_loops} route loops", net.frame_loops);
+    eprintln!(
+        "churn: 60 link flaps, {delivered} packets delivered, {} frame loops, {route_loops} route loops",
+        net.frame_loops
+    );
     assert_eq!(net.frame_loops, 0);
     assert_eq!(route_loops, 0);
     assert!(delivered > 100);

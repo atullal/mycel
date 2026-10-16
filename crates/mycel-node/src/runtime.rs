@@ -10,13 +10,13 @@ use parking_lot::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::BASE64URL_NOPAD;
+use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallManager};
 use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, SignPk, SymKey, random};
 use mycel_kit_chat::alerts::{self, AlertPolicy, ChatAlert, Latest, ThreadState};
-use mycel_kit_chat::thread::{self as chat_thread, Direct, Membership, Source};
-use mycel_kit_chat::{AttachmentRef, ChatOp, ChatSignal, ChatState, ChatView, ProfileHistory, messages_feed};
 #[cfg(test)]
 use mycel_kit_chat::reduce;
-use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallManager};
+use mycel_kit_chat::thread::{self as chat_thread, Direct, Membership, Source};
+use mycel_kit_chat::{AttachmentRef, ChatOp, ChatSignal, ChatState, ChatView, ProfileHistory, messages_feed};
 use mycel_net::{ContactCard, ExtraProtocol, NetEvent, NetMode, Node, NodeOptions, PathKind, PeerState};
 use mycel_sync::{FeedCursor, Replica};
 use mycel_trust::{Role, SpaceId};
@@ -253,11 +253,7 @@ impl CallHost for RuntimeCallHost {
 }
 
 fn load_set<T: serde::de::DeserializeOwned + Ord>(store: &DbStore, key: &str) -> Result<BTreeSet<T>> {
-    Ok(store
-        .kv_decode::<Vec<T>>(key)?
-        .unwrap_or_default()
-        .into_iter()
-        .collect())
+    Ok(store.kv_decode::<Vec<T>>(key)?.unwrap_or_default().into_iter().collect())
 }
 
 /// A conversation's view, kept up to date entry by entry: a change costs the
@@ -320,10 +316,7 @@ fn locate(views: &[Arc<ChatView>], id: &Hash32) -> Option<(usize, usize)> {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 const NOTICES: &str = "notices";
@@ -428,11 +421,7 @@ pub fn decode_contact_code_with_hints(code: &str) -> Result<(ContactCard, Vec<st
     let bytes = BASE64URL_NOPAD.decode(card_part.as_bytes()).context("not a Mycel contact code")?;
     let card: ContactCard = postcard::from_bytes(&bytes).context("not a Mycel contact code")?;
     card.verify().context("contact code signature is invalid")?;
-    let hints = hints
-        .split(',')
-        .filter_map(|h| h.parse().ok())
-        .take(8)
-        .collect();
+    let hints = hints.split(',').filter_map(|h| h.parse().ok()).take(8).collect();
     Ok((card, hints))
 }
 
@@ -510,16 +499,8 @@ fn guess_mime(name: &str) -> &'static str {
 /// come from other people's messages.
 pub fn sanitize_file_name(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
-    let mut clean: String = base
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || " .-_()[]+,@&'".contains(c) {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
+    let mut clean: String =
+        base.chars().map(|c| if c.is_alphanumeric() || " .-_()[]+,@&'".contains(c) { c } else { '_' }).collect();
     while clean.starts_with('.') || clean.starts_with(' ') {
         clean.remove(0);
     }
@@ -532,10 +513,7 @@ pub fn sanitize_file_name(name: &str) -> String {
 fn quarantine(path: &Path) {
     #[cfg(target_os = "macos")]
     {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let value = format!("0081;{secs:x};Mycel;");
         let _ = xattr::set(path, "com.apple.quarantine", value.as_bytes());
     }
@@ -563,11 +541,7 @@ fn net_mode(m: NetworkMode) -> NetMode {
 // ───────────────────────────── runtime ─────────────────────────────
 
 impl Runtime {
-    pub async fn open(
-        data_dir: impl AsRef<Path>,
-        mode: NetworkMode,
-        name: Option<String>,
-    ) -> Result<Arc<Runtime>> {
+    pub async fn open(data_dir: impl AsRef<Path>, mode: NetworkMode, name: Option<String>) -> Result<Arc<Runtime>> {
         Self::open_with(RuntimeOptions {
             data_dir: data_dir.as_ref().to_path_buf(),
             mode,
@@ -625,12 +599,14 @@ impl Runtime {
                 }
             }
         };
-        let contacts: Arc<Mutex<BTreeMap<SignPk, StoredContact>>> = Arc::new(Mutex::new(store
-            .kv_decode::<Vec<StoredContact>>("contacts")?
-            .unwrap_or_default()
-            .into_iter()
-            .map(|c| (c.keys.sign_pk, c))
-            .collect()));
+        let contacts: Arc<Mutex<BTreeMap<SignPk, StoredContact>>> = Arc::new(Mutex::new(
+            store
+                .kv_decode::<Vec<StoredContact>>("contacts")?
+                .unwrap_or_default()
+                .into_iter()
+                .map(|c| (c.keys.sign_pk, c))
+                .collect(),
+        ));
 
         let mut nopts = NodeOptions::new(net_mode(opts.mode), name.clone());
         nopts.store = Some(store.clone());
@@ -654,7 +630,8 @@ impl Runtime {
         let hidden_messages = Mutex::new(load_set(&store, "hidden_messages")?);
         let arriving: Arc<Mutex<HashSet<SpaceId>>> = Arc::default();
         let (blocked_for_policy, hidden_for_policy) = (blocked.clone(), hidden.clone());
-        let (arriving_for_policy, requests_for_policy, request_store) = (arriving.clone(), requests.clone(), store.clone());
+        let (arriving_for_policy, requests_for_policy, request_store) =
+            (arriving.clone(), requests.clone(), store.clone());
         let (contacts_for_policy, evicted): (_, Arc<Mutex<Vec<SpaceId>>>) = (contacts.clone(), Arc::default());
         let evicted_by_policy = evicted.clone();
         let arrival_order: Mutex<Vec<SpaceId>> = Mutex::default();
@@ -720,11 +697,8 @@ impl Runtime {
             let hidden = hidden_for_blobs.lock().contains(&space);
             keeper || (!arriving && !pending && !hidden)
         });
-        let hints: BTreeMap<SignPk, Vec<String>> = store
-            .kv_decode::<Vec<(SignPk, Vec<String>)>>("hints")?
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let hints: BTreeMap<SignPk, Vec<String>> =
+            store.kv_decode::<Vec<(SignPk, Vec<String>)>>("hints")?.unwrap_or_default().into_iter().collect();
         nopts.accept_relay_invites = opts.keeper;
         // Live calls share the endpoint (and so every path). Keepers relay
         // ciphertext only: no calls.
@@ -732,8 +706,8 @@ impl Runtime {
         if !opts.keeper {
             nopts.extra_protocols.push(ExtraProtocol { alpn: ALPN_CALL.to_vec(), incoming: call_tx });
         }
-        let engine = mycel_rules::RulesEngine::load(CHAT_RULES_WASM)
-            .map_err(|e| anyhow!("chat rules failed to load: {e:?}"))?;
+        let engine =
+            mycel_rules::RulesEngine::load(CHAT_RULES_WASM).map_err(|e| anyhow!("chat rules failed to load: {e:?}"))?;
         nopts.feed_validator = Some(Arc::new(WasmRules(engine)));
         let node = Node::spawn(keys.clone(), nopts).await?;
 
@@ -823,8 +797,12 @@ impl Runtime {
     fn emit(&self, e: Event) {
         let canonical = |id: String| parse_space(&id).map(|space| self.logical_id(&space)).unwrap_or(id);
         let e = match e {
-            Event::ConversationUpdated { conversation } => Event::ConversationUpdated { conversation: canonical(conversation) },
-            Event::ConversationAdded { conversation } => Event::ConversationAdded { conversation: canonical(conversation) },
+            Event::ConversationUpdated { conversation } => {
+                Event::ConversationUpdated { conversation: canonical(conversation) }
+            }
+            Event::ConversationAdded { conversation } => {
+                Event::ConversationAdded { conversation: canonical(conversation) }
+            }
             Event::Typing { conversation, peer } => Event::Typing { conversation: canonical(conversation), peer },
             Event::CallIncoming { call } => Event::CallIncoming { call: self.logical_call(call) },
             Event::CallUpdated { call } => Event::CallUpdated { call: self.logical_call(call) },
@@ -923,9 +901,7 @@ impl Runtime {
             bail!("that's your own contact code");
         }
         keys.verify_binding()?;
-        self.contacts
-            .lock()
-            .insert(keys.sign_pk, StoredContact { keys, name });
+        self.contacts.lock().insert(keys.sign_pk, StoredContact { keys, name });
         self.save_contacts();
         self.emit(Event::ContactsChanged);
         self.contact(&keys.sign_pk).context("contact vanished")
@@ -1028,11 +1004,7 @@ impl Runtime {
         NetworkStatus {
             mode: self.mode,
             next_mode: *self.next_mode.lock(),
-            online_peers: peers
-                .iter()
-                .filter(|(_, p)| p.online())
-                .map(|(pk, _)| hex_id(pk))
-                .collect(),
+            online_peers: peers.iter().filter(|(_, p)| p.online()).map(|(pk, _)| hex_id(pk)).collect(),
             nearby_peers: peers.values().filter(|p| p.is_directly_discovered()).count() as u32,
             addresses: self.node.local_addresses(),
             links: self.node.link_status(),
@@ -1115,9 +1087,12 @@ impl Runtime {
     /// the undo window means folding the whole history again.
     fn view(&self, space: &SpaceId) -> Result<Arc<ChatView>> {
         use std::sync::atomic::Ordering::AcqRel;
-        let cached = self.views.lock().entry(*space).or_insert_with(|| {
-            Arc::new(CachedView { stale: true.into(), ..Default::default() })
-        }).clone();
+        let cached = self
+            .views
+            .lock()
+            .entry(*space)
+            .or_insert_with(|| Arc::new(CachedView { stale: true.into(), ..Default::default() }))
+            .clone();
         let (view, names) = {
             let mut fold = cached.fold.lock();
             if !cached.stale.swap(false, AcqRel) {
@@ -1208,9 +1183,7 @@ impl Runtime {
     fn post(&self, space: SpaceId, op: ChatOp) -> Result<Hash32> {
         // Don't sign what can't be saved: a peer could hold it while we lose it.
         self.store.check_writable()?;
-        let (_, env) = self
-            .node
-            .with_space(&space, |r| r.append(messages_feed(), op.encode()))??;
+        let (_, env) = self.node.with_space(&space, |r| r.append(messages_feed(), op.encode()))??;
         self.touch(space);
         Ok(env.id())
     }
@@ -1235,11 +1208,7 @@ impl Runtime {
 
     fn contact_keys(&self, id: &str) -> Result<MemberKeys> {
         let pk = parse_pk(id)?;
-        self.contacts
-            .lock()
-            .get(&pk)
-            .map(|c| c.keys)
-            .ok_or_else(|| anyhow!("{} is not in your contacts", pk.short()))
+        self.contacts.lock().get(&pk).map(|c| c.keys).ok_or_else(|| anyhow!("{} is not in your contacts", pk.short()))
     }
 
     fn summary(&self, space: &SpaceId) -> Result<ConversationSummary> {
@@ -1263,10 +1232,7 @@ impl Runtime {
             })
             .collect();
         members.sort_by_key(|m| (!m.is_me, m.name.to_lowercase()));
-        let people: Vec<&Member> = members
-            .iter()
-            .filter(|m| !m.is_me && m.role != MemberRole::Keeper)
-            .collect();
+        let people: Vec<&Member> = members.iter().filter(|m| !m.is_me && m.role != MemberRole::Keeper).collect();
         let title = match &view.title {
             Some(t) => t.clone(),
             None if people.is_empty() => "Just you".to_string(),
@@ -1305,11 +1271,7 @@ impl Runtime {
     ) -> MessageView {
         let me = self.keys.sign_pk();
         let is_mine = m.author == me;
-        let delivery = if is_mine {
-            self.delivery(space, view, m)
-        } else {
-            Delivery::Delivered
-        };
+        let delivery = if is_mine { self.delivery(space, view, m) } else { Delivery::Delivered };
         MessageView {
             id: m.id.to_string(),
             conversation: space.to_string(),
@@ -1328,19 +1290,13 @@ impl Runtime {
                     name: sanitize_file_name(&a.name),
                     mime: a.mime.clone(),
                     size: a.size,
-                    local_path: self
-                        .file_path(a)
-                        .filter(|p| p.exists())
-                        .map(|p| p.to_string_lossy().into_owned()),
+                    local_path: self.file_path(a).filter(|p| p.exists()).map(|p| p.to_string_lossy().into_owned()),
                 })
                 .collect(),
             reactions: m
                 .reactions
                 .iter()
-                .map(|(emoji, by)| Reaction {
-                    emoji: emoji.clone(),
-                    by: by.iter().map(hex_id).collect(),
-                })
+                .map(|(emoji, by)| Reaction { emoji: emoji.clone(), by: by.iter().map(hex_id).collect() })
                 .collect(),
             is_mine,
             delivery,
@@ -1349,8 +1305,7 @@ impl Runtime {
 
     fn delivery(&self, space: &SpaceId, view: &ChatView, m: &mycel_kit_chat::Message) -> Delivery {
         let me = self.keys.sign_pk();
-        let Ok((members, holders)) = self.node.with_space(space, |r| (r.members(), r.holders(&m.id)))
-        else {
+        let Ok((members, holders)) = self.node.with_space(space, |r| (r.members(), r.holders(&m.id))) else {
             return Delivery::Local;
         };
         let others: Vec<SignPk> = members
@@ -1361,9 +1316,7 @@ impl Runtime {
         let idx = view.index_of(&m.id).unwrap_or(usize::MAX);
         if !others.is_empty() && others.iter().all(|o| view.has_read(o, idx)) {
             Delivery::Read
-        } else if !others.is_empty()
-            && others.iter().all(|o| holders.contains(o) || view.has_read(o, idx))
-        {
+        } else if !others.is_empty() && others.iter().all(|o| holders.contains(o) || view.has_read(o, idx)) {
             Delivery::Delivered
         } else if !holders.is_empty() {
             Delivery::Sent
@@ -1373,11 +1326,8 @@ impl Runtime {
     }
 
     pub fn conversations(&self) -> Vec<ConversationSummary> {
-        let mut out: Vec<ConversationSummary> = self
-            .logical_threads()
-            .iter()
-            .filter_map(|spaces| self.logical_summary(spaces).ok())
-            .collect();
+        let mut out: Vec<ConversationSummary> =
+            self.logical_threads().iter().filter_map(|spaces| self.logical_summary(spaces).ok()).collect();
         out.sort_by_key(|c| std::cmp::Reverse(c.last_message.as_ref().map_or(0, |m| m.sent_at)));
         out
     }
@@ -1428,8 +1378,7 @@ impl Runtime {
     fn settle_threads_with(&self, spaces: &[SpaceId]) {
         {
             let mut threads = self.threads.lock();
-            let missing: Vec<SpaceId> =
-                spaces.iter().filter(|s| !threads.spaces.contains_key(s)).copied().collect();
+            let missing: Vec<SpaceId> = spaces.iter().filter(|s| !threads.spaces.contains_key(s)).copied().collect();
             threads.dirty.extend(missing);
         }
         self.settle_threads();
@@ -1500,13 +1449,8 @@ impl Runtime {
     /// first: a direct chat's admitted aliases, otherwise just `space`.
     fn conversation_spaces(&self, space: &SpaceId) -> Vec<SpaceId> {
         let Some(direct) = self.direct_of(space) else { return vec![*space] };
-        let aliases: Vec<SpaceId> = self
-            .threads
-            .lock()
-            .direct
-            .get(&direct)
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_default();
+        let aliases: Vec<SpaceId> =
+            self.threads.lock().direct.get(&direct).map(|set| set.iter().copied().collect()).unwrap_or_default();
         let spaces: Vec<SpaceId> = aliases.into_iter().filter(|s| self.admitted(s)).collect();
         if spaces.is_empty() { vec![*space] } else { spaces }
     }
@@ -1570,9 +1514,9 @@ impl Runtime {
         // writer UI capability: admin operations keep each space's own role.
         let writable_alias = {
             let threads = self.threads.lock();
-            spaces[1..].iter().any(|s| {
-                threads.spaces.get(s).is_some_and(|f| f.membership.my_role.is_some_and(Role::can_write))
-            })
+            spaces[1..]
+                .iter()
+                .any(|s| threads.spaces.get(s).is_some_and(|f| f.membership.my_role.is_some_and(Role::can_write)))
         };
         if result.my_role == Some(MemberRole::ReadOnly) && writable_alias {
             result.my_role = Some(MemberRole::Member);
@@ -1585,7 +1529,9 @@ impl Runtime {
 
     fn message_space(&self, space: &SpaceId, target: &Hash32) -> Result<SpaceId> {
         for source in self.conversation_spaces(space) {
-            if self.view(&source)?.index_of(target).is_some() { return Ok(source); }
+            if self.view(&source)?.index_of(target).is_some() {
+                return Ok(source);
+            }
         }
         bail!("unknown message")
     }
@@ -1614,19 +1560,14 @@ impl Runtime {
         // discarded by starting another chat.
         self.settle_threads_with(&self.node.space_ids());
         let direct = Direct { peer, current: true };
-        let aliases: Vec<SpaceId> = self
-            .threads
-            .lock()
-            .direct
-            .get(&direct)
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_default();
+        let aliases: Vec<SpaceId> =
+            self.threads.lock().direct.get(&direct).map(|set| set.iter().copied().collect()).unwrap_or_default();
         let spaces: Vec<SpaceId> = aliases.into_iter().filter(|s| self.admitted(s)).collect();
         let writable = {
             let threads = self.threads.lock();
-            spaces.iter().any(|s| {
-                threads.spaces.get(s).is_some_and(|f| f.membership.my_role.is_some_and(Role::can_write))
-            })
+            spaces
+                .iter()
+                .any(|s| threads.spaces.get(s).is_some_and(|f| f.membership.my_role.is_some_and(Role::can_write)))
         };
         if !writable {
             return None;
@@ -1634,15 +1575,8 @@ impl Runtime {
         self.logical_summary(&spaces).ok()
     }
 
-    pub fn create_conversation(
-        &self,
-        title: Option<String>,
-        members: Vec<PeerId>,
-    ) -> Result<ConversationSummary> {
-        let keys: Vec<MemberKeys> = members
-            .iter()
-            .map(|m| self.contact_keys(m))
-            .collect::<Result<_>>()?;
+    pub fn create_conversation(&self, title: Option<String>, members: Vec<PeerId>) -> Result<ConversationSummary> {
+        let keys: Vec<MemberKeys> = members.iter().map(|m| self.contact_keys(m)).collect::<Result<_>>()?;
         self.create_with(title, keys)
     }
 
@@ -1690,7 +1624,10 @@ impl Runtime {
             .collect();
         drop(hidden);
         page.reverse();
-        Ok(page.into_iter().map(|(s, i)| self.message_view(&spaces[s], &views[s], &views[s].messages[i], &HashSet::new())).collect())
+        Ok(page
+            .into_iter()
+            .map(|(s, i)| self.message_view(&spaces[s], &views[s], &views[s].messages[i], &HashSet::new()))
+            .collect())
     }
 
     /// The visible messages around one (it included, unless hidden here):
@@ -1710,7 +1647,8 @@ impl Runtime {
         let (before, after) = (before.unwrap_or(25).min(10_000) as usize, after.unwrap_or(25).min(10_000) as usize);
         let hidden = self.hidden_messages.lock();
         let visible = |&(s, i): &(usize, usize)| !hidden.contains(&(spaces[s], views[s].messages[i].id));
-        let mut earlier: Vec<_> = chat_thread::newest_first(&sources, Some(anchor)).filter(visible).take(before + 1).collect();
+        let mut earlier: Vec<_> =
+            chat_thread::newest_first(&sources, Some(anchor)).filter(visible).take(before + 1).collect();
         let mut later: Vec<_> = chat_thread::oldest_first(&sources, anchor).filter(visible).take(after + 1).collect();
         let shown = visible(&anchor);
         drop(hidden);
@@ -1721,7 +1659,9 @@ impl Runtime {
         earlier.reverse();
         let window = earlier.into_iter().chain(shown.then_some(anchor)).chain(later);
         Ok(MessageWindow {
-            messages: window.map(|(s, i)| self.message_view(&spaces[s], &views[s], &views[s].messages[i], &HashSet::new())).collect(),
+            messages: window
+                .map(|(s, i)| self.message_view(&spaces[s], &views[s], &views[s].messages[i], &HashSet::new()))
+                .collect(),
             has_earlier,
             has_later,
         })
@@ -1744,12 +1684,7 @@ impl Runtime {
     }
 
     /// Search the entire locally synchronized history, newest match first.
-    pub fn search_messages(
-        &self,
-        id: ConversationId,
-        query: String,
-        limit: Option<u32>,
-    ) -> Result<Vec<MessageView>> {
+    pub fn search_messages(&self, id: ConversationId, query: String, limit: Option<u32>) -> Result<Vec<MessageView>> {
         let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
         if terms.is_empty() {
             return Ok(Vec::new());
@@ -1774,7 +1709,10 @@ impl Runtime {
             .take(limit.unwrap_or(100).min(1_000) as usize)
             .collect();
         drop(hidden);
-        Ok(hits.into_iter().map(|(s, i)| self.message_view(&spaces[s], &views[s], &views[s].messages[i], &HashSet::new())).collect())
+        Ok(hits
+            .into_iter()
+            .map(|(s, i)| self.message_view(&spaces[s], &views[s], &views[s].messages[i], &HashSet::new()))
+            .collect())
     }
 
     pub async fn send_message(
@@ -1851,9 +1789,7 @@ impl Runtime {
     /// (`.app`, `.pages`, `.key`, `.rtfd`, …) are sent as a `.zip`.
     async fn upload(&self, space: SpaceId, raw: &str) -> Result<AttachmentRef> {
         let path = crate::files::local_path(raw);
-        let meta = tokio::fs::metadata(&path)
-            .await
-            .map_err(|e| crate::files::read_error(&path, e))?;
+        let meta = tokio::fs::metadata(&path).await.map_err(|e| crate::files::read_error(&path, e))?;
         if meta.is_dir() {
             let base = sanitize_file_name(&path.file_name().unwrap_or_default().to_string_lossy());
             let name = format!("{base}.zip");
@@ -1878,10 +1814,7 @@ impl Runtime {
     }
 
     async fn encrypt_attachment(&self, space: SpaceId, src: &Path, name: String, id: &str) -> Result<AttachmentRef> {
-        let size = tokio::fs::metadata(src)
-            .await
-            .map_err(|e| crate::files::read_error(src, e))?
-            .len();
+        let size = tokio::fs::metadata(src).await.map_err(|e| crate::files::read_error(src, e))?.len();
         // room for the sealed blob plus our plaintext copy
         mycel_net::ensure_free_space(&self.data_dir, mycel_crypto::sealed_len(size) + size)?;
         let staged = self.node.blob_staging_path().context("blob storage disabled")?;
@@ -1931,11 +1864,7 @@ impl Runtime {
         let mut found = None;
         for space in self.node.space_ids() {
             if let Ok(view) = self.view(&space)
-                && let Some(a) = view
-                    .messages
-                    .iter()
-                    .flat_map(|m| &m.attachments)
-                    .find(|a| a.blob == hash)
+                && let Some(a) = view.messages.iter().flat_map(|m| &m.attachments).find(|a| a.blob == hash)
             {
                 found = Some((space, a.clone()));
                 break;
@@ -1944,7 +1873,8 @@ impl Runtime {
         let (space, a) = found.context("unknown attachment")?;
         // Consent applies even to already-cached files. Do not require current
         // membership: accepted history remains available after leaving a chat.
-        if self.requests.lock().contains_key(&space) || self.arriving.lock().contains(&space)
+        if self.requests.lock().contains_key(&space)
+            || self.arriving.lock().contains(&space)
             || self.hidden.lock().contains(&space)
         {
             bail!("accept this message request before downloading attachments");
@@ -2026,17 +1956,11 @@ impl Runtime {
         }
         let mut hidden = self.hidden_messages.lock();
         let mut next = hidden.clone();
-        let changed = if hide {
-            next.insert((space, target))
-        } else {
-            next.remove(&(space, target))
-        };
+        let changed = if hide { next.insert((space, target)) } else { next.remove(&(space, target)) };
         if changed {
             self.store.kv_batch_durable(vec![(
                 "hidden_messages".into(),
-                Some(postcard::to_allocvec(
-                    &next.iter().copied().collect::<Vec<_>>(),
-                )?),
+                Some(postcard::to_allocvec(&next.iter().copied().collect::<Vec<_>>())?),
             )])?;
             *hidden = next;
         }
@@ -2053,10 +1977,7 @@ impl Runtime {
         let target = parse_hash(&message)?;
         let view = self.view(&space)?;
         let m = &view.messages[view.index_of(&target).context("unknown message")?];
-        let on = !m
-            .reactions
-            .get(&emoji)
-            .is_some_and(|by| by.contains(&self.keys.sign_pk()));
+        let on = !m.reactions.get(&emoji).is_some_and(|by| by.contains(&self.keys.sign_pk()));
         self.post(space, ChatOp::React { target, emoji, on })?;
         Ok(())
     }
@@ -2077,13 +1998,7 @@ impl Runtime {
         }
         let me = self.keys.sign_pk();
         let view = self.view(space)?;
-        let Some((idx, last)) = view
-            .messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, m)| m.author != me)
-        else {
+        let Some((idx, last)) = view.messages.iter().enumerate().rev().find(|(_, m)| m.author != me) else {
             return Ok(());
         };
         if view.has_read(&me, idx) || !self.my_role(space).is_some_and(Role::can_write) {
@@ -2112,15 +2027,14 @@ impl Runtime {
     /// both of you and them instead (announced by `conversationAdded`).
     pub fn add_members(&self, id: ConversationId, members: Vec<PeerId>) -> Result<()> {
         let space = parse_space(&id)?;
-        let keys: Vec<MemberKeys> = members
-            .iter()
-            .map(|m| self.contact_keys(m))
-            .collect::<Result<_>>()?;
+        let keys: Vec<MemberKeys> = members.iter().map(|m| self.contact_keys(m)).collect::<Result<_>>()?;
         if let Some(direct) = self.direct_of(&space).filter(|d| d.current) {
             self.require_member(&self.posting_space(&space))?;
             let peer = self
                 .node
-                .with_space(&space, |r| r.members().into_iter().find(|(k, _)| k.sign_pk == direct.peer).map(|(k, _)| k))?
+                .with_space(&space, |r| {
+                    r.members().into_iter().find(|(k, _)| k.sign_pk == direct.peer).map(|(k, _)| k)
+                })?
                 .context("they're no longer in this chat")?;
             let mut people = vec![peer];
             people.extend(keys.into_iter().filter(|k| k.sign_pk != direct.peer && k.sign_pk != self.keys.sign_pk()));
@@ -2154,7 +2068,9 @@ impl Runtime {
             bail!("only admins can do that");
         }
         for space in spaces {
-            self.node.with_space(&space, |r| (!r.is_member(&k.sign_pk)).then(|| r.add_member(k, Role::Relay)))?.transpose()?;
+            self.node
+                .with_space(&space, |r| (!r.is_member(&k.sign_pk)).then(|| r.add_member(k, Role::Relay)))?
+                .transpose()?;
             self.touch(space);
         }
         Ok(())
@@ -2195,11 +2111,8 @@ impl Runtime {
     /// admin of any of them, nothing is left.
     pub fn leave_conversation(&self, id: ConversationId) -> Result<()> {
         let me = self.keys.sign_pk();
-        let spaces: Vec<SpaceId> = self
-            .conversation_spaces(&parse_space(&id)?)
-            .into_iter()
-            .filter(|s| self.my_role(s).is_some())
-            .collect();
+        let spaces: Vec<SpaceId> =
+            self.conversation_spaces(&parse_space(&id)?).into_iter().filter(|s| self.my_role(s).is_some()).collect();
         if spaces.is_empty() {
             bail!("can't leave: you're not a member of this conversation");
         }
@@ -2232,9 +2145,9 @@ impl Runtime {
             requests.remove(&space);
             inviter
         };
-        let keys = self.node.with_space(&space, |r| {
-            r.members().into_iter().find(|(k, _)| k.sign_pk == inviter).map(|(k, _)| k)
-        })?;
+        let keys = self
+            .node
+            .with_space(&space, |r| r.members().into_iter().find(|(k, _)| k.sign_pk == inviter).map(|(k, _)| k))?;
         if let Some(keys) = keys
             && !self.contacts.lock().contains_key(&inviter)
         {
@@ -2292,9 +2205,9 @@ impl Runtime {
                 let cleared = {
                     let mut requests = self.requests.lock();
                     let list: Vec<_> = requests.iter().filter(|(s, _)| **s != space).map(|(s, p)| (*s, *p)).collect();
-                    let result = postcard::to_allocvec(&list).map_err(anyhow::Error::from).and_then(|bytes| {
-                        self.store.kv_batch_durable(vec![("requests".into(), Some(bytes))])
-                    });
+                    let result = postcard::to_allocvec(&list)
+                        .map_err(anyhow::Error::from)
+                        .and_then(|bytes| self.store.kv_batch_durable(vec![("requests".into(), Some(bytes))]));
                     if result.is_ok() {
                         requests.remove(&space);
                     }
@@ -2445,9 +2358,10 @@ impl Runtime {
             return Ok(info);
         }
         // a denied camera doesn't stop the call: `video.error` says why
-        Ok(self.set_camera(info.id.clone(), true).await.unwrap_or_else(|_| {
-            self.call_status().into_iter().find(|c| c.id == info.id).unwrap_or(info)
-        }))
+        Ok(self
+            .set_camera(info.id.clone(), true)
+            .await
+            .unwrap_or_else(|_| self.call_status().into_iter().find(|c| c.id == info.id).unwrap_or(info)))
     }
 
     /// Answer a call, with our camera on if `video`.
@@ -2655,10 +2569,7 @@ async fn bridge(rt: Weak<Runtime>, mut rx: broadcast::Receiver<NetEvent>) {
             NetEvent::SpaceAdded { space, from } => rt.classify_arrival(space, from),
             NetEvent::Ephemeral { space, from, data } => {
                 if let Some(ChatSignal::Typing) = ChatSignal::decode(&data) {
-                    rt.emit(Event::Typing {
-                        conversation: space.to_string(),
-                        peer: hex_id(&from),
-                    });
+                    rt.emit(Event::Typing { conversation: space.to_string(), peer: hex_id(&from) });
                 }
             }
             NetEvent::PeersChanged => {
@@ -2704,10 +2615,8 @@ mod tests {
     #[test]
     fn notices_last_until_dismissed() {
         use super::*;
-        let path = std::env::temp_dir().join(format!(
-            "mycel-notices-{}.redb",
-            hex::encode(mycel_crypto::random::<16>())
-        ));
+        let path =
+            std::env::temp_dir().join(format!("mycel-notices-{}.redb", hex::encode(mycel_crypto::random::<16>())));
         let store = DbStore::open(&path).unwrap();
         let first = remember_notices(&store, vec![Notice::NetworkModeReset, Notice::RecordsSetAside { count: 2 }]);
         assert_eq!(first, vec![Notice::NetworkModeReset, Notice::RecordsSetAside { count: 2 }]);
@@ -2730,8 +2639,12 @@ mod tests {
         let runtime = Runtime::open(&dir, NetworkMode::Local, Some("Clock test".into())).await.unwrap();
         let peer = DeviceKeys::generate().sign_pk();
         let profile = |timestamp: u64, id: u8, name: &str| mycel_sync::FeedItem {
-            id: Hash32([id; 32]), author: peer, author_role: Role::Writer,
-            ts_ms: timestamp, deps: vec![], body: ChatOp::Profile { name: name.into() }.encode(),
+            id: Hash32([id; 32]),
+            author: peer,
+            author_role: Role::Writer,
+            ts_ms: timestamp,
+            deps: vec![],
+            body: ChatOp::Profile { name: name.into() }.encode(),
         };
         // The helper consumes authenticated, causally ordered feed snapshots;
         // synthetic item clocks exercise ordering independent of OS time.
@@ -2759,7 +2672,9 @@ mod tests {
         use super::*;
         async fn eventually(mut check: impl FnMut() -> bool) {
             for _ in 0..300 {
-                if check() { return; }
+                if check() {
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             panic!("signed profile rename timed out");
@@ -2776,8 +2691,12 @@ mod tests {
         bob.node.add_peer_addr(alice.node.addr());
         let conversation = alice.create_conversation(None, vec![contact.id.clone()]).unwrap();
         eventually(|| bob.conversations().iter().any(|c| c.id == conversation.id && !c.request)).await;
-        eventually(|| alice.view(&parse_space(&conversation.id).unwrap()).unwrap().names.contains_key(&bob.keys.sign_pk())).await;
-        let old_items = alice.node.with_space(&parse_space(&conversation.id).unwrap(), |r| r.feed(&messages_feed())).unwrap();
+        eventually(|| {
+            alice.view(&parse_space(&conversation.id).unwrap()).unwrap().names.contains_key(&bob.keys.sign_pk())
+        })
+        .await;
+        let old_items =
+            alice.node.with_space(&parse_space(&conversation.id).unwrap(), |r| r.feed(&messages_feed())).unwrap();
         let mut events = alice.subscribe();
         bob.set_name("Manbirs iphone".into()).unwrap();
         // Contact refresh must happen from the sync bridge itself; this poll
@@ -2789,24 +2708,37 @@ mod tests {
                     return;
                 }
             }
-        }).await;
+        })
+        .await;
         assert!(changed.is_ok(), "signed rename refreshes contact subscribers");
         assert_eq!(alice.conversation(conversation.id.clone()).unwrap().title, "Manbirs iphone");
         assert_eq!(alice.create_conversation(None, vec![contact.id.clone()]).unwrap().id, conversation.id);
-        let nearby = alice.nearby_from_peers(HashMap::from([(bob.keys.sign_pk(), PeerState {
-            name: Some("Unsigned discovery label".into()),
-            links: BTreeSet::from([PathKind::Bluetooth]), ..Default::default()
-        })]));
+        let nearby = alice.nearby_from_peers(HashMap::from([(
+            bob.keys.sign_pk(),
+            PeerState {
+                name: Some("Unsigned discovery label".into()),
+                links: BTreeSet::from([PathKind::Bluetooth]),
+                ..Default::default()
+            },
+        )]));
         assert_eq!(nearby[0].name, "Manbirs iphone");
         assert!(alice.network_status().peers.iter().any(|p| p.id == contact.id && p.name == "Manbirs iphone"));
         assert!(!alice.learn_profile_names(&old_items), "reading old signed history cannot undo the rename");
         alice.add_contact(imported_code).unwrap();
-        assert_eq!(alice.contacts()[0].name, "Manbirs iphone", "reimporting an old card cannot override a newer signed profile");
+        assert_eq!(
+            alice.contacts()[0].name,
+            "Manbirs iphone",
+            "reimporting an old card cannot override a newer signed profile"
+        );
         assert_eq!(alice.contacts()[0].id, contact.id, "display-name changes preserve authenticated identity");
         alice.shutdown().await.unwrap();
         drop(alice);
         alice = Runtime::open(&da, NetworkMode::Local, Some("Alice".into())).await.unwrap();
-        assert_eq!(alice.contacts()[0].name, "Manbirs iphone", "signed name is restored from encrypted history after restart");
+        assert_eq!(
+            alice.contacts()[0].name,
+            "Manbirs iphone",
+            "signed name is restored from encrypted history after restart"
+        );
         assert_eq!(alice.conversation(conversation.id).unwrap().title, "Manbirs iphone");
         alice.shutdown().await.unwrap();
         bob.shutdown().await.unwrap();
@@ -2818,11 +2750,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn direct_chat_wire_identity_survives_bluetooth_wifi_mesh_and_direct_path_change() {
         use super::*;
-        use mycel_net::link::{Link, MemNet};
         use mycel_net::MeshOptions;
+        use mycel_net::link::{Link, MemNet};
         async fn eventually(mut check: impl FnMut() -> bool) {
             for _ in 0..400 {
-                if check() { return; }
+                if check() {
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             panic!("mixed-medium mesh test timed out");
@@ -2843,24 +2777,44 @@ mod tests {
         // MemLink::start announces peers even when its net is already cut;
         // cut after startup so the test emits the matching Lost events.
         direct.cut();
-        eventually(|| !manbir.peers().get(&shreya.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
-            && !shreya.peers().get(&manbir.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))).await;
+        eventually(|| {
+            !manbir.peers().get(&shreya.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
+                && !shreya.peers().get(&manbir.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
+        })
+        .await;
         let mac = device("Mac relay", &[&bluetooth, &wifi]).await;
-        eventually(|| manbir.peers().get(&shreya.id()).is_some_and(|p| p.links.contains(&PathKind::Mesh))
-            && shreya.peers().get(&manbir.id()).is_some_and(|p| p.links.contains(&PathKind::Mesh))).await;
+        eventually(|| {
+            manbir.peers().get(&shreya.id()).is_some_and(|p| p.links.contains(&PathKind::Mesh))
+                && shreya.peers().get(&manbir.id()).is_some_and(|p| p.links.contains(&PathKind::Mesh))
+        })
+        .await;
         assert!(!manbir.peers()[&shreya.id()].is_directly_discovered());
         let (space, genesis) = manbir.create_space().unwrap();
-        manbir.with_space(&space, |r| -> Result<()> {
-            r.add_member(shreya.keys().public(), Role::Writer)?;
-            r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode())?;
-            r.append(messages_feed(), ChatOp::Text { body: "Bluetooth to WiFi through Mac".into(), reply_to: None, attachments: vec![] }.encode())?;
-            Ok(())
-        }).unwrap().unwrap();
+        manbir
+            .with_space(&space, |r| -> Result<()> {
+                r.add_member(shreya.keys().public(), Role::Writer)?;
+                r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode())?;
+                r.append(
+                    messages_feed(),
+                    ChatOp::Text { body: "Bluetooth to WiFi through Mac".into(), reply_to: None, attachments: vec![] }
+                        .encode(),
+                )?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
         shreya.join_space(genesis).unwrap();
         shreya.sync_with(manbir.id(), space, true).await.unwrap();
-        shreya.with_space(&space, |r| r.append(messages_feed(), ChatOp::Text {
-            body: "WiFi to Bluetooth through Mac".into(), reply_to: None, attachments: vec![]
-        }.encode())).unwrap().unwrap();
+        shreya
+            .with_space(&space, |r| {
+                r.append(
+                    messages_feed(),
+                    ChatOp::Text { body: "WiFi to Bluetooth through Mac".into(), reply_to: None, attachments: vec![] }
+                        .encode(),
+                )
+            })
+            .unwrap()
+            .unwrap();
         manbir.sync_with(shreya.id(), space, false).await.unwrap();
         assert_eq!(manbir.peers()[&shreya.id()].via, Some(PathKind::Mesh));
         for node in [&manbir, &shreya] {
@@ -2870,15 +2824,29 @@ mod tests {
         assert!(mac.space_ids().is_empty(), "transport relay is not invited into either chat");
 
         direct.restore();
-        eventually(|| manbir.peers().get(&shreya.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
-            && shreya.peers().get(&manbir.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))).await;
+        eventually(|| {
+            manbir.peers().get(&shreya.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
+                && shreya.peers().get(&manbir.id()).is_some_and(|p| p.links.contains(&PathKind::PeerWifi))
+        })
+        .await;
         // End the relay route after direct discovery. The existing chat now
         // travels over peer WiFi without changing the signed space identity.
         bluetooth.cut();
         wifi.cut();
-        manbir.with_space(&space, |r| r.append(messages_feed(), ChatOp::Text {
-            body: "Same chat after direct path change".into(), reply_to: None, attachments: vec![]
-        }.encode())).unwrap().unwrap();
+        manbir
+            .with_space(&space, |r| {
+                r.append(
+                    messages_feed(),
+                    ChatOp::Text {
+                        body: "Same chat after direct path change".into(),
+                        reply_to: None,
+                        attachments: vec![],
+                    }
+                    .encode(),
+                )
+            })
+            .unwrap()
+            .unwrap();
         shreya.sync_with(manbir.id(), space, false).await.unwrap();
         assert_eq!(shreya.peers()[&manbir.id()].via, Some(PathKind::PeerWifi));
         for node in [&manbir, &shreya] {
@@ -2896,7 +2864,9 @@ mod tests {
         use super::*;
         async fn eventually(mut check: impl FnMut() -> bool) {
             for _ in 0..300 {
-                if check() { return; }
+                if check() {
+                    return;
+                }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             panic!("direct chat convergence timed out");
@@ -2908,7 +2878,9 @@ mod tests {
         // Exchange only authenticated identity keys. Deliberately install no
         // address hints yet: both devices start a direct chat before meeting.
         alice.contacts.lock().insert(bob.keys.sign_pk(), StoredContact { keys: bob.keys.public(), name: "Bob".into() });
-        bob.contacts.lock().insert(alice.keys.sign_pk(), StoredContact { keys: alice.keys.public(), name: "Alice".into() });
+        bob.contacts
+            .lock()
+            .insert(alice.keys.sign_pk(), StoredContact { keys: alice.keys.public(), name: "Alice".into() });
         alice.save_contacts();
         bob.save_contacts();
         let ac = alice.create_conversation(None, vec![bob.profile().id]).unwrap();
@@ -2918,17 +2890,24 @@ mod tests {
         let am = alice.send_message(ac.id.clone(), "Alice original".into(), None, vec![]).await.unwrap();
         let file = db.join("voice-note.m4a");
         std::fs::write(&file, b"synthetic voice note attachment").unwrap();
-        let bm = bob.send_message(bc.id.clone(), "Bob original".into(), None, vec![file.to_string_lossy().into_owned()]).await.unwrap();
+        let bm = bob
+            .send_message(bc.id.clone(), "Bob original".into(), None, vec![file.to_string_lossy().into_owned()])
+            .await
+            .unwrap();
         assert_eq!(alice.node.space_ids().len(), 1);
         assert_eq!(bob.node.space_ids().len(), 1);
 
         alice.node.add_peer_addr(bob.node.addr());
         bob.node.add_peer_addr(alice.node.addr());
-        eventually(|| [alice.as_ref(), bob.as_ref()].iter().all(|rt| {
-            let list = rt.conversations();
-            list.len() == 1 && list[0].aliases.len() == 2
-                && rt.messages(list[0].id.clone(), None, None).is_ok_and(|messages| messages.len() == 2)
-        })).await;
+        eventually(|| {
+            [alice.as_ref(), bob.as_ref()].iter().all(|rt| {
+                let list = rt.conversations();
+                list.len() == 1
+                    && list[0].aliases.len() == 2
+                    && rt.messages(list[0].id.clone(), None, None).is_ok_and(|messages| messages.len() == 2)
+            })
+        })
+        .await;
         let canonical = ac.id.clone().min(bc.id.clone());
         for rt in [alice.as_ref(), bob.as_ref()] {
             assert_eq!(rt.node.space_ids().len(), 2, "both original wire spaces remain");
@@ -2947,12 +2926,23 @@ mod tests {
             assert_eq!(earlier.len(), 1);
             assert_ne!(last[0].id, earlier[0].id);
             assert_eq!(rt.search_messages(canonical.clone(), "original".into(), None).unwrap().len(), 2);
-            assert_eq!(rt.create_conversation(None, vec![if rt.keys.sign_pk() == alice.keys.sign_pk() { bob.profile().id } else { alice.profile().id }]).unwrap().id, canonical);
+            assert_eq!(
+                rt.create_conversation(
+                    None,
+                    vec![if rt.keys.sign_pk() == alice.keys.sign_pk() { bob.profile().id } else { alice.profile().id }]
+                )
+                .unwrap()
+                .id,
+                canonical
+            );
         }
         assert!(alice.edit_message(canonical.clone(), bm.id.clone(), "unauthorized".into()).is_err());
         alice.edit_message(bc.id.clone(), am.id.clone(), "Alice original edited".into()).unwrap();
         bob.toggle_reaction(ac.id.clone(), bm.id.clone(), "ok".into()).unwrap();
-        let reply = bob.send_message(bc.id.clone(), "Reply across old chat alias".into(), Some(am.id.clone()), vec![]).await.unwrap();
+        let reply = bob
+            .send_message(bc.id.clone(), "Reply across old chat alias".into(), Some(am.id.clone()), vec![])
+            .await
+            .unwrap();
         assert_eq!(reply.conversation, ac.id, "reply uses its target's original signed feed");
         let downloaded = alice.fetch_attachment(bm.attachments[0].blob.clone()).await.unwrap();
         assert_eq!(std::fs::read(downloaded).unwrap(), b"synthetic voice note attachment");
@@ -2965,15 +2955,26 @@ mod tests {
             messages.iter().any(|m| m.id == reply.id)
                 && messages.iter().any(|m| m.id == bm.id && m.reactions.iter().any(|r| r.emoji == "ok"))
                 && bob.messages(canonical.clone(), None, None).unwrap().iter().any(|m| m.id == am.id && m.edited)
-        }).await;
+        })
+        .await;
         bob.delete_message(ac.id.clone(), bm.id.clone()).unwrap();
-        eventually(|| alice.messages(canonical.clone(), None, None).unwrap().iter().any(|m| m.id == bm.id && m.deleted)).await;
+        eventually(|| {
+            alice.messages(canonical.clone(), None, None).unwrap().iter().any(|m| m.id == bm.id && m.deleted)
+        })
+        .await;
         assert_eq!(alice.search_messages(canonical.clone(), "original".into(), None).unwrap().len(), 1);
         alice.mark_read(bc.id.clone()).unwrap();
         bob.mark_read(ac.id.clone()).unwrap();
         assert_eq!(alice.conversations()[0].unread, 0);
         assert_eq!(bob.conversations()[0].unread, 0);
-        eventually(|| alice.messages(canonical.clone(), None, None).unwrap().iter().any(|m| m.id == am.id && m.delivery == Delivery::Read)).await;
+        eventually(|| {
+            alice
+                .messages(canonical.clone(), None, None)
+                .unwrap()
+                .iter()
+                .any(|m| m.id == am.id && m.delivery == Delivery::Read)
+        })
+        .await;
         // Calls arriving on a legacy source retain that wire identity while
         // events/status present the canonical logical chat to the app.
         use mycel_call::audio::{TestAudio, TestSource};
@@ -2983,22 +2984,49 @@ mod tests {
         let noncanonical = ac.id.clone().max(bc.id.clone());
         let raw_call = bob.calls.start(parse_space(&noncanonical).unwrap()).await.unwrap();
         assert_eq!(raw_call.conversation, noncanonical);
-        eventually(|| alice.call_status().iter().any(|call| call.id == raw_call.id && call.state == CallPhase::Ringing)).await;
+        eventually(|| {
+            alice.call_status().iter().any(|call| call.id == raw_call.id && call.state == CallPhase::Ringing)
+        })
+        .await;
         assert!(alice.call_status().iter().any(|call| call.id == raw_call.id && call.conversation == canonical));
         assert!(bob.call_status().iter().any(|call| call.id == raw_call.id && call.conversation == canonical));
         assert_eq!(alice.accept_call(raw_call.id.clone()).await.unwrap().conversation, canonical);
-        eventually(|| [alice.as_ref(), bob.as_ref()].iter().all(|rt| rt.call_status().iter().any(|call| call.id == raw_call.id && call.state == CallPhase::Active))).await;
+        eventually(|| {
+            [alice.as_ref(), bob.as_ref()]
+                .iter()
+                .all(|rt| rt.call_status().iter().any(|call| call.id == raw_call.id && call.state == CallPhase::Active))
+        })
+        .await;
         alice.end_call(raw_call.id.clone()).unwrap();
-        eventually(|| bob.call_status().iter().any(|call| call.id == raw_call.id && call.state == CallPhase::Ended)).await;
+        eventually(|| bob.call_status().iter().any(|call| call.id == raw_call.id && call.state == CallPhase::Ended))
+            .await;
         let canonical_call = alice.start_call(noncanonical).await.unwrap();
         assert_eq!(canonical_call.conversation, canonical);
-        assert!(alice.calls.status().iter().any(|call| call.id == canonical_call.id && call.conversation == canonical),
-            "new calls through old aliases choose the same canonical wire space on both devices");
-        eventually(|| bob.call_status().iter().any(|call| call.id == canonical_call.id && call.state == CallPhase::Ringing)).await;
+        assert!(
+            alice.calls.status().iter().any(|call| call.id == canonical_call.id && call.conversation == canonical),
+            "new calls through old aliases choose the same canonical wire space on both devices"
+        );
+        eventually(|| {
+            bob.call_status().iter().any(|call| call.id == canonical_call.id && call.state == CallPhase::Ringing)
+        })
+        .await;
         bob.decline_call(canonical_call.id).unwrap();
         // Read projection never copied a signed message into another feed.
-        assert!(!alice.view(&parse_space(&bc.id).unwrap()).unwrap().messages.iter().any(|m| m.id == parse_hash(&am.id).unwrap()));
-        assert!(!bob.view(&parse_space(&ac.id).unwrap()).unwrap().messages.iter().any(|m| m.id == parse_hash(&bm.id).unwrap()));
+        assert!(
+            !alice
+                .view(&parse_space(&bc.id).unwrap())
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| m.id == parse_hash(&am.id).unwrap())
+        );
+        assert!(
+            !bob.view(&parse_space(&ac.id).unwrap())
+                .unwrap()
+                .messages
+                .iter()
+                .any(|m| m.id == parse_hash(&bm.id).unwrap())
+        );
         alice.shutdown().await.unwrap();
         bob.shutdown().await.unwrap();
         drop((alice, bob));
@@ -3021,18 +3049,28 @@ mod tests {
         runtime.contacts.lock().insert(peer.sign_pk, StoredContact { keys: peer, name: "Peer".into() });
         let create_legacy = || {
             let (space, _) = runtime.node.create_space().unwrap();
-            runtime.node.with_space(&space, |r| -> Result<()> {
-                r.add_member(peer, Role::Writer)?;
-                r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode())?;
-                Ok(())
-            }).unwrap().unwrap();
+            runtime
+                .node
+                .with_space(&space, |r| -> Result<()> {
+                    r.add_member(peer, Role::Writer)?;
+                    r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode())?;
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap();
             runtime.touch(space);
             space
         };
         let first = create_legacy();
         let second = create_legacy();
-        let first_message = runtime.post(first, ChatOp::Text { body: "First history".into(), reply_to: None, attachments: vec![] }).unwrap().to_string();
-        let second_message = runtime.post(second, ChatOp::Text { body: "Second history".into(), reply_to: None, attachments: vec![] }).unwrap().to_string();
+        let first_message = runtime
+            .post(first, ChatOp::Text { body: "First history".into(), reply_to: None, attachments: vec![] })
+            .unwrap()
+            .to_string();
+        let second_message = runtime
+            .post(second, ChatOp::Text { body: "Second history".into(), reply_to: None, attachments: vec![] })
+            .unwrap()
+            .to_string();
         let selected = first.min(second);
         let other = first.max(second);
         let peer_id = hex_id(&peer.sign_pk);
@@ -3066,15 +3104,22 @@ mod tests {
 
         let former_group = create_legacy();
         let third = DeviceKeys::generate().public();
-        runtime.node.with_space(&former_group, |r| -> Result<()> {
-            r.add_member(third, Role::Writer)?;
-            r.append(messages_feed(), ChatOp::Text { body: "Former group history".into(), reply_to: None, attachments: vec![] }.encode())?;
-            r.remove_member(third.sign_pk)?;
-            // Even an admin explicitly relabelling it cannot erase the fact
-            // that a third person once had access to this space.
-            r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode())?;
-            Ok(())
-        }).unwrap().unwrap();
+        runtime
+            .node
+            .with_space(&former_group, |r| -> Result<()> {
+                r.add_member(third, Role::Writer)?;
+                r.append(
+                    messages_feed(),
+                    ChatOp::Text { body: "Former group history".into(), reply_to: None, attachments: vec![] }.encode(),
+                )?;
+                r.remove_member(third.sign_pk)?;
+                // Even an admin explicitly relabelling it cannot erase the fact
+                // that a third person once had access to this space.
+                r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode())?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
         runtime.touch(former_group);
         assert!(runtime.direct_peer(&former_group).is_none());
         assert_eq!(runtime.conversations().len(), 2);
@@ -3082,28 +3127,48 @@ mod tests {
         assert_eq!(runtime.messages(former_group.to_string(), None, None).unwrap().len(), 1);
 
         let promoted_keeper = create_legacy();
-        runtime.node.with_space(&promoted_keeper, |r| -> Result<()> {
-            r.add_member(third, Role::Relay)?;
-            r.set_role(third.sign_pk, Role::Reader)?;
-            r.set_role(third.sign_pk, Role::Relay)?;
-            Ok(())
-        }).unwrap().unwrap();
+        runtime
+            .node
+            .with_space(&promoted_keeper, |r| -> Result<()> {
+                r.add_member(third, Role::Relay)?;
+                r.set_role(third.sign_pk, Role::Reader)?;
+                r.set_role(third.sign_pk, Role::Relay)?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
         runtime.touch(promoted_keeper);
-        assert!(runtime.direct_peer(&promoted_keeper).is_none(), "a former reader must not be treated as a ciphertext-only keeper");
+        assert!(
+            runtime.direct_peer(&promoted_keeper).is_none(),
+            "a former reader must not be treated as a ciphertext-only keeper"
+        );
         let thread_key = runtime.conversation(selected.to_string()).unwrap().thread_key;
-        runtime.node.with_space(&selected, |r| -> Result<()> {
-            r.set_role(peer.sign_pk, Role::Admin)?;
-            r.set_role(runtime.keys.sign_pk(), Role::Reader)?;
-            Ok(())
-        }).unwrap().unwrap();
+        runtime
+            .node
+            .with_space(&selected, |r| -> Result<()> {
+                r.set_role(peer.sign_pk, Role::Admin)?;
+                r.set_role(runtime.keys.sign_pk(), Role::Reader)?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
         runtime.touch(selected);
         let logical = runtime.conversation(selected.to_string()).unwrap();
-        assert_eq!(logical.my_role, Some(MemberRole::Member), "writable alias enables posting without granting canonical admin authority");
+        assert_eq!(
+            logical.my_role,
+            Some(MemberRole::Member),
+            "writable alias enables posting without granting canonical admin authority"
+        );
         assert_eq!(logical.thread_key, thread_key);
-        let posted = runtime.send_message(selected.to_string(), "Writable source only".into(), None, vec![]).await.unwrap();
+        let posted =
+            runtime.send_message(selected.to_string(), "Writable source only".into(), None, vec![]).await.unwrap();
         assert_eq!(posted.conversation, other.to_string());
         let read_only_target = if selected == first { first_message } else { second_message };
-        assert!(runtime.edit_message(other.to_string(), read_only_target, "cannot bypass source permissions".into()).is_err());
+        assert!(
+            runtime
+                .edit_message(other.to_string(), read_only_target, "cannot bypass source permissions".into())
+                .is_err()
+        );
         runtime.shutdown().await.unwrap();
         drop(runtime);
         std::fs::remove_dir_all(dir).unwrap();
@@ -3119,13 +3184,23 @@ mod tests {
         let lan = DeviceKeys::generate().sign_pk();
         let mesh = DeviceKeys::generate().sign_pk();
         let recent = DeviceKeys::generate().sign_pk();
-        runtime.contacts.lock().insert(bluetooth.sign_pk, StoredContact { keys: bluetooth, name: "Alice's phone".into() });
+        runtime
+            .contacts
+            .lock()
+            .insert(bluetooth.sign_pk, StoredContact { keys: bluetooth, name: "Alice's phone".into() });
         runtime.announced.lock().insert(wifi, "Bob's phone".into());
         let mut peers = HashMap::from([
             (bluetooth.sign_pk, PeerState { links: BTreeSet::from([PathKind::Bluetooth]), ..Default::default() }),
             (wifi, PeerState { links: BTreeSet::from([PathKind::PeerWifi]), ..Default::default() }),
             (lan, PeerState { nearby: true, ..Default::default() }),
-            (mesh, PeerState { links: BTreeSet::from([PathKind::Mesh]), last_ok: Some(Instant::now()), ..Default::default() }),
+            (
+                mesh,
+                PeerState {
+                    links: BTreeSet::from([PathKind::Mesh]),
+                    last_ok: Some(Instant::now()),
+                    ..Default::default()
+                },
+            ),
             (recent, PeerState { last_ok: Some(Instant::now()), ..Default::default() }),
         ]);
         // This is the same filtering/name construction called by nearby(),
@@ -3216,7 +3291,11 @@ mod tests {
             record(&mut pending, &mut order, stranger(0), space(n));
         }
         assert_eq!(admit_request(&pending, &order, is_contact, &stranger(0), &space(999)), Admission::Refuse);
-        assert_eq!(admit_request(&pending, &order, is_contact, &stranger(0), &space(0)), Admission::Admit, "repeats are idempotent");
+        assert_eq!(
+            admit_request(&pending, &order, is_contact, &stranger(0), &space(0)),
+            Admission::Admit,
+            "repeats are idempotent"
+        );
         // Eight throwaway keys fill every slot.
         for n in MAX_PENDING_PER_INVITER..MAX_PENDING_REQUESTS {
             record(&mut pending, &mut order, stranger(n / MAX_PENDING_PER_INVITER), space(n));
@@ -3319,18 +3398,25 @@ mod tests {
         use super::*;
         runtime.contacts.lock().insert(peer.sign_pk, StoredContact { keys: peer, name: "Peer".into() });
         let (space, _) = runtime.node.create_space().unwrap();
-        runtime.node.with_space(&space, |r| -> Result<()> {
-            r.add_member(peer, Role::Writer)?;
-            r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode())?;
-            Ok(())
-        }).unwrap().unwrap();
+        runtime
+            .node
+            .with_space(&space, |r| -> Result<()> {
+                r.add_member(peer, Role::Writer)?;
+                r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode())?;
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
         runtime.touch(space);
         space
     }
 
     fn say(runtime: &super::Runtime, space: super::SpaceId, body: &str) -> String {
         use super::*;
-        runtime.post(space, ChatOp::Text { body: body.into(), reply_to: None, attachments: vec![] }).unwrap().to_string()
+        runtime
+            .post(space, ChatOp::Text { body: body.into(), reply_to: None, attachments: vec![] })
+            .unwrap()
+            .to_string()
     }
 
     async fn scratch_runtime(tag: &str) -> (super::Arc<super::Runtime>, std::path::PathBuf) {
@@ -3370,7 +3456,11 @@ mod tests {
         let mine = runtime.keys.sign_pk();
         let peers_choice = {
             let threads = runtime.threads.lock();
-            chat_thread::canonical_space(&peer.sign_pk, &mine, [low, high].iter().map(|s| (*s, &threads.spaces[s].membership)))
+            chat_thread::canonical_space(
+                &peer.sign_pk,
+                &mine,
+                [low, high].iter().map(|s| (*s, &threads.spaces[s].membership)),
+            )
         };
         assert_eq!(peers_choice, Some(high), "the other device picks the same space");
         finish(runtime, dir).await;
@@ -3408,7 +3498,10 @@ mod tests {
         }
         assert!(runtime.messages(group.id.clone(), None, None).unwrap().is_empty());
         let after = runtime.conversation(id.clone()).unwrap();
-        assert_eq!((after.aliases, after.thread_key.clone(), after.direct), (before.aliases.clone(), before.thread_key.clone(), true));
+        assert_eq!(
+            (after.aliases, after.thread_key.clone(), after.direct),
+            (before.aliases.clone(), before.thread_key.clone(), true)
+        );
 
         // Leaving is all or nothing: I created both spaces, so I'm the last
         // admin of each and nothing is left; nor when only one has another.
@@ -3453,7 +3546,8 @@ mod tests {
         // ...but only reached this device after that history was here.
         runtime.first_seen.lock().extend([(original, 0), (late, now_ms() + 1)]);
         let id = runtime.logical_id(&original);
-        let bodies = || runtime.messages(id.clone(), None, None).unwrap().into_iter().map(|m| m.body).collect::<Vec<_>>();
+        let bodies =
+            || runtime.messages(id.clone(), None, None).unwrap().into_iter().map(|m| m.body).collect::<Vec<_>>();
         assert_eq!(bodies(), ["old one", "old two", "claims to come first"]);
         let summary = runtime.conversation(id.clone()).unwrap();
         assert_eq!(summary.last_message.unwrap().body, "claims to come first", "the preview agrees with the timeline");
@@ -3499,16 +3593,22 @@ mod tests {
         async fn next(events: &mut broadcast::Receiver<Event>, mut want: impl FnMut(&Event) -> bool) -> Event {
             tokio::time::timeout(Duration::from_secs(15), async {
                 loop {
-                    if let Ok(event) = events.recv().await && want(&event) {
+                    if let Ok(event) = events.recv().await
+                        && want(&event)
+                    {
                         return event;
                     }
                 }
-            }).await.expect("expected event")
+            })
+            .await
+            .expect("expected event")
         }
         let (alice, da) = scratch_runtime("alert-a").await;
         let (bob, db) = scratch_runtime("alert-b").await;
         alice.contacts.lock().insert(bob.keys.sign_pk(), StoredContact { keys: bob.keys.public(), name: "Bob".into() });
-        bob.contacts.lock().insert(alice.keys.sign_pk(), StoredContact { keys: alice.keys.public(), name: "Alice".into() });
+        bob.contacts
+            .lock()
+            .insert(alice.keys.sign_pk(), StoredContact { keys: alice.keys.public(), name: "Alice".into() });
         alice.node.add_peer_addr(bob.node.addr());
         bob.node.add_peer_addr(alice.node.addr());
         let mut events = bob.subscribe();
@@ -3529,7 +3629,11 @@ mod tests {
         assert_eq!(bob.alert_route(&alert.target), Some(summary.id.clone()));
         // Read here: withdrawn, once.
         bob.mark_read(conversation.id.clone()).unwrap();
-        next(&mut events, |e| matches!(e, Event::AlertWithdrawn { thread, key: None } if *thread == summary.thread_key)).await;
+        next(
+            &mut events,
+            |e| matches!(e, Event::AlertWithdrawn { thread, key: None } if *thread == summary.thread_key),
+        )
+        .await;
         alice.send_message(conversation.id.clone(), "another".into(), None, vec![]).await.unwrap();
         let again = next(&mut events, |e| matches!(e, Event::Alert { .. } | Event::AlertWithdrawn { .. })).await;
         assert!(matches!(again, Event::Alert { .. }), "no repeated withdrawal before the next alert");
@@ -3544,7 +3648,8 @@ mod tests {
         use super::*;
         let peers: Vec<(MemberKeys, bool)> =
             (0..chats).map(|n| (DeviceKeys::generate().public(), n % 4 == 0)).collect();
-        let jobs: Vec<MemberKeys> = peers.iter().flat_map(|(p, two)| std::iter::repeat_n(*p, 1 + usize::from(*two))).collect();
+        let jobs: Vec<MemberKeys> =
+            peers.iter().flat_map(|(p, two)| std::iter::repeat_n(*p, 1 + usize::from(*two))).collect();
         let build = |peer: &MemberKeys| {
             let (mut r, _) = Replica::create(runtime.keys.clone(), None).unwrap();
             r.add_member(*peer, Role::Writer).unwrap();
@@ -3556,7 +3661,8 @@ mod tests {
             r
         };
         let replicas: Vec<Replica> = std::thread::scope(|scope| {
-            let workers: Vec<_> = jobs.chunks(jobs.len().div_ceil(4).max(1))
+            let workers: Vec<_> = jobs
+                .chunks(jobs.len().div_ceil(4).max(1))
                 .map(|chunk| scope.spawn(move || chunk.iter().map(build).collect::<Vec<_>>()))
                 .collect();
             workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
@@ -3645,7 +3751,10 @@ mod tests {
         // Around a message hidden on this device: its neighbours, without it.
         let window = runtime.messages_around(id.clone(), hidden, Some(1), Some(1)).unwrap();
         let at = full.iter().position(|body| body == "m17").unwrap();
-        assert_eq!(window.messages.iter().map(|m| m.body.clone()).collect::<Vec<_>>(), [full[at - 1].clone(), full[at + 1].clone()]);
+        assert_eq!(
+            window.messages.iter().map(|m| m.body.clone()).collect::<Vec<_>>(),
+            [full[at - 1].clone(), full[at + 1].clone()]
+        );
         assert!(runtime.messages_around(id, "00".repeat(32), None, None).is_err());
         finish(runtime, dir).await;
     }
@@ -3658,7 +3767,11 @@ mod tests {
         r.add_member(peer, Role::Writer).unwrap();
         r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode()).unwrap();
         for n in 0..messages {
-            r.append(messages_feed(), ChatOp::Text { body: format!("message {n}"), reply_to: None, attachments: vec![] }.encode()).unwrap();
+            r.append(
+                messages_feed(),
+                ChatOp::Text { body: format!("message {n}"), reply_to: None, attachments: vec![] }.encode(),
+            )
+            .unwrap();
         }
         let space = runtime.node.insert_replica(r);
         runtime.invalidate(&space);
@@ -3717,8 +3830,15 @@ mod tests {
         let mut pages = vec![];
         for depth in [100, messages / 2, messages - 100] {
             let cursor = view.messages[depth].id.to_string();
-            let page = time(&mut || assert_eq!(runtime.messages(id.clone(), Some(50), Some(cursor.clone())).unwrap().len(), 50));
-            let around = time(&mut || assert_eq!(runtime.messages_around(id.clone(), cursor.clone(), Some(25), Some(25)).unwrap().messages.len(), 51));
+            let page = time(&mut || {
+                assert_eq!(runtime.messages(id.clone(), Some(50), Some(cursor.clone())).unwrap().len(), 50)
+            });
+            let around = time(&mut || {
+                assert_eq!(
+                    runtime.messages_around(id.clone(), cursor.clone(), Some(25), Some(25)).unwrap().messages.len(),
+                    51
+                )
+            });
             pages.push(format!("depth {depth}: page {page:?}, window {around:?}"));
         }
         drop(view);
@@ -3726,7 +3846,10 @@ mod tests {
             say(&runtime, space, "new");
             runtime.view(&space).unwrap();
         });
-        eprintln!("{messages} messages (built and folded in {built:?}): {}; new message + fold {incoming:?}", pages.join("; "));
+        eprintln!(
+            "{messages} messages (built and folded in {built:?}): {}; new message + fold {incoming:?}",
+            pages.join("; ")
+        );
         finish(runtime, dir).await;
     }
 
@@ -3757,8 +3880,11 @@ mod tests {
             runtime.emit(Event::ConversationUpdated { conversation: space.to_string() });
         }
         let per_event = emitting.elapsed() / spaces.len() as u32;
-        eprintln!("{chats} chats ({} spaces) x {messages} messages: built in {built:?}; first listing {first:?}; \
-            conversations() {listing:?}; ConversationUpdated emit {per_event:?} per event", spaces.len());
+        eprintln!(
+            "{chats} chats ({} spaces) x {messages} messages: built in {built:?}; first listing {first:?}; \
+            conversations() {listing:?}; ConversationUpdated emit {per_event:?} per event",
+            spaces.len()
+        );
         finish(runtime, dir).await;
     }
 

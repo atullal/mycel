@@ -106,11 +106,11 @@ fn unscoped(ip: Ipv6Addr) -> Ipv6Addr {
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn hw_of_ift(t: u8) -> Hw {
     match t {
-        0x06 => Hw::Ethernet,      // IFT_ETHER (Wi-Fi too)
-        0x47 => Hw::Wifi,          // IFT_IEEE80211
-        0x18 => Hw::Loopback,      // IFT_LOOP
-        0x17 | 0x6c => Hw::Tunnel, // IFT_PPP, IFT_PDP
-        0x37 | 0x39 => Hw::Tunnel, // IFT_GIF, IFT_STF
+        0x06 => Hw::Ethernet,       // IFT_ETHER (Wi-Fi too)
+        0x47 => Hw::Wifi,           // IFT_IEEE80211
+        0x18 => Hw::Loopback,       // IFT_LOOP
+        0x17 | 0x6c => Hw::Tunnel,  // IFT_PPP, IFT_PDP
+        0x37 | 0x39 => Hw::Tunnel,  // IFT_GIF, IFT_STF
         0xd1 | 0x87 => Hw::Virtual, // IFT_BRIDGE, IFT_L2VLAN
         _ => Hw::Unknown,
     }

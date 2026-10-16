@@ -171,7 +171,8 @@ fn assert_in_order_from(seen: &Mutex<Seen>, from: usize) {
     let s = seen.lock();
     for (i, w) in s.frames.windows(2).enumerate().skip(from) {
         if w[1].0 <= w[0].0 {
-            let around: Vec<_> = s.frames[i.saturating_sub(3)..(i + 4).min(s.frames.len())].iter().map(|f| (f.0, f.2)).collect();
+            let around: Vec<_> =
+                s.frames[i.saturating_sub(3)..(i + 4).min(s.frames.len())].iter().map(|f| (f.0, f.2)).collect();
             panic!("frames out of order or repeated: {} then {} ({around:?})", w[0].0, w[1].0);
         }
     }
@@ -194,8 +195,17 @@ async fn video_both_ways_over_ip() {
     eprintln!(
         "over IP: bob sees {fps:.1} fps, capture→decoded {lat:.1} ms avg / {max:.1} ms max; alice sends {}x{} at {} bit/s ({:.1} fps, queue {} ms, {}); \
          frames sent {} received {} skipped {} keyframes {} requests {}",
-        ai.send_width, ai.send_height, ai.bitrate, ai.send_fps, ai.queue_ms, ai.encoder,
-        ai.frames_sent, bi.frames_received, ai.frames_skipped, ai.keyframes_sent, bi.keyframe_requests
+        ai.send_width,
+        ai.send_height,
+        ai.bitrate,
+        ai.send_fps,
+        ai.queue_ms,
+        ai.encoder,
+        ai.frames_sent,
+        bi.frames_received,
+        ai.frames_skipped,
+        ai.keyframes_sent,
+        bi.keyframe_requests
     );
     assert_in_order(&at_bob);
     assert_eq!(at_bob.lock().undecodable, 0, "every frame decodes");
@@ -249,11 +259,17 @@ async fn recovers_from_lost_frames_with_keyframes() {
     // gaps: how long the picture froze after each loss
     let freezes: Vec<f64> = {
         let s = at_bob.lock();
-        s.frames.windows(2).map(|w| w[1].3.duration_since(w[0].3).as_secs_f64() * 1000.0).filter(|g| *g > 80.0).collect()
+        s.frames
+            .windows(2)
+            .map(|w| w[1].3.duration_since(w[0].3).as_secs_f64() * 1000.0)
+            .filter(|g| *g > 80.0)
+            .collect()
     };
     eprintln!(
         "losses: keyframe requests {}, keyframes sent {}, freezes {:?} ms, after: {fps:.1} fps, {lat:.1} ms",
-        bi.keyframe_requests, ai.keyframes_sent, freezes.iter().map(|f| f.round()).collect::<Vec<_>>()
+        bi.keyframe_requests,
+        ai.keyframes_sent,
+        freezes.iter().map(|f| f.round()).collect::<Vec<_>>()
     );
     assert_in_order(&at_bob);
     assert_eq!(at_bob.lock().undecodable, 0, "no broken pictures: deltas after a loss wait for the keyframe");

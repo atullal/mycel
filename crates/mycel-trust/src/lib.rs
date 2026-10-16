@@ -11,8 +11,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 
 use mycel_crypto::{
-    CryptoError, DeviceKeys, Hash32, Lockbox, MemberKeys, Sig, SignPk, SymKey,
-    random_u64, seal_lockbox,
+    CryptoError, DeviceKeys, Hash32, Lockbox, MemberKeys, Sig, SignPk, SymKey, random_u64, seal_lockbox,
 };
 use serde::{Deserialize, Serialize};
 
@@ -137,7 +136,9 @@ pub enum Action {
     /// writer rotates automatically (TRUST.md §6). It is a revocation of the
     /// author with `cutoff` = their own last envelope, so whoever holds the
     /// device afterwards can't keep posting with backdated `auth_heads`.
-    Leave { cutoff: Option<Hash32> },
+    Leave {
+        cutoff: Option<Hash32>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,19 +241,11 @@ fn lockbox_info(epoch: &EpochId, recipient: &SignPk) -> Vec<u8> {
 }
 
 fn keyring_info(space: &SpaceId, nonce: u64, recipient: &SignPk) -> Vec<u8> {
-    [
-        CTX_KEYRING.as_bytes(),
-        &space.0,
-        &nonce.to_le_bytes(),
-        &recipient.0,
-    ]
-    .concat()
+    [CTX_KEYRING.as_bytes(), &space.0, &nonce.to_le_bytes(), &recipient.0].concat()
 }
 
 /// Generate a new epoch key sealed to exactly `recipients`.
-pub fn new_rotation<'a>(
-    recipients: impl IntoIterator<Item = &'a MemberKeys>,
-) -> Result<(Rotation, SymKey)> {
+pub fn new_rotation<'a>(recipients: impl IntoIterator<Item = &'a MemberKeys>) -> Result<(Rotation, SymKey)> {
     let key = SymKey::generate();
     let epoch = EpochId::for_commitment(&key.commitment());
     let mut lockboxes = recipients
@@ -263,14 +256,7 @@ pub fn new_rotation<'a>(
         })
         .collect::<Result<Vec<_>>>()?;
     lockboxes.sort_by_key(|(pk, _)| *pk);
-    Ok((
-        Rotation {
-            epoch,
-            commitment: key.commitment(),
-            lockboxes,
-        },
-        key,
-    ))
+    Ok((Rotation { epoch, commitment: key.commitment(), lockboxes }, key))
 }
 
 // ─────────────────────────── membership state ───────────────────────────
@@ -303,11 +289,7 @@ impl MemberState {
     }
 
     pub fn readers(&self) -> BTreeSet<SignPk> {
-        self.members
-            .iter()
-            .filter(|(_, m)| m.role.can_read())
-            .map(|(pk, _)| *pk)
-            .collect()
+        self.members.iter().filter(|(_, m)| m.role.can_read()).map(|(pk, _)| *pk).collect()
     }
 
     pub fn epoch(&self, id: &EpochId) -> Option<&Epoch> {
@@ -317,11 +299,7 @@ impl MemberState {
     /// TRUST.md §6: the latest epoch whose recipients are exactly the current readers.
     pub fn write_epoch(&self) -> Option<EpochId> {
         let readers = self.readers();
-        self.epochs
-            .iter()
-            .rev()
-            .find(|e| e.recipients == readers)
-            .map(|e| e.id)
+        self.epochs.iter().rev().find(|e| e.recipients == readers).map(|e| e.id)
     }
 
     pub(crate) fn admin_count(&self) -> usize {
@@ -388,10 +366,7 @@ impl SpaceGraph {
                 parents: vec![],
                 author: me.sign_pk,
                 nonce: random_u64(),
-                action: Action::Genesis {
-                    founder: me,
-                    rotation,
-                },
+                action: Action::Genesis { founder: me, rotation },
             },
         );
         let graph = Self::from_genesis(genesis.clone())?;
@@ -619,11 +594,11 @@ impl SpaceGraph {
                 let op = &self.ops[id].op;
                 match &op.action {
                     Action::Remove { member, revocation, .. }
-                    | Action::SetRole {
-                        member,
-                        revocation: Some(revocation),
-                        ..
-                    } if member == pk => Some((*id, revocation.cutoff)),
+                    | Action::SetRole { member, revocation: Some(revocation), .. }
+                        if member == pk =>
+                    {
+                        Some((*id, revocation.cutoff))
+                    }
                     Action::Leave { cutoff } if op.author == *pk => Some((*id, *cutoff)),
                     _ => None,
                 }
@@ -638,13 +613,8 @@ impl SpaceGraph {
     /// were newly added.
     pub fn unlock(&self, me: &DeviceKeys, keyring: &mut Keyring) -> usize {
         let my_pk = me.sign_pk();
-        let commitments: HashMap<EpochId, Hash32> = self
-            .res
-            .state
-            .epochs
-            .iter()
-            .map(|e| (e.id, e.commitment))
-            .collect();
+        let commitments: HashMap<EpochId, Hash32> =
+            self.res.state.epochs.iter().map(|e| (e.id, e.commitment)).collect();
         let mut added = 0;
         for id in &self.res.order {
             if !self.res.is_valid(id) {
@@ -652,19 +622,14 @@ impl SpaceGraph {
             }
             let op = &self.ops[id].op;
             let mut try_insert = |epoch: EpochId, key: SymKey| {
-                if keyring.get(&epoch).is_none()
-                    && commitments.get(&epoch) == Some(&key.commitment())
-                {
+                if keyring.get(&epoch).is_none() && commitments.get(&epoch) == Some(&key.commitment()) {
                     keyring.insert(epoch, key);
                     added += 1;
                 }
             };
             match &op.action {
                 Action::Genesis { rotation, .. }
-                | Action::SetRole {
-                    rotation: Some(rotation),
-                    ..
-                }
+                | Action::SetRole { rotation: Some(rotation), .. }
                 | Action::Remove { rotation, .. }
                 | Action::Rotate { rotation } => {
                     if let Some((_, lb)) = rotation.lockboxes.iter().find(|(pk, _)| *pk == my_pk)
@@ -675,13 +640,8 @@ impl SpaceGraph {
                         try_insert(rotation.epoch, SymKey(arr));
                     }
                 }
-                Action::Add {
-                    member,
-                    keyring: Some(lb),
-                    ..
-                } if member.sign_pk == my_pk => {
-                    if let Ok(bytes) =
-                        me.open_lockbox(&keyring_info(&self.space, op.nonce, &my_pk), lb)
+                Action::Add { member, keyring: Some(lb), .. } if member.sign_pk == my_pk => {
+                    if let Ok(bytes) = me.open_lockbox(&keyring_info(&self.space, op.nonce, &my_pk), lb)
                         && let Ok(entries) = postcard::from_bytes::<Vec<(EpochId, SymKey)>>(&bytes)
                     {
                         for (epoch, key) in entries {
@@ -700,13 +660,7 @@ impl SpaceGraph {
     fn author_op(&self, me: &DeviceKeys, action: Action) -> SignedOp {
         SignedOp::sign(
             me,
-            Op {
-                space: Some(self.space),
-                parents: self.heads(),
-                author: me.sign_pk(),
-                nonce: random_u64(),
-                action,
-            },
+            Op { space: Some(self.space), parents: self.heads(), author: me.sign_pk(), nonce: random_u64(), action },
         )
     }
 
@@ -723,13 +677,7 @@ impl SpaceGraph {
     }
 
     /// Admin: add a member. Readers receive every epoch key in `keyring`.
-    pub fn add_member(
-        &self,
-        me: &DeviceKeys,
-        keyring: &Keyring,
-        member: MemberKeys,
-        role: Role,
-    ) -> Result<SignedOp> {
+    pub fn add_member(&self, me: &DeviceKeys, keyring: &Keyring, member: MemberKeys, role: Role) -> Result<SignedOp> {
         self.require_role(me, Role::is_admin)?;
         member.verify_binding()?;
         if self.state().members.contains_key(&member.sign_pk) {
@@ -737,29 +685,14 @@ impl SpaceGraph {
         }
         let nonce = random_u64();
         let sealed = if role.can_read() {
-            let entries: Vec<(EpochId, SymKey)> = self
-                .state()
-                .epochs
-                .iter()
-                .filter_map(|e| keyring.get(&e.id).map(|k| (e.id, k.clone())))
-                .collect();
+            let entries: Vec<(EpochId, SymKey)> =
+                self.state().epochs.iter().filter_map(|e| keyring.get(&e.id).map(|k| (e.id, k.clone()))).collect();
             let bytes = postcard::to_allocvec(&entries).map_err(|_| TrustError::Encoding)?;
-            Some(seal_lockbox(
-                &member.kex_pk,
-                &keyring_info(&self.space, nonce, &member.sign_pk),
-                &bytes,
-            )?)
+            Some(seal_lockbox(&member.kex_pk, &keyring_info(&self.space, nonce, &member.sign_pk), &bytes)?)
         } else {
             None
         };
-        let mut op = self.author_op(
-            me,
-            Action::Add {
-                member,
-                role,
-                keyring: sealed,
-            },
-        );
+        let mut op = self.author_op(me, Action::Add { member, role, keyring: sealed });
         // re-sign with the nonce the keyring was bound to
         op.op.nonce = nonce;
         Ok(SignedOp::sign(me, op.op))
@@ -780,14 +713,7 @@ impl SpaceGraph {
         readers.remove(&member);
         let (rotation, key) = self.rotation_for(&readers)?;
         let epoch = rotation.epoch;
-        let op = self.author_op(
-            me,
-            Action::Remove {
-                member,
-                revocation: Revocation { cutoff },
-                rotation,
-            },
-        );
+        let op = self.author_op(me, Action::Remove { member, revocation: Revocation { cutoff }, rotation });
         Ok((op, epoch, key))
     }
 
@@ -801,10 +727,7 @@ impl SpaceGraph {
         cutoff: Option<Hash32>,
     ) -> Result<(SignedOp, Option<(EpochId, SymKey)>)> {
         self.require_role(me, Role::is_admin)?;
-        let prior = self
-            .state()
-            .role(&member)
-            .ok_or(TrustError::Malformed("not a member"))?;
+        let prior = self.state().role(&member).ok_or(TrustError::Malformed("not a member"))?;
         if prior == role {
             return Err(TrustError::Malformed("role unchanged"));
         }
@@ -818,15 +741,7 @@ impl SpaceGraph {
         } else {
             (None, None)
         };
-        let op = self.author_op(
-            me,
-            Action::SetRole {
-                member,
-                role,
-                revocation,
-                rotation,
-            },
-        );
+        let op = self.author_op(me, Action::SetRole { member, role, revocation, rotation });
         Ok((op, new_key))
     }
 

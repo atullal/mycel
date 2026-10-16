@@ -43,7 +43,8 @@ fn test_iface(port: u16) -> Option<(String, Options)> {
         Some(n) => n.clone(),
         None => all.iter().find(|i| i.loopback)?.name.clone(),
     };
-    let rules = Rules { ip_covers_routable: false, loopback: want.is_none(), only: Some(vec![name.clone()]), medium: vec![] };
+    let rules =
+        Rules { ip_covers_routable: false, loopback: want.is_none(), only: Some(vec![name.clone()]), medium: vec![] };
     let i = all.iter().find(|i| i.name == name)?;
     match classify(i, &rules) {
         Decision::Use { .. } => {}
@@ -97,5 +98,8 @@ async fn sync_over_an_interface_with_ip_off() {
     assert_eq!(via, Some(kind), "the path is the interface's medium");
     assert_ne!(via, Some(PathKind::Relay));
     let st = alice.link_status();
-    assert!(st.iter().any(|s| s.kind == kind && s.active && s.peers == 1 && s.label.as_deref() == Some(&*iface)), "{st:?}");
+    assert!(
+        st.iter().any(|s| s.kind == kind && s.active && s.peers == 1 && s.label.as_deref() == Some(&*iface)),
+        "{st:?}"
+    );
 }

@@ -29,7 +29,8 @@ fn run(name: &str, scale: f64) {
     let s = scenarios::find(name).expect("scenario");
     let mut r = (s.run)(Opts { seed: 1, scale, candidate: Candidate::Global });
     r.finish();
-    let failed: Vec<String> = r.failed_slos().iter().map(|f| format!("{}: {} (target {})", f.name, f.actual, f.target)).collect();
+    let failed: Vec<String> =
+        r.failed_slos().iter().map(|f| format!("{}: {} (target {})", f.name, f.actual, f.target)).collect();
     assert!(
         matches!(r.status, Status::Pass | Status::ExpectedFail),
         "{name}: {:?}\n  {}\n  headline: {}\n  notes: {}",

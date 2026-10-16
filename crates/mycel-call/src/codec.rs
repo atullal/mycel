@@ -35,7 +35,9 @@ impl Encoder {
     pub fn new(bitrate: u32) -> Result<Encoder> {
         let mut err = 0;
         // SAFETY: valid arguments; the returned pointer is checked below.
-        let st = unsafe { unsafe_ffi::opus_encoder_create(SAMPLE_RATE as i32, 1, unsafe_ffi::OPUS_APPLICATION_VOIP, &mut err) };
+        let st = unsafe {
+            unsafe_ffi::opus_encoder_create(SAMPLE_RATE as i32, 1, unsafe_ffi::OPUS_APPLICATION_VOIP, &mut err)
+        };
         if st.is_null() || err != unsafe_ffi::OPUS_OK {
             bail!("opus encoder could not start ({err})");
         }
@@ -85,7 +87,13 @@ impl Encoder {
         }
         // SAFETY: pointers and lengths come from live slices.
         let n = unsafe {
-            unsafe_ffi::opus_encode_float(self.st, pcm.as_ptr(), FRAME_SAMPLES as i32, out.as_mut_ptr(), out.len() as i32)
+            unsafe_ffi::opus_encode_float(
+                self.st,
+                pcm.as_ptr(),
+                FRAME_SAMPLES as i32,
+                out.as_mut_ptr(),
+                out.len() as i32,
+            )
         };
         Ok(check(n, "encode")? as usize)
     }
@@ -124,7 +132,9 @@ impl Decoder {
             _ => (std::ptr::null(), 0),
         };
         // SAFETY: `out` holds at least one frame; `ptr` is null or a live slice.
-        let n = unsafe { unsafe_ffi::opus_decode_float(self.st, ptr, len, out.as_mut_ptr(), FRAME_SAMPLES as i32, fec as i32) };
+        let n = unsafe {
+            unsafe_ffi::opus_decode_float(self.st, ptr, len, out.as_mut_ptr(), FRAME_SAMPLES as i32, fec as i32)
+        };
         Ok(check(n, "decode")? as usize)
     }
 

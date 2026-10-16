@@ -9,9 +9,9 @@ use std::ptr::NonNull;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
+use objc2::msg_send;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, Bool};
-use objc2::msg_send;
 use objc2_audio_toolbox::{
     AURenderCallbackStruct, AudioComponentDescription, AudioComponentFindNext, AudioComponentInstanceDispose,
     AudioComponentInstanceNew, AudioOutputUnitStart, AudioOutputUnitStop, AudioUnit, AudioUnitInitialize,
@@ -81,9 +81,7 @@ pub fn ensure_mic_permission() -> Result<()> {
             let media = media_audio();
             // SAFETY: +[AVCaptureDevice requestAccessForMediaType:completionHandler:]
             // takes an NSString and a `void (^)(BOOL)` block, which it copies.
-            let _: () = unsafe {
-                msg_send![cls, requestAccessForMediaType: &*media, completionHandler: &*block]
-            };
+            let _: () = unsafe { msg_send![cls, requestAccessForMediaType: &*media, completionHandler: &*block] };
             match rx.recv_timeout(Duration::from_secs(120)) {
                 Ok(true) => Ok(()),
                 Ok(false) => bail!(MIC_DENIED),
@@ -159,7 +157,8 @@ impl CallSession {
         let no_error = std::ptr::null_mut::<*mut objc2::runtime::AnyObject>();
         // SAFETY: -setCategory:mode:options:error: and -setActive:error: take
         // NSStrings, an NSUInteger, a BOOL and an optional NSError** (NULL).
-        let ok: Bool = unsafe { msg_send![session, setCategory: &*category, mode: &*mode, options: options, error: no_error] };
+        let ok: Bool =
+            unsafe { msg_send![session, setCategory: &*category, mode: &*mode, options: options, error: no_error] };
         if !ok.as_bool() {
             bail!("couldn't set up audio for the call");
         }
@@ -208,7 +207,14 @@ fn os(status: i32, what: &str) -> Result<()> {
 fn set<T>(unit: AudioUnit, prop: u32, scope: u32, element: u32, value: &T) -> Result<()> {
     // SAFETY: `value` is a live T of the size passed.
     let st = unsafe {
-        AudioUnitSetProperty(unit, prop, scope, element, value as *const T as *const c_void, std::mem::size_of::<T>() as u32)
+        AudioUnitSetProperty(
+            unit,
+            prop,
+            scope,
+            element,
+            value as *const T as *const c_void,
+            std::mem::size_of::<T>() as u32,
+        )
     };
     os(st, "AudioUnitSetProperty")
 }

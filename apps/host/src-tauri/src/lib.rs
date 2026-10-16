@@ -27,8 +27,8 @@ mod open_file;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use mycel_node::{Runtime, RuntimeOptions};
 use mycel_node::api::{Event, NetworkMode};
+use mycel_node::{Runtime, RuntimeOptions};
 use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tokio::sync::broadcast::error::RecvError;
 
@@ -45,9 +45,7 @@ fn network_mode(data_dir: &std::path::Path) -> Result<NetworkMode, String> {
         Some("lan") => Ok(NetworkMode::Lan),
         Some("internet") => Ok(NetworkMode::Internet),
         Some("local") => Ok(NetworkMode::Local),
-        Some(other) => Err(format!(
-            "MYCEL_NET={other:?} is not a network mode; use lan, internet or local"
-        )),
+        Some(other) => Err(format!("MYCEL_NET={other:?} is not a network mode; use lan, internet or local")),
     }
 }
 
@@ -82,10 +80,7 @@ fn forward_events(app: AppHandle, runtime: Rt, notifier: Arc<notify::Notifier>) 
                         Event::NoticesChanged,
                     ];
                     refresh.extend(
-                        runtime
-                            .conversations()
-                            .into_iter()
-                            .map(|c| Event::ConversationUpdated { conversation: c.id }),
+                        runtime.conversations().into_iter().map(|c| Event::ConversationUpdated { conversation: c.id }),
                     );
                     for event in refresh {
                         let _ = app.emit(EVENT, &event);
@@ -121,13 +116,10 @@ fn glob_escape(s: &str) -> String {
 /// data dir actually in use (it differs when `MYCEL_DATA_DIR` is set).
 fn allow_attachment_files(app: &tauri::App, data_dir: &std::path::Path) -> Result<(), String> {
     let files = data_dir.join("files");
-    std::fs::create_dir_all(&files)
-        .map_err(|e| format!("cannot create {}: {e}", files.display()))?;
+    std::fs::create_dir_all(&files).map_err(|e| format!("cannot create {}: {e}", files.display()))?;
 
     // Show downloaded attachments (convertFileSrc).
-    app.asset_protocol_scope()
-        .allow_directory(&files, true)
-        .map_err(|e| e.to_string())?;
+    app.asset_protocol_scope().allow_directory(&files, true).map_err(|e| e.to_string())?;
 
     // Open them with the system app. Scope paths are glob patterns, so escape
     // the directory; list both the given and the canonical form (on macOS
@@ -145,11 +137,11 @@ fn allow_attachment_files(app: &tauri::App, data_dir: &std::path::Path) -> Resul
             serde_json::json!({ "path": pattern })
         })
         .collect();
-    app.add_capability(
-        tauri::ipc::CapabilityBuilder::new("attachment-files")
-            .window("main")
-            .permission_scoped("opener:allow-open-path", allowed, Vec::new()),
-    )
+    app.add_capability(tauri::ipc::CapabilityBuilder::new("attachment-files").window("main").permission_scoped(
+        "opener:allow-open-path",
+        allowed,
+        Vec::new(),
+    ))
     .map_err(|e| format!("cannot allow opening attachments: {e}"))
 }
 
@@ -176,10 +168,8 @@ fn log_to_file(data_dir: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        if let Ok(previous) = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
+        if let Ok(previous) =
+            std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(&path)
             && previous.metadata().is_ok_and(|metadata| metadata.is_file())
         {
             let _ = previous.set_permissions(std::fs::Permissions::from_mode(0o600));
@@ -210,10 +200,8 @@ fn log_in_use(path: &std::path::Path) -> bool {
         use std::os::unix::fs::OpenOptionsExt;
         // That copy holds an advisory lock on it (log_to_file). Ours is
         // released when `file` closes, before the rotation.
-        let Ok(file) = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)
+        let Ok(file) =
+            std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)
         else {
             return false;
         };
@@ -249,8 +237,7 @@ fn link_diagnostics(data_dir: &std::path::Path) {
     if std::env::var_os("MYCEL_BLE_LOG").is_some() {
         return;
     }
-    let level = diagnostics_level(&data_dir.join("link-diagnostics"))
-        .or(cfg!(debug_assertions).then_some(1));
+    let level = diagnostics_level(&data_dir.join("link-diagnostics")).or(cfg!(debug_assertions).then_some(1));
     if let Some(level) = level {
         eprintln!("mycel-host: link diagnostics on (level {level})");
         // SAFETY: during startup, before the runtime (and its link threads)
@@ -276,10 +263,7 @@ fn diagnostics_level(path: &std::path::Path) -> Option<u8> {
 
 /// Retain exactly one owned copy of a pipe writer until its owner is dropped.
 #[cfg(all(unix, any(target_os = "ios", test)))]
-fn retain_pipe_writer(
-    retained: &mut Option<std::os::fd::OwnedFd>,
-    writer: std::os::fd::RawFd,
-) -> std::io::Result<()> {
+fn retain_pipe_writer(retained: &mut Option<std::os::fd::OwnedFd>, writer: std::os::fd::RawFd) -> std::io::Result<()> {
     use std::os::fd::FromRawFd;
     if retained.is_none() {
         // SAFETY: dup creates a separately owned descriptor; an error acquires
@@ -292,7 +276,6 @@ fn retain_pipe_writer(
     }
     Ok(())
 }
-
 
 #[cfg(all(unix, test))]
 mod logging_tests {
@@ -307,10 +290,7 @@ mod logging_tests {
         let write = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
         let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
         assert!(flags >= 0);
-        assert_eq!(
-            unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
-            0
-        );
+        assert_eq!(unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }, 0);
 
         let mut retained = None;
         retain_pipe_writer(&mut retained, write.as_raw_fd()).unwrap();
@@ -323,19 +303,10 @@ mod logging_tests {
         // must leave an empty pipe pending, rather than permanently EOF-ready.
         drop(write);
         let mut byte = 0u8;
-        assert_eq!(
-            unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
-            -1
-        );
-        assert_eq!(
-            std::io::Error::last_os_error().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
+        assert_eq!(unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) }, -1);
+        assert_eq!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::WouldBlock);
         drop(retained);
-        assert_eq!(
-            unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) },
-            0
-        );
+        assert_eq!(unsafe { libc::read(read.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) }, 0);
 
         let mut failed = None;
         assert!(retain_pipe_writer(&mut failed, -1).is_err());
@@ -377,7 +348,9 @@ mod logging_tests {
         let dir = TempDir::new("link-diagnostics");
         let file = dir.0.join("link-diagnostics");
         assert_eq!(super::diagnostics_level(&file), None);
-        for (text, level) in [("", Some(1)), ("1", Some(1)), ("2\n", Some(2)), (" 2 ", Some(2)), ("0", None), ("7", None), ("yes", None)] {
+        for (text, level) in
+            [("", Some(1)), ("1", Some(1)), ("2\n", Some(2)), (" 2 ", Some(2)), ("0", None), ("7", None), ("yes", None)]
+        {
             std::fs::write(&file, text).unwrap();
             assert_eq!(super::diagnostics_level(&file), level, "{text:?}");
         }
@@ -389,7 +362,6 @@ mod logging_tests {
     }
 }
 
-
 #[cfg(unix)]
 fn redirect_stderr(file: std::fs::File) {
     use std::os::fd::AsRawFd;
@@ -397,8 +369,7 @@ fn redirect_stderr(file: std::fs::File) {
     {
         // Tauri's Swift reader does not cancel on EOF. Keep its pipe open
         // when redirecting stderr so an idle app cannot spin that reader.
-        static PIPE_WRITER: std::sync::Mutex<Option<std::os::fd::OwnedFd>> =
-            std::sync::Mutex::new(None);
+        static PIPE_WRITER: std::sync::Mutex<Option<std::os::fd::OwnedFd>> = std::sync::Mutex::new(None);
         let retained = PIPE_WRITER
             .lock()
             .map_err(|_| std::io::Error::other("iOS logging writer lock poisoned"))
@@ -464,9 +435,9 @@ fn edge_to_edge(window: &tauri::WebviewWindow) {
 /// background time. The expiration handler ends the UIKit task exactly once.
 #[cfg(target_os = "ios")]
 fn finish_in_background(handle: &AppHandle) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use objc2::MainThreadMarker;
     use objc2_ui_kit::{UIApplication, UIBackgroundTaskInvalid};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn end_task(task: &AtomicUsize) {
         let Some(mtm) = MainThreadMarker::new() else { return };
@@ -485,8 +456,7 @@ fn finish_in_background(handle: &AppHandle) {
     let task = Arc::new(AtomicUsize::new(invalid));
     let expiration_task = task.clone();
     let expiration = block2::RcBlock::new(move || end_task(&expiration_task));
-    let id = UIApplication::sharedApplication(mtm)
-        .beginBackgroundTaskWithExpirationHandler(Some(&expiration));
+    let id = UIApplication::sharedApplication(mtm).beginBackgroundTaskWithExpirationHandler(Some(&expiration));
     task.store(id, Ordering::Release);
     let handle = handle.clone();
     std::thread::spawn(move || {
@@ -595,18 +565,12 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
     env_from_properties();
     let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
         Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => app
-            .path()
-            .app_data_dir()
-            .map_err(|e| format!("cannot find the app data folder: {e}"))?,
+        _ => app.path().app_data_dir().map_err(|e| format!("cannot find the app data folder: {e}"))?,
     };
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
     log_to_file(&data_dir);
     let mode = network_mode(&data_dir)?;
-    let name = std::env::var("MYCEL_NAME")
-        .ok()
-        .filter(|n| !n.trim().is_empty());
+    let name = std::env::var("MYCEL_NAME").ok().filter(|n| !n.trim().is_empty());
 
     let runtime: Rt = tauri::async_runtime::block_on(Runtime::open_with(RuntimeOptions {
         data_dir: data_dir.clone(),
@@ -632,11 +596,7 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
     app.manage(notifier);
     app.manage(runtime);
 
-    eprintln!(
-        "mycel-host: data dir {}, network {:?}",
-        data_dir.display(),
-        mode
-    );
+    eprintln!("mycel-host: data dir {}, network {:?}", data_dir.display(), mode);
     Ok(())
 }
 
@@ -648,11 +608,7 @@ fn fail_to_start(app: &AppHandle, msg: String) {
         let _ = window.hide();
     }
     let handle = app.clone();
-    app.dialog()
-        .message(msg)
-        .title("Mycel can't start")
-        .kind(MessageDialogKind::Error)
-        .show(move |_| handle.exit(1));
+    app.dialog().message(msg).title("Mycel can't start").kind(MessageDialogKind::Error).show(move |_| handle.exit(1));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

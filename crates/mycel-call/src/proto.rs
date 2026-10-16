@@ -100,16 +100,28 @@ impl CallRef {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Ctrl {
     /// Initiator → member: please ring. `group`: more than two people may join.
-    Ring { version: u16, call: CallRef, group: bool },
+    Ring {
+        version: u16,
+        call: CallRef,
+        group: bool,
+    },
     /// Participant → participant: I'm in this call too; let's talk.
-    Join { version: u16, call: CallRef },
+    Join {
+        version: u16,
+        call: CallRef,
+    },
     /// Someone not in the call → participant: keep me told who's in it.
-    Watch { version: u16, call: CallRef },
+    Watch {
+        version: u16,
+        call: CallRef,
+    },
     /// It's ringing.
     Ringing,
     Accept,
     /// Not answering (`missed`: nobody answered, it rang out).
-    Decline { missed: bool },
+    Decline {
+        missed: bool,
+    },
     /// In another call.
     Busy,
     /// We started calls in the same conversation at the same moment and
@@ -117,7 +129,9 @@ pub enum Ctrl {
     /// leg I dialed wins).
     Glare,
     /// There's already a call going on in this conversation: join it.
-    Existing { call: CallRef },
+    Existing {
+        call: CallRef,
+    },
     /// Not allowed (not a member, or not in that call).
     Denied,
     /// The call already has [`MAX_PARTICIPANTS`] people.
@@ -126,11 +140,19 @@ pub enum Ctrl {
     Started,
     /// I've left the call (or stopped ringing you).
     HangUp,
-    Mute { muted: bool },
+    Mute {
+        muted: bool,
+    },
     /// Receiver report, about once a second: what arrived of what was sent.
-    Report { loss_ppm: u32, jitter_ms: u16, bitrate: u32 },
+    Report {
+        loss_ppm: u32,
+        jitter_ms: u16,
+        bitrate: u32,
+    },
     /// The peers the sender is talking to, plus the sender if it's in the call.
-    Roster { joined: Vec<SignPk> },
+    Roster {
+        joined: Vec<SignPk>,
+    },
 }
 
 impl Ctrl {

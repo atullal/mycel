@@ -8,9 +8,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use clap::Parser;
-use rayon::prelude::*;
 use mycel_sim::report::{Status, markdown};
 use mycel_sim::scenarios::{self, Candidate, Opts};
+use rayon::prelude::*;
 
 #[derive(Parser)]
 #[command(about = "Mycel network simulation: real-world scenarios, scale and routing")]

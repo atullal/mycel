@@ -173,10 +173,7 @@ fn content_aad(header: &Header) -> Vec<u8> {
 }
 
 fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 impl Envelope {
@@ -185,11 +182,7 @@ impl Envelope {
     }
 
     pub fn verify_sig(&self) -> Result<()> {
-        self.header.author.verify(
-            CTX_ENV_SIG,
-            &[&encode(&self.header), &self.ciphertext],
-            &self.sig,
-        )?;
+        self.header.author.verify(CTX_ENV_SIG, &[&encode(&self.header), &self.ciphertext], &self.sig)?;
         Ok(())
     }
 }
@@ -382,9 +375,7 @@ impl FeedState {
             self.unsorted = true;
             return;
         }
-        let at = (after..self.order.len())
-            .find(|&i| self.key(&self.order[i]) > key)
-            .unwrap_or(self.order.len());
+        let at = (after..self.order.len()).find(|&i| self.key(&self.order[i]) > key).unwrap_or(self.order.len());
         self.order.insert(at, id);
         for (i, entry) in self.order[at..].iter().enumerate() {
             self.position.insert(*entry, at + i);
@@ -448,7 +439,8 @@ impl FeedState {
     fn changes_since(&mut self, since: FeedCursor) -> FeedChanges {
         self.sorted();
         let cursor = FeedCursor { instance: self.instance, version: self.version, len: self.order.len() };
-        let from = if since.instance != self.instance || since.version > self.version || since.version < self.forgotten {
+        let from = if since.instance != self.instance || since.version > self.version || since.version < self.forgotten
+        {
             0
         } else {
             self.changes
@@ -542,12 +534,7 @@ impl Replica {
         Ok(r)
     }
 
-    fn from_parts(
-        me: Arc<DeviceKeys>,
-        graph: SpaceGraph,
-        ring: Keyring,
-        store: Option<Arc<dyn Store>>,
-    ) -> Self {
+    fn from_parts(me: Arc<DeviceKeys>, graph: SpaceGraph, ring: Keyring, store: Option<Arc<dyn Store>>) -> Self {
         Replica {
             me,
             graph,
@@ -627,12 +614,7 @@ impl Replica {
 
     /// Current members.
     pub fn members(&self) -> Vec<(MemberKeys, Role)> {
-        self.graph
-            .state()
-            .members
-            .values()
-            .map(|m| (m.keys, m.role))
-            .collect()
+        self.graph.state().members.values().map(|m| (m.keys, m.role)).collect()
     }
 
     // ───────────── network-facing ─────────────
@@ -736,12 +718,7 @@ impl Replica {
         }
         env.verify_sig()?;
         self.persist_envelope(&env);
-        self.chains
-            .entry(env.header.author)
-            .or_default()
-            .entry(env.header.author_seq)
-            .or_default()
-            .push(id);
+        self.chains.entry(env.header.author).or_default().entry(env.header.author_seq).or_default().push(id);
         self.envelopes.insert(id, env);
         Ok(Some(id))
     }
@@ -782,10 +759,7 @@ impl Replica {
     // ───────────── validation (no decryption) ─────────────
 
     pub fn status(&self, id: &EnvelopeId) -> Status {
-        self.status
-            .get(id)
-            .cloned()
-            .unwrap_or(Status::Pending("unknown envelope"))
+        self.status.get(id).cloned().unwrap_or(Status::Pending("unknown envelope"))
     }
 
     fn compute_status(&self, id: &EnvelopeId) -> Status {
@@ -800,10 +774,7 @@ impl Replica {
         if !st.role(&h.author).is_some_and(Role::can_write) {
             return Status::Invalid("author not a writer at auth_heads");
         }
-        if !st
-            .epoch(&h.epoch)
-            .is_some_and(|e| e.recipients.contains(&h.author))
-        {
+        if !st.epoch(&h.epoch).is_some_and(|e| e.recipients.contains(&h.author)) {
             return Status::Invalid("author not a recipient of epoch");
         }
         match (h.author_seq, &h.author_prev) {
@@ -857,26 +828,14 @@ impl Replica {
     fn full_refresh(&mut self) {
         let ids: Vec<EnvelopeId> = self.envelopes.keys().copied().collect();
         self.status = ids.iter().map(|id| (*id, self.compute_status(id))).collect();
-        self.pending = self
-            .status
-            .iter()
-            .filter(|(_, s)| matches!(s, Status::Pending(_)))
-            .map(|(id, _)| *id)
-            .collect();
+        self.pending = self.status.iter().filter(|(_, s)| matches!(s, Status::Pending(_))).map(|(id, _)| *id).collect();
         let mut by_stream: HashMap<StreamId, BTreeSet<EnvelopeId>> = HashMap::new();
         for (id, st) in &self.status {
             if *st == Status::Valid {
-                by_stream
-                    .entry(self.envelopes[id].header.stream)
-                    .or_default()
-                    .insert(*id);
+                by_stream.entry(self.envelopes[id].header.stream).or_default().insert(*id);
             }
         }
-        let streams: BTreeSet<StreamId> = by_stream
-            .keys()
-            .chain(self.valid_by_stream.keys())
-            .copied()
-            .collect();
+        let streams: BTreeSet<StreamId> = by_stream.keys().chain(self.valid_by_stream.keys()).copied().collect();
         for stream in streams {
             let valid = by_stream.remove(&stream).unwrap_or_default();
             let old = self.valid_by_stream.insert(stream, valid).unwrap_or_default();
@@ -930,11 +889,7 @@ impl Replica {
             return true;
         }
         self.doc_inputs.get(&stream).is_some_and(|inputs| {
-            inputs
-                .known
-                .get(id)
-                .and_then(|k| inputs.slots.get(&k.slot))
-                .is_some_and(|candidates| candidates.len() > 1)
+            inputs.known.get(id).and_then(|k| inputs.slots.get(&k.slot)).is_some_and(|candidates| candidates.len() > 1)
         })
     }
 
@@ -990,26 +945,19 @@ impl Replica {
             self.process_doc(stream, vec![*id]);
             return;
         }
-        if self.rule_rejected.contains(id)
-            || self.feeds.get(&stream).is_some_and(|f| f.items.contains_key(id))
-        {
+        if self.rule_rejected.contains(id) || self.feeds.get(&stream).is_some_and(|f| f.items.contains_key(id)) {
             return;
         }
         let Some(key) = self.ring.get(&env.header.epoch) else {
             return; // opaque (e.g. we are a keeper, or joined after this epoch)
         };
-        let Ok(plain) = key.open(&env.header.nonce, &content_aad(&env.header), &env.ciphertext)
-        else {
+        let Ok(plain) = key.open(&env.header.nonce, &content_aad(&env.header), &env.ciphertext) else {
             return;
         };
         let Ok(entry) = postcard::from_bytes::<FeedEntry>(&plain) else {
             return;
         };
-        let role = self
-            .graph
-            .state_at(&env.header.auth_heads)
-            .role(&env.header.author)
-            .unwrap_or(Role::Relay);
+        let role = self.graph.state_at(&env.header.auth_heads).role(&env.header.author).unwrap_or(Role::Relay);
         if let Some(v) = &self.validator
             && !v.validate(&stream, &env.header.author, role, &entry.body)
         {
@@ -1029,11 +977,8 @@ impl Replica {
 
     /// Re-derive one document from its valid envelopes.
     fn rebuild_doc(&mut self, stream: StreamId) {
-        let ids: Vec<EnvelopeId> = self
-            .valid_by_stream
-            .get(&stream)
-            .map(|ids| ids.iter().copied().collect())
-            .unwrap_or_default();
+        let ids: Vec<EnvelopeId> =
+            self.valid_by_stream.get(&stream).map(|ids| ids.iter().copied().collect()).unwrap_or_default();
         self.reset_doc(stream);
         self.process_doc(stream, ids);
     }
@@ -1051,12 +996,16 @@ impl Replica {
 
     fn doc_change(&self, id: &EnvelopeId) -> std::result::Result<Option<Change>, ()> {
         let env = &self.envelopes[id];
-        let Some(key) = self.ring.get(&env.header.epoch) else { return Ok(None); };
+        let Some(key) = self.ring.get(&env.header.epoch) else {
+            return Ok(None);
+        };
         #[cfg(test)]
         self.stats.set(DocStats { opens: self.stats.get().opens + 1, ..self.stats.get() });
         let plain = key.open(&env.header.nonce, &content_aad(&env.header), &env.ciphertext).map_err(|_| ())?;
         let change = bounded_change::parse(&plain).map_err(|_| ())?;
-        if change.actor_id().to_bytes() != env.header.author.0 { return Err(()); }
+        if change.actor_id().to_bytes() != env.header.author.0 {
+            return Err(());
+        }
         Ok(Some(change))
     }
 
@@ -1087,11 +1036,8 @@ impl Replica {
                     for id in inputs.known.keys() {
                         self.equivocated.remove(id);
                     }
-                    ids = self
-                        .valid_by_stream
-                        .get(&stream)
-                        .map(|ids| ids.iter().copied().collect())
-                        .unwrap_or_default();
+                    ids =
+                        self.valid_by_stream.get(&stream).map(|ids| ids.iter().copied().collect()).unwrap_or_default();
                 }
             }
         }
@@ -1462,11 +1408,7 @@ impl Replica {
     ) -> Result<Vec<Change>> {
         edit(&mut state.doc)?;
         let Some(hash) = state.doc.commit() else { return Ok(Vec::new()) };
-        let change = state
-            .doc
-            .get_last_local_change()
-            .filter(|c| c.hash() == hash)
-            .ok_or(SyncError::Encoding)?;
+        let change = state.doc.get_last_local_change().filter(|c| c.hash() == hash).ok_or(SyncError::Encoding)?;
         let parts = if bounded_change::within(change.raw_bytes(), &change_resources::WRITE).is_ok() {
             vec![change]
         } else {
@@ -1500,11 +1442,7 @@ impl Replica {
     }
 
     fn my_chain_tip(&self) -> (u64, Option<EnvelopeId>) {
-        match self
-            .chains
-            .get(&self.me.sign_pk())
-            .and_then(|c| c.iter().next_back())
-        {
+        match self.chains.get(&self.me.sign_pk()).and_then(|c| c.iter().next_back()) {
             Some((seq, ids)) => (seq + 1, ids.first().copied()),
             None => (0, None),
         }
@@ -1512,10 +1450,7 @@ impl Replica {
 
     /// Latest envelope we've seen from `pk` (used as a revocation cutoff).
     pub fn latest_from(&self, pk: &SignPk) -> Option<EnvelopeId> {
-        self.chains
-            .get(pk)
-            .and_then(|c| c.iter().next_back())
-            .and_then(|(_, ids)| ids.first().copied())
+        self.chains.get(pk).and_then(|c| c.iter().next_back()).and_then(|(_, ids)| ids.first().copied())
     }
 
     // ───────────── membership (admin) ─────────────
@@ -1555,9 +1490,7 @@ impl Replica {
     pub fn opaque_count(&self) -> usize {
         self.status
             .iter()
-            .filter(|(id, s)| {
-                **s == Status::Valid && self.ring.get(&self.envelopes[*id].header.epoch).is_none()
-            })
+            .filter(|(id, s)| **s == Status::Valid && self.ring.get(&self.envelopes[*id].header.epoch).is_none())
             .count()
     }
 
@@ -1641,4 +1574,3 @@ fn split_change(change: &Change) -> Result<Vec<Change>> {
 
 #[cfg(test)]
 mod tests;
-

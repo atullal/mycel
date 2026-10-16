@@ -7,10 +7,7 @@ struct Peer {
 
 impl Peer {
     fn new() -> Self {
-        Peer {
-            keys: DeviceKeys::generate(),
-            ring: Keyring::default(),
-        }
+        Peer { keys: DeviceKeys::generate(), ring: Keyring::default() }
     }
     fn pk(&self) -> SignPk {
         self.keys.sign_pk()
@@ -79,11 +76,7 @@ fn non_admin_ops_are_invalid() {
             parents: g.heads(),
             author: w.pk(),
             nonce: 1,
-            action: Action::Add {
-                member: outsider.keys.public(),
-                role: Role::Relay,
-                keyring: None,
-            },
+            action: Action::Add { member: outsider.keys.public(), role: Role::Relay, keyring: None },
         },
     );
     assert_eq!(g.insert(forged.clone()).unwrap(), Inserted::New);
@@ -152,9 +145,7 @@ fn revoked_members_concurrent_ops_are_invalid() {
     // Partition: A removes B; concurrently B adds `victim`.
     let (rm, _, _) = g.remove_member(&a.keys, b.pk(), None).unwrap();
     g.insert(rm.clone()).unwrap();
-    let b_add = gb
-        .add_member(&b.keys, &Keyring::default(), victim.keys.public(), Role::Writer)
-        .unwrap();
+    let b_add = gb.add_member(&b.keys, &Keyring::default(), victim.keys.public(), Role::Writer).unwrap();
     gb.insert(b_add.clone()).unwrap();
     assert_eq!(gb.state().role(&victim.pk()), Some(Role::Writer));
 
@@ -279,12 +270,8 @@ fn bad_commitment_key_is_not_accepted() {
     let (mut rotation, _) = new_rotation([a.keys.public(), b.keys.public()].iter()).unwrap();
     let wrong = SymKey::generate();
     let idx = rotation.lockboxes.iter().position(|(pk, _)| *pk == b.pk()).unwrap();
-    rotation.lockboxes[idx].1 = mycel_crypto::seal_lockbox(
-        &b.keys.public().kex_pk,
-        &lockbox_info(&rotation.epoch, &b.pk()),
-        &wrong.0,
-    )
-    .unwrap();
+    rotation.lockboxes[idx].1 =
+        mycel_crypto::seal_lockbox(&b.keys.public().kex_pk, &lockbox_info(&rotation.epoch, &b.pk()), &wrong.0).unwrap();
     let epoch = rotation.epoch;
     let op = SignedOp::sign(
         &a.keys,
@@ -345,11 +332,7 @@ fn concurrent_revocation_by_unauthorized_author_does_not_win() {
             parents: gw.heads(),
             author: w.pk(),
             nonce: 3,
-            action: Action::Remove {
-                member: a.pk(),
-                revocation: Revocation { cutoff: None },
-                rotation,
-            },
+            action: Action::Remove { member: a.pk(), revocation: Revocation { cutoff: None }, rotation },
         },
     );
     gw.insert(forged.clone()).unwrap();
@@ -370,10 +353,8 @@ fn insert_many_matches_sequential_inserts() {
     let space = g.space_id();
     let mut b = SpaceGraph::from_genesis(g.get(&space).unwrap().clone()).unwrap();
     // reversed order: everything goes pending, then resolves once
-    let ops: Vec<SignedOp> = g.resolution().order.iter().rev()
-        .filter(|id| **id != space)
-        .map(|id| g.get(id).unwrap().clone())
-        .collect();
+    let ops: Vec<SignedOp> =
+        g.resolution().order.iter().rev().filter(|id| **id != space).map(|id| g.get(id).unwrap().clone()).collect();
     let (added, rejected) = b.insert_many(ops);
     assert_eq!((added.len(), rejected), (5, 0));
     assert_eq!(b.state(), g.state());
@@ -410,10 +391,16 @@ fn epoch_ids_cannot_be_reused_with_a_different_key() {
     // Attacker copies the honest epoch id but uses its own key/commitment.
     let (mut evil, _) = new_rotation([a.keys.public(), w.keys.public()].iter()).unwrap();
     evil.epoch = honest.epoch;
-    let op = SignedOp::sign(&w.keys, Op {
-        space: Some(g.space_id()), parents: g.heads(), author: w.pk(), nonce: 5,
-        action: Action::Rotate { rotation: evil },
-    });
+    let op = SignedOp::sign(
+        &w.keys,
+        Op {
+            space: Some(g.space_id()),
+            parents: g.heads(),
+            author: w.pk(),
+            nonce: 5,
+            action: Action::Rotate { rotation: evil },
+        },
+    );
     assert_eq!(g.insert(op), Err(TrustError::Malformed("epoch id must derive from commitment")));
 }
 
@@ -421,19 +408,31 @@ fn epoch_ids_cannot_be_reused_with_a_different_key() {
 fn ops_from_never_added_keys_are_dropped_at_the_door() {
     let (mut g, _a) = space();
     let outsider = Peer::new();
-    let junk = SignedOp::sign(&outsider.keys, Op {
-        space: Some(g.space_id()), parents: g.heads(), author: outsider.pk(), nonce: 1,
-        action: Action::Leave { cutoff: None },
-    });
+    let junk = SignedOp::sign(
+        &outsider.keys,
+        Op {
+            space: Some(g.space_id()),
+            parents: g.heads(),
+            author: outsider.pk(),
+            nonce: 1,
+            action: Action::Leave { cutoff: None },
+        },
+    );
     assert!(matches!(g.insert(junk), Err(TrustError::NotAuthorized(_))));
     assert_eq!(g.op_ids().len(), 1, "nothing stored");
 }
 
 fn relay_add(g: &SpaceGraph, author: &Peer, member: &Peer, parents: Vec<OpId>, nonce: u64) -> SignedOp {
-    SignedOp::sign(&author.keys, Op {
-        space: Some(g.space_id()), parents, author: author.pk(), nonce,
-        action: Action::Add { member: member.keys.public(), role: Role::Relay, keyring: None },
-    })
+    SignedOp::sign(
+        &author.keys,
+        Op {
+            space: Some(g.space_id()),
+            parents,
+            author: author.pk(),
+            nonce,
+            action: Action::Add { member: member.keys.public(), role: Role::Relay, keyring: None },
+        },
+    )
 }
 
 #[test]
@@ -488,10 +487,16 @@ fn genuinely_concurrent_valid_frontier_is_never_truncated() {
 }
 
 fn missing_parent_op(g: &SpaceGraph, author: &Peer, nonce: u64) -> SignedOp {
-    SignedOp::sign(&author.keys, Op {
-        space: Some(g.space_id()), parents: vec![Hash32([0x37; 32])], author: author.pk(), nonce,
-        action: Action::Leave { cutoff: None },
-    })
+    SignedOp::sign(
+        &author.keys,
+        Op {
+            space: Some(g.space_id()),
+            parents: vec![Hash32([0x37; 32])],
+            author: author.pk(),
+            nonce,
+            action: Action::Leave { cutoff: None },
+        },
+    )
 }
 
 #[test]
@@ -513,10 +518,15 @@ fn pending_quota_is_per_author_and_does_not_block_ready_ops() {
 fn full_pending_pool_allows_admin_ops_and_bulk_resolution() {
     let (mut g, a) = space();
     let authors: Vec<_> = (0..MAX_PENDING / MAX_PENDING_PER_AUTHOR).map(|_| Peer::new()).collect();
-    for author in &authors { add(&mut g, &a, author, Role::Relay); }
-    let pending: Vec<_> = authors.iter().flat_map(|author| {
-        (0..MAX_PENDING_PER_AUTHOR as u64).map(|n| missing_parent_op(&g, author, n)).collect::<Vec<_>>()
-    }).collect();
+    for author in &authors {
+        add(&mut g, &a, author, Role::Relay);
+    }
+    let pending: Vec<_> = authors
+        .iter()
+        .flat_map(|author| {
+            (0..MAX_PENDING_PER_AUTHOR as u64).map(|n| missing_parent_op(&g, author, n)).collect::<Vec<_>>()
+        })
+        .collect();
     assert_eq!(g.insert_many(pending), (vec![], 0));
     assert_eq!(g.pending.len(), MAX_PENDING);
     let first = Peer::new();
@@ -539,12 +549,20 @@ fn bulk_parent_arrival_releases_pending_quota_before_next_admission() {
     let relay = Peer::new();
     add(&mut g, &a, &reader, Role::Reader);
     let parent = relay_add(&g, &a, &relay, g.heads(), 1);
-    let pending: Vec<_> = (0..MAX_PENDING_PER_AUTHOR as u64).map(|nonce| {
-        SignedOp::sign(&reader.keys, Op {
-            space: Some(g.space_id()), parents: vec![parent.id()], author: reader.pk(), nonce,
-            action: Action::Leave { cutoff: None },
+    let pending: Vec<_> = (0..MAX_PENDING_PER_AUTHOR as u64)
+        .map(|nonce| {
+            SignedOp::sign(
+                &reader.keys,
+                Op {
+                    space: Some(g.space_id()),
+                    parents: vec![parent.id()],
+                    author: reader.pk(),
+                    nonce,
+                    action: Action::Leave { cutoff: None },
+                },
+            )
         })
-    }).collect();
+        .collect();
     assert_eq!(g.insert_many(pending), (vec![], 0));
     let next_pending = missing_parent_op(&g, &reader, MAX_PENDING_PER_AUTHOR as u64);
     let (added, rejected) = g.insert_many([parent, next_pending.clone()]);
@@ -559,29 +577,32 @@ fn bulk_parent_arrival_releases_pending_quota_before_next_admission() {
 fn long_admin_history(g: &SpaceGraph, admin: &Peer, n: usize) -> Vec<SignedOp> {
     let mut parent = g.space_id();
     let mut keeper = None;
-    (0..n as u64).map(|nonce| {
-        let action = match (nonce % 3, keeper.take()) {
-            (0, _) => {
-                let k = DeviceKeys::generate().public();
-                keeper = Some(k.sign_pk);
-                Action::Add { member: k, role: Role::Relay, keyring: None }
-            }
-            (1, k) => {
-                keeper = k;
-                Action::Rotate { rotation: new_rotation([&admin.keys.public()]).unwrap().0 }
-            }
-            (_, k) => Action::Remove {
-                member: k.unwrap(),
-                revocation: Revocation { cutoff: None },
-                rotation: new_rotation([&admin.keys.public()]).unwrap().0,
-            },
-        };
-        let op = SignedOp::sign(&admin.keys, Op {
-            space: Some(g.space_id()), parents: vec![parent], author: admin.pk(), nonce, action,
-        });
-        parent = op.id();
-        op
-    }).collect()
+    (0..n as u64)
+        .map(|nonce| {
+            let action = match (nonce % 3, keeper.take()) {
+                (0, _) => {
+                    let k = DeviceKeys::generate().public();
+                    keeper = Some(k.sign_pk);
+                    Action::Add { member: k, role: Role::Relay, keyring: None }
+                }
+                (1, k) => {
+                    keeper = k;
+                    Action::Rotate { rotation: new_rotation([&admin.keys.public()]).unwrap().0 }
+                }
+                (_, k) => Action::Remove {
+                    member: k.unwrap(),
+                    revocation: Revocation { cutoff: None },
+                    rotation: new_rotation([&admin.keys.public()]).unwrap().0,
+                },
+            };
+            let op = SignedOp::sign(
+                &admin.keys,
+                Op { space: Some(g.space_id()), parents: vec![parent], author: admin.pk(), nonce, action },
+            );
+            parent = op.id();
+            op
+        })
+        .collect()
 }
 
 #[test]

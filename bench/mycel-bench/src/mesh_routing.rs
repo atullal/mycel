@@ -160,8 +160,12 @@ fn run(path: &str) -> String {
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
     let n = v["nodes"].as_u64().unwrap() as usize;
     let simtime = v["simtime_ms"].as_f64().unwrap() as Time;
-    let links: Vec<(usize, usize)> =
-        v["links"].as_array().unwrap().iter().map(|l| (l[0].as_u64().unwrap() as usize, l[1].as_u64().unwrap() as usize)).collect();
+    let links: Vec<(usize, usize)> = v["links"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| (l[0].as_u64().unwrap() as usize, l[1].as_u64().unwrap() as usize))
+        .collect();
     let mut todo: Vec<Pending> = v["messages"]
         .as_array()
         .unwrap()
