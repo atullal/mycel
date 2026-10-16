@@ -688,15 +688,14 @@ fn unacknowledged_packets_move_a_destination_off_its_next_hop() {
     r.feedback(d, false, 4_200);
     assert_eq!(r.stats().hops_suspected, 1);
     assert_eq!(send(&mut r, 4_300), vec![honest]);
-    assert_eq!(r.toward(&d, 4_300), Toward::Hop(honest), "custody avoids it too");
     // the honest route works; nothing more is suspected
     r.feedback(d, true, 4_400);
     r.feedback(d, false, 6_000);
     assert_eq!(send(&mut r, 6_100), vec![honest]);
-    // nothing left: dropped, for the carrier to take over
+    // every route suspected: still the best (dropping can't deliver)
     r.feedback(d, false, 9_000);
-    assert_eq!(send(&mut r, 9_100), Vec::<SignPk>::new());
-    assert_eq!(r.toward(&d, 9_100), Toward::Nowhere);
+    assert_eq!(r.stats().hops_suspected, 2);
+    assert_eq!(send(&mut r, 9_100), vec![liar]);
     // suspicion runs out
     let later = 9_000 + SUSPECT_FOR + 1;
     r.on_announce(liar, ann(d, WALL + later, 1, 21), later, WALL + later, ok);

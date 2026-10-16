@@ -1276,13 +1276,19 @@ fn adversarial(o: Opts) -> ScenarioResult {
     r.at_least("delivery vs the same run without attackers", 100.0 * cand.m.delivery_ratio / clean.m.delivery_ratio.max(1e-9), 90.0, "%");
     r.check("storm announcements rate-limited", limited > 0, format!("{limited} dropped by per-neighbour limits"));
     r.check("replayed announcements dropped as stale", stale > 0, format!("{stale} stale"));
+    r.at_least(
+        "delivery with 5% black holes lying plausibly, dropping packets and bundles (of feasible)",
+        100.0 * liars.m.delivery_ratio,
+        90.0,
+        "%",
+    );
     r.check(
         "black holes' impossible routes refused",
         o.candidate != Candidate::Global || distrusted > 0,
         format!("{distrusted} times a device stopped routing through a lying neighbour"),
     );
     r.headline(format!(
-        "{}: clean {:.0}%, attacked {:.0}%, Sybil gateway {:.0}%; black holes lying plausibly (reported, not judged) {:.0}%",
+        "{}: clean {:.0}%, attacked {:.0}%, Sybil gateway {:.0}%, black holes lying plausibly {:.0}%",
         cand.m.model,
         100.0 * clean.m.delivery_ratio,
         100.0 * cand.m.delivery_ratio,
@@ -1291,7 +1297,7 @@ fn adversarial(o: Opts) -> ScenarioResult {
     ));
     r.note(row(&clean.m));
     r.note(format!(
-        "Black holes lying plausibly (the same devices claim to be one hop from everyone at the least cost an honest relay could report, and drop packets and bundles alike; nothing an announcement shows gives them away: docs/SIMULATION.md §4, open 14): {}",
+        "Black holes lying plausibly (the same devices claim to be one hop from everyone at the least cost an honest relay could report, and drop packets and bundles alike; nothing an announcement shows gives them away, but the destination's acknowledgements don't come back: the source moves off a next hop after two timeouts and spreads its bundle's copies; docs/SIMULATION.md §4, fixed 21): {}",
         row(&liars.m)
     ));
     r.note(format!("Sybil gateway (every lookup also returns a free route via it, and it swallows what it gets): {}", row(&syb.m)));

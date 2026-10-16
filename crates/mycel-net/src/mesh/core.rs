@@ -109,6 +109,10 @@ const DISTRUST_MAX: usize = 256;
 /// retransmission timeouts in a row with nothing acknowledged, the next hop
 /// our packets to a destination took is suspected for that destination ...
 const SUSPECT_STRIKES: u8 = 2;
+/// ... and only once the silence has lasted this long plus twice the
+/// route's cost (the time to move 64 KiB along it): a slow route, or one
+/// busy with a big transfer, gets longer before it is blamed.
+const SUSPECT_SILENCE: Time = 1_500;
 /// ... and avoided for it this long (another route is used, or none).
 const SUSPECT_FOR: Time = 2 * 60_000;
 /// Destinations followed for feedback, and suspects kept per destination.
@@ -672,8 +676,9 @@ pub struct Router {
     /// The next hop our own packets to each destination last took, for
     /// [`Router::feedback`] ...
     sent_via: Map<SignPk, SignPk>,
-    /// ... timeouts in a row with nothing acknowledged through it ...
-    strikes: Map<SignPk, (SignPk, u8)>,
+    /// ... timeouts in a row with nothing acknowledged through it, since
+    /// when ...
+    strikes: Map<SignPk, (SignPk, u8, Time)>,
     /// ... and the next hops suspected for a destination, until when.
     suspects: Map<SignPk, Vec<(SignPk, Time)>>,
     own: Option<Announce>,
@@ -1473,10 +1478,14 @@ impl Router {
     /// measured round trip, so a slow path isn't mistaken for a dead one.
     ///
     /// After [`SUSPECT_STRIKES`] timeouts in a row through the same next
-    /// hop, that hop is suspected for `dst` for [`SUSPECT_FOR`]: our packets
-    /// (and those we relay to `dst`) take the next feasible route, then a
-    /// gateway, and when nothing is left they are dropped, for the store
-    /// and forward carrier to take over. A black hole that lies plausibly
+    /// hop, over at least [`SUSPECT_SILENCE`] plus twice the route's cost,
+    /// that hop is suspected for `dst` for [`SUSPECT_FOR`]: our packets (and
+    /// those we relay to `dst`) take the next feasible route; with none
+    /// left, still the best (dropping can't deliver, and suspicion can be
+    /// wrong), while the store-and-forward carrier spreads the bundle
+    /// (`Carrier::doubt`). Custody hand-offs aren't steered by it: in a
+    /// network of brief contacts that cost more than it saved
+    /// (docs/SIMULATION.md §4, fixed 21). A black hole that lies plausibly
     /// pulls in routes nothing in an announcement can refute; what it can't
     /// fake is the destination's acknowledgements. A lost packet on a slow
     /// link doesn't count: one acknowledgement clears the strikes.
@@ -1497,12 +1506,14 @@ impl Router {
             self.strikes.remove(&dst);
             return false;
         }
-        let n = match self.strikes.get(&dst) {
-            Some((h, n)) if *h == hop => n + 1,
-            _ => 1,
+        let (n, since) = match self.strikes.get(&dst) {
+            Some((h, n, since)) if *h == hop => (n.saturating_add(1), *since),
+            _ => (1, now),
         };
-        if n < SUSPECT_STRIKES {
-            bounded_insert(&mut self.strikes, dst, (hop, n));
+        let cost = self.origins.get(&dst).and_then(|o| o.via.iter().find(|(k, _)| *k == hop)).map_or(0, |(_, v)| v.cost);
+        let silence = SUSPECT_SILENCE + 2 * cost as Time / 10;
+        if n < SUSPECT_STRIKES || now.saturating_sub(since) < silence {
+            bounded_insert(&mut self.strikes, dst, (hop, n, since));
             return true;
         }
         self.strikes.remove(&dst);
@@ -1772,7 +1783,7 @@ impl Router {
             }
         }
         let target = if f.reached { f.dst } else { f.waypoint };
-        match self.next_hop(&target, from.as_ref(), now) {
+        match self.next_hop(&target, from.as_ref(), true, now) {
             Next::Via(next) => {
                 // ours, along a mesh route: what `feedback` judges
                 if from.is_none() && !f.control && self.is_route_via(&target, &next) {
@@ -1785,13 +1796,18 @@ impl Router {
         }
     }
 
-    fn next_hop(&mut self, target: &SignPk, from: Option<&SignPk>, now: Time) -> Next {
+    /// `avoid`: steer clear of next hops suspected for `target` (packets,
+    /// not custody: [`Router::feedback`]).
+    fn next_hop(&mut self, target: &SignPk, from: Option<&SignPk>, avoid: bool, now: Time) -> Next {
         // 1. a neighbour (direct, or an internet hop already up)
         if Some(target) != from && self.nbs.get(target).is_some_and(|n| n.up) {
             return Next::Via(*target);
         }
-        // 2. a mesh route (not through a hop suspected for the target)
-        if let Some((n, _)) = self.best_unsuspected_route(target, from, now) {
+        // 2. a mesh route, not through a hop suspected for the target if
+        // there is another (if every one is, the best: dropping can't
+        // deliver, and suspicion can be wrong)
+        let unsuspected = if avoid { self.best_unsuspected_route(target, from, now) } else { None };
+        if let Some((n, _)) = unsuspected.or_else(|| self.best_route_except(target, from, now)) {
             return Next::Via(n);
         }
         let from_internet = from.is_some_and(|f| self.is_internet_hop(f));
@@ -1893,7 +1909,7 @@ impl Router {
         if *dst == self.me {
             return Toward::Nowhere;
         }
-        match self.next_hop(dst, None, now) {
+        match self.next_hop(dst, None, false, now) {
             Next::Via(n) => Toward::Hop(n),
             Next::Wait(_) => Toward::Soon,
             Next::Drop => Toward::Nowhere,
