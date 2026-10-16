@@ -7,3 +7,8 @@
 
 # The first repository-wide `cargo fmt` (rustfmt.toml).
 35a800b2b1ba0032ec01b5f00baa5e4634e1bca6
+
+# Branches formatted the same way before merging main (fix/glare, fix/route, fix/tworoutes).
+ef186f5f004b1924ab62bcc27ebed1867390d9ee
+165b27d982561651298134b811c4ae593bbac942
+a1171307926f463913014fa9f98d4b4a1b3ff9d5
