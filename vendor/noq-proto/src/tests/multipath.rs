@@ -2405,3 +2405,106 @@ fn late_handshake_done_after_path_zero_discarded() -> TestResult {
     assert!(!pair.client_conn_mut(ch).is_closed());
     Ok(())
 }
+
+/// MYCEL PATCH regression (vendor/noq-proto/MYCEL_PATCH.md §3): two paths carry a
+/// transfer and one of them goes dead mid-way (its link drops everything, both ways,
+/// without a word). What was in flight on it, and everything after, must finish over the
+/// other path within a few round trips.
+///
+/// Upstream, the peer kept acknowledging on the dead path (the lowest-numbered one), so
+/// the sender heard nothing on either path until the dead one's idle timeout, and the
+/// packets in flight on it were only retransmitted once it was discarded, 3 PTOs after the
+/// peer's PATH_ABANDON, with a PTO that late acknowledgements had inflated. Mycel saw
+/// ~23 s after losing a relay; here it was the 10 s idle timeout plus the drain.
+#[test]
+fn data_in_flight_on_a_dead_path_moves_to_the_other() -> TestResult {
+    let _guard = subscribe();
+    let idle = Duration::from_secs(10);
+    let mut builder = ConnPair::builder().enable_multipath();
+    for cfg in [
+        &mut builder.server_transport_cfg,
+        &mut builder.client_transport_cfg,
+    ] {
+        cfg.default_path_max_idle_timeout(Some(idle));
+        cfg.default_path_keep_alive_interval(Some(Duration::from_millis(500)));
+    }
+    let mut pair = builder.connect();
+    let mut client_two = pair.routes.as_basic().client_addr;
+    let mut server_two = pair.routes.as_basic().server_addr;
+    client_two.set_port(client_two.port() + 1);
+    server_two.set_port(server_two.port() + 1);
+    pair.routes = ManyToManyRouting::simple_symmetric(
+        [pair.routes.as_basic().client_addr, client_two],
+        [pair.routes.as_basic().server_addr, server_two],
+    )
+    .into();
+    let path1 = pair.open_path(
+        Client,
+        FourTuple {
+            local_ip: Some(client_two.ip()),
+            remote: server_two,
+        },
+        PathStatus::Available,
+    )?;
+    pair.drive();
+    while pair.poll(Client).is_some() {}
+    while pair.poll(Server).is_some() {}
+
+    // A transfer big enough to be in flight on both paths when path 0 dies.
+    const LEN: usize = 1_000_000;
+    let s = pair.streams(Client).open(Dir::Uni).unwrap();
+    assert_eq!(pair.send_stream(Client, s).write(&vec![7u8; LEN]).unwrap(), LEN);
+    pair.send_stream(Client, s).finish().unwrap();
+    let mut received = 0;
+    let mut read = |pair: &mut ConnPair| {
+        while let Some(ev) = pair.poll(Server) {
+            if matches!(ev, Event::Stream(StreamEvent::Opened { dir: Dir::Uni })) {
+                assert_eq!(pair.streams(Server).accept(Dir::Uni), Some(s));
+            }
+        }
+        let mut n = 0;
+        if let Ok(mut chunks) = pair.recv_stream(Server, s).read(false) {
+            while let Ok(Some(chunk)) = chunks.next(usize::MAX) {
+                n += chunk.bytes.len();
+            }
+            let _ = chunks.finalize();
+        }
+        n
+    };
+    // Both paths are carrying it, a tenth of it has arrived.
+    let sent = |pair: &mut ConnPair, p: PathId| {
+        pair.path_stats(Client, p).map_or(0, |s| s.udp_tx.bytes)
+    };
+    let (sent0, sent1) = (sent(&mut pair, PathId::ZERO), sent(&mut pair, path1));
+    while received < LEN / 10
+        || sent(&mut pair, PathId::ZERO) < sent0 + 20_000
+        || sent(&mut pair, path1) < sent1 + 20_000
+    {
+        received += read(&mut pair);
+        pair.step();
+    }
+    assert!(received < LEN / 2, "still going when the path dies");
+
+    info!("path 0 dies");
+    pair.routes.as_many_to_many_mut().cut_link(0);
+    let cut = pair.time;
+    while received < LEN && pair.time - cut < 2 * idle {
+        received += read(&mut pair);
+        if !pair.step() && received < LEN {
+            // Nothing scheduled: let the timers (idle, keep-alive) move time on.
+            pair.time += Duration::from_millis(10);
+        }
+    }
+    let took = pair.time - cut;
+    info!(?took, "rest of the transfer after path 0 died");
+    assert_eq!(received, LEN, "the transfer finished");
+    assert!(
+        took < Duration::from_secs(2),
+        "finished {took:?} after path 0 died (idle timeout {idle:?})"
+    );
+    // The survivor's RTT wasn't inflated by acknowledgements that waited for a way back.
+    let rtt = pair.rtt(Client, path1).expect("path 1 lives");
+    assert!(rtt < Duration::from_millis(100), "path 1 RTT {rtt:?}");
+    assert!(!pair.is_closed(Client) && !pair.is_closed(Server));
+    Ok(())
+}

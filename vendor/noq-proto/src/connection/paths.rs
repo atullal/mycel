@@ -274,6 +274,11 @@ pub(super) struct PathData {
     /// This will only ever be set from false to true.
     pub(super) draining: bool,
 
+    /// MYCEL PATCH (failover, MYCEL_PATCH.md §3): when an authenticated packet last
+    /// arrived on this path. Together with a probe timeout this tells a path that went
+    /// dead from one that is merely quiet ([`super::Connection::path_unresponsive`]).
+    pub(super) last_recv: Option<Instant>,
+
     /// Snapshot of the qlog recovery metrics
     #[cfg(feature = "qlog")]
     recovery_metrics: RecoveryMetrics,
@@ -344,6 +349,7 @@ impl PathData {
             keep_alive: config.default_path_keep_alive_interval,
             permit_idle_reset: true,
             draining: false,
+            last_recv: None,
             #[cfg(feature = "qlog")]
             recovery_metrics: RecoveryMetrics::default(),
             generation,
@@ -392,6 +398,7 @@ impl PathData {
             keep_alive: prev.keep_alive,
             permit_idle_reset: true,
             draining: false,
+            last_recv: None,
             #[cfg(feature = "qlog")]
             recovery_metrics: prev.recovery_metrics.clone(),
             generation,

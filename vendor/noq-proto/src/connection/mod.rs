@@ -706,6 +706,20 @@ impl Connection {
 
         self.abandoned_paths.insert(path_id);
 
+        // MYCEL PATCH (failover, MYCEL_PATCH.md §3): a path abandoned because it went
+        // silent (or the network under it changed) is dead, and what is in flight on it
+        // is gone with it: retransmit it on the other paths now. Upstream waited for the
+        // path to be discarded, 3 PTOs after the peer's PATH_ABANDON, and a stale
+        // acknowledgement could inflate that PTO to seconds (20 s seen). A path closed by
+        // the application or the peer may still deliver what it carries, so that keeps
+        // upstream's behaviour (and the PTO handling below hands its data on if it died).
+        if matches!(
+            reason,
+            PathAbandonReason::TimedOut | PathAbandonReason::UnusableAfterNetworkChange
+        ) {
+            self.lose_in_flight(path_id, now);
+        }
+
         for timer in PathTimer::VALUES {
             // match for completeness
             let keep_timer = match timer {
@@ -1084,7 +1098,7 @@ impl Connection {
                 return Some(transmit);
             }
 
-            let info = self.scheduling_info(path_id);
+            let info = self.scheduling_info(path_id, now);
             if let Some(transmit) = self.poll_transmit_on_path(
                 now,
                 buf,
@@ -1151,13 +1165,22 @@ impl Connection {
     /// so many other functions we have. But this is the only one to document this in its
     /// doc comment. Maybe that should change. Eventually we'll refactor things for this
     /// panic to go away.
-    fn scheduling_info(&self, path_id: PathId) -> PathSchedulingInfo {
+    fn scheduling_info(&self, path_id: PathId, now: Instant) -> PathSchedulingInfo {
+        // MYCEL PATCH (failover, MYCEL_PATCH.md §3): a path that looks dead
+        // (`path_unresponsive`) is passed over for SpaceKind::Data frames, ACKs included,
+        // while another validated path doesn't. Otherwise the lowest-numbered Available
+        // path keeps carrying every ACK even after it died, and the peer, hearing nothing,
+        // stalls on all paths until the dead one's idle timeout.
+        let avoid_unresponsive = self.has_responsive_path(now);
+        let avoided = |id: PathId| avoid_unresponsive && self.path_unresponsive(id, now);
+
         // Such a space is preferred for SpaceKind::Data frames.
         let have_validated_status_available_space = self.paths.iter().any(|(path_id, path)| {
             self.remote_cids.contains_key(path_id)
                 && !self.abandoned_paths.contains(path_id)
                 && path.data.validated
                 && path.data.local_status() == PathStatus::Available
+                && !avoided(*path_id)
         });
 
         // Such a space is able to send SpaceKind::Data frames.
@@ -1183,6 +1206,9 @@ impl Connection {
                 // already send 0-RTT and 0.5-RTT (permitting anti-amplification
                 // limit) data.
                 true
+            } else if avoided(path_id) {
+                // MYCEL PATCH: looks dead, and another path doesn't.
+                false
             } else if !validated {
                 // TODO(flub): When we have a network change we might end up
                 //    having to abandon all paths and re-open new ones to the
@@ -1223,12 +1249,84 @@ impl Connection {
         // abandoned itself if that was validated.
         let may_self_abandon = has_cids && validated && !have_validated_space;
 
+        // MYCEL PATCH (failover, MYCEL_PATCH.md §3): a packet with nothing but ACKs goes
+        // on the lowest-numbered path that may send data, as upstream, unless nothing
+        // arrived on that one for a PTO while another path has heard from the peer since:
+        // then on the one that heard last. A path that went dead stops hearing first, so
+        // the ACKs move off it at once instead of disappearing into it until it times
+        // out, and the peer, hearing nothing on any path, stalls. (ACKs still ride along
+        // in every other packet, on any path.)
+        let may_send_ack_only = is_handshaking || {
+            let data_ok = |id: PathId, path: &PathState| {
+                self.remote_cids.contains_key(&id)
+                    && !self.abandoned_paths.contains(&id)
+                    && path.data.validated
+                    && !avoided(id)
+                    && (path.data.local_status() == PathStatus::Available
+                        || !have_validated_status_available_space)
+            };
+            let mut candidates = self.paths.iter().filter(|(id, path)| data_ok(**id, path));
+            let first = candidates.next();
+            let freshest = first.into_iter().chain(candidates).max_by_key(|(id, path)| {
+                (path.data.last_recv, cmp::Reverse(**id))
+            });
+            let chosen = match (first, freshest) {
+                (Some((&id, path)), Some((&fresh, fresh_path))) => {
+                    let pto = path.data.rtt.pto_base() + self.ack_frequency.max_ack_delay_for_pto();
+                    let quiet = path
+                        .data
+                        .last_recv
+                        .is_none_or(|t| now.saturating_duration_since(t) > pto);
+                    if quiet && fresh_path.data.last_recv > path.data.last_recv {
+                        Some(fresh)
+                    } else {
+                        Some(id)
+                    }
+                }
+                _ => None,
+            };
+            chosen.is_none_or(|id| id == path_id)
+        };
+
         PathSchedulingInfo {
             is_abandoned,
             may_send_data,
             may_send_close,
             may_self_abandon,
+            may_send_ack_only,
         }
+    }
+
+    /// MYCEL PATCH (failover, MYCEL_PATCH.md §3): whether `path_id` looks dead.
+    ///
+    /// A probe timeout fired on it (nothing sent on it was acknowledged, over any path, for
+    /// a PTO) *and* nothing arrived on it for a PTO either. Either alone is normal: a
+    /// path whose packets the peer acknowledges on another path hears nothing itself, and
+    /// a path that is only slow fires a PTO now and then. Both together, in multipath, is
+    /// a path that stopped carrying anything.
+    fn path_unresponsive(&self, path_id: PathId, now: Instant) -> bool {
+        let Some(path) = self.path(path_id) else {
+            return false;
+        };
+        // (A path still being validated carries no data, and has its own timers.)
+        if !self.is_multipath_negotiated() || !path.validated || path.pto_count == 0 {
+            return false;
+        }
+        let pto = path.rtt.pto_base() + self.ack_frequency.max_ack_delay_for_pto();
+        path.last_recv
+            .is_none_or(|t| now.saturating_duration_since(t) > pto)
+    }
+
+    /// MYCEL PATCH (failover, MYCEL_PATCH.md §3): whether some validated path that isn't
+    /// abandoned still looks alive. Only then is a dead-looking path passed over: with no
+    /// alternative, the usual tail-loss probes keep trying it.
+    fn has_responsive_path(&self, now: Instant) -> bool {
+        self.paths.iter().any(|(id, path)| {
+            self.remote_cids.contains_key(id)
+                && !self.abandoned_paths.contains(id)
+                && path.data.validated
+                && !self.path_unresponsive(*id, now)
+        })
     }
 
     fn build_transmit(&mut self, path_id: PathId, transmit: TransmitBuf<'_>) -> Transmit {
@@ -1509,7 +1607,10 @@ impl Connection {
                 } else {
                     // Anything else we only send if we're the best path for SpaceKind::Data
                     // frames.
-                    !can_send.is_empty() && scheduling_info.may_send_data
+                    // MYCEL PATCH: and ACKs alone only on the path chosen for them.
+                    !can_send.is_empty()
+                        && scheduling_info.may_send_data
+                        && (can_send.other || scheduling_info.may_send_ack_only)
                 }
             };
 
@@ -3050,10 +3151,23 @@ impl Connection {
                     .largest_acked_packet_send_time,
             );
 
+            // MYCEL PATCH (failover, MYCEL_PATCH.md §3): a peer must acknowledge an
+            // ack-eliciting packet within its max_ack_delay. An ACK reporting a much longer
+            // delay is a later copy of one that was lost: in multipath, typically sent on a
+            // path that died, then repeated on another. Its "RTT" measures how long the
+            // peer took to find a working path, not this path (5 s samples set a 6.6 s PTO
+            // base). RFC 9002 would cap the delay and take the sample; skip it instead.
+            let held_ack = space == SpaceId::Data
+                && self.is_multipath_negotiated()
+                && Duration::from_micros(ack.delay << self.peer_params.ack_delay_exponent.0)
+                    > 2 * self.ack_frequency.peer_max_ack_delay + TIMER_GRANULARITY;
+
             let next_pn = self.spaces[space].for_path(path).next_packet_number;
             let path_data = self.path_data_mut(path);
             // TODO(@divma): should be a method of path, should be contained in a single place
-            path_data.rtt.update(ack_delay, rtt);
+            if !held_ack {
+                path_data.rtt.update(ack_delay, rtt);
+            }
             if path_data.first_packet_after_rtt_sample.is_none() {
                 path_data.first_packet_after_rtt_sample = Some((space.kind(), next_pn));
             }
@@ -3271,10 +3385,23 @@ impl Connection {
             // Conventional loss probe
             _ => 2,
         };
-        let pns = self.spaces[space].for_path(path_id);
-        pns.loss_probes = pns.loss_probes.saturating_add(count);
         let path_data = self.path_data_mut(path_id);
         path_data.pto_count = path_data.pto_count.saturating_add(1);
+        if space == SpaceId::Data
+            && self.path_unresponsive(path_id, now)
+            && self.has_responsive_path(now)
+        {
+            // MYCEL PATCH (failover, MYCEL_PATCH.md §3): this path looks dead and another
+            // doesn't. Hand what it carries to the other paths now, instead of probing it
+            // with that data and leaving the rest in flight until its idle timeout and
+            // drain. A probe, a PING, still goes out on it to notice if it comes back.
+            debug!(%path_id, "PTO on an unresponsive path: retransmitting its data on other paths");
+            self.lose_in_flight(path_id, now);
+            self.spaces[space].for_path(path_id).pending_ping = true;
+        } else {
+            let pns = self.spaces[space].for_path(path_id);
+            pns.loss_probes = pns.loss_probes.saturating_add(count);
+        }
         self.set_loss_detection_timer(now, path_id);
     }
 
@@ -3395,15 +3522,23 @@ impl Connection {
         );
     }
 
-    /// Drops the path state, declaring any remaining in-flight packets as lost
-    fn discard_path(&mut self, path_id: PathId, now: Instant) {
-        trace!(%path_id, "dropping path state");
-        let path = self.path_data(path_id);
+    /// Declares every packet in flight on `path_id` (Data space) lost, so their frames are
+    /// retransmitted on whichever paths may send.
+    ///
+    /// MYCEL PATCH (failover, MYCEL_PATCH.md §3): factored out of `discard_path` (upstream
+    /// only did this when the abandoned path was finally discarded, 3 PTOs after the
+    /// peer's PATH_ABANDON) so a dead or abandoned path can hand its data on at once.
+    fn lose_in_flight(&mut self, path_id: PathId, now: Instant) {
+        let Some(path) = self.path(path_id) else {
+            return;
+        };
         let in_flight_mtu_probe = path.mtud.in_flight_mtu_probe();
+        let Some(pns) = self.spaces[SpaceId::Data].number_spaces.get(&path_id) else {
+            return;
+        };
 
         let mut size_of_lost_packets = 0u64; // add to path_stats.lost_bytes;
-        let lost_pns: Vec<_> = self.spaces[SpaceId::Data]
-            .for_path(path_id)
+        let lost_pns: Vec<_> = pns
             .sent_packets
             .iter()
             .filter(|(pn, _info)| Some(*pn) != in_flight_mtu_probe)
@@ -3431,6 +3566,12 @@ impl Connection {
                 size_of_lost_packets,
             );
         }
+    }
+
+    /// Drops the path state, declaring any remaining in-flight packets as lost
+    fn discard_path(&mut self, path_id: PathId, now: Instant) {
+        trace!(%path_id, "dropping path state");
+        self.lose_in_flight(path_id, now);
         // Before removing the path, we fetch the final path stats via `Self::path_stats`.
         // This ensures snapshot values (like rtt) are properly updated.
         let path_stats = self.path_stats(path_id).unwrap_or_default();
@@ -3803,6 +3944,8 @@ impl Connection {
         // Do not process ECN for off-path packets. If this is a migration we'll get ECN
         // back once we've migrated.
         if is_on_path {
+            // MYCEL PATCH (failover, MYCEL_PATCH.md §3): the path is alive toward us.
+            self.path_data_mut(path_id).last_recv = Some(now);
             self.receiving_ecn |= ecn.is_some();
             if let Some(x) = ecn {
                 let space = &mut self.spaces[space_id];
@@ -7342,6 +7485,9 @@ struct PathSchedulingInfo {
     /// [`Self::may_send_data`] other paths could be equally good.
     may_send_close: bool,
     may_self_abandon: bool,
+    /// MYCEL PATCH (failover, MYCEL_PATCH.md §3): whether a packet carrying only ACKs
+    /// may go on this path (the one that heard from the peer last).
+    may_send_ack_only: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]

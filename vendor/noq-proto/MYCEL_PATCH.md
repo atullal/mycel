@@ -62,8 +62,82 @@ That connection must close with INTERNAL_ERROR, and a new connection on the
 same endpoint must still work. Upstream 1.3.0 aborts the test process with
 "thread caused non-unwinding panic. aborting."
 
+## 3. noq-proto: a path that dies stalls the connection for its idle timeout and more
+
+`src/connection/mod.rs` and `src/connection/paths.rs`, every line marked
+`MYCEL PATCH (failover, MYCEL_PATCH.md §3)`. This is separate from §1 and §2,
+which are being proposed upstream on their own; this section can go upstream
+independently.
+
+**Seen as:** in Mycel, a transfer over two mesh routes. When one relay leaves,
+the rest of the transfer should finish over the other in ~6 s, but about 1 run
+in 4 took ~23 s (`two_routes_aggregate_and_fail_over`). Traced with
+instrumented noq, one run went like this:
+
+1. **The receiver kept acknowledging on the dead path.** A packet with only
+   ACKs goes on the lowest-numbered path that may send data. If that path is
+   the one that died, every ACK goes into it until its idle timeout (5 s in
+   Mycel). The sender hears nothing on *any* path, so its live path's window
+   fills and stalls too.
+2. **Data in flight on the dead path waited for the path to be discarded.**
+   Abandoning a path (idle timeout) only stops new sends. The packets in flight
+   are declared lost when the path is *discarded*: 3 PTOs after the peer's
+   PATH_ABANDON arrives. Until then nothing retransmits them, and the receiver
+   can't deliver anything after the gap.
+3. **That PTO was inflated by stale ACKs.** When the receiver finally sent its
+   ACKs on the live path, they included PATH_ACKs for packets of the dead path
+   that it had received 5 s earlier. RFC 9002 caps the peer's reported ACK
+   delay at `max_ack_delay` and takes the sample, so the dead path's RTT
+   estimate jumped to seconds (pto_base 6.6 s), and its drain took 3 × 6.6 s.
+   That is the 20-second stall.
+
+**Fix** (multipath only; single-path connections behave as before):
+
+- **A path that looks dead is passed over** (`path_unresponsive`,
+  `scheduling_info`). It counts as dead when a PTO fired on it (nothing it
+  carried was acknowledged, over any path) *and* nothing arrived on it for a
+  PTO either (new `PathData::last_recv`). Either alone is normal: a path whose
+  packets are acknowledged on another path hears little itself, and a slow path
+  fires a PTO now and then. While another validated path doesn't look dead, it
+  gets no new data and no ACK-only packets. With no alternative, nothing
+  changes.
+- **ACK-only packets move off a quiet path.** They still go on the
+  lowest-numbered path, as upstream, unless nothing arrived on it for a PTO
+  while another path has heard from the peer since; then they go on the path
+  that heard last (`may_send_ack_only`). The receiver of a transfer usually
+  sends nothing ack-eliciting, so it can't see a path die the way a sender
+  does, but it does see it go quiet.
+- **A dead path's data moves at once.** On a PTO on a path that looks dead,
+  while another doesn't, its in-flight packets are declared lost, so their
+  frames are retransmitted on the other paths. A PING goes out on it instead
+  of the usual probes, to notice if it comes back. When a path is abandoned
+  because it went silent (`TimedOut`) or the network under it changed, its
+  in-flight packets are declared lost then too (`lose_in_flight`, factored out
+  of `discard_path`). A path closed by the application or the peer keeps
+  upstream's behaviour, since it may still deliver what it carries. If the
+  packets did arrive, the late ACKs find nothing to acknowledge, the loss
+  counts as spurious, and the duplicates are discarded by the peer.
+- **Stale ACKs give no RTT sample.** A peer must acknowledge within its
+  max_ack_delay, so an ACK reporting more than twice that (+ timer
+  granularity) is a later copy of a lost one. Its delay measures the peer's
+  wait for a working path, not this path, so its RTT sample is skipped.
+
+**Test:** `tests::multipath::data_in_flight_on_a_dead_path_moves_to_the_other`.
+Two paths on separate links carry a 1 MB stream. One link silently drops
+everything mid-transfer (`ManyToManyRouting::cut_link`). The rest must arrive
+within 2 s, and the survivor's RTT must stay under 100 ms. Upstream it takes
+the 10 s idle timeout plus the drain (10.2 s); with the patch, 77 ms.
+
+In Mycel, `two_routes_aggregate_and_fail_over` finishes the rest of the
+transfer after losing a relay in ~6.5 s, where it took 6–25 s before.
+
+**Drop §3** once upstream sends ACK-only packets on a working path,
+retransmits a dead path's in-flight data promptly, and ignores stale ACK RTT
+samples in multipath.
+
 ## Upstream report (draft, not filed)
 
 The text is in `vendor/noq-proto/UPSTREAM_ISSUE.md`.
 
-**Drop this patch** once upstream releases fixes for both.
+**Drop §1 and §2** once upstream releases fixes for both (the draft report
+above covers those two; §3 would be a report of its own).

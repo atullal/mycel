@@ -1704,6 +1704,14 @@ impl Routing {
         }
     }
 
+    /// MYCEL PATCH (failover test, MYCEL_PATCH.md §3).
+    pub(super) fn as_many_to_many_mut(&mut self) -> &mut ManyToManyRouting {
+        match self {
+            Self::ManyToMany(inner) => inner,
+            _ => panic!("cast to ManyToManyRouting failed, a different routing table is set"),
+        }
+    }
+
     /// Sets the one-way latency between the two endpoints.
     pub(super) fn set_latency(&mut self, latency: Duration) {
         match self {
@@ -2025,6 +2033,13 @@ impl ManyToManyRouting {
             server_routes,
             latency: Duration::from_millis(1),
         }
+    }
+
+    /// MYCEL PATCH (failover test, MYCEL_PATCH.md §3): the link between the client and
+    /// server interfaces at `idx` goes dead, both ways (a radio out of range), silently.
+    pub(super) fn cut_link(&mut self, idx: usize) {
+        self.client_routes[idx].1 = usize::MAX;
+        self.server_routes[idx].1 = usize::MAX;
     }
 
     /// Adds a new route from an existing server address to a new client address.
