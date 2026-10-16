@@ -114,6 +114,9 @@ struct Outgoing {
     srtt: Option<Time>,
     rto: Time,
     started: Time,
+    /// Its last packets went through the mesh (the routing core chose the
+    /// way), not straight to the peer.
+    meshed: bool,
 }
 
 const INITIAL_WINDOW: f64 = 10.0;
@@ -425,6 +428,10 @@ impl Global {
                 let part = u16::from_be_bytes([p[5], p[6]]);
                 let now = cx.now();
                 let Some(o) = self.outbox.get_mut(&msg) else { return };
+                if o.meshed {
+                    // end to end: the way our packets took works
+                    self.core.feedback(key(src), true, now / MS);
+                }
                 if let Some(sent) = o.inflight.remove(&part) {
                     let rtt = now.saturating_sub(sent);
                     let s = o.srtt.map_or(rtt, |s| (7 * s + rtt) / 8);
@@ -472,6 +479,9 @@ impl Global {
             self.conns.remove(&dst);
         }
         let now = Self::ms(cx);
+        if let Some(o) = msg.and_then(|m| self.outbox.get_mut(&m)) {
+            o.meshed = true;
+        }
         self.core.send(pk, self.pk, p, false, now);
         self.effects(cx);
         self.busy(cx);
@@ -787,12 +797,19 @@ impl Router for Global {
                 // anything in flight longer than the RTO is lost: resend, back off
                 let rto = o.rto;
                 let lost: Vec<u16> = o.inflight.iter().filter(|(_, t)| now_us.saturating_sub(**t) >= rto).map(|(p, _)| *p).collect();
-                if !lost.is_empty() {
+                let timed_out = !lost.is_empty();
+                if timed_out {
                     for p in lost {
                         o.inflight.remove(&p);
                     }
                     o.cwnd = (o.cwnd / 2.0).max(2.0);
                     o.rto = (o.rto * 2).min(30 * SEC);
+                }
+                // end to end: a whole timeout through the mesh, nothing acked
+                if timed_out && o.meshed {
+                    let dst = key(o.dst);
+                    o.meshed = false;
+                    self.core.feedback(dst, false, now);
                 }
                 let next = o.rto;
                 let (dst, size, none_acked) = (o.dst, o.size, o.left == o.parts);
@@ -823,6 +840,7 @@ impl Router for Global {
                 srtt: None,
                 rto: SEC,
                 started: cx.now(),
+                meshed: false,
             },
         );
         self.transmit(cx, msg);

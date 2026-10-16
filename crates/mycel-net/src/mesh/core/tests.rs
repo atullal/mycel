@@ -646,6 +646,64 @@ fn a_neighbour_relaying_impossible_routes_is_not_routed_through() {
     assert_eq!(r.next_hop_local(&p, later + 10), Some(liar));
 }
 
+/// A black hole that lies plausibly can't be refuted from announcements,
+/// but the destination's acknowledgements don't come back through it: two
+/// timeouts in a row with nothing acknowledged through one next hop, and the
+/// source takes the next route for that destination. One acknowledgement in
+/// between clears the count (a slow or lossy link isn't dropped), and the
+/// suspicion runs out.
+#[test]
+fn unacknowledged_packets_move_a_destination_off_its_next_hop() {
+    let ann = |origin, seq, hops, cost| Announce {
+        hops,
+        cost,
+        origin,
+        seq,
+        flags: 0,
+        scope: 8,
+        uplink: 0,
+        name: Arc::from(""),
+        sig: Sig([0; 64]),
+    };
+    let (liar, honest, d) = (key(2), key(3), key(9));
+    let mut r = Router::new(key(1), Config::default());
+    for n in [liar, honest] {
+        r.set_direct(n, true, 0);
+        r.hop_up(n, 0);
+        r.set_cost(n, 100);
+    }
+    let ok = |_: &Announce| true;
+    r.on_announce(liar, ann(d, WALL, 1, 21), 10, WALL, ok);
+    r.on_announce(honest, ann(d, WALL, 3, 500), 10, WALL, ok);
+    r.tick(20);
+    let send = |r: &mut Router, t: Time| {
+        r.send(d, key(1), Bytes::from_static(b"x"), false, t);
+        outcome(r).2
+    };
+    assert_eq!(send(&mut r, 100), vec![liar], "the cheapest claim wins");
+    r.feedback(d, false, 1_100);
+    r.feedback(d, true, 1_500); // an ack: the count starts again
+    r.feedback(d, false, 2_100);
+    assert_eq!(send(&mut r, 2_200), vec![liar], "one timeout at a time is a slow link");
+    r.feedback(d, false, 4_200);
+    assert_eq!(r.stats().hops_suspected, 1);
+    assert_eq!(send(&mut r, 4_300), vec![honest]);
+    assert_eq!(r.toward(&d, 4_300), Toward::Hop(honest), "custody avoids it too");
+    // the honest route works; nothing more is suspected
+    r.feedback(d, true, 4_400);
+    r.feedback(d, false, 6_000);
+    assert_eq!(send(&mut r, 6_100), vec![honest]);
+    // nothing left: dropped, for the carrier to take over
+    r.feedback(d, false, 9_000);
+    assert_eq!(send(&mut r, 9_100), Vec::<SignPk>::new());
+    assert_eq!(r.toward(&d, 9_100), Toward::Nowhere);
+    // suspicion runs out
+    let later = 9_000 + SUSPECT_FOR + 1;
+    r.on_announce(liar, ann(d, WALL + later, 1, 21), later, WALL + later, ok);
+    r.tick(later + 10);
+    assert_eq!(send(&mut r, later + 20), vec![liar]);
+}
+
 /// What a router did with one packet of ours: (dials, lookups, frames sent to).
 fn outcome(r: &mut Router) -> (Vec<SignPk>, usize, Vec<SignPk>) {
     let mut outs = Vec::new();

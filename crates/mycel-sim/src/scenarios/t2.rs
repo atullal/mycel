@@ -312,6 +312,7 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                         t.announcements_suppressed += s.announcements_suppressed;
                         t.announcements_implausible += s.announcements_implausible;
                         t.neighbours_distrusted += s.neighbours_distrusted;
+                        t.hops_suspected += s.hops_suspected;
                         t.retractions_sent += s.retractions_sent;
                         t.seqreqs_sent += s.seqreqs_sent;
                         t.infeasible += s.infeasible;
@@ -349,7 +350,7 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                     json!({"loops": sh.loops.get(), "announcements_sent": t.announcements_sent,
                            "announcements_received": t.announcements_received, "announcements_limited": t.announcements_limited,
                            "announcements_stale": t.announcements_stale, "announcements_suppressed": t.announcements_suppressed,
-                           "announcements_implausible": t.announcements_implausible, "neighbours_distrusted": t.neighbours_distrusted,
+                           "announcements_implausible": t.announcements_implausible, "neighbours_distrusted": t.neighbours_distrusted, "hops_suspected": t.hops_suspected,
                            "retractions_sent": t.retractions_sent, "seqreqs_sent": t.seqreqs_sent, "infeasible": t.infeasible,
                            "dropped_no_route": t.dropped_no_route, "dropped_pending": t.dropped_pending, "dropped_ttl": t.dropped_ttl,
                            "dials": t.dials, "resolves": t.resolves, "gateway_out": t.gateway_out,
