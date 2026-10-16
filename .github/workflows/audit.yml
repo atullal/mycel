@@ -1,0 +1,43 @@
+# New advisories against unchanged code: checks the locked dependencies of
+# both Cargo workspaces and of npm every day. (Pull requests run the same
+# checks in ci.yml.)
+name: Audit
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: audit
+  cancel-in-progress: true
+
+jobs:
+  advisories:
+    name: Advisories
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # cargo-deny reads the dependency graph with this toolchain's cargo.
+      - run: rustup toolchain install --no-self-update
+      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+        with:
+          tool: cargo-deny@0.20.2
+      - name: Rust (main workspace)
+        run: cargo deny --locked check advisories
+      - name: Rust (rules workspace)
+        run: |
+          cargo deny --locked --manifest-path rules/Cargo.toml --target wasm32-unknown-unknown \
+            check advisories -A advisory-not-detected
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: npm
+        run: npm audit --omit=dev

@@ -177,7 +177,7 @@ const DIAL_GIVE_UP: Time = 15_000;
 const DIAL_BACKOFF_MIN: Time = 2_000;
 const DIAL_BACKOFF_MAX: Time = 60_000;
 /// A device without the internet republishes its record this often (and
-/// when its gateways change, at most every [`REACH_MIN_GAP`]).
+/// when its gateways change, at most every `REACH_MIN_GAP`).
 pub const REACH_REFRESH: Time = 10 * 60_000;
 /// Records are valid this long (the origin refreshes well before).
 pub const REACH_LIFETIME: Time = 30 * 60_000;

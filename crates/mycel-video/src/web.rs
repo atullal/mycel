@@ -3,18 +3,18 @@
 //! H.264 with WebCodecs `VideoEncoder`, in hardware where the platform has
 //! it (MediaCodec on Android, Media Foundation in WebView2) and under the
 //! platform's codec licence, as VideoToolbox is on Apple devices. The page
-//! pushes each encoded frame here ([`push`]); the rest of the pipeline (rate
+//! pushes each encoded frame here (`push`); the rest of the pipeline (rate
 //! control, pacing, giving up on stuck frames, keyframes) is the same as on
 //! a Mac.
 //!
 //! The pieces the pipeline expects, for frames that arrive already encoded:
-//! - [`PixelBuffer`] carries one encoded frame instead of pixels;
-//! - [`H264Encoder`] passes frames through, and since a skipped frame
+//! - `PixelBuffer` carries one encoded frame instead of pixels;
+//! - `H264Encoder` passes frames through, and since a skipped frame
 //!   breaks the H.264 reference chain, it drops frames after a gap (or when
 //!   a keyframe is wanted) until the web view's next keyframe, and asks the
 //!   web view for one;
 //! - its size, frame rate and bitrate become targets the page encodes to
-//!   ([`push`] returns them), the lowest across a group call's peers.
+//!   (`push` returns them), the lowest across a group call's peers.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

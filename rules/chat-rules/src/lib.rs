@@ -16,8 +16,8 @@
 use mycel_rules_abi::chat::{
     ChatOp, MAX_ATTACHMENT_FIELD, MAX_ATTACHMENTS, MAX_BODY, MAX_EMOJI, MAX_NAME, MAX_TITLE,
     codes::{
-        BAD_ATTACHMENT, BAD_EMOJI, BODY_TOO_LONG, MALFORMED_PAYLOAD, NAME_TOO_LONG, NOT_ADMIN,
-        NOT_READER, NOT_WRITER, WRONG_STREAM,
+        BAD_ATTACHMENT, BAD_EMOJI, BODY_TOO_LONG, MALFORMED_PAYLOAD, NAME_TOO_LONG, NOT_ADMIN, NOT_READER, NOT_WRITER,
+        WRONG_STREAM,
     },
 };
 use mycel_rules_guest::{RuleInput, StreamKind, Verdict, abi};
@@ -45,32 +45,19 @@ fn check(input: &RuleInput) -> Result<(), u32> {
         _ => require(role.can_write(), NOT_WRITER)?,
     }
     match op {
-        ChatOp::Text {
-            body,
-            reply_to: _,
-            attachments,
-        } => {
+        ChatOp::Text { body, reply_to: _, attachments } => {
             require(body.len() <= MAX_BODY, BODY_TOO_LONG)?;
             require(attachments.len() <= MAX_ATTACHMENTS, BAD_ATTACHMENT)?;
             for a in &attachments {
-                require(
-                    a.name.len() <= MAX_ATTACHMENT_FIELD && a.mime.len() <= MAX_ATTACHMENT_FIELD,
-                    BAD_ATTACHMENT,
-                )?;
+                require(a.name.len() <= MAX_ATTACHMENT_FIELD && a.mime.len() <= MAX_ATTACHMENT_FIELD, BAD_ATTACHMENT)?;
             }
             Ok(())
         }
         ChatOp::Edit { target: _, body } => require(body.len() <= MAX_BODY, BODY_TOO_LONG),
         ChatOp::Delete { target: _ } => Ok(()),
-        ChatOp::React {
-            target: _,
-            emoji,
-            on: _,
-        } => require(!emoji.is_empty() && emoji.len() <= MAX_EMOJI, BAD_EMOJI),
+        ChatOp::React { target: _, emoji, on: _ } => require(!emoji.is_empty() && emoji.len() <= MAX_EMOJI, BAD_EMOJI),
         ChatOp::Receipt { up_to: _ } => Ok(()),
         ChatOp::Profile { name } => require(name.len() <= MAX_NAME, NAME_TOO_LONG),
-        ChatOp::Meta { title, direct: _ } => {
-            require(title.is_none_or(|t| t.len() <= MAX_TITLE), NAME_TOO_LONG)
-        }
+        ChatOp::Meta { title, direct: _ } => require(title.is_none_or(|t| t.len() <= MAX_TITLE), NAME_TOO_LONG),
     }
 }

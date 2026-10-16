@@ -231,7 +231,7 @@ mod tests {
 
     #[test]
     fn gatt_info_roundtrip_and_limits() {
-        let i = GattInfo { psm: 0x00c1, key: key(7), name: "Atul’s MacBook".into() };
+        let i = GattInfo { psm: 0x00c1, key: key(7), name: "Alice’s MacBook".into() };
         let b = i.encode();
         assert_eq!(GattInfo::decode(&b), Some(i));
         assert_eq!(GattInfo::decode(&b[..34]), None, "too short");

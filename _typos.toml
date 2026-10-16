@@ -1,0 +1,36 @@
+# typos (https://github.com/crate-ci/typos): spelling in code, comments and docs.
+#   typos            # check
+#   typos --write-changes
+# Add a word here only when it is right (a name, an abbreviation), with a note.
+
+[files]
+extend-exclude = [
+  # Upstream code, kept byte-for-byte (THIRD_PARTY_NOTICES.md).
+  "vendor/",
+  # Generated files and data.
+  "*.lock",
+  "package-lock.json",
+  "*.pbxproj",
+  "*.storyboard",
+  "*.svg",
+  "bench/results/",
+  "crates/mycel-sync/src/fixtures/",
+]
+
+[default.extend-identifiers]
+# ancestor (crates/mycel-trust)
+anc = "anc"
+# buffers a and b (tests)
+ba = "ba"
+
+[default.extend-words]
+# retransmission timeout
+rto = "rto"
+# UPnP
+pn = "pn"
+# Big Sur (macOS 11)
+sur = "sur"
+# a name in the SDK's mock data
+ines = "ines"
+# zlib's DEFLATE crates (flate2)
+flate = "flate"

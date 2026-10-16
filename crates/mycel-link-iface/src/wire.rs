@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn beacon_round_trip() {
-        let b = Beacon { key: SignPk([9; 32]), name: "Atul’s Laptop".into() };
+        let b = Beacon { key: SignPk([9; 32]), name: "Alice’s Laptop".into() };
         assert_eq!(Beacon::decode(&b.encode()), Some(b));
         assert_eq!(Beacon::decode(b"MYCELIF\x02rest"), None, "other version");
         assert_eq!(Beacon::decode(&b"MYCELIF\x01"[..]), None, "truncated");
