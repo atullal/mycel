@@ -204,7 +204,46 @@ something changes.
     full size (300 phones, 15 such black holes) delivery went from 82% to
     100% (`docs/SIMULATION.md` §4, fixed 20). A liar that claims plausible
     values (one hop from everyone, at the least cost) isn't caught by
-    this: open 14 there.
+    this; item 13 is what stops it.
+13. **End-to-end feedback.** What a liar can't fake is the destination's
+    acknowledgements. The transport tells the router (`Router::feedback`)
+    when a whole retransmission timeout passes with nothing acknowledged
+    for our packets to a destination, and when an acknowledgement comes
+    back. Its timeout follows the measured round trip, so a slow path isn't
+    a dead one. After two timeouts in a row through the same next hop, on
+    a mesh route that still claims to reach the destination and over a hop
+    that is still up, and a silence of at least 1.5 s plus twice the
+    route's cost (slow or busy routes get longer), that hop is
+    **suspected** for that destination for 2 minutes:
+    - our packets, and those we relay to it, take the next feasible route
+      (any feasible route is loop-free, not only the best); with every
+      route suspected, still the best: dropping can't deliver, and
+      suspicion can be wrong;
+    - the store-and-forward carrier stops trusting that route with every
+      copy of our bundle (§7.3).
+
+    One acknowledgement clears the count. Routes through gateways or the
+    internet aren't judged: the destination may just be offline. Custody
+    hand-offs aren't steered by it: on a trace of brief contacts, where
+    routes stop delivering for ordinary reasons, that cost more than it
+    saved. At most 1,024 destinations and 4 suspects each are kept. Relays
+    can't judge on their own: the acknowledgements are inside the
+    end-to-end encryption, and the reverse path needn't pass them. In
+    `adversarial` at full size, 15 such liars (dropping bundles too) took
+    delivery to 76%; with this and §7.3's split, 94%
+    (`docs/SIMULATION.md` §4, fixed 21). The tier-2 driver feeds it. In
+    the node, Iroh's multipath already fails over between a connection's
+    paths at the source; feeding the core (and `Carrier::doubt`) from the
+    node's connections is still to do.
+
+    **Next protocol version: signed route attestations.** Feedback finds a
+    liar only by losing traffic to it first, and only at sources. The
+    planned fix is to sign what relays add: each hop signs (origin, seqno,
+    the hops and cost it advertises, the neighbour it sends to), so a
+    relay can't claim to be nearer than the signed chain it received
+    (SEAD and Ariadne's idea, with our Ed25519 keys). It changes the
+    announcement format and costs a signature per hop, so it waits for the
+    next protocol version; `docs/TRUST.md` §8b.
 
 ## 7. Beyond one mesh
 
@@ -363,6 +402,14 @@ lifetime, copies) is signed by the source.
 - **Copies in flight** aren't given again: a single copy on its way to
   one neighbour isn't also offered to another.
 - **Rate limits:** per neighbour and per source.
+- **A route that just failed gets one share.** When our live packets to
+  the destination have just gone unacknowledged along a mesh route (§6,
+  item 13: the router tells the carrier, `Carrier::doubt`), our own
+  bundles for it send half their copies along the live route and the rest
+  to other neighbours, the likeliest first, one share each, keeping the
+  last copy for the next route. A black hole on the route can take custody
+  of one share, not all of them. Without that evidence custody moves whole
+  along a live route, as before.
 - **Hand-off order:** deliveries first, then live routes, the gradient,
   and spraying last: contacts end, and a 1 MB spray queued ahead of a
   delivery can cost the delivery.

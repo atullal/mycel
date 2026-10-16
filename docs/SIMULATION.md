@@ -103,9 +103,9 @@ marked *(gateways)* were rerun on 15 October with fixed 19, at a load
 average of ~40 (other agents' builds: their wall times are long); it
 leaves every other tier-2 scenario's numbers as they were (compared
 before and after at CI size, and at full size for those with
-gateways). The row marked *(lying neighbours)* was rerun on 15 October
-with fixed 20; that fix leaves every other tier-2 scenario's numbers as
-they were, at CI and full size. The Mac was
+gateways). The rows marked *(failover)* were rerun on 16 October with
+fixed 20 and 21; those fixes leave every other tier-2 scenario's numbers
+as they were, at CI and full size. The Mac was
 heavily loaded throughout the first runs: another agent's
 Java simulations, a host build and other apps, a load average of ~20 on
 18 cores, and 8 of 9 GB swap in use. Wall times are pessimistic, and the
@@ -138,8 +138,8 @@ machine it measured 500 nodes in 1.2 GB (§1).
 | `mailbox` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
 | `global-scale` | 2 | 2,002 devices (0.02) *(gateways)* | ✅ | global core + DTN: 100% delivered, p95 0.690 s, optimality p50 3.96× · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.119 s, p95 0.211 s, optimality p95 2.88× (was 4.45×, fixed 19; 32.2× before fixed 18) · control 706 B/s per device (was 8,470): routing 470, carrier 235 (was 8,004, fixed 17) · CI size (1,499 devices): warm optimality p95 2.65× (was 5.14×, failing) | 119 s |
 | `churn` | 2 | 1,001 devices (scale 0.1) *(gateways)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.5/17.1×; control 698 B/s per device: routing 2,659 → 469, carrier 4,540 → 256 (full size before the carrier fixes: 100%, p95 65.2 s) | 81 s |
-| `adversarial` | 2 | full *(lying neighbours)* | ✅ | global core + DTN: 100% delivered, p95 0.097 s, optimality p50/p95/p99 1.88/5.97/8.65× (was 82%, p95 1.28 s, 36.6/170/1570×, failing: fixed 20) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (reported, not judged): 76%, p95 91 s (open 14) · CI size (0.1): 100% (was 93%) | 657 s |
-| `trace-replay` | 2 | full *(control)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible, p50 4.7 s, p95 1259 s, optimality p50/p95/p99 1.22/8.38/18.0× (pipelining-aware oracle, fixed 12; 10.1× at 54cc562 after the routing changes), overhead 3.15 · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 103 s |
+| `adversarial` | 2 | full *(failover)* | ✅ | global core + DTN: 100% delivered, p95 0.097 s, optimality p50/p95/p99 1.88/5.97/8.65× (was 82%, p95 1.28 s, 36.6/170/1570×, failing: fixed 20) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (judged, ≥ 90%): 94%, p95 31 s (was 76%, p95 91 s: fixed 21) · CI size (0.1): 100% (was 93%), lying plausibly 97% (was 80%) | 142 s |
+| `trace-replay` | 2 | full *(failover)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible (3,985 of 4,000 sent, was 3,982), p50 4.7 s, p95 1259 s, optimality p50/p95/p99 1.22/8.24/36.8× (was 8.38/18.0×: fixed 21; pipelining-aware oracle, fixed 12; 10.1× at 54cc562 after the routing changes), overhead 3.21 (was 3.15) · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 49 s |
 | `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 53%, 68%, 83%, 92%, 93% | 0 s |
 
 ## 4. Findings
@@ -520,6 +520,58 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    17.3 kB/s in all), carrier 4.9 → 1.4 kB/s. CI size: 93% → 100%, p95
    1.20 → 0.079 s. Every other tier-2 scenario gives identical numbers,
    at CI and full size.
+21. **Black holes that lie plausibly** (was open 14). A liar that claims
+   to be one hop from every origin at the least cost an honest relay
+   could report (2.1 ms) passes fixed 20's check and pulls in every
+   route longer than about two hops. `adversarial` runs 15 of them (the
+   same devices as its black holes; they drop the bundles they take too):
+   76% delivered at full size, p95 91 s. Nothing in an announcement gives
+   them away, but the destination's acknowledgements don't come back.
+   Two defences, both without a wire change:
+   - **End-to-end feedback** (`Router::feedback`, `mesh/core.rs`). The
+     transport reports a retransmission timeout with nothing acknowledged,
+     and each acknowledgement. Two timeouts in a row through one next hop,
+     on a mesh route that still claims the destination, over a silence of
+     at least 1.5 s plus twice the route's cost, and that hop is
+     suspected for that destination for 2 minutes: packets (ours and those
+     we relay to it) take the next feasible route, which is loop-free
+     like the best; with every route suspected, still the best. One
+     acknowledgement clears the count; routes via gateways or the internet
+     aren't judged. Bounded: 1,024 destinations, 4 suspects each.
+   - **One share down a route that just failed** (`Carrier::doubt`,
+     `mesh/dtn.rs`). When feedback judged a mesh route, our own bundles
+     for that destination send half their copies along the live route and
+     the rest to other neighbours, one share each, keeping the last. Without
+     that evidence custody moves whole, as before.
+
+   Full size, seed 1: 76% → 94% delivered, p95 91 → 31 s; 1.0 → 3.8
+   replicas per message; control 21.5 → 23.3 kB/s per device in that run.
+   CI size: 80% → 97%, p95 91 → 7.1 s. The run is now judged: ≥ 90%.
+
+   What was tried and measured on the full-size synthetic `trace-replay`
+   (brief Bluetooth contacts, 1 MB messages, where routes stop delivering
+   for ordinary reasons; before: optimality p95/p99 8.38/18.0×):
+   - steering custody hand-offs off a suspected hop too, and dropping
+     packets once every route was suspected: 7.59/53.7×, and no better
+     against the liars (93% at full size); not kept;
+   - feedback without the bundle split: 10.5/54.3×;
+   - a 3 s minimum silence, or 3 strikes: 9.18/36.8×, and the liars got
+     through more (93%);
+   - kept: 8.24/36.8×, 3,985 of 4,000 delivered (was 3,982), overhead
+     3.21 (was 3.15). The p99 is the 5th-slowest of the 400 messages the
+     oracle checks: four more messages now miss a contact and wait 1–4
+     minutes, others finish sooner. Every other tier-2 scenario gives the
+     same numbers, at CI and full size.
+
+   The tier-2 driver feeds both. The node's driver doesn't yet: Iroh's
+   multipath already fails over between a connection's paths at the
+   source, and feeding the core from the node's connections is still to
+   do. Signed per-hop route attestations would stop the lie itself; they
+   change the announcement format, so they are planned for the next
+   protocol version (`docs/ROUTING.md` §6, item 13). Tests
+   `unacknowledged_packets_move_a_destination_off_its_next_hop`
+   (`mesh/core/tests.rs`), `a_doubted_route_gets_one_share_of_our_bundle`
+   (`mesh/dtn/tests.rs`).
 
 ### Open (with evidence)
 
@@ -590,6 +642,17 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
      mean wait to 6.9–9.0 ms. It gave 86.8% on seeds 1–12, but 87.3%
      against 86.6% on seeds 13–24, so it is noise; not adopted.
 
+   - **The world itself moves.** Waypoint mobility draws its targets
+     from the same random stream as each radio frame's jitter, so any
+     change in what is sent changes where everyone walks and who meets
+     whom. A carrier change (fixed 21's split, applied to every bundle at
+     first) changed how many of the CI-size run's 12 messages had any path
+     from 3 to 9, and its single-seed result from 100% to 78%, while 12
+     CI-size seeds averaged 87.5% against 87.6%. So two routers, or a
+     change and what it replaced, at one seed are compared on different
+     worlds. A separate random stream for mobility would fix that; not
+     done, since it changes every `disaster-dtn` number.
+
    The full scenario is now judged on the mean of 12 seeds (≥ 80%), with
    the per-seed spread in its notes. The CI size (0.1, one seed) delivers
    100%. Still open: which interaction makes single runs this sensitive.
@@ -617,26 +680,9 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
      budgeted) is a design question, not a bug.
 
    Repro: `mycel-sim global-scale --scale 0.01 --seed 3`.
-14. **Black holes that lie plausibly aren't caught** (after fixed 20). A
-   liar that claims to be one hop from every origin at the least cost an
-   honest relay could report (2.1 ms) passes the check, and still pulls
-   in every route longer than about two hops. `adversarial` now also runs
-   such liars (the same 15 devices, which drop the bundles they take as
-   well) and reports the result without judging it: 76% delivered at
-   full size, p95 91 s; 80% at CI size. Fixed 20 doesn't change it (it
-   can't see them). Nothing in an announcement gives them away, so a
-   defence needs evidence from outside the metric:
-   - data-plane feedback: a source whose packets go unacknowledged moves
-     to another route. The node's Iroh multipath does this across up to 3
-     first hops, but further relays route through liars too when most of
-     the neighbourhood is next to one (70% of the phones here);
-   - store-and-forward that doesn't hand all of a bundle's copies along
-     the live route that just failed (the bundle exists because the live
-     attempt failed);
-   - signed metrics: per-hop route attestations (a wire change;
-     `docs/TRUST.md` §8b).
-
-   Repro: `mycel-sim adversarial` (its notes).
+14. *(fixed 21: black holes that lie plausibly; what is left: the node's
+   driver doesn't feed `Router::feedback` and `Carrier::doubt` yet, and
+   signed route attestations wait for the next protocol version.)*
 
 ## 5. Benchmarks against external baselines
 
