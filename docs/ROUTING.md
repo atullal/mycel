@@ -194,7 +194,9 @@ something changes.
       and its in-flight packets are retransmitted on the others;
     - ACKs move off a path that went quiet, so the peer isn't left hearing
       nothing;
-    - stale ACKs don't inflate its RTT.
+    - stale ACKs don't inflate its RTT;
+    - path selection, and with it the path calls and the Network panel
+      report, moves off the dead path at once.
 
     Before the patch, losing a relay mid-transfer stalled the rest for 5–20 s
     in about 1 run in 4. Routing convergence only decides which routes to

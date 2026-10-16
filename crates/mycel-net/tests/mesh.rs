@@ -411,18 +411,8 @@ async fn route_heals_when_a_middle_device_leaves() {
     .await;
     write_and_sync(&a, &c, space, "via d and x").await;
     eprintln!("healed in {:?}", t.elapsed());
-    // The exchange moved to the new route as soon as the old path stopped
-    // answering; Iroh's selection (which `peers()` reports) follows once that
-    // path has been silent for a few seconds.
-    let hops = || c.peers()[&a.id()].mesh.as_ref().map(|m| m.hops);
-    for i in 0..30 {
-        if hops() == Some(3) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        write_and_sync(&a, &c, space, &format!("via d and x, {i}")).await;
-    }
-    assert_eq!(hops(), Some(3));
+    let route = c.peers()[&a.id()].mesh.clone().expect("mesh route");
+    assert_eq!(route.hops, 3);
 }
 
 /// Six devices in a ring: announcements stay bounded (each passed on once,

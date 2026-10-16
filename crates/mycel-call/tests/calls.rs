@@ -276,6 +276,56 @@ async fn call_moves_from_peer_wifi_to_bluetooth() {
     alice.calls.end(&id).unwrap();
 }
 
+/// When the Wi-Fi path dies mid-call, each leg reports Bluetooth within about
+/// a second (the call checks its path every second while talking), and keeps
+/// reporting it: QUIC declares the silent path dead after two probe timeouts
+/// and path selection drops it at once (vendor/noq-proto/MYCEL_PATCH.md §3).
+/// The leg's path picks the call's bitrate: before, it reported the dead
+/// Wi-Fi path for 3-5 s while the audio already went over Bluetooth.
+#[tokio::test(flavor = "multi_thread")]
+async fn call_leg_reports_bluetooth_promptly_after_wifi_dies() {
+    let wifi = MemNet::new(4, PathKind::PeerWifi);
+    let bt = MemNet::new(4, PathKind::Bluetooth);
+    bt.set_rate_limit(Some(20_000));
+    bt.set_latency(Duration::from_millis(20));
+    let alice = device("alice", sine(440.0), false, &[&wifi, &bt]).await;
+    let bob = device("bob", sine(660.0), false, &[&wifi, &bt]).await;
+    eventually("links up", 15, || {
+        alice.node.peers().get(&bob.node.id()).is_some_and(|p| p.links.len() == 2).then_some(())
+    })
+    .await;
+    let space = shared_space(&alice, &bob).await;
+    let id = connect_call(&alice, &bob, space).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(alice.call(&id).unwrap().path, Some(PathKind::PeerWifi), "starts on the fast link");
+    assert_eq!(bob.call(&id).unwrap().path, Some(PathKind::PeerWifi));
+
+    let cut = Instant::now();
+    wifi.cut();
+    let mut moved = [None, None];
+    while cut.elapsed() < Duration::from_secs(5) && moved.iter().any(Option::is_none) {
+        for (i, d) in [&alice, &bob].into_iter().enumerate() {
+            if moved[i].is_none() && d.call(&id).and_then(|c| c.path) == Some(PathKind::Bluetooth) {
+                moved[i] = Some(cut.elapsed());
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    eprintln!("legs report Bluetooth after: alice {:?}, bob {:?}", moved[0], moved[1]);
+    for (who, at) in ["alice", "bob"].into_iter().zip(moved) {
+        let at = at.unwrap_or_else(|| panic!("{who}'s leg never reported Bluetooth"));
+        assert!(at < Duration::from_millis(1500), "{who}'s leg reported Bluetooth {at:?} after the cut");
+    }
+    // ... and stays there
+    for _ in 0..30 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(alice.call(&id).unwrap().path, Some(PathKind::Bluetooth));
+        assert_eq!(bob.call(&id).unwrap().path, Some(PathKind::Bluetooth));
+    }
+    assert_eq!(alice.call(&id).unwrap().state, CallPhase::Active);
+    alice.calls.end(&id).unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn audio_falls_back_to_a_stream() {
     let alice = device("alice", sine(440.0), true, &[]).await;

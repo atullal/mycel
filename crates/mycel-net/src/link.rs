@@ -184,7 +184,7 @@ impl PathKind {
 }
 
 /// The path a connection is using: the one Iroh selected, else the open
-/// path that has carried the most.
+/// path that has carried the most, passing over paths that died.
 ///
 /// Iroh selects one path per peer, across all connections to that peer, and
 /// marks it selected on each connection that has it. But each end selects on
@@ -192,14 +192,37 @@ impl PathKind {
 /// better), and only the end that dialed a connection opens paths on it. So
 /// on a connection the peer dialed, the path we selected may not exist: no
 /// path there is selected, and the connection sends on the paths it has.
+///
+/// A path QUIC has found dead ([`path_dead`]) carries nothing any more, even
+/// in the moment before the selection moves off it: what it had is going over
+/// the others. Callers (calls pick their bitrate from this) see the path the
+/// data is actually on.
 pub fn path_in_use<'a>(paths: &'a PathList<'_>) -> Option<Path<'a>> {
-    paths.iter().find(|p| p.is_selected()).or_else(|| {
-        // the first of equals: a new connection's first path
-        paths.iter().rev().max_by_key(|p| {
+    let now = Instant::now();
+    let dead = |p: &Path<'_>| path_dead(&p.stats(), now);
+    // the first of equals: a new connection's first path
+    let busiest = |skip_dead: bool| {
+        paths.iter().rev().filter(|p| !skip_dead || !dead(p)).max_by_key(|p| {
             let s = p.stats();
             s.udp_tx.bytes.saturating_add(s.udp_rx.bytes)
         })
-    })
+    };
+    paths
+        .iter()
+        .find(|p| p.is_selected() && !dead(p))
+        .or_else(|| busiest(true))
+        .or_else(|| paths.iter().find(|p| p.is_selected()))
+        .or_else(|| busiest(false))
+}
+
+/// Whether QUIC has found this path dead: a probe timeout fired on it and
+/// nothing has arrived on it for a probe timeout since. Its data is then
+/// retransmitted on the connection's other paths and it gets no more
+/// (vendor/noq-proto/MYCEL_PATCH.md §3), so it isn't the path in use, and
+/// path selection drops it at once instead of after [`MycelPathSelector`]'s
+/// 3-second silence.
+pub fn path_dead(stats: &iroh::endpoint::PathStats, now: Instant) -> bool {
+    stats.unresponsive_from.is_some_and(|t| now >= t)
 }
 
 /// A link's health, shown in the Network panel.
@@ -470,7 +493,9 @@ fn cost(rtt: Duration, capacity: f64) -> i128 {
 ///
 /// A path that has received nothing for 3 s (every path is pinged each
 /// second) is dead: it is not *selected* while another path lives, so Iroh
-/// doesn't keep reopening it on other connections to the peer.
+/// doesn't keep reopening it on other connections to the peer. So is one
+/// QUIC has found dead ([`path_dead`]), at once: noq then asks Iroh to
+/// select again, and moves its data to the other paths itself.
 #[derive(Debug, Default)]
 pub struct MycelPathSelector {
     health: Mutex<HashMap<FourTuple, PathHealth>>,
@@ -513,15 +538,31 @@ struct Candidate<'a> {
     /// Bytes sent and not lost.
     delivered: u64,
     received: u64,
+    /// When a packet last arrived on it, on any connection.
+    last_recv: Option<Instant>,
+    /// When a connection first found it dead ([`path_dead`]); `None` if none
+    /// has.
+    dead_from: Option<Instant>,
+}
+
+impl Candidate<'_> {
+    /// Found dead on some connection, and nothing has arrived on it on any
+    /// connection since. (A quiet connection that hasn't noticed can't vouch
+    /// for the path; one that hears on it after it was found dead can.)
+    fn dead(&self) -> bool {
+        self.dead_from.is_some_and(|d| self.last_recv.is_none_or(|r| r < d))
+    }
 }
 
 impl PathSelector for MycelPathSelector {
     fn select(&self, ctx: &PathSelectionContext<'_>) -> PathSelection {
         // The same path can be on several connections to the peer.
+        let now = Instant::now();
         let mut cands: Vec<Candidate<'_>> = Vec::new();
         for p in ctx.paths() {
             let Some(s) = p.stats() else { continue };
             let delivered = s.udp_tx.bytes.saturating_sub(s.lost_bytes);
+            let dead_from = s.unresponsive_from.filter(|t| now >= *t);
             match cands.iter_mut().find(|c| c.data.network_path() == p.network_path()) {
                 Some(c) => {
                     c.rtt = c.rtt.min(s.rtt);
@@ -529,6 +570,11 @@ impl PathSelector for MycelPathSelector {
                     c.lost += s.lost_packets;
                     c.delivered += delivered;
                     c.received += s.udp_rx.datagrams;
+                    c.last_recv = c.last_recv.max(s.last_recv);
+                    c.dead_from = match (c.dead_from, dead_from) {
+                        (Some(a), Some(b)) => Some(a.min(b)),
+                        (a, b) => a.or(b),
+                    };
                 }
                 None => cands.push(Candidate {
                     rtt: s.rtt,
@@ -536,12 +582,13 @@ impl PathSelector for MycelPathSelector {
                     lost: s.lost_packets,
                     delivered,
                     received: s.udp_rx.datagrams,
+                    last_recv: s.last_recv,
+                    dead_from,
                     data: p,
                 }),
             }
         }
         let mut selection = PathSelection::none();
-        let now = Instant::now();
         let mut health = self.health.lock();
         health.retain(|_, h| now.duration_since(h.seen) < Duration::from_secs(120));
         for c in &cands {
@@ -552,8 +599,9 @@ impl PathSelector for MycelPathSelector {
                 }
             }
         }
-        // Dead paths (nothing received lately) are skipped while any path lives.
-        let alive = |c: &&Candidate<'_>| health.get(c.data.network_path()).is_none_or(|h| !h.stale(now));
+        // Dead paths (QUIC found them dead, or nothing received lately) are
+        // skipped while any path lives.
+        let alive = |c: &&Candidate<'_>| !c.dead() && health.get(c.data.network_path()).is_none_or(|h| !h.stale(now));
         let live: Vec<&Candidate<'_>> = cands.iter().filter(alive).collect();
         let pool: Vec<&Candidate<'_>> = if live.is_empty() { cands.iter().collect() } else { live };
         let current = pool.iter().copied().find(|c| Some(c.data.network_path()) == ctx.current());
@@ -614,9 +662,10 @@ impl PathSelector for MycelPathSelector {
             } else if h.aggregated && p_rate >= AGG_BUSY {
                 h.slow_pause = AGG_SLOW_PAUSE;
             }
-            // (A stale path keeps its status: demoting it before its idle
-            // timeout closes it only delays resending what is in flight on it.)
-            let ok = h.capacity * AGG_RATE_RATIO >= p_cap
+            // (A path that is only quiet keeps its status. One QUIC found
+            // dead leaves the aggregate: its data already moved to the others.)
+            let ok = !c.dead()
+                && h.capacity * AGG_RATE_RATIO >= p_cap
                 && h.base_rtt <= limit
                 && !h.lossy
                 && h.slow_until.is_none_or(|t| now >= t)
