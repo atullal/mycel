@@ -231,10 +231,26 @@ something changes.
     end-to-end encryption, and the reverse path needn't pass them. In
     `adversarial` at full size, 15 such liars (dropping bundles too) took
     delivery to 76%; with this and §7.3's split, 94%
-    (`docs/SIMULATION.md` §4, fixed 21). The tier-2 driver feeds it. In
-    the node, Iroh's multipath already fails over between a connection's
-    paths at the source; feeding the core (and `Carrier::doubt`) from the
-    node's connections is still to do.
+    (`docs/SIMULATION.md` §4, fixed 21).
+
+    **In the node** (`mesh/watch.rs`) the evidence comes per QUIC path.
+    Every end-to-end connection (pooled, dialled for another protocol, or
+    accepted) is watched: a path `mesh(dst, via)` we keep sending on that
+    has had no frame back for 3 s (both ends send keep-alives every 1.5 s),
+    or that QUIC gives up while still silent (after 5 s), is reported to
+    `Router::path_feedback`; frames arriving again clear it. Only frames
+    QUIC counted after decrypting the packet carrying them count, so a
+    relay can drop them but can't fake them; nothing at the mesh layer (a
+    packet merely claiming to come from the destination) counts. The same
+    rules apply: two silences scaled to the route's cost, mesh routes
+    only. A suspected hop's route stops being offered as a QUIC path for
+    that destination (`RouteDown`), the next one is (`RouteUp`), and if
+    every other route is infeasible because we advertised the cheap one,
+    a fresh seqno is asked for, not through the suspect, as after a loss.
+    The node's carrier is told (`Carrier::doubt`). Measured with real
+    nodes (`tests/mesh.rs`): a relay that keeps announcing a destination
+    and drops everything to and from it is routed around in 6.6 s, and two
+    hops at 20 kB/s with 30 ms of latency and queue drops suspect nothing.
 
     **Next protocol version: signed route attestations.** Feedback finds a
     liar only by losing traffic to it first, and only at sources. The

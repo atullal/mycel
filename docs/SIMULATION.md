@@ -105,7 +105,9 @@ leaves every other tier-2 scenario's numbers as they were (compared
 before and after at CI size, and at full size for those with
 gateways). The rows marked *(failover)* were rerun on 16 October with
 fixed 20 and 21; those fixes leave every other tier-2 scenario's numbers
-as they were, at CI and full size. The Mac was
+as they were, at CI and full size. The row marked *(one world)* was rerun
+on 16 October with fixed 22 (walking devices' own random stream), which
+changes no other scenario. The Mac was
 heavily loaded throughout the first runs: another agent's
 Java simulations, a host build and other apps, a load average of ~20 on
 18 cores, and 8 of 9 GB swap in use. Wall times are pessimistic, and the
@@ -134,12 +136,12 @@ machine it measured 500 nodes in 1.2 GB (§1).
 | `routing-convergence` | 2 | full *(routing)* | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never | 15 s |
 | `flood-scaling` | 2 | full *(routing)* | ✅ | largest N: global core 8.4% of BLE in steady state, 100% of pairs routed (before: 67.0%, 85% routed), main 136.1% | 839 s |
 | `partial-route` | 2 | full *(carrier)* | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.5 s; sender-holds 100% p50 98.2 s · gap 300 m: global core + DTN 100%; stand-in custody 0% p50 0 s; sender-holds 0% p50 0 s | 0 s |
-| `disaster-dtn` | 2 | full, judged on seeds 1–12 *(control)* | ✅ | **global core + DTN: mean 80.3% delivered** (target ≥ 80%; per seed 60–92%; seeds 13–24 mean 86.6%; open 12) · seed 1: 60%, p95 7220 s, optimality p50/p95/p99 1.01/4.62/4.65×, 18.3 replicas and 25.6 hand-offs per message (budget 32) · PRoPHET 58%, spray-and-wait (L=8) 32%, epidemic 100% (seed 1) · CI size (0.1): 100% | 55 s |
+| `disaster-dtn` | 2 | full, judged on seeds 1–12 *(one world)* | ✅ | **global core + DTN: mean 87.2% delivered** (target ≥ 80%; per seed 77–98%; seeds 2–13 mean 87.1%, 3–14 mean 86.9%; was 80.3% on worlds that moved with the routing: fixed 22) · seed 1: 90%, p95 7625 s, optimality p50/p95/p99 1.43/6.11/6.81×, 21.2 replicas and 32.9 hand-offs per message (budget 32) · PRoPHET 67%, spray-and-wait (L=8) 27%, epidemic 100%, now on the same world (seed 1, 60 of 60 messages feasible for every router) · CI size (0.1): 89% | 95 s |
 | `mailbox` | 2 | full *(carrier)* | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
 | `global-scale` | 2 | 2,002 devices (0.02) *(gateways)* | ✅ | global core + DTN: 100% delivered, p95 0.690 s, optimality p50 3.96× · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.119 s, p95 0.211 s, optimality p95 2.88× (was 4.45×, fixed 19; 32.2× before fixed 18) · control 706 B/s per device (was 8,470): routing 470, carrier 235 (was 8,004, fixed 17) · CI size (1,499 devices): warm optimality p95 2.65× (was 5.14×, failing) | 119 s |
 | `churn` | 2 | 1,001 devices (scale 0.1) *(gateways)* | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.5/17.1×; control 698 B/s per device: routing 2,659 → 469, carrier 4,540 → 256 (full size before the carrier fixes: 100%, p95 65.2 s) | 81 s |
-| `adversarial` | 2 | full *(failover)* | ✅ | global core + DTN: 100% delivered, p95 0.097 s, optimality p50/p95/p99 1.88/5.97/8.65× (was 82%, p95 1.28 s, 36.6/170/1570×, failing: fixed 20) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (judged, ≥ 90%): 94%, p95 31 s (was 76%, p95 91 s: fixed 21) · CI size (0.1): 100% (was 93%), lying plausibly 97% (was 80%) | 142 s |
-| `trace-replay` | 2 | full *(failover)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible (3,985 of 4,000 sent, was 3,982), p50 4.7 s, p95 1259 s, optimality p50/p95/p99 1.22/8.24/36.8× (was 8.38/18.0×: fixed 21; pipelining-aware oracle, fixed 12; 10.1× at 54cc562 after the routing changes), overhead 3.21 (was 3.15) · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 49 s |
+| `adversarial` | 2 | full *(failover)* | ✅ | global core + DTN: 100% delivered, p95 0.097 s, optimality p50/p95/p99 1.88/5.97/8.65× (was 82%, p95 1.28 s, 36.6/170/1570×, failing: fixed 20) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (judged, ≥ 90%): 94%, p95 29 s (was 76%, p95 91 s: fixed 21), but ❌ 76% with seed 2 and 87% with seed 3 (open 15) · CI size (0.1): 100% (was 93%), lying plausibly 97% (was 80%), and passes with seeds 2 and 3 | 142 s |
+| `trace-replay` | 2 | full *(failover)* | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.5% of feasible (3,983 of 4,000 sent, was 3,982), p50 4.7 s, p95 1245 s, optimality p50/p95/p99 1.22/7.55/46.9× (was 8.38/18.0×: fixed 21; pipelining-aware oracle, fixed 12; 10.1× at 54cc562 after the routing changes), overhead 3.26 (was 3.15); seeds 2 and 3: 99.8% and 99.0%, optimality p99 19.9× and 25.5× · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 49 s |
 | `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 53%, 68%, 83%, 92%, 93% | 0 s |
 
 ## 4. Findings
@@ -563,15 +565,43 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
      minutes, others finish sooner. Every other tier-2 scenario gives the
      same numbers, at CI and full size.
 
-   The tier-2 driver feeds both. The node's driver doesn't yet: Iroh's
-   multipath already fails over between a connection's paths at the
-   source, and feeding the core from the node's connections is still to
-   do. Signed per-hop route attestations would stop the lie itself; they
+   The tier-2 driver feeds both from its acknowledgements. The node feeds
+   them from what QUIC authenticated on each mesh path of its connections
+   (`mesh/watch.rs`, `Router::path_feedback`; `docs/ROUTING.md` §6, item
+   13): with real nodes, a relay that keeps announcing a destination and
+   drops everything to and from it is routed around in 6.6 s
+   (`a_relay_that_drops_one_destination_is_routed_around`), and a slow,
+   lossy two-hop route suspects nothing
+   (`a_slow_lossy_route_is_not_suspected`). When a suspicion leaves no
+   feasible route (we advertised the cheap one), a fresh seqno is asked
+   for. Signed per-hop route attestations would stop the lie itself; they
    change the announcement format, so they are planned for the next
    protocol version (`docs/ROUTING.md` §6, item 13). Tests
    `unacknowledged_packets_move_a_destination_off_its_next_hop`
    (`mesh/core/tests.rs`), `a_doubted_route_gets_one_share_of_our_bundle`
    (`mesh/dtn/tests.rs`).
+
+22. **Every router now sees the same world** (was open 12's main
+   cause). Waypoint mobility drew its targets from the random stream that
+   also draws every radio frame's jitter and the routers' own randomness,
+   so anything that changed what was sent changed where everyone walked
+   and who met whom. In `disaster-dtn` at CI size, seed 1, the seven
+   routers compared side by side each had a different world: 3, 11, 5, 11,
+   3, 7 and 12 of the 12 messages had any path at all. Walking devices now
+   have their own stream, seeded from the scenario's (`tier2/engine.rs`):
+   all seven see the same 9 there, and a routing change no longer moves
+   the world. Only `disaster-dtn` has walking devices. Its numbers on the
+   fixed worlds, full size: seeds 1–12 mean 87.2% (was 80.3%), 2–13 mean
+   87.1%, 3–14 mean 86.9% (per seed 77–98%); PRoPHET 67%, spray-and-wait
+   27% and epidemic 100% at seed 1 on the same world as GLOBAL's 90%.
+   Every tier-2 scenario was rerun at CI and full size with seeds 1, 2
+   and 3. Every threshold holds on all three except two:
+   - `adversarial`'s plausible-liar run (open 15);
+   - at CI size only, `disaster-dtn` with seeds 2 and 3 (75% and 75%:
+     6 of 8 and 9 of 12 messages; seed 3 failed on the old worlds too)
+     and `flood-hop-limit` with seed 3 (reach falls from 99% to 95% at
+     hop 7; the same on 4aab57a, before any of this work). The CI tests
+     run seed 1.
 
 ### Open (with evidence)
 
@@ -621,43 +651,10 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    2 one wasn't delivered within 20 s. The walkers separate mid-delivery
    (1.4 m/s, 60 m Bluetooth range); both are within the 80% / 10 s
    targets.
-12. **`disaster-dtn` swings with timing, seed to seed and change to
-   change.** Full size, since fixed 17, seeds 1–12: 60, 90, 82, 73, 92,
-   82, 83, 88, 67, 85, 72, 90% (mean 80.3%); seeds 13–24: mean 86.6%
-   (63–98%), so 83.5% over 24 seeds. At 54cc562, before fixed 17, seeds
-   1–12 averaged 88.8%. What I could tie it to:
-   - **Not what carriers know.** Instrumented, not one receipt was
-     missed: every receipt a device learnt from a summary, it learnt from
-     the first summary that carried it. Repeating the latest receipts in
-     every full summary told receivers nothing new, yet moved the 12-seed
-     mean to 87.0%.
-   - **Timing alone moves it.** 7 meaningless bytes per summary moved the
-     12-seed mean to 86.2%, 200 bytes to 81.7%. Its noise floor is about
-     ±3–6 points.
-   - **Not offers queued behind summaries.** Offers, answers, bundles and
-     their acks wait 7–11 ms on average for the radio (max 0.9–1.9 s;
-     seeds 1 and 9), and none was lost to a link breaking. Contacts here
-     last minutes. Giving them priority over summaries (summaries use only
-     airtime they leave, as a lower-priority QUIC stream would) cut the
-     mean wait to 6.9–9.0 ms. It gave 86.8% on seeds 1–12, but 87.3%
-     against 86.6% on seeds 13–24, so it is noise; not adopted.
-
-   - **The world itself moves.** Waypoint mobility draws its targets
-     from the same random stream as each radio frame's jitter, so any
-     change in what is sent changes where everyone walks and who meets
-     whom. A carrier change (fixed 21's split, applied to every bundle at
-     first) changed how many of the CI-size run's 12 messages had any path
-     from 3 to 9, and its single-seed result from 100% to 78%, while 12
-     CI-size seeds averaged 87.5% against 87.6%. So two routers, or a
-     change and what it replaced, at one seed are compared on different
-     worlds. A separate random stream for mobility would fix that; not
-     done, since it changes every `disaster-dtn` number.
-
-   The full scenario is now judged on the mean of 12 seeds (≥ 80%), with
-   the per-seed spread in its notes. The CI size (0.1, one seed) delivers
-   100%. Still open: which interaction makes single runs this sensitive.
-   Repro: `mycel-sim disaster-dtn` (runs seeds 1–12),
-   `mycel-sim disaster-dtn --seed 13` (13–24).
+12. *(fixed 22: `disaster-dtn`'s swings from change to change were
+   mostly the world moving with the routing. Seed to seed it still
+   varies, 77–98% at full size, which is why it is judged on the mean of
+   12 seeds.)*
 13. **The warm tail left in `global-scale` is pairs in one neighbourhood
    whose mesh route crosses Bluetooth** (after fixed 19, at CI size: all
    3 warm messages over 5× with seed 1, at 15×, 11× and 5.1×; 6 of the 7
@@ -680,9 +677,18 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
      budgeted) is a design question, not a bug.
 
    Repro: `mycel-sim global-scale --scale 0.01 --seed 3`.
-14. *(fixed 21: black holes that lie plausibly; what is left: the node's
-   driver doesn't feed `Router::feedback` and `Carrier::doubt` yet, and
-   signed route attestations wait for the next protocol version.)*
+14. *(fixed 21: black holes that lie plausibly, in the simulator and the
+   node; signed route attestations wait for the next protocol version.)*
+15. **The plausible-liar target holds on seed 1 only.** `adversarial`
+   judges its plausible black holes at ≥ 90%, set from seed 1 (94%, 281
+   of 300). With seed 2 they take delivery to 76% (227 of 300, latency
+   p50 1.04 s, p95 61 s), with seed 3 to 87% (262 of 300); the naive
+   black holes, the storm, the replayer and the Sybil gateway stay at
+   100% on all three. The defences of fixed 21 aren't enough where most of
+   a destination's neighbourhood sits next to a liar: every alternative
+   leads to one too. The target isn't lowered; whether to lower it
+   (seeds 1–3 support about 75%) or strengthen the defence is open.
+   Repro: `mycel-sim adversarial --seed 2`.
 
 ## 5. Benchmarks against external baselines
 
