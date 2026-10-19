@@ -21,7 +21,7 @@
   "dependencies": {
     "@mycel/messaging": "0.1.0",
     "@mycel/sdk": "0.1.0",
-    "@tauri-apps/api": "2.12.1",
+    "@tauri-apps/api": "2.12.3",
     "@tauri-apps/plugin-notification": "2.5.1",
     "qrcode-generator": "^2.0.4",
     "react": "^19.3.0",
