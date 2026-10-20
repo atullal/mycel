@@ -24,15 +24,19 @@ use anyhow::Result;
 use bytes::Bytes;
 use mycel_crypto::SignPk;
 use mycel_net::iroh::endpoint::{Connection, RecvStream, SendDatagramError};
+use mycel_video::realtime;
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc;
 
 use crate::audio::{AudioHandle, AudioIo, AudioPorts};
-use crate::codec::{Decoder, Encoder, FRAME_SAMPLES, MAX_PACKET, SAMPLE_RATE};
+use crate::codec::{Decoder, Encoder, FRAME_MS, FRAME_SAMPLES, MAX_PACKET, SAMPLE_RATE};
 use crate::frame::{AudioFrame, FLAG_MUTED, KIND_AUDIO, StreamDeframer};
 use crate::jitter::{JitterBuffer, JitterStats, Playout};
 use crate::level::meter;
 use crate::proto::CallId;
+
+/// One audio frame.
+const FRAME: Duration = Duration::from_millis(FRAME_MS as u64);
 
 /// Keep this much decoded audio queued for the speaker (~25 ms).
 const PLAYOUT_FILL: usize = FRAME_SAMPLES * 5 / 4;
@@ -208,6 +212,8 @@ impl Media {
         {
             let shared = shared.clone();
             threads.push(std::thread::Builder::new().name("mycel-call-send".into()).spawn(move || {
+                // wakes every 2 ms; encodes a 20 ms frame once per tier in use
+                realtime::promote_current_thread(FRAME, Duration::from_millis(4));
                 let mut pcm = vec![0f32; FRAME_SAMPLES];
                 let mut out = [0u8; MAX_PACKET];
                 let mut encoders: BTreeMap<u32, Encoder> = BTreeMap::new();
@@ -266,6 +272,8 @@ impl Media {
         {
             let shared = shared.clone();
             threads.push(std::thread::Builder::new().name("mycel-call-play".into()).spawn(move || {
+                // wakes every 3 ms; decodes and mixes a frame per peer
+                realtime::promote_current_thread(FRAME, Duration::from_millis(3));
                 let mut pcm = vec![0f32; FRAME_SAMPLES];
                 let mut mix = vec![0f32; FRAME_SAMPLES];
                 while !shared.stop.load(Ordering::Relaxed) {
