@@ -45,6 +45,29 @@ CI retries a failed test twice (`scripts/ci/retry-failed.py`) and flags one
 that then passes as a "Flaky test" warning; one that fails three times fails
 the run.
 
+**Timing on the macOS runner.** The hosted macOS runner is a virtual Mac
+whose jobs run throttled, the way macOS treats a process at utility QoS: the
+kernel coalesces timers, so an ordinary thread's short sleep oversleeps by
+a lot. Measured on the 18-core Mac (`thread::sleep`, 200 samples, p50–p90):
+3 ms takes 4.5 ms normally but 17–27 ms under `taskpolicy -c utility`, and
+10 ms takes 66–90 ms. That is what failed CI: the test camera made 10–13
+frames/s instead of 30, the fake Bluetooth radio moved 5.4 KiB/s instead
+of 40, and calls built up 300 ms of delay. All three reproduce exactly under
+`taskpolicy -c utility` (the radio test gave the same 5.4 KiB/s, 13 % of
+raw). The fixes, now tested that way too:
+- Media threads (a call's send and play threads, the test audio device, the
+  test camera) ask for real-time scheduling (`mycel_video::realtime`, the
+  time-constraint policy Core Audio gives its own I/O threads). A promoted
+  thread's 3 ms sleep takes 3.01 ms (p99 3.04 ms) throttled or not. This
+  matters outside CI too: an app in the background is throttled the same
+  way, and its call must not fall behind.
+- Emulated radios count the time that actually passed, not the time they
+  asked to sleep (fake radio: 30.8 KiB/s throttled, 31.5 KiB/s normal).
+- Tests that time a call (mouth-to-ear latency) run alone in their test
+  binary (`cpu_alone`); the others share the CPU. Throttled, with 18 CPU
+  burners alongside, mouth-to-ear is 75–95 ms 1:1 and 80–100 ms in the
+  3-way call (it was 207 ms when the latency test ran beside nine others).
+
 **Before merging to `main`:** the workspace tests pass twice in a row, clippy
 is clean with `-D warnings`, `cargo fmt --all --check` passes, and `npm run build` passes if TypeScript changed. Iroh, noq,
 swarm-discovery, swift-rs and the notification plugin are vendored with

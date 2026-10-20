@@ -16,6 +16,22 @@ use mycel_trust::Role;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
+/// Tests that time a call (mouth-to-ear latency) run alone: the calls of
+/// other tests running side by side starve them of CPU on a small machine,
+/// and the number then measures the machine, not the call. Every other test
+/// shares the CPU with the rest.
+static CPU: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
+
+/// Take at the top of a test that times a call.
+pub async fn cpu_alone() -> tokio::sync::RwLockWriteGuard<'static, ()> {
+    CPU.write().await
+}
+
+/// Take at the top of every other test.
+pub async fn cpu_shared() -> tokio::sync::RwLockReadGuard<'static, ()> {
+    CPU.read().await
+}
+
 pub struct Host {
     pub node: Arc<Node>,
     pub events: Arc<Mutex<Vec<CallEvent>>>,
