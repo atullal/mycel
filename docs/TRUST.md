@@ -2,8 +2,9 @@
 
 How Mycel decides who may read and write what, with no server to ask. This
 is the layer as implemented in `crates/mycel-crypto`, `crates/mycel-trust`
-and `crates/mycel-sync`; the wire format is version 0 (`mycel/v0/…` context
-strings).
+and `crates/mycel-sync`. Its records are generation 0 (`mycel/v0/…` context
+strings), unchanged by wire version 2; how they would change is in
+[PROTOCOL.md](PROTOCOL.md) §3.10.
 
 > **Rule zero: no custom cryptography.** Only standard, widely reviewed
 > primitives. **This layer has not had an external review.** Don't rely on
@@ -161,7 +162,7 @@ aad_i    = "mycel/v0/stream-chunk" ‖ len(A): u32 LE ‖ A ‖ chunk_size: u32 
 - **Legacy format:** attachments from earlier versions used one-shot `XChaCha20-Poly1305(key, nonce, A, plaintext)`. A blob without the magic prefix is opened that way. Only blobs up to 64 MiB are opened like that, so a hostile reference can't make a peer read a huge blob into memory.
 - Code: `crates/mycel-crypto/src/stream.rs`. Tests cover roundtrip at chunk boundaries (0, 1, chunk − 1, chunk, chunk + 1, many chunks), tampering, wrong key/nonce/AAD, truncation, extension, reordering, duplication and chunk-size changes.
 
-**Transfer.** Blobs are stored per space (`blobs/<space>/<blob>`) and served only to the space's members (stream kind `Blob` on ALPN `mycel/2`). They are streamed between QUIC and disk into `<blob>.part`, in disjoint ranges from every member that has the blob. The receiver checks the BLAKE3 hash of the whole blob before renaming it into place, so a peer can't substitute data. An interrupted transfer resumes from the `.part`, possibly from a different member. The final hash check covers the prefix too, and a bad prefix is discarded and fetched again.
+**Transfer.** Blobs are stored per space (`blobs/<space>/<blob>`) and served only to the space's members (stream kind `Blob` on the node protocol). They are streamed between QUIC and disk into `<blob>.part`, in disjoint ranges from every member that has the blob. The receiver checks the BLAKE3 hash of the whole blob before renaming it into place, so a peer can't substitute data. An interrupted transfer resumes from the `.part`, possibly from a different member. The final hash check covers the prefix too, and a bad prefix is discarded and fetched again.
 
 **Availability and disk use.** There is no size limit and no per-space quota.
 - Blobs up to 16 MiB are pushed to every member as soon as they're posted. Bigger ones are pushed only to keepers, and members fetch them when their user clicks download, from anyone in the space who has them.
@@ -170,11 +171,11 @@ aad_i    = "mycel/v0/stream-chunk" ‖ len(A): u32 LE ‖ A ‖ chunk_size: u32 
 
 ## 8. Transport rules
 
-- **ALPN** `mycel/2`: one connection per pair of devices; sync, cards, ephemeral messages and blobs are QUIC streams on it, labelled by a stream-kind byte. Iroh authenticates the remote node ID, which equals the remote `sign_pk`.
+- **ALPN** `mycel/node/2` (`mycel/2` with a pre-release build, [PROTOCOL.md](PROTOCOL.md)): one connection per pair of devices; sync, cards, ephemeral messages and blobs are QUIC streams on it, labelled by a stream-kind byte. Iroh authenticates the remote node ID, which equals the remote `sign_pk`.
 - **Responders serve a space only to its current members**, including Relays. Requests from non-members are refused.
 - **Sync order:** membership ops first, then envelopes (set difference over full ID inventories).
 - **Everything received is validated by the receiver.** Nothing is trusted because of who sent it.
-- **ALPN** `mycel/mesh/1`: hop connections between nearby devices for multi-hop relaying ([ARCHITECTURE.md](ARCHITECTURE.md) §8). Accepted from anyone nearby: relaying needs no membership. What crosses a relay is the QUIC traffic of a connection between two *other* devices, so the rules above still apply end to end. See §8b.
+- **ALPN** `mycel/mesh/2` (`mycel/mesh/1` with a pre-release build): hop connections between nearby devices for multi-hop relaying ([ARCHITECTURE.md](ARCHITECTURE.md) §8). Accepted from anyone nearby: relaying needs no membership. What crosses a relay is the QUIC traffic of a connection between two *other* devices, so the rules above still apply end to end. See §8b.
 
 ## 8b. Mesh relays: what they can and can't do
 

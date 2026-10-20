@@ -5,8 +5,11 @@ One codebase, five apps: the Tauri host (`apps/host`) with the Rust runtime
 and Linux. The UI is the same web UI everywhere; under 720 px wide it switches
 to the phone layout (tab bar at the bottom).
 
-**Every device must run the same build.** The wire format still changes between
-builds.
+**Run the same build on every device when you can.** Since wire version 2
+([PROTOCOL.md](PROTOCOL.md)) builds negotiate the protocol version, so a
+newer build keeps working with this one and with the pre-release builds
+just before it; older pre-release builds changed formats unannounced. The
+chat rules are still built in, so a space's devices should share them.
 
 Installing, permissions, logs and troubleshooting: [USER_GUIDE.md](USER_GUIDE.md).
 

@@ -100,7 +100,9 @@ To run the current code, build from source.
   SmartScreen needs **More info > Run anyway**.
 - **iPhone and iPad** need a build signed with your own Apple developer
   account (`scripts/package-ios.sh --install`).
-- **Every device you test with needs the same build.**
+- **Use the same build on every device you test with when you can.** Builds
+  negotiate the protocol version ([docs/PROTOCOL.md](docs/PROTOCOL.md)),
+  but older pre-release builds changed formats unannounced.
 
 Installing, permissions, connecting devices, logs and troubleshooting:
 [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
@@ -176,6 +178,7 @@ docs/               the documents below
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | layers, design decisions, what is built, limitations, the mesh and global routing |
 | [TRUST.md](docs/TRUST.md) | the trust layer: threat model, membership, keys, envelopes, resource limits, hardening, limitations |
 | [ROUTING.md](docs/ROUTING.md) | routing: a survey of ~20 protocols, what Mycel reuses, and why |
+| [PROTOCOL.md](docs/PROTOCOL.md) | every wire, signed and on-disk format, its version, and how versions and capabilities are negotiated |
 | [RUNTIME_API.md](docs/RUNTIME_API.md) | the API apps use (Rust, Tauri commands, HTTP) |
 | [RULES_ABI.md](docs/RULES_ABI.md) | the WASM rules ABI |
 | [TESTING.md](docs/TESTING.md) | how to run the tests, what they cover, measured results |

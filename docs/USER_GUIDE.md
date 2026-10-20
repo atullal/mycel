@@ -13,9 +13,11 @@ What works on which platform, and how each was tested, is in
 
 ## 1. Install
 
-**Every device you test with needs the same build.** The wire format still
-changes between builds, and an older build can miss a newer one's messages
-or not see it on the network at all.
+**Use the same build on every device you test with when you can.** Builds
+since wire version 2 negotiate the protocol version with each other and
+with the pre-release builds just before them ([PROTOCOL.md](PROTOCOL.md)),
+but older pre-release builds changed formats unannounced: one can miss a
+newer one's messages or not see it on the network at all.
 
 | Device | File | First launch |
 |---|---|---|
@@ -348,8 +350,8 @@ or script it with `mycel call <command> '<json>'`
   multicast). **Exchange contact codes**: they carry the addresses, so the
   devices connect without discovery. If even that fails, the network blocks
   traffic between devices; switch networks.
-- Check both run the same build: older builds can't see an iPhone running a
-  newer one.
+- Check neither runs an old pre-release build: those can't see an iPhone
+  running a newer one.
 
 **Messages stuck on the clock mark or *sent*.** The other side is offline
 or unreachable. In the Network panel it should show as *Connected* or *On

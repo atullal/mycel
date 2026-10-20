@@ -271,7 +271,10 @@ something changes.
     relay can't claim to be nearer than the signed chain it received
     (SEAD and Ariadne's idea, with our Ed25519 keys). It changes the
     announcement format and costs a signature per hop, so it waits for the
-    next protocol version; `docs/TRUST.md` §8b.
+    next protocol version; `docs/TRUST.md` §8b. The capability bit is
+    registered (`ROUTE_ATTEST`, `docs/PROTOCOL.md` §4): attested
+    announcements will go only to neighbours whose hop hello has it, so
+    unattested hops keep working beside them.
 14. **Short queues under the hops, so control traffic gets through.**
     Announcements, seqno requests, keep-alives and the end-to-end
     connections' acknowledgements share each hop with the bulk data, and
@@ -423,7 +426,10 @@ Data that must arrive later (sync envelopes, message requests) travels as
 
 A bundle is an already-signed, already-encrypted batch of Mycel envelopes
 addressed to a key. Its header (id, source, destination, creation time,
-lifetime, copies) is signed by the source.
+lifetime, copies) is signed by the source. It names its format (header
+version and payload kind, `docs/PROTOCOL.md` §3.6): a carrier refuses a
+header version it can't check, but carries a payload kind it doesn't
+know, and a version 2 bundle is never offered over a version 1 hop.
 - **What carriers learn:** destination key, size and timing; never content.
 - **Per-carrier limits:** a 64 MiB store for others' bundles (a device's
   own bundles don't count against it), a 256 KiB maximum bundle, a 4 MiB
