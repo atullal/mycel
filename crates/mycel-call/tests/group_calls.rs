@@ -18,6 +18,9 @@ use mycel_trust::Role;
 
 /// A tone nobody plays: the noise floor to compare against.
 const NOBODY: f32 = 1_500.0;
+/// Carol's tone where only she may be heard: clear of the harmonics and
+/// intermodulation products of 440 and 660 Hz up to the third order.
+const CAROL: f32 = 990.0;
 
 fn connect_all(devs: &[&Device]) {
     for a in devs {
@@ -128,6 +131,7 @@ fn mixed_burst_latency(from: &Device, to: &Device, hz: f32, period: f64) -> Opti
 
 #[tokio::test(flavor = "multi_thread")]
 async fn group_call_rings_everyone_late_join_and_leaves() {
+    let _cpu = cpu_alone().await;
     let alice = device("alice", TestSource::Bursts { hz: 1000.0, on_ms: 100, period_ms: 500 }, true, &[]).await;
     let bob = device("bob", sine(440.0), true, &[]).await;
     let carol = device("carol", sine(660.0), true, &[]).await;
@@ -246,9 +250,12 @@ async fn group_call_rings_everyone_late_join_and_leaves() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn outsiders_and_removed_members_are_refused() {
+    let _cpu = cpu_shared().await;
     let alice = device("alice", sine(440.0), true, &[]).await;
     let bob = device("bob", sine(660.0), true, &[]).await;
-    let carol = device("carol", sine(880.0), true, &[]).await;
+    // Not 880 Hz: that's both 440's second harmonic and 2×660 − 440, and
+    // the codec's concealment of a late frame puts a little of both there.
+    let carol = device("carol", sine(CAROL), true, &[]).await;
     let eve = device("eve", sine(550.0), true, &[]).await;
     connect_all(&[&alice, &bob, &carol, &eve]);
     let space = group_space(&[&alice, &bob, &carol]).await;
@@ -292,13 +299,17 @@ async fn outsiders_and_removed_members_are_refused() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     let a = talking_to(&alice, &id, 1).expect("alice still talking to bob only");
     assert!(a.participants.iter().all(|p| p.id != carol.hex() || p.state != ParticipantState::Joined));
-    assert!(!hears(&alice, 880.0) && !hears(&bob, 880.0), "nobody hears carol");
+    // Against the other voice, not the noise floor: a late frame's
+    // concealment leaves faint artifacts all over, a real leak is loud.
+    assert_hears(&alice, "alice", &[660.0], &[CAROL]);
+    assert_hears(&bob, "bob", &[440.0], &[CAROL]);
     alice.calls.end(&id).unwrap();
 }
 
 /// No IP at all: three devices on peer-to-peer Wi-Fi only.
 #[tokio::test(flavor = "multi_thread")]
 async fn group_call_over_links_only() {
+    let _cpu = cpu_shared().await;
     let wifi = MemNet::new(5, PathKind::PeerWifi);
     let alice = device("alice", sine(440.0), false, &[&wifi]).await;
     let bob = device("bob", sine(660.0), false, &[&wifi]).await;
