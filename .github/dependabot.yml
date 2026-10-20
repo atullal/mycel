@@ -7,7 +7,10 @@ version: 2
 updates:
   - package-ecosystem: cargo
     directories: ["/", "/rules"]
-    exclude-paths: ["vendor/**"]
+    # No `exclude-paths: ["vendor/**"]`: Dependabot needs the vendored
+    # crates' manifests to resolve the [patch.crates-io] paths ("failed to
+    # read vendor/iroh/Cargo.toml" failed every cargo update). It fetches
+    # path dependencies as support files and never edits them.
     schedule:
       interval: weekly
       day: monday
