@@ -65,6 +65,11 @@ pub fn chat_rules_hash() -> String {
     mycel_rules::RulesHash::of(CHAT_RULES_WASM).to_string()
 }
 const CONTACT_PREFIX: &str = "mycel:";
+/// Contact codes are format 1: `mycel:` + base64url(postcard(card)), then
+/// optional `@hints` (docs/PROTOCOL.md §3.3). A later format is written
+/// `mycel<N>:` (N ≥ 2): this build refuses it with a typed error ("update
+/// Mycel") instead of misreading it, and older builds see no contact code.
+pub const CONTACT_CODE_FORMAT: u32 = 1;
 
 /// Bound unsolicited request metadata independently of blob consent. Accepted
 /// conversations and their sync history are outside these admission limits,
@@ -414,9 +419,28 @@ pub fn decode_contact_code(code: &str) -> Result<ContactCard> {
     Ok(decode_contact_code_with_hints(code)?.0)
 }
 
+/// A contact code's format and what follows its prefix: `mycel:` is format
+/// 1, `mycel<N>:` format N; with no prefix (bare base64), format 1.
+fn contact_code_format(code: &str) -> Result<(u32, &str)> {
+    let Some((digits, body)) = code.strip_prefix("mycel").and_then(|rest| rest.split_once(':')) else {
+        return Ok((CONTACT_CODE_FORMAT, code));
+    };
+    if digits.is_empty() {
+        return Ok((1, body));
+    }
+    match digits.parse::<u32>() {
+        Ok(n) if digits.bytes().all(|b| b.is_ascii_digit()) => Ok((n, body)),
+        _ => bail!("not a Mycel contact code"),
+    }
+}
+
 pub fn decode_contact_code_with_hints(code: &str) -> Result<(ContactCard, Vec<std::net::SocketAddr>)> {
     let code: String = code.split_whitespace().collect();
-    let body = code.strip_prefix(CONTACT_PREFIX).unwrap_or(&code);
+    let (format, body) = contact_code_format(&code)?;
+    if format != CONTACT_CODE_FORMAT {
+        let (what, newest) = ("contact code", CONTACT_CODE_FORMAT);
+        return Err(mycel_net::VersionError::Unsupported { what, version: format, newest }.into());
+    }
     let (card_part, hints) = body.split_once('@').unwrap_or((body, ""));
     let bytes = BASE64URL_NOPAD.decode(card_part.as_bytes()).context("not a Mycel contact code")?;
     let card: ContactCard = postcard::from_bytes(&bytes).context("not a Mycel contact code")?;
@@ -2612,6 +2636,32 @@ fn sample_rate(s: &mut std::collections::VecDeque<(Instant, u64)>, now: Instant,
 
 #[cfg(test)]
 mod tests {
+    /// Contact codes name their format; a later one is refused with a
+    /// typed error, never decoded as this one.
+    #[test]
+    fn contact_codes_carry_their_format() {
+        use super::*;
+        let keys = DeviceKeys::generate();
+        let card = ContactCard::new(&keys, "Alice");
+        let code = encode_contact_code_with_hints(&card, &["127.0.0.1:4433".into()]);
+        assert!(code.starts_with("mycel:"));
+        let (back, hints) = decode_contact_code_with_hints(&code).unwrap();
+        assert_eq!((back, hints.len()), (card.clone(), 1));
+        // bare base64 (what older builds also took)
+        let bare = code.strip_prefix("mycel:").unwrap();
+        assert_eq!(decode_contact_code(bare).unwrap().keys.sign_pk, keys.sign_pk());
+        let newer = code.replacen("mycel:", "mycel2:", 1);
+        let err = decode_contact_code(&newer).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<mycel_net::VersionError>(),
+            Some(&mycel_net::VersionError::Unsupported { what: "contact code", version: 2, newest: 1 })
+        );
+        assert!(err.to_string().contains("update Mycel"), "{err}");
+        for junk in ["mycelx:abc", "mycel-1:abc", "mycel99999999999999:abc", "mycel:!!!"] {
+            assert!(decode_contact_code(junk).is_err(), "{junk}");
+        }
+    }
+
     #[test]
     fn notices_last_until_dismissed() {
         use super::*;
