@@ -1028,6 +1028,14 @@ impl Runtime {
         }
     }
 
+    /// Whether `data_dir` already holds a Mycel profile. Read-only (no lease,
+    /// nothing created): a host started with nobody watching (a phone after a
+    /// reboot, a background catch-up) opens the runtime only for an existing
+    /// profile, never creating one nobody named.
+    pub fn profile_exists(data_dir: &Path) -> Result<bool> {
+        crate::identity::established(data_dir)
+    }
+
     /// The network mode saved by `set_network_mode`, if any; an error if the
     /// saved mode can't be read (see `launch_network_mode`).
     pub fn saved_network_mode(data_dir: &Path) -> Result<Option<NetworkMode>> {
