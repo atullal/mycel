@@ -285,9 +285,26 @@ Bluetooth still completes. Code: `crates/mycel-net/src/resources.rs` and
 | §8–§8d transport, mesh, limits | `crates/mycel-net`, `crates/mycel-node` | End to end over real Iroh QUIC with five nodes (admin, writer, reader, keeper, outsider); forged, renamed and replayed mesh announcements; signed-field cache mutation; stream and frame budgets, stalled and progressing I/O, duplicate requests, invitation validation order, ephemeral limits; attachment consent and disk reservations across restarts |
 
 `scripts/security-check.sh` runs these security tests without retries, then
-the web checks, `npm audit` and `cargo audit --deny unsound`. The Linux
-build depends on GTK's `glib` 0.18, which has an unsoundness advisory
-(RUSTSEC-2024-0429), so that last gate fails.
+the web checks, `npm audit` and the RustSec advisories through cargo-deny
+(`cargo deny check advisories`, the policy in `deny.toml`). CI runs the same
+checks on every pull request and the Audit workflow runs them daily against
+new advisories. Vulnerabilities always fail; so do unmaintained and unsound
+crates, unless `deny.toml` accepts one by ID with the reason Mycel isn't
+exposed and a review date (`.cargo/audit.toml` mirrors the list for
+`cargo audit --deny unsound --deny unmaintained`). As of 2026-10-20 it
+accepts, all on Linux or at build time only:
+
+- RUSTSEC-2024-0429, unsound `glib::VariantStrIter` in glib 0.18, which
+  comes with Tauri's GTK 3 webview: no Tauri release is on gtk-rs 0.19 yet,
+  and nothing in this repository or between it and glib calls that API;
+- RUSTSEC-2026-0370/0371/0372, `zvariant`, `zbus_names` and
+  `zvariant_derive` "unmaintained" since zbus 6 absorbed them; zbus 5 still
+  comes with Tauri's notification and opener plugins;
+- RUSTSEC-2024-0370 and RUSTSEC-2024-0436, the `proc-macro-error` and
+  `paste` proc macros, which never run in a shipped binary.
+
+`zip` was moved to 9.0.5 for RUSTSEC-2026-0367/0368/0369 (extraction
+flaws; Mycel only writes archives, when it zips a shared folder).
 
 ## 9b. Hardening
 
