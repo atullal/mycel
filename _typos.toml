@@ -20,6 +20,8 @@ extend-exclude = [
 [default.extend-identifiers]
 # ancestor (crates/mycel-trust)
 anc = "anc"
+# mach_timebase_info_data_t's numerator field (crates/mycel-video/src/realtime.rs)
+numer = "numer"
 # buffers a and b (tests)
 ba = "ba"
 

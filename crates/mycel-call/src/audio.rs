@@ -142,9 +142,15 @@ pub struct Recording {
 
 /// Software audio paced by the wall clock in 10 ms ticks, like a device with
 /// a 10 ms buffer: the source goes into the call, what the call plays is
-/// recorded.
+/// recorded. [`TestAudio::with_period`] sets another buffer size.
+///
+/// Its thread stands in for a device's I/O thread, so it runs with
+/// real-time priority like one ([`mycel_video::realtime`]): an ordinary
+/// thread's 10 ms sleep can take 60–90 ms on a throttled Mac.
 pub struct TestAudio {
     source: TestSource,
+    /// The "device buffer": audio moves in ticks of this long.
+    period: Duration,
     /// Keep at most this much recording (oldest dropped).
     keep: usize,
     recording: Arc<Mutex<Recording>>,
@@ -153,11 +159,23 @@ pub struct TestAudio {
 }
 
 const TICK: Duration = Duration::from_millis(10);
-const TICK_SAMPLES: usize = (SAMPLE_RATE / 100) as usize;
 
 impl TestAudio {
     pub fn new(source: TestSource) -> TestAudio {
-        TestAudio { source, keep: SAMPLE_RATE as usize * 30, recording: Arc::default(), source_start: Arc::default() }
+        TestAudio {
+            source,
+            period: TICK,
+            keep: SAMPLE_RATE as usize * 30,
+            recording: Arc::default(),
+            source_start: Arc::default(),
+        }
+    }
+
+    /// Move audio in bursts of `period` (1–100 ms) instead of 10 ms, like a
+    /// device with a bigger buffer (some Bluetooth headsets: 40 ms or more).
+    pub fn with_period(mut self, period: Duration) -> TestAudio {
+        self.period = period.clamp(Duration::from_millis(1), Duration::from_millis(100));
+        self
     }
 
     pub fn source(&self) -> TestSource {
@@ -246,11 +264,13 @@ impl AudioIo for TestAudio {
 
     fn open(&self, mut ports: AudioPorts) -> Result<AudioHandle> {
         let stop = Arc::new(AtomicBool::new(false));
-        let (source, keep, recording) = (self.source, self.keep, self.recording.clone());
+        let (source, period, keep, recording) = (self.source, self.period, self.keep, self.recording.clone());
+        let tick_samples = (SAMPLE_RATE as u128 * period.as_micros() / 1_000_000) as usize;
         *recording.lock() = Recording::default();
         let source_start = self.source_start.clone();
         let flag = stop.clone();
         let thread = std::thread::Builder::new().name("mycel-test-audio".into()).spawn(move || {
+            mycel_video::realtime::promote_current_thread(period, Duration::from_millis(1));
             let start = Instant::now();
             *source_start.lock() = Some(start);
             let mut produced: u64 = 0;
@@ -258,12 +278,12 @@ impl AudioIo for TestAudio {
             let mut tick: u32 = 0;
             while !flag.load(Ordering::Relaxed) {
                 tick += 1;
-                let due = start + TICK * tick;
+                let due = start + period * tick;
                 if let Some(wait) = due.checked_duration_since(Instant::now()) {
                     std::thread::sleep(wait);
                 }
                 // "speaker": play one tick's worth
-                let mut played = vec![0f32; TICK_SAMPLES];
+                let mut played = vec![0f32; tick_samples];
                 let _ = ports.speaker.pop_partial_slice(&mut played);
                 {
                     let mut rec = recording.lock();
@@ -279,11 +299,11 @@ impl AudioIo for TestAudio {
                 let mic: Vec<f32> = match source {
                     TestSource::Echo => {
                         echo.extend_from_slice(&played);
-                        echo.drain(..TICK_SAMPLES.min(echo.len())).collect()
+                        echo.drain(..tick_samples.min(echo.len())).collect()
                     }
-                    _ => (0..TICK_SAMPLES as u64).map(|i| TestAudio::sample(source, produced + i)).collect(),
+                    _ => (0..tick_samples as u64).map(|i| TestAudio::sample(source, produced + i)).collect(),
                 };
-                produced += TICK_SAMPLES as u64;
+                produced += tick_samples as u64;
                 let _ = ports.mic.push_partial_slice(&mic);
             }
         })?;
@@ -421,26 +441,54 @@ fn cpal_streams(mut ports: AudioPorts) -> Result<(cpal::Stream, cpal::Stream)> {
 mod tests {
     use super::*;
 
+    /// The test device moves audio at the wall clock's pace. What it made
+    /// is checked against how long it actually ran: this (ordinary) test
+    /// thread's own 300 ms sleep can overrun by 100 ms on a throttled Mac.
     #[test]
     fn test_audio_paces_in_real_time_and_records() {
-        let audio = TestAudio::new(TestSource::Sine { hz: 440.0, amp: 0.5 });
-        let (mic_tx, mut mic_rx) = rtrb::RingBuffer::new(48_000);
-        let (mut spk_tx, spk_rx) = rtrb::RingBuffer::new(48_000);
-        // something to "play": 0.2 s of 300 Hz
-        for i in 0..9_600 {
-            let _ = spk_tx.push(0.4 * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / 48_000.0).sin());
+        for period in [10, 40] {
+            let audio =
+                TestAudio::new(TestSource::Sine { hz: 440.0, amp: 0.5 }).with_period(Duration::from_millis(period));
+            let (mic_tx, mut mic_rx) = rtrb::RingBuffer::new(96_000);
+            let (mut spk_tx, spk_rx) = rtrb::RingBuffer::new(48_000);
+            // something to "play": 0.2 s of 300 Hz
+            for i in 0..9_600 {
+                let _ = spk_tx.push(0.4 * (2.0 * std::f32::consts::PI * 300.0 * i as f32 / 48_000.0).sin());
+            }
+            let h = audio.open(AudioPorts { mic: mic_tx, speaker: spk_rx }).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            let stopping = Instant::now();
+            drop(h);
+            let stopped = Instant::now();
+            // one tick at the end of each period from when the thread started
+            let start = audio.source_start().unwrap();
+            let ticks = |until: Instant| (until - start).as_micros() / (period as u128 * 1000);
+            let tick = 48 * period as usize;
+            let got = mic_rx.slots();
+            assert_eq!(got % tick, 0, "whole ticks");
+            let made = (got / tick) as u128;
+            // (the last tick due before we stopped it may still be on its way)
+            assert!(
+                (ticks(stopping).saturating_sub(1)..=ticks(stopped) + 1).contains(&made),
+                "{period} ms ticks for {:?}: made {made}",
+                stopping - start
+            );
+            assert!(made >= 5, "it ran");
+            let mut mic = vec![0f32; got];
+            mic_rx.pop_entire_slice(&mut mic).unwrap();
+            assert!((estimate_frequency(&mic, 48_000).unwrap() - 440.0).abs() < 2.0);
+            let rec = audio.recording();
+            let rec = rec.lock();
+            assert!((estimate_frequency(&rec.samples[..9_600], 48_000).unwrap() - 300.0).abs() < 2.0);
         }
-        let h = audio.open(AudioPorts { mic: mic_tx, speaker: spk_rx }).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        drop(h);
-        let got = mic_rx.slots();
-        assert!((12_000..17_500).contains(&got), "~0.3 s of mic audio, got {got}");
-        let mut mic = vec![0f32; got];
-        mic_rx.pop_entire_slice(&mut mic).unwrap();
-        assert!((estimate_frequency(&mic, 48_000).unwrap() - 440.0).abs() < 2.0);
-        let rec = audio.recording();
-        let rec = rec.lock();
-        assert!((estimate_frequency(&rec.samples[..9_600], 48_000).unwrap() - 300.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn period_is_clamped() {
+        let src = TestSource::Silence;
+        assert_eq!(TestAudio::new(src).period, TICK);
+        assert_eq!(TestAudio::new(src).with_period(Duration::ZERO).period, Duration::from_millis(1));
+        assert_eq!(TestAudio::new(src).with_period(Duration::from_secs(1)).period, Duration::from_millis(100));
     }
 
     #[test]
