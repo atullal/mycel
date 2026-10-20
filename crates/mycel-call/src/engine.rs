@@ -38,8 +38,10 @@ use crate::proto::CallId;
 /// One audio frame.
 const FRAME: Duration = Duration::from_millis(FRAME_MS as u64);
 
-/// Keep this much decoded audio queued for the speaker (~25 ms).
+/// Keep at least this much decoded audio queued for the speaker (~25 ms).
 const PLAYOUT_FILL: usize = FRAME_SAMPLES * 5 / 4;
+/// ... and at most this much (100 ms), however big the device's bursts.
+const MAX_PLAYOUT_FILL: usize = FRAME_SAMPLES * 5;
 /// If the mic backs up (a stall), drop audio beyond this so we stay live.
 const MIC_BACKLOG: usize = FRAME_SAMPLES * 4;
 const MIC_RING: usize = SAMPLE_RATE as usize;
@@ -276,9 +278,10 @@ impl Media {
                 realtime::promote_current_thread(FRAME, Duration::from_millis(3));
                 let mut pcm = vec![0f32; FRAME_SAMPLES];
                 let mut mix = vec![0f32; FRAME_SAMPLES];
+                let mut cushion = Cushion::default();
                 while !shared.stop.load(Ordering::Relaxed) {
                     let queued = SPEAKER_RING - spk_tx.slots();
-                    if queued >= PLAYOUT_FILL {
+                    if queued >= cushion.observe(queued) {
                         std::thread::sleep(Duration::from_millis(3));
                         continue;
                     }
@@ -309,6 +312,7 @@ impl Media {
                     limit(&mut mix);
                     f32_store(&shared.out_level, meter(&mix));
                     let _ = spk_tx.push_partial_slice(&mix);
+                    cushion.refilled(SPEAKER_RING - spk_tx.slots());
                 }
             })?);
         }
@@ -434,6 +438,48 @@ impl Media {
     }
 }
 
+/// How much decoded audio the play thread keeps queued for the speaker.
+///
+/// The device takes audio in bursts of its buffer size: ~10 ms from Core
+/// Audio, a few ms from AAudio, but 20–40 ms or more from some Bluetooth
+/// headsets and Linux sound servers. A burst bigger than what's queued is
+/// played partly as silence, and every such gap delays the rest of the
+/// call's audio (the jitter buffer then has to trim it back out). So the
+/// play thread keeps the largest recent burst queued, plus a quarter frame
+/// of margin: between [`PLAYOUT_FILL`] (25 ms) and [`MAX_PLAYOUT_FILL`]
+/// (100 ms). A burst is what the device took between two looks at the
+/// queue, so a play thread that wakes late counts too, which is right: the
+/// queue has to cover that as well. The peak halves after ~1.5 s of
+/// smaller bursts, so one hiccup doesn't add delay for the rest of the call.
+#[derive(Debug, Default)]
+struct Cushion {
+    /// Samples queued after the last refill.
+    after_refill: usize,
+    /// Largest recent burst, samples (decaying).
+    peak: f32,
+}
+
+impl Cushion {
+    /// Per look at the queue (every ~3 ms): a half-life of ~1.5 s.
+    const DECAY: f32 = 0.9985;
+
+    /// Note how much is queued now; returns how much should be.
+    fn observe(&mut self, queued: usize) -> usize {
+        let taken = self.after_refill.saturating_sub(queued);
+        self.after_refill = queued;
+        self.peak = (self.peak * Self::DECAY).max(taken as f32);
+        self.target()
+    }
+
+    fn refilled(&mut self, queued: usize) {
+        self.after_refill = queued;
+    }
+
+    fn target(&self) -> usize {
+        (self.peak as usize + FRAME_SAMPLES / 4).clamp(PLAYOUT_FILL, MAX_PLAYOUT_FILL)
+    }
+}
+
 /// Keep the mix within -1..1: scale the frame down if several voices add up
 /// past full scale (no clipping, no distortion at normal levels).
 fn limit(mix: &mut [f32]) {
@@ -471,6 +517,64 @@ mod tests {
         assert_eq!(tier(9_000), 8_000);
         assert_eq!(tier(1_000), 8_000);
         assert_eq!(tier(100_000), 32_000);
+    }
+
+    /// Run a play thread against a device that takes `burst` samples every
+    /// `every` looks; returns the cushion's target and how often the
+    /// device found the queue short.
+    fn drive(cushion: &mut Cushion, burst: usize, every: usize, looks: usize) -> (usize, usize) {
+        let mut queued = cushion.after_refill;
+        let mut short = 0;
+        for n in 0..=looks {
+            // (n = 0: the play thread fills the queue before the device starts)
+            if n > 0 && n % every == 0 {
+                if queued < burst {
+                    short += 1;
+                }
+                // the device can't take more than is queued: the rest is silence
+                queued = queued.saturating_sub(burst);
+            }
+            while queued < cushion.observe(queued) {
+                queued += FRAME_SAMPLES;
+                cushion.refilled(queued);
+            }
+        }
+        (cushion.target(), short)
+    }
+
+    #[test]
+    fn cushion_covers_the_device_bursts() {
+        // Core Audio's ~10 ms: the 25 ms floor
+        let mut c = Cushion::default();
+        let (target, short) = drive(&mut c, 480, 3, 3_000);
+        assert_eq!(target, PLAYOUT_FILL);
+        assert_eq!(short, 0);
+        // a 40 ms Bluetooth burst: the old fixed 25 ms ran short every time
+        let mut c = Cushion::default();
+        let (target, short) = drive(&mut c, 1_920, 13, 3_000);
+        // (the peak decays a little between bursts, staying above one)
+        assert!((1_920..=1_920 + FRAME_SAMPLES / 4).contains(&target), "{target}");
+        assert_eq!(short, 0);
+        // a 60 ms burst: short for the first few bursts, then covered
+        let mut c = Cushion::default();
+        let (target, short) = drive(&mut c, 2_880, 20, 3_000);
+        assert!((2_880..=2_880 + FRAME_SAMPLES / 4).contains(&target), "{target}");
+        assert!(short <= 3, "short {short} times");
+        // never more than 100 ms, whatever the device does
+        let mut c = Cushion::default();
+        let (target, _) = drive(&mut c, 48_000 / 4, 50, 1_000);
+        assert_eq!(target, MAX_PLAYOUT_FILL);
+    }
+
+    #[test]
+    fn cushion_shrinks_back_after_a_hiccup() {
+        let mut c = Cushion::default();
+        drive(&mut c, 3_000, 1, 5);
+        assert!(c.target() > 3_000, "{c:?}");
+        // ~3 s of 10 ms bursts afterwards
+        let (target, short) = drive(&mut c, 480, 3, 1_000);
+        assert_eq!(target, PLAYOUT_FILL);
+        assert_eq!(short, 0);
     }
 
     #[test]
