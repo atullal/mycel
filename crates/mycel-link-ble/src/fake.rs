@@ -12,7 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Weak};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use mycel_crypto::SignPk;
@@ -81,6 +81,11 @@ impl PacketSink for SlowSink {
     }
 }
 
+/// Bytes a radio of `rate` bytes/s sends in `slice`.
+fn airtime(rate: usize, slice: Duration) -> usize {
+    (rate as u128 * slice.as_micros() / 1_000_000) as usize
+}
+
 fn pid(n: usize) -> String {
     format!("p{n}")
 }
@@ -134,12 +139,22 @@ impl Air {
             let weak = Arc::downgrade(&air);
             std::thread::spawn(move || {
                 const SLICE: Duration = Duration::from_millis(5);
+                // Airtime is what actually passed, not what was asked for:
+                // a 5 ms sleep can take 60 ms in a throttled process (a CI
+                // runner), and a fixed per-wake budget then ran the radio at
+                // a tenth of its rate. Capped so a long stall (a debugger)
+                // doesn't release a burst no radio could send.
+                const MAX_SLICE: Duration = Duration::from_millis(250);
+                let mut last = Instant::now();
                 loop {
                     std::thread::sleep(SLICE);
                     let Some(air) = weak.upgrade() else { return };
+                    let now = Instant::now();
+                    let slice = (now - last).min(MAX_SLICE);
+                    last = now;
                     let sinks = air.slow.lock().clone();
                     for s in sinks {
-                        let mut budget = rate * SLICE.as_millis() as usize / 1000;
+                        let mut budget = airtime(rate, slice);
                         let mut q = s.q.lock();
                         while budget > 0 {
                             let Some(chunk) = q.peek() else { break };
@@ -519,6 +534,16 @@ mod tests {
         assert!(goodput > RATE as f64 * 0.3, "QUIC keeps a slow radio reasonably busy");
         alice.shutdown().await.unwrap();
         bob.shutdown().await.unwrap();
+    }
+
+    /// The radio's budget follows the time that actually passed: a wake-up
+    /// that comes late moves proportionally more, so the rate holds.
+    #[test]
+    fn airtime_follows_elapsed_time() {
+        assert_eq!(airtime(40 * 1024, Duration::from_millis(5)), 204);
+        assert_eq!(airtime(40 * 1024, Duration::from_millis(60)), 2_457);
+        assert_eq!(airtime(40 * 1024, Duration::from_secs(1)), 40 * 1024);
+        assert_eq!(airtime(40 * 1024, Duration::ZERO), 0);
     }
 
     /// Three devices that all discover each other at once end up with one
