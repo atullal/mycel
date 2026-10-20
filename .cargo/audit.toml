@@ -1,0 +1,29 @@
+# cargo-audit: the same accepted advisories as deny.toml, which has the full
+# reason for each (CI and the daily Audit workflow run cargo-deny with
+# deny.toml; this file keeps a local `cargo audit` in agreement).
+#
+#   cargo audit --deny unsound --deny unmaintained
+#
+# cargo-audit reads the whole Cargo.lock for every platform; cargo-deny only
+# the platforms Mycel ships on, hence the one extra entry here.
+
+[advisories]
+ignore = [
+  # glib 0.18 via Tauri's GTK 3 webview (Linux): VariantStrIter unused, no
+  # fixed version Tauri can use. Review by 2027-01-31.
+  "RUSTSEC-2024-0429",
+  # Build-time only proc macros: proc-macro-error (glib-macros 0.18, Tauri on
+  # Linux) and paste (netlink-packet-core, Iroh on Linux and Android).
+  "RUSTSEC-2024-0370",
+  "RUSTSEC-2024-0436",
+  # zvariant, zbus_names, zvariant_derive: merged into zbus 6; zbus 5 still
+  # comes with notify-rust and tauri-plugin-opener (Linux). Review by
+  # 2027-01-31.
+  "RUSTSEC-2026-0370",
+  "RUSTSEC-2026-0371",
+  "RUSTSEC-2026-0372",
+  # atomic-polyfill: heapless 0.7 (via postcard) uses it only on AVR or with
+  # its `cas` feature, neither of which Mycel builds; cargo-deny, limited to
+  # the shipping targets, doesn't see it at all.
+  "RUSTSEC-2023-0089",
+]
