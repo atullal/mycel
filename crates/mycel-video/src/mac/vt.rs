@@ -148,7 +148,9 @@ struct Encoded {
     data: Bytes,
 }
 
-type EncOut = mpsc::Sender<Result<Encoded>>;
+/// One message per frame handed to the encoder: the frame, `None` if the
+/// encoder dropped it, or its error.
+type EncOut = mpsc::Sender<Result<Option<Encoded>>>;
 
 unsafe extern "C-unwind" fn on_encoded(
     refcon: *mut c_void,
@@ -167,9 +169,12 @@ unsafe extern "C-unwind" fn on_encoded(
         return;
     }
     if sb.is_null() || flags & kVTEncodeInfo_FrameDropped != 0 {
-        return; // dropped by the encoder's rate control: nothing to send
+        // dropped by the encoder's rate control: say so at once, or the
+        // caller would wait out its timeout for a frame that never comes
+        let _ = tx.send(Ok(None));
+        return;
     }
-    let _ = tx.send(unsafe { read_sample(sb) });
+    let _ = tx.send(unsafe { read_sample(sb) }.map(Some));
 }
 
 /// Pull the frame, its keyframe flag and (on keyframes) its SPS/PPS out of
@@ -212,12 +217,20 @@ unsafe fn read_sample(sb: CMSampleBufferRef) -> Result<Encoded> {
 pub struct H264Encoder {
     session: VTSessionRef,
     out: *mut EncOut,
-    rx: mpsc::Receiver<Result<Encoded>>,
+    rx: mpsc::Receiver<Result<Option<Encoded>>>,
     width: u32,
     height: u32,
     /// `None`: VideoToolbox doesn't say (low-latency mode).
     pub hardware: Option<bool>,
     pub low_latency: bool,
+    /// Frames the encoder's rate control dropped.
+    pub dropped: u32,
+    /// Frames VideoToolbox didn't return in time (neither encoded nor
+    /// dropped): a late one would be mistaken for the next frame's, so the
+    /// session is flushed before the next frame goes in.
+    pub timed_out: u32,
+    /// A frame timed out: drain the session before encoding another.
+    stale: bool,
 }
 
 // SAFETY: a VTCompressionSession may be used from any one thread at a time.
@@ -263,7 +276,18 @@ impl H264Encoder {
             drop(unsafe { Box::from_raw(out) });
             bail!("couldn't create an H.264 encoder for {width}x{height}");
         }
-        let mut enc = H264Encoder { session, out, rx, width, height, hardware: None, low_latency };
+        let mut enc = H264Encoder {
+            session,
+            out,
+            rx,
+            width,
+            height,
+            hardware: None,
+            low_latency,
+            dropped: 0,
+            timed_out: 0,
+            stale: false,
+        };
         unsafe {
             let set = |k: CFStringRef, v: CFTypeRef| VTSessionSetProperty(session, k, v);
             set(kVTCompressionPropertyKey_RealTime, cf_bool(true));
@@ -348,6 +372,12 @@ impl H264Encoder {
     /// Encode one picture (`pts` in µs). Returns the frame, or `None` if the
     /// encoder chose to drop it. `seq` and `capture_us` are left for the caller.
     pub fn encode(&mut self, pb: &PixelBuffer, pts_us: i64, force_key: bool) -> Result<Option<EncodedFrame>> {
+        if self.stale {
+            // whatever the last frame turns out to be, it isn't this one's
+            unsafe { VTCompressionSessionCompleteFrames(self.session, CMTime::INVALID) };
+            while self.rx.try_recv().is_ok() {}
+            self.stale = false;
+        }
         let yes = NSNumber::new_bool(true);
         let props = force_key.then(|| dict(&[(unsafe { kVTEncodeFrameOptionKey_ForceKeyFrame }, &yes)]));
         let mut info = 0u32;
@@ -370,7 +400,10 @@ impl H264Encoder {
         unsafe { VTCompressionSessionCompleteFrames(self.session, CMTime::INVALID) };
         match self.rx.recv_timeout(std::time::Duration::from_millis(200)) {
             Ok(r) => {
-                let e = r?;
+                let Some(e) = r? else {
+                    self.dropped += 1;
+                    return Ok(None);
+                };
                 Ok(Some(EncodedFrame {
                     seq: 0,
                     capture_us: 0,
@@ -381,7 +414,11 @@ impl H264Encoder {
                     data: e.data,
                 }))
             }
-            Err(_) => Ok(None),
+            Err(_) => {
+                self.timed_out += 1;
+                self.stale = true;
+                Ok(None)
+            }
         }
     }
 }
@@ -539,7 +576,7 @@ mod tests {
         for (w, h, bps) in [(1280, 720, 2_500_000), (424, 240, 250_000), (160, 90, 60_000)] {
             let mut enc = H264Encoder::new(w, h, 30, bps).unwrap();
             let mut dec = H264Decoder::default();
-            let (mut bytes, mut made, mut key_bytes) = (0, 0, 0);
+            let (mut bytes, mut made, mut key_bytes) = (0, 0usize, 0);
             let t0 = std::time::Instant::now();
             for n in 0..60u32 {
                 // the source is always 720p; the encoder scales it
@@ -561,13 +598,17 @@ mod tests {
             }
             let per = t0.elapsed() / 60;
             eprintln!(
-                "{w}x{h} @ {bps}: {} made {made}/60, keyframes ~{} B, deltas ~{} B, {:.1} kbit/s at 30 fps, {per:?}/frame encode+decode",
+                "{w}x{h} @ {bps}: {} made {made}/60 (dropped {}, timed out {}), keyframes ~{} B, deltas ~{} B, \
+                 {:.1} kbit/s at 30 fps, {per:?}/frame encode+decode",
                 enc.describe(),
+                enc.dropped,
+                enc.timed_out,
                 key_bytes / 2,
-                (bytes - key_bytes) / (made - 2).max(1),
+                (bytes - key_bytes) / made.saturating_sub(2).max(1),
                 bytes as f64 * 8.0 / 2.0 / 1000.0,
             );
-            assert!(made >= 50, "the encoder dropped {} of 60", 60 - made);
+            assert_eq!(made + enc.dropped as usize + enc.timed_out as usize, 60, "one answer per frame");
+            assert!(made >= 50, "{w}x{h}: made {made} of 60, dropped {}, timed out {}", enc.dropped, enc.timed_out);
         }
     }
 
