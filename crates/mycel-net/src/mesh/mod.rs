@@ -61,7 +61,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use anyhow::Result;
 use bytes::Bytes;
 use iroh::endpoint::transports::{CustomEndpoint, CustomSender, CustomTransport, RecvInfo, Transmit};
-use iroh::endpoint::{Connection, PathId};
+use iroh::endpoint::{ConnectOptions, Connection, PathId};
 use iroh::protocol::{AcceptError, ProtocolHandler};
 use iroh::{Endpoint, EndpointAddr};
 use mycel_crypto::{DeviceKeys, Hash32, SignPk};
@@ -76,9 +76,36 @@ pub use self::wire::{mesh_addr, parse_mesh_addr};
 use crate::link::{
     CustomAddr, Link, LinkEvent, LinkStatus, PathKind, TRANSPORT_MESH, n0_watcher, noq_udp, path_in_use,
 };
+use crate::version::{Hello, PeerProtocol, Protocol, WIRE_V1, WIRE_V2, WireVersion};
 
-/// Hop connections between neighbours (and internet hops to gateways).
-pub const ALPN: &[u8] = b"mycel/mesh/1";
+/// Hop connections between neighbours (and internet hops to gateways), wire
+/// version 2: version 1 plus a capability hello from each side of a hop,
+/// versioned bundle offers, and data-frame flags carried end to end (see
+/// docs/PROTOCOL.md). Dials offer every version the device speaks
+/// ([`alpns`]).
+pub const ALPN: &[u8] = ALPN_V2;
+/// The mesh, wire version 2.
+pub const ALPN_V2: &[u8] = b"mycel/mesh/2";
+/// The mesh as pre-release builds speak it (wire version 1).
+pub const ALPN_V1: &[u8] = b"mycel/mesh/1";
+
+/// The mesh's ALPNs for wire versions `newest` down to the oldest
+/// supported, newest first.
+pub fn alpns(newest: WireVersion) -> Vec<&'static [u8]> {
+    Protocol { version: newest, caps: crate::version::Caps::NONE }
+        .versions()
+        .map(|v| if v >= WIRE_V2 { ALPN_V2 } else { ALPN_V1 })
+        .collect()
+}
+
+/// The wire version a negotiated mesh ALPN stands for.
+pub fn version_of(alpn: &[u8]) -> Option<WireVersion> {
+    match alpn {
+        ALPN_V2 => Some(WIRE_V2),
+        ALPN_V1 => Some(WIRE_V1),
+        _ => None,
+    }
+}
 
 /// Sees each payload a device relays (tests).
 pub type Tap = Arc<dyn Fn(&[u8]) + Send + Sync>;
@@ -160,6 +187,10 @@ pub struct MeshOptions {
     /// announcement; in a crowd, a few well-spread neighbours route as well
     /// as all of them (docs/SIMULATION.md §4, finding 1).
     pub max_neighbours: usize,
+    /// The newest wire version offered on hops and the capabilities
+    /// advertised to neighbours (a node sets it from its own
+    /// `NodeOptions::protocol`).
+    pub protocol: Protocol,
 }
 
 impl Default for MeshOptions {
@@ -179,6 +210,7 @@ impl Default for MeshOptions {
             directory: None,
             store_and_forward: Some(dtn::DtnConfig::default()),
             max_neighbours: 6,
+            protocol: Protocol::default(),
         }
     }
 }
@@ -275,6 +307,9 @@ struct Hop {
     dialed_by_us: bool,
     next_dial: Instant,
     failures: u32,
+    /// What was agreed on `conn`: its wire version, then capabilities once
+    /// the neighbour's hello has arrived.
+    protocol: Option<PeerProtocol>,
 }
 
 impl Hop {
@@ -290,6 +325,7 @@ impl Hop {
             dialed_by_us: false,
             next_dial: now,
             failures: 0,
+            protocol: None,
         }
     }
 
@@ -491,7 +527,7 @@ struct Driver {
     records_published: std::sync::atomic::AtomicU64,
     carrier: Option<Mutex<dtn::Carrier>>,
     /// Where bundles for us go (the node ingests them).
-    bundle_sink: Mutex<Option<mpsc::UnboundedSender<(SignPk, Bytes)>>>,
+    bundle_sink: Mutex<Option<mpsc::UnboundedSender<(SignPk, u16, Bytes)>>>,
     /// Bundles being handed to each neighbour now ([`SENDS_PER_NEIGHBOUR`]).
     sending: Mutex<HashMap<SignPk, HashSet<Hash32>>>,
     /// One of them ended: plan the next without waiting for the tick.
@@ -567,6 +603,21 @@ impl Driver {
 
     fn conn(&self, peer: &SignPk) -> Option<Connection> {
         self.hops.lock().get(peer).and_then(|h| h.live().cloned())
+    }
+
+    /// The wire version of the hop connection to `peer` (1 if unknown).
+    fn hop_version(&self, peer: &SignPk) -> WireVersion {
+        self.hops.lock().get(peer).and_then(|h| h.protocol).map_or(WIRE_V1, |p| p.version)
+    }
+
+    /// Dial a hop connection, offering every mesh version we speak.
+    async fn dial_hop(&self, ep: &Endpoint, peer: SignPk) -> Option<Connection> {
+        let id = iroh::PublicKey::from_bytes(&peer.0).ok()?;
+        let offered = alpns(self.opts.protocol.version);
+        let (first, rest) = offered.split_first()?;
+        let options = ConnectOptions::new().with_additional_alpns(rest.iter().map(|a| a.to_vec()).collect());
+        let connect = async { ep.connect_with_opts(EndpointAddr::new(id), first, options).await.ok()?.await.ok() };
+        tokio::time::timeout(DIAL_TIMEOUT, connect).await.ok().flatten()
     }
 
     fn exec(self: &Arc<Self>, outs: Vec<Out>) {
@@ -753,7 +804,9 @@ impl Driver {
             h.dialed_by_us = conn.side().is_client();
             h.dgram_cap = conn.datagram_send_buffer_space();
             h.failures = 0;
+            h.protocol = Some(PeerProtocol::baseline(version_of(conn.alpn()).unwrap_or(WIRE_V1)));
         }
+        self.send_hello(&conn);
         let direct = self.hops.lock().get(&peer).is_some_and(|h| h.direct);
         self.with_router(|r, now| {
             r.hop_up(peer, now);
@@ -842,11 +895,8 @@ impl Driver {
         for pk in todo {
             let (me, ep) = (self.clone(), ep.clone());
             let task = tokio::spawn(async move {
-                let res = match iroh::PublicKey::from_bytes(&pk.0) {
-                    Ok(id) => tokio::time::timeout(DIAL_TIMEOUT, ep.connect(EndpointAddr::new(id), ALPN)).await.ok(),
-                    Err(_) => None,
-                };
-                let ok = matches!(res, Some(Ok(_)));
+                let res = me.dial_hop(&ep, pk).await;
+                let ok = res.is_some();
                 {
                     let mut hops = me.hops.lock();
                     if let Some(h) = hops.get_mut(&pk) {
@@ -858,7 +908,7 @@ impl Driver {
                         }
                     }
                 }
-                if let Some(Ok(conn)) = res {
+                if let Some(conn) = res {
                     me.add_conn(conn);
                 }
             });
@@ -875,13 +925,9 @@ impl Driver {
         };
         let me = self.clone();
         let task = tokio::spawn(async move {
-            let res = match iroh::PublicKey::from_bytes(&peer.0) {
-                Ok(id) => tokio::time::timeout(DIAL_TIMEOUT, ep.connect(EndpointAddr::new(id), ALPN)).await.ok(),
-                Err(_) => None,
-            };
-            match res {
-                Some(Ok(conn)) => me.add_conn(conn),
-                _ => me.with_router(|r, now| r.dial_failed(peer, now)),
+            match me.dial_hop(&ep, peer).await {
+                Some(conn) => me.add_conn(conn),
+                None => me.with_router(|r, now| r.dial_failed(peer, now)),
             }
         });
         self.keep(task);
@@ -1086,12 +1132,48 @@ impl Driver {
         }
     }
 
+    /// Our capability hello on a new hop connection (version 2 and later):
+    /// a uni-stream of its own, beside everything else.
+    fn send_hello(self: &Arc<Self>, conn: &Connection) {
+        if version_of(conn.alpn()).is_none_or(|v| v < WIRE_V2) {
+            return;
+        }
+        let mut msg = vec![K_HELLO];
+        msg.extend_from_slice(&Hello::ours(self.opts.protocol.caps).encode());
+        let conn = conn.clone();
+        self.keep(tokio::spawn(async move {
+            let open = crate::resources::within(crate::resources::REPLY_TIMEOUT, "no stream", conn.open_uni());
+            if let Ok(mut tx) = open.await {
+                tx.set_priority(1).ok();
+                if crate::resources::write_all(&mut tx, &msg).await.is_ok() {
+                    tx.finish().ok();
+                }
+            }
+        }));
+    }
+
+    /// A neighbour's capability hello: what both of us have on this hop.
+    fn on_hello(&self, from: SignPk, body: &[u8]) -> Result<()> {
+        let theirs = Hello::decode(body)?;
+        let mut hops = self.hops.lock();
+        let Some(h) = hops.get_mut(&from) else { return Ok(()) };
+        if let Some(p) = h.protocol.filter(|p| p.version >= WIRE_V2) {
+            h.protocol = Some(PeerProtocol::agreed(p.version, self.opts.protocol.caps, theirs.caps));
+        }
+        Ok(())
+    }
+
     async fn on_summary_stream(self: Arc<Self>, from: SignPk, mut rx: iroh::endpoint::RecvStream) -> Result<()> {
         // (it ends with the stream: no length first)
         let permit = self.frames.peer(&from).admit(MAX_SUMMARY).await?;
         let idle = crate::resources::IDLE_TIMEOUT;
         let (bytes, _permit) = crate::resources::read_body(&mut rx, MAX_SUMMARY, true, permit, idle).await?;
-        let Some((&K_SUMMARY, body)) = bytes.split_first() else { return Ok(()) };
+        let body = match bytes.split_first() {
+            Some((&K_SUMMARY, body)) => body,
+            Some((&K_HELLO, body)) => return self.on_hello(from, body),
+            // a kind from a newer neighbour: nothing it needs answered
+            _ => return Ok(()),
+        };
         let w: WireSummary = postcard::from_bytes(body)?;
         let s = dtn::Summary {
             full: w.full,
@@ -1121,9 +1203,28 @@ impl Driver {
         let Some(c) = &self.carrier else { return Ok(()) };
         let frames = self.frames.peer(&from);
         let (head, _head_permit) = read_frame(&mut rx, MAX_OFFER, crate::resources::FIRST_FRAME, &frames).await?;
-        let Some((&K_OFFER, body)) = head.split_first() else { return Ok(()) };
-        let w: WireOffer = postcard::from_bytes(body)?;
+        let (format, w): (dtn::BundleFormat, WireOffer) = match head.split_first() {
+            Some((&K_OFFER, body)) => (dtn::BundleFormat::V1, postcard::from_bytes(body)?),
+            Some((&K_OFFER_V2, body)) => {
+                let (format, w): (WireFormat, WireOffer) = postcard::from_bytes(body)?;
+                (dtn::BundleFormat { version: format.version, kind: format.kind }, w)
+            }
+            _ => return Ok(()),
+        };
+        if !format.checkable() {
+            // a header we can't check is one we won't carry (a payload kind
+            // we don't know is fine: carriers never read payloads)
+            write_frame(&mut tx, &crate::wire::encode_bounded(&WireAnswer::Refuse(false), 64)?).await?;
+            tx.finish()?;
+            return Err(crate::version::VersionError::Unsupported {
+                what: "bundle",
+                version: format.version.into(),
+                newest: dtn::BUNDLE_VERSION.into(),
+            }
+            .into());
+        }
         let o = dtn::Offer {
+            format,
             id: w.id,
             src: w.src,
             dst: w.dst,
@@ -1185,6 +1286,7 @@ impl Driver {
             return Ok(());
         }
         let b = dtn::Bundle {
+            format: o.format,
             id: o.id,
             src: o.src,
             dst: o.dst,
@@ -1202,7 +1304,7 @@ impl Driver {
             let sig = self.keys.sign(RECEIPT_CTX, &[&b.id.0]);
             c.lock().add_receipt(dtn::Receipt { id: b.id, dst: self.me, sig });
             if let Some(sink) = self.bundle_sink.lock().as_ref() {
-                let _ = sink.send((b.src, b.payload));
+                let _ = sink.send((b.src, b.format.kind, b.payload));
             }
         }
         Ok(())
@@ -1296,10 +1398,11 @@ impl Driver {
                 continue;
             };
             let me = self.clone();
+            let version = self.hop_version(&t.to);
             self.keep(tokio::spawn(async move {
                 let _slot = slot;
                 let frames = me.frames.peer(&t.to);
-                let sent = send_bundle(&conn, &b, t.copies, &frames).await.unwrap_or(Sent::Failed);
+                let sent = send_bundle(&conn, version, &b, t.copies, &frames).await.unwrap_or(Sent::Failed);
                 if let Some(c) = &me.carrier {
                     let mut c = c.lock();
                     match sent {
@@ -1313,13 +1416,23 @@ impl Driver {
     }
 
     /// Carry `payload` to `dst` whenever it can get there.
-    fn send_bundle(&self, dst: SignPk, payload: Bytes, lifetime: Duration) -> Option<Hash32> {
+    fn send_bundle(
+        &self,
+        dst: SignPk,
+        format: dtn::BundleFormat,
+        payload: Bytes,
+        lifetime: Duration,
+    ) -> Option<Hash32> {
         let c = self.carrier.as_ref()?;
-        let id = bundle_id(&self.me, &dst, &payload);
+        if !format.checkable() {
+            return None;
+        }
+        let id = bundle_id_of(format, &self.me, &dst, &payload);
         let created = wall_ms();
         let lifetime = lifetime.as_millis() as u64;
-        let sig = self.keys.sign(BUNDLE_CTX, &[&id.0, &created.to_be_bytes(), &lifetime.to_be_bytes()]);
-        let b = dtn::Bundle { id, src: self.me, dst, created, lifetime, payload, sig };
+        let (ctx, head) = bundle_signed(format);
+        let sig = self.keys.sign(ctx, &[&head, &id.0, &created.to_be_bytes(), &lifetime.to_be_bytes()]);
+        let b = dtn::Bundle { format, id, src: self.me, dst, created, lifetime, payload, sig };
         c.lock().originate(b, self.now()).ok()?;
         Some(id)
     }
@@ -1515,12 +1628,32 @@ impl Mesh {
     /// along any live part of the way, toward the internet, to its
     /// gateways' mailboxes. `None` if store-and-forward is off.
     pub fn send_bundle(&self, dst: SignPk, payload: Bytes, lifetime: Duration) -> Option<Hash32> {
-        self.d.send_bundle(dst, payload, lifetime)
+        self.d.send_bundle(dst, dtn::BundleFormat::V1, payload, lifetime)
     }
 
-    /// Where bundles for us go: `(source, payload)`.
-    pub fn set_bundle_sink(&self, tx: mpsc::UnboundedSender<(SignPk, Bytes)>) {
+    /// [`Mesh::send_bundle`] in another format: a version 2 bundle names its
+    /// payload kind, and carriers older than version 2 don't take it (so
+    /// it travels only through carriers that speak version 2). `None` also
+    /// for a format this build can't sign.
+    pub fn send_bundle_as(
+        &self,
+        dst: SignPk,
+        format: dtn::BundleFormat,
+        payload: Bytes,
+        lifetime: Duration,
+    ) -> Option<Hash32> {
+        self.d.send_bundle(dst, format, payload, lifetime)
+    }
+
+    /// Where bundles for us go: `(source, payload kind, payload)`.
+    pub fn set_bundle_sink(&self, tx: mpsc::UnboundedSender<(SignPk, u16, Bytes)>) {
         *self.d.bundle_sink.lock() = Some(tx);
+    }
+
+    /// What was agreed with a neighbour on our hop connection to it: the
+    /// wire version, and the capabilities once its hello has arrived.
+    pub fn neighbour_protocol(&self, peer: &SignPk) -> Option<PeerProtocol> {
+        self.d.hops.lock().get(peer).filter(|h| h.live().is_some()).and_then(|h| h.protocol)
     }
 
     pub fn dtn_stats(&self) -> dtn::DtnStats {
@@ -1652,10 +1785,18 @@ impl ProtocolHandler for MeshProtocol {
 
 // ───────────────────────────── store and forward ─────────────────────────────
 
+/// Bundle ids and signatures, version 1 (the context predates versioning).
 const BUNDLE_CTX: &str = "mycel/v0/dtn-bundle";
+/// Version 2 signatures (over the format too) and ids (over the kind too).
+const BUNDLE_V2_CTX: &str = "mycel/v2/dtn-bundle";
+const BUNDLE_V2_ID_CTX: &str = "mycel/v2/dtn-bundle-id";
 const RECEIPT_CTX: &str = "mycel/v0/dtn-receipt";
+/// Uni-stream kinds (first byte): a summary; a capability hello (v2).
 const K_SUMMARY: u8 = 1;
+const K_HELLO: u8 = 2;
+/// Bi-stream kinds: a bundle offer; a versioned one (v2 hops).
 const K_OFFER: u8 = 3;
+const K_OFFER_V2: u8 = 4;
 const MAX_SUMMARY: usize = 256 * 1024;
 const MAX_OFFER: usize = 1024;
 const DTN_EVERY: Duration = Duration::from_secs(1);
@@ -1678,6 +1819,13 @@ struct WireOffer {
     lifetime: u64,
     sig: mycel_crypto::Sig,
     copies: u8,
+}
+
+/// What a [`K_OFFER_V2`] offer adds in front of the offer itself.
+#[derive(Serialize, Deserialize)]
+struct WireFormat {
+    version: u8,
+    kind: u16,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1712,16 +1860,58 @@ struct WireSummary {
     wants: Vec<SignPk>,
 }
 
-/// A bundle's id: the same data for the same destination is the same bundle.
+/// A bundle's id: the same data for the same destination is the same bundle
+/// (a version 1 bundle: what [`Mesh::send_bundle`] sends).
 pub fn bundle_id(src: &SignPk, dst: &SignPk, payload: &[u8]) -> Hash32 {
-    let mut h = mycel_crypto::Digest::new(BUNDLE_CTX);
+    bundle_id_of(dtn::BundleFormat::V1, src, dst, payload)
+}
+
+/// A bundle's id in `format`: version 2 ids also cover the payload kind,
+/// so the same bytes as another kind are another bundle.
+pub fn bundle_id_of(format: dtn::BundleFormat, src: &SignPk, dst: &SignPk, payload: &[u8]) -> Hash32 {
+    let mut h = if format.version == dtn::BUNDLE_V1 {
+        mycel_crypto::Digest::new(BUNDLE_CTX)
+    } else {
+        let mut h = mycel_crypto::Digest::new(BUNDLE_V2_ID_CTX);
+        h.update(&format.kind.to_be_bytes());
+        h
+    };
     h.update(&src.0).update(&dst.0).update(payload);
     h.finalize()
 }
 
+/// The signature context of a bundle header in `format`, and what is
+/// signed before `(id, created, lifetime)`: nothing in version 1, the
+/// version and kind in version 2. (Only for formats that are checkable.)
+fn bundle_signed(format: dtn::BundleFormat) -> (&'static str, Vec<u8>) {
+    if format.version == dtn::BUNDLE_V1 {
+        (BUNDLE_CTX, Vec::new())
+    } else {
+        let k = format.kind.to_be_bytes();
+        (BUNDLE_V2_CTX, vec![format.version, k[0], k[1]])
+    }
+}
+
+/// The source's signature over a bundle header, in its format's rules.
+fn bundle_sig_ok(
+    format: dtn::BundleFormat,
+    src: &SignPk,
+    id: &Hash32,
+    created: u64,
+    lifetime: u64,
+    sig: &mycel_crypto::Sig,
+) -> bool {
+    if !format.checkable() {
+        return false;
+    }
+    let (ctx, head) = bundle_signed(format);
+    src.verify(ctx, &[&head, &id.0, &created.to_be_bytes(), &lifetime.to_be_bytes()], sig).is_ok()
+}
+
 fn verify_bundle(b: &dtn::Bundle) -> bool {
-    b.id == bundle_id(&b.src, &b.dst, &b.payload)
-        && b.src.verify(BUNDLE_CTX, &[&b.id.0, &b.created.to_be_bytes(), &b.lifetime.to_be_bytes()], &b.sig).is_ok()
+    b.format.checkable()
+        && b.id == bundle_id_of(b.format, &b.src, &b.dst, &b.payload)
+        && bundle_sig_ok(b.format, &b.src, &b.id, b.created, b.lifetime, &b.sig)
         && b.created.saturating_add(b.lifetime) > wall_ms()
 }
 
@@ -1730,7 +1920,7 @@ fn verify_receipt(r: &dtn::Receipt) -> bool {
 }
 
 fn verify_offer(o: &dtn::Offer) -> bool {
-    o.src.verify(BUNDLE_CTX, &[&o.id.0, &o.created.to_be_bytes(), &o.lifetime.to_be_bytes()], &o.sig).is_ok()
+    bundle_sig_ok(o.format, &o.src, &o.id, o.created, o.lifetime, &o.sig)
         && o.created.saturating_add(o.lifetime) > wall_ms()
 }
 
@@ -1744,10 +1934,12 @@ enum Sent {
     Refused(bool),
 }
 
-/// Hand a bundle over a hop connection: offer it, and send the payload
-/// (the rest of it, if an earlier transfer was cut) only if it is wanted.
+/// Hand a bundle over a hop connection of wire `version`: offer it, and
+/// send the payload (the rest of it, if an earlier transfer was cut) only
+/// if it is wanted. A version 1 hop only takes version 1 bundles.
 async fn send_bundle(
     conn: &Connection,
+    version: WireVersion,
     b: &dtn::Bundle,
     copies: u8,
     frames: &crate::resources::PeerFrames,
@@ -1762,8 +1954,19 @@ async fn send_bundle(
         sig: b.sig,
         copies,
     };
-    let mut msg = vec![K_OFFER];
-    msg.extend_from_slice(&crate::wire::encode_bounded(&offer, MAX_OFFER - 1)?);
+    let msg = if version >= WIRE_V2 {
+        let format = WireFormat { version: b.format.version, kind: b.format.kind };
+        let mut msg = vec![K_OFFER_V2];
+        msg.extend_from_slice(&crate::wire::encode_bounded(&(format, offer), MAX_OFFER - 1)?);
+        msg
+    } else if b.format == dtn::BundleFormat::V1 {
+        let mut msg = vec![K_OFFER];
+        msg.extend_from_slice(&crate::wire::encode_bounded(&offer, MAX_OFFER - 1)?);
+        msg
+    } else {
+        // (it would take it as a version 1 bundle and find the signature bad)
+        return Ok(Sent::Refused(false));
+    };
     // (waits while the neighbour has as many streams from us as it allows)
     let (mut tx, mut rx) =
         crate::resources::within(crate::resources::REPLY_TIMEOUT, "no stream", conn.open_bi()).await?;

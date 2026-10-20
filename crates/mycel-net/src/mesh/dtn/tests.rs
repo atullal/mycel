@@ -16,7 +16,16 @@ fn bundle(src: SignPk, dst: SignPk, n: u8, lifetime: u64) -> Bundle {
     idb[0] = n;
     idb[1..5].copy_from_slice(&src.0[..4]);
     idb[5..9].copy_from_slice(&dst.0[..4]);
-    Bundle { id: Hash32(idb), src, dst, created: 0, lifetime, payload: Bytes::from(vec![n; 1000]), sig: Sig([0; 64]) }
+    Bundle {
+        format: BundleFormat::V1,
+        id: Hash32(idb),
+        src,
+        dst,
+        created: 0,
+        lifetime,
+        payload: Bytes::from(vec![n; 1000]),
+        sig: Sig([0; 64]),
+    }
 }
 
 struct World {

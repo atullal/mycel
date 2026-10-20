@@ -19,6 +19,12 @@ pub(crate) const T_OGMS: u8 = 4;
 pub const DATA_HDR: usize = 3 + 32 * 3 + 4 + 2 + 2;
 const F_REACHED: u8 = 1;
 const F_CONTROL: u8 = 2;
+/// Flag bits not assigned yet (wire version 2): relays carry them
+/// unchanged and a destination ignores the ones it doesn't know, so a later
+/// version can mark frames end to end without upgrading every relay. A
+/// change relays must understand needs a new datagram type, sent only to
+/// neighbours whose hello has the capability for it.
+pub const F_EXTENSIONS: u8 = !(F_REACHED | F_CONTROL);
 /// QUIC's minimum MTU, and the largest packet the mesh carries: bigger ones
 /// (MTU probes) are dropped, so end-to-end connections stay at 1200 bytes.
 /// A hop's own MTU varies (it falls back to 1200 after loss); a 1200-byte
@@ -209,7 +215,7 @@ pub fn decode_seqreq(b: &[u8]) -> Option<SeqReq> {
 fn header(f: &Frame, offset: u16, b: &mut BytesMut) {
     b.put_u8(T_DATA);
     b.put_u8(f.ttl);
-    b.put_u8(if f.reached { F_REACHED } else { 0 } | if f.control { F_CONTROL } else { 0 });
+    b.put_u8(if f.reached { F_REACHED } else { 0 } | if f.control { F_CONTROL } else { 0 } | (f.ext & F_EXTENSIONS));
     b.put_slice(&f.dst.0);
     b.put_slice(&f.src.0);
     b.put_slice(&f.waypoint.0);
@@ -254,6 +260,7 @@ pub fn decode_frame(b: Bytes) -> Option<Frame> {
         ttl: b[1],
         reached: b[2] & F_REACHED != 0,
         control: b[2] & F_CONTROL != 0,
+        ext: b[2] & F_EXTENSIONS,
         dst: pk(3)?,
         src: pk(35)?,
         waypoint: pk(67)?,
@@ -331,6 +338,7 @@ mod tests {
             ttl: 5,
             reached: true,
             control: true,
+            ext: 0,
             dst: a,
             src: b,
             waypoint: b,
@@ -341,5 +349,15 @@ mod tests {
         };
         let d = decode_frame(encode_frame(&f, 1200).unwrap().remove(0)).unwrap();
         assert!(d.reached && d.control && d.ttl == 5 && d.id == 9 && &d.payload[..] == b"abc");
+        assert_eq!(d.ext, 0);
+        // flags a later version assigns survive the trip, in every fragment
+        let marked = Frame { ext: 0x84, total: 600, payload: Bytes::from(vec![7; 600]), ..f };
+        let grams = encode_frame(&marked, 400).unwrap();
+        assert!(grams.len() > 1);
+        assert!(grams.into_iter().map(|g| decode_frame(g).unwrap()).all(|d| d.ext == 0x84 && d.reached && d.control));
+        // ... and never pass for the flags this version assigns
+        let only_ext = Frame { reached: false, control: false, ext: 0xff, ..marked };
+        let d = decode_frame(encode_frame(&only_ext, 1200).unwrap().remove(0)).unwrap();
+        assert!(!d.reached && !d.control && d.ext == F_EXTENSIONS);
     }
 }

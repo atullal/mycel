@@ -11,6 +11,7 @@ use mycel_crypto::DeviceKeys;
 
 use super::{ALPN, Mesh, MeshOptions};
 use crate::link::{Link, MemNet, PathKind, transport_config};
+use crate::version::{Caps, PeerProtocol, Protocol, WIRE_V1, WIRE_V2};
 
 const PLAIN: &[u8] = b"test/plain";
 
@@ -62,6 +63,48 @@ async fn device(keys: Arc<DeviceKeys>, only: PathKind, nets: &[&MemNet]) -> Devi
     let routes = Routes::builder(ep.clone()).accept(ALPN, mesh.protocol()).accept(PLAIN, Hold).spawn();
     mesh.attach(ep.clone());
     Device { keys, ep, mesh, _routes: routes }
+}
+
+/// A device on one medium that speaks `protocol` on its hops, and carries
+/// bundles for others.
+async fn versioned(protocol: Protocol, net: &MemNet) -> Device {
+    let keys = Arc::new(DeviceKeys::generate());
+    let alpns = super::alpns(protocol.version);
+    let ep = Endpoint::builder(presets::Minimal)
+        .secret_key(SecretKey::from_bytes(&keys.seed()))
+        .relay_mode(RelayMode::Disabled)
+        .clear_ip_transports()
+        .transport_config(transport_config())
+        .alpns(alpns.iter().map(|a| a.to_vec()).collect())
+        .add_custom_transport(net.link(keys.sign_pk()).transport())
+        .bind()
+        .await
+        .unwrap();
+    let mesh = Mesh::new(keys.clone(), "test", MeshOptions { protocol, ..MeshOptions::default() });
+    let mut routes = Routes::builder(ep.clone());
+    for alpn in alpns {
+        routes = routes.accept(alpn, mesh.protocol());
+    }
+    let routes = routes.spawn();
+    mesh.attach(ep.clone());
+    Device { keys, ep, mesh, _routes: routes }
+}
+
+/// `a` and `b` are in range of each other on `net`: wait for their hop.
+async fn neighbours(net: &MemNet, a: &Device, b: &Device) {
+    let (pa, pb) = (a.keys.sign_pk(), b.keys.sign_pk());
+    for (from, to) in [(a, b), (b, a)] {
+        let found = iroh::address_lookup::MemoryLookup::new();
+        let addr = TransportAddr::Custom(net.addr_of(&to.keys.sign_pk()));
+        found.add_endpoint_info(EndpointAddr::from_parts(to.ep.id(), [addr]));
+        from.ep.address_lookup().unwrap().add(found);
+    }
+    a.mesh.set_direct(pb, true);
+    b.mesh.set_direct(pa, true);
+    eventually("the hop is up on both ends", || {
+        a.mesh.connected_neighbours().contains(&pb) && b.mesh.connected_neighbours().contains(&pa)
+    })
+    .await;
 }
 
 async fn eventually(what: &str, mut f: impl FnMut() -> bool) {
@@ -139,6 +182,88 @@ async fn a_hop_the_neighbour_dialed_has_a_cost_and_a_window() {
     for c in [&b_to_a, &a_to_b] {
         c.close(0u32.into(), b"done");
     }
+}
+
+/// Hops between current devices run version 2 and agree on the
+/// capabilities both have (unknown bits ignored); a hop to a pre-release
+/// device runs version 1, with none, whoever dials it.
+#[tokio::test(flavor = "multi_thread")]
+async fn hops_negotiate_versions_and_capabilities() {
+    let net = MemNet::new(1, PathKind::Bluetooth);
+    let future = Caps::from_bits(1 << 41);
+    let a = versioned(Protocol { version: WIRE_V2, caps: Caps::ROUTE_ATTEST | Caps::SYNC_V2 | future }, &net).await;
+    let b = versioned(Protocol { version: WIRE_V2, caps: Caps::ROUTE_ATTEST }, &net).await;
+    let old = versioned(Protocol { version: WIRE_V1, caps: Caps::ROUTE_ATTEST }, &net).await;
+    let (pa, pb, po) = (a.keys.sign_pk(), b.keys.sign_pk(), old.keys.sign_pk());
+    neighbours(&net, &a, &b).await;
+    neighbours(&net, &a, &old).await;
+    neighbours(&net, &b, &old).await;
+    let agreed = |d: &Device, peer| d.mesh.neighbour_protocol(&peer).is_some_and(|p| !p.caps.is_empty());
+    eventually("both hellos on the a–b hop", || agreed(&a, pb) && agreed(&b, pa)).await;
+    for (d, peer) in [(&a, pb), (&b, pa)] {
+        let p = d.mesh.neighbour_protocol(&peer).unwrap();
+        assert_eq!((p.version, p.caps), (WIRE_V2, Caps::ROUTE_ATTEST), "{p:?}");
+    }
+    assert!(b.mesh.neighbour_protocol(&pa).unwrap().advertised.contains(future));
+    for (d, peer) in [(&a, po), (&old, pa), (&b, po), (&old, pb)] {
+        assert_eq!(d.mesh.neighbour_protocol(&peer), Some(PeerProtocol::baseline(WIRE_V1)));
+    }
+}
+
+/// Bundle formats across hops (docs/PROTOCOL.md §3.6): a carrier takes and
+/// carries a version 2 bundle whose payload kind it doesn't know (it never
+/// reads payloads), refuses a header version it can't check, and a
+/// version 1 hop is never offered a version 2 bundle (version 1 bundles
+/// still cross it).
+#[tokio::test(flavor = "multi_thread")]
+async fn bundles_cross_hops_by_their_format() {
+    use super::dtn::{Bundle, BundleFormat};
+    use super::{Sent, bundle_id_of, bundle_signed, send_bundle, wall_ms};
+    let net = MemNet::new(1, PathKind::Bluetooth);
+    let a = versioned(Protocol::default(), &net).await;
+    let b = versioned(Protocol::default(), &net).await;
+    let old = versioned(Protocol { version: WIRE_V1, caps: Caps::NONE }, &net).await;
+    neighbours(&net, &a, &b).await;
+    neighbours(&net, &a, &old).await;
+    let far = DeviceKeys::generate().sign_pk(); // the destination, out of range
+    let signed = |format: BundleFormat, payload: &'static [u8]| {
+        let id = bundle_id_of(format, &a.keys.sign_pk(), &far, payload);
+        let (created, lifetime) = (wall_ms(), 600_000u64);
+        let (ctx, head) = if format.checkable() { bundle_signed(format) } else { ("mycel/v9/unknown", vec![]) };
+        let sig = a.keys.sign(ctx, &[&head, &id.0, &created.to_be_bytes(), &lifetime.to_be_bytes()]);
+        let src = a.keys.sign_pk();
+        Bundle { format, id, src, dst: far, created, lifetime, payload: bytes::Bytes::from_static(payload), sig }
+    };
+    let frames = crate::resources::PeerFrames::unbudgeted();
+    let to_b = a.mesh.d.conn(&b.keys.sign_pk()).unwrap();
+    let to_old = a.mesh.d.conn(&old.keys.sign_pk()).unwrap();
+
+    let unknown_kind = signed(BundleFormat::v2(0x7777), b"a payload kind from a later version");
+    assert!(matches!(send_bundle(&to_b, WIRE_V2, &unknown_kind, 1, &frames).await.unwrap(), Sent::Took));
+    assert!(b.mesh.holds_bundle(&unknown_kind.id), "carried, unread");
+
+    let unknown_version = signed(BundleFormat { version: 9, kind: 1 }, b"a header from a later version");
+    assert!(matches!(send_bundle(&to_b, WIRE_V2, &unknown_version, 1, &frames).await.unwrap(), Sent::Refused(false)));
+    assert!(!b.mesh.holds_bundle(&unknown_version.id));
+
+    let v2 = signed(BundleFormat::v2(super::dtn::KIND_SPACE_SYNC), b"version 2");
+    assert!(matches!(send_bundle(&to_old, WIRE_V1, &v2, 1, &frames).await.unwrap(), Sent::Refused(false)));
+    let v1 = signed(BundleFormat::V1, b"version 1");
+    assert!(matches!(send_bundle(&to_old, WIRE_V1, &v1, 1, &frames).await.unwrap(), Sent::Took));
+    assert!(old.mesh.holds_bundle(&v1.id) && !old.mesh.holds_bundle(&v2.id));
+    // and a version 1 bundle over a version 2 hop
+    let v1b = signed(BundleFormat::V1, b"version 1 again");
+    assert!(matches!(send_bundle(&to_b, WIRE_V2, &v1b, 1, &frames).await.unwrap(), Sent::Took));
+    assert!(b.mesh.holds_bundle(&v1b.id));
+    // a carrier only signs what it can check
+    assert!(
+        a.mesh
+            .send_bundle_as(far, BundleFormat { version: 9, kind: 1 }, v1.payload.clone(), Duration::from_secs(60))
+            .is_none()
+    );
+    assert!(
+        a.mesh.send_bundle_as(far, BundleFormat::v2(0x7777), v1.payload.clone(), Duration::from_secs(60)).is_some()
+    );
 }
 
 /// The queue management on a hop ([`super::Aqm`]), on a fake clock: a brief
