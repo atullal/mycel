@@ -62,8 +62,16 @@ use anyhow::{Result, bail};
 use mycel_crypto::{Hash32, SignPk};
 use serde::{Deserialize, Serialize};
 
+/// The call protocol, major version 1 (docs/PROTOCOL.md §3.8). A change an
+/// older build would misread gets a new ALPN, offered beside this one.
 pub const ALPN_CALL: &[u8] = b"mycel/call/1";
+/// The minor revision within [`ALPN_CALL`], sent in `Ring`, `Join` and
+/// `Watch`. A newer one only adds what older builds may skip: control
+/// messages they don't know are passed over ([`recv`]), not fatal.
 pub const VERSION: u16 = 1;
+/// How many [`Ctrl`] variants this build knows (a message whose tag is past
+/// them comes from a newer minor revision).
+const KNOWN_CTRL: u32 = 16;
 /// Most people in one call (you included).
 pub const MAX_PARTICIPANTS: usize = 8;
 /// Control messages are tiny; refuse anything bigger.
@@ -177,21 +185,35 @@ pub async fn send(tx: &mut mycel_net::iroh::endpoint::SendStream, msg: &Ctrl) ->
     Ok(())
 }
 
+/// Whether `body` is a control message of a newer minor revision: one
+/// whose variant tag this build doesn't have.
+fn from_newer_revision(body: &[u8]) -> bool {
+    postcard::take_from_bytes::<u32>(body).is_ok_and(|(tag, _)| tag >= KNOWN_CTRL)
+}
+
 /// The next control message; `None` when the peer finished the stream.
+/// Messages from a newer minor revision ([`VERSION`]) are skipped; a
+/// malformed message is an error.
 pub async fn recv(rx: &mut mycel_net::iroh::endpoint::RecvStream) -> Result<Option<Ctrl>> {
-    let mut len = [0u8; 2];
-    match rx.read_exact(&mut len).await {
-        Ok(()) => {}
-        Err(mycel_net::iroh::endpoint::ReadExactError::FinishedEarly(0)) => return Ok(None),
-        Err(e) => return Err(e.into()),
+    loop {
+        let mut len = [0u8; 2];
+        match rx.read_exact(&mut len).await {
+            Ok(()) => {}
+            Err(mycel_net::iroh::endpoint::ReadExactError::FinishedEarly(0)) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        }
+        let len = u16::from_le_bytes(len) as usize;
+        if len > MAX_CTRL {
+            bail!("control message too large");
+        }
+        let mut buf = vec![0u8; len];
+        rx.read_exact(&mut buf).await?;
+        match Ctrl::decode(&buf) {
+            Ok(msg) => return Ok(Some(msg)),
+            Err(_) if from_newer_revision(&buf) => continue,
+            Err(e) => return Err(e),
+        }
     }
-    let len = u16::from_le_bytes(len) as usize;
-    if len > MAX_CTRL {
-        bail!("control message too large");
-    }
-    let mut buf = vec![0u8; len];
-    rx.read_exact(&mut buf).await?;
-    Ctrl::decode(&buf).map(Some)
 }
 
 #[cfg(test)]
@@ -235,6 +257,15 @@ mod tests {
             assert_eq!(Ctrl::decode(&wire[2..]).unwrap(), m);
         }
         assert!(Ctrl::decode(&[0xff, 0xff, 0xff]).is_err());
+        // the last variant has the last known tag: KNOWN_CTRL is current
+        let last = Ctrl::Roster { joined: vec![] }.encode();
+        assert_eq!(postcard::take_from_bytes::<u32>(&last[2..]).unwrap().0, KNOWN_CTRL - 1);
+        assert!(!from_newer_revision(&last[2..]));
+        // a newer revision's message is recognised as such (and skipped by
+        // `recv`); garbage is not
+        assert!(from_newer_revision(&[KNOWN_CTRL as u8, 1, 2, 3]));
+        assert!(Ctrl::decode(&[KNOWN_CTRL as u8, 1, 2, 3]).is_err());
+        assert!(!from_newer_revision(&[0xff, 0xff, 0xff]));
         assert!(Ctrl::decode(&vec![0; MAX_CTRL + 1]).is_err());
         // a full roster stays far below the size limit
         let roster = Ctrl::Roster { joined: vec![SignPk([9; 32]); MAX_PARTICIPANTS] };
