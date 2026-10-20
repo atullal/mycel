@@ -90,7 +90,7 @@ committed.
 | `mycel-link-awdl` | Control datagrams, TXT records, interface filtering; plus 2 ignored Bonjour loopback tests (`-- --ignored`) |
 | `mycel-link-ble` | Framing, bounded queues, connection state machine (who dials, duplicates, timeouts, backoff, address rotation), fake-radio sync between real nodes with IP off, hours of simulated faults between two devices, macOS stream code over in-process pipes; the fake radio's rate holds when its thread wakes late |
 | `mycel-link-iface` | Interface classification (medium from type and name, software interfaces skipped, ordinary NICs left to IP), environment overrides, beacons; a sync over a real interface with IP off, one path per interface |
-| `mycel-kit-chat` | Author-only edits/deletes, reactions, receipts/unread, admin-only meta, garbage tolerance, thread merging, alerts |
+| `mycel-kit-chat` | Author-only edits/deletes, reactions, receipts/unread, admin-only meta, garbage tolerance, thread merging (a late alias can't backdate messages; a message written at an alias's first-seen time sorts after that alias's older messages), alerts |
 | `mycel-rules(-abi)` | Deterministic WASM engine: fuel/memory limits, banned features, ABI violations, chat rules, wire compatibility with the chat kit, the fuel cost model pinned |
 | `mycel-sim` | Every scenario at CI size, and the simulator's own models (`cargo test -p mycel-sim`) |
 | `mycel-host` | Log file privacy, notification privacy, deduplication, tap routing and permission handling |
