@@ -1247,7 +1247,11 @@ a recorded real day replayed. Nothing is above L1 today, and the radio is
 a disc, so **every tier-2 number in this document is L0**, and so is every
 tier-1 number (EmuNet's media are discs too). `report.md` now has
 Fidelity, Region and Robust-pass columns on every row; the hand-written
-scenarios get their tier's default (`Fidelity::tier_default`).
+scenarios get their tier's default (`Fidelity::tier_default`), a single
+catalogue run covers its nominal point, and `mycel-sim robust` writes one
+row per study with the region it sampled (points × seeds), its
+robust-pass fraction and what it hinges on (`report.md` beside
+`robustness.md`).
 
 `fidelity::MODELS` lists 55 models the catalogue can ask for: 20 the
 simulator has (with their level and source) and 35 it lacks (with the work
