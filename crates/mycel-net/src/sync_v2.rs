@@ -542,7 +542,17 @@ async fn drive(
             Ok::<_, anyhow::Error>(())
         }
     };
-    let res = tokio::try_join!(reader, writer);
+    // The writer ends only once the session is done and everything owed is
+    // sent: nothing more is needed from the peer then, so a peer that never
+    // finishes its side can't hold the session (or a sync slot) open.
+    tokio::pin!(reader, writer);
+    let res = tokio::select! {
+        r = &mut reader => match r {
+            Ok(()) => (&mut writer).await,
+            Err(e) => Err(e),
+        },
+        w = &mut writer => w,
+    };
     let s = shared.lock();
     let stats = s.stats();
     {

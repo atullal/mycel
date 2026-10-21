@@ -57,8 +57,8 @@ async fn v2_pair_syncs_and_an_idle_check_is_one_small_exchange() {
         })
         .unwrap()
         .unwrap();
-    let stats = bob.sync_with(alice.id(), space, false).await.unwrap();
-    assert_eq!(stats.envelopes, 200);
+    // (bob's own background session may have fetched some of them first)
+    bob.sync_with(alice.id(), space, false).await.unwrap();
     assert_eq!(bob.with_space(&space, |r| r.feed_len(&feed())).unwrap(), 200);
     // Let background forwarding settle, then measure one idle check.
     tokio::time::sleep(Duration::from_millis(500)).await;
