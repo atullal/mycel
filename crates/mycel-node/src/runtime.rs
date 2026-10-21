@@ -430,7 +430,9 @@ fn contact_code_format(code: &str) -> Result<(u32, &str)> {
     }
     match digits.parse::<u32>() {
         Ok(n) if digits.bytes().all(|b| b.is_ascii_digit()) => Ok((n, body)),
-        _ => bail!("not a Mycel contact code"),
+        // not a format prefix (a bare code with a `:` in its hints): the
+        // card decodes or doesn't as format 1
+        _ => Ok((CONTACT_CODE_FORMAT, code)),
     }
 }
 
@@ -2660,6 +2662,28 @@ mod tests {
         for junk in ["mycelx:abc", "mycel-1:abc", "mycel99999999999999:abc", "mycel:!!!"] {
             assert!(decode_contact_code(junk).is_err(), "{junk}");
         }
+    }
+
+    /// A version 1 contact code byte for byte, as the pre-release code
+    /// (main `98d9b7b`, before versioning) writes it for these fixed keys:
+    /// this build writes the same and reads it. (See mycel-net's
+    /// `mesh::v1_vectors`: never regenerate this from this build.)
+    #[test]
+    fn version_1_contact_codes_are_pinned() {
+        use super::*;
+        let pre_release = [
+            "mycel:iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1yoHF9XrnzfuxijIND63YK6YgmQU1KOa--XJT-r9k6m",
+            "BEAnw1U91gShebjJfzEerR201PFtzWOZ6gEyvxkfASnF_4gyCo1vgIsWLHjkGrhmFFYT6qmqDv7lzCPoVKHcUfMHA0",
+            "FkYUC4MlyRPlK9BCUGF9yZv1ueUM6PhFIyeSutkdPkkt3EvC5AWi5qr-ujSB_ULigXG5LhYAoJmxEL8YXDajquSagI",
+        ]
+        .concat();
+        let card = ContactCard::new(&DeviceKeys::from_seed([1; 32]), "Ada");
+        assert_eq!(encode_contact_code(&card), pre_release);
+        assert_eq!(decode_contact_code(&pre_release).unwrap(), card);
+        let with_hint = format!("{pre_release}@10.0.0.2:4433");
+        assert_eq!(decode_contact_code_with_hints(&with_hint).unwrap().1, vec!["10.0.0.2:4433".parse().unwrap()]);
+        let bare = format!("{}@10.0.0.2:4433", pre_release.strip_prefix("mycel:").unwrap());
+        assert_eq!(decode_contact_code(&bare).unwrap(), card);
     }
 
     #[test]
