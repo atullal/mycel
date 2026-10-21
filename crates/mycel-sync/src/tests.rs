@@ -1258,3 +1258,55 @@ fn an_arrival_rechecks_only_the_envelopes_waiting_for_it() {
     assert!(a.waiting.is_empty());
     assert!(chain.iter().all(|e| a.status(&e.id()) == Status::Valid));
 }
+
+/// Delivery state (Sync v2 WP7): who holds an envelope follows from the
+/// chain runs a member was seen to hold, not from a per-envelope map.
+#[test]
+fn holders_follow_from_the_runs_a_member_holds() {
+    let (mut a, mut b, bk) = pair(Role::Writer);
+    let feed = StreamId::new_feed();
+    let ids: Vec<EnvelopeId> = (0..10).map(|i| a.append(feed, vec![i]).unwrap().1.id()).collect();
+    let peer = bk.sign_pk();
+    assert!(a.holders(&ids[3]).is_empty());
+    // An inventory (v1) in any order: one run.
+    let mut inv = ids[..6].to_vec();
+    inv.reverse();
+    a.note_holder(peer, &inv);
+    assert!(a.holders(&ids[5]).contains(&peer));
+    assert!(a.holders(&ids[0]).contains(&peer));
+    assert!(!a.holders(&ids[6]).contains(&peer));
+    // A verified frontier covers the whole chain below its head.
+    sync(&mut a, &mut b);
+    let entry = reconcile::SyncSet::index(&b).entries()[&a.me.sign_pk()].clone();
+    a.note_frontier(peer, [&entry]);
+    assert!(ids.iter().all(|id| a.holders(id).contains(&peer)));
+    // Memory is per (member, author), not per envelope.
+    assert_eq!(a.delivery_runs(), 1);
+}
+
+#[test]
+fn seen_notes_are_sealed_signed_and_rate_limited() {
+    let (mut a, mut b, bk) = pair(Role::Writer);
+    let feed = StreamId::new_feed();
+    let id = a.append(feed, b"hello".to_vec()).unwrap().1.id();
+    sync(&mut a, &mut b);
+    let note = b.seen_note().expect("b has something to report");
+    assert!(note.len() <= reconcile::gossip::MAX_SEEN_NOTE, "{} B", note.len());
+    assert!(b.seen_note().is_none(), "one note per interval");
+    // Opaque without the epoch key (what a keeper or carrier sees).
+    assert!(!note.windows(5).any(|w| w == b"hello"));
+    let forwarder = dev().sign_pk();
+    assert_eq!(a.accept_seen(&forwarder, &note), Some(bk.sign_pk()));
+    assert!(a.holders(&id).contains(&bk.sign_pk()));
+    assert_eq!(a.accept_seen(&forwarder, &note), None, "a replay is refused");
+    // A tampered note doesn't open.
+    let mut bad = note.clone();
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    assert_eq!(a.accept_seen(&forwarder, &bad), None);
+    // A note from someone who isn't a member (here: a space of its own) is refused.
+    let (mut stranger, _) = Replica::create(dev(), None).unwrap();
+    stranger.append(feed, b"x".to_vec()).unwrap();
+    let foreign = stranger.seen_note().unwrap();
+    assert_eq!(a.accept_seen(&forwarder, &foreign), None);
+}

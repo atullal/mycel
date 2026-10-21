@@ -51,6 +51,7 @@ pub mod emu;
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing;
+mod gossip;
 pub mod link;
 #[cfg(any(target_os = "macos", target_os = "ios", fuzzing))]
 mod mdns_records;
@@ -88,9 +89,11 @@ use pool::{Pool, PooledConn};
 use tokio::sync::{Notify, Semaphore, broadcast, mpsc};
 
 pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_free_space, free_space, human_size};
+pub use gossip::GossipTotals;
 pub use iroh;
 pub use link::{Link, LinkEvent, LinkStatus, PathKind, path_in_use};
 pub use mesh::{Mesh, MeshOptions, MeshRoute, MeshStats, Tap};
+pub use mycel_sync::reconcile::gossip::GossipStats;
 pub use sync_v2::{V1_REMEMBERED, V1_SERVE_INTERVAL, V2Totals};
 pub use version::{Caps, PeerProtocol, Protocol, VersionError, WireVersion};
 use version::{Hello, STREAM_REFUSED, WIRE_V2};
@@ -208,8 +211,13 @@ pub struct NodeOptions {
     /// Speak Sync v2 (default). Off: behave as a build without it (don't
     /// advertise [`Caps::SYNC_V2`] even if `protocol` lists it, run only v1
     /// sessions, refuse `SyncV2` streams as an unknown kind, sync every
-    /// member), for mixed groups in tests and v1 baselines.
+    /// member), for mixed groups in tests and v1 baselines. Off also turns
+    /// gossip off.
     pub sync_v2: bool,
+    /// Read receipts: share seen notes (which members hold which chains,
+    /// sealed under the space's epoch key) so authors see "delivered to N"
+    /// beyond the devices they synced with directly. Off by default.
+    pub read_receipts: bool,
 }
 
 /// Another protocol served on the node's endpoint: incoming connections with
@@ -240,6 +248,7 @@ impl NodeOptions {
             max_ephemeral: MAX_EPHEMERAL,
             protocol: Protocol::default(),
             sync_v2: true,
+            read_receipts: false,
         }
     }
 }
@@ -364,6 +373,9 @@ struct Inner {
     bundled: Mutex<HashMap<(SignPk, SpaceId), Hash32>>,
     /// See [`NodeOptions::max_ephemeral`].
     max_ephemeral: usize,
+    /// Dissemination (`gossip.rs`).
+    gossip: gossip::Gossip,
+    read_receipts: bool,
     /// See [`NodeOptions::protocol`].
     protocol: Protocol,
     /// Memory for what devices send us: those we share a space with, and
@@ -797,9 +809,50 @@ impl Inner {
     /// Who to sync `space` with after a change or in a periodic round
     /// (excluding us): every member in small groups and on builds without
     /// v2; otherwise the bounded view (see the crate docs).
-    fn targets(&self, space: &SpaceId, r: &Replica, peers: &HashMap<SignPk, PeerState>, local: bool) -> Vec<SignPk> {
+    fn targets(
+        &self,
+        space: &SpaceId,
+        r: &Replica,
+        peers: &HashMap<SignPk, PeerState>,
+        local: bool,
+        trigger: Trigger,
+    ) -> Vec<SignPk> {
         let me = self.keys.sign_pk();
-        let members: Vec<SignPk> = r.members().into_iter().map(|(k, _)| k.sign_pk).filter(|pk| *pk != me).collect();
+        let mut members: Vec<SignPk> = r.members().into_iter().map(|(k, _)| k.sign_pk).filter(|pk| *pk != me).collect();
+        // Members gossip reaches get no session after a change (pushes carry
+        // it), and only one of them a periodic anti-entropy session.
+        let mut partner = None;
+        if self.gossip_on() {
+            let covered: HashSet<SignPk> = members.iter().filter(|p| self.gossip_covers(space, p)).copied().collect();
+            if !covered.is_empty() {
+                members.retain(|p| !covered.contains(p));
+                if trigger == Trigger::Periodic {
+                    partner = self.gossip.d.lock().anti_entropy_partner(space, mycel_crypto::random_u64());
+                }
+                if members.is_empty() {
+                    return partner.into_iter().collect();
+                }
+            }
+        }
+        let mut out = self.targets_of(space, peers, local, &members, &me);
+        if let Some(p) = partner
+            && !out.contains(&p)
+        {
+            out.push(p);
+        }
+        out
+    }
+
+    /// [`Inner::targets`] among `members` (those gossip doesn't reach).
+    fn targets_of(
+        &self,
+        space: &SpaceId,
+        peers: &HashMap<SignPk, PeerState>,
+        local: bool,
+        members: &[SignPk],
+        me: &SignPk,
+    ) -> Vec<SignPk> {
+        let (members, me) = (members.to_vec(), *me);
         let full = if local { AUTHOR_FULL } else { FULL_MESH };
         if !self.sync_v2 || members.len() <= full {
             return members;
@@ -876,6 +929,7 @@ impl Inner {
             res
         };
         if res.changed() {
+            self.gossip_changed(space, Some(peer));
             self.on_new_items(*space, res.ops > 0);
         } else if !sent.is_empty() {
             // delivery status changed
@@ -1029,13 +1083,14 @@ async fn serve_bi(
         StreamKind::Card => serve_card(inner, tx).await,
         StreamKind::Blob => blobs::serve(inner, peer, tx, rx).await,
         StreamKind::Hello => serve_hello(inner, version, peer, tx, rx).await,
-        StreamKind::Ephemeral => bail!("ephemeral messages use uni-streams"),
+        StreamKind::Ephemeral | StreamKind::Gossip => bail!("{kind:?} uses uni-streams"),
     }
 }
 
 async fn serve_uni(inner: &Arc<Inner>, version: WireVersion, peer: SignPk, mut rx: RecvStream) -> Result<()> {
     match stream_kind(version, None, &mut rx).await? {
         StreamKind::Ephemeral => serve_eph(inner, peer, rx).await,
+        StreamKind::Gossip => gossip::serve(inner, peer, rx).await,
         other => bail!("{other:?} needs a bi-stream"),
     }
 }
@@ -1537,6 +1592,21 @@ async fn scheduler(inner: Arc<Inner>) {
                 })
                 .collect()
         };
+        // Gossip views follow membership and reachability; seen notes (read
+        // receipts) ride on gossip.
+        {
+            let mut spaces = inner.spaces.lock();
+            let peers = inner.peers.lock();
+            for (s, r) in spaces.iter_mut() {
+                inner.gossip_view(r, &peers);
+                if inner.read_receipts
+                    && inner.gossip_on()
+                    && let Some(note) = r.seen_note()
+                {
+                    inner.gossip.d.lock().carry_seen(s, note);
+                }
+            }
+        }
         let targets: Vec<(SignPk, SpaceId, Trigger)> = {
             let spaces = inner.spaces.lock();
             let peers = inner.peers.lock();
@@ -1550,7 +1620,7 @@ async fn scheduler(inner: Arc<Inner>) {
                 .filter(|(s, _, r)| explicit.contains(s) || r.my_role().is_some())
                 .flat_map(|(s, t, r)| {
                     let local = t == Trigger::Change && local.contains(&s);
-                    inner.targets(&s, r, &peers, local).into_iter().map(move |pk| (pk, s, t)).collect::<Vec<_>>()
+                    inner.targets(&s, r, &peers, local, t).into_iter().map(move |pk| (pk, s, t)).collect::<Vec<_>>()
                 })
                 .filter(|(pk, _, _)| !peers.get(pk).is_some_and(|p| p.backing_off() && !p.nearby))
                 .collect()
@@ -1666,6 +1736,7 @@ pub fn fine_timers() {
 
 impl Node {
     pub async fn spawn(keys: Arc<DeviceKeys>, opts: NodeOptions) -> Result<Self> {
+        let me_pk = keys.sign_pk();
         fine_timers();
         // Same Ed25519 key for transport and for Mycel signatures (domain-separated).
         let secret = SecretKey::from_bytes(&keys.seed());
@@ -1793,11 +1864,16 @@ impl Node {
             stall_hellos: Default::default(),
             bundled: Mutex::default(),
             max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
+            gossip: gossip::Gossip::new(me_pk, false),
+            read_receipts: opts.read_receipts,
             // (a node without Sync v2 doesn't advertise it)
             protocol: if opts.sync_v2 {
                 opts.protocol
             } else {
-                Protocol { caps: opts.protocol.caps.difference(Caps::SYNC_V2), ..opts.protocol }
+                Protocol {
+                    caps: opts.protocol.caps.difference(Caps::SYNC_V2).difference(Caps::GOSSIP),
+                    ..opts.protocol
+                }
             },
             member_frames: resources::Frames::members(),
             stranger_frames: resources::Frames::strangers(),
@@ -1821,12 +1897,13 @@ impl Node {
             }
         }
         let router = router.spawn();
-        let mut tasks = vec![tokio::spawn(scheduler(inner.clone()))];
+        let mut tasks = vec![tokio::spawn(scheduler(inner.clone())), tokio::spawn(gossip::pump(inner.clone()))];
         let reaper = inner.clone();
         tasks.push(tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 reaper.pool.reap(POOL_IDLE);
+                gossip::reap(&reaper);
                 reaper.expire_reachability();
             }
         }));
@@ -1996,10 +2073,30 @@ impl Node {
     /// Local change happened: push to members soon and notify the app.
     pub fn changed(&self, space: SpaceId) {
         self.inner.emit(NetEvent::SpaceChanged { space });
+        // Pushed to gossip neighbours now; members gossip doesn't reach
+        // get sessions from the scheduler.
+        self.inner.gossip_changed(&space, None);
         self.inner.local_writes.lock().insert(space);
         self.inner.dirty_local.lock().insert(space);
         self.inner.loss_signal(space);
         self.inner.schedule(space);
+    }
+
+    /// Gossip counters: messages and bytes on gossip streams, new items
+    /// received by push, pulls (tests, benchmarks, the Network panel).
+    pub fn gossip_totals(&self) -> GossipTotals {
+        self.inner.gossip.totals()
+    }
+
+    /// The disseminator's own counters (pushes, announcements, prunes,
+    /// duplicates).
+    pub fn gossip_stats(&self) -> GossipStats {
+        self.inner.gossip.stats()
+    }
+
+    /// Our gossip neighbours in `space`, with whether each edge is eager.
+    pub fn gossip_neighbours(&self, space: &SpaceId) -> Vec<(SignPk, bool)> {
+        self.inner.gossip.d.lock().neighbours(space)
     }
 
     /// Sync v2 counters (sessions, fallbacks, bytes): for tests and the

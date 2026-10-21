@@ -301,6 +301,66 @@ async fn a_change_reaches_a_larger_group_with_bounded_fanout() {
     }
 }
 
+/// Dissemination over real QUIC (design §13.3): in a 12-member group a
+/// message reaches everyone by gossip pushes, with no sessions, and with at
+/// most 1.5 payload copies per member once the tree has formed.
+#[tokio::test(flavor = "multi_thread")]
+async fn gossip_reaches_a_12_member_group_with_few_copies() {
+    const N: usize = 12;
+    let mut nodes = Vec::new();
+    for i in 0..N {
+        nodes.push(node(&format!("g{i}"), true).await);
+    }
+    introduce(&nodes.iter().collect::<Vec<_>>());
+    let (space, genesis) = nodes[0].create_space().unwrap();
+    for n in &nodes[1..] {
+        nodes[0].with_space(&space, |r| r.add_member(n.keys().public(), Role::Writer)).unwrap().unwrap();
+        n.join_space(genesis.clone()).unwrap();
+    }
+    nodes[0].changed(space);
+    eventually("everyone learns the membership", || {
+        nodes.iter().all(|n| n.with_space(&space, |r| r.members().len()).unwrap() == N)
+    })
+    .await;
+    // Everyone has run a session with someone (hellos seen), so views form.
+    for n in &nodes[1..] {
+        n.sync_with(nodes[0].id(), space, false).await.unwrap();
+    }
+    eventually("gossip views formed", || nodes.iter().all(|n| n.gossip_neighbours(&space).len() >= 2)).await;
+    let copies = |nodes: &[Node]| nodes.iter().map(|n| n.gossip_stats().items_received).sum::<u64>();
+    let sessions = |nodes: &[Node]| nodes.iter().map(|n| n.sync_v2_totals().client_sessions).sum::<u64>();
+    // Warm-up: the first messages prune redundant eager edges.
+    for w in 0..4 {
+        let author = &nodes[w];
+        author.with_space(&space, |r| r.append(feed(), format!("warm {w}").into_bytes())).unwrap().unwrap();
+        author.changed(space);
+        eventually("warm-up message everywhere", || {
+            nodes.iter().all(|n| n.with_space(&space, |r| r.feed_len(&feed())).unwrap() == w + 1)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let (c0, s0) = (copies(&nodes), sessions(&nodes));
+    let started = Instant::now();
+    let author = &nodes[7];
+    author.with_space(&space, |r| r.append(feed(), b"to everyone".to_vec())).unwrap().unwrap();
+    author.changed(space);
+    eventually("every member gets the message", || {
+        nodes.iter().all(|n| n.with_space(&space, |r| r.feed_len(&feed())).unwrap() == 5)
+    })
+    .await;
+    let took = started.elapsed();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (c, s) = (copies(&nodes) - c0, sessions(&nodes) - s0);
+    eprintln!("one message, {N} members over QUIC: {c} payload copies, {s} sessions, everyone in {took:?}");
+    assert!(c as f64 <= 1.5 * (N - 1) as f64, "{c} payload copies");
+    let g: u64 = nodes.iter().map(|n| n.gossip_totals().sent_bytes).sum();
+    eprintln!("gossip bytes sent so far (all messages): {g}");
+    for n in nodes {
+        n.shutdown().await.unwrap();
+    }
+}
+
 async fn link_node(name: &str, net: &MemNet) -> Node {
     let keys = Arc::new(DeviceKeys::generate());
     let mut opts = NodeOptions::new(NetMode::Local, name);

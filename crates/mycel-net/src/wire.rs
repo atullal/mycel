@@ -64,6 +64,10 @@ pub enum StreamKind {
     /// agreed [`crate::Caps::SYNC_V2`]. A device that refuses it anyway is
     /// synced with `Sync`.
     SyncV2 = 6,
+    /// Uni-stream, wire version 2 and later: one dissemination message
+    /// (`gossip.rs`, `mycel_sync::reconcile::gossip`), sent only to a peer
+    /// that agreed [`crate::Caps::GOSSIP`].
+    Gossip = 7,
 }
 
 impl StreamKind {
@@ -71,7 +75,8 @@ impl StreamKind {
     /// `version`; `None` for a kind that version doesn't have (the stream
     /// is then refused, see [`crate::version::STREAM_REFUSED`]).
     pub fn on(version: WireVersion, b: u8) -> Option<Self> {
-        Self::from_byte(b).filter(|k| !matches!(k, StreamKind::Hello | StreamKind::SyncV2) || version >= WIRE_V2)
+        Self::from_byte(b)
+            .filter(|k| !matches!(k, StreamKind::Hello | StreamKind::SyncV2 | StreamKind::Gossip) || version >= WIRE_V2)
     }
 
     pub fn from_byte(b: u8) -> Option<Self> {
@@ -82,6 +87,7 @@ impl StreamKind {
             4 => StreamKind::Blob,
             5 => StreamKind::Hello,
             6 => StreamKind::SyncV2,
+            7 => StreamKind::Gossip,
             _ => return None,
         })
     }
@@ -91,6 +97,8 @@ impl StreamKind {
     pub fn priority(self) -> i32 {
         match self {
             StreamKind::Blob => -1,
+            // live messages first
+            StreamKind::Gossip => 2,
             _ => 1,
         }
     }

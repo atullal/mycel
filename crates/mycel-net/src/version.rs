@@ -53,15 +53,19 @@ impl Caps {
     pub const SYNC_V2: Caps = Caps(1 << 0);
     /// Per-hop route attestations on mesh announcements (mesh protocol).
     pub const ROUTE_ATTEST: Caps = Caps(1 << 1);
+    /// Dissemination: Plumtree eager/lazy push of new items on `Gossip`
+    /// uni-streams (node protocol; meaningful with [`Caps::SYNC_V2`], whose
+    /// sessions repair what gossip misses).
+    pub const GOSSIP: Caps = Caps(1 << 2);
     /// Bits never assigned: hellos set one at random so that peers keep
     /// ignoring bits they don't know (see the module docs).
     pub const RESERVED: Caps = Caps(0xffff << 48);
     /// Every bit this build has a name for.
-    pub const KNOWN: Caps = Caps(Self::SYNC_V2.0 | Self::ROUTE_ATTEST.0);
+    pub const KNOWN: Caps = Caps(Self::SYNC_V2.0 | Self::ROUTE_ATTEST.0 | Self::GOSSIP.0);
     /// What this build implements, and so advertises by default.
     /// (`ROUTE_ATTEST` is registered for the work that implements it; a
     /// build sets it here once it does.)
-    pub const SUPPORTED: Caps = Caps::SYNC_V2;
+    pub const SUPPORTED: Caps = Caps(Self::SYNC_V2.0 | Self::GOSSIP.0);
 
     /// The raw bits, unknown ones included.
     pub const fn bits(self) -> u64 {
@@ -155,6 +159,12 @@ pub const CAPABILITIES: &[Capability] = &[
         name: "ROUTE_ATTEST",
         protocol: "mesh",
         summary: "per-hop attestations on route announcements",
+    },
+    Capability {
+        cap: Caps::GOSSIP,
+        name: "GOSSIP",
+        protocol: "node",
+        summary: "Plumtree push of new items on gossip uni-streams (with SYNC_V2)",
     },
 ];
 

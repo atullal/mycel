@@ -22,6 +22,7 @@ pub use mycel_trust;
 mod bounded_change;
 mod change_ops;
 mod change_resources;
+mod delivery;
 mod doc_index;
 #[cfg(fuzzing)]
 #[doc(hidden)]
@@ -472,8 +473,8 @@ pub struct Replica {
     valid_by_stream: HashMap<StreamId, BTreeSet<EnvelopeId>>,
     docs: HashMap<StreamId, DocState>,
     feeds: HashMap<StreamId, FeedState>,
-    /// Which peers are known to hold which envelopes (from sync inventories).
-    holders: HashMap<EnvelopeId, BTreeSet<SignPk>>,
+    /// Which members are known to hold which chains (`delivery.rs`).
+    delivery: delivery::Delivery,
     store: Option<Arc<dyn Store>>,
     validator: Option<Arc<dyn FeedValidator>>,
     /// Valid envelopes whose decrypted content the rules rejected.
@@ -562,7 +563,7 @@ impl Replica {
             valid_by_stream: HashMap::new(),
             docs: HashMap::new(),
             feeds: HashMap::new(),
-            holders: HashMap::new(),
+            delivery: Default::default(),
             store,
             validator: None,
             rule_rejected: HashSet::new(),
@@ -694,19 +695,6 @@ impl Replica {
 
     pub fn envelope(&self, id: &EnvelopeId) -> Option<&Envelope> {
         self.envelopes.get(id)
-    }
-
-    /// Record that `peer` holds these envelopes (from its sync inventory).
-    pub fn note_holder(&mut self, peer: SignPk, ids: &[EnvelopeId]) {
-        for id in ids {
-            if self.envelopes.contains_key(id) {
-                self.holders.entry(*id).or_default().insert(peer);
-            }
-        }
-    }
-
-    pub fn holders(&self, id: &EnvelopeId) -> BTreeSet<SignPk> {
-        self.holders.get(id).cloned().unwrap_or_default()
     }
 
     /// Ingest a membership op from anyone. Returns true if it was new.

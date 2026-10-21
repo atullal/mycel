@@ -974,25 +974,22 @@ async fn drive(
         inner.v2.records.lock().put((peer, space), rec.clone());
     }
     let outcome = s.outcome().cloned();
-    let me = inner.keys.sign_pk();
-    let delivered_to = s.peer_holds_my_opening_set().then(|| s.opening_top(&me));
+    // Delivery state: the peer verified it holds our opening set, and held
+    // its own opening set (which we verified we cover).
+    let verified = s.peer_holds_my_opening_set().then(|| s.record().cloned()).flatten();
     drop(s);
-    if let Some(top) = delivered_to {
-        // The peer verified it holds our opening set: our latest writes up
-        // to its pinned top are delivered (ticks without a per-envelope
-        // pass; writes made during the session wait for the next one).
+    if let Some(rec) = verified {
         let _ = inner.with_space(&space, |r| {
-            let recent: Vec<EnvelopeId> = r
-                .recent_envelopes(&me, 64)
-                .into_iter()
-                .filter(|id| top.is_some_and(|t| r.index().seq(id).is_some_and(|s| s <= t)))
-                .collect();
-            r.note_holder(peer, &recent);
+            r.note_frontier(peer, rec.mine.authors.values());
+            r.note_frontier(peer, rec.peer.authors.values());
         });
         inner.emit(NetEvent::SpaceChanged { space });
     }
     let stats = *received.lock();
     if moved(&stats) {
+        // Forward what the session brought: pushed to gossip neighbours,
+        // sessions for members gossip doesn't reach.
+        inner.gossip_changed(&space, Some(peer));
         inner.schedule(space);
     }
     // A session that reached a successful outcome succeeded, whatever
