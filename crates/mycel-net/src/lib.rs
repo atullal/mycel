@@ -667,6 +667,25 @@ impl Inner {
         self.local_writes.lock().contains(space)
     }
 
+    /// We just learned how to reach `peer` (an address hint): a sign of a
+    /// reachability change. Sync the spaces we share with it now, without
+    /// waiting out a failure backoff or the periodic schedule.
+    fn peer_reachable(self: &Arc<Self>, peer: SignPk) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let shared: Vec<SpaceId> =
+            self.spaces.lock().iter().filter(|(_, r)| r.is_member(&peer)).map(|(s, _)| *s).collect();
+        if shared.is_empty() {
+            return;
+        }
+        if let Some(p) = self.peers.lock().get_mut(&peer) {
+            p.failures = 0;
+        }
+        for s in shared {
+            self.loss_signal(s);
+            rt.spawn(sync_once(self.clone(), peer, s, Trigger::Discovery));
+        }
+    }
+
     /// See [`Backoff::signal`].
     fn loss_signal(&self, space: SpaceId) {
         let now = Instant::now();
@@ -1607,12 +1626,15 @@ impl Node {
                 a = a.with_ip_addr(*x);
             }
             self.inner.memory.add_endpoint_info(a);
+            self.inner.peer_reachable(peer);
         }
     }
 
     /// Tell the node how to reach a peer directly (tests / manual pairing).
     pub fn add_peer_addr(&self, addr: EndpointAddr) {
+        let peer = to_sign_pk(&addr.id);
         self.inner.memory.add_endpoint_info(addr);
+        self.inner.peer_reachable(peer);
     }
 
     /// The mesh router, if this node relays.
