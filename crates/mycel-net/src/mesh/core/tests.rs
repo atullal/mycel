@@ -48,6 +48,12 @@ pub(crate) struct Net {
     /// be one hop from every origin, as cheaply as an honest relay could
     /// say it, and swallow the packets that this attracts.
     pub liars: BTreeSet<usize>,
+    /// With real keys ([`Net::signed`]): every signature is made and
+    /// checked for real (Ed25519, `wire.rs`).
+    pub keys: Option<Vec<mycel_crypto::DeviceKeys>>,
+    /// Devices whose hops take route attestations (`ROUTE_ATTEST`), when
+    /// both ends do.
+    pub attesting: BTreeSet<usize>,
 }
 
 impl Net {
@@ -69,7 +75,21 @@ impl Net {
             frame_loops: 0,
             sent: vec![0; n],
             liars: BTreeSet::new(),
+            keys: None,
+            attesting: BTreeSet::new(),
         }
+    }
+
+    /// [`Net::new`] with real keys and signatures, every device attesting.
+    pub fn signed(n: usize, cfg: impl Fn(usize) -> Config) -> Net {
+        let keys: Vec<mycel_crypto::DeviceKeys> =
+            (0..n).map(|i| mycel_crypto::DeviceKeys::from_seed([i as u8 + 1; 32])).collect();
+        let mut net = Net::new(n, &cfg);
+        net.nodes = keys.iter().enumerate().map(|(i, k)| Router::new(k.sign_pk(), cfg(i))).collect();
+        net.index = net.nodes.iter().enumerate().map(|(i, r)| (r.me(), i)).collect();
+        net.keys = Some(keys);
+        net.attesting = (0..n).collect();
+        net
     }
 
     pub fn fast(n: usize) -> Net {
@@ -85,6 +105,9 @@ impl Net {
         let (ka, kb, now) = (self.k(a), self.k(b), self.now);
         self.nodes[a].set_direct(kb, true, now);
         self.nodes[b].set_direct(ka, true, now);
+        let both = self.attesting.contains(&a) && self.attesting.contains(&b);
+        self.nodes[a].set_attests(kb, Some(both), now);
+        self.nodes[b].set_attests(ka, Some(both), now);
         self.nodes[a].hop_up(kb, now);
         self.nodes[b].hop_up(ka, now);
     }
@@ -126,8 +149,12 @@ impl Net {
         for o in outs {
             match o {
                 Out::Announce { to, mut ann } => {
+                    if let Some(keys) = &self.keys {
+                        ann = crate::mesh::wire::sign_hop(&keys[i], ann, &to);
+                    }
                     if self.liars.contains(&i) && ann.origin != me && ann.cost != INFINITY {
-                        (ann.hops, ann.cost) = (1, 1 + HOP_PENALTY);
+                        // (unattested: no chain backs this)
+                        (ann.hops, ann.cost, ann.chain, ann.sign_link) = (1, 1 + HOP_PENALTY, None, None);
                     }
                     self.sent[i] += 1;
                     if let Some(&j) = self.index.get(&to) {
@@ -189,7 +216,13 @@ impl Net {
             }
             let (f, now) = (self.k(from), self.now);
             match m {
-                Msg::Ann(a) => self.nodes[to].on_announce(f, a, now, WALL + now, |_| true),
+                Msg::Ann(a) => {
+                    if self.keys.is_some() {
+                        self.nodes[to].on_announce(f, a, now, WALL + now, crate::mesh::wire::verify)
+                    } else {
+                        self.nodes[to].on_announce(f, a, now, WALL + now, |_| true)
+                    }
+                }
                 Msg::Req(r) => self.nodes[to].on_seqreq(f, r, now),
                 Msg::Frame(fr) => {
                     if !self.seen.insert((to, fr.src, fr.id)) {
@@ -211,6 +244,12 @@ impl Net {
                 let r = &mut self.nodes[i];
                 if r.announce_due(now) {
                     let o = r.next_announce(WALL + now);
+                    if let Some(keys) = &self.keys {
+                        r.originate(crate::mesh::wire::sign_announce(&keys[i], o, ""), now);
+                        r.tick(now);
+                        self.effects(i);
+                        continue;
+                    }
                     let a = Announce {
                         hops: 0,
                         cost: 0,
@@ -1286,7 +1325,7 @@ fn security_verified_cache_allows_forwarded_hops_and_cost() {
 
 #[test]
 fn security_verified_cache_stays_bounded_and_can_be_disabled() {
-    use crate::mesh::wire::{sign_announce, verify, verify_announce};
+    use crate::mesh::wire::{sign_announce, verify};
     for limit in [0, 1, 2] {
         let owner = mycel_crypto::DeviceKeys::generate();
         let mut router = Router::new(key(1), Config { verified_max: limit, ..Config::default() });

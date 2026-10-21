@@ -1,0 +1,406 @@
+//! Signed route attestations (`ROUTE_ATTEST`, `docs/ROUTING.md` §6 item
+//! 13), with real Ed25519 signatures (`wire.rs`): what a lying relay can't
+//! get past a receiver (a cheaper link than its upstream measured, a
+//! forged, replayed, truncated or re-addressed chain), the downgrade policy
+//! in mixed meshes, the signature cache and the per-neighbour budget.
+
+use mycel_crypto::DeviceKeys;
+
+use super::tests::Net;
+use super::*;
+use crate::mesh::wire::{self, sign_announce, sign_hop};
+
+const WALL: u64 = 1_700_000_000_000;
+
+fn dk(i: u8) -> DeviceKeys {
+    DeviceKeys::from_seed([i; 32])
+}
+
+/// `origin`'s announcement (seqno `seq`, `scope`) as relayed honestly along
+/// `relays` and sent by the last of them (or the origin) to `to`. `links[j]`
+/// is the link cost the hop at position j measured to the next one (the
+/// last to `to`); each relay advertises its upstream's cost plus that
+/// upstream's link.
+fn relayed(origin: &DeviceKeys, relays: &[&DeviceKeys], to: SignPk, links: &[u32], seq: u64, scope: u8) -> Announce {
+    assert_eq!(links.len(), relays.len() + 1);
+    let next = |j: usize| relays.get(j).map_or(to, |k| k.sign_pk());
+    let mut a = sign_announce(origin, Origination { seq, flags: 0, scope, uplink: 0 }, "o");
+    a.sign_link = Some(links[0]);
+    a = sign_hop(origin, a, &next(0));
+    for (j, r) in relays.iter().enumerate() {
+        a.hops = j as u8 + 1;
+        a.cost += links[j];
+        a.sign_link = Some(links[j + 1]);
+        a = sign_hop(r, a, &next(j + 1));
+    }
+    a
+}
+
+/// A router for `me` with attesting neighbours `nbs`, each measured at
+/// `cost`.
+fn router(me: &DeviceKeys, nbs: &[SignPk], cost: u32) -> Router {
+    let mut r = Router::new(me.sign_pk(), Config::default());
+    for n in nbs {
+        r.set_direct(*n, true, 0);
+        r.set_attests(*n, Some(true), 0);
+        r.hop_up(*n, 0);
+        r.set_cost(*n, cost);
+    }
+    r
+}
+
+fn via(r: &Router, origin: &SignPk, n: &SignPk) -> Option<Via> {
+    r.origins.get(origin)?.via.iter().find(|(k, _)| k == n).map(|(_, v)| *v)
+}
+
+#[test]
+fn an_honest_chain_is_accepted_and_binds_the_costlier_end_of_each_link() {
+    let (o, u, l, me) = (dk(1), dk(2), dk(3), dk(4));
+    let mut r = router(&me, &[l.sign_pk()], 100);
+    // O measured 300 to U, U 5,000 to L (a slow link), L 21 to us
+    let a = relayed(&o, &[&u, &l], me.sign_pk(), &[300, 5_000, MIN_HOP_COST], WALL, 8);
+    assert_eq!(a.chain_len(), 3);
+    assert_eq!(a.cost, 5_300);
+    r.on_announce(l.sign_pk(), a, 0, WALL, wire::verify);
+    let s = r.stats();
+    assert_eq!((s.announcements_attested, s.chains_refused, s.neighbours_distrusted), (1, 0, 0));
+    assert_eq!(s.signatures_checked, 4, "three hops and the origin's signature");
+    let v = via(&r, &o.sign_pk(), &l.sign_pk()).expect("a route");
+    assert!(v.attested && v.hops == 3);
+    // L said its link to us costs 21; we measured 100 (+20): ours counts
+    assert_eq!(v.cost, 5_300 + 120);
+    // ... and where L measured more than we did, L's
+    let mut r = router(&me, &[l.sign_pk()], 100);
+    let a = relayed(&o, &[&u, &l], me.sign_pk(), &[300, 5_000, 4_000], WALL, 8);
+    r.on_announce(l.sign_pk(), a, 0, WALL, wire::verify);
+    assert_eq!(via(&r, &o.sign_pk(), &l.sign_pk()).map(|v| v.cost), Some(5_300 + 4_000));
+}
+
+#[test]
+fn a_relay_cannot_claim_a_cheaper_link_than_its_upstream_measured() {
+    let (o, u, l, me) = (dk(1), dk(2), dk(3), dk(4));
+    // U measured its link to L at 5,000; L claims the 2.1 ms floor for it
+    // (the chain-extending lie), signing its own hop honestly otherwise
+    let mut a = relayed(&o, &[&u], l.sign_pk(), &[300, 5_000], WALL, 8);
+    a.hops = 2;
+    a.cost = 300 + MIN_HOP_COST;
+    a.sign_link = Some(200);
+    let lie = sign_hop(&l, a, &me.sign_pk());
+    let mut r = router(&me, &[l.sign_pk()], 100);
+    r.on_announce(l.sign_pk(), lie.clone(), 0, WALL, wire::verify);
+    let s = r.stats();
+    assert_eq!((s.chains_refused, s.neighbours_distrusted, s.announcements_attested), (1, 1, 0));
+    assert!(via(&r, &o.sign_pk(), &l.sign_pk()).is_none());
+    // one unit under the bound is as much a lie
+    let mut a = relayed(&o, &[&u], l.sign_pk(), &[300, 5_000], WALL, 8);
+    (a.hops, a.cost, a.sign_link) = (2, 5_299, Some(200));
+    let mut r = router(&me, &[l.sign_pk()], 100);
+    r.on_announce(l.sign_pk(), sign_hop(&l, a, &me.sign_pk()), 0, WALL, wire::verify);
+    assert_eq!(r.stats().chains_refused, 1);
+    // stripped of its chain, the lie is an unattested route: kept, but
+    // ranked behind any attested one (below)
+    let mut r = router(&me, &[l.sign_pk()], 100);
+    r.on_announce(l.sign_pk(), Announce { chain: None, ..lie }, 0, WALL, wire::verify);
+    assert!(via(&r, &o.sign_pk(), &l.sign_pk()).is_some_and(|v| !v.attested));
+}
+
+#[test]
+fn understating_its_own_link_to_us_buys_a_relay_nothing() {
+    let (o, l, me) = (dk(1), dk(3), dk(4));
+    let mut r = router(&me, &[l.sign_pk()], 3_000);
+    let a = relayed(&o, &[&l], me.sign_pk(), &[300, MIN_HOP_COST], WALL, 8);
+    r.on_announce(l.sign_pk(), a, 0, WALL, wire::verify);
+    assert_eq!(via(&r, &o.sign_pk(), &l.sign_pk()).map(|v| v.cost), Some(300 + 3_020));
+    // and a link claimed under any honest hop's least is a lie
+    let mut a = relayed(&o, &[], l.sign_pk(), &[300], WALL, 8);
+    (a.hops, a.cost, a.sign_link) = (1, 300, Some(MIN_HOP_COST - 1));
+    let mut r = router(&me, &[l.sign_pk()], 100);
+    r.on_announce(l.sign_pk(), sign_hop(&l, a, &me.sign_pk()), 0, WALL, wire::verify);
+    assert_eq!(r.stats().chains_refused, 1);
+}
+
+#[test]
+fn forged_replayed_truncated_and_readdressed_chains_are_refused() {
+    let (o, a1, b, x, me) = (dk(1), dk(2), dk(3), dk(5), dk(4));
+    let honest = relayed(&o, &[&a1, &b], me.sign_pk(), &[300, 400, 500], WALL, 8);
+    let refused = |ann: Announce| {
+        let mut r = router(&me, &[b.sign_pk()], 100);
+        r.on_announce(b.sign_pk(), ann, 0, WALL, wire::verify);
+        let s = r.stats();
+        (s.chains_refused, s.neighbours_distrusted, s.announcements_attested)
+    };
+    assert_eq!(refused(honest.clone()), (0, 0, 1));
+    // a hop's signature altered (the middle one)
+    let hops: Vec<&Hop> = honest.chain.as_ref().unwrap().iter().collect();
+    let forged = {
+        let origin_hop = hops[2];
+        let mut mid = Hop { prev: origin_hop.prev.clone(), ..clone_hop(hops[1]) };
+        mid.prev = Some(Arc::new(clone_hop(origin_hop)));
+        mid.sig.0[7] ^= 1;
+        Arc::new(Hop { prev: Some(Arc::new(mid)), ..clone_hop(hops[0]) })
+    };
+    assert_eq!(refused(Announce { chain: Some(forged), ..honest.clone() }), (1, 1, 0));
+    // a hop's cost raised after signing (to make room below it)
+    let raised = {
+        let mut mid = clone_hop(hops[1]);
+        mid.cost += 50;
+        mid.prev = Some(Arc::new(clone_hop(hops[2])));
+        Arc::new(Hop { prev: Some(Arc::new(mid)), ..clone_hop(hops[0]) })
+    };
+    assert_eq!(refused(Announce { chain: Some(raised), ..honest.clone() }), (1, 1, 0));
+    // replayed under a newer seqno: every hop signed the old one
+    assert_eq!(refused(Announce { seq: WALL + 1, ..honest.clone() }), (1, 1, 0));
+    // the origin's fields changed (a far scope claimed for a near one)
+    assert_eq!(refused(Announce { scope: 10, sig: NO_SIG, ..honest.clone() }), (1, 1, 0));
+    // truncated: A's hop dropped, B claiming to be one hop from O (O's hop
+    // named A, not B)
+    let truncated = {
+        let own = Hop { cost: 300, prev: Some(Arc::new(clone_hop(hops[2]))), ..clone_hop(hops[0]) };
+        Announce { hops: 1, cost: 300, chain: Some(Arc::new(own)), ..honest.clone() }
+    };
+    assert_eq!(refused(truncated), (1, 1, 0));
+    // ... or keeping its hop count with a hop missing
+    let short = Announce { chain: Some(Arc::new(Hop { prev: Some(Arc::new(clone_hop(hops[2]))), ..clone_hop(hops[0]) })), ..honest.clone() };
+    assert_eq!(refused(short), (1, 1, 0));
+    // re-addressed: B passes on the copy A signed for X, as its own
+    let for_x = relayed(&o, &[&a1], x.sign_pk(), &[300, 400], WALL, 8);
+    assert_eq!(refused(for_x.clone()), (1, 1, 0), "the last hop isn't the sender's");
+    let mut stolen = for_x;
+    (stolen.hops, stolen.cost, stolen.sign_link) = (2, 700, Some(500));
+    let stolen = sign_hop(&b, stolen, &me.sign_pk());
+    assert_eq!(refused(stolen), (1, 1, 0), "A's hop names X, not B");
+    // a chain B was sent for us, replayed by someone else
+    let mut r = router(&me, &[x.sign_pk()], 100);
+    r.on_announce(x.sign_pk(), honest.clone(), 0, WALL, wire::verify);
+    assert_eq!(r.stats().chains_refused, 1);
+    // a path through us is a loop, not a lie
+    let through_us = relayed(&o, &[&me, &b], me.sign_pk(), &[300, 400, 500], WALL, 8);
+    let mut r = router(&me, &[b.sign_pk()], 100);
+    r.on_announce(b.sign_pk(), through_us, 0, WALL, wire::verify);
+    let s = r.stats();
+    assert_eq!((s.chains_refused, s.neighbours_distrusted, s.announcements_attested), (0, 0, 0));
+    assert!(via(&r, &o.sign_pk(), &b.sign_pk()).is_none());
+}
+
+fn clone_hop(h: &Hop) -> Hop {
+    Hop { signer: h.signer, cost: h.cost, link: h.link, sig: h.sig, prev: h.prev.clone() }
+}
+
+#[test]
+fn an_attested_route_needs_no_origin_signature_at_the_edge_of_its_scope() {
+    let (o, l, me) = (dk(1), dk(3), dk(4));
+    // near scope (2): we are its last hop, so L sends its chain without
+    // its own hop and without O's own signature (O's hop covers the fields)
+    let mut a = relayed(&o, &[], l.sign_pk(), &[300], WALL, NEAR_SCOPE);
+    (a.hops, a.cost) = (1, 300);
+    let mut wire_a = a.clone();
+    wire_a.sig = NO_SIG;
+    let bytes = wire::encode_attested(vec![wire_a.clone()], 1200).0;
+    let back = wire::decode_attested(&bytes[0], &l.sign_pk());
+    assert_eq!(back, vec![wire_a.clone()]);
+    assert_eq!(wire::wire_len(&wire_a), bytes[0].len() - 1);
+    assert_eq!(wire::wire_len(&wire_a), wire::wire_len(&Announce { chain: None, ..a.clone() }) + 4, "4 bytes over v1");
+    let mut r = router(&me, &[l.sign_pk()], 100);
+    r.on_announce(l.sign_pk(), back[0].clone(), 0, WALL, wire::verify);
+    assert_eq!(r.stats().announcements_attested, 1);
+    assert_eq!(r.stats().signatures_checked, 1, "O's hop only");
+    // it isn't passed on (scope), and has nothing to retract with
+    r.tick(100);
+    let mut out = Vec::new();
+    r.drain(&mut out);
+    assert!(!out.iter().any(|o| matches!(o, Out::Announce { ann, .. } if ann.origin == a.origin)));
+}
+
+#[test]
+fn copies_through_other_neighbours_share_the_checked_prefix() {
+    let (o, u, n1, n2, me) = (dk(1), dk(2), dk(3), dk(5), dk(4));
+    let mut r = router(&me, &[n1.sign_pk(), n2.sign_pk()], 100);
+    let mut checks = 0;
+    let mut count = |c: Check<'_>| {
+        checks += 1;
+        wire::verify(c)
+    };
+    // U's hop differs per receiver (it names n1 or n2); O's doesn't
+    r.on_announce(n1.sign_pk(), relayed(&o, &[&u, &n1], me.sign_pk(), &[300, 400, 500], WALL, 8), 0, WALL, &mut count);
+    r.on_announce(n2.sign_pk(), relayed(&o, &[&u, &n2], me.sign_pk(), &[300, 450, 500], WALL, 8), 1, WALL, &mut count);
+    let s = r.stats();
+    assert_eq!(s.announcements_attested, 2);
+    assert_eq!(checks, 4 + 2, "the second copy: U's and n2's hops only");
+    assert_eq!(s.signatures_cached, 2, "O's hop and O's own signature");
+}
+
+#[test]
+fn signature_checks_are_budgeted_per_neighbour() {
+    let (n, me) = (dk(3), dk(4));
+    let mut r = router(&me, &[n.sign_pk()], 100);
+    let mut checks = 0u64;
+    // fresh keys every time: nothing to cache, all valid (a stub)
+    for i in 0..400u32 {
+        let fake = |j: u32| {
+            let mut k = [0u8; 32];
+            k[..4].copy_from_slice(&i.to_be_bytes());
+            k[4..8].copy_from_slice(&j.to_be_bytes());
+            k[31] = 0x5a;
+            SignPk(k)
+        };
+        let origin = fake(99);
+        let mut chain = Arc::new(Hop { signer: origin, cost: 0, link: 100, sig: Sig([1; 64]), prev: None });
+        for j in 1..8u32 {
+            chain = Arc::new(Hop { signer: fake(j), cost: 100 * j, link: 100, sig: Sig([1; 64]), prev: Some(chain) });
+        }
+        chain = Arc::new(Hop { signer: n.sign_pk(), cost: 800, link: 100, sig: Sig([1; 64]), prev: Some(chain) });
+        let a = Announce {
+            hops: 8,
+            cost: 800,
+            origin,
+            seq: WALL,
+            flags: 0,
+            scope: 10,
+            uplink: 0,
+            name: Arc::from(""),
+            sig: Sig([1; 64]),
+            chain: Some(chain),
+            sign_link: None,
+        };
+        r.on_announce(n.sign_pk(), a, 0, WALL, |_| {
+            checks += 1;
+            true
+        });
+    }
+    // 400 announcements × 9 hops, at once: the burst is 4 s of the rate
+    let burst = (VERIFY_RATE * 4.0) as u64;
+    let s = r.stats();
+    assert!(checks <= burst + 400, "{checks} checks (origin signatures aren't budgeted: one each)");
+    assert!(s.announcements_limited > 0 && s.announcements_attested < 400, "{s:?}");
+    assert_eq!(s.chains_refused, 0, "over budget is not a lie");
+}
+
+#[test]
+fn a_neighbour_is_greeted_once_its_hello_says_how() {
+    let (n, m, me) = (dk(3), dk(5), dk(4));
+    let mut r = router(&me, &[m.sign_pk()], 100);
+    let o = dk(1);
+    r.on_announce(m.sign_pk(), relayed(&o, &[&m], me.sign_pk(), &[300, 400], WALL, 8), 0, WALL, wire::verify);
+    r.tick(100);
+    r.drain(&mut Vec::new());
+    r.set_direct(n.sign_pk(), true, 5_000);
+    r.set_attests(n.sign_pk(), None, 5_000);
+    r.hop_up(n.sign_pk(), 5_000);
+    r.tick(5_010);
+    let mut out = Vec::new();
+    r.drain(&mut out);
+    let greeted = |out: &[Out]| {
+        out.iter()
+            .filter_map(|x| match x {
+                Out::Announce { to, ann } if *to == n.sign_pk() && ann.origin == o.sign_pk() => Some(ann.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert!(greeted(&out).is_empty(), "waits for the hello");
+    r.set_attests(n.sign_pk(), Some(true), 5_100);
+    r.tick(5_110);
+    let mut out = Vec::new();
+    r.drain(&mut out);
+    let g = greeted(&out);
+    assert_eq!(g.len(), 1);
+    assert!(g[0].chain_len() == 2 && g[0].sign_link.is_some(), "attested, with our hop to sign");
+    // a hello that never comes: greeted unattested after the wait
+    let (p, q) = (dk(6), dk(7));
+    let mut r = router(&q, &[m.sign_pk()], 100);
+    r.on_announce(m.sign_pk(), relayed(&o, &[&m], q.sign_pk(), &[300, 400], WALL, 8), 0, WALL, wire::verify);
+    r.tick(100);
+    r.drain(&mut Vec::new());
+    r.set_direct(p.sign_pk(), true, 5_000);
+    r.set_attests(p.sign_pk(), None, 5_000);
+    r.hop_up(p.sign_pk(), 5_000);
+    r.tick(5_000 + HELLO_WAIT);
+    let mut out = Vec::new();
+    r.drain(&mut out);
+    let late: Vec<&Announce> = out
+        .iter()
+        .filter_map(|x| match x {
+            Out::Announce { to, ann } if *to == p.sign_pk() && ann.origin == o.sign_pk() => Some(ann),
+            _ => None,
+        })
+        .collect();
+    assert!(late.len() == 1 && late[0].chain.is_none() && late[0].sign_link.is_none());
+}
+
+/// Settle a signed network.
+fn settled(net: &mut Net) {
+    net.run(4_000);
+}
+
+#[test]
+fn attested_routes_converge_with_real_signatures() {
+    let mut net = Net::signed(6, |i| Config { announce_every: 500, seed: i as u64 + 1, ..Config::default() });
+    for i in 0..5 {
+        net.link_cost(i, i + 1, 300);
+    }
+    settled(&mut net);
+    for a in 0..6 {
+        for b in 0..6 {
+            assert!(a == b || net.routed(a, b), "{a} → {b}");
+        }
+    }
+    let s = net.nodes[5].stats();
+    assert!(s.announcements_attested > 0 && s.chains_refused == 0 && s.announcements_forged == 0, "{s:?}");
+    let v = via(&net.nodes[5], &net.k(0), &net.k(4)).expect("route");
+    assert!(v.attested && v.hops == 5);
+    assert_eq!(net.loops_toward(0), 0);
+    net.send(5, 0, 4, b"over five attested hops");
+    assert!(net.delivered.iter().any(|(i, _, p)| *i == 0 && &p[..] == b"over five attested hops"));
+}
+
+#[test]
+fn mixed_meshes_route_through_hops_that_dont_attest_but_prefer_those_that_do() {
+    // 0 — 1 — 3 (1 doesn't attest: a version 1 device, or a liar that stopped)
+    // 0 — 2 — 3 (attests, but costlier)
+    let mut net = Net::signed(4, |i| Config { announce_every: 500, seed: i as u64 + 1, ..Config::default() });
+    net.attesting.remove(&1);
+    net.link_cost(0, 1, 200);
+    net.link_cost(1, 3, 200);
+    net.link_cost(0, 2, 900);
+    net.link_cost(2, 3, 900);
+    settled(&mut net);
+    // everyone reaches everyone, the device that doesn't attest included
+    for a in 0..4 {
+        for b in 0..4 {
+            assert!(a == b || net.routed(a, b), "{a} → {b}");
+        }
+    }
+    let r3 = &net.nodes[3];
+    let (via1, via2) = (via(r3, &net.k(0), &net.k(1)).unwrap(), via(r3, &net.k(0), &net.k(2)).unwrap());
+    assert!(!via1.attested && via2.attested && via1.cost < via2.cost);
+    assert_eq!(r3.next_hop_local(&net.k(0), net.now), Some(net.k(2)), "the attested route, though costlier");
+    assert_eq!(r3.offered(&net.k(0)), vec![net.k(2)], "the other one isn't offered as a path");
+    // with the attested one gone, the other carries the traffic
+    net.cut(0, 2);
+    net.run(2_000);
+    assert_eq!(net.nodes[3].next_hop_local(&net.k(0), net.now), Some(net.k(1)));
+    net.send(3, 0, 1, b"through a hop that doesn't attest");
+    assert!(net.delivered.iter().any(|(i, _, p)| *i == 0 && &p[..] == b"through a hop that doesn't attest"));
+    let s: Vec<Stats> = net.nodes.iter().map(Router::stats).collect();
+    assert!(s.iter().all(|s| s.chains_refused == 0 && s.announcements_forged == 0), "{s:?}");
+}
+
+#[test]
+fn a_one_hop_liar_that_drops_its_chain_attracts_nothing_attested_nodes_can_avoid() {
+    // 0 — 1 (liar) — 4, and 0 — 2 — 3 — 4: the liar claims to be one hop
+    // from 0 at the floor, unattested
+    let topo = |attest: bool| {
+        let mut net = Net::signed(5, |i| Config { announce_every: 500, seed: i as u64 + 1, attest, ..Config::default() });
+        net.liars.insert(1);
+        for (a, b) in [(0, 1), (1, 4), (0, 2), (2, 3), (3, 4)] {
+            net.link_cost(a, b, 300);
+        }
+        settled(&mut net);
+        net.nodes[4].next_hop_local(&net.k(0), net.now)
+    };
+    let attested = topo(true);
+    assert_ne!(attested, None);
+    assert_ne!(attested, Some(Net::signed(5, |_| Config::default()).k(1)), "attested: around the liar");
+    let unattested = topo(false);
+    assert_eq!(unattested, Some(Net::signed(5, |_| Config::default()).k(1)), "without: through it");
+}

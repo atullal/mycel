@@ -1869,12 +1869,17 @@ impl Router {
         {
             return Verdict::Lie;
         }
-        // a path through us, or through one device twice: a loop
+        // a path through us is a loop (a neighbour may answer a seqno
+        // request with a route through the asker); through its sender or
+        // one device twice, no honest chain goes
         let ends = if own { n - 1 } else { n };
         for j in 0..n {
             let k = hops[j].signer;
-            if k == self.me || (j < ends && k == from) || hops[..j].iter().any(|x| x.signer == k) {
+            if k == self.me {
                 return Verdict::Loop;
+            }
+            if (j < ends && k == from) || hops[..j].iter().any(|x| x.signer == k) {
+                return Verdict::Lie;
             }
         }
         // no hop advertises less than the hop before it plus the link that
@@ -3241,3 +3246,6 @@ impl Router {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod attest_tests;
