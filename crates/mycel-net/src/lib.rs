@@ -373,6 +373,8 @@ struct Inner {
     /// The last store-and-forward bundle sent per (member, space).
     /// Store-and-forward state (`bundles.rs`).
     bundles: Mutex<bundles::Bundles>,
+    /// The most recent connections (dialed and accepted), for byte counts.
+    conns: Mutex<std::collections::VecDeque<Connection>>,
     /// See [`NodeOptions::max_ephemeral`].
     max_ephemeral: usize,
     /// Dissemination (`gossip.rs`).
@@ -470,6 +472,13 @@ impl Inner {
     fn watch(&self, conn: &Connection) {
         if let Some(m) = &self.mesh {
             m.watch(conn);
+        }
+        let mut conns = self.conns.lock();
+        if !conns.iter().any(|c| c.stable_id() == conn.stable_id()) {
+            conns.push_back(conn.clone());
+            if conns.len() > 256 {
+                conns.pop_front();
+            }
         }
     }
 
@@ -1809,6 +1818,7 @@ impl Node {
             #[cfg(test)]
             stall_hellos: Default::default(),
             bundles: Mutex::default(),
+            conns: Mutex::default(),
             max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
             gossip: gossip::Gossip::new(me_pk, false),
             read_receipts: opts.read_receipts,
@@ -2026,6 +2036,18 @@ impl Node {
         self.inner.dirty_local.lock().insert(space);
         self.inner.loss_signal(space);
         self.inner.schedule(space);
+    }
+
+    /// UDP bytes sent and received on the node's recent connections (the
+    /// last 256, open or closed): QUIC headers, acknowledgements and
+    /// keep-alives included. For benchmarks.
+    pub fn quic_udp_bytes(&self) -> (u64, u64) {
+        self.inner
+            .conns
+            .lock()
+            .iter()
+            .map(|c| c.stats())
+            .fold((0, 0), |(t, r), s| (t + s.udp_tx.bytes, r + s.udp_rx.bytes))
     }
 
     /// Gossip counters: messages and bytes on gossip streams, new items

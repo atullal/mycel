@@ -115,9 +115,16 @@ one protocol takes the other takes too).
 | `Blob` | 4 | bi | v1 | `BlobReq` → `BlobResp` + raw bytes. New request variants are only ever appended. |
 | `Hello` | 5 | bi | v2 | The dialer's `Hello{caps}`, then the listener's |
 | `SyncV2` | 6 | bi | v2, `SYNC_V2` | One Sync v2 session (`mycel_sync::reconcile::Msg`, `Open` first), opened only to a peer whose hello agreed `SYNC_V2`. A listener that fails after accepting it resets with `0x6d790002` (`SYNC_V2_FAILED`), never with `STREAM_REFUSED`; a device that refuses it all the same is synced with `Sync` and not offered `SyncV2` for 30 min |
+| `Gossip` | 7 | uni | v2, `GOSSIP` | One dissemination message (`mycel_sync::reconcile::gossip::GossipMsg`: `Push`, `IHave`, `Have`, `Graft`, `Prune`; at most 64 KiB), sent only to a peer whose hello agreed `GOSSIP`, and taken only from a current member of the message's space |
+
+A device with Sync v2 serves at most one `Sync` (v1) session per (peer,
+space) every 5 s (`V1_SERVE_INTERVAL`); it refuses the excess by resetting
+the stream with `0x6d790003` (`SYNC_V1_LIMITED`), which a current build
+takes as `Busy` and an older one as a failed session it retries on its own
+schedule.
 
 **Unknown kinds.** A kind the stream's connection version doesn't have
-(any byte not in the table, or `Hello` or `SyncV2` on a v1 connection, or
+(any byte not in the table, or `Hello`, `SyncV2` or `Gossip` on a v1 connection, or
 `SyncV2` at a device without Sync v2) is refused at
 once: the listener stops the receive side and resets the send side with the
 QUIC application error `STREAM_REFUSED` (`0x6d790001`). The opener's next
@@ -129,8 +136,12 @@ byte is ever read as something else. The connection carries on.
 **The hello.** The dialer opens it right after dialing (`start_hello`), on
 its own stream next to the exchange it dialed for. The two race: nothing
 may assume the hello arrives, or is answered, before that exchange.
-Nothing waits on it unless it needs a capability (`PooledConn::protocol`,
-at most `REPLY_TIMEOUT`, then "no capabilities"). It costs one stream each
+Nothing waits on it unless it needs a capability (`PooledConn::protocol`:
+a sync waits four round trips on the path in use, between 750 ms and 3 s,
+then uses v1 for that session; `Node::negotiate` waits up to
+`REPLY_TIMEOUT`). Mesh hops advertise only the capabilities registered for
+the mesh protocol (`Caps::for_protocol`): a hop never hears `SYNC_V2` or
+`GOSSIP`. It costs one stream each
 way with a few bytes in each, per connection, not per exchange. It may
 only grow at the end: receivers read the fields they know and ignore the
 rest (`Hello::decode`).
@@ -228,7 +239,14 @@ the payload only the endpoint reads (RFC 9171 §4.3):
     or id can be replayed as a v2 one, and the version is signed.
 - **Payload kind**, what only the destination reads. Kind 1
   (`KIND_SPACE_SYNC`): postcard `DtnPayload{space, data}`, signed ops and
-  encrypted envelopes of one space.
+  encrypted envelopes of one space, readable by any carrier (the space id,
+  every membership op and every envelope header). Kind 2
+  (`KIND_SPACE_SYNC_SEALED`, header v2 only): postcard
+  `Lockbox{enc, ct}`, the HPKE base-mode seal (the lockbox suite) to the
+  destination's key-exchange key with `info = "mycel/v2/dtn-seal" ‖ src ‖
+  dst` of `DtnPayload2{space, ops, envelopes}` followed by zero bytes up to
+  its PADMÉ size class (`bundles.rs`). A node sends kind 2 to every member
+  not known to speak only version 1.
 
 Receipts (context `mycel/v0/dtn-receipt`, over the id) are the same for
 both: ids of different versions never collide.
@@ -247,13 +265,16 @@ The planner reads a hop's version from the hop connection itself (its
 ALPN), never from separate state, so a hop replaced in between can't pair
 one connection with another's version.
 
-A node sends space data in v1 bundles (`Mesh::send_bundle`), which every
-carrier and destination takes. `Mesh::send_bundle_as` sends another format:
-a v2 bundle crosses only v2 carriers, so a sender should pick a kind its
-destination is known to support (`PeerState::protocol` from an earlier
-connection) and otherwise fall back to v1.
+A node sends space data in sealed v2 bundles (kind 2), except to a member
+known to speak only version 1 (`PeerState::protocol` without `SYNC_V2`, or
+remembered as v1-only), which gets a v1 bundle (kind 1). A v2 bundle
+crosses only v2 carriers. Sealing is the default because the v1 payload
+exposed a space's membership to strangers (Sync v2 finding 9): a member
+not seen since an upgrade loses bundles until it is seen, rather than
+every carrier learning the space.
 
-**Header v2 is provisional.** No build originates v2 bundles yet, and its
+**Header v2 is provisional.** Sealed sync bundles (kind 2) are the first
+v2 bundles a build originates (pre-release builds only), and the header's
 bytes may still change. One change is planned before any build sends one:
 every header version splits the carrier population (a carrier refuses
 what it can't check, and carriers are the slowest devices to upgrade, the
@@ -262,9 +283,9 @@ extension blocks covered by the signature (type, flags including "the
 destination may ignore it", bytes), as the Bundle Protocol's extension
 blocks under a stable primary block do (RFC 9171 §4.2.4, §4.3.2). Later
 additions are then new block types that v2 carriers still verify and
-carry, not new header versions. Until that lands, `send_bundle_as` with
-`BUNDLE_V2` is for tests only, and no other change may depend on the v2
-header's bytes (§9).
+carry, not new header versions. Until that lands, sealed sync bundles are
+the only v2 originator, no release may ship with them, and no other change
+may depend on the v2 header's bytes (§9).
 
 ### 3.7 Discovery and gateway records
 
@@ -410,11 +431,12 @@ names), so an old build finds them missing rather than misreading them.
 |---|---|---|---|---|
 | 0 | `SYNC_V2` | node | Negotiated set-reconciliation sync: a new stream kind whose cost tracks the difference, not the history | Implemented (stream kind `SyncV2`, `mycel_sync::reconcile`); advertised by default (`Caps::SUPPORTED`) unless `NodeOptions::sync_v2` is off |
 | 1 | `ROUTE_ATTEST` | mesh | Per-hop attestations on route announcements | Registered; future |
-| 2–47 | | | Free, assigned in order | |
+| 2 | `GOSSIP` | node | Dissemination: Plumtree push of new items on `Gossip` uni-streams (with `SYNC_V2`, whose sessions repair what gossip misses) | Implemented (stream kind `Gossip`, `mycel_sync::reconcile::gossip`); advertised by default unless `NodeOptions::sync_v2` is off |
+| 3–47 | | | Free, assigned in order | |
 | 48–63 | reserved | | Grease: one random bit per hello, never assigned | |
 
-`Caps::SUPPORTED` (what a build advertises by default) is `SYNC_V2` in
-this build: a bit is added there in the change that implements it.
+`Caps::SUPPORTED` (what a build advertises by default) is `SYNC_V2 |
+GOSSIP` in this build: a bit is added there in the change that implements it.
 
 ---
 
@@ -570,8 +592,12 @@ What versioning does not cover yet, so that no other change relies on it:
   framing version each. A framing change must keep accepting version 1
   beside the new one until the L2CAP hello and GATT record carry a version
   range (Bluetooth readers already skip appended fields).
-- **Bundle header v2 extension blocks** (§3.6): planned before any build
-  originates a v2 bundle.
+- **Bundle header v2 extension blocks** (§3.6): planned before any release
+  originates a v2 bundle (sealed sync bundles already do, in pre-release
+  builds).
+- **Persisted peer capabilities**: which payload kind a member gets is
+  decided from capabilities seen since the node started; they are not
+  kept across restarts yet.
 - **Ops and envelopes as opaque items in sync** (§3.10): for `SYNC_V2`, so
   one unreadable item doesn't stop a space's sync.
 - **`ROUTE_ATTEST` ranking** (§6): the downgrade policy above is the rule

@@ -80,8 +80,11 @@ pub const IHAVE_DELAY_MS: u64 = 250;
 /// grafts the announcer and pulls, on fast and on slow paths.
 pub const IHAVE_WAIT_FAST_MS: u64 = 1_000;
 pub const IHAVE_WAIT_SLOW_MS: u64 = 3_000;
-/// Entries accepted in one announcement or push.
+/// Entries accepted in one announcement or push, and the bytes of entries
+/// one carries (an equivocating author's entry lists up to 64 runs, so a
+/// count alone wouldn't keep a message under [`MAX_GOSSIP_FRAME`]).
 pub const MAX_ENTRIES: usize = 256;
+pub const ENTRIES_BYTES: usize = 24 * 1024;
 /// Alternatives named in a dropping `Prune`.
 pub const MAX_ALTERNATIVES: usize = 4;
 /// Seen notes attached to one message (bytes in all), and kept to forward.
@@ -536,7 +539,7 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
                 fits = bytes <= MAX_PUSH_BYTES;
             }
         }
-        let entries: Vec<AuthorEntry> = changed.iter().map(|e| (*e).clone()).take(MAX_ENTRIES).collect();
+        let entries = cap_entries(changed.iter().map(|e| (*e).clone()));
         let eager = view.eager(from);
         if fits {
             for p in &eager {
@@ -874,7 +877,7 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
                     lazy.rotate_left(start);
                     lazy.truncate(IHAVE_FANOUT);
                 }
-                let entries: Vec<AuthorEntry> = entries.into_values().collect();
+                let entries = cap_entries(entries.into_values());
                 for p in lazy {
                     let seen = take_seen(view, &p);
                     self.out.push_back(Action::Send {
@@ -958,7 +961,7 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
                 // What we hold of those authors: the receiver learns we hold
                 // at least this (delivery state).
                 Some(view) => (
-                    authors.iter().filter_map(|a| view.announced.entries.get(a).cloned()).collect(),
+                    cap_entries(authors.iter().filter_map(|a| view.announced.entries.get(a).cloned())),
                     take_seen(view, &peer),
                 ),
                 None => (Vec::new(), Vec::new()),
@@ -1011,6 +1014,18 @@ impl std::fmt::Display for GossipError {
 }
 
 impl std::error::Error for GossipError {}
+
+/// At most [`MAX_ENTRIES`] entries and [`ENTRIES_BYTES`] of them.
+fn cap_entries(entries: impl Iterator<Item = AuthorEntry>) -> Vec<AuthorEntry> {
+    let mut bytes = 0;
+    entries
+        .take(MAX_ENTRIES)
+        .take_while(|e| {
+            bytes += encoded_len(e);
+            bytes <= ENTRIES_BYTES
+        })
+        .collect()
+}
 
 /// Seen notes for one message to `peer`: newest first, each once per peer,
 /// at most [`SEEN_BYTES_PER_MSG`] in all.

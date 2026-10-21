@@ -40,7 +40,7 @@ bin="target/$host/release"
 # input: up to 64 edits, 24 messages or 128 steps. libFuzzer's length
 # control would keep inputs a few hundred bytes long for most of a short
 # run, so these start at their full length.
-structured=" blob_ranges call_media dtn link_ble mesh_router sync_doc sync_replica trust_graph video_media "
+structured=" blob_ranges call_media dtn link_ble mesh_router sync_doc sync_gossip sync_replica sync_v2_session trust_graph video_media "
 
 mkdir -p logs
 ledger=logs/runs.tsv
