@@ -165,7 +165,36 @@ only radio model, so there is no lighter profile to fall back to yet.
 What CRN buys, measured with `mycel-sim crn` (variance of A − B over
 seeds, A = the GLOBAL core + DTN, B = a reference model, three ways: on
 the same seed; on the same world with B's endogenous streams salted; on
-independent seeds): CRN_PLACEHOLDER
+independent seeds), 10 seeds from base 3000 (582 s wall, 2,198 s of
+CPU, 4 threads):
+
+| Scenario (scale) | A − B | Metric | Var CRN | Var same world | Var independent | independent / CRN |
+|---|---|---|---:|---:|---:|---:|
+| `churn` (0.05) | GLOBAL − main | delivery (%) | 2.33 | 2.88 | 1.89 | 0.8× |
+| `churn` (0.05) | GLOBAL − main | latency p50 (s) | 0.0006 | 0.0006 | 0.0012 | 1.9× |
+| `churn` (0.05) | GLOBAL − main | latency p95 (s) | 77.0 | 77.1 | 76.8 | 1.0× |
+| `disaster-dtn` (0.1) | GLOBAL − epidemic | delivery (%) | 169 | 169 | 169 | 1.0× (epidemic delivers 100% of feasible on every seed) |
+| `disaster-dtn` (0.1) | GLOBAL − epidemic | latency p50 (s) | 5.02 × 10⁵ | 5.02 × 10⁵ | 6.94 × 10⁶ | 13.8× |
+| `disaster-dtn` (0.1) | GLOBAL − epidemic | latency p95 (s) | 1.32 × 10⁶ | 1.32 × 10⁶ | 4.94 × 10⁶ | 3.7× |
+| `trace-replay` (0.05) | GLOBAL − epidemic | delivery (%) | 3.88 | 3.88 | 24.4 | 6.3× |
+| `trace-replay` (0.05) | GLOBAL − epidemic | latency p50 (s) | 4,919 | 4,919 | 106,422 | 21.6× |
+| `trace-replay` (0.05) | GLOBAL − epidemic | latency p95 (s) | 3.12 × 10⁶ | 3.12 × 10⁶ | 3.86 × 10⁶ | 1.2× |
+
+Pairing on one seed cut the variance of the latency-p50 gap 14–22× in
+the two delivery-tolerant scenarios and of `trace-replay`'s delivery gap
+6×, so a paired comparison there needs that many times fewer seeds for
+the same precision. Almost all of it comes from sharing the exogenous
+world: the same-world column matches the CRN column exactly in
+`trace-replay` (epidemic draws no router randomness and the trace's
+radio has no jitter), to within 0.2% in `disaster-dtn`, and to within
+25% in `churn`. Where the two
+models barely co-vary (`churn`: the old mesh delivers 3–5%, so the gap
+is the GLOBAL core's own spread) pairing buys nothing. With 10 seeds a
+ratio of two sample variances is uncertain by about a factor of 4 either
+way (F(9, 9) 2.5% and 97.5% points 0.25 and 4.0), so ratios between
+roughly 0.25 and 4 are not distinguishable from 1; the three above 6×
+are. Endogenous CRN will matter more once link setup, loss and OS wakes
+are endogenous models (WP7–WP9); today jitter is the only one.
 
 **Fidelity levels.** Each result is only as strong as the weakest model
 it uses:
@@ -249,7 +278,10 @@ other seven 17 s together), and `cargo test --release -p mycel-sim`
 156 s for the scenario tests (tier 1's CI three included), 245 s with an
 incremental build. On CI's 4-vCPU
 runner we estimate (not measured) about 3–6 minutes for the gate plus
-the release build; the job's limit is 45 minutes.
+the release build; the job's limit is 45 minutes. With the keyed streams and digests
+of fixed 27 the gate took 106.7 s wall, 418 s of CPU and 1.4 GB peak
+(2026-10-21, load 4–12; v2/integration the same hour: 109.0 s, 412 s,
+2.0 GB).
 
 ## 2. Models and sources
 
@@ -294,9 +326,13 @@ The scenarios ran as separate processes and were joined with
 (load averages of 9 to 40 on 18 cores, with other simulations and builds
 running), so wall times are pessimistic, and the real-time tier-1 latencies
 (calls especially) carry that load. Trace replays are in §5. The tier-2
-rows were rerun on the split random streams of §1 (seed 1, one process,
-4 threads); every tier-2 number moved once with that change, and the old
-value is given where it matters. Tail columns are p50/p95 and CVaR₉₅
+rows were rerun on the keyed streams of fixed 27 (seed 1, 4 threads,
+2026-10-21), beside v2/integration (4a321e48) run the same way the same
+hour: every tier-2 number moved once with that change, and "before"
+gives v2/integration's value (which differs from what this table said
+before in places, from the routing-defence changes merged since).
+Calibration ranges marked "before fixed 27" were measured on the earlier
+streams. Tail columns are p50/p95 and CVaR₉₅
 (§1); p99 appears only where a sample has 4,000 messages. Tier-1 rows give
 p50/p95/max: their runs have at most a few dozen messages (under 51),
 where the nearest-rank "p99" these rows used to print is the maximum.
@@ -316,19 +352,19 @@ where the nearest-rank "p99" these rows used to print is the maximum.
 | `adversarial-live` | 1 | full | ✅ | messages past a black hole and a storm: 100% delivered, p50 0.275 s, p95 0.308 s, optimality p50/p95/max 3.66/4.11/4.11× | 16 s |
 | `multipath` | 1 | full | ✅ | 3 links 8.0 MB/s, 1 link 2.9 MB/s (2.76×) | 21 s |
 | `mixed-room` | 1 | full | ✅ | Ethernet→Some(Ethernet), Wi-Fi Direct→Some(WifiDirect), UWB→Some(Uwb), Bluetooth LE→Some(Bluetooth) | 26 s |
-| `us-eu` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.737 s, optimality p50/p95 1.23/2.24×, CVaR₉₅ 2.34× (was p95 0.725 s, 2.15× on the shared streams) · CI size, 30 calibration seeds: optimality p95 2.22–2.37× | 1 s |
-| `gateway-choice` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 1.12 s, optimality p50/p95 6.26/9.15×, CVaR₉₅ 9.18× (100 KB and 1 MB messages against the pipelining bound) · 100% of relayed bytes via the far fibre gateway · CI size: 1 KB optimality p50 1.51–2.03× over 30 calibration seeds (target 2×, missed on 1) | 0 s |
-| `routing-convergence` | 2 | full | ✅ | global core: 99% routed in 1.1 s, 100% in 1.9 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never · CI size, 30 calibration seeds: 99% in 0.6–0.8 s, 0 loops on every seed | 15 s |
-| `flood-scaling` | 2 | full | ✅ | largest N (2,000): global core 8.3% of BLE in steady state (8.4% on the shared streams), 100% of pairs routed (before: 67.0%, 92% routed), main 136.2% | 333 s |
-| `partial-route` | 2 | full | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.6 s; sender-holds 100% p50 98.5 s · gap 300 m: global core + DTN 100%; stand-in custody 0%; sender-holds 0% | 0 s |
-| `disaster-dtn` | 2 | full, judged on 12 worlds from seed 1 | ✅ | **global core + DTN: mean 88.1% delivered** (target ≥ 80%; per world 78–100%; 87.2% on the shared streams) · seed 1: 93%, p95 7680 s, optimality p50/p95 1.45/5.38×, 21.3 replicas and 32.6 hand-offs per message (budget 32; mean of the 12 worlds 21.2) · latency p50 against epidemic's, median of the 12 worlds' ratios, 1.42× (per world 1.24–2.34×; target 3×) · PRoPHET 67%, spray-and-wait (L=8) 28%, epidemic 100%, on the same world (60 of 60 messages feasible for every router) · CI size (0.1, 48 messages, mean of 20 worlds): 81.1–91.0% over 30 calibration seeds, median 85.2% (finding 25) | 45 s |
+| `us-eu` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.720 s, optimality p50/p95 1.23/2.16×, CVaR₉₅ 2.27× (before: 0.737 s, 1.23/2.24×, 2.34×: jitter now drawn per link and frame) · CI size, the gate's 10 seeds: optimality p95 2.23–2.40× | 1 s |
+| `gateway-choice` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 1.11 s, optimality p50/p95 6.26/9.23×, CVaR₉₅ 9.24× (before: 1.12 s, 6.26/9.15×; 100 KB and 1 MB messages against the pipelining bound) · 1 KB optimality p50 1.88× (before 1.73×) · 100% of relayed bytes via the far fibre gateway · CI size: 1 KB optimality p50 1.45–1.96× on the gate's 10 seeds (before 1.53–2.03×, missed on 1; 1.51–2.03× over 30 calibration seeds before fixed 27) | 0 s |
+| `routing-convergence` | 2 | full | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.02× (before 1.01×) · the last of the 300 pairs not within the 40 s watched (before: 100% in 1.9 s; the objective is 99%; one pair, not yet looked into) · main: 99% in never · CI size, the gate's 10 seeds: 99% in 0.6–0.7 s, 0 loops on every seed | 18 s |
+| `flood-scaling` | 2 | full | ✅ | largest N (2,000): global core 8.5% of BLE in steady state (before 8.4%), 100% of pairs routed (flood reduction on: 98%, before 100%), main 136.1% | 550 s |
+| `partial-route` | 2 | full | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 98.4 s (before 97.6 s); sender-holds 100% p50 98.8 s (before 98.5 s) · gap 300 m: global core + DTN 100%; stand-in custody 0%; sender-holds 0% | 0 s |
+| `disaster-dtn` | 2 | full, judged on 12 worlds from seed 1 | ✅ | **global core + DTN: mean 83.6% delivered** (target ≥ 80%; per world 70–92%; before 88.1%, 78–100%: each message's ends and each walker's waypoints now come from their own streams, so all 12 worlds are new ones; DISASTER13_PLACEHOLDER) · seed 1: 83%, p95 7310 s, optimality p50/p95 1.58/4.60×, 20.1 replicas and 27.8 hand-offs per message (budget 32; mean of the 12 worlds 20.5) · latency p50 against epidemic's, median of the 12 worlds' ratios, 1.45× (before 1.36×; target 3×) · PRoPHET 52%, spray-and-wait (L=8) 22%, epidemic 100%, on the same world (before 67%, 28%, 100%) · CI size (0.1, 48 messages, mean of 20 worlds): the gate's 10 seeds 79.3–90.1%, median 86.2% (before 81.0–87.5%, 86.1%); CALDIS_PLACEHOLDER | 187 s |
 | `mailbox` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95 1.00/1.00× | 0 s |
-| `global-scale` | 2 | 2,002 devices (0.02) | ✅ | global core + DTN: 100% delivered, p95 0.690 s, optimality p50 3.76×, p95 10.0× · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.117 s, p95 0.211 s, optimality p95 2.76× (2.88× on the shared streams; 4.45× before fixed 19; 32.2× before fixed 18) · control 708 B/s per device (was 8,470): routing 470, carrier 238 (was 8,004, fixed 17) · CI size (1,499 devices, shared streams): warm optimality p95 2.65× (was 5.14×, failing) | 58 s |
-| `churn` | 2 | 1,001 devices (scale 0.1) | ✅ | global core + DTN: 100% delivered, p95 61.1 s, optimality p50/p95 5.99/12.6×, CVaR₉₅ 16.0× (p50/p95 5.87/12.5× on the shared streams); control 700 B/s per device: routing 2,659 → 471, carrier 4,540 → 256 (full size before the carrier fixes: 100%, p95 65.2 s) | 33 s |
-| `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.091 s, optimality p50/p95 1.91/6.02×, CVaR₉₅ 7.84× (was 82%, p95 1.28 s, 36.6/170× p50/p95, failing: fixed 20) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (today's one-hop liar, judged ≥ 90%; a weak attacker: open 15): 91%, liar-free-reachable delivery 91% of a 100% ceiling (94% on the shared streams; 76% before fixed 21); 85.4% mean over seeds 1–20, and 78.4% for the chain-extending lie any liar can tell today (open 15) · CI size (0.1), 30 calibration seeds: lying plausibly 88.3–100%, median 96.7% | 265 s |
-| `liar-ceiling` | 2 | full, seeds 1–20 | ⏳ | ceiling 100% on every seed · each announcement format against its worst strategy: today 78.4% (chain-extending liar, min 69%), signed per-hop chain 78.4% (+0.0), chain + each hop's measured cost 98.9% (+20.6 ± 2.4 points) · by strategy: one-hop liar 85.4%, chain-extending liar 78.4%, honest dropper 98.9%, honest grey hole 99.5% (open 15) · CI size (seeds 1–20): 97.0% (one-hop liar), chain alone +0.3 ± 0.7, hop costs +2.7 ± 0.9 | 507 s |
-| `trace-replay` | 2 | full | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.0% of feasible (3,981 of 4,000 sent), p50 4.7 s, p95 1311 s, optimality p50 1.22×, p95 8.30× [6.24–13.8], CVaR₉₅ 23.1×, 3 of 396 over 30× (Wilson upper bound 2.2%), overhead 3.34 (was 8.38/18.0× p95/p99: fixed 21; pipelining-aware oracle, fixed 12) · ten full-size calibration seeds pooled (3,982 messages): p95 8.30× [7.73–9.20], CVaR₉₅ 39.8× (the p99 jump 36.8× → 46.9× on the shared streams: finding 26) · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 49 s |
-| `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 52%, 70%, 83%, 91%, 94% (640 broadcasts, the same at every limit; the shape checks are paired, "reach rises" a non-inferiority test, weakest step 6→7 +3.1 ± 1.5 points: finding 24) | 0.5 s |
+| `global-scale` | 2 | 2,002 devices (0.02) | ✅ | global core + DTN: 100% delivered, p95 0.720 s, optimality p50 3.52×, p95 11.7× (before 0.690 s, 3.54×, 10.0×: every message's pair now from its own stream, so the 400 messages are new ones) · first contact p95 0.808 s (≤ 3 s; before 0.741 s), optimality p95 14.5× (before 12.9×) · warm p50 0.108 s, p95 0.216 s, optimality p95 3.39× (≤ 5×; before 2.87×; 4.45× before fixed 19; 32.2× before fixed 18) · control 704 B/s per device (was 8,470): routing 470, carrier 233 (was 8,004, fixed 17) | 62 s |
+| `churn` | 2 | 1,001 devices (scale 0.1) | ✅ | global core + DTN: 100% delivered, p95 59.0 s, optimality p50/p95 5.80/11.6×, CVaR₉₅ 12.9× (before 61.1 s, 5.89/12.6×, 16.0×: who leaves and who sends now come from per-minute and per-message streams); control 710 B/s per device (before 700) · stand-in 97% (before 91%), main 5% (before 3%) | 33 s |
+| `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.092 s, optimality p50/p95 1.92/5.39×, CVaR₉₅ 6.93× (before 0.091 s, 1.91/6.02×, 7.84×) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (today's one-hop liar, judged ≥ 90%; open 15): 92.7%, liar-free-reachable delivery 92.7% of a 100% ceiling (before 93.3%) · attackers are now placed from their own stream, so these are other devices: the storm's announcements dropped by per-neighbour limits 903,045 (before 261,195), replays dropped as stale 1,076,704 (before 141,475), devices that stopped routing through a lying neighbour 533 (before 341) · CI size: the gate's 10 seeds, lying plausibly 88.3–100%, median 99.2% (before 91.7–100%, 97.5%); CALADV_PLACEHOLDER | 567 s |
+| `liar-ceiling` | 2 | full, seeds 1–20 | ⏳ | ceiling 100% on every seed · each announcement format against its worst strategy: today 78.0% (chain-extending liar, min 66%), signed per-hop chain 78.0% (+0.0), chain + each hop's measured cost 99.4% (+21.3 ± 2.7 points) · by strategy: one-hop liar 85.9%, chain-extending liar 78.0%, honest dropper 99.4%, honest grey hole 99.7% (open 15) · before (v2/integration, same day): 79.0% (min 68%), 79.0%, 98.9% (+20.0 ± 2.3); by strategy 85.5%, 79.0%, 98.9%, 99.5%: the liars are other devices now (their own stream) | 833 s |
+| `trace-replay` | 2 | full | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible (3,990 of 4,000 sent), p50 4.8 s, p95 1370 s, optimality p50 1.22×, p95 8.35× [6.43–11.6], CVaR₉₅ 26.5×, 4 of 399 over 30× (Wilson upper bound 2.5%), overhead 3.28 · before (same trace, the workload from the old stream): 99.0% (3,984), p95 1312 s, 8.22× [6.28–11.1], CVaR₉₅ 19.1×, 4 of 396 over 30×, overhead 3.31: the 4,000 messages' times, ends and sizes now come from a Philox workload stream, so they are other messages; CVaR₉₅ is the mean of the 20 worst ratios and moves with them · ten full-size calibration seeds pooled before fixed 27: p95 8.30× [7.73–9.20], CVaR₉₅ 39.8× · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 57 s |
+| `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 51%, 68%, 82%, 91%, 95% (before 16, 33, 52, 70, 83, 91, 94%: the 640 broadcasts' sources now come from a Philox workload stream; the same at every limit; the shape checks are paired, "reach rises" a non-inferiority test, weakest step 6→7 +4.6 ± 1.3 points, before +3.1 ± 1.5: finding 24) | 0.7 s |
 
 ## 4. Findings
 
