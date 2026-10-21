@@ -118,12 +118,32 @@ to be reachable as often as it can, and how honestly the app says so:
 
 - **`MycelService`** is a foreground service of type `connectedDevice`
   ("interaction with external devices over Bluetooth, NFC, IR, USB, or
-  network"): it keeps the runtime's connections to nearby devices and the
-  internet open. Not `dataSync`, which Android 15 caps at 6 hours a day and
-  forbids starting after a reboot. Its prerequisite is a Wi-Fi or network
-  permission in the manifest (`CHANGE_WIFI_MULTICAST_STATE`,
-  `CHANGE_NETWORK_STATE`; no prompt). Google Play would ask for a
-  justification of the type; `specialUse` is the fallback if it's refused.
+  network"): it keeps the runtime's connections to other devices running
+  Mycel open: phones and computers on the same Wi-Fi or LAN, found by mDNS,
+  and those reached through them. Mycel has no Bluetooth link on Android
+  yet (no backend, no Bluetooth permissions), so the case rests on network
+  devices only, and keeping internet connections open is not by itself
+  "interaction with external devices". Not `dataSync`, which Android 15
+  caps at 6 hours a day and forbids starting after a reboot. Its
+  prerequisite is a Wi-Fi or network permission in the manifest
+  (`CHANGE_WIFI_MULTICAST_STATE`, `CHANGE_NETWORK_STATE`; no prompt).
+- **Google Play declaration (draft, not submitted or reviewed).** Play asks
+  apps targeting Android 14+ to justify each foreground service type. The
+  text Mycel would give for `connectedDevice`:
+
+  > Mycel is a peer-to-peer messenger with no server. The foreground
+  > service keeps open the encrypted connections to the user's other
+  > devices and contacts' devices running Mycel on the same Wi-Fi or local
+  > network, which it finds by mDNS and exchanges messages and calls with
+  > directly. Without it, messages from those devices can't reach the
+  > phone while the app is in the background, since there is no push
+  > server to wake it. The user sees a silent, persistent notification and
+  > can stop it by force-stopping the app.
+
+  If Play rejects that, the fallback is `specialUse` with a
+  `PROPERTY_SPECIAL_USE_FGS_SUBTYPE` property saying the same
+  ("peer-to-peer messaging without a push server"), which Play reviews case
+  by case.
 - **No window needed.** Tauri opens the runtime when the first activity is
   created, so the service now opens the same runtime itself when there is
   no activity (`MycelRuntime.kt`, `src-tauri/src/android.rs`), for an
@@ -133,9 +153,13 @@ to be reachable as often as it can, and how honestly the app says so:
     `MY_PACKAGE_REPLACED`, both allowed to start a foreground service on
     Android 12+; Android doesn't deliver them to an app that was never
     opened or was force-stopped);
-  - after Android kills the process (`START_STICKY`). Android 12+ refuses to
-    make a restarted service foreground unless Mycel may ignore battery
-    optimisation; then it catches up once (45 s) and stops;
+  - after Android kills the process (`START_STICKY`). Android 12+ may
+    refuse to make a restarted service foreground (Mycel not exempt from
+    battery optimisation, and not recently in use), and ignores the request
+    silently when the user restricted background use in Settings (the
+    service asks Android whether it took). Then it catches up once (at most
+    45 s) and stops, unless the app started it again meanwhile: a late
+    catch-up never stops the service a newer start made foreground;
   - a periodic backstop (`CatchUpWorker`, WorkManager, every 3 hours when
     the system allows): restart the service if allowed, else one 60 s
     catch-up. Android 16 holds jobs to runtime quotas per standby bucket,
@@ -164,15 +188,21 @@ to be reachable as often as it can, and how honestly the app says so:
   iOS decides when they run: typically a few times a day for an app used
   regularly, more while charging; never after the user swipes Mycel away
   in the app switcher, until it's opened again.
-- **Bluetooth in the background.** The `bluetooth-central` and
-  `bluetooth-peripheral` background modes keep scanning (always filtered by
-  Mycel's service, as iOS requires in the background) and advertising, and
-  CoreBluetooth events wake Mycel briefly; while awake, its LAN and
-  peer-to-peer Wi-Fi paths run too. Both managers opt into **state
-  restoration**: iOS relaunches Mycel in the background for a Bluetooth event
-  after ending it for memory (not after a swipe away). A backgrounded
-  iPhone advertises only in Apple's "overflow area", which other Apple
-  devices scanning for Mycel can see and a Linux peer can't.
+- **Bluetooth in the background.** The `bluetooth-central` background mode
+  keeps scanning (always filtered by Mycel's service, as iOS requires in
+  the background) and dialing devices that advertise Mycel (computers, and
+  phones with Mycel open), and CoreBluetooth events wake Mycel briefly;
+  while awake, its LAN and peer-to-peer Wi-Fi paths run too. The central
+  opts into **state restoration**: iOS relaunches Mycel in the background
+  for a Bluetooth event after ending it for memory (not after a swipe
+  away). **Not `bluetooth-peripheral`:** with it, a locked iPhone would keep
+  advertising and serving the readable characteristic that carries its
+  long-term device key to anyone in range, all day (a tracking beacon). So
+  two iPhones that both have Mycel in the background don't find each other
+  over Bluetooth; one of them has to be open. What the Bluetooth link
+  reveals, and the fix that would allow background advertising, are in
+  [TRUST.md](TRUST.md#8b-mesh-relays-what-they-can-and-cant-do) (§8b, known limits). The
+  characteristic never carries the display name.
 - **The grace period.** Leaving the app still asks for iOS's usual
   background time so sends finish.
 - **What the app says.** The *In the background* card says "Slow mode: new
@@ -216,9 +246,20 @@ to be reachable as often as it can, and how honestly the app says so:
 ### How it was tested
 
 - **Unit tests (macOS):** the catch-up's budget, linger and cancellation
-  (`background.rs`, paused tokio time), one catch-up at a time (also after
-  a panic), the Kotlin status JSON mapping, the UI copy (`apps/host/tests/backgroundStatus.test.ts`),
-  and `Runtime::profile_exists`.
+  (`background.rs`, paused tokio time); per-launch cancel tickets (a cancel
+  before the catch-up begins ends it at once; one launch's cancel never
+  stops another's); one catch-up at a time (also after a panic); the
+  windowless lifecycle against a real runtime (`lib.rs`: no profile is
+  created without a window, an existing one opens, later opens adopt the
+  same core, a catch-up syncs and is recorded); the Kotlin status JSON
+  mapping; that neither iOS Info.plist declares `bluetooth-peripheral`; the
+  GATT payload carrying no name; the UI copy
+  (`apps/host/tests/backgroundStatus.test.ts`); and `Runtime::profile_exists`.
+- **JVM unit tests (Android, `gen/android/app/src/test`, `./gradlew
+  :app:testArm64DebugUnitTest`):** the service's and the worker's
+  decisions (`BackgroundPolicy.kt`), including the regression where a late
+  catch-up stopped the service the app had just made foreground, and a
+  worker stopped while the runtime opens.
 - **Builds and emulator checks:** [TESTING.md](TESTING.md#phones-and-the-other-platforms).
 - **Not tested on real phones:** none of this has run on a physical Android
   phone or iPhone. BGTaskScheduler never runs in the Simulator, and

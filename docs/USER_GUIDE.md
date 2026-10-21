@@ -267,8 +267,8 @@ messages from the keeper later.
 iOS pauses Mycel soon after you leave it, and Mycel has no push server, so
 nothing can wake it the moment a message is sent. It catches up when iOS
 lends it time (a few times a day if you use it often, more while
-charging), over Bluetooth when a device running Mycel is nearby, and when
-you open it. **New messages may wait until you open Mycel.** Swiping Mycel
+charging), over Bluetooth when a computer running Mycel, or a phone with
+Mycel open, is nearby, and when you open it. **New messages may wait until you open Mycel.** Swiping Mycel
 away in the app switcher stops the background checks until you open it
 again, so leave it in the switcher. Calls continue in the background.
 **Profile > In the background** says when the last background check ran.

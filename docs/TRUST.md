@@ -210,6 +210,7 @@ A relay forwards QUIC packets of a connection between two other devices.
 **Limits (known):**
 - No onion routing or padding: relays see endpoints, sizes and timing. Hiding who-talks-to-whom would need onion-style layered encryption and cover traffic, at a large bandwidth cost on Bluetooth.
 - Sybil devices nearby can each be a neighbour (each is rate-limited separately); the radio's range is the practical bound.
+- **Bluetooth shows the device key to anyone in range.** The link has no pairing. The readable GATT characteristic carries the L2CAP PSM and the device's long-term key (never the display name), and the first frame on an L2CAP channel (the hello) carries the key and the display name, unencrypted, to whichever device opened or accepted it. So a nearby attacker scanning for Mycel's service can recognise a device by its key (passive), and one advertising the service can also get its name (active). How long a device is exposed: computers whenever Mycel runs; iPhones and iPads while Mycel is open and, in the background, only to devices that advertise Mycel (iOS keeps scanning and dialing with the `bluetooth-central` background mode; `bluetooth-peripheral` is deliberately not declared, so a locked iPhone neither advertises nor serves the characteristic). Android has no Bluetooth link yet. The fix, rotating tokens in place of the key and identity only inside an encrypted handshake, is not built.
 
 ## 8c. Gateways, records and carriers (global routing, store-and-forward)
 
@@ -290,16 +291,26 @@ operator, so its trust is fixed here before any code:
   no key that decrypts any, and envelopes are checked by the trust layer as
   always.
 - **Content-blind.** A wake is a capability ID plus a fixed-size HPKE blob
-  (RFC 9180, X25519 / HKDF-SHA256 / ChaCha20-Poly1305) sealed to a
-  per-relay wake key that is separate from the device's Mycel keys. The
-  blob holds only a fetch hint; the content comes over Mycel's own paths.
+  (RFC 9180 base mode, X25519 / HKDF-SHA256 / ChaCha20-Poly1305) sealed to
+  that capability's own wake key, separate from the device's Mycel keys
+  and from every other capability's. The blob holds only a timestamp and a
+  fetch hint the extension doesn't trust; the content comes over Mycel's
+  own paths.
 - **Identity-blind.** The relay sees a push token and random registration
   and capability IDs, never Mycel identity keys. Wakes reach it through a
   one-hop proxy or Oblivious HTTP (RFC 9458), so it doesn't see senders'
   addresses.
-- **Unlinkable, revocable capabilities.** Each contact gets its own random
-  capability over the end-to-end channel; contacts can't link theirs to
-  others'; the device can revoke any; the relay rate-limits each.
+- **Unlinkable, revocable capabilities.** Each contact gets its own
+  capability (a random ID and its own wake key) over the end-to-end
+  channel; two capabilities share nothing but the relay's URL, so contacts
+  can't link theirs to others'; the device can revoke any; the relay
+  rate-limits each.
+- **Wakes are attributed by capability, never by their contents.** Base
+  mode authenticates no sender, so a wake proves only "from whoever holds
+  this capability", which the device gave to exactly one contact. Abuse is
+  counted and revoked per capability ID: a malicious contact can burn only
+  its own, never forge one that passes for another contact's. The relay
+  can't forge wakes (it never sees a wake key), only drop or replay them.
 - **What it learns:** a push token (which Apple can tie to an Apple ID),
   how many capabilities a registration has, and when each fires. Timing is
   the residual leak, shared with Apple; random delay, coalescing and cover
