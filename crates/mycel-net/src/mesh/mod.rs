@@ -1565,6 +1565,22 @@ impl Mesh {
         *self.d.uplink.lock() = units;
     }
 
+    /// How far devices are from us in our spaces' membership graph (1: a
+    /// member of a space we are in): routes through relays farther away, or
+    /// not listed, rank costlier (`Router::set_affinity`). Nothing about it
+    /// is sent.
+    pub fn set_affinity(&self, table: impl IntoIterator<Item = (SignPk, u8)>) {
+        self.d.with_router(|r, now| {
+            r.set_affinity(table);
+            r.tick(now); // the routes we offer may change
+        });
+    }
+
+    /// `peer`'s distance as [`Mesh::set_affinity`] last set it.
+    pub fn affinity(&self, peer: &SignPk) -> Option<u8> {
+        self.d.router.lock().affinity(peer)
+    }
+
     /// Tests: see every payload this device relays for others.
     pub fn set_tap(&self, tap: Option<Tap>) {
         *self.d.tap.lock() = tap;

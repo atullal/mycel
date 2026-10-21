@@ -117,6 +117,7 @@ async fn line_a_b_c_syncs_through_a_non_member() {
 
     let (space, genesis) = a.create_space().unwrap();
     a.with_space(&space, |r| r.add_member(c.keys().public(), Role::Writer)).unwrap().unwrap();
+    a.changed(space);
     c.join_space(genesis).unwrap();
     let doc = Replica::new_doc_id();
     let secret = "the quick brown fox jumps over the lazy mesh relay";
@@ -130,6 +131,13 @@ async fn line_a_b_c_syncs_through_a_non_member() {
     assert_eq!(route.via, b.id());
     assert_eq!(route.hops, 2);
     assert_eq!(route.via_name.as_deref(), Some("bob"));
+
+    // the members prefer each other as relays (`Router::set_affinity`);
+    // the relay, in no space, prefers nobody
+    let (am, cm) = (a.mesh().unwrap(), c.mesh().unwrap());
+    eventually("co-members listed", 10, || am.affinity(&c.id()) == Some(1) && cm.affinity(&a.id()) == Some(1)).await;
+    assert_eq!(am.affinity(&b.id()), None);
+    assert_eq!(b.mesh().unwrap().affinity(&a.id()), None);
 
     // B relayed it, holds nothing of it, and saw only ciphertext
     let stats = b.mesh().unwrap().stats();
