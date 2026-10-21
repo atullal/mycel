@@ -4,7 +4,7 @@
 //! A seed is a replication, never a tuning target. Seeds come from a base
 //! and a run index ([`run_seeds`], ns-3's fixed seed with an advancing run
 //! number), and each seed's protocol randomness is a stream apart from its
-//! world ([`crate::stats::Stream`]). Two kinds of objective, two rules:
+//! world ([`crate::world::streams`]). Two kinds of objective, two rules:
 //!
 //! - **Invariants** (no loops, no route through a black hole after the
 //!   defence, convergence at all; [`crate::report::Slo::invariant`]) hold
