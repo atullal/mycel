@@ -1367,8 +1367,42 @@ cases). `mycel-sim robust NAME` runs, for the scenario's objective
    nominal point, every sampled point and the confirmed worst case pass;
    the report says the worst case was found by search, not proven.
 
-The parameters a verdict hinges on (total index ≥ 0.1) are the ones that
-jump WP14's measurement queue. `uq::params::builtin` has 14 named
+Every step is judged against **seed noise**, because a scenario's metric
+moves with the seed as well as with the parameters, and with a few seeds
+per point the seed can be most of what the points show (it was, in the
+first `rural-starlink` study: §7.7). The study pools each point's spread
+over its seeds into one run's noise, and from it:
+
+- the **signal share**: the part of the variance between points' means
+  that is not seed noise (also about the best leave-one-out Q² any
+  emulator can reach), and how many seeds per point would bring it to
+  80%;
+- the **emulator's known noise**: each point's mean is fitted with its
+  noise variance fixed (stochastic kriging: Ankenman, Nelson and Staum,
+  *Oper. Res.* 58, 2010), and only a small extra nugget is fitted; fitted
+  alone, the nugget lost to short length scales that explained noise;
+- a **noise floor for each Morris factor**: the μ* that seed noise alone
+  would give, from the spread over seeds of each elementary effect (paired
+  on the same seeds, so common random numbers count); a factor whose μ*
+  interval does not clear its floor is not distinguishable from noise;
+- how many failing points fail **beyond noise** (their mean's 95% interval
+  excludes the threshold).
+
+The parameters a verdict hinges on are those with a total index ≥ 0.1 only
+if the emulator is **adequate**: signal share ≥ 0.5 and leave-one-out Q² ≥
+0.6 × the signal share (our thresholds; there is no standard value, and
+Marrel et al., *RESS* 94, 2009, judge emulators case by case). Otherwise
+they are the Morris factors above their noise floor, and the report says
+which basis it used; with neither, it names none rather than ranking
+noise. Before Sobol estimation every output is centred: the first-order
+estimator is unbiased under a constant shift, but its variance grows with
+the square of the metric's mean (Ishigami plus 1000 at 4,096 rows gave
+S₁ = −3.8 ± 8.7 against 0.28 ± 0.045 without the offset; regression test
+`a_large_mean_does_not_widen_the_intervals`; centring as in Owen, *ACM
+TOMACS* 23, 2013).
+
+The parameters a verdict hinges on are the ones that jump WP14's
+measurement queue. `uq::params::builtin` has 14 named
 parameters, each with a range, a prior and a source or "(estimate)":
 `range_mult`, `adoption`, `inet_share`, `nat_hard`, `max_neighbours`,
 `walk_speed`, `pause_s`, `msg_rate`, `adversary_share`,
@@ -1531,3 +1565,17 @@ is reproducible from the command given.
    the carrier recover). Not fixed here: the routing core belongs to the
    routing tracks. Replay: `mycel-sim catalogue stadium-exit --people 3000
    --minutes 20 --seed 2515552253147602109`.
+
+### 7.6 The CI gate is unchanged
+
+The catalogue and the robustness tools add code beside the engine, not in
+it, so the gate must give the same numbers. Checked by running it twice,
+`mycel-sim ci --seed 1000 --runs 10`, once with the binary of
+`v2/integration` (4a321e48) and once with this branch's, both with 4
+threads: the verdicts are identical, and all 90 per-seed results are
+identical in every metric and note except wall-clock times (and the new
+`fidelity` field, which only labels them). 10 of 10 scenarios and the
+pinned seeds pass, as before. Wall time 101 s and 104 s (noise; the
+machine was running other jobs). `report.md` now has Fidelity, Region and
+Robust-pass columns on every row; the gate's tier-2 scenarios get the
+tier's default, L0, with no region studied.
