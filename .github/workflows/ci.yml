@@ -125,6 +125,39 @@ jobs:
           echo "== retrying the failed tests"
           "$(command -v python3 || command -v python)" scripts/ci/retry-failed.py "$RUNNER_TEMP/test.log"
 
+  simulation:
+    name: Simulation (ten seeds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config
+      - run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The statistics the gate rests on (seeds, streams, intervals).
+      - name: Simulator unit tests
+        run: cargo test --locked --release -p mycel-sim --lib
+      # The tier-2 scenarios at CI size, each on the gate's ten seeds
+      # (crates/mycel-sim/src/seeds.rs, docs/SIMULATION.md §1): invariants
+      # on every seed, quality objectives on at least 8 of 10, thresholds
+      # calibrated on other seeds; then the pinned regression seeds, whole.
+      # Every failing seed is printed with the command that replays it.
+      - name: Ten-seed gate
+        run: |
+          set -o pipefail
+          cargo run --locked --release -p mycel-sim -- ci --seed 1000 --runs 10 --out "$RUNNER_TEMP/sim" \
+            | tee "$RUNNER_TEMP/failing-seeds.txt"
+      - name: Verdicts
+        if: always()
+        run: cat "$RUNNER_TEMP/sim/gate.md" >> "$GITHUB_STEP_SUMMARY" || true
+
   security:
     name: Security regressions
     runs-on: ubuntu-latest
@@ -335,7 +368,7 @@ jobs:
   result:
     name: CI result
     if: always()
-    needs: [fmt, clippy, test, security, docs, rules, deny, web, dependency-review, dco, typos, workflows, gradle-wrapper]
+    needs: [fmt, clippy, test, simulation, security, docs, rules, deny, web, dependency-review, dco, typos, workflows, gradle-wrapper]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}

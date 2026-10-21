@@ -15,7 +15,9 @@ cargo run --release -p mycel-sim -- list
 cargo run --release -p mycel-sim -- all                    # everything, full size
 cargo run --release -p mycel-sim -- us-eu,mailbox --scale 0.1 --seed 7
 cargo run --release -p mycel-sim -- t2 --candidate main    # hold the earlier mesh design to the same objectives
-cargo test -p mycel-sim                                    # CI sizes; `-- --ignored` for the rest
+cargo run --release -p mycel-sim -- ci --seed 1000 --runs 10  # CI's gate: 10 seeds per scenario (§1)
+cargo run --release -p mycel-sim -- liar-ceiling           # plausible liars on seeds 1–20 (§4, open 15)
+cargo test --release -p mycel-sim                          # CI sizes; `-- --ignored` for the rest
 ```
 
 Each run writes `target/mycel-sim/report.md` and `results.json`. Every
@@ -49,7 +51,7 @@ achieved latency is divided by the fastest path that was physically possible:
 an earliest-arrival search over the ground-truth contact plan (who could hear
 whom when, who had internet when), moving the message store-and-forward hop by
 hop and waiting anywhere for free (`tier2/oracle.rs`; tier 1 does Dijkstra over
-the emulated media). Reported as p50 / p95 / p99. The oracle is a lower bound:
+the emulated media). Reported as p50 and the tail (below). The oracle is a lower bound:
 no congestion control, no lookups, no handshakes. So for small messages the
 ratio measures routing (path choice, lookups); for large ones it also measures
 QUIC slow start over long round trips; and in tier 1 it includes Mycel sync's
@@ -58,6 +60,67 @@ own round trips (a 32 ms message on a 5 ms LAN path is 6×).
 **Candidates.** Tier-2 objectives judge `--candidate global` (default: the
 routing core and carrier), `main` (the earlier flooding mesh, modelled), or
 `stand-in` (an earlier model of the current design, kept as a reference).
+
+**The tail.** p99 of a few hundred messages is one of the few slowest:
+at n = 400 its exact 95% interval (from the order statistics) runs from the
+9th-largest ratio to the largest, and below 299 messages it has no upper
+bound at all. So the tail is reported, and judged, in numbers that hold at
+that size (`stats::Tail`): p95 with its exact interval; CVaR₉₅, the mean of
+the worst 5% (it moves with every message in the tail, not with one order
+statistic); and how many messages are over 10× and over 30×, with Wilson
+95% intervals on the share. p99 is reported only for 4,000 messages or
+more, pooled over seeds (`--runs`). Tier 1 has tens of messages per run
+and reports the slowest instead.
+
+**Seeds and verdicts** (`src/seeds.rs`, `src/stats.rs`). A seed is a
+replication, never a tuning target. Replication seeds come from a base and
+a run index (`run_seed(base, i)`, SplitMix64's mixer over both: ns-3's
+fixed seed with an advancing run number), and each seed's randomness is
+split into streams that never share a sequence: the world
+(`Rng::new(seed ^ tag)`, as before), walking devices (fixed 22), the
+workload where the world already draws from the bare seed
+(`Stream::Workload`), the engine's radio jitter (`Stream::Protocol`), and
+each routing core's generator (`Stream::Routers`, one sub-stream per
+device). Before, the engine drew its jitter from `Rng::new(seed)`, the
+very sequence a mesh's positions came from, and the routers' seeds were
+`seed × constant ^ device`: xorshift states a few bits apart. (So every
+tier-2 number changed once; §3 is rerun on the split streams.)
+
+Objectives come in two kinds (`Slo::invariant`):
+
+- **Invariants** hold on every seed, or the gate fails: no packet sent
+  round a loop, no honest route through a black hole once the defence has
+  run, routes converge at all (and again after the busiest device fails),
+  nothing delivered between a pair every path of which crosses a liar.
+- **Quality objectives** (delivery, latency, optimality) pass on at least
+  8 of 10 seeds. If each seed passes with probability 0.95, that gate fails
+  1.2% of the time (exact binomial, `stats::spurious_fail`), while three
+  seeds that all pass bound a seed's failure rate only below 63% (ten:
+  26%).
+
+Thresholds are calibrated on base 2000's seeds (30 at CI size), never on
+the gate's (base 1000). CI's "Simulation" job (`.github/workflows/ci.yml`)
+runs `mycel-sim ci --seed 1000 --runs 10`: the nine tier-2 scenarios of
+`seeds::CI_SUITE` at CI size, ten seeds each, in parallel, then the pinned
+regression seeds (`seeds::PINNED`), every objective; every failing seed is
+printed with the command that replays it, and the verdicts go to the job
+summary. A nightly soak (`.github/workflows/sim-soak.yml`) runs the gate's
+scenarios, the heavier ones and `liar-ceiling` on 20 fresh seeds (the base
+is the run's id) and prints each failing seed, to be pinned once its cause
+is fixed (TigerBeetle's VOPR keeps every seed for the same reason). On
+4 seeds the soak took 170 s wall here and 595 s of CPU summed over its
+runs (`global-scale` 238 s, `churn` 184 s); 20 seeds is an estimated 50
+CPU-minutes, so roughly 15–30 minutes on the 4-vCPU runner (an estimate;
+the job's limit is 150).
+`cargo test --release -p mycel-sim` runs the same gate scenario by
+scenario. Runtime, measured on the 18-core Mac with 4 threads while other
+jobs ran (load average ~16): `mycel-sim ci --seed 1000 --runs 10` took
+92 s wall, 360 s of CPU summed over the 90 runs (`adversarial` 179 s and
+`disaster-dtn` 166 s of it; the other seven 14 s together), and
+`cargo test --release -p mycel-sim` 145 s for the scenario tests (tier 1's
+CI three included), 263 s with an incremental build. On CI's 4-vCPU
+runner we estimate (not measured) about 3–6 minutes for the gate plus
+the release build; the job's limit is 45 minutes.
 
 ## 2. Models and sources
 
@@ -101,7 +164,11 @@ The scenarios ran as separate processes and were joined with
 `mycel-sim merge`, with the fixes of §4 in place. The machine was loaded
 (load averages of 9 to 40 on 18 cores, with other simulations and builds
 running), so wall times are pessimistic, and the real-time tier-1 latencies
-(calls especially) carry that load. Trace replays are in §5.
+(calls especially) carry that load. Trace replays are in §5. The tier-2
+rows were rerun on the split random streams of §1 (seed 1, one process,
+4 threads); every tier-2 number moved once with that change, and the old
+value is given where it matters. Tail columns are p50/p95 and CVaR₉₅
+(§1); p99 appears only where a sample has 4,000 messages.
 
 | Scenario | Tier | Size | Status | Result | Wall |
 |---|---|---|---|---|---:|
@@ -118,18 +185,18 @@ running), so wall times are pessimistic, and the real-time tier-1 latencies
 | `adversarial-live` | 1 | full | ✅ | messages past a black hole and a storm: 100% delivered, p50 0.275 s, p95 0.308 s, optimality p50/p95/p99 3.66/4.11/4.11× | 16 s |
 | `multipath` | 1 | full | ✅ | 3 links 8.0 MB/s, 1 link 2.9 MB/s (2.76×) | 21 s |
 | `mixed-room` | 1 | full | ✅ | Ethernet→Some(Ethernet), Wi-Fi Direct→Some(WifiDirect), UWB→Some(Uwb), Bluetooth LE→Some(Bluetooth) | 26 s |
-| `us-eu` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.725 s, optimality p50/p95/p99 1.22/2.15/2.38× | 1 s |
-| `gateway-choice` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 1.11 s, optimality p50/p95/p99 6.26/9.12/9.19× (100 KB and 1 MB messages now against the pipelining bound) · 100% of relayed bytes via the far fibre gateway | 0 s |
-| `routing-convergence` | 2 | full | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never | 15 s |
-| `flood-scaling` | 2 | full | ✅ | largest N: global core 8.4% of BLE in steady state, 100% of pairs routed (before: 67.0%, 85% routed), main 136.1% | 839 s |
-| `partial-route` | 2 | full | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.5 s; sender-holds 100% p50 98.2 s · gap 300 m: global core + DTN 100%; stand-in custody 0% p50 0 s; sender-holds 0% p50 0 s | 0 s |
-| `disaster-dtn` | 2 | full, judged on seeds 1–12 | ✅ | **global core + DTN: mean 87.2% delivered** (target ≥ 80%; per seed 77–98%; seeds 2–13 mean 87.1%, 3–14 mean 86.9%; was 80.3% on worlds that moved with the routing: fixed 22) · seed 1: 90%, p95 7625 s, optimality p50/p95/p99 1.43/6.11/6.81×, 21.2 replicas and 32.9 hand-offs per message (budget 32) · PRoPHET 67%, spray-and-wait (L=8) 27%, epidemic 100%, now on the same world (seed 1, 60 of 60 messages feasible for every router) · CI size (0.1): 89% | 95 s |
-| `mailbox` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95/p99 1.00/1.00/1.00× | 0 s |
-| `global-scale` | 2 | 2,002 devices (0.02) | ✅ | global core + DTN: 100% delivered, p95 0.690 s, optimality p50 3.96× · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.119 s, p95 0.211 s, optimality p95 2.88× (was 4.45×, fixed 19; 32.2× before fixed 18) · control 706 B/s per device (was 8,470): routing 470, carrier 235 (was 8,004, fixed 17) · CI size (1,499 devices): warm optimality p95 2.65× (was 5.14×, failing) | 119 s |
-| `churn` | 2 | 1,001 devices (scale 0.1) | ✅ | global core + DTN: 100% delivered, p95 61.2 s, optimality p50/p95/p99 5.87/12.5/17.1×; control 698 B/s per device: routing 2,659 → 469, carrier 4,540 → 256 (full size before the carrier fixes: 100%, p95 65.2 s) | 81 s |
-| `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.097 s, optimality p50/p95/p99 1.88/5.97/8.65× (was 82%, p95 1.28 s, 36.6/170/1570×, failing: fixed 20) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (judged, ≥ 90%): 94%, p95 29 s (was 76%, p95 91 s: fixed 21), but ❌ 76% with seed 2 and 87% with seed 3 (open 15) · CI size (0.1): 100% (was 93%), lying plausibly 97% (was 80%), and passes with seeds 2 and 3 | 142 s |
-| `trace-replay` | 2 | full | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.5% of feasible (3,983 of 4,000 sent, was 3,982), p50 4.7 s, p95 1245 s, optimality p50/p95/p99 1.22/7.55/46.9× (was 8.38/18.0×: fixed 21; pipelining-aware oracle, fixed 12; 10.1× at 54cc562 after the routing changes), overhead 3.26 (was 3.15); seeds 2 and 3: 99.8% and 99.0%, optimality p99 19.9× and 25.5× · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 49 s |
-| `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 53%, 68%, 83%, 92%, 93% | 0 s |
+| `us-eu` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.737 s, optimality p50/p95 1.23/2.24×, CVaR₉₅ 2.34× (was p95 0.725 s, 2.15× on the shared streams) · CI size, 30 calibration seeds: optimality p95 2.22–2.37× | 1 s |
+| `gateway-choice` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 1.12 s, optimality p50/p95 6.26/9.15×, CVaR₉₅ 9.18× (100 KB and 1 MB messages against the pipelining bound) · 100% of relayed bytes via the far fibre gateway · CI size: 1 KB optimality p50 1.51–2.03× over 30 calibration seeds (target 2×, missed on 1) | 0 s |
+| `routing-convergence` | 2 | full | ✅ | global core: 99% routed in 1.1 s, 100% in 1.9 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never · CI size, 30 calibration seeds: 99% in 0.6–0.8 s, 0 loops on every seed | 15 s |
+| `flood-scaling` | 2 | full | ✅ | largest N (2,000): global core 8.3% of BLE in steady state (8.4% on the shared streams), 100% of pairs routed (before: 67.0%, 92% routed), main 136.2% | 333 s |
+| `partial-route` | 2 | full | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.6 s; sender-holds 100% p50 98.5 s · gap 300 m: global core + DTN 100%; stand-in custody 0%; sender-holds 0% | 0 s |
+| `disaster-dtn` | 2 | full, judged on 12 worlds from seed 1 | ✅ | **global core + DTN: mean 88.1% delivered** (target ≥ 80%; per world 78–100%; 87.2% on the shared streams) · seed 1: 93%, p95 7680 s, optimality p50/p95 1.45/5.38×, 21.3 replicas and 32.6 hand-offs per message (budget 32) · PRoPHET 67%, spray-and-wait (L=8) 28%, epidemic 100%, on the same world (60 of 60 messages feasible for every router) · CI size (0.1, 48 messages, mean of 20 worlds): 81.1–91.0% over 30 calibration seeds, median 85.2% (finding 25) | 117 s |
+| `mailbox` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95 1.00/1.00× | 0 s |
+| `global-scale` | 2 | 2,002 devices (0.02) | ✅ | global core + DTN: 100% delivered, p95 0.690 s, optimality p50 3.76×, p95 10.0× · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.117 s, p95 0.211 s, optimality p95 2.76× (2.88× on the shared streams; 4.45× before fixed 19; 32.2× before fixed 18) · control 708 B/s per device (was 8,470): routing 470, carrier 238 (was 8,004, fixed 17) · CI size (1,499 devices, shared streams): warm optimality p95 2.65× (was 5.14×, failing) | 58 s |
+| `churn` | 2 | 1,001 devices (scale 0.1) | ✅ | global core + DTN: 100% delivered, p95 61.1 s, optimality p50/p95 5.99/12.6×, CVaR₉₅ 16.0× (p50/p95 5.87/12.5× on the shared streams); control 700 B/s per device: routing 2,659 → 471, carrier 4,540 → 256 (full size before the carrier fixes: 100%, p95 65.2 s) | 33 s |
+| `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.091 s, optimality p50/p95 1.91/6.02×, CVaR₉₅ 7.84× (was 82%, p95 1.28 s, 36.6/170× p50/p95, failing: fixed 20) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (judged, ≥ 90%): 91%, liar-free-reachable delivery 91% of a 100% ceiling (94% on the shared streams; 76% before fixed 21); 85.4% mean over seeds 1–20 (open 15) · CI size (0.1), 30 calibration seeds: lying plausibly 88.3–100%, median 96.7% | 265 s |
+| `trace-replay` | 2 | full | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.0% of feasible (3,981 of 4,000 sent), p50 4.7 s, p95 1311 s, optimality p50 1.22×, p95 8.30× [6.24–13.8], CVaR₉₅ 23.1×, 3 of 396 over 30× (Wilson upper bound 2.2%), overhead 3.34 (was 8.38/18.0× p95/p99: fixed 21; pipelining-aware oracle, fixed 12) · ten full-size calibration seeds pooled (3,982 messages): p95 8.30× [7.73–9.20], CVaR₉₅ 39.8× (the p99 jump 36.8× → 46.9× on the shared streams: finding 26) · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 49 s |
+| `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 55%, 70%, 84%, 91%, 90% (the same broadcasts at every limit; the shape checks are paired: finding 24) | 0 s |
 
 ## 4. Findings
 
@@ -570,7 +637,103 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
      6 of 8 and 9 of 12 messages; seed 3 failed on the old worlds too)
      and `flood-hop-limit` with seed 3 (reach falls from 99% to 95% at
      hop 7; the same on 4aab57a, before any of this work). The CI tests
-     run seed 1.
+     ran seed 1. (Both fixed: 24 and 25; CI now gates on ten seeds, 23.)
+
+23. **One seed carried every tier-2 verdict, and seeds shared streams.**
+   CI ran seed 1 and the thresholds were set from it; three seeds that
+   all pass bound a seed's failure rate only below 63%. The engine drew
+   radio jitter and the routers' randomness from `Rng::new(seed)`, the
+   same sequence a mesh's positions came from, and each router's seed
+   was `seed × constant ^ device`. Now (§1, "Seeds and verdicts"): split
+   streams, replication seeds from a base and a run index, invariants on
+   every seed, quality on 8 of 10, thresholds from calibration seeds,
+   pinned regression seeds and a nightly soak. On the 30 calibration
+   seeds (base 2000, `mycel-sim ci --seed 2000 --runs 30 --min-pass 1`)
+   every invariant held on every seed, and six scenarios passed every
+   quality objective on all 30. Three missed once each: `gateway-choice`
+   (1 KB optimality p50 2.03×, target 2.00×), `adversarial` (plausible
+   liars 88.3%, target 90%) and `disaster-dtn` (latency p50 3.42× epidemic's,
+   target 3×). At a per-seed pass rate of 29/30 a scenario fails 8 of 10
+   0.37% of the time, and the suite about 1.1% per change (point
+   estimates). The trace-replay tail thresholds sit above the worst of
+   the 30 (p95 6.43× against 8×, CVaR₉₅ 86.0× against 120×, Wilson bound
+   over 30× 4.49% against 6%). The gate's own seeds (base 1000) all pass;
+   `gateway-choice` on 9 of 10 (2.03× again).
+24. **`flood-hop-limit`'s shape check compared different broadcasts.**
+   (It is a check on the managed-flooding baseline, not Mycel's router.)
+   Each hop limit's run drew new sources from one shared stream, so
+   neighbouring limits compared different messages: at CI size with
+   seed 3, reach "fell" from 99% to 95% at hop 7 on 20 broadcasts. Every
+   limit now sends the same broadcasts (sources and times, from the
+   workload stream), 40 at CI size (was 20), and both shape checks are
+   paired: a step fails "reach rises" only if the per-broadcast
+   differences fall by more than 2 points and two standard errors, and
+   "diminishing returns" fails only if hop 6→7's gain exceeds half of
+   2→3's by more than two standard errors. Reach needn't rise exactly:
+   with duplicate suppression, a device that first hears a copy late,
+   over a long path, has fewer hops left to pass it on. Seed 3 at CI
+   size is pinned (`seeds::PINNED`) and passes; so do all 30 calibration
+   seeds.
+25. **`disaster-dtn` at CI size failed on sample size.** A CI-size world
+   had 12 messages (one message was 8 points of delivery: seeds 2 and 3
+   "failed" at 6 of 8 and 9 of 12). It now has 48 messages and, like the
+   full size (12 seeds), is judged on a mean: of 20 worlds (seed, seed +
+   1, ...). That is what the spread needs: one world ranged 43–100% over
+   the 30 calibration seeds, so the spread is the worlds', not the 48
+   messages'. The mean of 6 worlds fell below 80% on 2 of 30 (73.6% and
+   77.9%), and so did the mean of 10 (78.2% twice; median 86.3%): a few
+   per cent false alarm per change at 8 of 10. The mean of 20 (CI size
+   now) ran 81.1–91.0% over the 30 (p10 82.0%, median 85.2%, p90 88.3%)
+   and passed on all 30; at full size the mean of 12 is 88.1% (per world
+   78–100%). The 20 worlds cost about 20 s of CPU per seed.
+26. **The `trace-replay` p99 jump (36.8× → 46.9×) was one message
+   changing places.** Tier 2 is deterministic, so the two commits were
+   run on the same synthetic trace (full size: 40 devices, 400 messages
+   checked) and seeds 1–3, and compared message by message (the dump is
+   `MYCEL_SIM_DUMP=<dir>`). Seed 1, the ten slowest at each commit
+   (ratio at c1d38de / at c3217f2):
+
+   | c1d38de's ten slowest | ratio | c3217f2's ten slowest | ratio |
+   |---|---|---|---|
+   | #1830 (24→38) | 304.5 / 303.5 | #1830 (24→38) | 304.5 / 303.5 |
+   | #2610 (17→13) | 83.1 / 99.9 | #3240 (11→7) | 1.2 / 101.4 |
+   | #3020 (28→22) | 40.6 / 12.3 | #2610 (17→13) | 83.1 / 99.9 |
+   | #3990 (34→22) | 38.2 / 46.9 | #2310 (23→31) | 11.2 / 48.5 |
+   | #3730 (1→31) | 36.8 / 36.8 | #3990 (34→22) | 38.2 / 46.9 |
+   | #2440 (18→21) | 31.3 / 7.3 | #740 (34→12) | 27.1 / 37.1 |
+   | #740 (34→12) | 27.1 / 37.1 | #3730 (1→31) | 36.8 / 36.8 |
+   | #3530 (3→7) | 23.2 / 23.2 | #2500 (6→1) | 8.4 / 32.7 |
+   | #3910 (18→21) | 20.8 / 9.5 | #2370 (16→2) | 7.3 / 29.1 |
+   | #1310 (4→29) | 14.9 / 15.5 | #2200 (23→3) | 9.2 / 25.6 |
+
+   The "p99" is the 5th-slowest: #3730 at 36.8× (the same at both
+   commits), then #3990 at 46.9× once #3240 and #2310 moved up. Only 5
+   of the ten slowest are the same messages. Over the 398 messages
+   delivered at both, 69 are identical, 26 slower by more than 10% at
+   c3217f2 and 30 faster, mean log-ratio −0.006. Seeds 2 and 3 move the
+   other way: p99 34.8× → 19.9× and 41.8× → 25.5× (top-ten overlap 7 and
+   4 of 10; mean log-ratios −0.012 and −0.036); p95 8.24 → 7.55×,
+   6.96 → 7.27×, 9.10 → 8.51×. Nothing in the simulator changed between
+   the two commits; c3217f2 changed the routing core so that a suspicion
+   re-offers the destination's routes and, when nothing feasible is left,
+   asks for a fresh seqno. Its footprint here is tiny: seed 1, 551 → 505
+   hop suspicions, 3,199,871 → 3,198,096 seqno requests (0.06% fewer),
+   1,665,350 → 1,664,603 retractions, routing control 176 B/s per device
+   at both; seeds 2 and 3 alike (483 → 477 and 533 → 526 suspicions,
+   seqno requests within 0.1%). On a trace of brief
+   Bluetooth contacts even that moves control traffic in time, and with it
+   which 1 MB message catches which contact: a reshuffle of the slowest
+   few, not a regression. The p99 of 400 can't tell the two apart (its
+   95% interval runs from the 9th-largest ratio to the largest), which is
+   why the gate is now p95, CVaR₉₅ and the share over 30× (§1), and p99
+   is reported only pooled over 4,000 messages or more. On the ten full-size
+   calibration seeds (base 2000, split streams) each seed's p95 ran
+   6.30–11.8×, CVaR₉₅ 22.9–67.6× and the Wilson upper bound on the share
+   over 30× 2.20–3.92%; pooled, 3,982 messages: p50 1.22×, p95 8.30×
+   [7.73–9.20], CVaR₉₅ 39.8×, 159 over 10× (3.4–4.6%), 57 over 30×
+   (1.1–1.8%), 18 short of a pooled p99. The gate: p95 ≤ 15×, CVaR₉₅ ≤
+   100×, over 30× ≤ 6% (upper bound) at full size; 8×, 120× and 6% at CI
+   size, where the worst of 30 seeds was 6.43×, 86.0× and 4.49%.
 
 ### Open findings
 
@@ -646,16 +809,82 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    Repro: `mycel-sim global-scale --scale 0.01 --seed 3`.
 14. *(fixed 21: black holes that lie plausibly, in the simulator and the
    node; signed route attestations wait for the next protocol version.)*
-15. **The plausible-liar target holds on seed 1 only.** `adversarial`
-   judges its plausible black holes at ≥ 90%, set from seed 1 (94%, 281
-   of 300). With seed 2 they take delivery to 76% (227 of 300, latency
-   p50 1.04 s, p95 61 s), with seed 3 to 87% (262 of 300); the naive
-   black holes, the storm, the replayer and the Sybil gateway stay at
-   100% on all three. The defences of fixed 21 aren't enough where most of
-   a destination's neighbourhood sits next to a liar: every alternative
-   leads to one too. The target isn't lowered; whether to lower it
-   (seeds 1–3 support about 75%) or strengthen the defence is open.
-   Repro: `mycel-sim adversarial --seed 2`.
+15. **Plausible liars: the defences lose pairs they could save, and
+   the planned route attestations buy nothing unless they also bind each
+   link's cost.** `adversarial` judges its plausible black holes at ≥ 90%,
+   set from seed 1 (94% then, 91% on the split streams). `liar-ceiling`
+   runs that attack on seeds 1–20 at full size (300 phones, 15 liars that
+   drop every packet and bundle they relay, 300 messages), three ways on
+   the same world and traffic each seed: today's liar (one hop from every
+   origin at the 2.1 ms floor); an *attested* liar, held to what the
+   planned signed per-hop chain allows (the cheapest chain it was sent,
+   plus one hop and the 2.1 ms floor: it can only understate its own
+   link); and an *honest dropper*, which announces the truth and drops
+   (what is left of a liar if each upstream's measured cost to the next
+   hop is signed into the chain too). Liar-free-reachable (LFR) delivery
+   counts only the pairs still connected once every liar is removed, on
+   the time-expanded contact graph (`tier2/lfr.rs`).
+
+   | Seeds 1–20, full size | Delivered (mean, min–max) | vs today's liar, paired |
+   |---|---|---|
+   | today's liar | 85.4% (77.3–91.0%) | |
+   | attested liar | 78.4% (69.3–88.0%) | −7.0 ± 1.4 points, worse on 20 of 20 seeds |
+   | honest dropper | 98.9% (97.0–100%) | +13.6 ± 1.5 points, better on 20 of 20 |
+
+   (± two standard errors of the per-seed differences.) What the numbers
+   say:
+   - **Nothing here is inherent.** The liar-free ceiling is 100% on every
+     seed: no pair has every path through a liar (liar-cut 0), every pair
+     has at least two liar-free vertex-disjoint paths and 294 or more of
+     each seed's ~300 have three or more (the world is static, so these
+     counts are exact), and 196–266 have the f + 1 disjoint paths (15 or
+     16) that no placement of the f liars could cut. So LFR delivery
+     equals raw delivery, and the 90% target isn't the wrong number: the
+     defences (fixed 21) lose 9–23% of pairs they could save. Lowering the
+     target to the ~75% seeds 2 and 3 support would hide that.
+   - **A per-hop chain alone doesn't help; it makes it worse.** Held to
+     the chain, a liar still pulls traffic by understating its own link,
+     and more of it stays pulled: 189 honest routes ran through a liar at
+     the end of the run (mean of 20 seeds) against 142 with today's liar.
+     Today's liar is partly self-defeating. It claims a far origin at 1
+     hop, so its neighbours hold that route in the near scope and expire
+     it after 3.5 announcement periods, while the liar can only refresh it
+     when the origin's far-scope announcement arrives; every other route
+     is infeasible (they advertised the cheap one), so they retract and
+     ask for a fresh seqno: 1.3–2.3 million seqno requests and 1.1–2.1
+     million retractions per run, against medians of 1,350 and 96 with
+     attested liars (open 16). Between refreshes the honest
+     routes carry traffic.
+   - **Binding each link's measured cost is what pays.** An honest dropper
+     costs 0–3 points of delivery (latency p95 1.5 s, median of the
+     seeds, against 53 s with today's liar). So step 12 of the routing
+     plan is worth its bytes only if each upstream entry carries the
+     upstream's measured cost to the named next hop; without it, it
+     isn't (`docs/ROUTING.md` §6, item 13 plans the chain without it).
+   - Without a wire change, the remaining 9–23 points are the end-to-end
+     defence's to win (it detects only by losing traffic first, and per
+     source and destination).
+
+   `liar-ceiling` fails as expected at full size (LFR delivery 85.4%,
+   target 90%); at CI size (80 phones, 4 liars, seeds 1–3) it passes with
+   96.7%, and it runs nightly on fresh seeds. Repro: `mycel-sim
+   liar-ceiling` (seeds 1–20, 455–477 s on the 18-core Mac with 4 threads; rerun on the final build, identical per seed),
+   `mycel-sim adversarial --seed 2`.
+16. **Today's liar makes its neighbourhood ask for seqnos millions of
+   times a run.** The mechanism is open 15's: routes it claims at 1 hop
+   expire on the near scope's schedule and come back only at the far
+   scope's, and each loss with nothing feasible left sends a retraction
+   and a seqno request to every neighbour (`after_loss`, rate-limited per
+   origin and device by `SEQREQ_GAP`). In `liar-ceiling` that is 1.3–2.3
+   million seqno requests per 210 s run of 300 phones (about 30 per device
+   per second), and routing control of 21.9 kB/s per device against
+   15.9 kB/s with attested liars and 16.3 kB/s with honest droppers (mean
+   of 20 seeds): about 6 kB/s more per device, 15% of a Bluetooth radio.
+   A cheap way for one device to load its neighbourhood's control
+   plane; a hold-down on routes that keep expiring, or a limit on seqno
+   requests per neighbour rather than per origin, would bound it. Repro:
+   `mycel-sim liar-ceiling --scale 0.5` (12 s; 105k–123k seqno requests
+   per run of 150 phones).
 
 ## 5. Benchmarks against external baselines
 
