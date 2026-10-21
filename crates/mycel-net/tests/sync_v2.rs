@@ -1,10 +1,12 @@
 //! Sync v2 between real nodes over QUIC: idle cost, fallback to v1 for
-//! builds without it, and bounded fan-out in a larger group.
+//! builds without it, bounded fan-out in a larger group, and a long
+//! catch-up over a slow emulated radio link.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mycel_crypto::DeviceKeys;
+use mycel_net::link::{Link, MemNet, PathKind};
 use mycel_net::{NetMode, Node, NodeOptions};
 use mycel_sync::{StreamId, StreamKind};
 use mycel_trust::Role;
@@ -139,4 +141,63 @@ async fn a_change_reaches_a_larger_group_with_bounded_fanout() {
     for n in nodes {
         n.shutdown().await.unwrap();
     }
+}
+
+async fn link_node(name: &str, net: &MemNet) -> Node {
+    let keys = Arc::new(DeviceKeys::generate());
+    let mut opts = NodeOptions::new(NetMode::Local, name);
+    opts.ip = false;
+    opts.links = vec![net.link(keys.sign_pk()) as Arc<dyn Link>];
+    Node::spawn(keys, opts).await.unwrap()
+}
+
+/// Review regression: the streaming side heard nothing back for more than
+/// a reply timeout (60 s) and aborted its own session; a converged session
+/// whose peer stopped the stream first was reported as failed; and both
+/// directions streamed the same items at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catch_up_longer_than_a_reply_timeout_completes_over_a_slow_link() {
+    let bt = MemNet::new(0, PathKind::Bluetooth);
+    let alice = link_node("alice", &bt).await;
+    let bob = link_node("bob", &bt).await;
+    eventually("the link comes up", || alice.peers().get(&bob.id()).is_some_and(|p| p.online())).await;
+    let (space, genesis) = alice.create_space().unwrap();
+    alice.with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer)).unwrap().unwrap();
+    const N: u32 = 2_500;
+    alice
+        .with_space(&space, |r| {
+            for i in 0..N {
+                let mut body = vec![0u8; 900];
+                body[..4].copy_from_slice(&i.to_le_bytes());
+                r.append(feed(), body)?;
+            }
+            anyhow::Ok(())
+        })
+        .unwrap()
+        .unwrap();
+    // 25 kB/s: about 100 s of one-way streaming for one session. Bob joins
+    // and catches up (its explicit sync, or a background one: one session
+    // per pair runs, the other waits or gets `Busy`).
+    bt.set_rate_limit(Some(25_000));
+    let t = Instant::now();
+    bob.join_space(genesis).unwrap();
+    let res = bob.sync_with(alice.id(), space, true).await;
+    while bob.with_space(&space, |r| r.feed_len(&feed())).unwrap() < N as usize
+        && t.elapsed() < Duration::from_secs(400)
+    {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let took = t.elapsed();
+    // (alice's side ends when bob's `Close` reaches it)
+    eventually("alice's side of the session ends", || alice.sync_v2_totals().server_sessions >= 1).await;
+    let (a, b) = (alice.sync_v2_totals(), bob.sync_v2_totals());
+    let held = bob.with_space(&space, |r| r.feed_len(&feed())).unwrap();
+    eprintln!("slow catch-up: explicit {res:?}; bob holds {held}/{N} after {took:?}; alice {a:?}; bob {b:?}");
+    assert_eq!(held, N as usize);
+    assert!(took > Duration::from_secs(60), "the transfer must outlast a reply timeout to test anything");
+    assert_eq!(a.failed + b.failed, 0, "no session failed");
+    // Each item crossed about once (no parallel duplicate session).
+    assert!(a.sent_bytes < 3 * N as u64 * 1_100 / 2, "{} bytes for {N} envelopes", a.sent_bytes);
+    alice.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
 }

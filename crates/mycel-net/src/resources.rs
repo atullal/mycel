@@ -40,10 +40,10 @@ pub(crate) const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const REPLY_TIMEOUT: Duration = Duration::from_secs(60);
 /// The slowest delivery rate planned for (bytes/s): a loaded multi-hop
 /// Bluetooth route shared with other streams.
-const SLOWEST_RATE: u64 = 2 * 1024;
+pub(crate) const SLOWEST_RATE: u64 = 2 * 1024;
 /// What we wrote is buffered, not delivered: QUIC accepts up to a stream
 /// window of it (`link::transport_config`) before writes start to wait.
-const MAX_UNDELIVERED: u64 = crate::link::STREAM_WINDOW as u64;
+pub(crate) const MAX_UNDELIVERED: u64 = crate::link::STREAM_WINDOW as u64;
 /// How long to wait for the answer to a message of `sent` bytes: the
 /// part of it still buffered on our side must get there first, even over
 /// the slowest link, then the peer has [`REPLY_TIMEOUT`] to answer.

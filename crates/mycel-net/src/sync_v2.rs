@@ -10,13 +10,27 @@
 //!
 //! Policy stays here, exactly as in v1: the membership gate, invites and
 //! `Removed` proofs; and the per-peer limits, none of which depends on the
-//! peer acknowledging anything: sessions per (peer, space) that find a
-//! difference (a burst of 32, then 4 per second, `Busy` beyond; an idle
-//! check with equal digests costs one cached hash and is not counted),
-//! bytes sent per (peer, space) (one
-//! full catch-up, then 1 MiB/min; the session aborts with `Budget` and
-//! resumes later, keeping what arrived), and phase-2 sessions per peer
-//! (6 per hour).
+//! peer acknowledging anything: one session at a time per (peer, space),
+//! in either role (two devices that open to each other at once: the lower
+//! key's session runs, the other gets `Busy`), and at most
+//! [`MAX_SERVED_PER_PEER`] served per peer across spaces; sessions per
+//! (peer, space) that find a difference (a burst of 32, then 4 per second,
+//! `Busy` beyond; an idle check with equal digests costs one hash over
+//! cached op tips and boundary and is not counted); bytes sent per (peer,
+//! space) (one full catch-up, then 1 MiB/min, charged for what was written
+//! to the stream; the session aborts with `Budget` and resumes later,
+//! keeping what arrived); phase-2 sessions per peer (6 per hour, reserved
+//! when a session starts and refunded if it didn't need phase 2); and the
+//! peer's frontier a session buffers (authors and runs, scaled to ours).
+//!
+//! **Liveness.** A session has no total deadline (a catch-up over
+//! Bluetooth takes minutes) and no per-frame reply deadline either: the
+//! side that streams hears nothing back until it is done. It fails only
+//! when the peer stays silent for a reply timeout after both its last
+//! frame and the time what we wrote takes to drain at the slowest planned
+//! rate (QUIC accepts up to a stream window of it at once), or when a frame
+//! already started stalls. Once the session reached a successful outcome, errors
+//! on the stream's tail (the peer stopping its side first) don't count.
 //!
 //! **Negotiation (local stand-in, marked for integration).** The capability
 //! hello lives on the parallel `v2/wire-versioning` branch. Until it is
@@ -25,11 +39,16 @@
 //! versioning branch, resets it with `STREAM_REFUSED`. Either, on a
 //! connection that is still up, or an explicit `Unsupported` verdict, makes
 //! the client fall back to v1 and remember that peer for
-//! [`V1_REMEMBERED`]. A `Busy` answer, an `Abort` or a broken connection
-//! never cause fallback. Integration: replace the try-and-remember with
+//! [`V1_REMEMBERED`]. A `STREAM_REFUSED` reset or `Unsupported` is
+//! remembered at once; a bare end of stream (code 0, which a v2 server that
+//! failed could also cause, though it resets with [`SYNC_V2_FAILED`]) only
+//! on the second time in a row, and falls back for that session alone
+//! before then. A `Busy` answer, an `Abort` or a broken connection never
+//! cause fallback. Integration: replace the try-and-remember with
 //! `PeerState::protocol` carrying `Caps::SYNC_V2`.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -51,6 +70,14 @@ type V2Msg = Msg<SignedOp, Envelope>;
 /// (`version::STREAM_REFUSED` on the `v2/wire-versioning` branch; the same
 /// value, to be replaced by that constant at integration).
 pub(crate) const STREAM_REFUSED: u32 = 0x6d79_0001;
+/// The reset code of a v2 server that failed after accepting the stream
+/// (not a refusal: the client doesn't fall back).
+pub(crate) const SYNC_V2_FAILED: u32 = 0x6d79_0002;
+/// Sessions served to one peer at once, all spaces together.
+pub const MAX_SERVED_PER_PEER: usize = 4;
+/// How long a client waits for a session the peer is serving it in the
+/// same space to end before running its own.
+const WAIT_FOR_SERVED: Duration = Duration::from_secs(30);
 /// How long a peer that refused `SyncV2` is synced with v1 before v2 is
 /// tried again (it may have been updated).
 pub const V1_REMEMBERED: Duration = Duration::from_secs(30 * 60);
@@ -74,6 +101,10 @@ pub(crate) struct V2 {
     /// Peers that recently opened a session to us, per space: they chose us
     /// as a neighbour, so we push to them too (symmetric overlay edges).
     inbound: Mutex<HashMap<SpaceId, HashMap<SignPk, Instant>>>,
+    /// Sessions running per (peer, space): (as client, as server).
+    active: Mutex<HashMap<(SignPk, SpaceId), (bool, bool)>>,
+    /// Ambiguous refusals (a bare end of stream) in a row, per peer.
+    refusals: Mutex<HashMap<SignPk, u8>>,
     totals: Mutex<V2Totals>,
 }
 
@@ -95,6 +126,9 @@ pub struct V2Totals {
     /// `Busy` answers given and received.
     pub busy_sent: u64,
     pub busy_received: u64,
+    /// Sessions that ended without a successful outcome (aborted, broken,
+    /// stalled, refused or unconverged), both roles.
+    pub failed: u64,
 }
 
 #[derive(Default)]
@@ -231,19 +265,106 @@ impl V2 {
         }
     }
 
-    fn phase2_allowed(&self, peer: SignPk) -> bool {
+    /// Reserve a phase-2 session (refunded with [`Self::refund_phase2`] if
+    /// the session didn't need it): concurrent sessions can't all take the
+    /// last one.
+    fn take_phase2(&self, peer: SignPk) -> Option<Instant> {
         let mut p = self.phase2.lock();
         let q = p.entry(peer).or_default();
         while q.front().is_some_and(|t| t.elapsed() > Duration::from_secs(3600)) {
             q.pop_front();
         }
-        q.len() < PHASE2_PER_HOUR
+        (q.len() < PHASE2_PER_HOUR).then(|| {
+            let now = Instant::now();
+            q.push_back(now);
+            now
+        })
     }
 
-    fn charge_phase2(&self, peer: SignPk) {
-        self.phase2.lock().entry(peer).or_default().push_back(Instant::now());
+    fn refund_phase2(&self, peer: SignPk, stamp: Instant) {
+        if let Some(q) = self.phase2.lock().get_mut(&peer)
+            && let Some(i) = q.iter().rposition(|t| *t == stamp)
+        {
+            q.remove(i);
+        }
+    }
+
+    /// Start a client session with `peer` in `space`, unless it is serving
+    /// us one there right now.
+    fn begin_client(&self, peer: SignPk, space: SpaceId) -> Option<ActiveGuard<'_>> {
+        let mut a = self.active.lock();
+        let e = a.entry((peer, space)).or_default();
+        if e.1 || e.0 {
+            return None;
+        }
+        e.0 = true;
+        Some(ActiveGuard { v2: self, key: (peer, space), client: true })
+    }
+
+    /// Start serving `peer` in `space`: not while serving it there already
+    /// or more than [`MAX_SERVED_PER_PEER`] spaces at once, and not while our
+    /// own session to it there runs, if our key is the lower one (the two
+    /// sides decide the same way, so exactly one session survives).
+    fn begin_server(&self, me: SignPk, peer: SignPk, space: SpaceId) -> Option<ActiveGuard<'_>> {
+        let mut a = self.active.lock();
+        let served = a.iter().filter(|((p, _), (_, srv))| *p == peer && *srv).count();
+        let e = a.entry((peer, space)).or_default();
+        if e.1 || (e.0 && me < peer) || served >= MAX_SERVED_PER_PEER {
+            return None;
+        }
+        e.1 = true;
+        Some(ActiveGuard { v2: self, key: (peer, space), client: false })
+    }
+
+    /// Count an ambiguous refusal; true when it should be remembered.
+    fn note_refusal(&self, peer: SignPk) -> bool {
+        let mut r = self.refusals.lock();
+        let n = r.entry(peer).or_default();
+        *n += 1;
+        if *n >= 2 {
+            r.remove(&peer);
+            true
+        } else {
+            false
+        }
     }
 }
+
+/// A running session in [`V2::active`]; cleared when dropped.
+struct ActiveGuard<'a> {
+    v2: &'a V2,
+    key: (SignPk, SpaceId),
+    client: bool,
+}
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        let mut a = self.v2.active.lock();
+        if let Some(e) = a.get_mut(&self.key) {
+            if self.client {
+                e.0 = false;
+            } else {
+                e.1 = false;
+            }
+            if !e.0 && !e.1 {
+                a.remove(&self.key);
+            }
+        }
+    }
+}
+
+/// The peer answered `Busy`, or is already syncing this space with us: not
+/// a failure (no backoff, no store-and-forward bundle).
+#[derive(Debug)]
+pub(crate) struct PeerBusy(pub u32);
+
+impl fmt::Display for PeerBusy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "peer busy (retry in {} ms)", self.0)
+    }
+}
+
+impl std::error::Error for PeerBusy {}
 
 /// One full catch-up of our set (ops estimated at 8 KiB each), then the
 /// refill rate.
@@ -251,32 +372,54 @@ fn byte_cap(r: &Replica) -> f64 {
     1.1 * (r.stored_bytes() as f64 + r.op_count() as f64 * 8192.0) + 1024.0 * 1024.0
 }
 
-fn config(inner: &Inner, peer: SignPk, space: SpaceId, r: &Replica) -> Config {
+fn config(inner: &Inner, peer: SignPk, space: SpaceId, r: &Replica, allow_phase2: bool) -> Config {
+    // The peer's frontier, buffered whole: scaled to the authors we know of
+    // (the peer may know some more, not orders of magnitude more: authors
+    // must be named by an admin, rule A2), runs to a few per author.
+    let known = r.index().entries().len().max(r.members().len());
+    let authors = (2 * known + 1024).min(Config::default().max_frontier_authors);
     Config {
         send_budget: inner.v2.byte_budget(peer, space, byte_cap(r)),
-        allow_phase2: inner.v2.phase2_allowed(peer),
+        allow_phase2,
+        max_frontier_authors: authors,
+        max_frontier_runs: 8 * authors,
         ..Config::default()
     }
 }
 
 /// Did the peer refuse the stream kind (a build without Sync v2)? Only on
-/// a connection that is still up: the stream ended before any answer, or
-/// was reset or stopped with code 0 or [`STREAM_REFUSED`].
-fn refused(err: &anyhow::Error, conn: &Connection) -> bool {
+/// a connection that is still up, on the opening exchange. `Some(true)`:
+/// explicitly (reset or stopped with [`STREAM_REFUSED`]); `Some(false)`:
+/// ambiguously (the stream ended before any answer, or code 0).
+fn refused(err: &anyhow::Error, conn: &Connection) -> Option<bool> {
     use iroh::endpoint::{ReadError, ReadExactError, VarInt, WriteError};
     if conn.close_reason().is_some() {
-        return false;
+        return None;
     }
-    let codes = [VarInt::from_u32(0), VarInt::from_u32(STREAM_REFUSED)];
-    let is_refusal = |e: &(dyn std::error::Error + 'static)| {
-        matches!(e.downcast_ref::<ReadExactError>(), Some(ReadExactError::FinishedEarly(0)))
-            || matches!(e.downcast_ref::<ReadExactError>(), Some(ReadExactError::ReadError(ReadError::Reset(c))) if codes.contains(c))
-            || matches!(e.downcast_ref::<ReadError>(), Some(ReadError::Reset(c)) if codes.contains(c))
-            || matches!(e.downcast_ref::<WriteError>(), Some(WriteError::Stopped(c)) if codes.contains(c))
+    let code = |e: &(dyn std::error::Error + 'static)| -> Option<VarInt> {
+        match e.downcast_ref::<ReadExactError>() {
+            Some(ReadExactError::FinishedEarly(0)) => return Some(VarInt::from_u32(0)),
+            Some(ReadExactError::ReadError(ReadError::Reset(c))) => return Some(*c),
+            _ => {}
+        }
+        if let Some(ReadError::Reset(c)) = e.downcast_ref::<ReadError>() {
+            return Some(*c);
+        }
+        if let Some(WriteError::Stopped(c)) = e.downcast_ref::<WriteError>() {
+            return Some(*c);
+        }
+        None
     };
-    err.chain().any(|e| {
-        is_refusal(e) || e.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).is_some_and(|e| is_refusal(e))
-    })
+    let found = err.chain().find_map(|e| {
+        code(e).or_else(|| e.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).and_then(|e| code(e)))
+    })?;
+    if found == VarInt::from_u32(STREAM_REFUSED) {
+        Some(true)
+    } else if found == VarInt::from_u32(0) {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Refuse a `SyncV2` stream as a build without it would (with the
@@ -296,7 +439,9 @@ struct Done {
 // ─────────────────────────────── client ───────────────────────────────
 
 /// One Sync v2 session with `peer` as the client. `Ok(None)`: the peer
-/// doesn't speak Sync v2 (run v1; it is remembered).
+/// doesn't speak Sync v2 (run v1; remembered once it is clear). A
+/// [`PeerBusy`] error: the peer is syncing this space with us already, or
+/// is over its limits.
 pub(crate) async fn sync(
     inner: &Arc<Inner>,
     peer: SignPk,
@@ -307,14 +452,40 @@ pub(crate) async fn sync(
     if !inner.with_space(&space, |r| trust_peer || r.is_member(&peer))? {
         bail!("peer is not a member of this space");
     }
+    // One session per (peer, space): wait out one it is serving us (it
+    // carries our pinned set both ways; ours then sends what came after).
+    let waited = Instant::now();
+    let _active = loop {
+        if let Some(g) = inner.v2.begin_client(peer, space) {
+            break g;
+        }
+        if waited.elapsed() > WAIT_FOR_SERVED {
+            return Err(PeerBusy(1000).into());
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
     let res = crate::on_conn!(inner, &peer, |conn| exchange(inner, &conn, peer, space, eager));
     match res {
-        Ok(None) => {
-            inner.v2.mark_v1_only(peer);
+        Ok(Exchange::Refused { explicit }) => {
+            if explicit || inner.v2.note_refusal(peer) {
+                inner.v2.mark_v1_only(peer);
+            }
             Ok(None)
         }
-        other => other,
+        Ok(Exchange::Done(stats)) => {
+            inner.v2.refusals.lock().remove(&peer);
+            Ok(Some(stats))
+        }
+        Err(e) => Err(e),
     }
+}
+
+enum Exchange {
+    Done(SyncStats),
+    /// The peer refused the stream kind (see [`refused`]).
+    Refused {
+        explicit: bool,
+    },
 }
 
 async fn exchange(
@@ -323,12 +494,35 @@ async fn exchange(
     peer: SignPk,
     space: SpaceId,
     eager: bool,
-) -> Result<Option<SyncStats>> {
+) -> Result<Exchange> {
     let (mut tx, mut rx) = open_bi(conn, StreamKind::SyncV2).await?;
     let record = inner.v2.records.lock().get(&(peer, space));
+    let phase2 = inner.v2.take_phase2(peer);
+    let res = exchange_on(inner, conn, peer, space, eager, record, phase2, &mut tx, &mut rx).await;
+    if let Some(stamp) = phase2
+        && !matches!(&res, Ok(Exchange::Done(_)))
+    {
+        // (a session that ran refunds in `drive`)
+        inner.v2.refund_phase2(peer, stamp);
+    }
+    res
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn exchange_on(
+    inner: &Arc<Inner>,
+    conn: &Connection,
+    peer: SignPk,
+    space: SpaceId,
+    eager: bool,
+    record: Option<PeerRecord>,
+    phase2: Option<Instant>,
+    tx: &mut SendStream,
+    rx: &mut RecvStream,
+) -> Result<Exchange> {
     let new_session = |invite: Option<Vec<SignedOp>>| {
         inner.with_space(&space, |r| {
-            let cfg = config(inner, peer, space, r);
+            let cfg = config(inner, peer, space, r, phase2.is_some());
             Session::<Replica>::open(r, cfg, mycel_crypto::random(), record.clone(), eager, invite)
         })
     };
@@ -337,17 +531,21 @@ async fn exchange(
     let first = loop {
         let mut sent = 0;
         while let Some(m) = inner.with_space(&space, |r| session.poll_send(r))? {
-            match send_len(&mut tx, &m).await {
+            match send_len(tx, &m).await {
                 Ok(n) => sent += n,
-                Err(e) if refused(&e, conn) => return Ok(None),
-                Err(e) => return Err(e),
+                Err(e) => match refused(&e, conn) {
+                    Some(explicit) => return Ok(Exchange::Refused { explicit }),
+                    None => return Err(e),
+                },
             }
         }
         let wait = resources::reply_timeout(sent);
-        let msg = match recv_bounded::<V2Msg>(&mut rx, wait, reconcile::MAX_FRAME, &inner.reply_frames(&peer)).await {
+        let msg = match recv_bounded::<V2Msg>(rx, wait, reconcile::MAX_FRAME, &inner.reply_frames(&peer)).await {
             Ok((m, _permit)) => m,
-            Err(e) if refused(&e, conn) => return Ok(None),
-            Err(e) => return Err(e),
+            Err(e) => match refused(&e, conn) {
+                Some(explicit) => return Ok(Exchange::Refused { explicit }),
+                None => return Err(e),
+            },
         };
         match msg {
             Msg::Status(Verdict::NeedInvite) if !invited => {
@@ -363,20 +561,20 @@ async fn exchange(
                 bail!("peer denied sync (we were removed from this space)")
             }
             Msg::Status(Verdict::Denied) => bail!("peer denied sync (we are not a member)"),
-            Msg::Status(Verdict::Unsupported { .. }) => return Ok(None),
+            Msg::Status(Verdict::Unsupported { .. }) => return Ok(Exchange::Refused { explicit: true }),
             Msg::Status(Verdict::Busy { retry_after_ms }) => {
                 inner.v2.totals.lock().busy_received += 1;
-                bail!("peer busy (retry in {retry_after_ms} ms)")
+                return Err(PeerBusy(retry_after_ms).into());
             }
             other => break other,
         }
     };
-    let done = drive(inner, peer, space, session, Some(first), tx, rx, true).await?;
+    let done = drive(inner, peer, space, session, Some(first), tx, rx, true, phase2).await?;
     inner.note_path(peer, conn);
-    finish(inner, peer, done)
+    Ok(Exchange::Done(finish(inner, peer, done)?))
 }
 
-fn finish(inner: &Arc<Inner>, peer: SignPk, done: Done) -> Result<Option<SyncStats>> {
+fn finish(inner: &Arc<Inner>, peer: SignPk, done: Done) -> Result<SyncStats> {
     match done.outcome {
         Some(Outcome::Aborted { reason, by_peer }) => {
             bail!("sync aborted ({reason:?}, by {})", if by_peer { "peer" } else { "us" })
@@ -385,7 +583,7 @@ fn finish(inner: &Arc<Inner>, peer: SignPk, done: Done) -> Result<Option<SyncSta
         None => bail!("sync ended early"),
         Some(_) => {
             inner.mark_ok(peer);
-            Ok(Some(done.stats))
+            Ok(done.stats)
         }
     }
 }
@@ -403,23 +601,39 @@ pub(crate) async fn serve(
         refuse_stream(&mut tx, &mut rx);
         return Ok(());
     }
+    let res = serve_on(inner, conn, peer, &mut tx, &mut rx).await;
+    if res.is_err() {
+        // Never a bare end of stream: the client must not take a failure
+        // for a build without v2.
+        let code = iroh::endpoint::VarInt::from_u32(SYNC_V2_FAILED);
+        rx.stop(code).ok();
+        tx.reset(code).ok();
+    }
+    res
+}
+
+async fn serve_on(
+    inner: &Arc<Inner>,
+    conn: &Connection,
+    peer: SignPk,
+    tx: &mut SendStream,
+    rx: &mut RecvStream,
+) -> Result<()> {
     let max = reconcile::MAX_FRAME;
-    let (mut msg, mut _permit) =
-        recv_bounded::<V2Msg>(&mut rx, resources::FIRST_FRAME, max, &inner.frames(&peer)).await?;
+    let (mut msg, mut _permit) = recv_bounded::<V2Msg>(rx, resources::FIRST_FRAME, max, &inner.frames(&peer)).await?;
     loop {
         let Msg::Open(mut open) = msg else { bail!("expected Open") };
         let space = open.space;
         if !inner.spaces.lock().contains_key(&space) {
             match open.invite.take() {
                 None => {
-                    let n = send_len(&mut tx, &V2Msg::Status(Verdict::NeedInvite)).await?;
-                    (msg, _permit) =
-                        recv_bounded(&mut rx, resources::reply_timeout(n), max, &inner.frames(&peer)).await?;
+                    let n = send_len(tx, &V2Msg::Status(Verdict::NeedInvite)).await?;
+                    (msg, _permit) = recv_bounded(rx, resources::reply_timeout(n), max, &inner.frames(&peer)).await?;
                     continue;
                 }
                 Some(ops) => {
                     if !accept_invite(inner, peer, space, ops) {
-                        send_len(&mut tx, &V2Msg::Status(Verdict::Denied)).await?;
+                        send_len(tx, &V2Msg::Status(Verdict::Denied)).await?;
                         tx.finish()?;
                         return Ok(());
                     }
@@ -427,35 +641,54 @@ pub(crate) async fn serve(
             }
         }
         open.invite = None;
+        let me = inner.keys.sign_pk();
+        let active = inner.v2.begin_server(me, peer, space);
+        let phase2 = if active.is_some() { inner.v2.take_phase2(peer) } else { None };
         // Membership gate: only current members (any role) may sync.
         let record = inner.v2.records.lock().get(&(peer, space));
         let gate = inner.with_space(&space, |r| {
             if r.is_member(&peer) {
+                if active.is_none() {
+                    return Err(Box::new(Verdict::Busy { retry_after_ms: 1000 }));
+                }
                 let cap = byte_cap(r);
                 let idle = open.digest == r.digest();
                 match if idle { Ok(()) } else { inner.v2.take_session(peer, space, cap) } {
-                    Ok(()) => Ok(Session::accept(r, config(inner, peer, space, r), open, record)),
+                    Ok(()) => Ok(Session::accept(r, config(inner, peer, space, r, phase2.is_some()), open, record)),
                     Err(retry_after_ms) => Err(Box::new(Verdict::Busy { retry_after_ms })),
                 }
             } else {
                 let proof = r.revocation_proof(&peer);
                 Err(Box::new(if proof.is_empty() { Verdict::Denied } else { Verdict::Removed { ops: proof } }))
             }
-        })?;
+        });
+        let gate = match gate {
+            Ok(g) => g,
+            Err(e) => {
+                if let Some(stamp) = phase2 {
+                    inner.v2.refund_phase2(peer, stamp);
+                }
+                return Err(e);
+            }
+        };
         let session = match gate {
             Ok(s) => s,
             Err(v) => {
+                if let Some(stamp) = phase2 {
+                    inner.v2.refund_phase2(peer, stamp);
+                }
                 if matches!(*v, Verdict::Busy { .. }) {
                     inner.v2.totals.lock().busy_sent += 1;
                 }
-                send_len(&mut tx, &V2Msg::Status(*v)).await?;
+                send_len(tx, &V2Msg::Status(*v)).await?;
                 tx.finish()?;
                 return Ok(());
             }
         };
         inner.v2.note_inbound(space, peer);
         drop(_permit);
-        let done = drive(inner, peer, space, session, None, tx, rx, false).await?;
+        let done = drive(inner, peer, space, session, None, tx, rx, false, phase2).await?;
+        drop(active);
         inner.note_path(peer, conn);
         finish(inner, peer, done)?;
         return Ok(());
@@ -464,8 +697,42 @@ pub(crate) async fn serve(
 
 // ─────────────────────────────── both ───────────────────────────────
 
+/// When the peer last sent a frame, and when what we wrote will have been
+/// delivered at the slowest planned rate (see the module docs, "Liveness").
+struct Progress {
+    heard: Instant,
+    drained: Instant,
+}
+
+impl Progress {
+    /// We wrote `n` bytes: they queue behind what is still undelivered
+    /// (at most a stream window of it).
+    fn wrote(&mut self, n: usize) {
+        let now = Instant::now();
+        let per = Duration::from_secs_f64(n as f64 / resources::SLOWEST_RATE as f64);
+        let most = now + Duration::from_secs(resources::MAX_UNDELIVERED / resources::SLOWEST_RATE);
+        self.drained = (self.drained.max(now) + per).min(most);
+    }
+}
+
+/// Completes once the peer has been silent for a reply timeout after the
+/// later of its last frame and the delivery of what we wrote.
+async fn stalled(p: &Mutex<Progress>) {
+    loop {
+        let deadline = {
+            let p = p.lock();
+            p.heard.max(p.drained) + resources::REPLY_TIMEOUT
+        };
+        if Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep_until(deadline.into()).await;
+    }
+}
+
 /// Run a session to its end on `tx`/`rx`. `first`: a frame already read
-/// (the client's `Status`).
+/// (the client's `Status`). `phase2`: the reserved phase-2 slot, refunded
+/// if the session didn't use it.
 #[allow(clippy::too_many_arguments)]
 async fn drive(
     inner: &Arc<Inner>,
@@ -473,74 +740,85 @@ async fn drive(
     space: SpaceId,
     session: Session<Replica>,
     first: Option<V2Msg>,
-    mut tx: SendStream,
-    mut rx: RecvStream,
+    tx: &mut SendStream,
+    rx: &mut RecvStream,
     client: bool,
+    phase2: Option<Instant>,
 ) -> Result<Done> {
     let shared = Arc::new(Mutex::new(session));
-    let notify = Arc::new(Notify::new());
+    let notify = Notify::new();
     let received = Arc::new(Mutex::new(SyncStats::default()));
+    let progress = Mutex::new(Progress { heard: Instant::now(), drained: Instant::now() });
+    // Data bytes written to the stream (what the byte budget is charged).
+    let written_data = Mutex::new(0u64);
     let frames = if client { inner.reply_frames(&peer) } else { inner.frames(&peer) };
-    let reader = {
-        let (shared, notify, received) = (shared.clone(), notify.clone(), received.clone());
-        async move {
-            let mut ops: Vec<SignedOp> = Vec::new();
-            let mut ops_bytes = 0;
-            if let Some(m) = first {
-                process(inner, peer, space, &shared, m, &mut ops, &mut ops_bytes, &received)?;
-                notify.notify_one();
-            }
-            loop {
-                if shared.lock().outcome().is_some() {
-                    break;
-                }
-                let wait = resources::reply_timeout(0);
-                let msg = match recv_bounded::<V2Msg>(&mut rx, wait, reconcile::MAX_FRAME, &frames).await {
-                    Ok((m, _permit)) => m,
-                    Err(_) if shared.lock().outcome().is_some() => break,
-                    Err(e) => {
-                        notify.notify_one();
-                        return Err(e);
-                    }
-                };
-                let res = process(inner, peer, space, &shared, msg, &mut ops, &mut ops_bytes, &received);
-                notify.notify_one();
-                res?;
-            }
-            if !ops.is_empty() {
-                ingest(inner, peer, space, &shared, std::mem::take(&mut ops), Vec::new(), &received);
-            }
+    // The reader borrows `rx`, which outlives both loops: dropping it as
+    // soon as the outcome is known would stop the peer's last writes.
+    let reader = async {
+        let mut ops: Vec<SignedOp> = Vec::new();
+        let mut ops_bytes = 0;
+        if let Some(m) = first {
+            process(inner, peer, space, &shared, m, &mut ops, &mut ops_bytes, &received)?;
             notify.notify_one();
-            Ok::<_, anyhow::Error>(())
         }
+        loop {
+            if shared.lock().outcome().is_some() {
+                break;
+            }
+            // No reply deadline of its own (see "Liveness"); a frame
+            // already started must keep arriving (`IDLE_TIMEOUT`).
+            let got = tokio::select! {
+                r = recv_bounded::<V2Msg>(rx, Duration::from_secs(86_400), reconcile::MAX_FRAME, &frames) => r,
+                _ = stalled(&progress) => Err(anyhow!("sync stalled: nothing moved either way")),
+            };
+            let msg = match got {
+                Ok((m, _permit)) => m,
+                Err(_) if shared.lock().outcome().is_some() => break,
+                Err(e) => {
+                    notify.notify_one();
+                    return Err(e);
+                }
+            };
+            progress.lock().heard = Instant::now();
+            let res = process(inner, peer, space, &shared, msg, &mut ops, &mut ops_bytes, &received);
+            notify.notify_one();
+            res?;
+        }
+        if !ops.is_empty() {
+            ingest(inner, peer, space, &shared, std::mem::take(&mut ops), Vec::new(), &received);
+        }
+        notify.notify_one();
+        Ok::<_, anyhow::Error>(())
     };
-    let writer = {
-        let (shared, notify) = (shared.clone(), notify.clone());
-        async move {
-            loop {
-                let frame = inner.with_space(&space, |r| shared.lock().poll_send(r)).unwrap_or_else(|_| {
-                    shared.lock().abort(AbortReason::Gone);
-                    None
-                });
-                match frame {
-                    Some(m) => {
-                        send_len(&mut tx, &m).await?;
+    let writer = async {
+        loop {
+            let frame = inner.with_space(&space, |r| shared.lock().poll_send(r)).unwrap_or_else(|_| {
+                shared.lock().abort(AbortReason::Gone);
+                None
+            });
+            match frame {
+                Some(m) => {
+                    let data = matches!(m, Msg::Ops(_) | Msg::Chunk(_));
+                    let n = send_len(tx, &m).await?;
+                    if data {
+                        *written_data.lock() += n as u64;
                     }
-                    None if shared.lock().is_done() => break,
-                    None => {
-                        // Woken by the reader after every frame; the timeout
-                        // only bounds a wait on a peer that went silent.
-                        if tokio::time::timeout(resources::IDLE_TIMEOUT, notify.notified()).await.is_err()
-                            && !shared.lock().is_done()
-                        {
-                            continue;
-                        }
+                    progress.lock().wrote(n);
+                }
+                None if shared.lock().is_done() => break,
+                None => {
+                    // Woken by the reader after every frame; the timeout
+                    // only bounds a wait on a peer that went silent.
+                    if tokio::time::timeout(resources::IDLE_TIMEOUT, notify.notified()).await.is_err()
+                        && !shared.lock().is_done()
+                    {
+                        continue;
                     }
                 }
             }
-            tx.finish()?;
-            Ok::<_, anyhow::Error>(())
         }
+        tx.finish()?;
+        Ok::<_, anyhow::Error>(())
     };
     // The writer ends only once the session is done and everything owed is
     // sent: nothing more is needed from the peer then, so a peer that never
@@ -551,7 +829,16 @@ async fn drive(
             Ok(()) => (&mut writer).await,
             Err(e) => Err(e),
         },
-        w = &mut writer => w,
+        w = &mut writer => match w {
+            Ok(()) => Ok(()),
+            // The peer may have stopped our stream once it had our `Close`:
+            // its own `Close` may still be on the way, so read on (the
+            // reader ends on the outcome, an error, or a stall).
+            Err(e) => {
+                let _ = (&mut reader).await;
+                Err(e)
+            }
+        },
     };
     let s = shared.lock();
     let stats = s.stats();
@@ -570,22 +857,33 @@ async fn drive(
         if stats.phase >= 2 {
             t.phase2 += 1;
         }
+        if !matches!(s.outcome(), Some(Outcome::InSync | Outcome::Unchanged | Outcome::Converged { .. })) {
+            t.failed += 1;
+        }
     }
-    inner.v2.spend(peer, space, stats.sent_data_bytes);
-    if stats.phase >= 2 {
-        inner.v2.charge_phase2(peer);
+    inner.v2.spend(peer, space, *written_data.lock());
+    if let Some(stamp) = phase2
+        && stats.phase < 2
+    {
+        inner.v2.refund_phase2(peer, stamp);
     }
     if let Some(rec) = s.record() {
         inner.v2.records.lock().put((peer, space), rec.clone());
     }
     let outcome = s.outcome().cloned();
+    let me = inner.keys.sign_pk();
+    let delivered_to = s.peer_holds_my_opening_set().then(|| s.opening_top(&me));
     drop(s);
-    if matches!(outcome, Some(Outcome::InSync | Outcome::Unchanged | Outcome::Converged { .. })) {
-        // The peer verified it holds our opening set: our latest writes are
-        // delivered to it (delivery ticks without a per-envelope pass).
-        let me = inner.keys.sign_pk();
+    if let Some(top) = delivered_to {
+        // The peer verified it holds our opening set: our latest writes up
+        // to its pinned top are delivered (ticks without a per-envelope
+        // pass; writes made during the session wait for the next one).
         let _ = inner.with_space(&space, |r| {
-            let recent = r.recent_envelopes(&me, 64);
+            let recent: Vec<EnvelopeId> = r
+                .recent_envelopes(&me, 64)
+                .into_iter()
+                .filter(|id| top.is_some_and(|t| r.index().seq(id).is_some_and(|s| s <= t)))
+                .collect();
             r.note_holder(peer, &recent);
         });
         inner.emit(NetEvent::SpaceChanged { space });
@@ -594,7 +892,12 @@ async fn drive(
     if moved(&stats) {
         inner.schedule(space);
     }
-    res?;
+    // A session that reached a successful outcome succeeded, whatever
+    // happened to the stream's tail afterwards (the peer may stop reading
+    // its side as soon as it has our `Close`).
+    if !matches!(outcome, Some(Outcome::InSync | Outcome::Unchanged | Outcome::Converged { .. })) {
+        res?;
+    }
     Ok(Done { stats, outcome })
 }
 
@@ -677,4 +980,56 @@ fn ingest(
 /// Did a session bring anything (a sign of loss for a periodic one)?
 pub(crate) fn moved(stats: &SyncStats) -> bool {
     stats.ops + stats.envelopes > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_session_per_peer_and_space_in_either_role() {
+        let v2 = V2::default();
+        let (lo, hi) = (SignPk([1; 32]), SignPk([2; 32]));
+        let space = Hash32([5; 32]);
+        // I am `lo` with a session open to `hi`: `hi`'s crossing open is
+        // refused (the lower key's session wins) ...
+        let c = v2.begin_client(hi, space).unwrap();
+        assert!(v2.begin_server(lo, hi, space).is_none());
+        drop(c);
+        // ... and as `hi`, `lo`'s open is served (ours will get `Busy`).
+        let c = v2.begin_client(lo, space).unwrap();
+        let s = v2.begin_server(hi, lo, space).unwrap();
+        assert!(v2.begin_server(hi, lo, space).is_none(), "one served per (peer, space)");
+        drop((c, s));
+        // A client waits while the peer is served in that space.
+        let s = v2.begin_server(hi, lo, space).unwrap();
+        assert!(v2.begin_client(lo, space).is_none());
+        drop(s);
+        assert!(v2.active.lock().is_empty());
+        // At most MAX_SERVED_PER_PEER spaces served to one peer at once.
+        let held: Vec<_> =
+            (0..MAX_SERVED_PER_PEER as u8).map(|i| v2.begin_server(hi, lo, Hash32([i; 32])).unwrap()).collect();
+        assert!(v2.begin_server(hi, lo, Hash32([99; 32])).is_none());
+        drop(held);
+        assert!(v2.begin_server(hi, lo, Hash32([99; 32])).is_some());
+    }
+
+    #[test]
+    fn phase2_slots_are_reserved_up_front_and_refunded() {
+        let v2 = V2::default();
+        let peer = SignPk([3; 32]);
+        let stamps: Vec<Instant> = (0..PHASE2_PER_HOUR).map(|_| v2.take_phase2(peer).unwrap()).collect();
+        assert!(v2.take_phase2(peer).is_none(), "concurrent sessions can't all take the last slot");
+        v2.refund_phase2(peer, stamps[2]);
+        assert!(v2.take_phase2(peer).is_some());
+    }
+
+    #[test]
+    fn an_ambiguous_refusal_is_remembered_only_the_second_time() {
+        let v2 = V2::default();
+        let peer = SignPk([4; 32]);
+        assert!(!v2.note_refusal(peer));
+        assert!(v2.note_refusal(peer));
+        assert!(!v2.note_refusal(peer), "counting starts again");
+    }
 }

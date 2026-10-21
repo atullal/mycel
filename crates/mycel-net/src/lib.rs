@@ -719,16 +719,17 @@ impl Inner {
             .map(|(_, p)| *p)
             .collect();
         // Random edges (by rendezvous hash over the whole member list, so
-        // physical clusters can't split the overlay).
-        let nearby = out.len();
-        for (_, p) in &ranked {
-            if out.len() >= nearby + VIEW_RANDOM {
-                break;
-            }
-            if !out.contains(p) {
-                out.push(*p);
-            }
-        }
+        // physical clusters can't split the overlay), preferring members
+        // with recent evidence of reachability: one that fails drops a
+        // tier and the next by rank takes its place (HyParView's active
+        // view), so offline picks can't cut a device off for an epoch.
+        let tier = |p: &SignPk| match peers.get(p) {
+            Some(s) if s.backing_off() => 2,
+            Some(s) if s.online() => 0,
+            _ => 1,
+        };
+        let random = pick_ranked(&ranked, &out, VIEW_RANDOM, tier);
+        out.extend(random);
         for p in self.v2.inbound(space, VIEW_INBOUND) {
             if members.contains(&p) && !out.contains(&p) {
                 out.push(p);
@@ -1205,6 +1206,7 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Tri
         inflight.insert((peer, space), false);
     }
     let _slot = inner.sync_slots.acquire().await;
+    let mut busy_retries = 0;
     loop {
         // No total deadline (a large sync over Bluetooth takes minutes):
         // every wait inside is bounded, and a dead connection fails it.
@@ -1217,6 +1219,25 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Tri
                 session.await
             }
         };
+        // `Busy`: the peer is syncing this space with us already, or over
+        // its limits. Not a failure: no backoff, no bundle; try again soon
+        // if a change is waiting.
+        if let Err(e) = &res
+            && let Some(busy) = e.downcast_ref::<sync_v2::PeerBusy>()
+        {
+            let retry = Duration::from_millis(u64::from(busy.0).clamp(200, 5000));
+            let again = inner.inflight.lock().get(&(peer, space)).copied().unwrap_or(false);
+            if again && busy_retries < 3 {
+                busy_retries += 1;
+                if let Some(a) = inner.inflight.lock().get_mut(&(peer, space)) {
+                    *a = false;
+                }
+                tokio::time::sleep(retry).await;
+                continue;
+            }
+            inner.inflight.lock().remove(&(peer, space));
+            return;
+        }
         let ok = res.is_ok();
         if let Ok(stats) = &res {
             inner.mark_ok(peer);
@@ -2128,5 +2149,35 @@ mod security_exchange_tests {
         assert!(node.send_ephemeral(space, vec![42; MAX_EPHEMERAL]).is_ok());
         assert!(node.send_ephemeral(space, vec![42; MAX_EPHEMERAL + 1]).is_err());
         node.shutdown().await.unwrap();
+    }
+}
+
+/// `n` members of `ranked` (rendezvous order) not in `skip`: lowest `tier`
+/// first (0 recently reachable, 1 unknown, 2 failing), by rank within a tier.
+fn pick_ranked(ranked: &[(Hash32, SignPk)], skip: &[SignPk], n: usize, tier: impl Fn(&SignPk) -> u8) -> Vec<SignPk> {
+    let mut picks: Vec<(u8, usize, SignPk)> =
+        ranked.iter().enumerate().filter(|(_, (_, p))| !skip.contains(p)).map(|(i, (_, p))| (tier(p), i, *p)).collect();
+    picks.sort_unstable();
+    picks.into_iter().take(n).map(|(_, _, p)| p).collect()
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn view_replaces_unreachable_members_by_rank() {
+        let ranked: Vec<(Hash32, SignPk)> = (0..10u8).map(|i| (Hash32([i; 32]), SignPk([i; 32]))).collect();
+        let pk = |i: u8| SignPk([i; 32]);
+        // Nothing known: the first two by rank.
+        assert_eq!(pick_ranked(&ranked, &[], 2, |_| 1), vec![pk(0), pk(1)]);
+        // The first two fail: the next two by rank replace them.
+        let failing = |p: &SignPk| if p.0[0] < 2 { 2 } else { 1 };
+        assert_eq!(pick_ranked(&ranked, &[], 2, failing), vec![pk(2), pk(3)]);
+        // A recently reachable member is preferred over unknown ones.
+        let seen = |p: &SignPk| if p.0[0] == 7 { 0 } else { 1 };
+        assert_eq!(pick_ranked(&ranked, &[pk(0)], 2, seen), vec![pk(7), pk(1)]);
+        // Everyone failing: still the best by rank (retried after backoff).
+        assert_eq!(pick_ranked(&ranked, &[], 2, |_| 2), vec![pk(0), pk(1)]);
     }
 }
