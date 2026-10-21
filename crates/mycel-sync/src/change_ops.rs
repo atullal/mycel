@@ -247,6 +247,10 @@ pub(crate) fn visit(change: &Change, mut f: impl FnMut(usize, &Row, &[OpRef]) ->
         let key = match (key_actor.next()?.flatten(), key_ctr.next()?.flatten(), key_str.next()?.flatten()) {
             (None, None, Some(())) => Key::Prop,
             (None, Some(0), None) => Key::Head,
+            // Upstream reads any element counter 0 as the head, but never
+            // writes one with an actor (found by fuzzing: we read an element
+            // no operation has, where upstream reads the head).
+            (Some(_), Some(0), None) => return bad(),
             (Some(actor), Some(counter), None) => Key::Elem(op_ref(counter, actor)?),
             _ => return bad(),
         };
@@ -362,6 +366,24 @@ pub(crate) mod tests {
             ops += seen;
         }
         assert!(ops > 20);
+    }
+
+    /// Found by fuzzing (`fuzz/fuzz_targets/sync_change.rs`, differential
+    /// against Automerge): a key with an actor and counter 0 decoded here as
+    /// an element, while Automerge reads it as the head. Upstream never
+    /// writes it; it is refused.
+    #[test]
+    fn element_counter_zero_with_an_actor_is_refused() {
+        let mut d = AutoCommit::new().with_actor(actor(1));
+        let list = d.put_object(ROOT, "list", ObjType::List).unwrap();
+        d.insert(&list, 0, 1).unwrap();
+        d.commit();
+        let mut crafted = d.get_last_local_change().unwrap().decode();
+        let insert = crafted.operations.iter().position(|op| op.insert).unwrap();
+        crafted.operations[insert].key = LegacyKey::Seq(ElementId::Id(LegacyOpId::new(0, &actor(1))));
+        let crafted = Change::from(crafted);
+        assert_eq!(crafted.decode().operations[insert].key, LegacyKey::Seq(ElementId::Head), "upstream: the head");
+        assert!(visit(&crafted, |_, _, _| Ok(())).is_err());
     }
 
     #[test]
