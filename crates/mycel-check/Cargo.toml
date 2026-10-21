@@ -1,0 +1,27 @@
+[package]
+name = "mycel-check"
+description = "Bounded model checking of Mycel's sans-IO cores (mesh router, store-and-forward carrier, BLE link) with Stateright"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# A test tool: nothing depends on it, so the production crates never gain
+# Stateright, and their `model` features stay off in every release build.
+publish = false
+
+[[bin]]
+name = "mycel-check"
+path = "src/main.rs"
+
+[dependencies]
+bytes = "1.12"
+mycel-crypto = { version = "0.1.0", path = "../mycel-crypto" }
+mycel-link-ble = { version = "0.0.1", path = "../mycel-link-ble", features = ["model"] }
+mycel-net = { version = "0.1.0", path = "../mycel-net", features = ["model"] }
+stateright = "0.31.0"
+
+[lints]
+workspace = true

@@ -465,6 +465,7 @@ pub struct DtnStats {
     pub resumed: u64,
 }
 
+#[cfg_attr(feature = "model", derive(Clone, Debug))]
 struct Held {
     b: Bundle,
     copies: u8,
@@ -557,6 +558,7 @@ fn utility_in(gradient: Gradient, table: Option<&NbPreds>, dst: &SignPk, inet: b
 }
 
 /// The first bytes of a bundle whose transfer to us was cut short.
+#[cfg_attr(feature = "model", derive(Clone, Debug))]
 struct Partial {
     src: SignPk,
     bytes: Bytes,
@@ -564,6 +566,7 @@ struct Partial {
 }
 
 /// One device's store-and-forward carrier.
+#[cfg_attr(feature = "model", derive(Clone, Debug))]
 pub struct Carrier {
     me: SignPk,
     cfg: DtnConfig,
@@ -1474,6 +1477,19 @@ impl Carrier {
             self.nb_room.remove(&k);
             self.nb_refused.remove(&k);
         }
+    }
+
+    /// Model checking (`model` feature): whether we hold a receipt for
+    /// `id` (we were its destination, or learnt of it).
+    #[cfg(feature = "model")]
+    pub fn model_has_receipt(&self, id: &Hash32) -> bool {
+        self.receipts.contains_key(id)
+    }
+
+    /// Model checking (`model` feature): the copies of `id` we hold.
+    #[cfg(feature = "model")]
+    pub fn model_copies(&self, id: &Hash32) -> Option<u8> {
+        self.held.get(id).map(|h| h.copies)
     }
 
     /// Neighbours whose summaries we remember.

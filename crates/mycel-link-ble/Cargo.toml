@@ -38,6 +38,9 @@ futures-util = "0.3"
 tokio = { version = "1.53.2", features = ["sync", "rt", "time", "macros", "io-util"] }
 
 [features]
+# Clone, Debug and read-only views of the connection state machine for the
+# bounded model checker, crates/mycel-check. Never on in a release build.
+model = []
 # Build libdbus from source (Linux systems without libdbus-1-dev; cross-checks).
 vendored-dbus = ["dep:dbus"]
 

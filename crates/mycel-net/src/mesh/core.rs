@@ -634,6 +634,7 @@ impl Bucket {
     }
 }
 
+#[cfg_attr(feature = "model", derive(Clone, Debug))]
 struct Nb {
     /// In range on a link or the LAN (else an internet hop, when up).
     direct: bool,
@@ -700,6 +701,7 @@ struct Via {
     since: Option<Time>,
 }
 
+#[cfg_attr(feature = "model", derive(Clone, Debug))]
 struct Origin {
     newest: u64,
     /// The newest announcement itself (passed on with our cost added).
@@ -735,6 +737,7 @@ impl Origin {
     }
 }
 
+#[cfg_attr(feature = "model", derive(Clone, Debug))]
 struct Reasm {
     buf: Vec<u8>,
     got: usize,
@@ -743,6 +746,7 @@ struct Reasm {
     control: bool,
 }
 
+#[cfg_attr(feature = "model", derive(Clone, Debug))]
 struct Reach {
     /// (gateway, its mesh cost to the target). Empty: no record, reach the
     /// target itself over the internet.
@@ -751,6 +755,7 @@ struct Reach {
     until: Time,
 }
 
+#[cfg_attr(feature = "model", derive(Clone, Debug))]
 struct Pending {
     frames: VecDeque<(Frame, Option<SignPk>)>,
     since: Time,
@@ -784,6 +789,7 @@ pub enum Toward {
 type GatewayPick = (Vec<(SignPk, u32)>, Vec<SignPk>);
 
 /// One device's router. See the module docs.
+#[cfg_attr(feature = "model", derive(Clone, Debug))]
 pub struct Router {
     me: SignPk,
     cfg: Config,
@@ -872,6 +878,9 @@ pub struct Router {
     gw_sorted: Option<Vec<(SignPk, u32, u32, SignPk)>>,
     /// What `choose_gateways` picks from `gw_sorted`.
     gw_pick: Option<GatewayPick>,
+    /// Model checking only: a planted bug ([`Router::model_plant_infeasible`]).
+    #[cfg(feature = "model")]
+    planted_infeasible: bool,
 }
 
 impl Router {
@@ -932,6 +941,8 @@ impl Router {
             gw_all_dirty: true,
             gw_sorted: None,
             gw_pick: None,
+            #[cfg(feature = "model")]
+            planted_infeasible: false,
             cfg,
         }
     }
@@ -1712,10 +1723,26 @@ impl Router {
 
     // ───────────── routes ─────────────
 
+    /// The planted bug of the model checker's acceptance test (`model`
+    /// feature only; compiled to `false` otherwise).
+    #[inline(always)]
+    fn planted_infeasible(&self) -> bool {
+        #[cfg(feature = "model")]
+        {
+            self.planted_infeasible
+        }
+        #[cfg(not(feature = "model"))]
+        {
+            false
+        }
+    }
+
     /// A route through `n` that can carry traffic now: feasible, fresh,
     /// through a direct neighbour whose hop is up.
     fn usable(&self, o: &Origin, n: &SignPk, v: &Via, now: Time) -> bool {
-        o.feasible(v) && self.fresh(o, v, now) && self.nbs.get(n).is_some_and(|n| n.up && n.direct)
+        (o.feasible(v) || self.planted_infeasible())
+            && self.fresh(o, v, now)
+            && self.nbs.get(n).is_some_and(|n| n.up && n.direct)
     }
 
     /// What a route through `n` is chosen by: its cost, with what the
@@ -2748,6 +2775,11 @@ impl Router {
         (w, g)
     }
 }
+
+#[cfg(feature = "model")]
+mod model;
+#[cfg(feature = "model")]
+pub use model::ModelVia;
 
 #[cfg(test)]
 mod tests;

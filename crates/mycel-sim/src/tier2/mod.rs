@@ -7,6 +7,7 @@ pub mod global;
 pub mod lfr;
 pub mod mycel;
 pub mod oracle;
+pub mod swarm;
 pub mod world;
 
 use serde::{Deserialize, Serialize};

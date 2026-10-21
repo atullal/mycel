@@ -15,6 +15,13 @@ publish = false
 [features]
 # Publish and resolve gateway records on the BitTorrent Mainline DHT.
 dht = ["dep:n0-mainline"]
+# Read-only views of the sans-IO cores' state (and one planted bug) for the
+# bounded model checker, crates/mycel-check. Never on in a release build.
+model = []
+# In-code fault injection (`buggify!`, src/buggify.rs) for simulation. Off,
+# every injection point compiles to `false`; on, it still fires only after
+# `buggify::enable`. Never on in a release build.
+sim = []
 
 [dependencies]
 anyhow = "1.0.104"

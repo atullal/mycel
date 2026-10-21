@@ -184,6 +184,7 @@ enum Phase {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "model", derive(Clone))]
 struct Periph {
     phase: Phase,
     key: Option<SignPk>,
@@ -198,6 +199,7 @@ struct Periph {
 }
 
 #[derive(Debug)]
+#[cfg_attr(feature = "model", derive(Clone))]
 struct Chan {
     /// `Some`: we dialed it over this peripheral.
     pid: Option<Pid>,
@@ -209,6 +211,7 @@ struct Chan {
     doomed: Option<Instant>,
 }
 
+#[cfg_attr(feature = "model", derive(Clone, Debug))]
 pub struct Core {
     me: SignPk,
     periphs: BTreeMap<Pid, Periph>,
@@ -261,6 +264,49 @@ impl Core {
     #[cfg(test)]
     pub(crate) fn seed(&mut self, seed: u64) {
         self.rng = seed | 1;
+    }
+
+    /// Model checking (`model` feature): seed the jitter and bound it
+    /// (zero: none), so runs are reproducible.
+    #[cfg(feature = "model")]
+    pub fn model_seed(&mut self, seed: u64, jitter_max: Duration) {
+        self.rng = seed | 1;
+        self.jitter_max = jitter_max;
+    }
+
+    /// Model checking (`model` feature): the channel carrying each
+    /// reachable node.
+    #[cfg(feature = "model")]
+    pub fn model_active(&self) -> Vec<(SignPk, ChanId)> {
+        self.active.iter().map(|(k, c)| (*k, *c)).collect()
+    }
+
+    /// Model checking (`model` feature): every channel we track, as
+    /// (id, node key, said hello, doomed duplicate, dialed by us).
+    #[cfg(feature = "model")]
+    pub fn model_chans(&self) -> Vec<(ChanId, Option<SignPk>, bool, bool, bool)> {
+        self.chans.iter().map(|(id, c)| (*id, c.key, c.hello, c.doomed.is_some(), c.pid.is_some())).collect()
+    }
+
+    /// Model checking (`model` feature): each peripheral's phase, by name.
+    #[cfg(feature = "model")]
+    pub fn model_phases(&self) -> Vec<(Pid, &'static str)> {
+        self.periphs
+            .iter()
+            .map(|(pid, p)| {
+                let ph = match p.phase {
+                    Phase::Idle => "idle",
+                    Phase::Connecting(_) => "connecting",
+                    Phase::Reading(_) => "reading",
+                    Phase::Opening(_) => "opening",
+                    Phase::Linked => "linked",
+                    Phase::Spare => "spare",
+                    Phase::Myself => "myself",
+                    Phase::Stranger => "stranger",
+                };
+                (pid.clone(), ph)
+            })
+            .collect()
     }
 
     /// Nodes currently reachable.

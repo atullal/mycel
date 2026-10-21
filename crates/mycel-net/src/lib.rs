@@ -47,6 +47,8 @@
 //! membership change, a local write, a newly reachable peer).
 
 mod blobs;
+#[cfg_attr(not(feature = "sim"), allow(unused_imports))]
+pub mod buggify;
 pub mod emu;
 #[cfg(fuzzing)]
 #[doc(hidden)]

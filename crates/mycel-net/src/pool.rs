@@ -219,6 +219,11 @@ impl Pool {
             anyhow::Ok(connecting.await?)
         };
         let dialed = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+            // (simulation: a dial that fails although the device is there,
+            // as radios and NATs make some do)
+            _ if crate::buggify::buggify!("pool: dial fails spuriously") => {
+                Err(anyhow!("can't reach the device: dial failed (injected)"))
+            }
             Ok(Ok(c)) => Ok(c),
             Ok(Err(e)) => Err(anyhow!("can't reach the device: {e}")),
             Err(_) => Err(anyhow!("can't reach the device: connect timed out")),
@@ -231,6 +236,11 @@ impl Pool {
             }
         };
         self.dialed.fetch_add(1, Ordering::Relaxed);
+        if crate::buggify::buggify!("pool: connection lost right after the dial") {
+            // (simulation: the link drops just after the handshake; the
+            // connection is handed out closed, as a real one can be)
+            conn.close(0u32.into(), b"injected");
+        }
         // (the handshake can only pick one of the ALPNs we offered)
         let Some(version) = wire::version_of(conn.alpn()) else {
             conn.close(0u32.into(), b"unexpected protocol");

@@ -86,6 +86,9 @@ fn main() -> anyhow::Result<()> {
         eprintln!("merged {} scenarios into {}", results.len(), a.out.join("report.md").display());
         return Ok(());
     }
+    if a.what == "swarm" {
+        return swarm(&a);
+    }
     if a.what == "list" {
         for s in &all {
             println!("{:16} tier {}  {}", s.name, s.tier, s.title);
@@ -152,6 +155,42 @@ fn main() -> anyhow::Result<()> {
 /// `--runs K`: each scenario on K seeds from `--seed` (the base), judged
 /// together (`mycel_sim::seeds`). Prints every failing seed with the
 /// command that replays it.
+/// `mycel-sim swarm [--seed S] [--runs K]`: the pinned failing
+/// configurations, then K random ones (swarm testing,
+/// `mycel_sim::tier2::swarm`); every failure is minimised and printed as a
+/// line to pin.
+fn swarm(a: &Args) -> anyhow::Result<()> {
+    use mycel_sim::tier2::swarm::{PINNED, draw, minimise, names, run_one};
+    const N: usize = 60;
+    let mut configs: Vec<(u64, u32)> = PINNED.to_vec();
+    configs.extend((0..a.runs as u64).map(|k| (a.seed + k, draw(a.seed + k))));
+    let t = Instant::now();
+    let outcomes: Vec<_> = configs.par_iter().map(|&(seed, mask)| run_one(seed, mask, N)).collect();
+    let mut failed = 0;
+    for o in &outcomes {
+        let verdict = o.check();
+        eprintln!(
+            "seed {:>6} {:<60} {:>3}/{:>3} delivered of feasible  {}",
+            o.seed,
+            names(o.mask).join(","),
+            o.delivered,
+            o.feasible,
+            match &verdict {
+                Ok(()) => "ok".to_string(),
+                Err(e) => format!("FAIL: {e}"),
+            }
+        );
+        if verdict.is_err() {
+            failed += 1;
+            let m = minimise(o.mask, |m| run_one(o.seed, m, N).check().is_err());
+            eprintln!("  minimised to {:?}; pin it: ({}, {:#x}),", names(m), o.seed, m);
+        }
+    }
+    eprintln!("{} configurations in {:.1} s, {failed} failed", outcomes.len(), t.elapsed().as_secs_f64());
+    anyhow::ensure!(failed == 0, "{failed} swarm configuration(s) failed");
+    Ok(())
+}
+
 fn replications(a: &Args, picked: &[(&scenarios::Scenario, f64)], candidate: Candidate) -> anyhow::Result<()> {
     use mycel_sim::seeds::{min_pass, replicate, verdict};
     let seeds = mycel_sim::stats::run_seeds(a.seed, a.runs);
