@@ -335,7 +335,7 @@ Not modelled yet:
 Properties and the bounds checked exhaustively (release build, 3 threads,
 on the 18-core Mac while other builds ran). The bound says how many of
 each fault and clock jump a path may contain. `mycel-check 300` ran all
-five checks in about 2.5 minutes of wall time. CI runs it with a 300 s
+five checks in about 2 minutes of wall time (129 s summed). CI runs it with a 300 s
 budget per check, and a bound not exhausted within its budget fails the
 job.
 
