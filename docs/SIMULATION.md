@@ -330,6 +330,27 @@ where the nearest-rank "p99" these rows used to print is the maximum.
 | `trace-replay` | 2 | full | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.0% of feasible (3,981 of 4,000 sent), p50 4.7 s, p95 1311 s, optimality p50 1.22×, p95 8.30× [6.24–13.8], CVaR₉₅ 23.1×, 3 of 396 over 30× (Wilson upper bound 2.2%), overhead 3.34 (was 8.38/18.0× p95/p99: fixed 21; pipelining-aware oracle, fixed 12) · ten full-size calibration seeds pooled (3,982 messages): p95 8.30× [7.73–9.20], CVaR₉₅ 39.8× (the p99 jump 36.8× → 46.9× on the shared streams: finding 26) · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 49 s |
 | `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 52%, 70%, 83%, 91%, 94% (640 broadcasts, the same at every limit; the shape checks are paired, "reach rises" a non-inferiority test, weakest step 6→7 +3.1 ± 1.5 points: finding 24) | 0.5 s |
 
+**Rerun with real wire sizes** (§2, "Wire sizes"; seed 1, full size;
+before is the build just before the change, after is with it): `global-scale`,
+`churn` and `flood-scaling` above carry their new numbers. For the rows
+below, the before figures are today's rerun, which differs from the
+table where it was last measured on an older build.
+
+| Scenario | Before → after |
+|---|---|
+| `us-eu` | p95 0.737 → 0.719 s, optimality p50/p95 1.23/2.24 → 1.23/2.19×, CVaR₉₅ 2.34 → 2.30× |
+| `gateway-choice` | p95 1.12 s both, optimality p50/p95 6.26/9.15 → 6.29/9.19×; 100% of relayed bytes via the far fibre gateway both |
+| `trace-replay` (synthetic trace) | 99.0% delivered both; p95 1,312 → 1,308 s; optimality p50/p95 1.22/8.22 → 1.29/8.48×, CVaR₉₅ 19.1 → 23.3×; over 30×: 4 → 3 of 396 |
+| `adversarial` | 100% delivered, p95 0.091 → 0.100 s, optimality p50/p95 1.91/6.02 → 1.92/6.75×, CVaR₉₅ 7.84 → 8.26×; black holes lying plausibly 93 → 95% (liar-free-reachable 93 → 95%) |
+| `disaster-dtn` | mean of 12 worlds 88.1 → 87.4% delivered, replicas 21.2 → 21.0, latency p50 vs epidemic's 1.36 → 1.35×; seed 1: 93 → 95%, optimality p95 5.38 → 4.69× |
+| `partial-route`, `mailbox`, `routing-convergence`, `flood-hop-limit` | unchanged |
+
+The changes have both signs: more bytes per frame make every transfer a
+little slower against the payload-only oracle (`trace-replay`'s 500 kB–
+1 MB bundles most), and batched announcements change which frames carry
+them and when, so routes form at slightly different moments; neither
+moves a verdict.
+
 ## 4. Findings
 
 Each with the evidence and how to reproduce it (`--seed 1` unless noted).
