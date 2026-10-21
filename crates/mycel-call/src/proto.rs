@@ -195,13 +195,19 @@ fn from_newer_revision(body: &[u8]) -> bool {
 /// Messages from a newer minor revision ([`VERSION`]) are skipped; a
 /// malformed message is an error.
 pub async fn recv(rx: &mut mycel_net::iroh::endpoint::RecvStream) -> Result<Option<Ctrl>> {
+    recv_from(rx).await
+}
+
+/// [`recv`] from any byte stream.
+async fn recv_from<R: tokio::io::AsyncRead + Unpin>(rx: &mut R) -> Result<Option<Ctrl>> {
+    use tokio::io::AsyncReadExt;
     loop {
         let mut len = [0u8; 2];
-        match rx.read_exact(&mut len).await {
-            Ok(()) => {}
-            Err(mycel_net::iroh::endpoint::ReadExactError::FinishedEarly(0)) => return Ok(None),
-            Err(e) => return Err(e.into()),
+        // finished between messages: the end; inside one: an error
+        if rx.read(&mut len[..1]).await? == 0 {
+            return Ok(None);
         }
+        rx.read_exact(&mut len[1..]).await?;
         let len = u16::from_le_bytes(len) as usize;
         if len > MAX_CTRL {
             bail!("control message too large");
@@ -233,6 +239,26 @@ mod tests {
         let r = CallRef::new(space, a, n);
         assert!(r.is_valid());
         assert!(!CallRef { initiator: b, ..r }.is_valid(), "someone else's call id");
+    }
+
+    /// On a stream: a message from a newer minor revision is skipped and
+    /// the next one arrives; the stream finishing between messages is the
+    /// end, inside one an error; garbage is an error.
+    #[tokio::test]
+    async fn recv_skips_messages_from_a_newer_revision() {
+        let mut wire = Ctrl::Ringing.encode();
+        wire.extend_from_slice(&[4, 0, KNOWN_CTRL as u8, 1, 2, 3]); // a newer revision's message
+        wire.extend_from_slice(&Ctrl::Mute { muted: true }.encode());
+        let mut rx = wire.as_slice();
+        assert_eq!(recv_from(&mut rx).await.unwrap(), Some(Ctrl::Ringing));
+        assert_eq!(recv_from(&mut rx).await.unwrap(), Some(Ctrl::Mute { muted: true }));
+        assert_eq!(recv_from(&mut rx).await.unwrap(), None);
+        let cut = &Ctrl::HangUp.encode()[..1];
+        assert!(recv_from(&mut &cut[..]).await.is_err(), "finished inside a message");
+        let garbage = [3, 0, 0xff, 0xff, 0xff];
+        assert!(recv_from(&mut &garbage[..]).await.is_err());
+        let too_big = ((MAX_CTRL + 1) as u16).to_le_bytes();
+        assert!(recv_from(&mut &too_big[..]).await.is_err());
     }
 
     #[test]
