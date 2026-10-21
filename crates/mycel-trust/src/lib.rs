@@ -5,6 +5,8 @@
 //! membership, roles and encryption epochs.
 
 mod bitset;
+#[cfg(any(test, feature = "oracle"))]
+pub mod oracle;
 mod resolve;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
