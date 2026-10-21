@@ -431,6 +431,7 @@ fn robust(a: &Args) -> anyhow::Result<()> {
     std::fs::create_dir_all(&a.out)?;
     let mut md = String::from("# Mycel robustness studies\n\n");
     let mut all = Vec::new();
+    let mut rows = Vec::new();
     for s in specs {
         let size = size_of(a, &s);
         let st = Study::new(s, size)?;
@@ -455,6 +456,9 @@ fn robust(a: &Args) -> anyhow::Result<()> {
             plan.morris_r
         );
         let r = study(&st, &plan)?;
+        let mut row = mycel_sim::catalogue::run::study_result(&st, &r);
+        row.finish();
+        rows.push(row);
         eprintln!(
             "  {} in {:.0} s: {}; hinges on {}",
             if r.robust { "robust" } else { "not robust" },
@@ -473,6 +477,9 @@ fn robust(a: &Args) -> anyhow::Result<()> {
     }
     std::fs::write(a.out.join("robustness.md"), &md)?;
     std::fs::write(a.out.join("robustness.json"), serde_json::to_string_pretty(&all)?)?;
+    // the scorecard: fidelity, region and robust-pass fraction per row
+    std::fs::write(a.out.join("report.md"), markdown(&rows))?;
+    std::fs::write(a.out.join("results.json"), serde_json::to_string_pretty(&rows)?)?;
     eprintln!("wrote {}", a.out.join("robustness.md").display());
     Ok(())
 }

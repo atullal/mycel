@@ -213,6 +213,62 @@ impl Experiment for Study {
     }
 }
 
+/// A robustness study as a report row: the scenario's fidelity, the region
+/// it covered and its robust-pass fraction (WP19's scorecard columns), the
+/// verdict over the region and the nominal point as objectives.
+pub fn study_result(st: &Study, r: &crate::uq::Study) -> ScenarioResult {
+    let s = &st.spec;
+    let mut out = ScenarioResult::new(&s.name, &s.title, 2, r.plan.seed, st.size.people as f64 / s.size.people as f64);
+    let cmp = if r.higher_is_better { "≥" } else { "≤" };
+    out.check(
+        &format!("{} {cmp} {} at the nominal point ({} seeds)", r.metric, fmt(r.threshold), r.nominal.values.len()),
+        r.nominal.pass,
+        fmt(r.nominal.mean),
+    );
+    out.check(
+        &format!("{} {cmp} {} over the whole region, worst case searched and confirmed", r.metric, fmt(r.threshold)),
+        r.robust,
+        r.robust_pass_label(),
+    );
+    out.wall_s = r.wall_s;
+    let mut fid = s.fidelity();
+    fid.region = format!("{} ({} points × {} seeds)", r.region.label(), r.points.len(), r.plan.seeds.len());
+    let hinges = r.hinges_on();
+    fid.robust_pass = Some(format!(
+        "{}; {}{}",
+        r.robust_pass_label(),
+        if r.robust { "robust" } else { "not robust" },
+        if hinges.is_empty() { String::new() } else { format!("; hinges on {}", hinges.join(", ")) }
+    ));
+    if fid.is_bound() {
+        out.note(format!(
+            "A bound, not a verdict: it runs without {} ({}), so robustness here is robustness of the bound.",
+            fid.missing.iter().filter(|x| x.essential).map(|x| x.wanted.as_str()).collect::<Vec<_>>().join(", "),
+            fid.bound_bias().label()
+        ));
+    }
+    out.fidelity = Some(fid);
+    out.headline(format!(
+        "{}: {} at the nominal point; {} ({} runs)",
+        r.metric,
+        fmt(r.nominal.mean),
+        r.robust_pass_label(),
+        r.runs
+    ));
+    out.note(format!(
+        "Hinges on: {} (basis: {}).",
+        if hinges.is_empty() { "none".into() } else { hinges.join(", ") },
+        r.hinges_basis()
+    ));
+    out.note(format!(
+        "Seed noise: run sd {}, signal share {:.0}% of the spread between points.",
+        fmt(r.noise.run_sd),
+        100.0 * r.noise.signal_share.max(0.0)
+    ));
+    out.note("Full study: robustness.md.");
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,5 +317,33 @@ mod tests {
         let a = st.run(&x, 3);
         assert_eq!(a, st.run(&x, 3), "deterministic");
         assert!(a.is_nan() || (0.0..=100.0).contains(&a));
+    }
+
+    /// A study becomes a scorecard row: level, the region it covered and
+    /// its robust-pass fraction, which `report.md` prints per row.
+    #[test]
+    fn a_study_is_a_scorecard_row() {
+        let s = find("rural-line").unwrap();
+        let st = Study::new(s, Size { people: 30, duration: 5 * crate::tier2::MIN }).unwrap();
+        let (threshold, higher_is_better) = st.threshold();
+        let plan = crate::uq::Plan {
+            points: 4,
+            seeds: vec![1, 2],
+            morris_r: 0,
+            threshold,
+            higher_is_better,
+            confirm_seeds: vec![3],
+            sobol_n: 256,
+            boots: 10,
+            seed: 1,
+        };
+        let r = crate::uq::study(&st, &plan).unwrap();
+        let mut row = study_result(&st, &r);
+        row.finish();
+        let f = row.fidelity.as_ref().unwrap();
+        assert!(f.region.contains("range_mult") && f.region.contains("4 points × 2 seeds"), "{}", f.region);
+        assert!(f.robust_pass.as_ref().unwrap().contains("of the region pass"), "{:?}", f.robust_pass);
+        let md = crate::report::markdown(&[row]);
+        assert!(md.contains("4 points × 2 seeds") && md.contains("of the region pass"), "{md}");
     }
 }
