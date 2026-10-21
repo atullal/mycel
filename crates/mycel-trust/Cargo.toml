@@ -23,5 +23,10 @@ proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 # before/after benchmark. Tests always have it.
 oracle = []
 
+[[bench]]
+name = "resolve"
+harness = false
+required-features = ["oracle"]
+
 [lints]
 workspace = true

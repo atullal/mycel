@@ -103,7 +103,12 @@ Ops whose parents are unknown are **pending** and are not evaluated until the pa
 
 **Pending caps.** Pending ops are held in memory before anyone can tell whether they are authorized, so the pool is bounded: at most `MAX_PENDING` (4,096) in total and `MAX_PENDING_PER_AUTHOR` (256) per author. The per-author cap stops one member (or one stolen key) from filling the shared pool and starving everyone else's out-of-order ops; ops whose parents are all known bypass the pool entirely, so a full pool never blocks a ready admin op such as a revocation. An op refused by a full pool is not lost: it is offered again by the next sync. To keep honest syncs inside these caps, peers send ops in resolution order (`op_ids()`/`all_ops()`: topological, then pending ops by id), so a receiver normally admits every op directly; a new member receives a single admin's 10,000-op history in one exchange.
 
-**Cost.** Resolution keeps a running state while history is linear (each op's past contains every valid op before it), so a long run of one admin's ops resolves in linear time; only ops concurrent with others replay their own past.
+**Cost.** Peers resolve incrementally (`crates/mycel-trust/src/resolve.rs`) and get exactly the result of the steps above. The from-scratch implementation of those steps is kept as `oracle::resolve_full`, and differential tests require identical results (order, validity, heads, winners, state, `state_at`, ancestry) after every insert of random concurrent histories (§9).
+
+- **Ancestry** comes from a chain cover index (`reach.rs`), the approach Synapse uses for Matrix auth chains, instead of an n × n ancestor bitset. A linear op costs O(1); a merge stores one sparse vector of the other chains it reaches. Side branches that get merged stop costing anything once merged, and ops nobody builds on (the losers of a revocation storm) never take a chain position. Memory is O(n · k) in the worst case for `k` chains that stay open and partly reached, not O(n²).
+- **Fast path.** An op that descends from the current valid heads and conflicts with nothing is checked against the running state of each round and applied in place: O(op), plus, for a reader `Add`, one recipient insert per epoch the member lacks (§6).
+- **Concurrency** re-resolves only a **region**: the ops that arrived after the newest cut the new op can be resolved against. A cut is the valid heads after an earlier update; it qualifies when the new op descends from it and nothing before it can change (no older op outside it that is valid or could win is concurrent with the new op, and seniority does not move for anyone with older revocations). This is the conflicted-subgraph idea of Matrix state resolution v2.1. A full recompute happens only when a new op moves the seniority of a member with older revocations.
+- **Measured** (one insert at a time, Apple M5 Pro, `cargo bench -p mycel-trust --features oracle --bench resolve --profile replay`): insert cost stays flat from 1,000 to 100,000 ops, 27–28 µs for one admin's linear history and 38–48 µs in a revocation storm, of which 24–37 µs is the signature check; memory is linear, about 1.2 KiB per op. Before, every insert ran the from-scratch resolution: 78 ms at 10,000 linear ops and 9.1 s at 100,000 (with a 1.2 GB bitset), and 588 s in a 10,000-op storm. Details in [BENCHMARKS.md §7](BENCHMARKS.md#7-membership-resolution-mycel-trust).
 
 ## 6. Epochs and encryption keys
 
@@ -280,7 +285,7 @@ Bluetooth still completes. Code: `crates/mycel-net/src/resources.rs` and
 | Spec section | Code | What the tests cover |
 |---|---|---|
 | §2 primitives | `crates/mycel-crypto` | Domain separation, framing, kex binding, lockbox info binding, AEAD tamper; the streaming attachment AEAD (§7b): chunk boundaries, tamper, truncation, extension, reorder, duplication, chunk-size change, legacy detection, incremental digest |
-| §3–§6 graph, resolution, epochs | `crates/mycel-trust` (`resolve.rs` = §5) | Forged admin ops, pending ops, removal and rotation, concurrent revocation, mutual removal (seniority), delivery-order convergence, rotation recipient checks, bad key commitment, last admin, self-healing rotation, leave, epoch-ID reuse, ops from never-added keys; fan-outs of invalid ops, wide valid frontiers, pending-pool limits and ready admin ops |
+| §3–§6 graph, resolution, epochs | `crates/mycel-trust` (`resolve.rs` = §5, incremental; `oracle.rs` = §5 from scratch; `reach.rs` = ancestry) | Forged admin ops, pending ops, removal and rotation, concurrent revocation, mutual removal (seniority), delivery-order convergence, rotation recipient checks, bad key commitment, last admin, self-healing rotation, leave, epoch-ID reuse, ops from never-added keys; fan-outs of invalid ops, wide valid frontiers, pending-pool limits and ready admin ops. **Differential tests** (`diff_tests.rs`, proptest): random concurrent histories from four replicas (concurrent adds, removals and role changes, revocation storms, mutual revocation cycles, equivocation, reused epochs, stale recipients, out-of-order and duplicate delivery, batches) must resolve exactly as `resolve_full` after every insert, with and without the fast path; the ancestry index is checked against brute force |
 | §7 envelopes | `crates/mycel-sync` | Replication, reader writes rejected, keeper can't read, outsider and tampered envelopes, forged actor, backdated writes after removal, 3-way convergence, demotion, feed causal order, restore from storage, equivocation; decompression and expansion bombs, malformed and deferred changes, declared-history checks (actor, counters, object references), delivery-order and restore consistency |
 | §8–§8d transport, mesh, limits | `crates/mycel-net`, `crates/mycel-node` | End to end over real Iroh QUIC with five nodes (admin, writer, reader, keeper, outsider); forged, renamed and replayed mesh announcements; signed-field cache mutation; stream and frame budgets, stalled and progressing I/O, duplicate requests, invitation validation order, ephemeral limits; attachment consent and disk reservations across restarts |
 
@@ -344,9 +349,16 @@ What this layer does **not** do:
   the user profile's permissions). Downloaded attachments are plaintext in
   the app's files folder. There is no database encryption, app lock or
   app-switcher redaction.
-- **Scale.** Resolution is linear for linear history but O(n²) for heavily
-  concurrent membership ops, and envelope validity is recomputed on each
-  membership change. Rotation sends one lockbox per reader: fine up to a
+- **Scale.** Membership resolution is incremental (§5): flat per-insert
+  cost to 100,000 ops, linear or in revocation storms. What remains
+  superlinear: a new op whose parents lie far back re-resolves everything
+  that arrived after the newest cut it can use (cuts thin out
+  geometrically, so up to about twice its lag), and inserting it into the
+  topological order shifts the ops after it; a reader `Add` writes the
+  member into every epoch they lack, since the state lists each epoch's
+  recipients; the ancestry index grows with chains that stay open and
+  partly reached (long-lived parallel branches), O(n · k) in the worst
+  case. Envelope validity is recomputed on each membership change. Rotation sends one lockbox per reader: fine up to a
   few hundred members. Sync exchanges full ID inventories.
 - **Rebuild costs.** A batch carrying a lower-ID fork of an already-applied
   change costs one linear rebuild of that document, and the displaced

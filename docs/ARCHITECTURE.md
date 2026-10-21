@@ -252,7 +252,7 @@ contact traces: [SIMULATION.md](SIMULATION.md), [BENCHMARKS.md](BENCHMARKS.md).
 - **Calls** are a full mesh: at most 8 people, and each sends to every other.
 - **Scaling characteristics:**
   - Sync exchanges full ID inventories, so its cost grows with the size of a space.
-  - Trust resolution is quadratic when many membership changes are concurrent.
+  - Trust resolution is incremental, with flat per-op cost to 100,000 membership ops, revocation storms included (TRUST.md §5, BENCHMARKS.md §7). An op whose parents lie far back re-resolves what arrived since, and long-lived parallel branches grow its ancestry index.
   - A writer who sends K conflicting versions in K separate batches costs K document rebuilds; within one batch it's one.
   - Unread counts scale with the unread backlog.
   - Loading a space re-checks its whole feed against the chat rules.
