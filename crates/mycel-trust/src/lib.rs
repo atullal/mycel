@@ -227,10 +227,12 @@ impl SignedOp {
 }
 
 /// The key an op names as founder or added member, if any.
-fn names(op: &SignedOp) -> Option<SignPk> {
+/// What an op grants for admission rule A2: (key named, also made admin).
+fn grants(op: &SignedOp) -> Option<(SignPk, bool)> {
     match &op.op.action {
-        Action::Genesis { founder, .. } => Some(founder.sign_pk),
-        Action::Add { member, .. } => Some(member.sign_pk),
+        Action::Genesis { founder, .. } => Some((founder.sign_pk, true)),
+        Action::Add { member, role, .. } => Some((member.sign_pk, role.is_admin())),
+        Action::SetRole { member, role, .. } if role.is_admin() => Some((*member, true)),
         _ => None,
     }
 }
@@ -347,8 +349,15 @@ pub struct SpaceGraph {
     pending: HashMap<OpId, SignedOp>,
     /// Unresolved ops per author, for the per-author pending quota.
     pending_by_author: HashMap<SignPk, usize>,
-    /// Every key any known op (valid or not) names as founder or added member.
+    /// Admission rule A2: the founder and every key added by an op whose
+    /// author was ever granted Admin (valid or not, revoked or not), among
+    /// stored, resolvable ops. Only these keys may author ops or envelopes.
     named: HashSet<SignPk>,
+    /// Keys ever granted Admin, by the founder or by such a key.
+    admins: HashSet<SignPk>,
+    /// Stored grants (`Add`, `SetRole` to Admin) whose author isn't an
+    /// admin yet: applied if it becomes one, whatever the arrival order.
+    held_grants: HashMap<SignPk, Vec<OpId>>,
     res: Resolution,
     state_cache: Mutex<HashMap<Vec<OpId>, MemberState>>,
 }
@@ -379,20 +388,25 @@ impl SpaceGraph {
             return Err(TrustError::Malformed("first op must be genesis"));
         }
         let space = genesis.id();
-        let mut named = HashSet::new();
-        named.extend(names(&genesis));
+        let founder = genesis.op.author;
         let mut ops = HashMap::new();
         ops.insert(space, genesis);
         let res = resolve::resolve(&ops);
-        Ok(SpaceGraph {
+        let mut graph = SpaceGraph {
             space,
             ops,
             pending: HashMap::new(),
             pending_by_author: HashMap::new(),
-            named,
+            named: HashSet::new(),
+            admins: HashSet::new(),
+            held_grants: HashMap::new(),
             res,
             state_cache: Mutex::new(HashMap::new()),
-        })
+        };
+        graph.named.insert(founder);
+        graph.make_admin(founder);
+        graph.admit(&space);
+        Ok(graph)
     }
 
     pub fn space_id(&self) -> SpaceId {
@@ -476,15 +490,16 @@ impl SpaceGraph {
         if op.op.space != Some(self.space) {
             return Err(TrustError::WrongSpace);
         }
-        // DoS guard: only keys that some known op ever added may author ops.
-        // (An op that arrives before its author's Add is simply re-fetched on
-        // a later sync, so this doesn't affect convergence.)
+        // Admission rule A2: only named keys (see `named`) may author ops.
+        // (An op that arrives before its author's Add is resolvable is simply
+        // re-fetched on a later sync, so this doesn't affect convergence.)
         if !self.ever_named(&op.op.author) {
             return Err(TrustError::NotAuthorized("author was never added to this space"));
         }
         if op.op.parents.iter().all(|parent| self.ops.contains_key(parent)) {
-            self.named.extend(names(&op));
-            self.ops.insert(op.id(), op);
+            let id = op.id();
+            self.ops.insert(id, op);
+            self.admit(&id);
             return Ok(true);
         }
         if self.pending.len() >= MAX_PENDING {
@@ -495,14 +510,54 @@ impl SpaceGraph {
             return Err(TrustError::Malformed("too many pending ops by author"));
         }
         *by_author += 1;
-        self.named.extend(names(&op));
+        // (pending ops name no one: what is named mustn't depend on which
+        // ops the bounded pending pool happened to keep)
         self.pending.insert(op.id(), op);
         Ok(false)
     }
 
-    /// Has any known op (valid or not) named `pk` as founder or added member?
+    /// Has a stored, resolvable op of an ever-admin (valid or not) named `pk`
+    /// as founder or added member? (Admission rule A2: monotone in the op
+    /// set, never in arrival order, so honest replicas agree on it.)
     pub fn ever_named(&self, pk: &SignPk) -> bool {
         self.named.contains(pk)
+    }
+
+    /// Apply what a newly stored op grants (rule A2).
+    fn admit(&mut self, id: &OpId) {
+        let Some(op) = self.ops.get(id) else { return };
+        let Some((key, admin)) = grants(op) else { return };
+        let author = op.op.author;
+        if !self.admins.contains(&author) {
+            self.held_grants.entry(author).or_default().push(*id);
+            return;
+        }
+        if matches!(op.op.action, Action::Genesis { .. } | Action::Add { .. }) {
+            self.named.insert(key);
+        }
+        if admin {
+            self.make_admin(key);
+        }
+    }
+
+    /// `key` was granted Admin: its held grants now count.
+    fn make_admin(&mut self, key: SignPk) {
+        let mut work = vec![key];
+        while let Some(k) = work.pop() {
+            if !self.admins.insert(k) {
+                continue;
+            }
+            for id in self.held_grants.remove(&k).unwrap_or_default() {
+                let Some(op) = self.ops.get(&id) else { continue };
+                let Some((key, admin)) = grants(op) else { continue };
+                if matches!(op.op.action, Action::Add { .. }) {
+                    self.named.insert(key);
+                }
+                if admin {
+                    work.push(key);
+                }
+            }
+        }
     }
 
     fn reresolve(&mut self) {
@@ -531,6 +586,7 @@ impl SpaceGraph {
                     }
                 }
                 self.ops.insert(id, op);
+                self.admit(&id);
                 promoted.insert(id);
             }
         }

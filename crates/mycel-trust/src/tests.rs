@@ -84,6 +84,72 @@ fn non_admin_ops_are_invalid() {
     assert!(g.state().role(&outsider.pk()).is_none());
 }
 
+/// A hand-crafted `Add` by `by` (no role check), on `g`'s heads.
+fn forged_add(g: &SpaceGraph, by: &Peer, who: &Peer, role: Role, nonce: u64) -> SignedOp {
+    SignedOp::sign(
+        &by.keys,
+        Op {
+            space: Some(g.space_id()),
+            parents: g.heads(),
+            author: by.pk(),
+            nonce,
+            action: Action::Add { member: who.keys.public(), role, keyring: None },
+        },
+    )
+}
+
+#[test]
+fn only_keys_added_by_an_ever_admin_are_named() {
+    // Admission rule A2: a writer, reader or relay can't mint authors (each
+    // minted key could store envelopes and grow every sync frontier).
+    let (mut g, a) = space();
+    let w = Peer::new();
+    let r = Peer::new();
+    add(&mut g, &a, &w, Role::Writer);
+    add(&mut g, &a, &r, Role::Reader);
+    for (i, by) in [&w, &r].into_iter().enumerate() {
+        let minted = Peer::new();
+        let op = forged_add(&g, by, &minted, Role::Relay, i as u64);
+        assert_eq!(g.insert(op).unwrap(), Inserted::New, "kept: peers converge on the DAG");
+        assert!(!g.ever_named(&minted.pk()));
+        // So the minted key can't author ops (or store envelopes).
+        let own = forged_add(&g, &minted, &Peer::new(), Role::Relay, 9);
+        assert!(matches!(g.insert(own), Err(TrustError::NotAuthorized(_))));
+    }
+    assert!(g.ever_named(&w.pk()) && g.ever_named(&r.pk()));
+}
+
+#[test]
+fn named_keys_do_not_depend_on_arrival_order() {
+    // The writer adds a key while still a writer (an invalid op); the
+    // founder concurrently promotes the writer to admin. Ever-admin counts,
+    // so the key is named on every replica, whichever op arrived first.
+    let (mut g, a) = space();
+    let w = Peer::new();
+    add(&mut g, &a, &w, Role::Writer);
+    let base = replica(&g);
+    let x = Peer::new();
+    let by_writer = forged_add(&g, &w, &x, Role::Relay, 1);
+    let (promote, _) = g.set_role(&a.keys, w.pk(), Role::Admin, None).unwrap();
+    for order in [[&by_writer, &promote], [&promote, &by_writer]] {
+        let mut r = replica(&base);
+        for op in order {
+            r.insert(op.clone()).unwrap();
+        }
+        assert!(r.ever_named(&x.pk()));
+    }
+    // A pending Add names no one until it is resolvable.
+    let mut r = replica(&base);
+    let y = Peer::new();
+    let mut h = replica(&base);
+    h.insert(promote.clone()).unwrap();
+    let add_y = forged_add(&h, &w, &y, Role::Relay, 2);
+    assert_eq!(r.insert(add_y).unwrap(), Inserted::Pending);
+    assert!(!r.ever_named(&y.pk()));
+    r.insert(promote).unwrap();
+    assert!(r.ever_named(&y.pk()));
+}
+
 #[test]
 fn tampered_and_foreign_ops_rejected() {
     let (mut g, a) = space();
