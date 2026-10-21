@@ -1552,7 +1552,7 @@ fn relays_far_from_our_spaces_rank_costlier() {
 }
 
 /// Relayed announcements to a slow hop take at most 2% of its capacity
-/// (after a burst of 30 s of it); the rest wait, fewest hops first, and go
+/// (after a burst of what it accepts at once); the rest wait, fewest hops first, and go
 /// out as they stand when sent: a route lost meanwhile isn't advertised
 /// late, one that got cheaper goes at its new cost (and sets our
 /// feasibility distance, as any advertisement), and retractions never wait.
@@ -1593,9 +1593,9 @@ fn relayed_announcements_are_paced_to_the_hop_nearest_first() {
     r.tick(t0 + 100);
     r.drain(&mut outs);
     let first = to_ble(&mut outs).len();
-    // a burst of 30 s at ~786 B/s: 201 announcements of 117 bytes
-    assert_eq!(first, 201);
-    assert_eq!(r.stats().announcements_deferred, 399);
+    // a burst of what it accepts from one neighbour at once
+    assert_eq!(first, 400);
+    assert_eq!(r.stats().announcements_deferred, 200);
     let waiting = |r: &Router, hops: u8| {
         origins.iter().copied().find(|o| r.nbs[&ble].ctl_q.iter().any(|a| a.origin == *o && a.hops == hops))
     };
@@ -1621,7 +1621,7 @@ fn relayed_announcements_are_paced_to_the_hop_nearest_first() {
     assert!((19..=21).contains(&later.len()), "{} in 3 s", later.len());
     assert!(later.windows(2).all(|w| w[0].1 <= w[1].1), "nearest first");
     // (the near routes expire meanwhile: their retractions don't count)
-    for k in 4..=70 {
+    for k in 4..=40 {
         if k % 20 == 0 {
             // kept fresh (it is near: it would expire before its turn)
             r.on_announce(other, ann(cheaper, WALL, 1, 100), t0 + k * 1_000, WALL, |_| true);
@@ -1630,7 +1630,7 @@ fn relayed_announcements_are_paced_to_the_hop_nearest_first() {
         r.drain(&mut outs);
         later.extend(to_ble(&mut outs).into_iter().filter(|(.., c)| *c != INFINITY));
     }
-    assert_eq!(later.len(), 398, "all but the lost one");
+    assert_eq!(later.len(), 199, "all but the lost one");
     assert!(!later.iter().any(|(o, ..)| *o == lost));
     assert_eq!(r.stats().announcements_shed, 1);
     assert!(later.contains(&(cheaper, 2, 220)), "as it stands when sent");
@@ -1639,9 +1639,9 @@ fn relayed_announcements_are_paced_to_the_hop_nearest_first() {
 
 /// A new neighbour is greeted with our table before its hop is measured:
 /// the greeting is paced as for the slowest radio until then, so a big
-/// table doesn't go out at once over Bluetooth. A fast hop, once measured,
-/// is still never sent more than its receiver accepts from one neighbour
-/// (it would throw the rest away).
+/// table doesn't go out at once over Bluetooth: what the neighbour accepts
+/// at once (more would be thrown away), then 2% of the link. A fast hop,
+/// once measured, is never sent more than its receiver accepts either.
 #[test]
 fn a_greeting_to_an_unmeasured_hop_is_paced() {
     let from = key(2);
@@ -1670,19 +1670,22 @@ fn a_greeting_to_an_unmeasured_hop_is_paced() {
     r.set_direct(ble, true, 21_000);
     r.hop_up(ble, 21_000);
     r.set_cost(ble, 16_680);
-    // 30 s of 2% of a Bluetooth hop: 24 kB, 205 announcements (not 2,000)
-    assert_eq!(greeted(&mut r, ble, &mut outs), 205);
-    assert_eq!(r.stats().announcements_deferred, 2_000 - 205);
+    // 400 announcements, 47 kB (not 2,000, 234 kB: 6 s of a BLE link) ...
+    assert_eq!(greeted(&mut r, ble, &mut outs), 400);
+    assert_eq!(r.stats().announcements_deferred, 2_000 - 400);
+    // ... then ~790 B/s, 6.7 a second
+    r.tick(22_000);
+    assert!((6..=7).contains(&greeted(&mut r, ble, &mut outs)));
     let wifi = key(4);
     let t = 21_000 + GREET_GAP;
     r.set_direct(wifi, true, t);
     r.hop_up(wifi, t);
     r.set_cost(wifi, 100);
-    assert_eq!(greeted(&mut r, wifi, &mut outs), 205);
-    // measured fast: 75 a second, 3/4 of the 100 it accepts from us
+    assert_eq!(greeted(&mut r, wifi, &mut outs), 400);
+    // measured fast: 100 a second, what it accepts from us (2% of the
+    // link would be ~1,100)
     r.tick(t + 1_000);
-    assert_eq!(greeted(&mut r, wifi, &mut outs), 75);
-    assert_eq!(Nb::control_bucket(100).burst as usize / ANN_BYTES, 300, "and 300 at once (it accepts 400)");
+    assert_eq!(greeted(&mut r, wifi, &mut outs), 100);
 }
 
 /// Answering a seqno request is an advertisement like any other: it sets

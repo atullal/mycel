@@ -155,19 +155,18 @@ pub const AFFINITY_UNKNOWN: u8 = 3;
 /// relayed announcements to a neighbour take at most this share of the
 /// hop's capacity (estimated from its cost: the time to move 64 KiB) ...
 const CONTROL_SHARE: f64 = 0.02;
-/// ... with this many seconds of it as a burst (a greeting's table, a
-/// full-scope period, a crowd switching on at once) ...
-const CONTROL_BURST_S: f64 = 30.0;
-/// ... and never more than this share of what the neighbour accepts from
-/// one neighbour ([`OGM_RATE`] a second, 4 s of it at once): beyond that it
-/// would throw them away. Past the budget they queue, fewest hops first ...
-const CONTROL_OF_ACCEPTED: f64 = 0.75;
-/// ... at most this many per neighbour (the farthest make way).
+/// ... and never more than the neighbour accepts from one neighbour
+/// ([`OGM_RATE`] a second, 4 s of it at once: beyond that it throws them
+/// away), which is also the burst (a greeting's table, a full-scope period,
+/// a crowd switching on at once: 400 announcements, 1.2 s of a Bluetooth
+/// hop; smaller, at a cold start far routes waited behind the near ones'
+/// refreshes). Past the budget they queue, fewest hops first, at most
+/// this many per neighbour (the farthest make way).
 const CONTROL_QUEUE: usize = 1024;
 /// A hop not measured yet is budgeted as the slowest radio (Bluetooth LE
 /// at ~40 kB/s: 64 KiB in 1.6 s) until it is: a new neighbour is greeted
 /// before its first measurement, and a whole table sent unpaced would fill
-/// a slow link for seconds.
+/// a slow link for seconds (and mostly be thrown away).
 const UNMEASURED_CONTROL_COST: u32 = 16_384;
 /// Bytes of an announcement on the wire without its name (`wire.rs`).
 const ANN_BYTES: usize = 117;
@@ -666,13 +665,13 @@ impl Nb {
 
     /// The control budget for a hop of this cost: its cost is the time to
     /// move 64 KiB over it (and its round trip), so its capacity is about
-    /// 64 KiB / cost. Unmeasured (0): as the slowest radio. Capped by what
-    /// the neighbour accepts from us.
+    /// 64 KiB / cost. Unmeasured (0): as the slowest radio. The burst, and
+    /// the cap on the rate, are what the neighbour accepts from us.
     fn control_bucket(cost: u32) -> Bucket {
         let cost = if cost == 0 { UNMEASURED_CONTROL_COST } else { cost };
-        let accepted = CONTROL_OF_ACCEPTED * OGM_RATE * ANN_BYTES as f64;
+        let accepted = OGM_RATE * ANN_BYTES as f64;
         let rate = (CONTROL_SHARE * 65_536.0 * 10_000.0 / cost as f64).min(accepted);
-        Bucket::new(rate, (rate * CONTROL_BURST_S).min(accepted * 4.0))
+        Bucket::new(rate, accepted * 4.0)
     }
 
     fn internet(&self) -> bool {
@@ -1233,9 +1232,7 @@ impl Router {
             let units = units.max(1);
             n.cost = if n.cost == 0 { units } else { (n.cost * 7 + units) / 8 };
             // the control budget follows the hop's capacity
-            let b = Nb::control_bucket(n.cost);
-            (n.ctl.rate, n.ctl.burst) = (b.rate, b.burst);
-            n.ctl.tokens = n.ctl.tokens.min(n.ctl.burst);
+            n.ctl.rate = Nb::control_bucket(n.cost).rate;
         }
     }
 
@@ -2000,6 +1997,9 @@ impl Router {
     /// or someone past it drops (an honest relay in front of a liar is
     /// blamed too, as for one destination).
     fn aggregate(&mut self, hop: SignPk, now: Time) {
+        if self.shunned.get(&hop).is_some_and(|t| now < *t) {
+            return;
+        }
         let acked_since = |d: &SignPk, until: Time| {
             self.acked_via.get(d).is_some_and(|(via, at)| *via != hop && *at + SUSPECT_FOR >= until)
         };
@@ -2010,7 +2010,7 @@ impl Router {
             .map(|(d, _)| *d)
             .collect();
         let good = self.vouched.get(&hop).map_or(0, |v| v.iter().filter(|(d, t)| now < *t && !bad.contains(d)).count());
-        if bad.len() < AGGREGATE_MIN || bad.len() <= good || self.shunned.get(&hop).is_some_and(|t| now < *t) {
+        if bad.len() < AGGREGATE_MIN || bad.len() <= good {
             return;
         }
         bounded_insert(&mut self.shunned, hop, now + SUSPECT_FOR);
