@@ -128,9 +128,9 @@ pub struct Plan {
 impl Plan {
     fn apply<R: Router>(&self, sim: &mut Sim<R>) {
         if let Some(m) = self.max_neighbours {
-            sim.core.max_neighbours = m;
+            sim.exo.max_neighbours = m;
         }
-        sim.core.dir_poison = self.poison;
+        sim.exo.dir_poison = self.poison;
         for (t, s, d, size, call) in &self.sends {
             if *call {
                 sim.call_at(*t, *s, *d);
@@ -816,7 +816,7 @@ pub fn walk<R: Router + NextHop>(sim: &Sim<R>, a: NodeId, b: NodeId, max: u8) ->
     let mut seen = vec![a];
     for h in 1..=max {
         let Some(n) = sim.routers[at as usize].next(b, sim.now) else { return Walk::Dead };
-        if !sim.core.neighbours_of(at).contains(&n) {
+        if !sim.exo.neighbours_of(at).contains(&n) {
             return Walk::Dead; // stale: not a neighbour any more
         }
         if n == b {
@@ -887,12 +887,12 @@ fn pairs_within<R: Router>(
     skip: Option<NodeId>,
 ) -> Vec<(NodeId, NodeId, u8)> {
     let mut out = Vec::new();
-    let nb = |u: NodeId| sim.core.neighbours_of(u);
+    let nb = |u: NodeId| sim.exo.neighbours_of(u);
     let mut tries = 0;
     while out.len() < k && tries < k * 20 {
         tries += 1;
         let a = rng.below(n) as NodeId;
-        if Some(a) == skip || !sim.core.is_online(a) {
+        if Some(a) == skip || !sim.exo.is_online(a) {
             continue;
         }
         let d = bfs(&nb, a, max);
@@ -957,7 +957,7 @@ fn converge<R: Router + NextHop>(mut sim: Sim<R>, n: usize, seed: u64, max_hops:
         }
     }
     // the busiest device (most neighbours) fails
-    let hub = (0..n as NodeId).max_by_key(|i| (sim.core.degree(*i), *i)).unwrap_or(0);
+    let hub = (0..n as NodeId).max_by_key(|i| (sim.exo.degree(*i), *i)).unwrap_or(0);
     sim.act_at(t + 1, Action::Online(hub, false));
     sim.run(t + 2);
     let fail_at = t;

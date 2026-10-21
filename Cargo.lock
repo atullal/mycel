@@ -3861,6 +3861,7 @@ name = "mycel-sim"
 version = "0.0.1"
 dependencies = [
  "anyhow",
+ "blake3",
  "bytes",
  "clap",
  "libc",

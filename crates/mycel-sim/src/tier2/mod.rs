@@ -85,7 +85,7 @@ pub fn metrics<R: Router>(
     only: Option<&dyn Fn(&engine::MsgRecord) -> bool>,
 ) -> T2Metrics {
     let msgs: Vec<&engine::MsgRecord> = sim.core.msgs.iter().filter(|m| only.is_none_or(|f| f(m))).collect();
-    let n = sim.core.len();
+    let n = sim.exo.len();
     let secs = sim.now as f64 / SEC as f64;
     // feasible: of the messages the oracle checked (a sample in big runs),
     // those it found a path for or that got there anyway

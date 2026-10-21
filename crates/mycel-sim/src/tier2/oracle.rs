@@ -41,10 +41,10 @@ pub struct Oracle {
 
 impl Oracle {
     pub fn new<R: Router>(sim: &Sim<R>) -> Oracle {
-        let n = sim.core.len();
+        let n = sim.exo.len();
         let mut adj = vec![Vec::new(); n];
         let mut windows = Vec::new();
-        let mut pairs: Vec<(&(NodeId, NodeId), &Vec<_>)> = sim.core.contacts.radio.iter().collect();
+        let mut pairs: Vec<(&(NodeId, NodeId), &Vec<_>)> = sim.exo.contacts.radio.iter().collect();
         pairs.sort_by_key(|p| *p.0);
         for ((a, b), w) in pairs {
             let idx = windows.len() as u32;
@@ -52,10 +52,10 @@ impl Oracle {
             adj[*a as usize].push((*b, idx));
             adj[*b as usize].push((*a, idx));
         }
-        let inet = sim.core.contacts.inet.clone();
+        let inet = sim.exo.contacts.inet.clone();
         let mut inet_by_area: Map<u32, Vec<NodeId>> = Map::default();
         for i in (0..n as NodeId).filter(|i| !inet[*i as usize].is_empty()) {
-            inet_by_area.entry(sim.core.spec(i).area).or_default().push(i);
+            inet_by_area.entry(sim.exo.spec(i).area).or_default().push(i);
         }
         Oracle { adj, windows, inet, inet_by_area }
     }
@@ -125,9 +125,9 @@ impl Oracle {
                     inet_done = true;
                     continue;
                 }
-                let up = sim.core.spec(u).inet.expect("inet").access.uplink();
+                let up = sim.exo.spec(u).inet.expect("inet").access.uplink();
                 let air = size as u64 * 1_000_000 / up;
-                let targets = self.inet_by_area.get(&sim.core.spec(dst).area).map_or(&[][..], |v| &v[..]);
+                let targets = self.inet_by_area.get(&sim.exo.spec(dst).area).map_or(&[][..], |v| &v[..]);
                 for &b in targets {
                     if b == u || banned(b) {
                         continue;
@@ -187,7 +187,7 @@ impl Oracle {
     /// The most bytes per second `dst` can receive: every radio at once,
     /// plus the fastest internet access there is if it has internet.
     fn max_rate_into<R: Router>(&self, sim: &Sim<R>, dst: NodeId) -> u64 {
-        let spec = sim.core.spec(dst);
+        let spec = sim.exo.spec(dst);
         let radios: u64 = spec.radios.iter().map(|t| t.rate()).sum();
         radios + spec.inet.map_or(0, |_| Access::Fibre.uplink())
     }
