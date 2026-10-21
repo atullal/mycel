@@ -482,6 +482,15 @@ lifetime, copies) is signed by the source.
   delivery can cost the delivery.
 - **Forgetting:** what a neighbour last told us (its predictabilities and
   bundle ids) is dropped 10 minutes after we last heard from it.
+- **Bounds:** a neighbour that keeps its link up can't grow what we
+  remember without end. Its predictabilities are kept to one summary's
+  worth (80: its latest summary in full, then the likeliest of what it said
+  before), the bundle ids it says it holds to 4,096 beyond those we hold,
+  and our own predictabilities (transitive ones included, for destinations
+  we have never met) to 4,096, the least likely forgotten first once the
+  table is a quarter over (an estimated 50 bytes each, not measured). A
+  neighbour lying about high predictabilities can still crowd out honest
+  ones within that bound.
 - **Dials:** a failed internet dial backs off (2 s, doubling to 60 s). A
   device with the internet whose dial to a destination without a record
   fails learns that the internet doesn't reach it (`Toward::Unreachable`)
