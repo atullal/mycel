@@ -344,6 +344,7 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
         Model::Global(g) => {
             let shared = Rc::new(Shared::default());
             let sh = shared.clone();
+            let spaces = crate::tier2::global::spaces(&w.specs, &plan.roles, seed);
             go(
                 w,
                 plan,
@@ -358,6 +359,7 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                         r.bundle_lifetime_ms = plan.bundle_lifetime_ms.unwrap_or(24 * 3600 * 1000);
                     }
                     r.role = plan.role(i);
+                    r.core.set_affinity(spaces[i as usize].iter().map(|j| (key(*j), 1)));
                     r
                 },
                 move |sim| {
