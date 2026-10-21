@@ -48,6 +48,8 @@ pub mod directory;
 pub mod dtn;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod v1_vectors;
 mod watch;
 pub mod wire;
 
@@ -76,7 +78,9 @@ pub use self::wire::{mesh_addr, parse_mesh_addr};
 use crate::link::{
     CustomAddr, Link, LinkEvent, LinkStatus, PathKind, TRANSPORT_MESH, n0_watcher, noq_udp, path_in_use,
 };
-use crate::version::{Hello, PeerProtocol, Protocol, WIRE_V1, WIRE_V2, WireVersion};
+use crate::version::{
+    AlpnTable, Hello, PeerProtocol, Protocol, WIRE_V1, WIRE_V2, WireVersion, alpn_table_ok, alpns_in, version_in,
+};
 
 /// Hop connections between neighbours (and internet hops to gateways), wire
 /// version 2: version 1 plus a capability hello from each side of a hop,
@@ -89,22 +93,19 @@ pub const ALPN_V2: &[u8] = b"mycel/mesh/2";
 /// The mesh as pre-release builds speak it (wire version 1).
 pub const ALPN_V1: &[u8] = b"mycel/mesh/1";
 
+/// The mesh's ALPN for each wire version (see [`AlpnTable`]).
+pub const ALPNS: AlpnTable = [(WIRE_V1, ALPN_V1), (WIRE_V2, ALPN_V2)];
+const _: () = assert!(alpn_table_ok(&ALPNS), "one mesh ALPN per wire version, each its own");
+
 /// The mesh's ALPNs for wire versions `newest` down to the oldest
 /// supported, newest first.
 pub fn alpns(newest: WireVersion) -> Vec<&'static [u8]> {
-    Protocol { version: newest, caps: crate::version::Caps::NONE }
-        .versions()
-        .map(|v| if v >= WIRE_V2 { ALPN_V2 } else { ALPN_V1 })
-        .collect()
+    alpns_in(&ALPNS, newest)
 }
 
 /// The wire version a negotiated mesh ALPN stands for.
 pub fn version_of(alpn: &[u8]) -> Option<WireVersion> {
-    match alpn {
-        ALPN_V2 => Some(WIRE_V2),
-        ALPN_V1 => Some(WIRE_V1),
-        _ => None,
-    }
+    version_in(&ALPNS, alpn)
 }
 
 /// Sees each payload a device relays (tests).
@@ -1203,14 +1204,7 @@ impl Driver {
         let Some(c) = &self.carrier else { return Ok(()) };
         let frames = self.frames.peer(&from);
         let (head, _head_permit) = read_frame(&mut rx, MAX_OFFER, crate::resources::FIRST_FRAME, &frames).await?;
-        let (format, w): (dtn::BundleFormat, WireOffer) = match head.split_first() {
-            Some((&K_OFFER, body)) => (dtn::BundleFormat::V1, postcard::from_bytes(body)?),
-            Some((&K_OFFER_V2, body)) => {
-                let (format, w): (WireFormat, WireOffer) = postcard::from_bytes(body)?;
-                (dtn::BundleFormat { version: format.version, kind: format.kind }, w)
-            }
-            _ => return Ok(()),
-        };
+        let Some((format, w)) = decode_offer(&head)? else { return Ok(()) };
         if !format.checkable() {
             // a header we can't check is one we won't carry (a payload kind
             // we don't know is fine: carriers never read payloads)
@@ -1430,8 +1424,7 @@ impl Driver {
         let id = bundle_id_of(format, &self.me, &dst, &payload);
         let created = wall_ms();
         let lifetime = lifetime.as_millis() as u64;
-        let (ctx, head) = bundle_signed(format);
-        let sig = self.keys.sign(ctx, &[&head, &id.0, &created.to_be_bytes(), &lifetime.to_be_bytes()]);
+        let sig = sign_bundle(&self.keys, format, &id, created, lifetime);
         let b = dtn::Bundle { format, id, src: self.me, dst, created, lifetime, payload, sig };
         c.lock().originate(b, self.now()).ok()?;
         Some(id)
@@ -1892,6 +1885,18 @@ fn bundle_signed(format: dtn::BundleFormat) -> (&'static str, Vec<u8>) {
     }
 }
 
+/// Sign a bundle header in `format`'s rules (one this build can check).
+fn sign_bundle(
+    keys: &DeviceKeys,
+    format: dtn::BundleFormat,
+    id: &Hash32,
+    created: u64,
+    lifetime: u64,
+) -> mycel_crypto::Sig {
+    let (ctx, head) = bundle_signed(format);
+    keys.sign(ctx, &[&head, &id.0, &created.to_be_bytes(), &lifetime.to_be_bytes()])
+}
+
 /// The source's signature over a bundle header, in its format's rules.
 fn bundle_sig_ok(
     format: dtn::BundleFormat,
@@ -1944,26 +1949,7 @@ async fn send_bundle(
     copies: u8,
     frames: &crate::resources::PeerFrames,
 ) -> Result<Sent> {
-    let offer = WireOffer {
-        id: b.id,
-        src: b.src,
-        dst: b.dst,
-        size: b.payload.len() as u64,
-        created: b.created,
-        lifetime: b.lifetime,
-        sig: b.sig,
-        copies,
-    };
-    let msg = if version >= WIRE_V2 {
-        let format = WireFormat { version: b.format.version, kind: b.format.kind };
-        let mut msg = vec![K_OFFER_V2];
-        msg.extend_from_slice(&crate::wire::encode_bounded(&(format, offer), MAX_OFFER - 1)?);
-        msg
-    } else if b.format == dtn::BundleFormat::V1 {
-        let mut msg = vec![K_OFFER];
-        msg.extend_from_slice(&crate::wire::encode_bounded(&offer, MAX_OFFER - 1)?);
-        msg
-    } else {
+    let Some(msg) = encode_offer(version, b, copies)? else {
         // (it would take it as a version 1 bundle and find the signature bad)
         return Ok(Sent::Refused(false));
     };
@@ -1984,6 +1970,47 @@ async fn send_bundle(
     let wait = crate::resources::reply_timeout(b.payload.len() - at);
     let ack = crate::resources::within(wait, "no receipt", rx.read_to_end(1)).await?;
     Ok(if ack.first() == Some(&1) { Sent::Took } else { Sent::Refused(false) })
+}
+
+/// The offer of bundle `b` on a hop of wire `version` (its first frame's
+/// body); `None` if that hop can't take `b` (a version 1 hop only takes
+/// version 1 bundles).
+fn encode_offer(version: WireVersion, b: &dtn::Bundle, copies: u8) -> Result<Option<Vec<u8>>> {
+    let offer = WireOffer {
+        id: b.id,
+        src: b.src,
+        dst: b.dst,
+        size: b.payload.len() as u64,
+        created: b.created,
+        lifetime: b.lifetime,
+        sig: b.sig,
+        copies,
+    };
+    Ok(Some(if version >= WIRE_V2 {
+        let format = WireFormat { version: b.format.version, kind: b.format.kind };
+        let mut msg = vec![K_OFFER_V2];
+        msg.extend_from_slice(&crate::wire::encode_bounded(&(format, offer), MAX_OFFER - 1)?);
+        msg
+    } else if b.format == dtn::BundleFormat::V1 {
+        let mut msg = vec![K_OFFER];
+        msg.extend_from_slice(&crate::wire::encode_bounded(&offer, MAX_OFFER - 1)?);
+        msg
+    } else {
+        return Ok(None);
+    }))
+}
+
+/// An offer's first frame: the bundle's format and the offer; `None` for
+/// an offer kind this build doesn't know (left unanswered).
+fn decode_offer(head: &[u8]) -> Result<Option<(dtn::BundleFormat, WireOffer)>> {
+    Ok(match head.split_first() {
+        Some((&K_OFFER, body)) => Some((dtn::BundleFormat::V1, postcard::from_bytes(body)?)),
+        Some((&K_OFFER_V2, body)) => {
+            let (format, w): (WireFormat, WireOffer) = postcard::from_bytes(body)?;
+            Some((dtn::BundleFormat { version: format.version, kind: format.kind }, w))
+        }
+        _ => None,
+    })
 }
 
 /// A length-prefixed frame on a stream that goes on after it.

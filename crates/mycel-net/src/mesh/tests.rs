@@ -266,6 +266,33 @@ async fn bundles_cross_hops_by_their_format() {
     );
 }
 
+/// The same through the planner, as a node sends: a version 2 bundle goes
+/// only to the neighbour whose hop runs version 2, never to the one on
+/// version 1 (whose refusal of it doesn't stop version 1 bundles going
+/// there).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_planner_sends_bundles_only_over_hops_that_take_their_format() {
+    use super::dtn::{BundleFormat, KIND_SPACE_SYNC};
+    let net = MemNet::new(1, PathKind::Bluetooth);
+    let a = versioned(Protocol::default(), &net).await;
+    let b = versioned(Protocol::default(), &net).await;
+    let old = versioned(Protocol { version: WIRE_V1, caps: Caps::NONE }, &net).await;
+    neighbours(&net, &a, &b).await;
+    neighbours(&net, &a, &old).await;
+    assert_eq!(a.mesh.neighbour_protocol(&old.keys.sign_pk()).map(|p| p.version), Some(WIRE_V1));
+    let far = DeviceKeys::generate().sign_pk(); // the destination, out of range
+    let lifetime = Duration::from_secs(600);
+    let v2 = a.mesh.send_bundle_as(far, BundleFormat::v2(KIND_SPACE_SYNC), b"version 2".to_vec().into(), lifetime);
+    let v2 = v2.unwrap();
+    eventually("the version 2 neighbour carries the version 2 bundle", || b.mesh.holds_bundle(&v2)).await;
+    let v1 = a.mesh.send_bundle(far, b"version 1".to_vec().into(), lifetime).unwrap();
+    eventually("both neighbours carry the version 1 bundle", || b.mesh.holds_bundle(&v1) && old.mesh.holds_bundle(&v1))
+        .await;
+    // the planner has run many times since: the version 1 hop never got it
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!old.mesh.holds_bundle(&v2), "a version 2 bundle reached a version 1 carrier");
+}
+
 /// The queue management on a hop ([`super::Aqm`]), on a fake clock: a brief
 /// or short queue gets no drops; a standing one gets its first drop after
 /// an interval and then more, faster; a queue the drops don't drain (not

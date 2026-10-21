@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::io::AsyncRead;
 
 use crate::resources::{FramePermit, PeerFrames};
-use crate::version::{Caps, Protocol, WIRE_V1, WIRE_V2, WireVersion};
+use crate::version::{AlpnTable, Hello, MAX_HELLO, WIRE_V1, WIRE_V2, WireVersion, alpn_table_ok, alpns_in, version_in};
 
 /// Mycel's protocol (the "node protocol"), wire version 2: version 1 plus
 /// a capability hello ([`StreamKind::Hello`]) and typed refusals of
@@ -27,23 +27,20 @@ pub const ALPN_V2: &[u8] = b"mycel/node/2";
 /// ALPNs `mycel/sync/1`, `mycel/card/0`, `mycel/eph/0`, `mycel/blob/0`.)
 pub const ALPN_V1: &[u8] = b"mycel/2";
 
+/// The node protocol's ALPN for each wire version (see [`AlpnTable`]).
+pub const ALPNS: AlpnTable = [(WIRE_V1, ALPN_V1), (WIRE_V2, ALPN_V2)];
+const _: () = assert!(alpn_table_ok(&ALPNS), "one node-protocol ALPN per wire version, each its own");
+
 /// The node protocol's ALPNs for wire versions `newest` down to the oldest
 /// supported, newest first: what a dialer offers and, in that order of
 /// preference, what a listener accepts.
 pub fn alpns(newest: WireVersion) -> Vec<&'static [u8]> {
-    Protocol { version: newest, caps: Caps::NONE }
-        .versions()
-        .map(|v| if v >= WIRE_V2 { ALPN_V2 } else { ALPN_V1 })
-        .collect()
+    alpns_in(&ALPNS, newest)
 }
 
 /// The wire version a negotiated node-protocol ALPN stands for.
 pub fn version_of(alpn: &[u8]) -> Option<WireVersion> {
-    match alpn {
-        ALPN_V2 => Some(WIRE_V2),
-        ALPN_V1 => Some(WIRE_V1),
-        _ => None,
-    }
+    version_in(&ALPNS, alpn)
 }
 
 /// The first byte of every stream on [`ALPN`]: what the stream carries. (A
@@ -195,6 +192,13 @@ pub(crate) async fn recv_small<T: DeserializeOwned>(
     frames: &PeerFrames,
 ) -> Result<T> {
     Ok(recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, MAX_SMALL_FRAME, frames).await?.0)
+}
+
+/// A capability hello, held to [`MAX_HELLO`] bytes like a mesh hop's
+/// ([`Hello::decode`]): a hello that one protocol takes, the other does
+/// too. Bytes after the fields this build knows are ignored.
+pub(crate) async fn recv_hello(r: &mut RecvStream, wait: Duration, frames: &PeerFrames) -> Result<Hello> {
+    Ok(recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, MAX_HELLO, frames).await?.0)
 }
 
 /// An ephemeral message of up to `max_plain` bytes: sizes are checked

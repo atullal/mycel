@@ -295,6 +295,8 @@ struct Inner {
     accepted: AtomicU64,
     /// Blob bytes served to fetching members.
     blob_served: AtomicU64,
+    /// Capability hellos answered (one per connection a v2 peer dials).
+    hellos_served: AtomicU64,
     /// The last store-and-forward bundle sent per (member, space).
     bundled: Mutex<HashMap<(SignPk, SpaceId), Hash32>>,
     /// See [`NodeOptions::max_ephemeral`].
@@ -485,10 +487,26 @@ impl Inner {
         p.last_fail = Some(Instant::now());
     }
 
-    /// Remember what was agreed with `peer` (diagnostics, and formats sent
-    /// without a connection: store-and-forward).
+    /// Remember what was agreed with `peer` on a connection we dialed
+    /// (diagnostics, and formats sent without a connection:
+    /// store-and-forward). We chose to dial it, so it may get an entry.
     fn note_protocol(&self, peer: SignPk, p: PeerProtocol) {
         self.peers.lock().entry(peer).or_default().protocol = Some(p);
+    }
+
+    /// The same, on a connection `peer` dialed: before any exchange, so
+    /// anyone may have dialed (a fresh key costs nothing). Only a device we
+    /// already track or share a space with is noted; a stranger gets no
+    /// entry, which would never be removed. (Its connection still knows its
+    /// version.)
+    fn note_accepted_protocol(&self, peer: SignPk, p: PeerProtocol) {
+        let member = self.spaces.lock().values().any(|r| r.is_member(&peer));
+        let mut peers = self.peers.lock();
+        match peers.get_mut(&peer) {
+            Some(state) => state.protocol = Some(p),
+            None if member => peers.entry(peer).or_default().protocol = Some(p),
+            None => {}
+        }
     }
 
     /// The memory budget for what `peer` sends us on a stream it opened: a
@@ -697,7 +715,7 @@ async fn serve_conn(inner: &Arc<Inner>, conn: Connection) {
     // (the router only hands us connections with one of our ALPNs)
     let Some(version) = wire::version_of(conn.alpn()) else { return };
     if version < WIRE_V2 {
-        inner.note_protocol(peer, PeerProtocol::baseline(version));
+        inner.note_accepted_protocol(peer, PeerProtocol::baseline(version));
     }
     loop {
         tokio::select! {
@@ -773,8 +791,9 @@ async fn serve_hello(
     mut tx: SendStream,
     mut rx: RecvStream,
 ) -> Result<()> {
-    let theirs: Hello = recv_small(&mut rx, resources::FIRST_FRAME, &inner.frames(&peer)).await?;
-    inner.note_protocol(peer, PeerProtocol::agreed(version, inner.protocol.caps, theirs.caps));
+    let theirs = recv_hello(&mut rx, resources::FIRST_FRAME, &inner.frames(&peer)).await?;
+    inner.hellos_served.fetch_add(1, Ordering::Relaxed);
+    inner.note_accepted_protocol(peer, PeerProtocol::agreed(version, inner.protocol.caps, theirs.caps));
     send(&mut tx, &Hello::ours(inner.protocol.caps)).await?;
     tx.finish()?;
     Ok(())
@@ -963,7 +982,7 @@ fn start_hello(inner: &Arc<Inner>, peer: SignPk, c: &PooledConn) {
             let (mut tx, mut rx) = open_bi(&conn, StreamKind::Hello).await?;
             let len = send_len(&mut tx, &Hello::ours(caps)).await?;
             tx.finish()?;
-            recv_small::<Hello>(&mut rx, resources::reply_timeout(len), &inner.reply_frames(&peer)).await
+            recv_hello(&mut rx, resources::reply_timeout(len), &inner.reply_frames(&peer)).await
         };
         let p = match hello.await {
             Ok(theirs) => PeerProtocol::agreed(version, caps, theirs.caps),
@@ -1375,6 +1394,7 @@ impl Node {
             pool,
             accepted: AtomicU64::new(0),
             blob_served: AtomicU64::new(0),
+            hellos_served: AtomicU64::new(0),
             bundled: Mutex::default(),
             max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
             protocol: opts.protocol,
@@ -1842,6 +1862,9 @@ mod version_tests {
         let future = Caps::from_bits(1 << 40);
         let a = node("a", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 | Caps::ROUTE_ATTEST | future }).await;
         let b = node("b", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        // (b notes what a dialer agreed only for a device it shares a space with)
+        let (space, _) = b.create_space().unwrap();
+        b.with_space(&space, |r| r.add_member(a.keys().public(), Role::Writer)).unwrap().unwrap();
         a.add_peer_addr(b.addr());
         let p = a.negotiate(b.id()).await.unwrap();
         assert_eq!((p.version, p.caps), (WIRE_V2, Caps::SYNC_V2));
@@ -1854,7 +1877,43 @@ mod version_tests {
         // agreed once per connection: asking again sends nothing
         assert_eq!(a.negotiate(b.id()).await.unwrap(), p);
         assert_eq!(a.connection_counts().dialed, 1);
+        assert_eq!(b.inner.hellos_served.load(Ordering::Relaxed), 1, "one hello for the connection");
         a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    /// Devices b has never dealt with (fresh keys cost nothing) dial it,
+    /// on version 1 and with a hello on version 2: b answers them all but
+    /// keeps no state about them, which nothing would ever remove. A member
+    /// that dials is noted.
+    #[tokio::test]
+    async fn strangers_that_dial_leave_no_peer_state() {
+        let b = node("b", Protocol::default()).await;
+        for i in 0..8 {
+            let version = if i % 2 == 0 { WIRE_V1 } else { WIRE_V2 };
+            let s = node("stranger", Protocol { version, caps: Caps::SYNC_V2 }).await;
+            s.add_peer_addr(b.addr());
+            assert_eq!(s.fetch_card(b.id()).await.unwrap().keys.sign_pk, b.id());
+            assert_eq!(s.negotiate(b.id()).await.unwrap().version, version);
+            s.shutdown().await.unwrap();
+        }
+        assert_eq!(b.inner.hellos_served.load(Ordering::Relaxed), 4, "the version 2 strangers were answered");
+        assert_eq!(b.connection_counts().accepted, 8);
+        assert!(b.peers().is_empty(), "no state for strangers: {:?}", b.peers().keys().collect::<Vec<_>>());
+
+        let m = node("member", Protocol { version: WIRE_V1, caps: Caps::NONE }).await;
+        let (space, _) = b.create_space().unwrap();
+        b.with_space(&space, |r| r.add_member(m.keys().public(), Role::Writer)).unwrap().unwrap();
+        m.add_peer_addr(b.addr());
+        m.negotiate(b.id()).await.unwrap();
+        let noted = || b.peers().get(&m.id()).and_then(|p| p.protocol);
+        let until = Instant::now() + Duration::from_secs(5);
+        while noted().is_none() && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(noted(), Some(PeerProtocol::baseline(WIRE_V1)));
+        assert_eq!(b.peers().len(), 1);
+        m.shutdown().await.unwrap();
         b.shutdown().await.unwrap();
     }
 
@@ -1927,6 +1986,31 @@ mod version_tests {
         assert_eq!(wire::alpns(WIRE_V2), vec![wire::ALPN_V2, wire::ALPN_V1]);
         assert_eq!(wire::alpns(WIRE_V1), vec![wire::ALPN_V1]);
         assert_eq!(wire::version_of(b"mycel/node/3"), None);
+    }
+
+    /// Every supported version has one ALPN per protocol, its own: none
+    /// shared between versions or protocols, and each maps back to its
+    /// version. (A version added without its ALPNs doesn't build.)
+    #[test]
+    fn every_version_has_its_own_alpns() {
+        use version::{MIN_WIRE_VERSION, WIRE_VERSION, alpn_table_ok};
+        let mut seen: Vec<&[u8]> = Vec::new();
+        for v in MIN_WIRE_VERSION..=WIRE_VERSION {
+            let (node, mesh) =
+                (wire::ALPNS[usize::from(v - MIN_WIRE_VERSION)], mesh::ALPNS[usize::from(v - MIN_WIRE_VERSION)]);
+            assert_eq!((node.0, mesh.0), (v, v));
+            assert_eq!(wire::version_of(node.1), Some(v));
+            assert_eq!(mesh::version_of(mesh.1), Some(v));
+            assert_eq!(wire::alpns(v)[0], node.1, "the newest offered first");
+            assert_eq!(mesh::alpns(v)[0], mesh.1);
+            assert!(!seen.contains(&node.1) && !seen.contains(&mesh.1) && node.1 != mesh.1);
+            seen.extend([node.1, mesh.1]);
+        }
+        assert_eq!(wire::alpns(WIRE_VERSION).len(), usize::from(WIRE_VERSION - MIN_WIRE_VERSION) + 1);
+        // what the compile-time check refuses
+        assert!(!alpn_table_ok(&[(WIRE_V1, b"same"), (WIRE_V2, b"same")]), "two versions, one name");
+        assert!(!alpn_table_ok(&[(WIRE_V2, b"a"), (WIRE_V1, b"b")]), "out of place");
+        assert!(!alpn_table_ok(&[(WIRE_V1, b"a"), (WIRE_V2, b"")]), "no name");
     }
 
     /// A store-and-forward payload of a kind this build doesn't know is

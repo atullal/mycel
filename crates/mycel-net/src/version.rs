@@ -173,6 +173,59 @@ impl Protocol {
     }
 }
 
+/// A protocol's ALPNs, one per wire version, oldest first: entry `i` names
+/// version `MIN_WIRE_VERSION + i`. The array's length follows
+/// [`WIRE_VERSION`], so raising it without naming the new version's ALPN
+/// doesn't build, and [`alpn_table_ok`] (asserted at compile time beside
+/// each table) rejects a table with versions out of place or two versions
+/// under one name, which would let one version's bytes reach a peer under
+/// another's name.
+pub type AlpnTable = [(WireVersion, &'static [u8]); (WIRE_VERSION - MIN_WIRE_VERSION + 1) as usize];
+
+/// Whether `t` lists every version in order, each under its own name.
+pub const fn alpn_table_ok(t: &AlpnTable) -> bool {
+    const fn same(a: &[u8], b: &[u8]) -> bool {
+        if a.len() != b.len() {
+            return false;
+        }
+        let mut i = 0;
+        while i < a.len() {
+            if a[i] != b[i] {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+    let mut i = 0;
+    while i < t.len() {
+        if t[i].0 != MIN_WIRE_VERSION + i as WireVersion || t[i].1.is_empty() {
+            return false;
+        }
+        let mut j = 0;
+        while j < i {
+            if same(t[i].1, t[j].1) {
+                return false;
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The ALPNs in `t` for wire versions `newest` down to the oldest
+/// supported, newest first: what a dialer offers and, in that order of
+/// preference, what a listener accepts.
+pub fn alpns_in(t: &AlpnTable, newest: WireVersion) -> Vec<&'static [u8]> {
+    Protocol { version: newest, caps: Caps::NONE }.versions().map(|v| t[usize::from(v - MIN_WIRE_VERSION)].1).collect()
+}
+
+/// The wire version `alpn` stands for in `t`.
+pub fn version_in(t: &AlpnTable, alpn: &[u8]) -> Option<WireVersion> {
+    t.iter().find(|(_, a)| *a == alpn).map(|(v, _)| *v)
+}
+
 /// What was agreed with a peer on a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PeerProtocol {
