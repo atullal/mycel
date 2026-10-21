@@ -41,7 +41,7 @@ class MycelService : Service() {
     // A null intent is Android restarting the sticky service.
     val fromApp = intent?.getBooleanExtra(EXTRA_FROM_APP, false) ?: false
     val foreground = goForeground()
-    starts.begin(startId, foreground)
+    starts.begin(startId, foreground, fromApp)
     MycelRuntime.startAsync(this) { running ->
       when (starts.after(fromApp, running, foreground)) {
         AfterStart.STAY -> {}
@@ -60,13 +60,18 @@ class MycelService : Service() {
 
   /**
    * Stop for start `startId`, unless a newer start arrived meanwhile (the
-   * user opened Mycel during a catch-up, say) or one made the service
-   * foreground: plain `stopSelf()` would stop it regardless, and a service
-   * stopped that way is never restarted as sticky.
+   * user opened Mycel during a catch-up, say) or the service is foreground
+   * with a runtime to keep alive ([ServiceStarts.mayStop]): plain
+   * `stopSelf()` would stop it regardless, and a service stopped that way
+   * is never restarted as sticky. A foreground one first drops its
+   * "connected" notification.
    */
   private fun stopOnMain(startId: Int) {
     Handler(Looper.getMainLooper()).post {
-      if (starts.mayStop(startId)) stopSelfResult(startId)
+      if (starts.mayStop(startId)) {
+        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        stopSelfResult(startId)
+      }
     }
   }
 

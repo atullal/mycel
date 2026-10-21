@@ -10,7 +10,7 @@ class BackgroundPolicyTest {
   @Test
   fun theAppsStartAlwaysStays() {
     val starts = ServiceStarts()
-    starts.begin(1, foreground = true)
+    starts.begin(1, foreground = true, fromApp = true)
     assertEquals(AfterStart.STAY, starts.after(fromApp = true, running = false, foreground = true))
     assertFalse(starts.mayStop(1))
   }
@@ -24,6 +24,26 @@ class BackgroundPolicyTest {
     fresh.begin(1, foreground = false)
     assertEquals(AfterStart.STOP, fresh.after(fromApp = false, running = false, foreground = false))
     assertTrue(fresh.mayStop(1))
+  }
+
+  /**
+   * Regression: a start after a reboot or an update is foreground; with no
+   * profile (or a store that won't open) its STOP did nothing, and the
+   * service sat there saying "Mycel is connected" with no runtime at all.
+   */
+  @Test
+  fun aForegroundStartWithNoRuntimeStillStops() {
+    val starts = ServiceStarts()
+    starts.begin(1, foreground = true)
+    assertEquals(AfterStart.STOP, starts.after(fromApp = false, running = false, foreground = true))
+    assertTrue(starts.mayStop(1))
+    // ...but not once the app started it: the app is creating the profile.
+    val opened = ServiceStarts()
+    opened.begin(1, foreground = true)
+    assertEquals(AfterStart.STOP, opened.after(fromApp = false, running = false, foreground = true))
+    opened.begin(2, foreground = true, fromApp = true)
+    assertFalse(opened.mayStop(1))
+    assertFalse(opened.mayStop(2))
   }
 
   @Test
@@ -44,7 +64,7 @@ class BackgroundPolicyTest {
     val starts = ServiceStarts()
     starts.begin(1, foreground = false)
     assertEquals(AfterStart.CATCH_UP_THEN_STOP, starts.after(fromApp = false, running = true, foreground = false))
-    starts.begin(2, foreground = true)
+    starts.begin(2, foreground = true, fromApp = true)
     assertEquals(AfterStart.STAY, starts.after(fromApp = true, running = true, foreground = true))
     assertFalse("start 1 finishing late must not stop the service", starts.mayStop(1))
     assertFalse(starts.mayStop(2))
