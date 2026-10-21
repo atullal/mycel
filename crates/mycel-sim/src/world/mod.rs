@@ -68,8 +68,10 @@ impl WorldEvent {
 /// bijection with full avalanche), one absorbing each record's first two
 /// words and the other its last two, crossed after every record; finished
 /// with BLAKE3 over both chains and the record count.
-/// It detects divergence (two different record sequences collide with
-/// odds of about 2^-128); it is not meant to resist an adversary, and a
+/// It detects divergence (two different record sequences that nobody
+/// chose to collide should collide with odds near 2^-128, an estimate
+/// from its 128-bit state, not a proof); it is not meant to resist an
+/// adversary, and a
 /// million records a second cost a few nanoseconds each, where feeding
 /// every record to BLAKE3 itself cost ~100 ns (measured, fixed 27).
 #[derive(Clone, Debug, Default)]

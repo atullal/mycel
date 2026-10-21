@@ -1254,9 +1254,10 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
         .collect();
     // steady state: after one full fisheye cycle (cold start is reported
     // apart), over the next cycle (at least 32 s). Every (size, variant) run is
-    // independent, so they all run at once: (steady, cold, coverage, wall).
+    // independent, so they all run at once: (steady, cold, coverage, wall,
+    // exogenous hash).
     let jobs: Vec<(usize, usize)> = (0..sizes.len()).flat_map(|i| (0..variants.len()).map(move |v| (i, v))).collect();
-    let runs: Vec<(f64, f64, f64, f64)> = jobs
+    let runs: Vec<(f64, f64, f64, f64, String)> = jobs
         .par_iter()
         .map(|&(i, v)| {
             let (n, w, g) = (sizes[i], &worlds[i], variants[v].1);
@@ -1279,10 +1280,10 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
             let mut rng = Rng::new(o.seed);
             let pairs = pairs_within(&sim, n, 8, 200, &mut rng, None);
             let ok = pairs.iter().filter(|(a, b, _)| matches!(walk(&sim, *a, *b, 16), Walk::Reached(_))).count();
-            (steady, cold, ok as f64 / pairs.len().max(1) as f64, wall)
+            (steady, cold, ok as f64 / pairs.len().max(1) as f64, wall, hex(&sim.exo_hash()))
         })
         .collect();
-    let mains: Vec<f64> = worlds
+    let mains: Vec<(f64, String)> = worlds
         .par_iter()
         .map(|w| {
             let cfg = Rc::new(Cfg::main());
@@ -1290,7 +1291,7 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
                 Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Mycel::new(i, cfg.clone(), Role::Honest));
             sim.start();
             sim.run(40 * SEC);
-            metrics(&sim, "main", 0.0, None).ctrl_bytes_per_node_s
+            (metrics(&sim, "main", 0.0, None).ctrl_bytes_per_node_s, hex(&sim.exo_hash()))
         })
         .collect();
     let mut rows = Vec::new();
@@ -1300,7 +1301,8 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
     for (i, &n) in sizes.iter().enumerate() {
         let mut line = format!("N={n}:");
         for (v, (label, g)) in variants.into_iter().enumerate() {
-            let (steady, cold, cov, wall) = runs[i * variants.len() + v];
+            let (steady, cold, cov, wall, ref exo) = runs[i * variants.len() + v];
+            r.world_hash(&format!("N={n}"), exo);
             let share = steady / ble;
             if label == "now" {
                 cand_worst = cand_worst.max(share);
@@ -1315,10 +1317,12 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
             ));
             rows.push(json!({"n": n, "variant": label, "every_ms": g.announce_every_ms, "far_every": g.far_every, "fisheye": g.fisheye, "flood_reduction": g.flood_reduction, "ctrl_bytes_per_node_s": steady, "first_cycle_bytes_per_node_s": cold, "ble_share": share, "coverage": cov, "wall_s": wall}));
         }
-        let share = mains[i] / ble;
+        let (main, ref exo) = mains[i];
+        r.world_hash(&format!("N={n}"), exo);
+        let share = main / ble;
         main_worst = main_worst.max(share);
-        line.push_str(&format!(" [main: {} B/s ({:.1}% of BLE)]", fmt(mains[i]), 100.0 * share));
-        rows.push(json!({"n": n, "model": "main", "ctrl_bytes_per_node_s": mains[i], "ble_share": share}));
+        line.push_str(&format!(" [main: {} B/s ({:.1}% of BLE)]", fmt(main), 100.0 * share));
+        rows.push(json!({"n": n, "model": "main", "ctrl_bytes_per_node_s": main, "ble_share": share}));
         r.note(line);
     }
     let worst = if o.candidate == Candidate::Main { main_worst } else { cand_worst };
