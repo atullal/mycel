@@ -1106,7 +1106,9 @@ impl Carrier {
         let full = s.full;
         let mut table: NbPreds = Vec::with_capacity(s.preds.len().min(SUMMARY_PREDS + SUMMARY_WANTS));
         for (x, px) in s.preds.into_iter().take(SUMMARY_PREDS + SUMMARY_WANTS) {
-            let px = (px as f64).clamp(0.0, 1.0);
+            // (`clamp` keeps a NaN: one would outrank every real
+            // predictability where candidates are ranked by `total_cmp`)
+            let px = if px.is_nan() { 0.0 } else { (px as f64).clamp(0.0, 1.0) };
             table.push((x, px as f32));
             if x == self.me {
                 continue;

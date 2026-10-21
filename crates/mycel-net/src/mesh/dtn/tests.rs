@@ -511,6 +511,28 @@ fn a_refusal_marks_the_neighbour_full_until_its_next_summary() {
     assert_eq!(c.plan(2_000, |_| Toward::Nowhere, &nb).len(), 2);
 }
 
+/// Found while writing the `dtn` fuzz target: summaries carry `f32`
+/// predictabilities, and `f64::clamp` keeps a NaN. A neighbour reporting
+/// NaN then outranked every real predictability wherever candidates are
+/// ranked with `total_cmp` (the spread of a doubted route's copies). What a
+/// neighbour reports is a probability, or nothing.
+#[test]
+fn a_reported_nan_predictability_counts_as_zero() {
+    let mut c = Carrier::new(key(1), DtnConfig::default());
+    let (liar, x) = (key(2), key(9));
+    let s = Summary {
+        full: true,
+        preds: vec![(x, f32::NAN), (INTERNET, f32::INFINITY), (key(10), -1.0)],
+        ..Summary::default()
+    };
+    c.on_summary(liar, s, 0, |_| true);
+    let table = &c.nb_pred[&liar];
+    assert!(table.iter().all(|(_, p)| (0.0..=1.0).contains(p)), "{table:?}");
+    assert_eq!(table.iter().find(|(k, _)| *k == x).map(|(_, p)| *p), Some(0.0));
+    assert_eq!(table.iter().find(|(k, _)| *k == INTERNET).map(|(_, p)| *p), Some(1.0));
+    assert!(c.p(&x, 0).is_finite());
+}
+
 /// A transfer cut short keeps its bytes with the receiver; the next offer
 /// of that bundle, from anyone, resumes where it stopped. Kept bytes are
 /// bounded and expire.
