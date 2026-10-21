@@ -7,7 +7,9 @@
 //!
 //! Properties: no panic; decoded messages re-encode to equal values; the
 //! planner never hands a bundle (or zero copies of one) to ourselves; what
-//! we tell neighbours are probabilities.
+//! we tell neighbours are probabilities; after every step, what the carrier
+//! remembers from neighbours (their predictabilities and bundle ids, and the
+//! transitive predictabilities they gave us) is within its caps.
 #![no_main]
 
 use arbitrary::{Arbitrary, Unstructured};
@@ -194,6 +196,9 @@ fuzz_target!(|input: Input| {
             if let Some(b) = c.bundle(&id) {
                 assert_eq!(b.id, id);
             }
+        }
+        if let Err(grew) = fuzzing::dtn_bounds(&c) {
+            panic!("a neighbour grew the carrier's state: {grew}");
         }
         let _ = c.stats();
         let _ = c.p(&pk(1), now);

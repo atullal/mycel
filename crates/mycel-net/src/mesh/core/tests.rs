@@ -1238,12 +1238,15 @@ fn security_verified_cache_stays_bounded_and_can_be_disabled() {
 }
 
 /// Found by fuzzing (`fuzz/fuzz_targets/mesh_router.rs`): smoothing a hop
-/// cost overflowed once a hop measured above about 61 s per 64 KiB (a
-/// congested Bluetooth hop: 1.1 s round trips at the minimum window). Debug
-/// builds panicked; release builds wrapped to a near-zero cost, making the
-/// slowest hop the cheapest. A later run found the same for a cost above
-/// the driver's cap plus the per-hop penalty: costs are now capped where
-/// the driver caps them, and the penalty saturates.
+/// cost multiplied it by 7 in `u32`, which overflowed above `u32::MAX / 7`
+/// (costs are in 0.1 ms units: about 61,000 s, 17 hours, per 64 KiB; the
+/// driver's `mesh::hop_cost` would need round trips of about 1,100 s at the
+/// minimum window to measure that). Debug builds panicked; release builds
+/// wrapped to a near-zero cost, making the slowest hop the cheapest. No real
+/// link gets there, but the driver can technically report up to its cap of
+/// `u32::MAX / 2`. A later run found the same for a cost above that cap plus
+/// the per-hop penalty: costs are now capped where the driver caps them,
+/// and the penalty saturates.
 #[test]
 fn smoothing_a_very_slow_hop_cost_does_not_overflow() {
     let mut r = Router::new(key(1), Config::default());

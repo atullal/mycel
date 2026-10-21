@@ -44,9 +44,13 @@ fuzz_target!(|data: &[u8]| {
         _ => {
             // Seal gateways taken from the input: what opens is what was sealed.
             let gateways: Vec<(SignPk, u32)> = rest
-                .chunks_exact(5)
+                .as_chunks::<5>()
+                .0
+                .iter()
                 .take(3)
-                .map(|c| (DeviceKeys::from_seed([c[0]; 32]).sign_pk(), u32::from_le_bytes([c[1], c[2], c[3], c[4]])))
+                .map(|&[seed, a, b, c, d]| {
+                    (DeviceKeys::from_seed([seed; 32]).sign_pk(), u32::from_le_bytes([a, b, c, d]))
+                })
                 .collect();
             let record = directory::seal(&keys, &gateways).expect("three gateways fit a record");
             let r = directory::open(&record, Some(&me)).expect("our own record opens");

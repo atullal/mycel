@@ -105,21 +105,28 @@ pub fn encode_dtn_offer(o: &dtn::Offer) -> Option<Vec<u8>> {
     mesh::encode_offer(o).ok()
 }
 
+/// Whether what `c` remembers from its neighbours is within the caps that
+/// keep a hostile neighbour from growing it without end; the error says
+/// what grew.
+pub fn dtn_bounds(c: &dtn::Carrier) -> Result<(), String> {
+    c.check_bounds()
+}
+
 /// A neighbour's answer to our offer (see `mesh::decode_answer`).
 pub fn dtn_answer(body: &[u8]) -> Option<Result<Option<u64>, bool>> {
     mesh::decode_answer(body).ok()
 }
 
-/// Bonjour SRV record data, as the system daemon hands it over (Apple only).
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+/// Bonjour SRV record data, as the system daemon hands it over (parsed on
+/// Apple platforms; fuzzed everywhere).
 pub fn mdns_srv(rdata: &[u8]) -> Option<(String, u16)> {
-    crate::native_mdns::parse_srv(rdata)
+    crate::mdns_records::parse_srv(rdata)
 }
 
-/// Bonjour TXT record data: a peer's Iroh user data (Apple only).
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+/// Bonjour TXT record data: a peer's Iroh user data (parsed on Apple
+/// platforms; fuzzed everywhere).
 pub fn mdns_txt(txt: &[u8]) -> Option<String> {
-    crate::native_mdns::parse_txt(txt).map(|u| u.as_ref().to_string())
+    crate::mdns_records::parse_txt(txt).map(|u| u.as_ref().to_string())
 }
 
 /// A partial download's `.ranges` file as read back from storage (a damaged

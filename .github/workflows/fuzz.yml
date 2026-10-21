@@ -87,6 +87,14 @@ jobs:
           esac
           # four vCPUs: four fuzzers at once
           JOBS=4 fuzz/run.sh "$seconds"
+      - name: Run ledger
+        # (per target: CPU and wall seconds, inputs run; the totals in
+        # docs/TESTING.md can be checked against these)
+        if: always()
+        run: |
+          if [ -f fuzz/logs/runs.tsv ]; then
+            { echo '```'; cat fuzz/logs/runs.tsv; echo '```'; } >>"$GITHUB_STEP_SUMMARY"
+          fi
       - name: Minimise the corpora
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         run: |
