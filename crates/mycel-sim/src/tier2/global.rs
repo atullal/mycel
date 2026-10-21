@@ -157,6 +157,37 @@ pub struct Shared {
     pub loops: Cell<u64>,
     pub routes_up: Cell<u64>,
     pub routes_down: Cell<u64>,
+    /// With `MYCEL_LOOP_TRACE` set: each data frame's path, (src, id) →
+    /// hops (device, came from, its mesh next hop toward the destination
+    /// then, ms), printed when the frame revisits a device.
+    pub paths: Option<std::cell::RefCell<Map<(SignPk, u32), Vec<Hop>>>>,
+    /// Devices that drop what they relay (for the counters below).
+    pub bad: Set<NodeId>,
+    /// Times an honest device began to shun a neighbour for every
+    /// destination (`Router::is_shunned`): [honest neighbour, bad one] ...
+    pub shuns: Cell<[u64; 2]>,
+    /// ... and to hold one down for routes that kept expiring
+    /// (`Router::is_stale_hop`).
+    pub stale: Cell<[u64; 2]>,
+}
+
+/// One hop of a traced frame: the device, the neighbour it came from, the
+/// device's mesh next hop toward the destination at that moment (`None`:
+/// no mesh route: the default route, the internet, or a drop), and when.
+pub type Hop = (NodeId, NodeId, Option<NodeId>, u64);
+
+impl Shared {
+    /// Counters for one run, tracing frame paths if `MYCEL_LOOP_TRACE` is set.
+    pub fn new(bad: Set<NodeId>) -> Shared {
+        let paths = std::env::var_os("MYCEL_LOOP_TRACE").map(|_| std::cell::RefCell::new(Map::default()));
+        Shared { paths, bad, ..Shared::default() }
+    }
+
+    fn count(c: &Cell<[u64; 2]>, bad: bool) {
+        let mut v = c.get();
+        v[usize::from(bad)] += 1;
+        c.set(v);
+    }
 }
 
 /// A message being sent, QUIC-style: per-packet acks, a congestion window
@@ -219,6 +250,10 @@ pub struct Global {
     /// For tests: with `Some`, the last announcement heard from each
     /// neighbour, per origin: (neighbour, origin) → (seq, hops, cost).
     pub heard: Option<Map<(NodeId, SignPk), Chain>>,
+    /// Neighbours shunned / held down at the last look ([`Shared::shuns`]).
+    blamed: Map<NodeId, (bool, bool)>,
+    /// [`Role::AdaptiveLiar`]: when it turns (engine time).
+    pub turn_at: Time,
 }
 
 /// An announcement's (seq, hops, cost).
@@ -311,6 +346,8 @@ impl Global {
             buffer_now: 0,
             chains: Map::default(),
             heard: None,
+            blamed: Map::default(),
+            turn_at: 0,
         }
     }
 
@@ -452,7 +489,7 @@ impl Global {
             match o {
                 Out::Announce { to, mut ann } => {
                     if ann.origin != self.pk && ann.cost != mc::INFINITY {
-                        match self.role {
+                        match self.acting(cx.now()) {
                             Role::BlackHole => ann.cost = 0, // "everyone is right here"
                             Role::Liar => {
                                 // "everyone is one hop from me", as cheaply as
@@ -473,7 +510,7 @@ impl Global {
                     self.send_to(cx, node(&to), Frame::Req(req), None);
                 }
                 Out::Frame { to, frame, relayed } => {
-                    if relayed && self.role.swallows(packet_of(&frame.payload)) {
+                    if relayed && self.acting(cx.now()).swallows(packet_of(&frame.payload)) {
                         continue; // swallowed
                     }
                     let msg = packet_msg(&frame.payload);
@@ -628,6 +665,41 @@ impl Global {
         }
     }
 
+    /// Count the neighbours this (honest) device began to shun or hold
+    /// down since the last look, by their role.
+    fn note_blame(&mut self, now: mc::Time) {
+        if self.role != Role::Honest {
+            return;
+        }
+        for (k, _) in self.core.neighbours() {
+            let n = node(&k);
+            let now_blamed = (self.core.is_shunned(&k, now), self.core.is_stale_hop(&k, now));
+            let was = self.blamed.get(&n).copied().unwrap_or_default();
+            let bad = self.shared.bad.contains(&n);
+            if now_blamed.0 && !was.0 {
+                Shared::count(&self.shared.shuns, bad);
+            }
+            if now_blamed.1 && !was.1 {
+                Shared::count(&self.shared.stale, bad);
+            }
+            if now_blamed == (false, false) {
+                self.blamed.remove(&n);
+            } else {
+                self.blamed.insert(n, now_blamed);
+            }
+        }
+    }
+
+    /// What this device does at engine time `now`: its role, except that
+    /// an adaptive liar is honest until it turns, and a one-hop liar after.
+    fn acting(&self, now: Time) -> Role {
+        match self.role {
+            Role::AdaptiveLiar if now < self.turn_at => Role::Honest,
+            Role::AdaptiveLiar => Role::Liar,
+            r => r,
+        }
+    }
+
     pub fn loops(&self) -> u64 {
         self.shared.loops.get()
     }
@@ -758,8 +830,24 @@ impl Router for Global {
             Frame::Req(r) => self.core.on_seqreq(fpk, r, now),
             Frame::Data(d) => {
                 let k = (d.src, d.id);
+                if let Some(paths) = &self.shared.paths
+                    && d.offset == 0
+                {
+                    let local = self.core.next_hop_local(&d.dst, now).map(|k| node(&k));
+                    paths.borrow_mut().entry(k).or_default().push((node(&self.pk), from, local, now));
+                }
                 if d.offset == 0 && self.seen.insert(k, cx.now()).is_some() {
                     self.shared.loops.set(self.shared.loops.get() + 1);
+                    if let Some(paths) = &self.shared.paths {
+                        eprintln!(
+                            "loop: frame {}#{} to {} at {}: {:?}",
+                            node(&d.src),
+                            d.id,
+                            node(&d.dst),
+                            node(&self.pk),
+                            paths.borrow().get(&k)
+                        );
+                    }
                 }
                 self.core.on_frame(fpk, d, now);
             }
@@ -786,8 +874,9 @@ impl Router for Global {
             Frame::Bundle(b, copies) => {
                 let id = b.id;
                 let msg = bundle_msg(&id);
-                if matches!(self.role, Role::Liar | Role::AttestedLiar | Role::Dropper | Role::GreyHole)
-                    && self.role.swallows(Some(msg))
+                let acting = self.acting(cx.now());
+                if matches!(acting, Role::Liar | Role::AttestedLiar | Role::Dropper | Role::GreyHole)
+                    && acting.swallows(Some(msg))
                     && b.dst != self.pk
                 {
                     // takes custody, keeps nothing
@@ -893,6 +982,7 @@ impl Router for Global {
                 }
                 self.core.tick(now);
                 self.effects(cx);
+                self.note_blame(now);
                 if self.dtn.is_some() {
                     if let Some(c) = self.dtn.as_mut() {
                         c.tick(now);

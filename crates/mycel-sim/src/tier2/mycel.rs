@@ -99,6 +99,12 @@ pub enum Role {
     /// the rest. Some traffic through it is acknowledged, so the
     /// end-to-end defence sees mixed evidence (tier-2 GLOBAL core only).
     GreyHole,
+    /// Honest until the plan's turn (`Plan::turn`), then a [`Role::Liar`]:
+    /// it carries traffic and acknowledgements while its neighbours learn to
+    /// trust it (its routes become incumbents, it is vouched for), then
+    /// claims to be one hop from everyone and drops everything (tier-2
+    /// GLOBAL core only).
+    AdaptiveLiar,
     /// Announces every 10 ms.
     Storm,
     /// Re-sends announcements it heard long ago.
@@ -109,7 +115,10 @@ impl Role {
     /// It drops what it is given to relay (packets, and with the GLOBAL
     /// core bundles too).
     pub fn drops(self) -> bool {
-        matches!(self, Role::BlackHole | Role::Liar | Role::AttestedLiar | Role::Dropper | Role::GreyHole)
+        matches!(
+            self,
+            Role::BlackHole | Role::Liar | Role::AttestedLiar | Role::Dropper | Role::GreyHole | Role::AdaptiveLiar
+        )
     }
 
     /// It drops traffic of message `msg` that it relays (`None`: traffic

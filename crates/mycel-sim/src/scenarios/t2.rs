@@ -123,6 +123,8 @@ pub struct Plan {
     pub bundle_lifetime_ms: Option<u64>,
     /// Buffer and TTL for the baseline routers.
     pub baseline: Option<crate::tier2::dtn::Opts>,
+    /// When [`Role::AdaptiveLiar`]s turn (default: at once).
+    pub turn: Option<Time>,
 }
 
 impl Plan {
@@ -402,9 +404,9 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
     let name = model.name();
     match model {
         Model::Global(g) => {
-            let shared = Rc::new(Shared::default());
-            let sh = shared.clone();
             let droppers: Vec<NodeId> = plan.roles.iter().filter(|(_, r)| r.drops()).map(|(i, _)| *i).collect();
+            let shared = Rc::new(Shared::new(droppers.iter().copied().collect()));
+            let sh = shared.clone();
             let spaces = crate::tier2::global::spaces(&w.specs, &plan.roles, seed);
             go(
                 w,
@@ -420,6 +422,7 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                         r.bundle_lifetime_ms = plan.bundle_lifetime_ms.unwrap_or(24 * 3600 * 1000);
                     }
                     r.role = plan.role(i);
+                    r.turn_at = plan.turn.unwrap_or(0);
                     r.core.set_affinity(spaces[i as usize].iter().map(|j| (key(*j), 1)));
                     r
                 },
@@ -436,6 +439,9 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                         t.neighbours_distrusted += s.neighbours_distrusted;
                         t.hops_suspected += s.hops_suspected;
                         t.hops_shunned += s.hops_shunned;
+                        t.hops_stale += s.hops_stale;
+                        t.seqreqs_limited += s.seqreqs_limited;
+                        t.dropped_unreachable += s.dropped_unreachable;
                         t.announcements_deferred += s.announcements_deferred;
                         t.retractions_sent += s.retractions_sent;
                         t.seqreqs_sent += s.seqreqs_sent;
@@ -472,11 +478,12 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                     let n = sim.routers.len().max(1) as f64;
                     let secs = (sim.now as f64 / SEC as f64).max(1e-9);
                     let through = (!droppers.is_empty()).then(|| routes_through(sim, &droppers));
-                    json!({"loops": sh.loops.get(), "routes_through_droppers": through, "announcements_sent": t.announcements_sent,
+                    let mut v = json!({"loops": sh.loops.get(), "routes_through_droppers": through, "announcements_sent": t.announcements_sent,
                            "announcements_received": t.announcements_received, "announcements_limited": t.announcements_limited,
                            "announcements_stale": t.announcements_stale, "announcements_suppressed": t.announcements_suppressed,
                            "announcements_implausible": t.announcements_implausible, "neighbours_distrusted": t.neighbours_distrusted, "hops_suspected": t.hops_suspected,
-                           "hops_shunned": t.hops_shunned, "announcements_deferred": t.announcements_deferred,
+                           "hops_shunned": t.hops_shunned,
+                           "announcements_deferred": t.announcements_deferred,
                            "retractions_sent": t.retractions_sent, "seqreqs_sent": t.seqreqs_sent, "infeasible": t.infeasible,
                            "dropped_no_route": t.dropped_no_route, "dropped_pending": t.dropped_pending, "dropped_ttl": t.dropped_ttl,
                            "dials": t.dials, "resolves": t.resolves, "gateway_out": t.gateway_out,
@@ -487,7 +494,20 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                            "buffer_peak_bytes": peak, "buffer_avg_bytes": avg / n,
                            "control_b_s_per_device": {
                                "routing": kinds[0] as f64 / n / secs, "carrier": kinds[1] as f64 / n / secs,
-                               "dials": kinds[2] as f64 / n / secs, "other": kinds[3] as f64 / n / secs}})
+                               "dials": kinds[2] as f64 / n / secs, "other": kinds[3] as f64 / n / secs}});
+                    // (the macro's recursion limit: the rest one by one)
+                    for (key, x) in [
+                        ("hops_stale", t.hops_stale),
+                        ("dropped_unreachable", t.dropped_unreachable),
+                        ("seqreqs_limited", t.seqreqs_limited),
+                        ("shunned_honest", sh.shuns.get()[0]),
+                        ("shunned_bad", sh.shuns.get()[1]),
+                        ("stale_honest", sh.stale.get()[0]),
+                        ("stale_bad", sh.stale.get()[1]),
+                    ] {
+                        v[key] = json!(x);
+                    }
+                    v
                 },
             )
         }

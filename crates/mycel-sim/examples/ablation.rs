@@ -81,6 +81,10 @@ fn adversarial(seed: u64, scale: f64) {
     let sybil_plan =
         Plan { poison: Some(sybil), roles: [(sybil, Role::BlackHole)].into_iter().collect(), ..plan.clone() };
     let liar_plan = Plan { roles: bad.iter().map(|b| (*b, Role::Liar)).collect(), ..plan.clone() };
+    // the same liars, honest until a quarter of the messages have been
+    // sent (most of the traffic comes once they have turned)
+    let turn = plan.sends.get(plan.sends.len() / 4).map(|s| s.0);
+    let adaptive_plan = Plan { roles: bad.iter().map(|b| (*b, Role::AdaptiveLiar)).collect(), turn, ..plan.clone() };
     // the same liars, but few sources each sending to many destinations (a
     // device messaging its contacts): what cross-destination aggregation
     // needs to see; its own stream, so the other plans don't move
@@ -104,6 +108,7 @@ fn adversarial(seed: u64, scale: f64) {
         ("plausible-liars", &liar_plan),
         ("sybil", &sybil_plan),
         ("liars-fanout", &fanout),
+        ("adaptive-liars", &adaptive_plan),
     ];
     // ABL_VARIANTS=a,b runs only those
     let only = std::env::var("ABL_VARIANTS").unwrap_or_default();
