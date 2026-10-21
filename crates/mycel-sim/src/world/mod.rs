@@ -83,6 +83,9 @@ pub struct Digest {
 impl Digest {
     /// Four words: two into each chain (the two run in parallel), then
     /// each chain takes in the other, so every word reaches both.
+    /// The second chain is offset by a nothing-up-my-sleeve constant (the
+    /// fractional bits of √2, SHA-512's first initial word, FIPS 180-4) so
+    /// the two chains never start equal.
     fn absorb(&mut self, w: [u64; 4]) {
         let c0 = mix64(mix64(self.chains[0] ^ w[0]) ^ w[1]);
         let c1 = mix64(mix64(self.chains[1] ^ w[2] ^ 0x6a09_e667_f3bc_c908) ^ w[3]);
