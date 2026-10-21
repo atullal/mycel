@@ -816,12 +816,80 @@ measured in the design notes, is extra).
   the chain index maintained on every insert took 262 ms (2.6 µs per
   envelope, including model hashing); a cold digest 18.8 µs; a cached one
   0.3 µs.
-- **Group fan-out**, real nodes over loopback QUIC: one message in a
-  10-member group took 57 sessions in total (`tests/sync_v2.rs`); v1's
-  epidemic re-sync starts about m(m−1) = 90. Most of the 57 are idle
-  one-round-trip checks.
+### 8.1 Between real nodes over loopback QUIC
 
-Not measured here: QUIC and radio overhead per packet, the group-chat and
-community scenarios of the design (the tier-2 `group-sync` simulator
-scenario is not built yet), and real-replica sessions at 100k (the real
-envelope path adds signature checks and validation, not bytes).
+`cargo test -p mycel-net --test sync_v2_bench -- --ignored --nocapture
+--test-threads=1` (`crates/mycel-net/tests/sync_v2_bench.rs`), debug build,
+on the 18-core Mac while other agents built and fuzzed (2026-10-21). Real
+replicas (signed, encrypted envelopes of a 45-byte chat body), one author.
+"Stream" counts the frames on Sync v2 and gossip streams; "UDP" counts
+every UDP byte both nodes sent on their QUIC connections during the
+measured window (headers, acknowledgements, keep-alives, capability hellos
+and any background session the window caught: loopback, no loss). v1 has
+no stream counter, so only its UDP bytes are shown. One run each; times
+are debug-build and indicative only.
+
+| Case (history 2,000 envelopes) | Stream B | UDP B | Envelopes received | Time |
+|---|---|---|---|---|
+| v2 idle | 363 | 659 | 0 | 1.3 ms |
+| v2 1 new | 857 | 1,228 | 1 | 1.4 ms |
+| v2 1,000 missing | 356,935 | 368,613 | 1,000 | 101 ms |
+| v2 fresh join (3,001 envelopes) | 1,070,006 | 1,198,039 | 3,001 | 343 ms |
+| v2 fork at seq 1,900, 100 envelopes on each branch | 74,995 | 141,836 | 100 | 19 ms (phase 2: 1 session) |
+| v1 idle | — | 132,248 | 0 | 40 ms |
+| v1 1 new | — | 264,844 | 1 | 40 ms |
+| v1 1,000 missing | — | 762,636 | 1,000 | 164 ms |
+| v1 fresh join (3,001 envelopes) | — | 1,697,481 | 3,001 | 379 ms |
+
+v1's "1 new" window holds two inventory exchanges (the explicit session and
+the server's epidemic re-sync it triggers), which is v1's real cost per
+change. v2's UDP overhead over its stream bytes is about 300 B per idle
+check and 3–12% on bulk transfers.
+
+**Dissemination** (`bench_dissemination_over_quic`): a group of real nodes
+on loopback, one new message by a different author each time, after the
+gossip tree formed (5 warm-up messages, the next 5 averaged). Bytes are all
+nodes' gossip and session frames (stream) and all UDP they sent, for the
+whole group per message. Payload copies count envelopes received by push
+(the author's own excluded, so the floor is members − 1).
+
+| Members | Stream B per message (group) | Per member | UDP B per message (group) | Payload copies | Sessions per message | Time to everyone |
+|---|---|---|---|---|---|---|
+| 10 | 8,012 | 801 | 88,408 | 9.0 | 0.2 | 52 ms |
+| 50 | 63,408 | 1,268 | 341,994 | 88.2 | 4.4 | 794 ms |
+| 200 | 250,482 | 1,252 | 1,526,169 | 372.0 | 17.2 | 996 ms |
+
+The same on model sets (`bench_gossip_dissemination_cost` in
+`reconcile/gossip_tests.rs`: the real `Disseminator`, postcard sizes, all
+messages of a 10 ms step delivered in order, no transport overhead):
+
+| Members | Gossip B per message (group) | Per member | Payload copies | Pulls |
+|---|---|---|---|---|
+| 10 | 8,024 | 802 | 9.0 | 0 |
+| 50 | 41,661 | 833 | 49.0 | 0 |
+| 200 | 169,967 | 849 | 199.0 | 0 |
+
+- In the model the tree settles at one payload copy per member and about
+  830 B of gossip per member per message (the push, about 430 B, plus lazy
+  announcements), flat from 10 to 200 members. v1 started about m(m−1)
+  sessions per change (2,450 at 50 members; at 640 KB per session with a
+  10,000-envelope history, about 1.5 GB group-wide, **estimate** from §8).
+- Over real QUIC the 10-member group matches the model. The 50- and
+  200-member groups do not yet: 1.8 and 1.9 payload copies per member and
+  about 4 and 17 pulls per message
+  (an `IHave` that timed out, then a graft and a session), so the eager tree
+  keeps losing edges to crossing pushes and is repaired by pulls. The
+  design's gate is at most 1.5 copies per member after warm-up; 50 and 200
+  members over QUIC miss it. Still, a message costs the 200-member group
+  about 1.25 KB of frames per member and reaches everyone in about 1 s,
+  where v1 would start about 39,800 sessions. Tuning (prune rules under concurrency, the
+  `IHave` wait) belongs with the simulator's `group-chat-50` scenario.
+- UDP bytes per message exceed stream bytes several-fold in groups: every
+  device keeps a QUIC connection per neighbour, each with acknowledgements
+  and 1.5 s keep-alives, and the first messages to a new neighbour pay its
+  handshake.
+
+Not measured here: radio overhead per packet, the group-chat and community
+scenarios of the design over intermittent links (the tier-2 `group-sync`
+simulator scenario), and real-replica sessions at 100k (the real envelope
+path adds signature checks and validation, not bytes).

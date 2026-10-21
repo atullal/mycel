@@ -152,8 +152,21 @@ impl Inner {
     }
 
     /// Does gossip reach `peer` in `space` (so a change needs no session)?
-    pub(crate) fn gossip_covers(&self, space: &SpaceId, peer: &SignPk) -> bool {
-        self.gossip_on() && self.gossip.d.lock().covers(space, peer)
+    /// `strict` (our own writes; the caller holds the peer states):
+    /// only a member whose hello agreed `GOSSIP`. A member we never
+    /// connected to may not have the space yet (an invite needs a session)
+    /// or may not gossip; the session that reaches it also learns its
+    /// capabilities, so this costs one session per such member, once.
+    pub(crate) fn gossip_covers(
+        &self,
+        space: &SpaceId,
+        peer: &SignPk,
+        strict: Option<&HashMap<SignPk, PeerState>>,
+    ) -> bool {
+        if !self.gossip_on() || !self.gossip.d.lock().covers(space, peer) {
+            return false;
+        }
+        strict.is_none_or(|peers| peers.get(peer).and_then(|s| s.protocol).is_some_and(|p| p.supports(Caps::GOSSIP)))
     }
 }
 
@@ -255,7 +268,19 @@ pub(crate) async fn serve(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) 
         if !r.is_member(&peer) {
             bail!("gossip from a non-member");
         }
-        let pushed = inner.gossip.d.lock().on_msg(r, peer, msg, now)?;
+        // (bound first: a guard in the match scrutinee would live through
+        // the arms, which lock the disseminator again)
+        let res = inner.gossip.d.lock().on_msg(r, peer, msg, now);
+        let pushed = match res {
+            Ok(p) => p,
+            // We hold the space but don't gossip in it yet (our own `Add`
+            // hasn't reached us): a session with the sender brings it.
+            Err(reconcile::gossip::GossipError::UnknownSpace) => {
+                inner.gossip.d.lock().pull(peer, space);
+                return anyhow::Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        };
         // What the sender holds: delivery state (design §10).
         r.note_frontier(peer, &pushed.entries);
         let mut changed = None;

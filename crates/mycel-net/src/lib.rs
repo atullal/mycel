@@ -776,7 +776,8 @@ impl Inner {
         // it), and only one of them a periodic anti-entropy session.
         let mut partner = None;
         if self.gossip_on() {
-            let covered: HashSet<SignPk> = members.iter().filter(|p| self.gossip_covers(space, p)).copied().collect();
+            let covered: HashSet<SignPk> =
+                members.iter().filter(|p| self.gossip_covers(space, p, local.then_some(peers))).copied().collect();
             if !covered.is_empty() {
                 members.retain(|p| !covered.contains(p));
                 if trigger == Trigger::Periodic {

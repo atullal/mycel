@@ -154,7 +154,11 @@ depends only on what is held, never on arrival order, so peers that end up
 with the same items store the same set; it bounds a writer's dangling
 envelopes (no predecessor held) to 4,096 seqs per chain. Senders send each
 author's chain in ascending seq, so honest data never waits on it; a
-refused envelope is offered again once its prefix has arrived.
+refused envelope is offered again once its prefix has arrived. Pending
+envelopes are indexed by the stored envelope each waits for (its missing
+predecessor, or a gap below a revocation cutoff), so an arrival re-checks
+only what waits for it: dangling envelopes cost storage, not CPU on every
+later batch (measured: 2 status checks for one arrival with 1,000 pending).
 
 **After decrypting** (members only):
 7. the Automerge change's actor ID must equal `header.author`. Authors cannot write under someone else's actor.

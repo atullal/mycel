@@ -330,8 +330,10 @@ async fn gossip_reaches_a_12_member_group_with_few_copies() {
     let copies = |nodes: &[Node]| nodes.iter().map(|n| n.gossip_stats().items_received).sum::<u64>();
     let sessions = |nodes: &[Node]| nodes.iter().map(|n| n.sync_v2_totals().client_sessions).sum::<u64>();
     // Warm-up: the first messages prune redundant eager edges.
-    for w in 0..4 {
-        let author = &nodes[w];
+    // (each author's first write also runs a session with every member it
+    // never connected to: invites and capabilities need one, once)
+    for (w, a) in [0usize, 3, 7, 9].into_iter().enumerate() {
+        let author = &nodes[a];
         author.with_space(&space, |r| r.append(feed(), format!("warm {w}").into_bytes())).unwrap().unwrap();
         author.changed(space);
         eventually("warm-up message everywhere", || {
@@ -354,6 +356,9 @@ async fn gossip_reaches_a_12_member_group_with_few_copies() {
     let (c, s) = (copies(&nodes) - c0, sessions(&nodes) - s0);
     eprintln!("one message, {N} members over QUIC: {c} payload copies, {s} sessions, everyone in {took:?}");
     assert!(c as f64 <= 1.5 * (N - 1) as f64, "{c} payload copies");
+    // Members whose hello a device hadn't seen are in the gossip view too
+    // (regression: they each got a session per change).
+    assert!(s <= 2, "{s} sessions for one message");
     let g: u64 = nodes.iter().map(|n| n.gossip_totals().sent_bytes).sum();
     eprintln!("gossip bytes sent so far (all messages): {g}");
     for n in nodes {
