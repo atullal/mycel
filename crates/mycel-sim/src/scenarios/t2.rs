@@ -1087,15 +1087,33 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
         o.seed,
         o.scale,
     );
-    let sizes: Vec<usize> = if o.scale >= 1.0 { vec![250, 500, 1000, 2000] } else { vec![o.n(250, 60)] };
+    // (`MYCEL_SIM_FLOOD_SIZES=2000`, `MYCEL_SIM_FLOOD_VARIANTS=now,attested`
+    // and `MYCEL_SIM_FLOOD_MAIN=0` run part of it: a 2,000-device run holds
+    // a GB or more)
+    let env_list = |k: &str| std::env::var(k).ok().map(|v| v.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>());
+    let mut sizes: Vec<usize> = if o.scale >= 1.0 { vec![250, 500, 1000, 2000] } else { vec![o.n(250, 60)] };
+    if let Some(only) = env_list("MYCEL_SIM_FLOOD_SIZES") {
+        sizes = only.iter().filter_map(|x| x.parse().ok()).collect();
+    }
     let ble = Tech::Ble.rate() as f64;
     let now = GCfg::routing();
-    let variants = [
+    let all_variants = [
         ("now", now),
+        ("now, attested", GCfg { attest: true, ..now }),
         ("now, flood reduction on", GCfg { flood_reduction: true, ..now }),
         ("now, fisheye off", GCfg { fisheye: false, ..now }),
         ("before (every 2 s, full scope of 8 hops every 4th, reduction on)", GCfg::before()),
     ];
+    let picked = env_list("MYCEL_SIM_FLOOD_VARIANTS");
+    let variants: Vec<(&str, GCfg)> = all_variants
+        .into_iter()
+        .filter(|(label, _)| {
+            picked.as_ref().is_none_or(|p| {
+                p.iter().any(|x| *label == x.as_str() || (x == "attested" && *label == "now, attested"))
+            })
+        })
+        .collect();
+    let with_main = std::env::var("MYCEL_SIM_FLOOD_MAIN").map_or(true, |v| v != "0");
     // Bluetooth-only phones, one per 900 m² outdoors: ~12 neighbours each
     let worlds: Vec<_> = sizes
         .iter()
@@ -1111,7 +1129,11 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
     // apart), over the next cycle (at least 32 s). Every (size, variant) run is
     // independent, so they all run at once: (steady, cold, coverage, wall).
     let jobs: Vec<(usize, usize)> = (0..sizes.len()).flat_map(|i| (0..variants.len()).map(move |v| (i, v))).collect();
-    let runs: Vec<(f64, f64, f64, f64)> = jobs
+    // per run: steady, first cycle, coverage, wall, and with attestations
+    // the signatures checked and spared by the cache per device and second
+    // in steady state, and announcements refused for the signature budget
+    type FloodRun = (f64, f64, f64, f64, f64, f64, u64);
+    let runs: Vec<FloodRun> = jobs
         .par_iter()
         .map(|&(i, v)| {
             let (n, w, g) = (sizes[i], &worlds[i], variants[v].1);
@@ -1126,19 +1148,30 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
             sim.start();
             sim.run(warm);
             let ctrl = |sim: &Sim<Global>| sim.core.counters.iter().map(|c| c.ctrl_bytes).sum::<u64>();
+            let sigs = |sim: &Sim<Global>| {
+                sim.routers.iter().map(|r| r.core.stats()).fold((0u64, 0u64, 0u64), |a, s| {
+                    (a.0 + s.signatures_checked, a.1 + s.signatures_cached, a.2 + s.announcements_limited)
+                })
+            };
             let cold = ctrl(&sim);
+            let (c0, k0, _) = sigs(&sim);
             sim.run(warm + window);
-            let steady = (ctrl(&sim) - cold) as f64 / n as f64 / (window as f64 / SEC as f64);
+            let secs = window as f64 / SEC as f64;
+            let steady = (ctrl(&sim) - cold) as f64 / n as f64 / secs;
+            let (c1, k1, limited) = sigs(&sim);
+            let checked = (c1 - c0) as f64 / n as f64 / secs;
+            let cached = (k1 - k0) as f64 / n as f64 / secs;
             let cold = cold as f64 / n as f64 / (warm as f64 / SEC as f64);
             let wall = t.elapsed().as_secs_f64();
             let mut rng = Rng::new(o.seed);
             let pairs = pairs_within(&sim, n, 8, 200, &mut rng, None);
             let ok = pairs.iter().filter(|(a, b, _)| matches!(walk(&sim, *a, *b, 16), Walk::Reached(_))).count();
-            (steady, cold, ok as f64 / pairs.len().max(1) as f64, wall)
+            (steady, cold, ok as f64 / pairs.len().max(1) as f64, wall, checked, cached, limited)
         })
         .collect();
     let mains: Vec<f64> = worlds
         .par_iter()
+        .filter(|_| with_main)
         .map(|w| {
             let cfg = Rc::new(Cfg::main());
             let mut sim =
@@ -1151,30 +1184,49 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
     let mut rows = Vec::new();
     let mut cand_worst = 0.0f64;
     let mut cand_cov = 1.0f64;
+    let (mut attested_worst, mut attested_cov) = (0.0f64, 1.0f64);
     let mut main_worst = 0.0f64;
     for (i, &n) in sizes.iter().enumerate() {
         let mut line = format!("N={n}:");
-        for (v, (label, g)) in variants.into_iter().enumerate() {
-            let (steady, cold, cov, wall) = runs[i * variants.len() + v];
+        for (v, (label, g)) in variants.iter().enumerate() {
+            let (steady, cold, cov, wall, checked, cached, limited) = runs[i * variants.len() + v];
             let share = steady / ble;
-            if label == "now" {
+            if *label == "now" {
                 cand_worst = cand_worst.max(share);
                 cand_cov = cand_cov.min(cov);
             }
+            if g.attest {
+                attested_worst = attested_worst.max(share);
+                attested_cov = attested_cov.min(cov);
+            }
             line.push_str(&format!(
-                " [{label}: {} B/s per device ({:.1}% of BLE), first cycle {} B/s, {:.0}% routed]",
+                " [{label}: {} B/s per device ({:.1}% of BLE), first cycle {} B/s, {:.0}% routed",
                 fmt(steady),
                 100.0 * share,
                 fmt(cold),
                 100.0 * cov
             ));
-            rows.push(json!({"n": n, "variant": label, "every_ms": g.announce_every_ms, "far_every": g.far_every, "fisheye": g.fisheye, "flood_reduction": g.flood_reduction, "ctrl_bytes_per_node_s": steady, "first_cycle_bytes_per_node_s": cold, "ble_share": share, "coverage": cov, "wall_s": wall}));
+            if g.attest {
+                line.push_str(&format!(
+                    "; signatures checked {checked:.1}/s per device, {cached:.1}/s spared by the cache, {limited} announcements over a budget"
+                ));
+            }
+            line.push(']');
+            rows.push(json!({"n": n, "variant": label, "every_ms": g.announce_every_ms, "far_every": g.far_every, "fisheye": g.fisheye, "flood_reduction": g.flood_reduction, "attest": g.attest, "ctrl_bytes_per_node_s": steady, "first_cycle_bytes_per_node_s": cold, "ble_share": share, "coverage": cov, "wall_s": wall, "signatures_checked_per_node_s": checked, "signatures_cached_per_node_s": cached, "announcements_limited": limited}));
         }
-        let share = mains[i] / ble;
-        main_worst = main_worst.max(share);
-        line.push_str(&format!(" [main: {} B/s ({:.1}% of BLE)]", fmt(mains[i]), 100.0 * share));
-        rows.push(json!({"n": n, "model": "main", "ctrl_bytes_per_node_s": mains[i], "ble_share": share}));
+        if let Some(main) = mains.get(i) {
+            let share = main / ble;
+            main_worst = main_worst.max(share);
+            line.push_str(&format!(" [main: {} B/s ({:.1}% of BLE)]", fmt(*main), 100.0 * share));
+            rows.push(json!({"n": n, "model": "main", "ctrl_bytes_per_node_s": main, "ble_share": share}));
+        }
         r.note(line);
+    }
+    if attested_worst > 0.0 {
+        r.at_most("attested announcement traffic at the largest N, as a share of one BLE radio", 100.0 * attested_worst, 15.0, "%");
+        if o.candidate == Candidate::Global {
+            r.at_least("pairs within 8 hops routed with attestations, every N", 100.0 * attested_cov, 95.0, "%");
+        }
     }
     let worst = if o.candidate == Candidate::Main { main_worst } else { cand_worst };
     r.at_most("announcement traffic at the largest N, as a share of one BLE radio", 100.0 * worst, 10.0, "%");

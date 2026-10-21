@@ -1,8 +1,10 @@
 //! Mesh datagrams as a neighbour sends them (`mesh/wire.rs`): announcements,
-//! batches of them, seqno requests and data frames, plus mesh addresses.
+//! batches of them (attested ones too, `ROUTE_ATTEST`), seqno requests and
+//! data frames, plus mesh addresses.
 //!
 //! Properties: no decoder panics; every accepted datagram re-encodes to the
-//! same bytes (announcements, batches, seqno requests) or to a frame that
+//! same bytes (announcements, batches, attested batches with chains of the
+//! shape the router expects, seqno requests) or to a frame that
 //! decodes to the same fields; a decoded frame split into fragments for any
 //! hop MTU reassembles into the same payload.
 #![no_main]
@@ -29,6 +31,29 @@ fuzz_target!(|data: &[u8]| {
         let again = wire::encode_announces(&batch, usize::MAX);
         assert_eq!(again.len(), 1);
         assert_eq!(&again[0][..], data, "a batch re-encodes to the same datagram");
+    }
+    // attested batches, from a neighbour whose key the input picks
+    if let Some((&k, rest)) = data.split_first() {
+        let from = mycel_crypto::SignPk([k; 32]);
+        let batch = wire::decode_attested(rest, &from);
+        if !batch.is_empty() {
+            for a in &batch {
+                assert!(a.name.len() <= wire::MAX_NAME);
+                let n = a.chain.as_ref().map_or(0, |c| c.len());
+                assert!(n == a.hops as usize || n == a.hops as usize + 1, "{n} hops for {}", a.hops);
+                assert!(n <= mycel_net::mesh::core::MAX_CHAIN);
+                assert!(a.chain_len() > 0 && a.cost != u32::MAX);
+                assert_eq!(wire::wire_len(a), {
+                    let (g, r) = wire::encode_attested(vec![a.clone()], usize::MAX);
+                    assert!(r.is_empty(), "a decoded announcement encodes");
+                    g[0].len() - 1
+                });
+            }
+            let (again, rest2) = wire::encode_attested(batch, usize::MAX);
+            assert!(rest2.is_empty());
+            assert_eq!(again.len(), 1);
+            assert_eq!(&again[0][..], rest, "an attested batch re-encodes to the same datagram");
+        }
     }
     if let Some(r) = wire::decode_seqreq(data) {
         assert_eq!(&wire::encode_seqreq(&r)[..], data);

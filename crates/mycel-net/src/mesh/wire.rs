@@ -334,10 +334,12 @@ fn get_attested(r: &mut Reader<'_>, from: &SignPk) -> Option<Announce> {
     let att = r.u8()?;
     let (base, own) = (att & A_BASE != 0, att & A_OWN != 0);
     let h = hops as usize;
-    if att & !(A_BASE | A_OWN) != 0 || (h == 0 && !own) || h + own as usize > MAX_CHAIN {
+    // (the origin's signature only with the sender's own hop, as we send it:
+    // every accepted encoding is the one we would send)
+    if att & !(A_BASE | A_OWN) != 0 || (base && !own) || (h == 0 && !own) || h + own as usize > MAX_CHAIN {
         return None;
     }
-    let sig = if base { r.sig()? } else { NO_SIG };
+    let sig = if base { r.sig().filter(|s| *s != NO_SIG)? } else { NO_SIG };
     let between = h.saturating_sub(1);
     let keys: Vec<SignPk> = (0..between).map(|_| r.key()).collect::<Option<_>>()?;
     let mut chain = Arc::new(Hop { signer: origin, cost: 0, link: r.u32()?, sig: r.sig()?, prev: None });
@@ -631,6 +633,30 @@ mod tests {
         assert_eq!(rest, vec![plain.clone(), plain]);
         // an absent signature never verifies
         assert!(!verify(Check::Origin(&Announce { sig: NO_SIG, ..a })));
+    }
+
+    /// What one attestation hop costs a device: `cargo test --release -p
+    /// mycel-net attestation_crypto_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn attestation_crypto_cost() {
+        let (o, r) = (DeviceKeys::generate(), DeviceKeys::generate());
+        let me = DeviceKeys::generate().sign_pk();
+        let a = attested(&o, &[&r], me, true);
+        let n = 20_000;
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            let x = Announce { cost: a.cost + i, sign_link: Some(300), ..a.clone() };
+            std::hint::black_box(sign_hop(&r, x, &me));
+        }
+        let sign = t.elapsed().as_secs_f64() / n as f64 * 1e6;
+        let hop = a.chain.as_ref().unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..n {
+            assert!(verify(Check::Hop { ann: &a, hop, pos: 1, next: me }));
+        }
+        let check = t.elapsed().as_secs_f64() / n as f64 * 1e6;
+        println!("attestation hop: sign {sign:.1} µs, verify {check:.1} µs (this machine)");
     }
 
     #[test]

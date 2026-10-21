@@ -7,9 +7,15 @@
 //! framing. Signature checks are decided by the input: a liar may hold a
 //! valid signature.
 //!
+//! Attested announcements (`ROUTE_ATTEST`) arrive raw or structured, with
+//! chains of any shape and hop values; the router checks their structure
+//! and bounds itself, and each signature as the input decides.
+//!
 //! Properties: nothing panics (overflow checks are on), the router never
-//! addresses itself, what it emits re-encodes, and a frame relayed in the
-//! step it arrived has a lower TTL than it arrived with.
+//! addresses itself, what it emits re-encodes (attested announcements, once
+//! signed, as an attested datagram: the router only ever extends chains of
+//! the shape it checked), attests only to neighbours that take it, and a
+//! frame relayed in the step it arrived has a lower TTL than it arrived with.
 #![no_main]
 
 use std::sync::Arc;
@@ -18,7 +24,7 @@ use arbitrary::Arbitrary;
 use bytes::Bytes;
 use libfuzzer_sys::fuzz_target;
 use mycel_crypto::{Sig, SignPk};
-use mycel_net::mesh::core::{Announce, Config, Frame, Out, Router, SeqReq};
+use mycel_net::mesh::core::{Announce, Config, Frame, Hop, Out, Router, SeqReq};
 use mycel_net::mesh::wire;
 
 const PEERS: u8 = 12;
@@ -36,6 +42,20 @@ enum Step {
     DialFailed(u8),
     SetInternet(bool),
     SetUplink(u32),
+    SetAttests(u8, Option<bool>),
+    Attested {
+        from: u8,
+        origin: u8,
+        /// The hops between the origin and the sender: (key, cost, link).
+        relays: Vec<(u8, u32, u32)>,
+        origin_link: u32,
+        cost: u32,
+        /// The sender's own hop (its link to us), if it signs one.
+        own: Option<u32>,
+        seq: i32,
+        scope: u8,
+        verify: bool,
+    },
     Raw {
         from: u8,
         bytes: Vec<u8>,
@@ -103,19 +123,30 @@ struct Input {
     gateway: bool,
     fisheye: bool,
     flood_reduction: bool,
+    attest: bool,
     steps: Vec<Step>,
 }
 
 const WALL0: u64 = 1_760_000_000_000;
 
 /// `arrived`: the (TTL, extension bits) of a frame that arrived this step.
-fn check(me: SignPk, outs: &mut Vec<Out>, arrived: Option<(u8, u8)>) {
+fn check(me: SignPk, r: &Router, outs: &mut Vec<Out>, arrived: Option<(u8, u8)>) {
     for out in outs.drain(..) {
         match out {
             Out::Announce { to, ann } => {
                 assert_ne!(to, me, "announcement to ourselves");
                 assert!(ann.name.len() <= wire::MAX_NAME);
-                assert_eq!(wire::decode_announce(&wire::encode_announce(&ann)), Some(ann));
+                if ann.chain.is_some() || ann.sign_link.is_some() {
+                    assert!(r.attests(&to), "attested to a neighbour that doesn't take it");
+                    let signed = ann.signed_by(me, Sig([9; 64]));
+                    let (grams, rest) = wire::encode_attested(vec![signed.clone()], usize::MAX);
+                    assert!(rest.is_empty(), "the router extended a chain it can't send: {signed:?}");
+                    let back = wire::decode_attested(&grams[0], &me);
+                    assert_eq!(back.len(), 1);
+                    assert_eq!((back[0].chain.clone(), back[0].hops, back[0].cost), (signed.chain, signed.hops, signed.cost));
+                } else {
+                    assert_eq!(wire::decode_announce(&wire::encode_announce(&ann)), Some(ann));
+                }
             }
             Out::SeqReq { to, .. } => assert_ne!(to, me, "seqno request to ourselves"),
             Out::Frame { to, frame, relayed } => {
@@ -142,6 +173,7 @@ fuzz_target!(|input: Input| {
         gateway: input.gateway,
         fisheye: input.fisheye,
         flood_reduction: input.flood_reduction,
+        attest: input.attest,
         ..Config::default()
     };
     let mut r = Router::new(me, cfg);
@@ -158,6 +190,41 @@ fuzz_target!(|input: Input| {
             Step::DialFailed(p) => r.dial_failed(pk(p), now),
             Step::SetInternet(on) => r.set_internet(on),
             Step::SetUplink(u) => r.set_uplink(u),
+            Step::SetAttests(p, on) => r.set_attests(pk(p), on, now),
+            Step::Attested { from, origin, relays, origin_link, cost, own, seq, scope, verify } => {
+                let (from, origin) = (pk(from), pk(origin));
+                let mut chain = Arc::new(Hop { signer: origin, cost: 0, link: origin_link, sig: Sig([1; 64]), prev: None });
+                for (k, c, l) in relays.iter().take(16) {
+                    chain = Arc::new(Hop { signer: pk(*k), cost: *c, link: *l, sig: Sig([2; 64]), prev: Some(chain) });
+                }
+                // the sender sits right after the relays, with or without its own hop
+                let hops = relays.len().min(16) as u8 + 1;
+                if let Some(l) = own {
+                    chain = Arc::new(Hop { signer: from, cost, link: l, sig: Sig([3; 64]), prev: Some(chain) });
+                }
+                let a = Announce {
+                    hops,
+                    cost,
+                    origin,
+                    seq: wall.saturating_add_signed(i64::from(seq)),
+                    flags: 0,
+                    scope,
+                    uplink: 0,
+                    name: Arc::from(""),
+                    sig: Sig([4; 64]),
+                    chain: Some(chain),
+                    sign_link: None,
+                };
+                // as the decoder would give it, where it would
+                let (g, rest) = wire::encode_attested(vec![a.clone()], usize::MAX);
+                if rest.is_empty() {
+                    for a in wire::decode_attested(&g[0], &from) {
+                        r.on_announce(from, a, now, wall, |_| verify);
+                    }
+                } else {
+                    r.on_announce(from, a, now, wall, |_| verify);
+                }
+            }
             Step::Raw { from, bytes, verify } => {
                 let from = pk(from);
                 // as `Driver::on_datagram`
@@ -183,6 +250,11 @@ fuzz_target!(|input: Input| {
                             r.on_seqreq(from, q, now);
                         }
                     }
+                    Some(&5) => {
+                        for a in wire::decode_attested(&bytes, &from) {
+                            r.on_announce(from, a, now, wall, |_| verify);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -197,6 +269,8 @@ fuzz_target!(|input: Input| {
                     uplink,
                     name: Arc::from(wire::truncate(&name, wire::MAX_NAME)),
                     sig: Sig([origin; 64]),
+                    chain: None,
+                    sign_link: None,
                 };
                 // only what the decoder lets through
                 let a = wire::decode_announce(&wire::encode_announce(&a)).expect("valid announcement");
@@ -267,7 +341,7 @@ fuzz_target!(|input: Input| {
             }
         }
         r.drain(&mut outs);
-        check(me, &mut outs, arrived);
+        check(me, &r, &mut outs, arrived);
     }
     let _ = r.stats();
 });
