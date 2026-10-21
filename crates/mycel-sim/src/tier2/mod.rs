@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 pub use engine::{Action, Area, HOUR, Inet, MIN, MS, MsgId, NodeId, NodeSpec, Router, SEC, Sim, Techs, Time};
 
-use crate::stats::{Summary, jain, max_share};
+use crate::stats::{Summary, Tail, jain, max_share};
 
 /// What a tier-2 run measured.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -30,6 +30,13 @@ pub struct T2Metrics {
     pub latency_s: Summary,
     /// achieved / optimal latency, per delivered message with an oracle answer.
     pub optimality: Summary,
+    /// The tail of the same ratios in numbers that hold at a few hundred
+    /// messages (p95 with its interval, CVaR₉₅, counts over 10× and 30×).
+    #[serde(default)]
+    pub optimality_tail: Tail,
+    /// The ratios themselves, for pooling across seeds (not reported).
+    #[serde(skip)]
+    pub optimality_ratios: Vec<f64>,
     /// Seconds from send to the receipt (or a call's answer) at the sender.
     pub round_trip_s: Summary,
     /// Copies of each message that came to exist (1 = no duplication).
@@ -99,6 +106,8 @@ pub fn metrics<R: Router>(
         delivery_ratio: if feasible.is_empty() { 0.0 } else { delivered_feasible as f64 / feasible.len() as f64 },
         latency_s: Summary::of(&lat),
         optimality: Summary::of(&opt),
+        optimality_tail: Tail::of(&opt),
+        optimality_ratios: opt.clone(),
         round_trip_s: Summary::of(&rt),
         copies_per_msg: copies,
         handoffs_per_msg: handoffs,

@@ -11,6 +11,23 @@ pub struct Slo {
     pub target: String,
     pub actual: String,
     pub pass: bool,
+    /// The measured number, for objectives that have one (calibration
+    /// across seeds reads it).
+    #[serde(default)]
+    pub value: Option<f64>,
+    /// An invariant (no loops, no route through a black hole after the
+    /// defence, convergence at all) must hold on every seed; any other
+    /// objective is a quality metric, judged on how many seeds pass
+    /// ([`crate::seeds`]).
+    #[serde(default)]
+    pub invariant: bool,
+}
+
+impl Slo {
+    /// Make this objective an invariant: zero tolerance on every seed.
+    pub fn invariant(&mut self) {
+        self.invariant = true;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +57,11 @@ pub struct ScenarioResult {
     pub notes: Vec<String>,
     pub metrics: serde_json::Value,
     pub wall_s: f64,
+    /// The candidate's optimality ratios (achieved / fastest feasible), one
+    /// per delivered message, for pooling across seeds ([`crate::seeds`]):
+    /// p99 only means something over thousands. Not written out.
+    #[serde(skip)]
+    pub optimality: Vec<f64>,
 }
 
 impl ScenarioResult {
@@ -57,6 +79,7 @@ impl ScenarioResult {
             notes: Vec::new(),
             metrics: serde_json::Value::Null,
             wall_s: 0.0,
+            optimality: Vec::new(),
         }
     }
 
@@ -64,28 +87,44 @@ impl ScenarioResult {
         self.expected_fail = Some(why.into());
     }
 
+    fn push(&mut self, slo: Slo) -> &mut Slo {
+        self.slos.push(slo);
+        self.slos.last_mut().expect("just pushed")
+    }
+
     /// Require `actual <= max`.
-    pub fn at_most(&mut self, name: &str, actual: f64, max: f64, unit: &str) {
-        self.slos.push(Slo {
+    pub fn at_most(&mut self, name: &str, actual: f64, max: f64, unit: &str) -> &mut Slo {
+        self.push(Slo {
             name: name.into(),
             target: format!("≤ {} {unit}", fmt(max)),
             actual: format!("{} {unit}", fmt(actual)),
             pass: actual.is_finite() && actual <= max,
-        });
+            value: Some(actual),
+            invariant: false,
+        })
     }
 
     /// Require `actual >= min`.
-    pub fn at_least(&mut self, name: &str, actual: f64, min: f64, unit: &str) {
-        self.slos.push(Slo {
+    pub fn at_least(&mut self, name: &str, actual: f64, min: f64, unit: &str) -> &mut Slo {
+        self.push(Slo {
             name: name.into(),
             target: format!("≥ {} {unit}", fmt(min)),
             actual: format!("{} {unit}", fmt(actual)),
             pass: actual.is_finite() && actual >= min,
-        });
+            value: Some(actual),
+            invariant: false,
+        })
     }
 
-    pub fn check(&mut self, name: &str, ok: bool, actual: impl Into<String>) {
-        self.slos.push(Slo { name: name.into(), target: "true".into(), actual: actual.into(), pass: ok });
+    pub fn check(&mut self, name: &str, ok: bool, actual: impl Into<String>) -> &mut Slo {
+        self.push(Slo {
+            name: name.into(),
+            target: "true".into(),
+            actual: actual.into(),
+            pass: ok,
+            value: None,
+            invariant: false,
+        })
     }
 
     pub fn headline(&mut self, s: impl Into<String>) {

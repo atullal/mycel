@@ -17,7 +17,7 @@ use std::collections::BinaryHeap;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{Access, Env, Nat, Tech, backbone, km, nearest_relay};
-use crate::stats::Rng;
+use crate::stats::{Rng, Stream, stream_seed};
 
 /// Microseconds of virtual time.
 pub type Time = u64;
@@ -289,7 +289,9 @@ pub struct WorldCore<F> {
     events: Vec<Option<Ev<F>>>,
     free: Vec<usize>,
     seq: u64,
-    /// Radio jitter and the routers' own randomness.
+    /// Radio jitter and the routers' own randomness: the seed's protocol
+    /// stream ([`Stream::Protocol`]), apart from every stream the scenario
+    /// draws its world and workload from.
     pub rng: Rng,
     /// Where walking devices go: a stream of its own, so the world (who
     /// meets whom, when) is the same whatever the routers send.
@@ -691,7 +693,7 @@ impl<R: Router> Sim<R> {
             events: Vec::new(),
             free: Vec::new(),
             seq: 0,
-            rng: Rng::new(seed),
+            rng: Rng::new(stream_seed(seed, Stream::Protocol)),
             mob_rng: Rng::new(seed ^ 0x6d6f_6269_6c69_7479),
             msgs: Vec::new(),
             counters: vec![NodeCounters::default(); n],
