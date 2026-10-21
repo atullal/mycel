@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! frame  = len:u16be  type:u8  body[len-1]
-//! type 1 = hello:  "MYCL" version:u8 node_key[32] name:utf8   (first frame, both ways)
+//! type 1 = hello:  "MYCL" version:u8 node_key[32] name:utf8 [0x00 ext]   (first frame, both ways)
 //! type 2 = packet: one QUIC datagram
 //! type 3 = ping:   empty; sent every few seconds so a dead channel is noticed
 //!                  even when the OS doesn't report it and QUIC is idle
@@ -17,6 +17,13 @@
 //! dialing side already read it from GATT). It is *not* authenticated: QUIC's
 //! TLS handshake authenticates the node key end to end, so a device lying in
 //! its hello can at worst black-hole the Bluetooth path for that key.
+//!
+//! Room to grow (docs/PROTOCOL.md §3.9): a name never contains a NUL byte,
+//! and readers stop the name at the first one, so a later build can append
+//! fields after a NUL to the GATT record and the hello (a supported version
+//! range, say) that this build ignores. A later build must keep sending
+//! version 1 records and hellos until every build it should reach reads
+//! such fields.
 
 use std::collections::VecDeque;
 
@@ -33,6 +40,10 @@ const T_PING: u8 = 3;
 pub const MAX_FRAME: usize = 4096;
 /// Longest display name carried in GATT / hello.
 pub const MAX_NAME: usize = 64;
+/// Longest GATT info record read: the most an attribute value can hold
+/// (Bluetooth Core, Vol 3 Part F §3.2.9), so fields a later build appends
+/// fit.
+pub const MAX_GATT: usize = 512;
 
 /// What a peripheral publishes in its GATT characteristic: where its L2CAP
 /// channel listens and which node it is.
@@ -52,9 +63,22 @@ pub fn clip_name(name: &str) -> &str {
     &name[..end]
 }
 
+/// A name as it goes on the air: no NUL (that ends the name, see the module
+/// docs), at most [`MAX_NAME`] bytes.
+fn air_name(name: &str) -> String {
+    clip_name(&name.replace('\0', "")).to_owned()
+}
+
+/// A name as read off the air: up to the first NUL (what follows is for a
+/// later build), at most [`MAX_NAME`] bytes.
+fn read_name(b: &[u8]) -> String {
+    let end = b.iter().position(|&c| c == 0).unwrap_or(b.len());
+    clip_name(&String::from_utf8_lossy(&b[..end])).to_owned()
+}
+
 impl GattInfo {
     pub fn encode(&self) -> Vec<u8> {
-        let name = clip_name(&self.name);
+        let name = air_name(&self.name);
         let mut v = Vec::with_capacity(35 + name.len());
         v.push(VERSION);
         v.extend_from_slice(&self.psm.to_be_bytes());
@@ -64,12 +88,12 @@ impl GattInfo {
     }
 
     pub fn decode(b: &[u8]) -> Option<GattInfo> {
-        if b.len() < 35 || b[0] != VERSION || b.len() > 35 + MAX_NAME {
+        if b.len() < 35 || b[0] != VERSION || b.len() > MAX_GATT {
             return None;
         }
         let psm = u16::from_be_bytes([b[1], b[2]]);
         let key = SignPk(b[3..35].try_into().ok()?);
-        let name = String::from_utf8_lossy(&b[35..]).into_owned();
+        let name = read_name(&b[35..]);
         Some(GattInfo { psm, key, name })
     }
 }
@@ -93,7 +117,7 @@ fn frame(ty: u8, body_len: usize, body: impl FnOnce(&mut BytesMut)) -> Bytes {
 }
 
 pub fn encode_hello(key: &SignPk, name: &str) -> Bytes {
-    let name = clip_name(name);
+    let name = air_name(name);
     frame(T_HELLO, 4 + 1 + 32 + name.len(), |b| {
         b.put_slice(MAGIC);
         b.put_u8(VERSION);
@@ -148,14 +172,16 @@ impl Deframer {
                 T_PACKET => Frame::Packet(body),
                 T_PING => Frame::Ping,
                 T_HELLO => {
-                    if body.len() < 37 || &body[..4] != MAGIC || body.len() > 37 + MAX_NAME {
+                    // (any length up to MAX_FRAME: a later build may append
+                    // fields after the name's NUL)
+                    if body.len() < 37 || &body[..4] != MAGIC {
                         return Err(BadStream("bad hello"));
                     }
                     if body[4] != VERSION {
                         return Err(BadStream("unsupported version"));
                     }
                     let key = SignPk(body[5..37].try_into().expect("32 bytes"));
-                    let name = String::from_utf8_lossy(&body[37..]).into_owned();
+                    let name = read_name(&body[37..]);
                     Frame::Hello { key, name }
                 }
                 _ => return Err(BadStream("unknown frame type")),
@@ -243,6 +269,39 @@ mod tests {
         let d = GattInfo::decode(&long.encode()).unwrap();
         assert_eq!(d.name, "é".repeat(32));
         assert!(long.encode().len() <= 35 + MAX_NAME);
+    }
+
+    /// A later build may append fields after a NUL that ends the name: the
+    /// GATT record and the hello still read, the extra bytes ignored. This
+    /// build never puts a NUL in a name.
+    #[test]
+    fn fields_a_later_build_appends_are_ignored() {
+        let i = GattInfo { psm: 0x00c1, key: key(7), name: "Bob".into() };
+        let mut b = i.encode();
+        b.push(0);
+        b.extend_from_slice(&[1, 2, 0xff, 0, 9]); // e.g. a version range
+        assert_eq!(GattInfo::decode(&b), Some(i.clone()));
+        b.resize(MAX_GATT, 7);
+        assert_eq!(GattInfo::decode(&b), Some(i));
+        b.push(7);
+        assert_eq!(GattInfo::decode(&b), None, "longer than an attribute can be");
+        let sneaky = GattInfo { psm: 1, key: key(1), name: "a\0b".into() };
+        assert_eq!(GattInfo::decode(&sneaky.encode()).unwrap().name, "ab");
+        // a long name on its own, with no NUL, still reads (as before)
+        let long = GattInfo { psm: 1, key: key(1), name: "n".repeat(MAX_NAME) };
+        assert_eq!(GattInfo::decode(&long.encode()).unwrap().name, "n".repeat(MAX_NAME));
+
+        let hello = encode_hello(&key(3), "bob");
+        let mut longer = hello[3..].to_vec(); // the hello body
+        longer.extend_from_slice(&[0, 1, 2, 3]);
+        let mut framed = ((1 + longer.len()) as u16).to_be_bytes().to_vec();
+        framed.push(1);
+        framed.extend_from_slice(&longer);
+        framed.extend_from_slice(&encode_ping());
+        let got = Deframer::default().push(&framed).unwrap();
+        assert_eq!(got, vec![Frame::Hello { key: key(3), name: "bob".into() }, Frame::Ping]);
+        let got = Deframer::default().push(&encode_hello(&key(3), "x\0y")).unwrap();
+        assert_eq!(got, vec![Frame::Hello { key: key(3), name: "xy".into() }]);
     }
 
     #[test]

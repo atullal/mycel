@@ -272,10 +272,48 @@ impl DtnConfig {
     }
 }
 
+/// The format of a bundle (docs/PROTOCOL.md §3.6): `version`, of what
+/// carriers check (the id and signature rules), and `kind`, of what only
+/// the destination reads (the payload). A carrier refuses a version it
+/// can't check, but carries a payload kind it doesn't know like any other:
+/// it never reads payloads anyway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BundleFormat {
+    pub version: u8,
+    pub kind: u16,
+}
+
+/// Bundle header versions: 1, as pre-release builds sign them (the payload
+/// kind is implicitly [`KIND_SPACE_SYNC`]); 2, which signs the version and
+/// a payload kind.
+pub const BUNDLE_V1: u8 = 1;
+pub const BUNDLE_V2: u8 = 2;
+/// The newest bundle header version this build checks.
+pub const BUNDLE_VERSION: u8 = BUNDLE_V2;
+/// Payload kinds. What a node sends a member of a space it can't reach
+/// live: signed ops and encrypted envelopes of that space.
+pub const KIND_SPACE_SYNC: u16 = 1;
+
+impl BundleFormat {
+    /// The pre-release format, which every carrier takes.
+    pub const V1: BundleFormat = BundleFormat { version: BUNDLE_V1, kind: KIND_SPACE_SYNC };
+
+    pub const fn v2(kind: u16) -> BundleFormat {
+        BundleFormat { version: BUNDLE_V2, kind }
+    }
+
+    /// Whether this build can check the header (else: refuse the bundle).
+    pub const fn checkable(self) -> bool {
+        matches!(self.version, BUNDLE_V1 | BUNDLE_V2) && (self.version != BUNDLE_V1 || self.kind == KIND_SPACE_SYNC)
+    }
+}
+
 /// A bundle. `id` = H(src, dst, payload) (the same data is the same
-/// bundle); `sig` is the source's over `(id, created, lifetime)`.
+/// bundle); `sig` is the source's over `(id, created, lifetime)` (version
+/// 2: and over its format).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bundle {
+    pub format: BundleFormat,
     pub id: Hash32,
     pub src: SignPk,
     pub dst: SignPk,
@@ -292,6 +330,7 @@ pub struct Bundle {
 /// the payload once it has arrived.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Offer {
+    pub format: BundleFormat,
     pub id: Hash32,
     pub src: SignPk,
     pub dst: SignPk,
@@ -305,6 +344,7 @@ pub struct Offer {
 impl Offer {
     pub fn of(b: &Bundle, copies: u8) -> Offer {
         Offer {
+            format: b.format,
             id: b.id,
             src: b.src,
             dst: b.dst,

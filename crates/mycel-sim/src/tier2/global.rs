@@ -47,7 +47,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 use mycel_crypto::Hash32;
 use mycel_crypto::{Sig, SignPk};
 use mycel_net::mesh::core::{self as mc, Announce, Config, Out, SeqReq};
-use mycel_net::mesh::dtn::{Accepted, Answer, Bundle, Carrier, DtnConfig, Offer, Receipt, Summary as DtnSummary};
+use mycel_net::mesh::dtn::{
+    Accepted, Answer, Bundle, BundleFormat, Carrier, DtnConfig, Offer, Receipt, Summary as DtnSummary,
+};
 
 use super::engine::{Cx, MS, MsgId, NodeId, Over, Router, SEC, Techs, Time};
 use super::mycel::Role;
@@ -300,6 +302,7 @@ impl Global {
         let pk = self.pk;
         let Some(c) = self.dtn.as_mut() else { return };
         let b = Bundle {
+            format: BundleFormat::V1,
             id: bundle_id(msg, node(&pk)),
             src: pk,
             dst: key(dst),

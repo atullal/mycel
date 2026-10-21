@@ -7,13 +7,20 @@
 //! keepers), and everything received is re-validated by the receiving
 //! `Replica` — nothing is trusted because of who sent it.
 //!
-//! Connections: one ALPN ([`wire::ALPN`]), and a long-lived connection per
-//! peer from a small connection pool (`pool.rs`; closed after [`POOL_IDLE`]
-//! without use, redialed when it breaks). Every exchange is a new QUIC stream on it, labelled by a
-//! [`wire::StreamKind`] byte; the server accepts streams in a loop. QUIC does
-//! the multiplexing, flow control and loss recovery; stream priorities send
-//! messages ahead of file bytes. No handshake per sync, and the connection's
-//! extra paths (links, other interfaces) stay open and measured.
+//! Connections: one protocol ([`wire::ALPN`], in every wire version the
+//! node speaks: see [`version`] and docs/PROTOCOL.md), and a long-lived
+//! connection per peer from a small connection pool (`pool.rs`; closed
+//! after [`POOL_IDLE`] without use, redialed when it breaks). Every exchange
+//! is a new QUIC stream on it, labelled by a [`wire::StreamKind`] byte; the
+//! server accepts streams in a loop, and refuses a kind it doesn't know
+//! with [`version::STREAM_REFUSED`]. QUIC does the multiplexing, flow
+//! control and loss recovery; stream priorities send messages ahead of
+//! file bytes. No handshake per sync, and the connection's extra paths
+//! (links, other interfaces) stay open and measured. On wire version 2 the
+//! dialer sends a capability hello ([`wire::StreamKind::Hello`]) on a
+//! stream of its own, beside the exchange it dialed for: the two race, so
+//! nothing may assume the hello arrives (or is answered) first, and a hello
+//! that fails is tried again later on the same connection.
 //!
 //! Sync protocol (stream kind `Sync`), one bi-stream, strictly alternating so
 //! neither side can deadlock on flow control:
@@ -33,6 +40,7 @@ pub mod mesh;
 mod native_mdns;
 mod pool;
 mod resources;
+pub mod version;
 pub mod wire;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -48,7 +56,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, PublicKey, SecretKey,
     address_lookup::{MemoryLookup, UserData},
-    endpoint::{Connection, RecvStream, SendStream, presets},
+    endpoint::{ConnectOptions, Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
@@ -63,6 +71,8 @@ pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_fr
 pub use iroh;
 pub use link::{Link, LinkEvent, LinkStatus, PathKind, path_in_use};
 pub use mesh::{Mesh, MeshOptions, MeshRoute, MeshStats, Tap};
+pub use version::{Caps, PeerProtocol, Protocol, VersionError, WireVersion};
+use version::{Hello, STREAM_REFUSED, WIRE_V2};
 use wire::*;
 pub use wire::{ContactCard, MAX_EPHEMERAL};
 
@@ -145,6 +155,10 @@ pub struct NodeOptions {
     /// device. What is queued for the app (up to 1024 events) can hold
     /// that much per event.
     pub max_ephemeral: usize,
+    /// The newest wire version offered and the capabilities advertised, on
+    /// the node protocol and the mesh alike (docs/PROTOCOL.md). Default:
+    /// everything this build speaks.
+    pub protocol: Protocol,
 }
 
 /// Another protocol served on the node's endpoint: incoming connections with
@@ -173,6 +187,7 @@ impl NodeOptions {
             extra_protocols: Vec::new(),
             mesh: None,
             max_ephemeral: MAX_EPHEMERAL,
+            protocol: Protocol::default(),
         }
     }
 }
@@ -220,6 +235,9 @@ pub struct PeerState {
     pub via: Option<PathKind>,
     /// When `via` is the mesh: which neighbour it leaves through, how many hops.
     pub mesh: Option<MeshRoute>,
+    /// The wire version and capabilities last agreed with the peer, on a
+    /// connection either side dialed (`None`: none agreed yet).
+    pub protocol: Option<PeerProtocol>,
 }
 
 impl PeerState {
@@ -280,10 +298,19 @@ struct Inner {
     accepted: AtomicU64,
     /// Blob bytes served to fetching members.
     blob_served: AtomicU64,
+    /// Capability hellos answered (one per connection a v2 peer dials).
+    hellos_served: AtomicU64,
+    /// Capability hellos we sent that failed (see [`ConnectionCounts`]).
+    hellos_failed: AtomicU64,
+    /// Tests: refuse this many hellos we're sent, as a lossy path would.
+    #[cfg(test)]
+    drop_hellos: std::sync::atomic::AtomicU32,
     /// The last store-and-forward bundle sent per (member, space).
     bundled: Mutex<HashMap<(SignPk, SpaceId), Hash32>>,
     /// See [`NodeOptions::max_ephemeral`].
     max_ephemeral: usize,
+    /// See [`NodeOptions::protocol`].
+    protocol: Protocol,
     /// Memory for what devices send us: those we share a space with, and
     /// the rest (`resources.rs`).
     member_frames: resources::Frames,
@@ -297,6 +324,10 @@ pub struct ConnectionCounts {
     pub dialed: u64,
     /// Accepted from peers.
     pub accepted: u64,
+    /// Capability hellos we sent on dialed connections that failed (lost
+    /// stream, timeout). Each is tried again later on the same connection,
+    /// a few times; meanwhile that connection has no capabilities.
+    pub hellos_failed: u64,
 }
 
 impl Inner {
@@ -468,6 +499,28 @@ impl Inner {
         p.last_fail = Some(Instant::now());
     }
 
+    /// Remember what was agreed with `peer` on a connection we dialed
+    /// (diagnostics, and formats sent without a connection:
+    /// store-and-forward). We chose to dial it, so it may get an entry.
+    fn note_protocol(&self, peer: SignPk, p: PeerProtocol) {
+        self.peers.lock().entry(peer).or_default().protocol = Some(p);
+    }
+
+    /// The same, on a connection `peer` dialed: before any exchange, so
+    /// anyone may have dialed (a fresh key costs nothing). Only a device we
+    /// already track or share a space with is noted; a stranger gets no
+    /// entry, which would never be removed. (Its connection still knows its
+    /// version.)
+    fn note_accepted_protocol(&self, peer: SignPk, p: PeerProtocol) {
+        let member = self.spaces.lock().values().any(|r| r.is_member(&peer));
+        let mut peers = self.peers.lock();
+        match peers.get_mut(&peer) {
+            Some(state) => state.protocol = Some(p),
+            None if member => peers.entry(peer).or_default().protocol = Some(p),
+            None => {}
+        }
+    }
+
     /// The memory budget for what `peer` sends us on a stream it opened: a
     /// share of the members' pool if we share a space with it (now: it may
     /// just have joined one), of the strangers' otherwise.
@@ -532,13 +585,22 @@ impl Inner {
     }
 
     /// A bundle for us arrived through carriers: apply it like a sync from
-    /// its (authenticated) source, if that source is a member.
-    fn on_bundle(&self, src: SignPk, payload: &[u8]) {
-        let Ok(DtnPayload { space, data }) = postcard::from_bytes::<DtnPayload>(payload) else { return };
+    /// its (authenticated) source, if that source is a member. A payload
+    /// kind this build doesn't know (a newer sender's) is refused unread;
+    /// it was still delivered (the mesh has sent its receipt), so carriers
+    /// stop carrying it.
+    fn on_bundle(&self, src: SignPk, kind: u16, payload: &[u8]) -> Result<()> {
+        if kind != mesh::dtn::KIND_SPACE_SYNC {
+            return Err(
+                VersionError::Unsupported { what: "bundle payload kind", version: kind.into(), newest: 1 }.into()
+            );
+        }
+        let DtnPayload { space, data } = postcard::from_bytes::<DtnPayload>(payload)?;
         if !self.with_space(&space, |r| r.is_member(&src)).unwrap_or(false) {
-            return;
+            return Ok(());
         }
         self.ingest(&space, src, data, &[]);
+        Ok(())
     }
 
     fn schedule(&self, space: SpaceId) {
@@ -662,40 +724,57 @@ async fn serve_conn(inner: &Arc<Inner>, conn: Connection) {
     inner.accepted.fetch_add(1, Ordering::Relaxed);
     inner.watch(&conn);
     let peer = to_sign_pk(&conn.remote_id());
+    // (the router only hands us connections with one of our ALPNs)
+    let Some(version) = wire::version_of(conn.alpn()) else { return };
+    if version < WIRE_V2 {
+        inner.note_accepted_protocol(peer, PeerProtocol::baseline(version));
+    }
     loop {
         tokio::select! {
             bi = conn.accept_bi() => {
                 let Ok((tx, rx)) = bi else { break };
                 let (inner, conn) = (inner.clone(), conn.clone());
                 tokio::spawn(async move {
-                    let _ = serve_bi(&inner, &conn, peer, tx, rx).await;
+                    let _ = serve_bi(&inner, &conn, version, peer, tx, rx).await;
                 });
             }
             uni = conn.accept_uni() => {
                 let Ok(rx) = uni else { break };
                 let inner = inner.clone();
                 tokio::spawn(async move {
-                    let _ = serve_uni(&inner, peer, rx).await;
+                    let _ = serve_uni(&inner, version, peer, rx).await;
                 });
             }
         }
     }
 }
 
-async fn stream_kind(rx: &mut RecvStream) -> Result<StreamKind> {
+/// The kind byte a stream starts with. One this wire `version` doesn't
+/// have is refused at once: both directions are stopped with
+/// [`STREAM_REFUSED`], so the opener (an older or newer build) learns it
+/// in one round trip instead of waiting for an answer that never comes.
+async fn stream_kind(version: WireVersion, tx: Option<&mut SendStream>, rx: &mut RecvStream) -> Result<StreamKind> {
     let mut b = [0u8; 1];
     resources::first(rx.read_exact(&mut b)).await?;
-    StreamKind::from_byte(b[0]).ok_or_else(|| anyhow!("unknown stream kind {}", b[0]))
+    StreamKind::on(version, b[0]).ok_or_else(|| {
+        let code = iroh::endpoint::VarInt::from_u32(STREAM_REFUSED);
+        rx.stop(code).ok();
+        if let Some(tx) = tx {
+            tx.reset(code).ok();
+        }
+        VersionError::UnknownStreamKind(b[0]).into()
+    })
 }
 
 async fn serve_bi(
     inner: &Arc<Inner>,
     conn: &Connection,
+    version: WireVersion,
     peer: SignPk,
-    tx: SendStream,
+    mut tx: SendStream,
     mut rx: RecvStream,
 ) -> Result<()> {
-    let kind = stream_kind(&mut rx).await?;
+    let kind = stream_kind(version, Some(&mut tx), &mut rx).await?;
     tx.set_priority(kind.priority()).ok();
     match kind {
         // No total deadline: over a slow link a large sync takes minutes,
@@ -703,15 +782,38 @@ async fn serve_bi(
         StreamKind::Sync => serve_sync(inner, conn, peer, tx, rx).await,
         StreamKind::Card => serve_card(inner, tx).await,
         StreamKind::Blob => blobs::serve(inner, peer, tx, rx).await,
+        StreamKind::Hello => serve_hello(inner, version, peer, tx, rx).await,
         StreamKind::Ephemeral => bail!("ephemeral messages use uni-streams"),
     }
 }
 
-async fn serve_uni(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) -> Result<()> {
-    match stream_kind(&mut rx).await? {
+async fn serve_uni(inner: &Arc<Inner>, version: WireVersion, peer: SignPk, mut rx: RecvStream) -> Result<()> {
+    match stream_kind(version, None, &mut rx).await? {
         StreamKind::Ephemeral => serve_eph(inner, peer, rx).await,
         other => bail!("{other:?} needs a bi-stream"),
     }
+}
+
+/// A dialer's capability hello: answer with ours. (Anyone may send one:
+/// capabilities are public, and both hellos are a few bytes.)
+async fn serve_hello(
+    inner: &Arc<Inner>,
+    version: WireVersion,
+    peer: SignPk,
+    mut tx: SendStream,
+    mut rx: RecvStream,
+) -> Result<()> {
+    let theirs = recv_hello(&mut rx, resources::FIRST_FRAME, &inner.frames(&peer)).await?;
+    #[cfg(test)]
+    if inner.drop_hellos.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+        tx.reset(0u32.into()).ok();
+        bail!("test: hello dropped");
+    }
+    inner.hellos_served.fetch_add(1, Ordering::Relaxed);
+    inner.note_accepted_protocol(peer, PeerProtocol::agreed(version, inner.protocol.caps, theirs.caps));
+    send(&mut tx, &Hello::ours(inner.protocol.caps)).await?;
+    tx.finish()?;
+    Ok(())
 }
 
 async fn serve_sync(
@@ -855,15 +957,19 @@ async fn serve_eph(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) -> Resu
 
 // ─────────────────────────────── client side ───────────────────────────────
 
-/// A fresh connection for another protocol ([`Node::connect`]).
-async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpn: &[u8]) -> Result<Connection> {
+/// A fresh connection for another protocol ([`Node::connect_offering`]):
+/// `alpns` newest first, the peer picks one.
+async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpns: &[&[u8]]) -> Result<Connection> {
     let addr = inner.addr_of(peer)?;
-    match tokio::time::timeout(CONNECT_TIMEOUT, inner.endpoint.connect(addr, alpn)).await {
+    let (first, rest) = alpns.split_first().ok_or_else(|| anyhow!("no protocol to offer"))?;
+    let options = ConnectOptions::new().with_additional_alpns(rest.iter().map(|a| a.to_vec()).collect());
+    let connect = async { anyhow::Ok(inner.endpoint.connect_with_opts(addr, first, options).await?.await?) };
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(c)) => {
             inner.watch(&c);
             Ok(c)
         }
-        Ok(Err(e)) => Err(e.into()),
+        Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow!("connect timed out")),
     }
 }
@@ -873,7 +979,46 @@ async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpn: &[u8]) -> Result<Conne
 pub(crate) async fn pooled(inner: &Arc<Inner>, peer: &SignPk) -> Result<PooledConn> {
     let c = inner.pool.get(peer).await?;
     inner.watch(&c);
+    if c.claim_hello() {
+        start_hello(inner, *peer, &c);
+    }
     Ok(c)
+}
+
+/// A connection we just dialed (or whose last hello failed a while ago:
+/// [`PooledConn::claim_hello`]): agree on capabilities, beside whatever
+/// exchange it was dialed for (nothing waits for this unless it needs a
+/// capability: [`PooledConn::protocol`]). Version 1 has no hello.
+fn start_hello(inner: &Arc<Inner>, peer: SignPk, c: &PooledConn) {
+    let version = c.version();
+    if version < WIRE_V2 {
+        let p = PeerProtocol::baseline(version);
+        c.set_protocol(p);
+        inner.note_protocol(peer, p);
+        return;
+    }
+    let (inner, conn) = (inner.clone(), c.share());
+    tokio::spawn(async move {
+        let caps = inner.protocol.caps;
+        let hello = async {
+            let (mut tx, mut rx) = open_bi(&conn, StreamKind::Hello).await?;
+            let len = send_len(&mut tx, &Hello::ours(caps)).await?;
+            tx.finish()?;
+            recv_hello(&mut rx, resources::reply_timeout(len), &inner.reply_frames(&peer)).await
+        };
+        match hello.await {
+            Ok(theirs) => {
+                let p = PeerProtocol::agreed(version, caps, theirs.caps);
+                conn.set_protocol(p);
+                inner.note_protocol(peer, p);
+            }
+            // (no capabilities until a later try succeeds)
+            Err(_) => {
+                inner.hellos_failed.fetch_add(1, Ordering::Relaxed);
+                conn.hello_failed(PeerProtocol::baseline(version));
+            }
+        }
+    });
 }
 
 /// Run one exchange (`$body`, a future using `$conn`) on the pooled
@@ -904,9 +1049,14 @@ pub(crate) use on_conn;
 /// Open a bi-stream of `kind` (labelled and prioritised). Waits while the
 /// peer already has as many of our streams open as it allows.
 pub(crate) async fn open_bi(conn: &Connection, kind: StreamKind) -> Result<(SendStream, RecvStream)> {
+    open_bi_raw(conn, kind as u8, kind.priority()).await
+}
+
+/// [`open_bi`] with any kind byte (tests: kinds a peer doesn't know).
+pub(crate) async fn open_bi_raw(conn: &Connection, kind: u8, priority: i32) -> Result<(SendStream, RecvStream)> {
     let (mut tx, rx) = resources::within(resources::REPLY_TIMEOUT, "no stream", conn.open_bi()).await?;
-    tx.set_priority(kind.priority()).ok();
-    tx.write_all(&[kind as u8]).await?;
+    tx.set_priority(priority).ok();
+    tx.write_all(&[kind]).await.map_err(|e| version::refusal(e.into()))?;
     Ok((tx, rx))
 }
 
@@ -1157,12 +1307,19 @@ impl Node {
         // Same Ed25519 key for transport and for Mycel signatures (domain-separated).
         let secret = SecretKey::from_bytes(&keys.seed());
         let memory = MemoryLookup::new();
-        let mut alpns: Vec<Vec<u8>> = vec![ALPN.to_vec()];
+        // Every wire version we speak, newest (preferred) first: a peer
+        // that only speaks an older one still gets that one.
+        let node_alpns = wire::alpns(opts.protocol.version);
+        let mesh_alpns = mesh::alpns(opts.protocol.version);
+        let mut alpns: Vec<Vec<u8>> = node_alpns.iter().map(|a| a.to_vec()).collect();
         alpns.extend(opts.extra_protocols.iter().map(|p| p.alpn.clone()));
-        let mesh = opts.mesh.clone().map(|o| Mesh::new(keys.clone(), &opts.name, o));
+        let mesh = opts.mesh.clone().map(|o| {
+            let o = MeshOptions { protocol: opts.protocol, ..o };
+            Mesh::new(keys.clone(), &opts.name, o)
+        });
         let mut links = opts.links;
         if let Some(m) = &mesh {
-            alpns.push(mesh::ALPN.to_vec());
+            alpns.extend(mesh_alpns.iter().map(|a| a.to_vec()));
             links.push(Arc::new(m.clone()));
         }
         let builder = match opts.mode {
@@ -1237,7 +1394,7 @@ impl Node {
             None
         };
         let (events, _) = broadcast::channel(1024);
-        let pool = Pool::new(endpoint.clone());
+        let pool = Pool::new(endpoint.clone(), opts.protocol.version);
         let inner = Arc::new(Inner {
             keys,
             mode: opts.mode,
@@ -1265,17 +1422,28 @@ impl Node {
             pool,
             accepted: AtomicU64::new(0),
             blob_served: AtomicU64::new(0),
+            hellos_served: AtomicU64::new(0),
+            hellos_failed: AtomicU64::new(0),
+            #[cfg(test)]
+            drop_hellos: Default::default(),
             bundled: Mutex::default(),
             max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
+            protocol: opts.protocol,
             member_frames: resources::Frames::members(),
             stranger_frames: resources::Frames::strangers(),
         });
-        let mut router = Router::builder(endpoint).accept(ALPN, Handler { inner: inner.clone() });
+        // (the router's order is the listener's preference: newest first)
+        let mut router = Router::builder(endpoint);
+        for alpn in node_alpns {
+            router = router.accept(alpn, Handler { inner: inner.clone() });
+        }
         for p in opts.extra_protocols {
             router = router.accept(p.alpn, Forward(p.incoming));
         }
         if let Some(m) = &mesh {
-            router = router.accept(mesh::ALPN, m.protocol());
+            for alpn in mesh_alpns {
+                router = router.accept(alpn, m.protocol());
+            }
         }
         let router = router.spawn();
         let mut tasks = vec![tokio::spawn(scheduler(inner.clone()))];
@@ -1301,12 +1469,12 @@ impl Node {
             tasks.push(tokio::spawn(watch_mdns(inner.clone(), mdns)));
         }
         if let Some(m) = &inner.mesh {
-            let (tx, mut rx) = mpsc::unbounded_channel::<(SignPk, bytes::Bytes)>();
+            let (tx, mut rx) = mpsc::unbounded_channel::<(SignPk, u16, bytes::Bytes)>();
             m.set_bundle_sink(tx);
             let inner = inner.clone();
             tasks.push(tokio::spawn(async move {
-                while let Some((src, payload)) = rx.recv().await {
-                    inner.on_bundle(src, &payload);
+                while let Some((src, kind, payload)) = rx.recv().await {
+                    let _ = inner.on_bundle(src, kind, &payload);
                 }
             }));
         }
@@ -1479,7 +1647,15 @@ impl Node {
     /// [`ExtraProtocol`]): dialed by key over every path the node knows
     /// (network, links, relay), with multipath failover.
     pub async fn connect(&self, peer: SignPk, alpn: &[u8]) -> Result<Connection> {
-        let res = connect(&self.inner, &peer, alpn).await;
+        self.connect_offering(peer, &[alpn]).await
+    }
+
+    /// [`Node::connect`] offering several versions of a protocol, newest
+    /// (preferred) first: the peer's TLS picks the first of its own it was
+    /// offered, which `Connection::alpn` then names. That is how a protocol
+    /// served beside the node's gets versions too (docs/PROTOCOL.md §1).
+    pub async fn connect_offering(&self, peer: SignPk, alpns: &[&[u8]]) -> Result<Connection> {
+        let res = connect(&self.inner, &peer, alpns).await;
         match &res {
             Ok(c) => {
                 self.inner.note_path(peer, c);
@@ -1490,11 +1666,26 @@ impl Node {
         res
     }
 
+    /// What this node offers: its newest wire version and its capabilities.
+    pub fn protocol(&self) -> Protocol {
+        self.inner.protocol
+    }
+
+    /// The wire version and capabilities agreed with `peer`: on the pooled
+    /// connection, dialed if there is none, after its hello (one round trip
+    /// on a new connection; nothing on one already agreed). A capability is
+    /// used with a peer only if [`PeerProtocol::supports`] it.
+    pub async fn negotiate(&self, peer: SignPk) -> Result<PeerProtocol> {
+        let conn = pooled(&self.inner, &peer).await?;
+        Ok(conn.protocol(resources::REPLY_TIMEOUT).await)
+    }
+
     /// QUIC connections (handshakes) this node has dialed and accepted.
     pub fn connection_counts(&self) -> ConnectionCounts {
         ConnectionCounts {
             dialed: self.inner.pool.dialed.load(Ordering::Relaxed),
             accepted: self.inner.accepted.load(Ordering::Relaxed),
+            hellos_failed: self.inner.hellos_failed.load(Ordering::Relaxed),
         }
     }
 
@@ -1694,6 +1885,259 @@ mod discovery_tests {
 }
 
 #[cfg(test)]
+mod version_tests {
+    use super::*;
+    use version::{WIRE_V1, WIRE_V2};
+
+    async fn node(name: &str, protocol: Protocol) -> Node {
+        let mut opts = NodeOptions::new(NetMode::Local, name);
+        opts.protocol = protocol;
+        Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap()
+    }
+
+    /// Two current devices agree on version 2 and on exactly the
+    /// capabilities both have; bits one of them doesn't know are ignored.
+    #[tokio::test]
+    async fn current_devices_negotiate_version_2_and_common_capabilities() {
+        let future = Caps::from_bits(1 << 40);
+        let a = node("a", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 | Caps::ROUTE_ATTEST | future }).await;
+        let b = node("b", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        // (b notes what a dialer agreed only for a device it shares a space with)
+        let (space, _) = b.create_space().unwrap();
+        b.with_space(&space, |r| r.add_member(a.keys().public(), Role::Writer)).unwrap().unwrap();
+        a.add_peer_addr(b.addr());
+        let p = a.negotiate(b.id()).await.unwrap();
+        assert_eq!((p.version, p.caps), (WIRE_V2, Caps::SYNC_V2));
+        assert!(p.supports(Caps::SYNC_V2) && !p.supports(Caps::ROUTE_ATTEST));
+        assert_eq!(a.peers()[&b.id()].protocol, Some(p));
+        // b agreed the same from a's hello, and set a's unknown bit aside
+        let q = b.peers()[&a.id()].protocol.expect("b took a's hello");
+        assert_eq!((q.version, q.caps), (WIRE_V2, Caps::SYNC_V2));
+        assert!(q.advertised.contains(future) && q.advertised.contains(Caps::ROUTE_ATTEST));
+        // agreed once per connection: asking again sends nothing
+        assert_eq!(a.negotiate(b.id()).await.unwrap(), p);
+        assert_eq!(a.connection_counts().dialed, 1);
+        assert_eq!(b.inner.hellos_served.load(Ordering::Relaxed), 1, "one hello for the connection");
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    /// A hello lost on the way (as on a flaky Bluetooth or multi-hop path)
+    /// doesn't cost the connection its capabilities for good: it is
+    /// counted, the connection has none for now, and a later use of the
+    /// same connection tries again and agrees them. Tries are bounded.
+    #[tokio::test]
+    async fn a_failed_hello_is_retried_on_the_same_connection() {
+        let a = node("a", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        let b = node("b", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        a.add_peer_addr(b.addr());
+        b.inner.drop_hellos.store(1, Ordering::SeqCst);
+        let p = a.negotiate(b.id()).await.unwrap();
+        assert_eq!((p.version, p.caps), (WIRE_V2, Caps::NONE), "no capabilities while the hello failed");
+        assert_eq!(a.connection_counts().hellos_failed, 1);
+        // too soon to try again: still none, nothing sent
+        assert_eq!(a.negotiate(b.id()).await.unwrap().caps, Caps::NONE);
+        tokio::time::sleep(pool::HELLO_RETRY + Duration::from_millis(100)).await;
+        let p = a.negotiate(b.id()).await.unwrap();
+        assert_eq!((p.version, p.caps), (WIRE_V2, Caps::SYNC_V2), "agreed on the retry");
+        assert_eq!(a.peers()[&b.id()].protocol, Some(p));
+        let counts = a.connection_counts();
+        assert_eq!((counts.dialed, counts.hellos_failed), (1, 1), "same connection, one failure");
+        assert_eq!(b.inner.hellos_served.load(Ordering::Relaxed), 1);
+        a.shutdown().await.unwrap();
+
+        // every try lost: bounded, then the connection stays without
+        let c = node("c", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        c.add_peer_addr(b.addr());
+        b.inner.drop_hellos.store(u32::MAX, Ordering::SeqCst);
+        for i in 0..pool::HELLO_TRIES + 2 {
+            assert_eq!(c.negotiate(b.id()).await.unwrap().caps, Caps::NONE);
+            tokio::time::sleep(pool::HELLO_RETRY * 2u32.pow(i.min(pool::HELLO_TRIES)) + Duration::from_millis(50))
+                .await;
+        }
+        assert_eq!(c.connection_counts().hellos_failed, pool::HELLO_TRIES as u64);
+        assert_eq!(c.connection_counts().dialed, 1);
+        b.inner.drop_hellos.store(0, Ordering::SeqCst);
+        c.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    /// Devices b has never dealt with (fresh keys cost nothing) dial it,
+    /// on version 1 and with a hello on version 2: b answers them all but
+    /// keeps no state about them, which nothing would ever remove. A member
+    /// that dials is noted.
+    #[tokio::test]
+    async fn strangers_that_dial_leave_no_peer_state() {
+        let b = node("b", Protocol::default()).await;
+        for i in 0..8 {
+            let version = if i % 2 == 0 { WIRE_V1 } else { WIRE_V2 };
+            let s = node("stranger", Protocol { version, caps: Caps::SYNC_V2 }).await;
+            s.add_peer_addr(b.addr());
+            assert_eq!(s.fetch_card(b.id()).await.unwrap().keys.sign_pk, b.id());
+            assert_eq!(s.negotiate(b.id()).await.unwrap().version, version);
+            s.shutdown().await.unwrap();
+        }
+        assert_eq!(b.inner.hellos_served.load(Ordering::Relaxed), 4, "the version 2 strangers were answered");
+        assert_eq!(b.connection_counts().accepted, 8);
+        assert!(b.peers().is_empty(), "no state for strangers: {:?}", b.peers().keys().collect::<Vec<_>>());
+
+        let m = node("member", Protocol { version: WIRE_V1, caps: Caps::NONE }).await;
+        let (space, _) = b.create_space().unwrap();
+        b.with_space(&space, |r| r.add_member(m.keys().public(), Role::Writer)).unwrap().unwrap();
+        m.add_peer_addr(b.addr());
+        m.negotiate(b.id()).await.unwrap();
+        let noted = || b.peers().get(&m.id()).and_then(|p| p.protocol);
+        let until = Instant::now() + Duration::from_secs(5);
+        while noted().is_none() && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(noted(), Some(PeerProtocol::baseline(WIRE_V1)));
+        assert_eq!(b.peers().len(), 1);
+        m.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    /// A pre-release device (version 1 only) and a current one still do
+    /// everything they did together: version 1 is chosen in the handshake
+    /// whoever dials, no hello is sent, no capability is used, and spaces
+    /// sync both ways.
+    #[tokio::test]
+    async fn a_version_1_device_and_a_version_2_device_talk_version_1() {
+        let new = node("new", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        let old = node("old", Protocol { version: WIRE_V1, caps: Caps::SYNC_V2 }).await;
+        new.add_peer_addr(old.addr());
+        old.add_peer_addr(new.addr());
+        assert_eq!(new.negotiate(old.id()).await.unwrap(), PeerProtocol::baseline(WIRE_V1));
+        assert_eq!(old.negotiate(new.id()).await.unwrap(), PeerProtocol::baseline(WIRE_V1));
+        let (space, _) = new.create_space().unwrap();
+        new.with_space(&space, |r| r.add_member(old.keys().public(), Role::Writer)).unwrap().unwrap();
+        new.with_space(&space, |r| r.append(mycel_sync::StreamId::new_feed(), b"from new".to_vec())).unwrap().unwrap();
+        new.sync_with(old.id(), space, false).await.unwrap();
+        assert_eq!(old.with_space(&space, |r| r.envelope_ids().len()).unwrap(), 1, "the invitation and its data");
+        old.with_space(&space, |r| r.append(mycel_sync::StreamId::new_feed(), b"from old".to_vec())).unwrap().unwrap();
+        old.sync_with(new.id(), space, false).await.unwrap();
+        assert_eq!(new.with_space(&space, |r| r.envelope_ids().len()).unwrap(), 2);
+        assert_eq!(new.fetch_card(old.id()).await.unwrap().keys.sign_pk, old.id());
+        assert_eq!(old.fetch_card(new.id()).await.unwrap().keys.sign_pk, new.id());
+        new.shutdown().await.unwrap();
+        old.shutdown().await.unwrap();
+    }
+
+    /// A stream kind the device doesn't know (a newer build's) is refused
+    /// at once with a typed error: never a timeout, never bytes read as
+    /// something else; the connection carries on. A version 1 connection
+    /// has no hello, so a hello on one is unknown too.
+    #[tokio::test]
+    async fn unknown_stream_kinds_are_refused_cleanly() {
+        use iroh::endpoint::VarInt;
+        let a = node("a", Protocol::default()).await;
+        let b = node("b", Protocol::default()).await;
+        a.add_peer_addr(b.addr());
+        let conn = pooled(&a.inner, &b.id()).await.unwrap();
+        let start = Instant::now();
+        let (mut tx, mut rx) = open_bi_raw(&conn, 0xee, 1).await.unwrap();
+        let _ = send(&mut tx, &42u32).await;
+        let err = recv::<u32>(&mut rx).await.unwrap_err();
+        assert_eq!(err.downcast_ref::<VersionError>(), Some(&VersionError::StreamRefused), "{err:#}");
+        assert!(start.elapsed() < Duration::from_secs(5), "refused, not timed out");
+        let mut uni = conn.open_uni().await.unwrap();
+        uni.write_all(&[0xee, 1, 2, 3]).await.unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), uni.stopped()).await.unwrap().unwrap();
+        assert_eq!(stopped, Some(VarInt::from_u32(STREAM_REFUSED)));
+        assert_eq!(a.fetch_card(b.id()).await.unwrap().keys.sign_pk, b.id(), "the connection still works");
+        drop(conn);
+
+        let v1 = a.inner.endpoint.connect(b.addr(), wire::ALPN_V1).await.unwrap();
+        assert_eq!(wire::version_of(v1.alpn()), Some(WIRE_V1));
+        let (mut tx, mut rx) = open_bi(&v1, StreamKind::Hello).await.unwrap();
+        let _ = send(&mut tx, &Hello::ours(Caps::NONE)).await;
+        let err = recv::<Hello>(&mut rx).await.unwrap_err();
+        assert_eq!(err.downcast_ref::<VersionError>(), Some(&VersionError::StreamRefused), "{err:#}");
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    /// A node serves its versions newest first, so a dialer that offers
+    /// several lands on the newest, on the node protocol and on mesh hops
+    /// alike, even one listing the oldest first (TLS goes by the listener's
+    /// order). A node registering an old version first would quietly put
+    /// every current pair on it.
+    #[tokio::test]
+    async fn a_node_serves_its_newest_versions_first() {
+        let a = node("a", Protocol::default()).await;
+        let mut opts = NodeOptions::new(NetMode::Local, "b");
+        opts.mesh = Some(MeshOptions::default());
+        let b = Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap();
+        for (table, newest) in [(&wire::ALPNS, wire::ALPN_V2), (&mesh::ALPNS, mesh::ALPN_V2)] {
+            let oldest_first: Vec<&[u8]> = table.iter().map(|(_, a)| *a).collect();
+            let (first, rest) = oldest_first.split_first().unwrap();
+            let options = ConnectOptions::new().with_additional_alpns(rest.iter().map(|a| a.to_vec()).collect());
+            let conn = a.inner.endpoint.connect_with_opts(b.addr(), first, options).await.unwrap().await.unwrap();
+            assert_eq!(conn.alpn(), newest, "offered {oldest_first:?}");
+            conn.close(0u32.into(), b"");
+        }
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn stream_kinds_per_version() {
+        assert_eq!(StreamKind::on(WIRE_V2, 5), Some(StreamKind::Hello));
+        assert_eq!(StreamKind::on(WIRE_V1, 5), None, "version 1 has no hello");
+        assert_eq!(StreamKind::on(WIRE_V1, 1), Some(StreamKind::Sync));
+        assert!((6..=255).all(|b| StreamKind::on(WIRE_V2, b).is_none()) && StreamKind::on(WIRE_V2, 0).is_none());
+        assert_eq!(wire::alpns(WIRE_V2), vec![wire::ALPN_V2, wire::ALPN_V1]);
+        assert_eq!(wire::alpns(WIRE_V1), vec![wire::ALPN_V1]);
+        assert_eq!(wire::version_of(b"mycel/node/3"), None);
+    }
+
+    /// Every supported version has one ALPN per protocol, its own: none
+    /// shared between versions or protocols, and each maps back to its
+    /// version. (A version added without its ALPNs doesn't build.)
+    #[test]
+    fn every_version_has_its_own_alpns() {
+        use version::{MIN_WIRE_VERSION, WIRE_VERSION, alpn_table_ok};
+        let mut seen: Vec<&[u8]> = Vec::new();
+        for v in MIN_WIRE_VERSION..=WIRE_VERSION {
+            let (node, mesh) =
+                (wire::ALPNS[usize::from(v - MIN_WIRE_VERSION)], mesh::ALPNS[usize::from(v - MIN_WIRE_VERSION)]);
+            assert_eq!((node.0, mesh.0), (v, v));
+            assert_eq!(wire::version_of(node.1), Some(v));
+            assert_eq!(mesh::version_of(mesh.1), Some(v));
+            assert_eq!(wire::alpns(v)[0], node.1, "the newest offered first");
+            assert_eq!(mesh::alpns(v)[0], mesh.1);
+            assert!(!seen.contains(&node.1) && !seen.contains(&mesh.1) && node.1 != mesh.1);
+            seen.extend([node.1, mesh.1]);
+        }
+        assert_eq!(wire::alpns(WIRE_VERSION).len(), usize::from(WIRE_VERSION - MIN_WIRE_VERSION) + 1);
+        // what the compile-time check refuses
+        assert!(!alpn_table_ok(&[(WIRE_V1, b"same"), (WIRE_V2, b"same")]), "two versions, one name");
+        assert!(!alpn_table_ok(&[(WIRE_V2, b"a"), (WIRE_V1, b"b")]), "out of place");
+        assert!(!alpn_table_ok(&[(WIRE_V1, b"a"), (WIRE_V2, b"")]), "no name");
+    }
+
+    /// A store-and-forward payload of a kind this build doesn't know is
+    /// refused unread with a typed error (it was delivered: the mesh sent
+    /// its receipt); a known kind that doesn't decode is an error, not a
+    /// panic.
+    #[tokio::test]
+    async fn bundles_of_an_unknown_payload_kind_are_refused_unread() {
+        let n = node("n", Protocol::default()).await;
+        let src = DeviceKeys::generate().sign_pk();
+        let err = n.inner.on_bundle(src, 999, b"from a newer build").unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<VersionError>(),
+                Some(VersionError::Unsupported { what: "bundle payload kind", version: 999, .. })
+            ),
+            "{err:#}"
+        );
+        assert!(n.inner.on_bundle(src, mesh::dtn::KIND_SPACE_SYNC, &[0xff; 3]).is_err());
+        n.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
 mod security_tests {
     use super::*;
 
@@ -1777,7 +2221,7 @@ mod security_exchange_tests {
             tokio::spawn(async move {
                 let conn = remote.accept().await.unwrap().await.unwrap();
                 let (mut tx, mut rx) = conn.accept_bi().await.unwrap();
-                assert_eq!(stream_kind(&mut rx).await.unwrap(), StreamKind::Sync);
+                assert_eq!(stream_kind(WIRE_V2, None, &mut rx).await.unwrap(), StreamKind::Sync);
                 assert!(matches!(recv::<SyncMsg>(&mut rx).await.unwrap(), SyncMsg::Hello { .. }));
                 send(
                     &mut tx,

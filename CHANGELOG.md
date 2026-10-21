@@ -38,6 +38,11 @@ The first public version. It contains:
   routes; gateways and signed reachability records in the Mainline DHT for
   reach from anywhere; store-and-forward with custody, mailboxes and signed
   receipts.
+- **Protocol versions:** every connection negotiates its wire version in
+  the QUIC handshake (ALPN) and, from version 2, a set of capabilities;
+  unknown stream kinds are refused with a typed error; store-and-forward
+  bundles, the store and contact codes name their format
+  ([PROTOCOL.md](docs/PROTOCOL.md)).
 - **Hardening:** resource limits on everything a peer sends, and fixes for
   the findings of internal adversarial reviews, each with a regression test
   ([TRUST.md](docs/TRUST.md) §8d and §9b).
@@ -56,7 +61,11 @@ The first public version. It contains:
   run on CI machines only, Android on the emulator only.
 - A suspended iPhone or iPad doesn't receive messages until Mycel is opened
   again.
-- Every device must run the same build.
+- Devices in a space should run builds with the same chat rules (they are
+  built in). The `dev-2026-10-09-apps` release speaks the same wire format
+  (version 1) and passed a basic cross-build check, but validates some data
+  differently from newer builds; older pre-release builds may not
+  interoperate ([PROTOCOL.md](docs/PROTOCOL.md) §5).
 
 More in [ARCHITECTURE.md](docs/ARCHITECTURE.md) §7 and
 [TRUST.md](docs/TRUST.md) §10.

@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use mycel_call::audio::{AudioIo, TestAudio, TestSource};
 use mycel_call::level::{estimate_frequency, goertzel};
-use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallInfo, CallManager, CallPhase};
+use mycel_call::{ALPNS_CALL, BoxFuture, CallEvent, CallHost, CallInfo, CallManager, CallPhase};
 use mycel_crypto::{DeviceKeys, Hash32, SignPk};
 use mycel_net::iroh::endpoint::Connection;
 use mycel_net::link::{Link, MemNet};
@@ -35,6 +35,8 @@ pub async fn cpu_shared() -> tokio::sync::RwLockReadGuard<'static, ()> {
 pub struct Host {
     pub node: Arc<Node>,
     pub events: Arc<Mutex<Vec<CallEvent>>>,
+    /// The call protocol versions this device speaks (ALPNs, newest first).
+    pub alpns: &'static [&'static [u8]],
 }
 
 impl CallHost for Host {
@@ -66,8 +68,8 @@ impl CallHost for Host {
     }
 
     fn connect(&self, peer: SignPk) -> BoxFuture<anyhow::Result<Connection>> {
-        let node = self.node.clone();
-        Box::pin(async move { node.connect(peer, ALPN_CALL).await })
+        let (node, alpns) = (self.node.clone(), self.alpns);
+        Box::pin(async move { node.connect_offering(peer, alpns).await })
     }
 
     fn note_connection(&self, peer: &SignPk, conn: &Connection) {
@@ -131,6 +133,12 @@ pub async fn device(name: &str, source: TestSource, ip: bool, nets: &[&MemNet]) 
     device_with(name, source, ip, nets, None).await
 }
 
+/// A device that speaks only the call protocol versions `alpns` (for
+/// example only `mycel/call/1`, as pre-release builds do).
+pub async fn device_speaking(name: &str, source: TestSource, alpns: &'static [&'static [u8]]) -> Device {
+    device_full(name, source, true, &[], None, alpns).await
+}
+
 #[allow(dead_code)] // not every test binary uses the mesh
 pub async fn device_with(
     name: &str,
@@ -139,16 +147,30 @@ pub async fn device_with(
     nets: &[&MemNet],
     mesh: Option<MeshOptions>,
 ) -> Device {
+    device_full(name, source, ip, nets, mesh, &ALPNS_CALL).await
+}
+
+async fn device_full(
+    name: &str,
+    source: TestSource,
+    ip: bool,
+    nets: &[&MemNet],
+    mesh: Option<MeshOptions>,
+    alpns: &'static [&'static [u8]],
+) -> Device {
     let keys = Arc::new(DeviceKeys::generate());
     let mut opts = NodeOptions::new(NetMode::Local, name);
     opts.ip = ip;
     opts.mesh = mesh;
     opts.links = nets.iter().map(|n| n.link(keys.sign_pk()) as Arc<dyn Link>).collect();
     let (tx, rx) = mpsc::unbounded_channel();
-    opts.extra_protocols.push(ExtraProtocol { alpn: ALPN_CALL.to_vec(), incoming: tx });
+    for alpn in alpns {
+        opts.extra_protocols.push(ExtraProtocol { alpn: alpn.to_vec(), incoming: tx.clone() });
+    }
     let node = Arc::new(Node::spawn(keys, opts).await.unwrap());
     let events: Arc<Mutex<Vec<CallEvent>>> = Arc::default();
-    let calls = CallManager::new(Arc::new(Host { node: node.clone(), events: events.clone() }));
+    let host = Host { node: node.clone(), events: events.clone(), alpns };
+    let calls = CallManager::new(Arc::new(host));
     let audio = Arc::new(TestAudio::new(source));
     calls.set_audio(audio.clone() as Arc<dyn AudioIo>);
     calls.serve(rx);

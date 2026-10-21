@@ -404,6 +404,9 @@ pub struct Frame {
     pub reached: bool,
     /// For the router at `dst` (e.g. a record to publish), not for QUIC.
     pub control: bool,
+    /// Flag bits this build doesn't assign (`wire::F_EXTENSIONS`): carried
+    /// unchanged to the destination, which ignores them.
+    pub ext: u8,
     pub dst: SignPk,
     pub src: SignPk,
     pub waypoint: SignPk,
@@ -1793,6 +1796,7 @@ impl Router {
             ttl: self.cfg.max_hops.saturating_mul(2).saturating_add(2),
             reached: false,
             control,
+            ext: 0,
             dst,
             src: self.me,
             waypoint,

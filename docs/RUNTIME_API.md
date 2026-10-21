@@ -186,8 +186,9 @@ rings every other member, and up to 8 people can be in the call at once.
 
 Semantics:
 - **Ringing needs only the devices online.** The caller dials each other
-  device's key directly (ALPN `mycel/call/1` on the node's endpoint, so every
-  path: network, peer-to-peer Wi-Fi, Bluetooth, relay, mesh). If nobody can be
+  device's key directly (ALPN `mycel/call/2`, or `mycel/call/1` with
+  pre-release builds, on the node's endpoint, so every path: network,
+  peer-to-peer Wi-Fi, Bluetooth, relay, mesh). If nobody can be
   reached within a few seconds the call ends `unavailable`.
 - **Group calls are a full mesh.** Everyone in the call has their own
   connection to everyone else. Each frame is encoded once per bitrate tier

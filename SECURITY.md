@@ -14,8 +14,10 @@ review has happened.
 ## Supported versions
 
 Only the latest commit on `main` and the newest pre-release (`dev-*` tags) get
-security fixes. We don't backport fixes to older builds. Mycel doesn't yet
-promise compatibility between builds, so after a fix, update every device.
+security fixes. We don't backport fixes to older builds. Builds negotiate
+the protocol version ([docs/PROTOCOL.md](docs/PROTOCOL.md)), so an updated
+device keeps working with the others, but compatibility is not yet a
+promise: after a fix, update every device.
 
 ## Reporting a vulnerability
 

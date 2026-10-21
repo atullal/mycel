@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use mycel_crypto::Hash32;
+use mycel_net::VersionError;
 use mycel_sync::{Envelope, Store};
 use mycel_trust::{SignedOp, SpaceId};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
@@ -23,6 +24,21 @@ const KV: TableDefinition<&str, &[u8]> = TableDefinition::new("kv");
 /// Stored records that couldn't be decoded, kept byte for byte under
 /// `<table>/<key>` so one bad row neither blocks startup nor is deleted.
 const QUARANTINE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("quarantine");
+
+/// Facts about the store itself, read before any other table is opened.
+/// This table's name and layout never change: a migration renames the
+/// tables it changes (docs/PROTOCOL.md §3.11), never this one, so every
+/// build, older or newer, finds the format where it expects it.
+const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
+/// The layout of what a store holds (docs/PROTOCOL.md §3.11), recorded in
+/// the `meta` table under [`FORMAT_KEY`]. A build refuses to open a store
+/// in a newer layout rather than misread or overwrite it; an older layout
+/// is migrated forward when there is one (format 1 is the first: a store
+/// from before formats were recorded is format 1).
+pub const STORE_FORMAT: u32 = 1;
+/// The `meta` entry holding the store's format (u32, little-endian).
+pub const FORMAT_KEY: &str = "format";
 
 /// Synced records buffered for the next commit. Past this, a healthy store
 /// makes writers wait for the flusher; a failing one stops buffering them.
@@ -119,6 +135,27 @@ pub type StoredSpace = (Vec<SignedOp>, Vec<Envelope>);
 pub struct DbStore {
     shared: Arc<Shared>,
     flusher: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+/// The format a store records, if it records one (a new store, or one from
+/// before formats were recorded, doesn't).
+fn stored_format(db: &Database) -> Result<Option<u32>> {
+    let txn = db.begin_read()?;
+    let meta = match txn.open_table(META) {
+        Ok(meta) => meta,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let Some(v) = meta.get(FORMAT_KEY)? else { return Ok(None) };
+    let bytes: [u8; 4] = v.value().try_into().map_err(|_| anyhow!("corrupt store format marker"))?;
+    Ok(Some(u32::from_le_bytes(bytes)))
+}
+
+fn record_format(db: &Database, format: u32) -> Result<()> {
+    let txn = db.begin_write()?;
+    txn.open_table(META)?.insert(FORMAT_KEY, format.to_le_bytes().as_slice())?;
+    txn.commit()?;
+    Ok(())
 }
 
 fn key(space: &SpaceId, id: &Hash32) -> Vec<u8> {
@@ -232,8 +269,17 @@ impl DbStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<Self>> {
         let path = path.as_ref().to_path_buf();
         let db = Database::create(&path)?;
-        // make sure tables exist
+        // before anything is written: a newer build's store stays untouched
+        match stored_format(&db)? {
+            None | Some(STORE_FORMAT) => {}
+            Some(version) => {
+                let newest = STORE_FORMAT;
+                return Err(VersionError::Unsupported { what: "store", version, newest }.into());
+            }
+        }
+        // make sure tables exist, and record the format
         commit(&db, &[Write::Kv("__init".into(), Some(vec![]))])?;
+        record_format(&db, STORE_FORMAT)?;
         let shared = Arc::new(Shared {
             path,
             db: RwLock::new(Some(db)),
@@ -499,6 +545,93 @@ mod tests {
             .join(format!("mycel-store-security-{}.redb", hex::encode(mycel_crypto::random::<16>())));
         let store = DbStore::open(&path).unwrap();
         (path, store)
+    }
+
+    /// The format a closed store at `path` records.
+    fn format_at(path: &std::path::Path) -> Option<u32> {
+        stored_format(&Database::create(path).unwrap()).unwrap()
+    }
+
+    fn tables_at(path: &std::path::Path) -> Vec<String> {
+        use redb::TableHandle;
+        let db = Database::create(path).unwrap();
+        let txn = db.begin_read().unwrap();
+        txn.list_tables().unwrap().map(|t| t.name().to_string()).collect()
+    }
+
+    /// A store records its format; one written by a newer build (a newer
+    /// format) is refused untouched, with a typed error, not misread.
+    #[test]
+    fn stores_record_their_format_and_newer_ones_are_refused() {
+        let (path, store) = test_store();
+        store.kv_put("contacts", vec![1, 2, 3]);
+        store.close().unwrap();
+        drop(store);
+        assert_eq!(format_at(&path), Some(STORE_FORMAT));
+        // reopening the same format works and keeps what was there
+        let store = DbStore::open(&path).unwrap();
+        assert_eq!(store.kv_get("contacts").unwrap(), Some(vec![1, 2, 3]));
+        store.close().unwrap();
+        drop(store);
+        record_format(&Database::create(&path).unwrap(), STORE_FORMAT + 1).unwrap();
+        let err = DbStore::open(&path).err().expect("a newer store is refused");
+        assert_eq!(
+            err.downcast_ref::<VersionError>(),
+            Some(&VersionError::Unsupported { what: "store", version: STORE_FORMAT + 1, newest: STORE_FORMAT })
+        );
+        // ... untouched
+        assert_eq!(format_at(&path), Some(STORE_FORMAT + 1));
+        let db = Database::create(&path).unwrap();
+        let txn = db.begin_read().unwrap();
+        assert_eq!(txn.open_table(KV).unwrap().get("contacts").unwrap().unwrap().value(), &[1, 2, 3]);
+        drop((txn, db));
+        fs_cleanup(path);
+    }
+
+    /// A newer format may have renamed any table but `meta` (here the
+    /// key-value table): this build still finds the format first and
+    /// refuses the store, rather than taking it for a new one and
+    /// creating empty tables beside the renamed ones.
+    #[test]
+    fn a_newer_store_without_the_tables_we_know_is_refused() {
+        let path =
+            std::env::temp_dir().join(format!("mycel-store-format-{}.redb", hex::encode(mycel_crypto::random::<16>())));
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            let kv2: TableDefinition<&str, &[u8]> = TableDefinition::new("kv@2");
+            txn.open_table(kv2).unwrap().insert("contacts", [7u8].as_slice()).unwrap();
+            txn.commit().unwrap();
+            record_format(&db, STORE_FORMAT + 1).unwrap();
+        }
+        let err = DbStore::open(&path).err().expect("a newer store is refused");
+        assert!(matches!(err.downcast_ref::<VersionError>(), Some(VersionError::Unsupported { what: "store", .. })));
+        let mut tables = tables_at(&path);
+        tables.sort();
+        assert_eq!(tables, vec!["kv@2".to_string(), "meta".to_string()], "nothing created");
+        fs_cleanup(path);
+    }
+
+    /// A store from before formats were recorded opens as format 1.
+    #[test]
+    fn stores_from_before_formats_open_as_format_1() {
+        let (path, store) = test_store();
+        store.kv_put("contacts", vec![9]);
+        store.close().unwrap();
+        drop(store);
+        {
+            let db = Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            txn.delete_table(META).unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(format_at(&path), None);
+        let store = DbStore::open(&path).unwrap();
+        assert_eq!(store.kv_get("contacts").unwrap(), Some(vec![9]));
+        store.close().unwrap();
+        drop(store);
+        assert_eq!(format_at(&path), Some(STORE_FORMAT));
+        fs_cleanup(path);
     }
 
     #[test]

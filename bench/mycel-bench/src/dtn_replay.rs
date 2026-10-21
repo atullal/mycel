@@ -49,7 +49,7 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use bytes::Bytes;
 use mycel_crypto::{Hash32, Sig, SignPk};
 use mycel_net::mesh::core::{Time, Toward};
-use mycel_net::mesh::dtn::{Accepted, Answer, Bundle, Carrier, DtnConfig, Offer, Receipt, Why};
+use mycel_net::mesh::dtn::{Accepted, Answer, Bundle, BundleFormat, Carrier, DtnConfig, Offer, Receipt, Why};
 
 /// Payload bytes: bundles only need the right length.
 static ZERO: [u8; 4 << 20] = [0; 4 << 20];
@@ -501,6 +501,7 @@ fn main() {
             let id = bundle_id(mi);
             // `created` on the carriers' clock (they keep no wall-clock offset)
             let b = Bundle {
+                format: BundleFormat::V1,
                 id,
                 src: key(m.src),
                 dst: key(m.dst),

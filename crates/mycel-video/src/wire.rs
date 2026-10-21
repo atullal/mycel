@@ -98,7 +98,10 @@ pub fn ctrl_stream_header() -> [u8; STREAM_HEADER_LEN] {
     [KIND_CTRL]
 }
 
-/// Video control messages (one control stream per direction).
+/// Video control messages (one control stream per direction). Variants
+/// are only ever appended: a build skips messages whose variant it doesn't
+/// have ([`CtrlDeframer::next_msg`]), so a newer build's additions don't
+/// end an older one's control stream (docs/PROTOCOL.md §3.8).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VideoCtrl {
     /// My decoder lost its place: it can't go on from frame `missing`.
@@ -114,6 +117,16 @@ pub enum VideoCtrl {
 }
 
 impl VideoCtrl {
+    /// The first call protocol version that has this message: a track on
+    /// an older leg never sends it ([`crate::TrackOptions::call_version`]).
+    /// Every message so far is in call/1; one added later says 2 or newer
+    /// (no catch-all, so nobody adds a variant without choosing).
+    pub fn since(&self) -> u16 {
+        match self {
+            VideoCtrl::KeyframeRequest { .. } | VideoCtrl::State { .. } | VideoCtrl::Dropped { .. } => 1,
+        }
+    }
+
     pub fn encode(&self) -> Bytes {
         let body = postcard::to_allocvec(self).expect("serializable");
         let mut b = BytesMut::with_capacity(2 + body.len());
@@ -214,19 +227,35 @@ impl CtrlDeframer {
         self.buf.extend_from_slice(data);
     }
 
+    /// The next whole message. One from a newer build (a variant this
+    /// build doesn't have) is skipped; one that doesn't decode is an error.
     pub fn next_msg(&mut self) -> Result<Option<VideoCtrl>> {
-        if self.buf.len() < 2 {
-            return Ok(None);
+        loop {
+            if self.buf.len() < 2 {
+                return Ok(None);
+            }
+            let len = u16::from_le_bytes([self.buf[0], self.buf[1]]) as usize;
+            ensure!(len <= 1024, "control message too long ({len} bytes)");
+            if self.buf.len() < 2 + len {
+                return Ok(None);
+            }
+            let _ = self.buf.split_to(2);
+            let body = self.buf.split_to(len);
+            match postcard::from_bytes(&body) {
+                Ok(m) => return Ok(Some(m)),
+                Err(_) if from_newer_build(&body) => continue,
+                Err(e) => return Err(e.into()),
+            }
         }
-        let len = u16::from_le_bytes([self.buf[0], self.buf[1]]) as usize;
-        ensure!(len <= 1024, "control message too long ({len} bytes)");
-        if self.buf.len() < 2 + len {
-            return Ok(None);
-        }
-        let _ = self.buf.split_to(2);
-        let body = self.buf.split_to(len);
-        Ok(Some(postcard::from_bytes(&body)?))
     }
+}
+
+/// How many [`VideoCtrl`] variants this build has: a message whose
+/// variant tag is past them comes from a newer build.
+const KNOWN_CTRL: u32 = 3;
+
+fn from_newer_build(body: &[u8]) -> bool {
+    postcard::take_from_bytes::<u32>(body).is_ok_and(|(tag, _)| tag >= KNOWN_CTRL)
 }
 
 // ───────────────────────────── H.264 helpers ─────────────────────────────
@@ -342,6 +371,31 @@ mod tests {
             }
             assert_eq!(got, msgs);
         }
+    }
+
+    /// A message of a variant a newer build added is skipped and the
+    /// messages after it still arrive; garbage is still an error.
+    #[test]
+    fn ctrl_messages_from_newer_builds_are_skipped() {
+        // the last variant has the last known tag: KNOWN_CTRL is current
+        let last = VideoCtrl::Dropped { seq: 1 }.encode();
+        assert_eq!(postcard::take_from_bytes::<u32>(&last[2..]).unwrap().0, KNOWN_CTRL - 1);
+        let mut wire = VideoCtrl::KeyframeRequest { missing: 7 }.encode().to_vec();
+        wire.extend_from_slice(&[4, 0, KNOWN_CTRL as u8, 9, 9, 9]); // a newer build's message
+        wire.extend_from_slice(&[2, 0, 0x80, 0x01]); // ... with a two-byte tag (128)
+        wire.extend_from_slice(&VideoCtrl::Dropped { seq: 9 }.encode());
+        let mut d = CtrlDeframer::default();
+        d.push(&wire);
+        assert_eq!(d.next_msg().unwrap(), Some(VideoCtrl::KeyframeRequest { missing: 7 }));
+        assert_eq!(d.next_msg().unwrap(), Some(VideoCtrl::Dropped { seq: 9 }));
+        assert_eq!(d.next_msg().unwrap(), None);
+        // a known variant that doesn't decode, or no tag at all, is an error
+        let mut d = CtrlDeframer::default();
+        d.push(&[1, 0, 1]);
+        assert!(d.next_msg().is_err());
+        let mut d = CtrlDeframer::default();
+        d.push(&[1, 0, 0xff]);
+        assert!(d.next_msg().is_err());
     }
 
     #[test]

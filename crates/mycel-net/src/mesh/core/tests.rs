@@ -405,6 +405,7 @@ fn fragments_reassemble_at_the_destination() {
             ttl: 8,
             reached: true,
             control: false,
+            ext: 0,
             dst: key(1),
             src,
             waypoint: src,
@@ -833,6 +834,38 @@ fn an_out_of_date_record_keeps_a_working_gateway_while_it_is_looked_up() {
     assert_eq!(outcome(&mut r), (vec![], 1, vec![]));
 }
 
+/// Data-frame flags a later version assigns are relayed unchanged (wire
+/// version 2: docs/PROTOCOL.md §3.5), so marking frames end to end needs
+/// no relay upgrade.
+#[test]
+fn relays_carry_unknown_frame_flags_unchanged() {
+    let mut r = Router::new(key(1), Config::default());
+    for k in [key(2), key(3)] {
+        r.set_direct(k, true, 0);
+        r.hop_up(k, 0);
+    }
+    let f = Frame {
+        ttl: 8,
+        reached: true,
+        control: false,
+        ext: 0x40,
+        dst: key(3),
+        src: key(2),
+        waypoint: key(1),
+        id: 0,
+        offset: 0,
+        total: 3,
+        payload: Bytes::from_static(b"abc"),
+    };
+    r.on_frame(key(2), f, 0);
+    let mut outs = Vec::new();
+    r.drain(&mut outs);
+    let relayed: Vec<&Frame> =
+        outs.iter().filter_map(|o| if let Out::Frame { frame, .. } = o { Some(frame) } else { None }).collect();
+    assert_eq!(relayed.len(), 1, "{outs:?}");
+    assert_eq!(relayed[0].ext, 0x40);
+}
+
 #[test]
 fn relay_budgets_hold() {
     let cfg = Config { relay_rate_per_neighbour: 1000, relay_rate_total: 1500, ..Config::default() };
@@ -845,6 +878,7 @@ fn relay_budgets_hold() {
         ttl: 8,
         reached: true,
         control: false,
+        ext: 0,
         dst,
         src,
         waypoint: key(1),

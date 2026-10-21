@@ -1,6 +1,7 @@
 //! Live voice calls over the Mycel fabric: 1:1 and group (up to 8 people).
 //!
-//! A call is a full mesh of QUIC connections (ALPN `mycel/call/1`), one per
+//! A call is a full mesh of QUIC connections (ALPN `mycel/call/2`, or
+//! `mycel/call/1` with pre-release builds: [`proto::ALPNS_CALL`]), one per
 //! pair of participants, each dialed straight to the other device's key on
 //! the node's own endpoint. Every connection therefore uses every path the
 //! node has (same network, peer-to-peer Wi-Fi, internet relay, Bluetooth
@@ -44,4 +45,4 @@ mod video;
 pub use api::{CallInfo, CallPhase, CallStats, Direction, EndReason, Participant, ParticipantState};
 pub use engine::TrackSink;
 pub use manager::{BoxFuture, CallEvent, CallHost, CallManager, selected_path};
-pub use proto::{ALPN_CALL, MAX_PARTICIPANTS};
+pub use proto::{ALPNS_CALL, MAX_PARTICIPANTS};
