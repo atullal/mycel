@@ -47,6 +47,7 @@
 //! membership change, a local write, a newly reachable peer).
 
 mod blobs;
+pub mod bundles;
 pub mod emu;
 #[cfg(fuzzing)]
 #[doc(hidden)]
@@ -370,7 +371,8 @@ struct Inner {
     #[cfg(test)]
     stall_hellos: std::sync::atomic::AtomicBool,
     /// The last store-and-forward bundle sent per (member, space).
-    bundled: Mutex<HashMap<(SignPk, SpaceId), Hash32>>,
+    /// Store-and-forward state (`bundles.rs`).
+    bundles: Mutex<bundles::Bundles>,
     /// See [`NodeOptions::max_ephemeral`].
     max_ephemeral: usize,
     /// Dissemination (`gossip.rs`).
@@ -695,64 +697,6 @@ impl Inner {
         let mut spaces = self.spaces.lock();
         let r = spaces.get_mut(space).ok_or_else(|| anyhow!("unknown space"))?;
         Ok(f(r))
-    }
-
-    /// `peer` (a member of `space`) can't be reached live: send what it may
-    /// lack through store-and-forward carriers (no plaintext leaves us:
-    /// envelopes are already signed and encrypted).
-    fn offer_bundle(&self, peer: SignPk, space: SpaceId) {
-        let Some(mesh) = &self.mesh else { return };
-        let data = self
-            .with_space(&space, |r| {
-                if !r.is_member(&peer) {
-                    return None;
-                }
-                let envelopes: Vec<_> = r
-                    .envelope_ids()
-                    .iter()
-                    .filter(|id| !r.holders(id).contains(&peer))
-                    .filter_map(|id| r.envelope(id).cloned())
-                    .collect();
-                (!envelopes.is_empty()).then(|| Data { ops: r.all_ops(), envelopes })
-            })
-            .ok()
-            .flatten();
-        let Some(mut data) = data else { return };
-        let payload = loop {
-            let Ok(p) = postcard::to_allocvec(&DtnPayload { space, data }) else { return };
-            if p.len() <= MAX_BUNDLE_PAYLOAD {
-                break p;
-            }
-            let Ok(DtnPayload { data: mut d, .. }) = postcard::from_bytes::<DtnPayload>(&p) else { return };
-            if d.envelopes.pop().is_none() {
-                return;
-            }
-            data = d;
-        };
-        let id = mesh::bundle_id(&self.keys.sign_pk(), &peer, &payload);
-        if self.bundled.lock().insert((peer, space), id) == Some(id) {
-            return; // already on its way
-        }
-        mesh.send_bundle(peer, payload.into(), BUNDLE_LIFETIME);
-    }
-
-    /// A bundle for us arrived through carriers: apply it like a sync from
-    /// its (authenticated) source, if that source is a member. A payload
-    /// kind this build doesn't know (a newer sender's) is refused unread;
-    /// it was still delivered (the mesh has sent its receipt), so carriers
-    /// stop carrying it.
-    fn on_bundle(&self, src: SignPk, kind: u16, payload: &[u8]) -> Result<()> {
-        if kind != mesh::dtn::KIND_SPACE_SYNC {
-            return Err(
-                VersionError::Unsupported { what: "bundle payload kind", version: kind.into(), newest: 1 }.into()
-            );
-        }
-        let DtnPayload { space, data } = postcard::from_bytes::<DtnPayload>(payload)?;
-        if !self.with_space(&space, |r| r.is_member(&src)).unwrap_or(false) {
-            return Ok(());
-        }
-        self.ingest(&space, src, data, &[]);
-        Ok(())
     }
 
     fn schedule(&self, space: SpaceId) {
@@ -1536,6 +1480,8 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Tri
         let ok = res.is_ok();
         if let Ok(stats) = &res {
             inner.mark_ok(peer);
+            // Live again: what was in flight by carriers is settled.
+            inner.bundles.lock().delivered(&peer, &space);
             // A periodic session that found something means pushes are
             // being missed: back to the short interval.
             if trigger == Trigger::Periodic && sync_v2::moved(stats) {
@@ -1862,7 +1808,7 @@ impl Node {
             drop_hellos: Default::default(),
             #[cfg(test)]
             stall_hellos: Default::default(),
-            bundled: Mutex::default(),
+            bundles: Mutex::default(),
             max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
             gossip: gossip::Gossip::new(me_pk, false),
             read_receipts: opts.read_receipts,
@@ -2726,6 +2672,51 @@ mod version_tests {
         b.shutdown().await.unwrap();
     }
 
+    /// Store-and-forward v2 on a node: a plaintext identical to one in
+    /// flight isn't sealed or sent again (sealing changes the bundle id
+    /// every time), and at most `SOURCE_BUDGET` of our bundles are in
+    /// flight across destinations.
+    #[tokio::test]
+    async fn bundles_are_deduplicated_on_the_plaintext_and_budgeted_per_source() {
+        let mut opts = NodeOptions::new(NetMode::Local, "src");
+        opts.mesh = Some(MeshOptions::default());
+        let n = Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap();
+        let (space, _) = n.create_space().unwrap();
+        let peers: Vec<Arc<DeviceKeys>> = (0..24).map(|_| Arc::new(DeviceKeys::generate())).collect();
+        n.with_space(&space, |r| {
+            for p in &peers {
+                r.add_member(p.public(), Role::Writer).unwrap();
+            }
+            let feed = mycel_sync::StreamId::new_feed();
+            for i in 0..700 {
+                r.append(feed, vec![i as u8; 200]).unwrap();
+            }
+        })
+        .unwrap();
+        n.inner.offer_bundle(peers[0].sign_pk(), space);
+        n.inner.offer_bundle(peers[0].sign_pk(), space);
+        {
+            let b = n.inner.bundles.lock();
+            assert_eq!(b.sent, 2, "the backlog is larger than a bundle: the second continues it");
+        }
+        // A destination whose backlog is all in flight gets nothing new; with
+        // nothing new, the same plaintext isn't sent twice.
+        let small = Arc::new(DeviceKeys::generate());
+        let (space2, _) = n.create_space().unwrap();
+        n.with_space(&space2, |r| r.add_member(small.public(), Role::Writer).unwrap()).unwrap();
+        n.inner.offer_bundle(small.sign_pk(), space2);
+        n.inner.offer_bundle(small.sign_pk(), space2);
+        assert_eq!(n.inner.bundles.lock().sent, 3, "nothing new: no second bundle");
+        for p in &peers[1..] {
+            n.inner.offer_bundle(p.sign_pk(), space);
+        }
+        let b = n.inner.bundles.lock();
+        assert!(b.over_budget >= 1, "sent {} before the budget", b.sent);
+        assert!(b.in_flight_bytes() <= bundles::SOURCE_BUDGET, "{} B in flight", b.in_flight_bytes());
+        drop(b);
+        n.shutdown().await.unwrap();
+    }
+
     #[test]
     fn stream_kinds_per_version() {
         assert_eq!(StreamKind::on(WIRE_V2, 5), Some(StreamKind::Hello));
@@ -2733,7 +2724,9 @@ mod version_tests {
         assert_eq!(StreamKind::on(WIRE_V1, 1), Some(StreamKind::Sync));
         assert_eq!(StreamKind::on(WIRE_V2, 6), Some(StreamKind::SyncV2));
         assert_eq!(StreamKind::on(WIRE_V1, 6), None, "version 1 has no Sync v2");
-        assert!((7..=255).all(|b| StreamKind::on(WIRE_V2, b).is_none()) && StreamKind::on(WIRE_V2, 0).is_none());
+        assert_eq!(StreamKind::on(WIRE_V2, 7), Some(StreamKind::Gossip));
+        assert_eq!(StreamKind::on(WIRE_V1, 7), None, "version 1 has no gossip");
+        assert!((8..=255).all(|b| StreamKind::on(WIRE_V2, b).is_none()) && StreamKind::on(WIRE_V2, 0).is_none());
         assert_eq!(wire::alpns(WIRE_V2), vec![wire::ALPN_V2, wire::ALPN_V1]);
         assert_eq!(wire::alpns(WIRE_V1), vec![wire::ALPN_V1]);
         assert_eq!(wire::version_of(b"mycel/node/3"), None);

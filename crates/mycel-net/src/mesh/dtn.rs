@@ -307,6 +307,10 @@ pub const BUNDLE_VERSION: u8 = BUNDLE_V2;
 /// Payload kinds. What a node sends a member of a space it can't reach
 /// live: signed ops and encrypted envelopes of that space.
 pub const KIND_SPACE_SYNC: u16 = 1;
+/// The same, sealed to the destination and padded (Sync v2, design §9):
+/// carriers learn nothing about the space, its members or its items.
+/// Bundle header version 2 only.
+pub const KIND_SPACE_SYNC_SEALED: u16 = 2;
 
 impl BundleFormat {
     /// The pre-release format, which every carrier takes.

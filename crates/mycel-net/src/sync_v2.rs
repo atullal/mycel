@@ -223,6 +223,11 @@ impl V2 {
         *self.totals.lock()
     }
 
+    /// The last converged session with `peer` in `space`, if remembered.
+    pub(crate) fn record(&self, peer: SignPk, space: SpaceId) -> Option<PeerRecord> {
+        self.records.lock().get(&(peer, space))
+    }
+
     pub(crate) fn is_v1_only(&self, peer: &SignPk) -> bool {
         let mut v1 = self.v1_only.lock();
         match v1.get(peer) {
