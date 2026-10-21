@@ -226,6 +226,16 @@ const GREET_GAP: Time = 4_000;
 /// Seqno requests per origin at most this often; how far they travel.
 const SEQREQ_GAP: Time = 1_000;
 const SEQREQ_HOPS: u8 = 8;
+/// After a loss, a seqno request goes to at most this many neighbours: those
+/// that offered a route to the origin, cheapest first (all of them only if
+/// none did). Each copy travels on toward the origin, so every neighbour
+/// asked costs up to [`SEQREQ_HOPS`] requests ([`Config::seqreq_fanout`]).
+pub const SEQREQ_FANOUT: usize = 2;
+/// Seqno requests taken from one neighbour: at most this many a second
+/// (burst 4×); the rest are dropped. Each one answered by an origin floods
+/// a fresh announcement to its full scope, so without a limit one device
+/// asking for every origin would make the whole mesh flood twice a second.
+const SEQREQ_RATE: f64 = 10.0;
 /// An origin answers a seqno request at most this often.
 const FORCED_GAP: Time = 500;
 /// A relay floods one origin's new seqnos at most this often: a storming
@@ -357,6 +367,9 @@ pub struct Config {
     /// origin don't take the default route for this long (0: they do at
     /// once, as before; [`RETRACT_HOLD`]).
     pub retract_hold: Time,
+    /// Neighbours a seqno request goes to after a loss ([`SEQREQ_FANOUT`];
+    /// 0: every neighbour, as before).
+    pub seqreq_fanout: usize,
 }
 
 /// Defences against lying relays that need no wire change
@@ -423,6 +436,7 @@ impl Default for Config {
             defences: Defences::default(),
             affinity_step: AFFINITY_STEP,
             retract_hold: RETRACT_HOLD,
+            seqreq_fanout: SEQREQ_FANOUT,
         }
     }
 }
@@ -433,7 +447,8 @@ impl Config {
     /// and `reduction` (on, off); the defences ([`Defences`]) all at once,
     /// `defences` (all, default, none), or one by one: `aggregate`, `corroborate`,
     /// `affinity`, `budget`, `refresh` (on, off); `affinity_step` (percent);
-    /// `hold` (ms, Babel's hold time after a retraction).
+    /// `hold` (ms, Babel's hold time after a retraction); `fanout` (seqno
+    /// requests after a loss, 0: to every neighbour).
     pub fn tune(&mut self, s: &str) -> Result<(), String> {
         let on = |kv: &str, v: &str| match v {
             "on" => Ok(true),
@@ -461,6 +476,7 @@ impl Config {
                 ("budget", v) => self.defences.budget = on(kv, v)?,
                 ("refresh", v) => self.defences.refresh = on(kv, v)?,
                 ("hold", n) => self.retract_hold = n.parse().map_err(|e| format!("{kv}: {e}"))?,
+                ("fanout", n) => self.seqreq_fanout = n.parse().map_err(|e| format!("{kv}: {e}"))?,
                 _ => return Err(format!("{kv}: unknown knob")),
             }
         }
@@ -626,6 +642,8 @@ pub struct Stats {
     /// Routes withdrawn at once on a loss, and fresh-seqno requests sent.
     pub retractions_sent: u64,
     pub seqreqs_sent: u64,
+    /// Seqno requests dropped over a neighbour's rate.
+    pub seqreqs_limited: u64,
     /// Routes refused by the feasibility condition (would risk a loop).
     pub infeasible: u64,
     pub frames_sent: u64,
@@ -689,6 +707,8 @@ struct Nb {
     cost: u32,
     budget: Bucket,
     ogm_budget: Bucket,
+    /// Seqno requests it may send us ([`SEQREQ_RATE`]).
+    req_budget: Bucket,
     last_used: Time,
     /// Relayed announcements to it: their budget ([`Defences::budget`]) and
     /// those waiting for it.
@@ -703,9 +723,11 @@ impl Nb {
         budget.at = now;
         let mut ogm_budget = Bucket::new(OGM_RATE, OGM_RATE * 4.0);
         ogm_budget.at = now;
+        let mut req_budget = Bucket::new(SEQREQ_RATE, SEQREQ_RATE * 4.0);
+        req_budget.at = now;
         let mut ctl = Self::control_bucket(0);
         ctl.at = now;
-        Nb { direct: false, up: false, cost: 0, budget, ogm_budget, last_used: now, ctl, ctl_q: Vec::new() }
+        Nb { direct: false, up: false, cost: 0, budget, ogm_budget, req_budget, last_used: now, ctl, ctl_q: Vec::new() }
     }
 
     fn hop_cost(&self) -> u32 {
@@ -1550,6 +1572,7 @@ impl Router {
             return;
         }
         let targets: Vec<SignPk> = self.direct_up().filter(|k| Some(*k) != except && *k != origin).collect();
+        let asked = self.seqreq_targets(origin, &targets);
         let Some(o) = self.origins.get_mut(&origin) else { return };
         if o.fd.is_some() && !o.retracted {
             o.retracted = true;
@@ -1566,17 +1589,35 @@ impl Router {
         if o.last_req.is_none_or(|t| now.saturating_sub(t) >= SEQREQ_GAP) {
             o.last_req = Some(now);
             let req = SeqReq { origin, seq: o.newest + 1, hops: SEQREQ_HOPS };
-            for t in targets {
+            for t in asked {
                 self.stats.seqreqs_sent += 1;
                 self.out.push(Out::SeqReq { to: t, req });
             }
         }
     }
 
+    /// Of `targets`, whom to ask for a fresh seqno of `origin`
+    /// ([`Config::seqreq_fanout`]): the neighbours that offered a route to it
+    /// (they are nearer it, and infeasible only because of what we
+    /// advertised), cheapest first; all of `targets` if none did.
+    fn seqreq_targets(&self, origin: SignPk, targets: &[SignPk]) -> Vec<SignPk> {
+        let fanout = self.cfg.seqreq_fanout;
+        let Some(o) = self.origins.get(&origin).filter(|_| fanout > 0) else { return targets.to_vec() };
+        let mut offered: Vec<(u32, SignPk)> =
+            o.via.iter().filter(|(n, _)| targets.contains(n)).map(|(n, v)| (v.cost, *n)).collect();
+        if offered.is_empty() {
+            return targets.to_vec();
+        }
+        offered.sort_by_key(|(c, n)| (*c, n.0));
+        offered.into_iter().take(fanout).map(|(_, n)| n).collect()
+    }
+
     /// A neighbour asks for an announcement of `req.origin` at least as
     /// new as `req.seq`.
     pub fn on_seqreq(&mut self, from: SignPk, req: SeqReq, now: Time) {
-        if !self.nbs.get(&from).is_some_and(|n| n.direct && n.up) {
+        let Some(n) = self.nbs.get_mut(&from).filter(|n| n.direct && n.up) else { return };
+        if !n.req_budget.take(1.0, now) {
+            self.stats.seqreqs_limited += 1;
             return;
         }
         if req.origin == self.me {

@@ -2164,3 +2164,93 @@ fn a_neighbour_whose_routes_keep_expiring_ranks_last() {
         }
     }
 }
+
+/// The seqno requests in `outs`, by neighbour asked.
+fn seqreqs_to(outs: &[Out]) -> Vec<SignPk> {
+    let mut v: Vec<SignPk> =
+        outs.iter().filter_map(|o| if let Out::SeqReq { to, .. } = o { Some(*to) } else { None }).collect();
+    v.sort();
+    v
+}
+
+/// After a loss, a seqno request goes to the two cheapest neighbours that
+/// offered a route to the origin (each copy travels on toward it), not to
+/// every neighbour; to all of them only if nobody offered one.
+#[test]
+fn a_loss_asks_the_neighbours_nearest_the_origin_for_a_seqno() {
+    let o = key(9);
+    let nbs: Vec<SignPk> = (2..8).map(key).collect();
+    let mut r = Router::new(key(1), Config { defences: Defences::NONE, ..Config::default() });
+    for n in &nbs {
+        r.set_direct(*n, true, 0);
+        r.hop_up(*n, 0);
+        r.set_cost(*n, 100);
+    }
+    let ok = |_: &Announce| true;
+    // the cheapest through nbs[0]; dearer ones through nbs[1..4], made
+    // infeasible by what we advertise
+    r.on_announce(nbs[0], ann(o, WALL, 1, 100), 10, WALL, ok);
+    r.tick(100);
+    for (i, n) in nbs[1..4].iter().enumerate() {
+        r.on_announce(*n, ann(o, WALL, 3, 2_000 + 100 * i as u32), 200, WALL, ok);
+    }
+    let mut outs = Vec::new();
+    r.drain(&mut outs);
+    outs.clear();
+    r.on_announce(nbs[0], Announce { cost: INFINITY, ..ann(o, WALL, 1, 0) }, 300, WALL, ok);
+    r.drain(&mut outs);
+    assert_eq!(seqreqs_to(&outs), vec![nbs[1], nbs[2]], "the two cheapest that offered one");
+    // nobody left who offered a route: everyone is asked
+    let mut r = Router::new(key(1), Config { defences: Defences::NONE, ..Config::default() });
+    for n in &nbs {
+        r.set_direct(*n, true, 0);
+        r.hop_up(*n, 0);
+        r.set_cost(*n, 100);
+    }
+    r.on_announce(nbs[0], ann(o, WALL, 1, 100), 10, WALL, ok);
+    r.tick(100);
+    r.drain(&mut outs);
+    outs.clear();
+    r.on_announce(nbs[0], Announce { cost: INFINITY, ..ann(o, WALL, 1, 0) }, 300, WALL, ok);
+    r.drain(&mut outs);
+    assert_eq!(seqreqs_to(&outs), nbs[1..].to_vec());
+    // the build before: every neighbour, whoever offered what
+    let mut c = Config::default();
+    c.tune("fanout=0").unwrap();
+    assert_eq!(c.seqreq_fanout, 0);
+}
+
+/// One neighbour asking for fresh seqnos of every origin it can name would
+/// make each of them flood a fresh announcement to its full scope: requests
+/// from one neighbour are taken at most 10 a second (burst 40).
+#[test]
+fn seqno_requests_from_one_neighbour_are_rate_limited() {
+    let (asker, other) = (key(2), key(3));
+    let mut r = Router::new(key(1), Config::default());
+    for n in [asker, other] {
+        r.set_direct(n, true, 0);
+        r.hop_up(n, 0);
+    }
+    let ok = |_: &Announce| true;
+    let origins: Vec<SignPk> = (100..200).map(key).collect();
+    for o in &origins {
+        r.on_announce(other, ann(*o, WALL, 2, 500), 10, WALL, ok);
+    }
+    r.tick(100);
+    let mut outs = Vec::new();
+    r.drain(&mut outs);
+    outs.clear();
+    for o in &origins {
+        r.on_seqreq(asker, SeqReq { origin: *o, seq: WALL + 1, hops: 8 }, 1_000);
+    }
+    r.drain(&mut outs);
+    assert_eq!(seqreqs_to(&outs).len(), 40, "forwarded toward their origins: the burst");
+    assert_eq!(r.stats().seqreqs_limited, 60);
+    // a second later, ten more
+    outs.clear();
+    for o in &origins {
+        r.on_seqreq(asker, SeqReq { origin: *o, seq: WALL + 2, hops: 8 }, 2_000);
+    }
+    r.drain(&mut outs);
+    assert_eq!(seqreqs_to(&outs).len(), 10);
+}
