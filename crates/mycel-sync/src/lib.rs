@@ -23,6 +23,7 @@ mod bounded_change;
 mod change_ops;
 mod change_resources;
 mod doc_index;
+pub mod reconcile;
 
 pub type EnvelopeId = Hash32;
 
@@ -484,6 +485,8 @@ pub struct Replica {
     doc_inputs: HashMap<StreamId, DocInputs>,
     /// Envelopes whose status is Pending (re-checked when new inputs arrive).
     pending: HashSet<EnvelopeId>,
+    /// The envelope chains held, for Sync v2 (`reconcile`).
+    index: reconcile::ChainIndex,
     #[cfg(test)]
     stats: std::cell::Cell<DocStats>,
 }
@@ -553,6 +556,7 @@ impl Replica {
             doc_rejected: HashSet::new(),
             doc_inputs: HashMap::new(),
             pending: HashSet::new(),
+            index: reconcile::ChainIndex::default(),
             #[cfg(test)]
             stats: Default::default(),
         }
@@ -716,15 +720,37 @@ impl Replica {
         if !self.graph.ever_named(&env.header.author) {
             return Err(SyncError::NotAllowed("author was never added to this space"));
         }
+        // Admission rule A3: at most `reconcile::WINDOW` seqs beyond the
+        // author's chain held from its start (re-offered once the prefix
+        // arrives; senders go in ascending seq, so honest data never waits).
+        if !self.index.within_window(&env.header.author, env.header.author_seq) {
+            return Err(SyncError::NotAllowed("beyond the author's chain window"));
+        }
         env.verify_sig()?;
         self.persist_envelope(&env);
         self.chains.entry(env.header.author).or_default().entry(env.header.author_seq).or_default().push(id);
+        self.index.insert(id, env.header.author, env.header.author_seq, env.header.author_prev);
         self.envelopes.insert(id, env);
         Ok(Some(id))
     }
 
     /// Ingest many items at once (one graph resolution, one refresh).
     pub fn ingest_batch(&mut self, ops: Vec<SignedOp>, envelopes: Vec<Envelope>) -> Ingested {
+        self.ingest_batch_refused(ops, envelopes).0
+    }
+
+    /// [`Replica::ingest_batch`], also returning the ids of envelopes refused
+    /// for reasons intrinsic to the envelope (bad signature, too large,
+    /// another space): they will never be accepted, whatever else arrives.
+    /// Envelopes are staged in (author, seq) order, so a batch in any order
+    /// extends chains from their start (admission rule A3).
+    pub fn ingest_batch_refused(
+        &mut self,
+        ops: Vec<SignedOp>,
+        mut envelopes: Vec<Envelope>,
+    ) -> (Ingested, Vec<EnvelopeId>) {
+        envelopes.sort_by_key(|e| (e.header.author, e.header.author_seq));
+        let mut refused = Vec::new();
         let mut out = Ingested::default();
         if !ops.is_empty() {
             let ids: Vec<OpId> = ops.iter().map(|o| o.id()).collect();
@@ -740,10 +766,16 @@ impl Replica {
         }
         let mut new_envs = Vec::new();
         for env in envelopes {
+            let id = env.id();
             match self.stage_envelope(env) {
                 Ok(Some(id)) => new_envs.push(id),
                 Ok(None) => {}
-                Err(_) => out.rejected += 1,
+                Err(e) => {
+                    out.rejected += 1;
+                    if !matches!(e, SyncError::NotAllowed(m) if m != "too many auth heads") {
+                        refused.push(id);
+                    }
+                }
             }
         }
         out.envelopes = new_envs.len();
@@ -753,7 +785,7 @@ impl Replica {
         } else if !new_envs.is_empty() {
             self.incremental(&new_envs);
         }
-        out
+        (out, refused)
     }
 
     // ───────────── validation (no decryption) ─────────────
