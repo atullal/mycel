@@ -31,6 +31,8 @@ pub mod emu;
 #[doc(hidden)]
 pub mod fuzzing;
 pub mod link;
+#[cfg(any(target_os = "macos", target_os = "ios", fuzzing))]
+mod mdns_records;
 pub mod mesh;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod native_mdns;

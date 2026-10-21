@@ -1,8 +1,8 @@
 //! Discovery and control bytes from nearby devices on the other links:
 //! peer-to-peer Wi-Fi control datagrams and Bonjour TXT adverts
 //! (`mycel-link-awdl`), interface beacons and link addresses
-//! (`mycel-link-iface`), and, on Apple platforms, the SRV and TXT records
-//! of LAN discovery (`mycel-net`). The first input byte picks the decoder.
+//! (`mycel-link-iface`), and the Bonjour SRV and TXT records of LAN
+//! discovery (`mycel-net`; parsed on Apple platforms, fuzzed on every one). The first input byte picks the decoder.
 //!
 //! Properties: no panic; whatever decodes re-encodes to the same value.
 #![no_main]
@@ -48,15 +48,12 @@ fuzz_target!(|data: &[u8]| {
                 }
             }
         }
-        4 =>
-        {
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
+        4 => {
             if let Some((name, _port)) = mycel_net::fuzzing::mdns_srv(data) {
                 assert!(!name.is_empty() && name.len() <= 255);
             }
         }
         _ => {
-            #[cfg(any(target_os = "macos", target_os = "ios"))]
             let _ = mycel_net::fuzzing::mdns_txt(data);
         }
     }
