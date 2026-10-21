@@ -1574,7 +1574,7 @@ it, so the gate must give the same numbers. Checked by running it twice,
 `v2/integration` (4a321e48) and once with this branch's, both with 4
 threads: the verdicts are identical, and all 90 per-seed results are
 identical in every metric and note except wall-clock times (and the new
-`fidelity` field, which only labels them). 10 of 10 scenarios and the
+`fidelity` field, which only labels them). All 9 scenarios and the
 pinned seeds pass, as before. Wall time 101 s and 104 s (noise; the
 machine was running other jobs). `report.md` now has Fidelity, Region and
 Robust-pass columns on every row; the gate's tier-2 scenarios get the
