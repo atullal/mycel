@@ -1,8 +1,9 @@
 //! Dissemination on model sets: an in-memory network of devices, each with
-//! a [`Disseminator`], delivering every message within one 10 ms step and
-//! running a real Sync v2 session for every pull.
+//! a [`Disseminator`], delivering every message within one 10 ms step (or,
+//! jittered, after a random delay, in any order) and running a real Sync v2
+//! session for every pull.
 
-use std::collections::{BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use mycel_crypto::{Hash32, SignPk};
 
@@ -35,6 +36,34 @@ struct Net {
     gossip_bytes: u64,
     /// Devices whose incoming pushes are dropped (a lossy path).
     deaf: HashSet<usize>,
+    /// Jittered delivery: each message takes `lo..=hi` ms (seeded), so
+    /// pushes cross and arrive out of order as on a real network.
+    jitter: Option<Jitter>,
+    inflight: Vec<(u64, u64, usize, usize, GossipMsg<ModelOp, ModelEnv>)>,
+    step_ms: u64,
+    /// Announcements delivered, per (from, to).
+    ihaves: HashMap<(usize, usize), u64>,
+}
+
+struct Jitter {
+    state: u64,
+    lo: u64,
+    hi: u64,
+}
+
+impl Jitter {
+    fn next(&mut self) -> u64 {
+        // splitmix64
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    fn delay(&mut self) -> u64 {
+        self.lo + self.next() % (self.hi - self.lo + 1)
+    }
 }
 
 impl Net {
@@ -60,32 +89,58 @@ impl Net {
             session_bytes: 0,
             gossip_bytes: 0,
             deaf: HashSet::new(),
+            jitter: None,
+            inflight: Vec::new(),
+            step_ms: 10,
+            ihaves: HashMap::new(),
         }
+    }
+
+    /// Deliver each message after `lo..=hi` ms, in 2 ms steps.
+    fn jittered(mut self, seed: u64, lo: u64, hi: u64) -> Net {
+        self.jitter = Some(Jitter { state: seed, lo, hi });
+        self.step_ms = 2;
+        self
     }
 
     fn ix(&self, k: &SignPk) -> usize {
         self.keys.iter().position(|p| p == k).unwrap()
     }
 
-    /// One step: every device's actions, then every message delivered.
+    /// One step: every device's actions, then every message that is due
+    /// delivered (all of them at once without jitter).
     fn step(&mut self) -> bool {
-        let mut mail: VecDeque<(usize, usize, GossipMsg<ModelOp, ModelEnv>)> = VecDeque::new();
         let mut pulls = Vec::new();
+        let mut seq = self.inflight.len() as u64;
         for i in 0..self.ds.len() {
             while let Some(a) = self.ds[i].poll(self.now) {
                 match a {
                     Action::Send { to, msg } => {
                         self.gossip_bytes += frame_len(&msg) as u64;
-                        mail.push_back((i, self.ix(&to), msg));
+                        let to = self.ix(&to);
+                        let (due, order) = match self.jitter.as_mut() {
+                            Some(j) => (self.now + j.delay(), j.next()),
+                            None => (self.now, seq),
+                        };
+                        seq += 1;
+                        self.inflight.push((due, order, i, to, msg));
                     }
                     Action::Pull { peer, .. } => pulls.push((i, self.ix(&peer))),
                 }
             }
         }
-        let busy = !mail.is_empty() || !pulls.is_empty();
-        for (from, to, msg) in mail {
+        let busy = !self.inflight.is_empty() || !pulls.is_empty();
+        let now = self.now;
+        let (mut mail, rest): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.inflight).into_iter().partition(|m| m.0 <= now);
+        self.inflight = rest;
+        mail.sort_by_key(|m| (m.0, m.1));
+        for (_, _, from, to, msg) in mail {
             if self.deaf.contains(&to) && matches!(msg, GossipMsg::Push { .. }) {
                 continue;
+            }
+            if matches!(msg, GossipMsg::IHave { .. }) {
+                *self.ihaves.entry((from, to)).or_insert(0) += 1;
             }
             let fk = self.keys[from];
             let pushed = self.ds[to].on_msg(&self.sets[to], fk, msg, self.now).expect("valid gossip");
@@ -124,7 +179,7 @@ impl Net {
         let end = self.now + ms;
         while self.now < end {
             self.step();
-            self.now += 10;
+            self.now += self.step_ms;
         }
     }
 
@@ -399,6 +454,130 @@ fn seen_notes_ride_on_messages_once_per_neighbour() {
     assert_eq!(carried, 1);
 }
 
+/// Both ends of every edge agree whether it is eager.
+fn eagerness_agrees(net: &Net) -> Result<(), String> {
+    for (i, d) in net.ds.iter().enumerate() {
+        for (p, eager) in d.neighbours(&space()) {
+            let j = net.ix(&p);
+            let theirs = net.ds[j].neighbours(&space()).into_iter().find(|(q, _)| *q == net.keys[i]).map(|(_, e)| e);
+            if theirs != Some(eager) {
+                return Err(format!("{i}→{j} eager {eager}, {j}→{i} {theirs:?}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Regression (QUIC benchmark, 50 members: 1.8 payload copies per member):
+/// an edge lazy at one end only (a prune lost with a failed path, or a
+/// prune and a graft that crossed) made the eager end push every message
+/// for ever, because a duplicate from an edge already lazy here sent no
+/// prune. Now every duplicate prunes, and new items make the edge eager on
+/// the receiving end too, so both ends agree again after one message.
+#[test]
+fn an_edge_lazy_at_one_end_only_is_repaired() {
+    let mut net = Net::new(12, internet);
+    net.run(500);
+    for w in 0..5 {
+        net.write(w, 1, 300);
+        net.run(3_000);
+    }
+    eagerness_agrees(&net).expect("a settled tree is consistent");
+    // Every eager edge of device 3 goes lazy at its end only.
+    let eager: Vec<SignPk> = net.ds[3].neighbours(&space()).into_iter().filter(|(_, e)| *e).map(|(p, _)| p).collect();
+    assert!(!eager.is_empty());
+    for p in &eager {
+        net.ds[3].path_down(p);
+    }
+    while net.ds[3].poll(net.now).is_some() {}
+    assert!(eagerness_agrees(&net).is_err());
+    for w in 0..3 {
+        net.write(7 + w, 1, 300);
+        net.run(3_000);
+    }
+    let before: u64 = net.copies.iter().sum();
+    for w in 0..3 {
+        let ids = net.write(w, 1, 300);
+        net.run(3_000);
+        assert_eq!(net.holders(&ids[0]), 12);
+    }
+    eagerness_agrees(&net).expect("both ends agree again");
+    let copies = (net.copies.iter().sum::<u64>() - before) as f64 / 3.0;
+    assert!(copies <= 1.5 * 11.0, "{copies} copies per message");
+}
+
+/// A member pushing to a device whose degree is full, without being its
+/// neighbour, is told to stop (a dropping prune); before, it was ignored
+/// and pushed duplicates for ever.
+#[test]
+fn a_push_from_a_non_neighbour_over_the_degree_cap_is_refused() {
+    let keys: Vec<SignPk> = (0..20).map(pk).collect();
+    let mut d = D::new(keys[0], GossipConfig::default());
+    let members: Vec<Member> = keys[1..].iter().map(|p| internet(0, p)).collect();
+    let set = ModelSet::new(space());
+    d.set_members(&set, &members, 0);
+    for p in &keys[1..=MAX_DEGREE] {
+        d.on_msg(&set, *p, GossipMsg::Graft { space: space() }, 0).unwrap();
+    }
+    while d.poll(0).is_some() {}
+    let stranger = *keys.iter().find(|p| **p != keys[0] && !d.is_neighbour(&space(), p)).unwrap();
+    let push = GossipMsg::Push { space: space(), ops: vec![], items: vec![], entries: vec![], seen: vec![] };
+    d.on_msg(&set, stranger, push, 0).unwrap();
+    let mut told = false;
+    while let Some(a) = d.poll(0) {
+        if let Action::Send { to, msg: GossipMsg::Prune { drop: true, .. } } = a {
+            told |= to == stranger;
+        }
+    }
+    assert!(told);
+    assert!(!d.is_neighbour(&space(), &stranger));
+}
+
+/// Several neighbours announce the same item: when the wait runs out, one
+/// of them is grafted and pulled, not all (Plumtree's second timer).
+#[test]
+fn one_announcer_is_pulled_at_a_time() {
+    let keys: Vec<SignPk> = (0..8).map(pk).collect();
+    let mut d = D::new(keys[0], GossipConfig::default());
+    let members: Vec<Member> = keys[1..].iter().map(|p| internet(0, p)).collect();
+    let set = ModelSet::new(space());
+    d.set_members(&set, &members, 0);
+    while d.poll(0).is_some() {}
+    let mut other = ModelSet::new(space());
+    other.append(pk(60), 1, 100);
+    let entries: Vec<_> = other.index().entries().values().cloned().collect();
+    for p in &keys[1..4] {
+        let ihave = GossipMsg::IHave { space: space(), ops: vec![], entries: entries.clone(), seen: vec![] };
+        d.on_msg(&set, *p, ihave, 10).unwrap();
+    }
+    let pulls = |d: &mut D, now: u64| {
+        let mut n = 0;
+        while let Some(a) = d.poll(now) {
+            n += usize::from(matches!(a, Action::Pull { .. }));
+        }
+        n
+    };
+    assert_eq!(pulls(&mut d, 10 + IHAVE_WAIT_FAST_MS), 1, "one pull when the wait runs out");
+    assert_eq!(pulls(&mut d, 10 + IHAVE_WAIT_FAST_MS + 10), 0, "the others wait");
+    // Still missing after the second wait: the next announcer is tried.
+    assert!(pulls(&mut d, 10 + 2 * IHAVE_WAIT_FAST_MS) >= 1);
+}
+
+/// The author learns soon that its neighbours hold its write (delivery
+/// state): a neighbour that got the author's own items by push announces
+/// back to it, whatever the edge, even in a full mesh where the author is
+/// the one peer it would otherwise skip.
+#[test]
+fn an_author_hears_back_from_neighbours_its_push_reached() {
+    let mut net = Net::new(3, internet);
+    net.run(100);
+    net.write(0, 1, 100);
+    net.run(2_000);
+    for i in 1..3 {
+        assert!(net.ihaves.get(&(i, 0)).copied().unwrap_or(0) >= 1, "{i} announced back to the author");
+    }
+}
+
 /// Dissemination cost on model sets (real postcard sizes, no transport
 /// overhead): gossip frame bytes and payload copies for one 351-byte
 /// message in 10/50/200-member groups after warm-up (docs/BENCHMARKS.md
@@ -426,5 +605,38 @@ fn bench_gossip_dissemination_cost() {
         let c = (net.copies.iter().sum::<u64>() - c0) as f64 / K as f64;
         let s = (net.sessions - s0) as f64 / K as f64;
         println!("| {n} | {b} | {} | {c:.1} | {s:.1} |", b / u64::from(n));
+    }
+}
+
+/// The same with jittered delivery (2–60 ms per message, any order): pushes
+/// cross, as between real nodes. `cargo test -p mycel-sync --lib
+/// bench_gossip_jittered -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_gossip_jittered() {
+    println!("| members | gossip B per message (group) | per member | payload copies | pulls | prunes | grafts |");
+    println!("|---|---|---|---|---|---|---|");
+    for n in [10u16, 50, 200] {
+        let mut net = Net::new(n, internet).jittered(u64::from(n), 2, 60);
+        net.run(500);
+        for w in 0..8 {
+            net.write((w * 7) % n as usize, 1, 300);
+            net.run(3_000);
+        }
+        let stat = |net: &Net, f: &dyn Fn(&GossipStats) -> u64| net.ds.iter().map(|d| f(&d.stats())).sum::<u64>();
+        let (b0, c0, s0) = (net.gossip_bytes, net.copies.iter().sum::<u64>(), net.sessions);
+        let (p0, g0) = (stat(&net, &|s| s.prunes_sent), stat(&net, &|s| s.grafts_sent));
+        const K: u64 = 5;
+        for k in 0..K {
+            let ids = net.write((k as usize * 13) % n as usize, 1, 300);
+            net.run(3_000);
+            assert_eq!(net.holders(&ids[0]), n as usize);
+        }
+        let b = (net.gossip_bytes - b0) / K;
+        let c = (net.copies.iter().sum::<u64>() - c0) as f64 / K as f64;
+        let s = (net.sessions - s0) as f64 / K as f64;
+        let p = (stat(&net, &|s| s.prunes_sent) - p0) as f64 / K as f64;
+        let g = (stat(&net, &|s| s.grafts_sent) - g0) as f64 / K as f64;
+        println!("| {n} | {b} | {} | {c:.1} | {s:.1} | {p:.1} | {g:.1} |", b / u64::from(n));
     }
 }

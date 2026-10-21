@@ -263,9 +263,20 @@ struct View {
     rr: usize,
 }
 
-/// Aggregated announcement: due time, changed entries, op tips, and the
-/// one peer all of it came from, if one did (not announced back to it).
-type PendingIHave = (u64, BTreeMap<SignPk, AuthorEntry>, Vec<OpId>, Option<SignPk>);
+/// Aggregated announcement.
+struct PendingIHave {
+    due: u64,
+    /// Changed entries and op tips.
+    entries: BTreeMap<SignPk, AuthorEntry>,
+    ops: Vec<OpId>,
+    /// The one peer all of it came from, if one did (not announced back to
+    /// it as one of the lazy few).
+    from: Option<SignPk>,
+    /// Authors whose own writes they pushed (or a session brought) to us:
+    /// they get the announcement whatever their edge, as an acknowledgement
+    /// (their delivery state, design §10). Bounded by the degree cap.
+    acks: BTreeSet<SignPk>,
+}
 
 struct Missing {
     due: u64,
@@ -620,13 +631,21 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
         }
         // Lazy announcement, aggregated.
         let due = now + IHAVE_DELAY_MS;
-        let agg = view.ihave.get_or_insert_with(|| (due, BTreeMap::new(), Vec::new(), from));
+        let ack = from.filter(|f| entries.iter().any(|e| e.author == *f) && view.is_neighbour(f));
+        let agg = view.ihave.get_or_insert_with(|| PendingIHave {
+            due,
+            entries: BTreeMap::new(),
+            ops: Vec::new(),
+            from,
+            acks: BTreeSet::new(),
+        });
+        agg.acks.extend(ack);
         for e in entries {
-            agg.1.insert(e.author, e);
+            agg.entries.insert(e.author, e);
         }
-        agg.2 = ops.clone();
-        if agg.3 != from {
-            agg.3 = None;
+        agg.ops = ops.clone();
+        if agg.from != from {
+            agg.from = None;
         }
         view.announced = Announced { entries: cur, ops };
     }
@@ -653,9 +672,21 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
                     return Err(GossipError::TooLarge);
                 }
                 // A push from a member that isn't a neighbour yet: it chose
-                // us (its graft may still be on the way).
-                if !view.is_neighbour(&from) && view.members.contains_key(&from) && view.degree() < degree_cap {
-                    view.accepted.insert(from);
+                // us (its graft may still be on the way). Over the degree
+                // cap, it is told to stop (or it would push for ever: we
+                // never prune a non-neighbour).
+                if !view.is_neighbour(&from) && view.members.contains_key(&from) {
+                    if view.degree() < degree_cap {
+                        view.accepted.insert(from);
+                    } else {
+                        let alternatives: Vec<SignPk> =
+                            view.neighbours().filter(|p| **p != from).take(MAX_ALTERNATIVES).copied().collect();
+                        self.out.push_back(Action::Send {
+                            to: from,
+                            msg: GossipMsg::Prune { space, drop: true, alternatives },
+                        });
+                        self.stats.prunes_sent += 1;
+                    }
                 }
                 self.stats.items_received += items.len() as u64;
                 // IDONTWANT: large new items, before we forward them.
@@ -784,16 +815,25 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
 
     /// The driver ingested a push from `from`: `new` of its items were new
     /// to the set. Nothing new prunes the edge to lazy (Plumtree); something
-    /// new is forwarded ([`Self::on_changed`]).
+    /// new makes the edge eager on our side too, and is forwarded
+    /// ([`Self::on_changed`]).
+    ///
+    /// Both rules keep the two ends of an edge agreeing, which the tree
+    /// depends on: a `Prune` and a `Graft` that cross, or a prune lost with
+    /// a failed path, leave one end eager and the other lazy. Without them
+    /// the eager end pushes every message for ever, and we never pushed
+    /// ours to it.
     pub fn after_push<S: SyncSet<Op = O, Env = E>>(&mut self, set: &S, from: SignPk, items: usize, new: u64, now: u64) {
         let space = set.space();
         if new == 0 {
             if items > 0 {
                 self.stats.duplicates += items as u64;
+                // A prune even if the edge is lazy here already: the sender
+                // still treats it as eager.
                 if let Some(view) = self.views.get_mut(&space)
                     && view.is_neighbour(&from)
-                    && view.lazy.insert(from)
                 {
+                    view.lazy.insert(from);
                     self.out.push_back(Action::Send {
                         to: from,
                         msg: GossipMsg::Prune { space, drop: false, alternatives: Vec::new() },
@@ -804,6 +844,11 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
             return;
         }
         self.stats.duplicates += (items as u64).saturating_sub(new);
+        if let Some(view) = self.views.get_mut(&space)
+            && view.is_neighbour(&from)
+        {
+            view.lazy.remove(&from);
+        }
         self.on_changed(set, Some(from), now);
     }
 
@@ -857,7 +902,7 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
         let views = self
             .views
             .values()
-            .flat_map(|v| v.ihave.as_ref().map(|i| i.0).into_iter().chain(v.missing.values().map(|m| m.due)));
+            .flat_map(|v| v.ihave.as_ref().map(|i| i.due).into_iter().chain(v.missing.values().map(|m| m.due)));
         let links = self.links.values().filter(|l| !l.is_empty()).map(|l| {
             let need = (1.0 - l.tokens).max(0.0);
             l.at + (need / l.rate * 1000.0).ceil() as u64
@@ -881,9 +926,9 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
     fn fire_timers(&mut self, now: u64) {
         let mut rng_seed = now;
         for (space, view) in self.views.iter_mut() {
-            if let Some((due, ..)) = &view.ihave
+            if let Some(PendingIHave { due, .. }) = &view.ihave
                 && *due <= now
-                && let Some((_, entries, ops, from)) = view.ihave.take()
+                && let Some(PendingIHave { entries, ops, from, acks, .. }) = view.ihave.take()
             {
                 let mut lazy = view.lazy_neighbours(from);
                 // A few lazy neighbours, not all of them.
@@ -893,6 +938,11 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
                     let start = (rng_seed >> 33) as usize % k;
                     lazy.rotate_left(start);
                     lazy.truncate(IHAVE_FANOUT);
+                }
+                for a in acks {
+                    if !lazy.contains(&a) {
+                        lazy.push(a);
+                    }
                 }
                 let entries = cap_entries(entries.into_values());
                 for p in lazy {
@@ -904,9 +954,29 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
                     self.stats.ihaves_sent += 1;
                 }
             }
-            let due: Vec<SignPk> = view.missing.iter().filter(|(_, m)| m.due <= now).map(|(p, _)| *p).collect();
+            // The first announcer whose wait ran out is grafted and pulled;
+            // the others wait a little longer (Plumtree's second timer):
+            // that session will most likely settle what they announced too,
+            // and grafting all of them would add eager edges that only
+            // bring duplicates and prunes.
+            let due: Vec<SignPk> = view
+                .missing
+                .iter()
+                .filter(|(_, m)| m.due <= now)
+                .min_by_key(|(_, m)| m.due)
+                .map(|(p, _)| *p)
+                .into_iter()
+                .collect();
             for p in due {
-                view.missing.remove(&p);
+                if let Some(m) = view.missing.remove(&p) {
+                    for (q, other) in view.missing.iter_mut() {
+                        if !other.heads.is_disjoint(&m.heads) || !other.ops.is_disjoint(&m.ops) {
+                            let slow = view.members.get(q).is_some_and(|x| x.slow);
+                            let wait = if slow { IHAVE_WAIT_SLOW_MS } else { IHAVE_WAIT_FAST_MS };
+                            other.due = other.due.max(now + wait / 2);
+                        }
+                    }
+                }
                 // The tree missed it: make the edge eager and pull now.
                 if view.is_neighbour(&p) && view.lazy.remove(&p) {
                     self.out.push_back(Action::Send { to: p, msg: GossipMsg::Graft { space: *space } });
