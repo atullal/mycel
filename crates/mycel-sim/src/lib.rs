@@ -19,6 +19,7 @@ pub mod latency;
 pub mod models;
 pub mod report;
 pub mod scenarios;
+pub mod seeds;
 pub mod stats;
 pub mod tier1;
 pub mod tier2;

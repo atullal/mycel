@@ -104,14 +104,17 @@ fn judge(
     let (ratio, lat, opt) = summarize(ds);
     r.at_least(&format!("{label}: delivery"), 100.0 * ratio, 100.0 * min_delivery, "%");
     r.at_most(&format!("{label}: latency p95"), if lat.n == 0 { f64::INFINITY } else { lat.p95 }, max_p95, "s");
+    // tens of messages: the slowest is reported, not a "p99" that is it
+    // anyway (crate::stats::P99_MIN_N)
     r.headline(format!(
-        "{label}: {:.0}% delivered, p50 {} s, p95 {} s, optimality p50/p95/p99 {}/{}/{}×",
+        "{label}: {:.0}% delivered, p50 {} s, p95 {} s, optimality p50/p95/max {}/{}/{}× of {}",
         100.0 * ratio,
         fmt(lat.p50),
         fmt(lat.p95),
         fmt(opt.p50),
         fmt(opt.p95),
-        fmt(opt.p99)
+        fmt(opt.max),
+        opt.n
     ));
     (ratio, lat, opt)
 }

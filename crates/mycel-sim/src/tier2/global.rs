@@ -165,6 +165,45 @@ pub struct Global {
     conns: Map<NodeId, Time>,
     buffer_at: Time,
     buffer_now: u64,
+    /// [`Role::AttestedLiar`]: per origin, the cheapest announcement it was
+    /// sent of the newest seqno (seq, hops, cost), as received.
+    chains: Map<SignPk, Chain>,
+    /// For tests: with `Some`, the last announcement heard from each
+    /// neighbour, per origin: (neighbour, origin) → (seq, hops, cost).
+    pub heard: Option<Map<(NodeId, SignPk), Chain>>,
+}
+
+/// An announcement's (seq, hops, cost).
+pub type Chain = (u64, u8, u32);
+
+/// The least a hop adds to a route's cost (the core's plausibility floor,
+/// `MIN_HOP_COST`: a measured cost of at least 1 plus [`mc::HOP_PENALTY`],
+/// 2.1 ms): what a liar claims for its own link.
+pub const ATTESTED_HOP_FLOOR: u32 = 1 + mc::HOP_PENALTY;
+
+/// [`Role::AttestedLiar`] hears `a`: keep the cheapest chain of the newest
+/// seqno (every chain it is sent is one it could extend).
+fn keep_chain(chains: &mut Map<SignPk, Chain>, a: &Announce) {
+    let e = chains.entry(a.origin).or_insert((a.seq, a.hops, a.cost));
+    if a.seq > e.0 || (a.seq == e.0 && (a.cost, a.hops) < (e.2, e.1)) {
+        *e = (a.seq, a.hops, a.cost);
+    }
+}
+
+/// [`Role::AttestedLiar`] sends `ann`: the cheapest chain it was sent of
+/// that seqno, extended by one hop at the least an honest hop adds, when
+/// that is cheaper than what the core chose; otherwise the core's own
+/// announcement (hops and cost always of one route, never mixed). With no
+/// chain of that seqno (one newer arrived since the core chose its route)
+/// it can't sign for this one, and sends the honest announcement.
+fn extend_chain(ann: &mut Announce, chain: Option<&Chain>) {
+    if let Some(&(seq, hops, cost)) = chain
+        && seq == ann.seq
+        && cost.saturating_add(ATTESTED_HOP_FLOOR) < ann.cost
+    {
+        ann.hops = hops.saturating_add(1);
+        ann.cost = cost.saturating_add(ATTESTED_HOP_FLOOR);
+    }
 }
 
 /// A bundle's id for message `msg` (the same message is the same bundle).
@@ -222,6 +261,8 @@ impl Global {
             conns: Map::default(),
             buffer_at: 0,
             buffer_now: 0,
+            chains: Map::default(),
+            heard: None,
         }
     }
 
@@ -369,7 +410,11 @@ impl Global {
                                 // "everyone is one hop from me", as cheaply as
                                 // an honest relay could say it
                                 ann.hops = 1;
-                                ann.cost = 1 + mc::HOP_PENALTY;
+                                ann.cost = ATTESTED_HOP_FLOOR;
+                            }
+                            Role::AttestedLiar => {
+                                let chain = self.chains.get(&ann.origin).copied();
+                                extend_chain(&mut ann, chain.as_ref());
                             }
                             _ => {}
                         }
@@ -380,7 +425,7 @@ impl Global {
                     self.send_to(cx, node(&to), Frame::Req(req), None);
                 }
                 Out::Frame { to, frame, relayed } => {
-                    if relayed && matches!(self.role, Role::BlackHole | Role::Liar) {
+                    if relayed && self.role.swallows(packet_of(&frame.payload)) {
                         continue; // swallowed
                     }
                     let msg = packet_msg(&frame.payload);
@@ -554,6 +599,12 @@ fn packet_msg(p: &Bytes) -> Option<MsgId> {
     (p.len() >= PKT_HDR && p[0] == TAG_DATA).then(|| u32::from_be_bytes(p[1..5].try_into().expect("4")))
 }
 
+/// The message a data packet or an acknowledgement belongs to.
+fn packet_of(p: &Bytes) -> Option<MsgId> {
+    (p.len() >= PKT_HDR && matches!(p[0], TAG_DATA | TAG_ACK))
+        .then(|| u32::from_be_bytes(p[1..5].try_into().expect("4")))
+}
+
 impl Router for Global {
     type Frame = Frame;
 
@@ -648,6 +699,12 @@ impl Router for Global {
                 if self.role == Role::Replayer && self.old.len() < 200 {
                     self.old.push(a.clone());
                 }
+                if self.role == Role::AttestedLiar && a.cost != mc::INFINITY && a.origin != self.pk {
+                    keep_chain(&mut self.chains, &a);
+                }
+                if let Some(h) = self.heard.as_mut() {
+                    h.insert((from, a.origin), (a.seq, a.hops, a.cost));
+                }
                 self.core.on_announce(fpk, a, now, WALL_MS + now, |_| true)
             }
             Frame::Req(r) => self.core.on_seqreq(fpk, r, now),
@@ -681,7 +738,10 @@ impl Router for Global {
             Frame::Bundle(b, copies) => {
                 let id = b.id;
                 let msg = bundle_msg(&id);
-                if self.role == Role::Liar && b.dst != self.pk {
+                if matches!(self.role, Role::Liar | Role::AttestedLiar | Role::Dropper | Role::GreyHole)
+                    && self.role.swallows(Some(msg))
+                    && b.dst != self.pk
+                {
                     // takes custody, keeps nothing
                     self.send_to(cx, from, Frame::BundleAck { id, copies, ok: true, stored: true }, None);
                     return;
@@ -920,5 +980,68 @@ impl Router for Global {
         self.core.set_internet(online && cx.has_inet());
         self.core.tick(now);
         self.effects(cx);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ann(seq: u64, hops: u8, cost: u32) -> Announce {
+        Announce {
+            hops,
+            cost,
+            origin: key(9),
+            seq,
+            flags: 0,
+            scope: 8,
+            uplink: 0,
+            name: Arc::from("n9"),
+            sig: Sig([0; 64]),
+        }
+    }
+
+    #[test]
+    fn an_attested_liar_keeps_the_cheapest_chain_of_the_newest_seqno() {
+        let mut chains = Map::default();
+        keep_chain(&mut chains, &ann(5, 3, 900));
+        keep_chain(&mut chains, &ann(5, 4, 700)); // cheaper, same seqno
+        keep_chain(&mut chains, &ann(5, 2, 800)); // dearer: kept out
+        keep_chain(&mut chains, &ann(4, 1, 100)); // older: kept out
+        assert_eq!(chains.get(&key(9)), Some(&(5, 4, 700)));
+        keep_chain(&mut chains, &ann(6, 5, 2_000)); // newer, however dear
+        assert_eq!(chains.get(&key(9)), Some(&(6, 5, 2_000)));
+    }
+
+    #[test]
+    fn an_attested_liar_extends_only_a_chain_of_the_seqno_it_sends() {
+        // the core would send 4 hops at 50,000 (its own link 20,000 of it)
+        let honest = ann(5, 4, 50_000);
+        let mut a = honest.clone();
+        extend_chain(&mut a, Some(&(5, 3, 30_000)));
+        assert_eq!((a.hops, a.cost), (4, 30_000 + ATTESTED_HOP_FLOOR), "only its own link understated");
+        // a route cheaper than any chain it could extend is never raised,
+        // and keeps its own hop count: (hops, cost) stay one route's
+        let mut a = ann(5, 4, 100);
+        extend_chain(&mut a, Some(&(5, 3, 30_000)));
+        assert_eq!((a.hops, a.cost), (4, 100));
+        let mut a = ann(5, 7, 30_000 + ATTESTED_HOP_FLOOR);
+        extend_chain(&mut a, Some(&(5, 3, 30_000)));
+        assert_eq!((a.hops, a.cost), (7, 30_000 + ATTESTED_HOP_FLOOR), "no cheaper, so the core's own");
+        // it holds a newer seqno's chain, not this one's: it can't sign for
+        // this one, so it sends what the core chose
+        let mut a = honest.clone();
+        extend_chain(&mut a, Some(&(6, 1, 10)));
+        assert_eq!(a, honest);
+        let mut a = honest.clone();
+        extend_chain(&mut a, None);
+        assert_eq!(a, honest);
+    }
+
+    #[test]
+    fn a_grey_hole_swallows_about_half_the_messages() {
+        let swallowed = (0..1000u32).filter(|m| Role::GreyHole.swallows(Some(*m))).count();
+        assert!((450..=550).contains(&swallowed), "{swallowed}");
+        assert!(!Role::GreyHole.swallows(None) && Role::Dropper.swallows(None) && !Role::Honest.swallows(Some(1)));
     }
 }

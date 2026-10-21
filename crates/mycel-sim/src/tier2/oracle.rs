@@ -62,7 +62,24 @@ impl Oracle {
 
     /// Earliest a message of `size` sent at `t0` from `src` can reach `dst`.
     pub fn earliest<R: Router>(&self, sim: &Sim<R>, src: NodeId, dst: NodeId, t0: Time, size: u32) -> Option<Time> {
+        self.earliest_avoiding(sim, src, dst, t0, size, None)
+    }
+
+    /// [`Oracle::earliest`] through devices not marked in `avoid` (indexed
+    /// by device): the fastest path that needs none of them, or `None` if
+    /// every path in the contact plan crosses one. `src` and `dst` are
+    /// never avoided.
+    pub fn earliest_avoiding<R: Router>(
+        &self,
+        sim: &Sim<R>,
+        src: NodeId,
+        dst: NodeId,
+        t0: Time,
+        size: u32,
+        avoid: Option<&[bool]>,
+    ) -> Option<Time> {
         let n = self.adj.len();
+        let banned = |v: NodeId| v != dst && avoid.is_some_and(|a| a.get(v as usize).copied().unwrap_or(false));
         let mut best: Map<NodeId, Time> = Map::default();
         let mut pq: BinaryHeap<Reverse<(Time, NodeId)>> = BinaryHeap::new();
         best.insert(src, t0);
@@ -81,6 +98,9 @@ impl Oracle {
             }
             // radio hops
             for (v, w) in &self.adj[u as usize] {
+                if banned(*v) {
+                    continue;
+                }
                 for (from, to, techs) in &self.windows[*w as usize] {
                     if *to <= t {
                         continue;
@@ -109,7 +129,7 @@ impl Oracle {
                 let air = size as u64 * 1_000_000 / up;
                 let targets = self.inet_by_area.get(&sim.core.spec(dst).area).map_or(&[][..], |v| &v[..]);
                 for &b in targets {
-                    if b == u {
+                    if b == u || banned(b) {
                         continue;
                     }
                     let arrive = enter + air + sim.inet_delay_any(u, b);
@@ -125,6 +145,38 @@ impl Oracle {
             let _ = n;
         }
         None
+    }
+
+    /// Devices in the contact plan.
+    pub fn len(&self) -> usize {
+        self.adj.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.adj.is_empty()
+    }
+
+    /// Pairs in radio contact at some time at or after `t`, over radios
+    /// that can carry `size` bytes: the union of the contact graph from
+    /// `t` on (a static world's links; for a moving one, a superset of what
+    /// any one moment offers).
+    pub fn links_after(&self, t: Time, size: u32) -> Vec<(NodeId, NodeId)> {
+        let mut out = Vec::new();
+        for (u, nbs) in self.adj.iter().enumerate() {
+            for (v, w) in nbs {
+                if (u as NodeId) < *v
+                    && self.windows[*w as usize].iter().any(|(_, to, techs)| *to > t && techs.best(size).is_some())
+                {
+                    out.push((u as NodeId, *v));
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `u` has internet at some time at or after `t`.
+    pub fn inet_after(&self, u: NodeId, t: Time) -> bool {
+        self.inet_window(u, t).is_some()
     }
 
     /// When `u` can first use its internet at or after `t`.
