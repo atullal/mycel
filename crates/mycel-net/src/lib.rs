@@ -1383,7 +1383,7 @@ async fn peer_has_sync_v2(inner: &Arc<Inner>, peer: SignPk) -> Result<bool> {
 /// path in use plus a margin, within [`HELLO_WAIT_MIN`, `HELLO_WAIT_MAX`]
 /// (the hello is one round trip; a multi-hop Bluetooth path takes about
 /// half a second per round trip).
-fn hello_wait(conn: &Connection) -> Duration {
+pub(crate) fn hello_wait(conn: &Connection) -> Duration {
     let rtt = link::path_in_use(&conn.paths()).map(|p| p.rtt()).unwrap_or(HELLO_WAIT_MAX);
     (rtt * 4 + Duration::from_millis(250)).clamp(HELLO_WAIT_MIN, HELLO_WAIT_MAX)
 }

@@ -111,7 +111,7 @@ async fn pair(sync_v2: bool, history: u32) -> (Node, Node, SpaceId) {
 async fn bench_sync_v2_sessions_over_quic() {
     const HISTORY: u32 = 2_000;
     println!("\nhistory: {HISTORY} chat envelopes (~350 B each)\n");
-    println!("| case | stream B | UDP B (client) | envelopes received | time |");
+    println!("| case | stream B | UDP B (both ways) | envelopes received | time |");
     println!("|---|---|---|---|---|");
     for v2 in [true, false] {
         let tag = if v2 { "v2" } else { "v1" };
@@ -204,7 +204,7 @@ async fn bench_dissemination_over_quic() {
         eventually("views formed", || nodes.iter().all(|m| m.gossip_neighbours(&space).len() >= 2.min(n - 1))).await;
         let all: Vec<&Node> = nodes.iter().collect();
         let mut rows: Vec<Row> = Vec::new();
-        for k in 0..6usize {
+        for k in 0..10usize {
             let author = &nodes[(k * 7) % n];
             tokio::time::sleep(Duration::from_millis(500)).await;
             let before = bytes(&all);
@@ -224,8 +224,8 @@ async fn bench_dissemination_over_quic() {
             let sessions = nodes.iter().map(|m| m.sync_v2_totals().client_sessions).sum::<u64>() - sessions0;
             rows.push((after.0 - before.0, after.1 - before.1, copies, sessions, took));
         }
-        // The first messages form the tree (prunes); report the last three.
-        let tail = &rows[3..];
+        // The first messages form the tree (prunes); report the last five.
+        let tail = &rows[5..];
         let avg = |f: &dyn Fn(&Row) -> f64| tail.iter().map(f).sum::<f64>() / tail.len() as f64;
         let s = avg(&|r| r.0 as f64);
         let u = avg(&|r| r.1 as f64);
@@ -233,7 +233,7 @@ async fn bench_dissemination_over_quic() {
         let ss = avg(&|r| r.3 as f64);
         let t = avg(&|r| r.4.as_secs_f64() * 1000.0);
         println!("| {n} | {s:.0} | {:.0} | {u:.0} | {c:.1} | {ss:.1} | {t:.0} ms |", s / n as f64);
-        println!("<!-- {n}: warm-up rows {:?} -->", &rows[..3].iter().map(|r| (r.0, r.2, r.3)).collect::<Vec<_>>());
+        println!("<!-- {n}: warm-up rows {:?} -->", &rows[..5].iter().map(|r| (r.0, r.2, r.3)).collect::<Vec<_>>());
         for m in nodes {
             m.shutdown().await.unwrap();
         }

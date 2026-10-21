@@ -395,7 +395,20 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
         let fresh: BTreeMap<SignPk, Member> =
             members.iter().filter(|m| m.key != me && m.gossip).map(|m| (m.key, *m)).collect();
         let epoch = now / VIEW_EPOCH_MS;
-        if fresh == view.members && epoch == view.epoch && !view.initiated.is_empty() {
+        // Hysteresis: edges are redrawn only when the member set or the
+        // epoch changed, an edge we initiated leads to a member that is
+        // unreachable now, or we have fewer than we want while a reachable
+        // candidate exists. Reachability flags of other members change
+        // often (they follow recent exchanges), and redrawing on each would
+        // re-graft pruned edges and undo the tree.
+        let same_set = fresh.len() == view.members.len() && fresh.keys().eq(view.members.keys());
+        let want = fresh.len().min(if fresh.len() <= FULL_MESH { FULL_MESH } else { LOCAL_EDGES + RANDOM_EDGES });
+        let broken = view.initiated.iter().any(|p| fresh.get(p).is_none_or(|m| !m.reachable));
+        let short = view.initiated.len() < want
+            && fresh.values().any(|m| m.reachable && !view.is_neighbour(&m.key) && !view.refused.contains(&m.key));
+        if same_set && epoch == view.epoch && !view.initiated.is_empty() && !broken && !short {
+            // (keep the latest flags for path classes and anti-entropy)
+            view.members = fresh;
             return;
         }
         if epoch != view.epoch {

@@ -99,7 +99,11 @@ pub(crate) fn member(key: SignPk, state: Option<&PeerState>, gossip: bool) -> Me
         PathClass::Internet
     };
     let slow = matches!(s.via, Some(PathKind::Bluetooth | PathKind::Mesh));
-    Member { key, class, reachable: s.online() && !s.backing_off(), gossip, slow }
+    // Reachable: not failing now, and reached at some point (a quiet lazy
+    // neighbour mustn't count as gone after the 45 s online window, or the
+    // view would redraw its edges every time).
+    let reachable = !s.backing_off() && (s.online() || s.last_ok.is_some());
+    Member { key, class, reachable, gossip, slow }
 }
 
 impl Inner {
@@ -121,7 +125,12 @@ impl Inner {
             .filter(|p| *p != me)
             .map(|p| {
                 let state = peers.get(&p);
-                let gossip = state.and_then(|s| s.protocol).is_some_and(|pr| pr.supports(Caps::GOSSIP))
+                // A member whose capabilities we haven't learned yet (no
+                // connection to it so far) is taken to gossip: the sender
+                // checks the hello on the connection before the first
+                // message, and a member without `GOSSIP` drops out of the
+                // view (and gets sessions) once its hello is known.
+                let gossip = state.and_then(|s| s.protocol).is_none_or(|pr| pr.supports(Caps::GOSSIP))
                     && !self.v2.is_v1_only(&p);
                 member(p, state, gossip)
             })
@@ -193,7 +202,12 @@ fn send(inner: &Arc<Inner>, peer: SignPk, msg: GMsg) {
 
 async fn sender(inner: Arc<Inner>, peer: SignPk, mut rx: mpsc::Receiver<GMsg>) {
     while let Some(msg) = rx.recv().await {
+        let space = msg.space();
         let res = on_conn!(&inner, &peer, |conn| async {
+            // Only to a peer whose hello agreed `GOSSIP` on this connection.
+            if !conn.protocol(crate::hello_wait(&conn)).await.supports(Caps::GOSSIP) {
+                bail!("peer doesn't gossip");
+            }
             let mut tx = resources::within(resources::REPLY_TIMEOUT, "no stream", conn.open_uni()).await?;
             tx.set_priority(StreamKind::Gossip.priority()).ok();
             resources::write_all(&mut tx, &[StreamKind::Gossip as u8]).await?;
@@ -203,6 +217,7 @@ async fn sender(inner: Arc<Inner>, peer: SignPk, mut rx: mpsc::Receiver<GMsg>) {
         });
         match res {
             Ok(n) => {
+                inner.mark_ok(peer);
                 let mut t = inner.gossip.totals.lock();
                 t.sent_msgs += 1;
                 t.sent_bytes += n as u64 + 1;
@@ -210,6 +225,10 @@ async fn sender(inner: Arc<Inner>, peer: SignPk, mut rx: mpsc::Receiver<GMsg>) {
             Err(_) => {
                 inner.gossip.totals.lock().send_failures += 1;
                 inner.gossip.d.lock().path_down(&peer);
+                // A peer that doesn't gossip (its hello now known) leaves
+                // the view at the next refresh, and gets a session for what
+                // this message carried.
+                inner.schedule(space);
                 inner.gossip.senders.lock().remove(&peer);
                 return;
             }

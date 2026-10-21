@@ -398,3 +398,33 @@ fn seen_notes_ride_on_messages_once_per_neighbour() {
     }
     assert_eq!(carried, 1);
 }
+
+/// Dissemination cost on model sets (real postcard sizes, no transport
+/// overhead): gossip frame bytes and payload copies for one 351-byte
+/// message in 10/50/200-member groups after warm-up (docs/BENCHMARKS.md
+/// §8). `cargo test -p mycel-sync --lib bench_gossip -- --ignored --nocapture`
+#[test]
+#[ignore]
+fn bench_gossip_dissemination_cost() {
+    println!("| members | gossip B per message (group) | per member | payload copies | pulls (sessions) |");
+    println!("|---|---|---|---|---|");
+    for n in [10u16, 50, 200] {
+        let mut net = Net::new(n, internet);
+        net.run(500);
+        for w in 0..8 {
+            net.write(w % n as usize, 1, 300);
+            net.run(3_000);
+        }
+        let (b0, c0, s0) = (net.gossip_bytes, net.copies.iter().sum::<u64>(), net.sessions);
+        const K: u64 = 5;
+        for k in 0..K {
+            let ids = net.write((k as usize * 13) % n as usize, 1, 300);
+            net.run(3_000);
+            assert_eq!(net.holders(&ids[0]), n as usize);
+        }
+        let b = (net.gossip_bytes - b0) / K;
+        let c = (net.copies.iter().sum::<u64>() - c0) as f64 / K as f64;
+        let s = (net.sessions - s0) as f64 / K as f64;
+        println!("| {n} | {b} | {} | {c:.1} | {s:.1} |", b / u64::from(n));
+    }
+}
