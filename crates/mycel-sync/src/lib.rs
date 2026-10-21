@@ -487,6 +487,9 @@ pub struct Replica {
     pending: HashSet<EnvelopeId>,
     /// The envelope chains held, for Sync v2 (`reconcile`).
     index: reconcile::ChainIndex,
+    /// Sync v2's op tips, with the op count they were computed at (ops are
+    /// never removed, so an equal count means the same op set).
+    op_tips: std::sync::Mutex<Option<(usize, Vec<OpId>)>>,
     /// Encoded bytes of the envelopes held (for per-peer sync budgets).
     stored_bytes: u64,
     #[cfg(test)]
@@ -559,6 +562,7 @@ impl Replica {
             doc_inputs: HashMap::new(),
             pending: HashSet::new(),
             index: reconcile::ChainIndex::default(),
+            op_tips: std::sync::Mutex::new(None),
             stored_bytes: 0,
             #[cfg(test)]
             stats: Default::default(),

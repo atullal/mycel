@@ -9,9 +9,11 @@
 //! `bottom(id)` is O(1). Heads (envelopes no held envelope names as a valid
 //! predecessor) with their set's bottom are the author's runs.
 //!
-//! Forks are seqs holding more than one id (`multi`). Finding the id a
-//! branch has at a seq jumps over unforked stretches, so it costs
-//! O(log n) plus one step per forked seq in between, not O(distance).
+//! Finding the id a branch holds at a seq follows one skip pointer per
+//! envelope (Bitcoin's `pskip`, a deterministic skip list): O(log n) steps
+//! however densely the author forked. A skip whose target lies below a gap
+//! is filled in when the gap fills (only O(log n) envelopes of a run set
+//! have one), so fork placement never costs O(distance).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -23,6 +25,7 @@ use super::msg::{AuthorEntry, Run};
 use crate::EnvelopeId;
 
 const CTX_BOUNDARY: &str = "mycel/v2/sync-boundary";
+const CTX_ALL_HEADS: &str = "mycel/v2/sync-author-heads";
 
 /// The envelope window (admission rule A3): an author's envelope at seq `s`
 /// is stored only if `s < reach + WINDOW`, where `reach` is one past the
@@ -37,6 +40,23 @@ struct Node {
     seq: u64,
     prev: Option<EnvelopeId>,
     set: u32,
+    /// The ancestor at [`skip_seq`]`(seq)`, once held and linked.
+    jump: Option<EnvelopeId>,
+}
+
+/// The seq a node's skip pointer targets (Bitcoin's `GetSkipHeight`): with
+/// one such pointer per node, any ancestor is O(log n) steps away.
+fn skip_seq(seq: u64) -> u64 {
+    fn clear_lowest(n: u64) -> u64 {
+        n & n.wrapping_sub(1)
+    }
+    if seq < 2 {
+        0
+    } else if seq & 1 == 1 {
+        clear_lowest(clear_lowest(seq - 1)) + 1
+    } else {
+        clear_lowest(seq)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -47,14 +67,14 @@ struct RunSet {
     missing: Option<EnvelopeId>,
     members: Vec<EnvelopeId>,
     top: u64,
+    /// Members whose skip target lies below `bottom` (no skip pointer yet).
+    clamped: Vec<EnvelopeId>,
 }
 
 #[derive(Debug)]
 struct AuthorChains {
     key: SignPk,
     by_seq: BTreeMap<u64, Vec<EnvelopeId>>,
-    /// Seqs holding more than one id.
-    multi: BTreeSet<u64>,
     /// (seq, id) of every head.
     heads: BTreeSet<(u64, EnvelopeId)>,
     reach: u64,
@@ -148,7 +168,6 @@ impl ChainIndex {
                 self.authors.push(AuthorChains {
                     key: author,
                     by_seq: BTreeMap::new(),
-                    multi: BTreeSet::new(),
                     heads: BTreeSet::new(),
                     reach: 0,
                 });
@@ -157,10 +176,18 @@ impl ChainIndex {
             }
         };
         let parent = prev.filter(|p| self.is_link(p, a, seq));
+        let mut jump = None;
+        let mut clamped = false;
         let set = match parent {
             Some(p) => {
                 let pn = self.nodes[&p];
                 self.authors[a as usize].heads.remove(&(pn.seq, p));
+                let target = skip_seq(seq);
+                if target >= self.sets[pn.set as usize].bottom {
+                    jump = self.walk(p, target);
+                } else {
+                    clamped = true;
+                }
                 let s = &mut self.sets[pn.set as usize];
                 s.members.push(id);
                 s.top = s.top.max(seq);
@@ -172,18 +199,19 @@ impl ChainIndex {
                 {
                     self.waiting.entry(p).or_default().push(id);
                 }
-                self.sets.push(RunSet { bottom: seq, missing: prev, members: vec![id], top: seq });
+                clamped = seq > 0;
+                self.sets.push(RunSet { bottom: seq, missing: prev, members: vec![id], top: seq, clamped: Vec::new() });
                 (self.sets.len() - 1) as u32
             }
         };
-        self.nodes.insert(id, Node { author: a, seq, prev, set });
+        if clamped {
+            self.sets[set as usize].clamped.push(id);
+        }
+        self.nodes.insert(id, Node { author: a, seq, prev, set, jump });
         let chains = &mut self.authors[a as usize];
         let ids = chains.by_seq.entry(seq).or_default();
         let at = ids.binary_search(&id).unwrap_or_else(|i| i);
         ids.insert(at, id);
-        if ids.len() > 1 {
-            chains.multi.insert(seq);
-        }
         let mut has_child = false;
         for child in self.waiting.remove(&id).unwrap_or_default() {
             if self.is_link(&id, a, self.nodes[&child].seq) && self.nodes[&child].author == a {
@@ -232,6 +260,8 @@ impl ChainIndex {
         }
         let (bottom, missing) = (self.sets[parent as usize].bottom, self.sets[parent as usize].missing);
         let top = self.sets[parent as usize].top.max(self.sets[child as usize].top);
+        let mut lifted = std::mem::take(&mut self.sets[child as usize].clamped);
+        let mut clamped = std::mem::take(&mut self.sets[parent as usize].clamped);
         let k = &mut self.sets[keep as usize];
         k.members.extend(moved);
         k.bottom = bottom;
@@ -240,6 +270,38 @@ impl ChainIndex {
         let g = &mut self.sets[gone as usize];
         g.members = Vec::new();
         g.top = 0;
+        // The child's run now reaches lower: fill in the skip pointers whose
+        // targets it holds now, lowest first (a walk uses the ones below).
+        lifted.sort_by_key(|id| self.nodes.get(id).map_or(0, |n| n.seq));
+        for id in lifted {
+            let Some(n) = self.nodes.get(&id).copied() else { continue };
+            let target = skip_seq(n.seq);
+            match n.prev {
+                Some(p) if target >= bottom => {
+                    let jump = self.walk(p, target);
+                    if let Some(node) = self.nodes.get_mut(&id) {
+                        node.jump = jump;
+                    }
+                }
+                _ => clamped.push(id),
+            }
+        }
+        self.sets[keep as usize].clamped = clamped;
+    }
+
+    /// The ancestor of `from` at `target` (at most `from`'s seq, at least
+    /// its run's bottom), by Bitcoin's `GetAncestor` walk.
+    fn walk(&self, from: EnvelopeId, target: u64) -> Option<EnvelopeId> {
+        let mut cur = from;
+        let mut n = *self.nodes.get(&cur)?;
+        while n.seq > target {
+            let hs = skip_seq(n.seq);
+            let hsp = skip_seq(n.seq - 1);
+            let take = n.jump.is_some() && (hs == target || (hs > target && !(hsp + 2 < hs && hsp >= target)));
+            cur = if take { n.jump? } else { n.prev? };
+            n = *self.nodes.get(&cur)?;
+        }
+        (n.seq == target).then_some(cur)
     }
 
     /// The id that the branch ending at `head` holds at `seq`, if `seq` is
@@ -249,31 +311,13 @@ impl ChainIndex {
         if seq > hn.seq || seq < self.sets[hn.set as usize].bottom {
             return None;
         }
-        let chains = &self.authors[hn.author as usize];
-        let mut cur = *head;
-        let mut cur_seq = hn.seq;
-        loop {
-            if cur_seq == seq {
-                return Some(cur);
-            }
-            // The highest forked seq in (seq, cur_seq]: above it, every seq
-            // holds one id, so the branch's id there is that one.
-            match chains.multi.range(seq + 1..=cur_seq).next_back().copied() {
-                None => {
-                    let above = chains.by_seq.get(&(seq + 1))?.first()?;
-                    return self.nodes.get(above)?.prev;
-                }
-                Some(m) if m < cur_seq => {
-                    let above = chains.by_seq.get(&(m + 1))?.first()?;
-                    cur = self.nodes.get(above)?.prev?;
-                    cur_seq = m;
-                }
-                Some(_) => {
-                    cur = self.nodes.get(&cur)?.prev?;
-                    cur_seq -= 1;
-                }
-            }
-        }
+        self.walk(*head, seq)
+    }
+
+    /// The held predecessor `id` links to, if any.
+    pub fn parent(&self, id: &EnvelopeId) -> Option<EnvelopeId> {
+        let n = self.nodes.get(id)?;
+        n.prev.filter(|p| self.is_link(p, n.author, n.seq))
     }
 
     /// Is `x` on the branch ending at `y` (or equal to it)?
@@ -350,7 +394,25 @@ impl ChainIndex {
             .take(MAX_RUNS_INLINE)
             .map(|(seq, head)| Run { top: *seq, head: *head, bottom: self.sets[self.nodes[head].set as usize].bottom })
             .collect();
-        AuthorEntry { author: chains.key, runs, truncated: chains.heads.len() > MAX_RUNS_INLINE }
+        let truncated = (chains.heads.len() > MAX_RUNS_INLINE).then(|| {
+            let mut h = mycel_crypto::Digest::new(CTX_ALL_HEADS);
+            self.hash_heads(chains, &mut h);
+            h.finalize().0
+        });
+        AuthorEntry { author: chains.key, runs, truncated }
+    }
+
+    /// Hash an author's key and every head with its bottom and gap id.
+    fn hash_heads(&self, c: &AuthorChains, h: &mut mycel_crypto::Digest) {
+        h.update(&c.key.0).update(&(c.heads.len() as u64).to_le_bytes());
+        for (seq, head) in &c.heads {
+            let set = &self.sets[self.nodes[head].set as usize];
+            h.update(&seq.to_le_bytes()).update(&head.0).update(&set.bottom.to_le_bytes());
+            match &set.missing {
+                Some(m) => h.update(&[1]).update(&m.0),
+                None => h.update(&[0]),
+            };
+        }
     }
 
     /// The runs of `author` (all of them, highest first).
@@ -382,15 +444,7 @@ impl ChainIndex {
         let mut h = mycel_crypto::Digest::new(CTX_BOUNDARY);
         h.update(&(order.len() as u64).to_le_bytes());
         for c in order {
-            h.update(&c.key.0).update(&(c.heads.len() as u64).to_le_bytes());
-            for (seq, head) in &c.heads {
-                let set = &self.sets[self.nodes[head].set as usize];
-                h.update(&seq.to_le_bytes()).update(&head.0).update(&set.bottom.to_le_bytes());
-                match &set.missing {
-                    Some(m) => h.update(&[1]).update(&m.0),
-                    None => h.update(&[0]),
-                };
-            }
+            self.hash_heads(c, &mut h);
         }
         let out = h.finalize();
         cache.boundary = Some(out);

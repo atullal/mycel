@@ -22,11 +22,20 @@ impl SyncSet for Replica {
     }
 
     fn op_tips(&self) -> Vec<OpId> {
+        // Cached: an idle check (digest only) must not pass over every op.
+        let count = self.graph.len();
+        let mut cache = self.op_tips.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((n, tips)) = cache.as_ref()
+            && *n == count
+        {
+            return tips.clone();
+        }
         let order = &self.graph.resolution().order;
         let parents: HashSet<&OpId> =
             order.iter().filter_map(|id| self.graph.get(id)).flat_map(|op| op.op.parents.iter()).collect();
         let mut tips: Vec<OpId> = order.iter().filter(|id| !parents.contains(id)).copied().collect();
         tips.sort();
+        *cache = Some((count, tips.clone()));
         tips
     }
 

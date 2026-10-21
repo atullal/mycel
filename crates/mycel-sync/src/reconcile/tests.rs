@@ -629,7 +629,7 @@ fn malformed_and_out_of_order_frames_are_refused() {
     assert!(run(vec![close(1), close(1)]).is_err(), "duplicate Close");
     // Frontier abuse, on a server that asked for the full frontier.
     let fresh = ModelSet::new(space());
-    let bad_entry = |runs: Vec<Run>| AuthorEntry { author: pk(1), runs, truncated: false };
+    let bad_entry = |runs: Vec<Run>| AuthorEntry { author: pk(1), runs, truncated: None };
     for (what, entry) in [
         ("too many runs", bad_entry(vec![Run { top: 1, head: Hash32([3; 32]), bottom: 0 }; MAX_RUNS_INLINE + 1])),
         ("bottom above top", bad_entry(vec![Run { top: 1, head: Hash32([3; 32]), bottom: 5 }])),
@@ -658,7 +658,7 @@ fn oversized_frontiers_and_data_floods_hit_limits() {
     let entry = |i: u32| {
         let mut k = [0u8; 32];
         k[..4].copy_from_slice(&i.to_le_bytes());
-        AuthorEntry { author: SignPk(k), runs: vec![Run { top: 0, head: Hash32(k), bottom: 0 }], truncated: false }
+        AuthorEntry { author: SignPk(k), runs: vec![Run { top: 0, head: Hash32(k), bottom: 0 }], truncated: None }
     };
     let chunk = |from: u32, more: bool| Frontier {
         delta_of: None,
@@ -1145,4 +1145,152 @@ mod bench {
         assert_eq!(big.digest(), d);
         println!("digest, cached: {:.1?}", t.elapsed());
     }
+}
+
+// ───────────── review regressions ─────────────
+
+/// One author: a chain of `n`, plus a one-envelope side branch at every
+/// seq (an equivocation at every seq, all inside the window).
+fn comb(n: u64) -> ModelSet {
+    let mut a = ModelSet::new(space());
+    let chain = a.fork(pk(7), None, n, 0);
+    for (i, base) in chain.iter().enumerate().take(n as usize - 1) {
+        a.fork(pk(7), Some(*base), 1, 1 + i as u32);
+    }
+    a
+}
+
+#[test]
+fn skip_pointers_answer_any_ancestor_in_log_steps_whatever_the_order() {
+    // A comb inserted in a scrambled order (gaps filling late) must answer
+    // exactly what a walk along `prev` answers.
+    let full = comb(300);
+    let (_, mut envs) = full.all();
+    let mut rng = 7u64;
+    for i in (1..envs.len()).rev() {
+        envs.swap(i, (xorshift(&mut rng) % (i as u64 + 1)) as usize);
+    }
+    let mut s = ModelSet::new(space());
+    for e in envs {
+        let _ = s.insert_env(e);
+    }
+    let idx = s.index();
+    for run in idx.runs(&pk(7)).iter().step_by(7) {
+        let mut cur = Some(run.head);
+        let mut seq = run.top;
+        while let Some(id) = cur {
+            assert_eq!(idx.branch_id_at(&run.head, seq), Some(id), "seq {seq} below {}", run.top);
+            if seq == 0 {
+                break;
+            }
+            seq -= 1;
+            cur = idx.parent(&id);
+        }
+    }
+}
+
+#[test]
+fn a_fork_at_every_seq_costs_bounded_work_per_session() {
+    // Reviewer finding: one session took ~n^2.4 (165 s at n = 512, debug).
+    for n in [512u64, 2048] {
+        let mut a = comb(n);
+        let mut b = copy(&a);
+        b.append(pk(1), 1, 10);
+        let t = std::time::Instant::now();
+        let run = sync(&mut b, &mut a);
+        let took = t.elapsed();
+        assert!(converged(&run) <= 2, "{run:?}");
+        assert_equal(&a, &b);
+        // Equal commitments over all of the author's heads: nothing of the
+        // flooded author is placed or sent.
+        assert_eq!(run.server_stats.items_out + run.client_stats.items_out, 1);
+        assert!(took < std::time::Duration::from_secs(5), "n={n}: {took:?}");
+    }
+}
+
+#[test]
+fn a_flood_that_differs_is_placed_within_the_work_cap_and_still_converges() {
+    let n = 1024;
+    let mut a = comb(n);
+    let mut b = copy(&a);
+    // Both sides gain different side branches of the flooded author.
+    let base = a.index().branch_ids(&a.index().runs(&pk(7))[0].head, 0, n - 1);
+    for (i, at) in base.iter().enumerate().step_by(97) {
+        a.fork(pk(7), Some(*at), 1, 50_000 + i as u32);
+        b.fork(pk(7), Some(*at), 1, 90_000 + i as u32);
+    }
+    let cfg = Config::default();
+    let t = std::time::Instant::now();
+    let mut records = (None, None);
+    for round in 0..40 {
+        let run = run_pair(&mut a, &mut b, records, cfg.clone(), false, |_, _, _| {});
+        if a.digest() == b.digest() {
+            break;
+        }
+        assert!(round < 39, "no convergence: {run:?}");
+        records = (run.client_record, run.server_record);
+    }
+    assert_equal(&a, &b);
+    // (about 30 ms in a debug build; pairwise placement took 11 s)
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "{:?}", t.elapsed());
+}
+
+#[test]
+fn a_fork_at_every_seq_fresh_join_is_linear() {
+    // Reviewer finding: the fresh join walked every run's whole branch.
+    let mut a = comb(4096);
+    let mut b = ModelSet::new(space());
+    let t = std::time::Instant::now();
+    let run = sync(&mut b, &mut a);
+    assert!(converged(&run) <= 2, "{run:?}");
+    assert_equal(&a, &b);
+    assert!(t.elapsed() < std::time::Duration::from_secs(10), "{:?}", t.elapsed());
+}
+
+#[test]
+fn concurrent_membership_ops_converge_without_phase_2() {
+    // Reviewer finding: each side held an op tip the other lacked, both
+    // deferred their op sends to phase 2, and with phase 2 rationed no op
+    // ever crossed (a revocation could wait an hour).
+    let mut a = history(2, 5, 10);
+    let mut b = copy(&a);
+    let root = a.tip_op();
+    a.insert_op(ModelOp { parents: vec![root], nonce: 101 });
+    b.insert_op(ModelOp { parents: vec![root], nonce: 202 });
+    let cfg = Config { allow_phase2: false, ..Config::default() };
+    let run = run_pair(&mut a, &mut b, (None, None), cfg, false, |_, _, _| {});
+    assert_eq!(converged(&run), 1);
+    assert_equal(&a, &b);
+}
+
+#[test]
+fn a_fork_reaches_a_fresh_joiner_in_one_session() {
+    // Reviewer finding: the fork's envelopes were interleaved ahead of the
+    // main chain's prefix, refused by the window, and needed a second session.
+    let mut a = ModelSet::new(space());
+    let main = a.fork(pk(7), None, 10_000, 0);
+    a.fork(pk(7), Some(main[4_999]), 5_000, 1);
+    let mut b = ModelSet::new(space());
+    let run = sync(&mut b, &mut a);
+    assert_eq!(converged(&run), 1, "{run:?}");
+    assert_equal(&a, &b);
+}
+
+#[test]
+fn frontier_runs_are_capped() {
+    let a = ModelSet::new(space());
+    let b = history(1, 3, 3);
+    let cfg = Config { max_frontier_runs: 10, ..Config::default() };
+    let mut c = Session::open(&a, cfg.clone(), [1; 16], None, false, None);
+    let Some(Msg::Open(open)) = c.poll_send(&a) else { panic!() };
+    let mut s = Session::accept(&b, cfg, open, None);
+    let entries: Vec<AuthorEntry> = (0..11u8)
+        .map(|k| AuthorEntry {
+            author: SignPk([k + 100; 32]),
+            runs: vec![Run { top: 0, head: Hash32([k; 32]), bottom: 0 }],
+            truncated: None,
+        })
+        .collect();
+    let f = Frontier { delta_of: None, ops: Some(Vec::new()), authors: entries, more: false };
+    assert_eq!(s.on_msg(&b, Msg::Frontier(f)).err(), Some(SessionError::Limit("frontier runs")));
 }

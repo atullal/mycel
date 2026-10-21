@@ -21,16 +21,16 @@
 //! partner later. Every amount of work is bounded per session (frames,
 //! probes, bytes) whatever the peer says.
 
-use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
-use mycel_crypto::SignPk;
+use mycel_crypto::{Hash32, SignPk};
 use mycel_trust::{OpId, SpaceId};
 
 use super::msg::{AbortReason, AuthorEntry, Coverage, Digest, Frontier, Msg, Open, RecordName, Run, Scope, Verdict};
 use super::{
-    CHUNK_BYTES, FEATURES, FRONTIER_CHUNK_AUTHORS, MAX_OP_TIPS, MAX_RUNS_INLINE, PROBE_POINTS, Summary, SyncSet,
-    VERSION, encoded_len, frame_len,
+    CHUNK_BYTES, ChainIndex, FEATURES, FRONTIER_CHUNK_AUTHORS, MAX_OP_TIPS, MAX_RUNS_INLINE, PROBE_POINTS, Summary,
+    SyncSet, VERSION, encoded_len, frame_len,
 };
 use crate::EnvelopeId;
 
@@ -47,8 +47,18 @@ pub enum Role {
 pub struct Config {
     /// Target size of data frames.
     pub chunk_bytes: usize,
-    /// Most authors accepted in the peer's frontier.
+    /// Most authors, and runs in all, accepted in the peer's frontier
+    /// (what a session buffers of it).
     pub max_frontier_authors: usize,
+    pub max_frontier_runs: usize,
+    /// Placement work per session: (my run, peer run) pairs compared
+    /// (honest authors need one per run, normally one), and index steps
+    /// for authors with more than [`MAX_RUNS_INLINE`] runs (an equivocation
+    /// flood). Past either cap the rest waits for a later session (whose
+    /// rotated order reaches it), so no peer or author can make a session
+    /// slow.
+    pub max_place_pairs: usize,
+    pub max_flood_steps: usize,
     /// Data bytes this side may send in this session (the driver's per-peer
     /// byte budget); beyond it the session aborts with `Budget`.
     pub send_budget: u64,
@@ -66,6 +76,9 @@ impl Default for Config {
         Config {
             chunk_bytes: CHUNK_BYTES,
             max_frontier_authors: 1 << 16,
+            max_frontier_runs: 1 << 18,
+            max_place_pairs: 1 << 17,
+            max_flood_steps: 1 << 20,
             send_budget: u64::MAX,
             recv_budget: 4 << 30,
             allow_phase2: true,
@@ -246,6 +259,7 @@ struct FrontierRx {
     delta_of: Option<RecordName>,
     ops: Option<Vec<OpId>>,
     authors: Vec<AuthorEntry>,
+    runs: usize,
     done: bool,
 }
 
@@ -262,6 +276,8 @@ pub struct Session<S: SyncSet> {
     role: Role,
     cfg: Config,
     space: SpaceId,
+    /// The client's nonce: varies the order flooded authors are placed in.
+    nonce: [u8; 16],
     /// The record the frontiers of this session are deltas against.
     record: Option<PeerRecord>,
     refused_by_peer: HashSet<EnvelopeId>,
@@ -275,13 +291,16 @@ pub struct Session<S: SyncSet> {
     outbox: VecDeque<Msg<S::Op, S::Env>>,
     ops_q: VecDeque<OpId>,
     jobs: Jobs,
-    queued: HashSet<EnvelopeId>,
+    /// Envelopes queued (or skipped as refused), each with the lowest seq
+    /// down to which its branch is queued too.
+    queued: HashMap<EnvelopeId, u64>,
     queued_ops: HashSet<OpId>,
     /// 0 until both frontiers are known, then 1 or 2.
     phase: u8,
     planned: bool,
-    ops_deferred: bool,
-    undecided: Vec<(SignPk, Run)>,
+    /// Placement stopped at the work cap: what this side owes isn't all
+    /// queued, so the session's record isn't quiet.
+    incomplete: bool,
     probes: BTreeMap<EnvelopeId, Probe>,
     probes_answered: usize,
     sends_done: bool,
@@ -297,12 +316,13 @@ pub struct Session<S: SyncSet> {
 }
 
 impl<S: SyncSet> Session<S> {
-    fn new(role: Role, set: &S, cfg: Config, record: Option<PeerRecord>) -> Self {
+    fn new(role: Role, set: &S, cfg: Config, nonce: [u8; 16], record: Option<PeerRecord>) -> Self {
         let refused_by_peer = record.as_ref().map(|r| (*r.refused).clone()).unwrap_or_default();
         Session {
             role,
             cfg,
             space: set.space(),
+            nonce,
             record,
             refused_by_peer,
             discard: None,
@@ -314,12 +334,11 @@ impl<S: SyncSet> Session<S> {
             outbox: VecDeque::new(),
             ops_q: VecDeque::new(),
             jobs: Jobs::default(),
-            queued: HashSet::new(),
+            queued: HashMap::new(),
             queued_ops: HashSet::new(),
             phase: 0,
             planned: false,
-            ops_deferred: false,
-            undecided: Vec::new(),
+            incomplete: false,
             probes: BTreeMap::new(),
             probes_answered: 0,
             sends_done: false,
@@ -347,7 +366,7 @@ impl<S: SyncSet> Session<S> {
         eager: bool,
         invite: Option<Vec<S::Op>>,
     ) -> Self {
-        let mut s = Self::new(Role::Client, set, cfg, record);
+        let mut s = Self::new(Role::Client, set, cfg, nonce, record);
         let mut chunks = match &s.record {
             Some(r) => s.mine.chunks(Some((&r.mine, r.name))),
             None if eager => s.mine.chunks(None),
@@ -373,7 +392,7 @@ impl<S: SyncSet> Session<S> {
     /// Answer a client's `Open` (after the driver's membership gate).
     /// `record`: what this server remembers about the client.
     pub fn accept(set: &S, cfg: Config, open: Open<S::Op>, record: Option<PeerRecord>) -> Self {
-        let mut s = Self::new(Role::Server, set, cfg, record);
+        let mut s = Self::new(Role::Server, set, cfg, open.nonce, record);
         s.stats.recv_frames += 1;
         s.stats.recv_bytes += frame_len(&Msg::<S::Op, S::Env>::Open(open.clone())) as u64;
         s.status_seen = true;
@@ -474,6 +493,23 @@ impl<S: SyncSet> Session<S> {
 
     pub fn stats(&self) -> SessionStats {
         self.stats
+    }
+
+    /// The highest seq of `author` in my opening set (what a peer that
+    /// verified my set holds of that chain at least).
+    pub fn opening_top(&self, author: &SignPk) -> Option<u64> {
+        self.mine.top(author)
+    }
+
+    /// Did the peer verify that it holds my whole opening set? (`InSync`
+    /// on equal digests, `Unchanged`, or `Converged`; not an `InSync` whose
+    /// digest no longer matched my pinned set.)
+    pub fn peer_holds_my_opening_set(&self) -> bool {
+        match &self.outcome {
+            Some(Outcome::InSync) => self.record_out.is_some(),
+            Some(Outcome::Unchanged | Outcome::Converged { .. }) => true,
+            _ => false,
+        }
     }
 
     /// The driver ingested the items of the last frame: `new` of them were
@@ -648,7 +684,7 @@ impl<S: SyncSet> Session<S> {
                 }
                 self.peer_sends_done = true;
                 let coverage = self.coverage(set);
-                let quiet = set.count().saturating_sub(self.count_open) == self.ingested_new;
+                let quiet = set.count().saturating_sub(self.count_open) == self.ingested_new && !self.incomplete;
                 let phase2 = self.cfg.allow_phase2;
                 let refused: Vec<EnvelopeId> = self.refused_here.iter().take(64).copied().collect();
                 let digest = set.digest();
@@ -732,6 +768,7 @@ impl<S: SyncSet> Session<S> {
             delta_of: f.delta_of,
             ops: None,
             authors: Vec::new(),
+            runs: 0,
             done: false,
         });
         if rx.done || rx.delta_of != f.delta_of {
@@ -753,6 +790,10 @@ impl<S: SyncSet> Session<S> {
         }
         if f.authors.iter().any(|e| e.runs.iter().any(|r| r.bottom > r.top)) {
             return Err(SessionError::Malformed("run bottom above its top"));
+        }
+        rx.runs += f.authors.iter().map(|e| e.runs.len()).sum::<usize>();
+        if rx.runs > self.cfg.max_frontier_runs {
+            return Err(SessionError::Limit("frontier runs"));
         }
         rx.authors.extend(f.authors);
         rx.done = !f.more;
@@ -797,42 +838,70 @@ impl<S: SyncSet> Session<S> {
         self.planned = true;
         let Some(peer) = self.peer.clone() else { return };
         let idx = set.index();
-        // Ops: those not in the past of the peer's tips. If we don't hold
-        // all of them we can't tell their past: defer to phase 2, when the
-        // peer's ops (it sends ours-lacking first) will have arrived.
+        // Ops: those not in the past of the peer's tips that I hold. When I
+        // lack some tips (concurrent membership changes on both sides) this
+        // over-sends what lies in their past, a superset bounded by the op
+        // count (ops are small and rare), but it never waits for phase 2.
         let held: Vec<OpId> = peer.ops.iter().filter(|t| set.holds_op(t)).copied().collect();
-        if held.len() == peer.ops.len() || self.phase == 2 {
-            self.ops_deferred = false;
-            for id in set.ops_after(&held) {
-                if self.queued_ops.insert(id) {
-                    self.ops_q.push_back(id);
-                }
+        for id in set.ops_after(&held) {
+            if self.queued_ops.insert(id) {
+                self.ops_q.push_back(id);
             }
-        } else {
-            self.ops_deferred = true;
         }
-        let empty = AuthorEntry { author: SignPk([0; 32]), runs: Vec::new(), truncated: false };
+        let empty = AuthorEntry { author: SignPk([0; 32]), runs: Vec::new(), truncated: None };
         let mine = idx.entries();
         let mut undecided = Vec::new();
+        let mut pairs = self.cfg.max_place_pairs;
+        let mut flood_work = self.cfg.max_flood_steps;
         for (author, entry) in mine.iter() {
-            let runs = if entry.truncated { idx.runs(author) } else { entry.runs.clone() };
             let theirs = peer.authors.get(author).unwrap_or(&empty);
-            for r in runs {
-                match self.uncovered(set, &r, theirs, None) {
-                    Some(intervals) => {
-                        let mut ids = Vec::new();
-                        for (lo, hi) in intervals {
-                            ids.extend(
-                                idx.branch_ids(&r.head, lo, hi)
-                                    .into_iter()
-                                    .filter(|id| !self.refused_by_peer.contains(id) && self.queued.insert(*id)),
-                            );
-                        }
-                        self.jobs.push(ids);
+            if entry.truncated.is_some() && entry.truncated == theirs.truncated {
+                continue; // the same chains, committed to in full
+            }
+            let runs = match entry.truncated {
+                None => entry.runs.clone(),
+                Some(_) => {
+                    // A flood: start at a point that varies per session and
+                    // phase, so a capped placement reaches every run in time.
+                    let mut all = idx.runs(author);
+                    let h =
+                        Hash32::digest("mycel/v2/sync-rotate", &[&self.nonce[..], &author.0, &[self.phase]].concat());
+                    let at = (u64::from_le_bytes(h.0[..8].try_into().unwrap_or_default()) % all.len().max(1) as u64)
+                        as usize;
+                    all.rotate_left(at);
+                    all
+                }
+            };
+            let exact: HashMap<EnvelopeId, u64> = theirs.runs.iter().map(|p| (p.head, p.bottom)).collect();
+            let mut owed = Vec::new();
+            if entry.truncated.is_some() || theirs.truncated.is_some() {
+                self.plan_flood(idx, &runs, theirs, &exact, &mut flood_work, &mut owed);
+            } else {
+                for r in runs {
+                    if exact.get(&r.head).is_some_and(|b| *b <= r.bottom) {
+                        continue; // the peer holds this run
                     }
-                    None => undecided.push((*author, r)),
+                    // (at most MAX_RUNS_INLINE² pairs per author here)
+                    let cost = theirs.runs.len();
+                    if cost > pairs {
+                        self.incomplete = true;
+                        break;
+                    }
+                    pairs -= cost;
+                    match self.uncovered(set, &r, theirs, None) {
+                        Some(intervals) => {
+                            for (lo, hi) in intervals {
+                                self.queue_branch(idx, &r.head, lo, hi, &mut owed);
+                            }
+                        }
+                        None => undecided.push((*author, r)),
+                    }
                 }
             }
+            // One job per author in ascending seq, so a fork's envelopes
+            // never overtake the prefix the receiver's window waits for.
+            owed.sort_unstable();
+            self.jobs.push(owed.into_iter().map(|(_, id)| id).collect());
         }
         if self.phase == 2 {
             for (author, run) in undecided {
@@ -841,15 +910,136 @@ impl<S: SyncSet> Session<S> {
                 }
                 self.start_probe(set, author, run, &peer);
             }
-        } else {
-            self.undecided = undecided;
+        }
+    }
+
+    /// Place a flooded author's runs (more than [`MAX_RUNS_INLINE`] heads on
+    /// either side) in time linear in what the peer's listed heads cover,
+    /// not in pairs of runs. Each envelope on the branch of a listed peer
+    /// head I hold is marked once with the lowest bottom the peer holds it
+    /// down to; each of my runs then walks down to its first marked
+    /// envelope. Peer heads I don't hold are ignored rather than probed
+    /// (probing reaches only a few of many runs per session): this may
+    /// over-send the part of a run the peer holds below such a head, never
+    /// under-send. Stops at `work` steps; the rest waits for a later
+    /// session, whose rotated run order reaches it.
+    fn plan_flood(
+        &mut self,
+        idx: &ChainIndex,
+        runs: &[Run],
+        theirs: &AuthorEntry,
+        exact: &HashMap<EnvelopeId, u64>,
+        work: &mut usize,
+        owed: &mut Vec<(u64, EnvelopeId)>,
+    ) {
+        let mut marks: HashMap<EnvelopeId, u64> = HashMap::new();
+        for p in theirs.runs.iter().filter(|p| idx.holds(&p.head)) {
+            let mut cur = Some(p.head);
+            while let Some(id) = cur {
+                if marks.get(&id).is_some_and(|b| *b <= p.bottom) {
+                    break;
+                }
+                if *work == 0 {
+                    self.incomplete = true;
+                    return;
+                }
+                *work -= 1;
+                let b = marks.get(&id).map_or(p.bottom, |b| (*b).min(p.bottom));
+                marks.insert(id, b);
+                if idx.seq(&id).is_none_or(|s| s <= p.bottom) {
+                    break;
+                }
+                cur = idx.parent(&id);
+            }
+        }
+        for r in runs {
+            if exact.get(&r.head).is_some_and(|b| *b <= r.bottom) {
+                continue;
+            }
+            // Walk down to the first envelope the peer holds (each envelope
+            // is walked about once: queued stretches are skipped).
+            let mut cur = Some(r.head);
+            let mut seq = r.top;
+            let mut met = None;
+            while let Some(id) = cur {
+                if let Some(b) = marks.get(&id) {
+                    met = Some((seq, *b));
+                    break;
+                }
+                // Queued already, down to `floor`: skip that stretch.
+                if let Some(floor) = self.queued.get(&id).copied() {
+                    if floor <= r.bottom {
+                        break;
+                    }
+                    seq = floor - 1;
+                    cur = idx.branch_id_at(&id, seq);
+                    continue;
+                }
+                if *work == 0 {
+                    self.incomplete = true;
+                    return;
+                }
+                *work -= 1;
+                if seq <= r.bottom {
+                    break;
+                }
+                seq -= 1;
+                cur = idx.parent(&id);
+            }
+            let (above, below) = match met {
+                Some((m, b)) => (m + 1, b),
+                None => (r.bottom, r.bottom),
+            };
+            self.queue_branch(idx, &r.head, above, r.top, owed);
+            if below > r.bottom {
+                self.queue_branch(idx, &r.head, r.bottom, below - 1, owed);
+            }
+        }
+    }
+
+    /// Queue the envelopes of the branch ending at `head` in `lo..=hi`
+    /// (into `out` as (seq, id)), skipping the ones already queued: the walk
+    /// stops at an envelope whose branch is queued down to `lo`, so each
+    /// envelope is visited about once however many runs share it.
+    fn queue_branch(
+        &mut self,
+        idx: &ChainIndex,
+        head: &EnvelopeId,
+        lo: u64,
+        hi: u64,
+        out: &mut Vec<(u64, EnvelopeId)>,
+    ) {
+        if lo > hi {
+            return;
+        }
+        let mut seq = hi;
+        let mut cur = idx.branch_id_at(head, hi);
+        while let Some(id) = cur {
+            if let Some(floor) = self.queued.get(&id).copied() {
+                if floor <= lo {
+                    break;
+                }
+                seq = floor - 1;
+                cur = idx.branch_id_at(&id, seq);
+                continue;
+            }
+            self.queued.insert(id, lo);
+            if !self.refused_by_peer.contains(&id) {
+                out.push((seq, id));
+            }
+            if seq <= lo {
+                break;
+            }
+            seq -= 1;
+            cur = idx.parent(&id);
         }
     }
 
     /// The seq intervals of my run `r` that the peer's entry shows it lacks,
     /// or `None` if the entry can't decide (a peer head I don't hold that
     /// overlaps the run). `probed`: after probing, the intervals of `r` the
-    /// peer is known to hold; undecided peer runs then add nothing.
+    /// peer is known to hold (empty for a flood); peer heads I don't hold
+    /// then add nothing.
     fn uncovered(
         &self,
         set: &S,
@@ -1057,20 +1247,16 @@ impl<S: SyncSet> Session<S> {
         }
         // Placed: send the run minus what the peer is known to hold (from
         // the probes, and from its heads that I hold).
-        let empty = AuthorEntry { author, runs: Vec::new(), truncated: false };
+        let empty = AuthorEntry { author, runs: Vec::new(), truncated: None };
         let peer = self.peer.clone().unwrap_or_default();
         let theirs = peer.authors.get(&author).unwrap_or(&empty);
         let intervals = self.uncovered(set, &p.run, theirs, Some(&p.covered)).unwrap_or_default();
-        let idx = set.index();
-        let mut ids = Vec::new();
+        let mut owed = Vec::new();
         for (lo, hi) in intervals {
-            ids.extend(
-                idx.branch_ids(&p.run.head, lo, hi)
-                    .into_iter()
-                    .filter(|id| !self.refused_by_peer.contains(id) && self.queued.insert(*id)),
-            );
+            self.queue_branch(set.index(), &p.run.head, lo, hi, &mut owed);
         }
-        self.jobs.push(ids);
+        owed.sort_unstable();
+        self.jobs.push(owed.into_iter().map(|(_, id)| id).collect());
         Ok(())
     }
 }

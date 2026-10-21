@@ -32,14 +32,17 @@ pub struct Run {
 /// An author's chain heads, as full 32-byte ids (nothing is truncated, so
 /// nothing can be ground). Normally one run. At most
 /// [`super::MAX_RUNS_INLINE`] are listed, the highest first; `truncated`
-/// says there are more. Listing fewer never breaks convergence (each side
-/// sends what the other's frontier shows it lacks); it only makes the
-/// peer's coverage check of this author incomplete.
+/// says there are more and commits to all of them (heads, bottoms and gap
+/// ids, as the digest does), so two sides whose commitments match know they
+/// hold the same chains of this author without listing them. Listing fewer
+/// never breaks convergence (each side sends what the other's frontier
+/// shows it lacks); it only makes the peer's coverage check of this author
+/// incomplete.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorEntry {
     pub author: SignPk,
     pub runs: Vec<Run>,
-    pub truncated: bool,
+    pub truncated: Option<Digest>,
 }
 
 /// A frontier, or one chunk of it. The first chunk carries the op tips;
