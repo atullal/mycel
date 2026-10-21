@@ -281,7 +281,7 @@ runner we estimate (not measured) about 3–6 minutes for the gate plus
 the release build; the job's limit is 45 minutes. With the keyed streams and digests
 of fixed 27 the gate took 106.7 s wall, 418 s of CPU and 1.4 GB peak
 (2026-10-21, load 4–12; v2/integration the same hour: 109.0 s, 412 s,
-2.0 GB).
+2.0 GB), and 108.7 s, 425 s and 1.4 GB with fixed 28 too.
 
 ## 2. Models and sources
 
@@ -354,7 +354,7 @@ where the nearest-rank "p99" these rows used to print is the maximum.
 | `mixed-room` | 1 | full | ✅ | Ethernet→Some(Ethernet), Wi-Fi Direct→Some(WifiDirect), UWB→Some(Uwb), Bluetooth LE→Some(Bluetooth) | 26 s |
 | `us-eu` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.720 s, optimality p50/p95 1.23/2.16×, CVaR₉₅ 2.27× (before: 0.737 s, 1.23/2.24×, 2.34×: jitter now drawn per link and frame) · CI size, the gate's 10 seeds: optimality p95 2.23–2.40× | 1 s |
 | `gateway-choice` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 1.11 s, optimality p50/p95 6.26/9.23×, CVaR₉₅ 9.24× (before: 1.12 s, 6.26/9.15×; 100 KB and 1 MB messages against the pipelining bound) · 1 KB optimality p50 1.88× (before 1.73×) · 100% of relayed bytes via the far fibre gateway · CI size: 1 KB optimality p50 1.45–1.96× on the gate's 10 seeds (before 1.53–2.03×, missed on 1; 1.51–2.03× over 30 calibration seeds before fixed 27) | 0 s |
-| `routing-convergence` | 2 | full | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.02× (before 1.01×) · the last of the 300 pairs not within the 40 s watched (before: 100% in 1.9 s; the objective is 99%; one pair, not yet looked into) · main: 99% in never · CI size, the gate's 10 seeds: 99% in 0.6–0.7 s, 0 loops on every seed | 18 s |
+| `routing-convergence` | 2 | full | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.02× (before 1.01×) · the last of the 300 pairs not within the 40 s watched (before: 100% in 1.9 s; the objective is 99%; one pair, 8 hops apart, whose relayed hop counts reach the 10-hop limit: open 18) · main: 99% in never · CI size, the gate's 10 seeds: 99% in 0.6–0.7 s, 0 loops on every seed | 18 s |
 | `flood-scaling` | 2 | full | ✅ | largest N (2,000): global core 8.5% of BLE in steady state (before 8.4%), 100% of pairs routed (flood reduction on: 98%, before 100%), main 136.1% | 550 s |
 | `partial-route` | 2 | full | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 98.4 s (before 97.6 s); sender-holds 100% p50 98.8 s (before 98.5 s) · gap 300 m: global core + DTN 100%; stand-in custody 0%; sender-holds 0% | 0 s |
 | `disaster-dtn` | 2 | full, judged on 12 worlds from seed 1 | ✅ | **global core + DTN: mean 83.6% delivered** (target ≥ 80%; per world 70–92%; before 88.1%, 78–100%: each message's ends and each walker's waypoints now come from their own streams, so all 12 worlds are new ones; DISASTER13_PLACEHOLDER) · seed 1: 83%, p95 7310 s, optimality p50/p95 1.58/4.60×, 20.1 replicas and 27.8 hand-offs per message (budget 32; mean of the 12 worlds 20.5) · latency p50 against epidemic's, median of the 12 worlds' ratios, 1.45× (before 1.36×; target 3×) · PRoPHET 52%, spray-and-wait (L=8) 22%, epidemic 100%, on the same world (before 67%, 28%, 100%) · CI size (0.1, 48 messages, mean of 20 worlds): the gate's 10 seeds 79.3–90.1%, median 86.2% (before 81.0–87.5%, 86.1%); CALDIS_PLACEHOLDER | 187 s |
@@ -953,9 +953,11 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    message. Now each draw is keyed by (seed, purpose, entity, event),
    the exogenous world sits behind a read-only borrow, and the
    exogenous hash is an invariant in every scenario that runs several
-   models on one world (the gate: 10 of 10 seeds in all eight that do;
-   `flood-hop-limit` and `routing-convergence` build their own runs and
-   don't register yet). The CRN isolation test fails on the old engine
+   models on one world (the gate: 10 of 10 seeds in all nine of its
+   scenarios; `flood-scaling`, `global-scale` and `churn` check it too).
+   `liar-ceiling` runs each attacker strategy on a world of its own (the
+   strategy is part of the adversary placement, so it is in the hash),
+   and has nothing to pair. The CRN isolation test fails on the old engine
    by construction (its extra frame's draw moved everyone's) and passes
    now.
 
@@ -975,7 +977,7 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    | `trace-replay` | CVaR₉₅ | 10.3× (5.34–22.4) | 8.55× (4.06–25.0) | same (120×) |
    | `trace-replay` | over 10×, upper bound | 3.36% (1.90–5.08) | 3.20% (1.91–5.95) | same (12%) |
    | `trace-replay` | over 30×, upper bound | 2.35% (1.88–4.36) | 2.02% (1.88–4.32) | same (6%) |
-   | `adversarial` | plausible liars | 97.5% (91.7–100), 10 of 10 | 99.2% (88.3–100), 9 of 10 | liars, storm, replayer and Sybil placed from their own stream, honest pairs from per-attempt workload streams: new attackers in the same towns. The miss (seed 16427468972947960519, 88.3%) equals the lowest of the 30 calibration seeds before |
+   | `adversarial` | plausible liars | 97.5% (91.7–100), 10 of 10 | 98.3% (88.3–100), 9 of 10 | liars, storm, replayer and Sybil placed from their own stream, honest pairs from per-attempt workload streams: new attackers in the same towns; and since fixed 28 as distinct devices (99.2% median before that). The miss (seed 16427468972947960519, 88.3%) equals the lowest of the 30 calibration seeds before |
    | `routing-convergence` | 99% routed at cold start | 0.7 s (0.6–0.7) | 0.6 s (0.6–0.7) | router start phases from per-router streams |
    | `routing-convergence` | route length vs shortest | 1.00 (1.00–1.00) | 1.00 (1.00–1.01) | same |
    | `disaster-dtn` | delivery, mean of 20 worlds | 86.1% (81.0–87.5), 10 of 10 | 86.2% (79.3–90.1), 9 of 10 | each message's ends from its own stream, each walker's waypoints from its own: new worlds. The miss (same seed, 79.3% against 80%) is within the slack |
@@ -987,7 +989,8 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    every delivery of 100%, `partial-route`, `flood-hop-limit`'s four
    paired shape checks and the pinned seeds. The gate passes: 106.7 s
    wall, 418 s of CPU and 1.4 GB peak (before, the same day: 109.0 s,
-   412 s, 2.0 GB; machine load 4–12 both times). CALIBRATION_PLACEHOLDER
+   412 s, 2.0 GB; machine load 4–12 both times); with fixed 28 as well,
+   108.7 s, 425 s and 1.4 GB. CALIBRATION_PLACEHOLDER
 
 23. **Routing defences without a wire change, measured one by one**
    (`docs/ROUTING.md` §6, item 15). Eight were built in the core. Each
@@ -1279,6 +1282,27 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    default route toward a gateway, while the next one still routes
    toward the destination. Repro: `MYCEL_CORE=defences=none cargo run
    --release -p mycel-sim --example ablation -- churn 3 0.1`.
+18. **A pair eight hops apart can stay unrouted: relayed hop counts grow
+   to the limit** (`routing-convergence` at full size, seed 1, since
+   fixed 27). One of the 300 sampled pairs (226 → 194, 8 radio hops)
+   has no route at 40 s, nor at 60 s or 100 s (checked; the tables do
+   not change). Along its shortest path, from the far end, the relays
+   hold routes to 194 of none, 10, 10, 9–10, 8–9 and 7–10 hops, then
+   device 129 two hops away, whose own route (a 2-hop one, through
+   device 75 next to 194) is right but whose neighbours hold 7-hop
+   routes through it: what 129 relays is a copy that came the long
+   way. A relay forwards each seqno once, the
+   best copy it holds when its forwarding jitter ends
+   (`flush_announcements`, `forwarded`), and does not re-forward a
+   shorter copy of the same seqno that arrives later, so hop counts
+   can grow to `max_hops` (10) and the fringe drops them. Why the short
+   copy reaches 129 late on every round is not established (75 has 22
+   neighbours, and a control budget that queues announcements: a
+   suspect, not checked). The same pair routed in
+   1.9 s on the earlier streams, the CI-size worlds route every pair on
+   all 10 gate seeds, and the objective (99%) holds. Repro: `cargo run
+   --release -p mycel-sim -- routing-convergence --seed 1` ("100% in
+   never" in the headline).
 
 ## 5. Benchmarks against external baselines
 
