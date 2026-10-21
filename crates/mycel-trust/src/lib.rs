@@ -7,6 +7,8 @@
 mod bitset;
 #[cfg(any(test, feature = "oracle"))]
 pub mod oracle;
+#[cfg(test)]
+mod reach;
 mod resolve;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
