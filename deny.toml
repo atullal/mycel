@@ -38,7 +38,8 @@ unsound = "all"
 yanked = "deny"
 #
 # Each ignore names the one advisory, why Mycel isn't exposed, and when to
-# look again. The same list is in .cargo/audit.toml for `cargo audit`.
+# look again. The same list is in .cargo/audit.toml for `cargo audit` and in
+# osv-scanner.toml for OSV-Scanner (OpenSSF Scorecard).
 ignore = [
   # Unsound `Iterator` impls of glib::VariantStrIter (fixed in glib 0.20).
   # Linux only: glib 0.18 comes with Tauri's GTK 3 webview (wry 0.57 and

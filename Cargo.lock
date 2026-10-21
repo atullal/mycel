@@ -3622,7 +3622,7 @@ dependencies = [
  "block2",
  "bytes",
  "cpal",
- "jni 0.21.1",
+ "jni 0.22.4",
  "mycel-crypto",
  "mycel-net",
  "mycel-sync",
@@ -3680,7 +3680,7 @@ version = "0.1.0"
 dependencies = [
  "block2",
  "data-encoding",
- "jni 0.21.1",
+ "jni 0.22.4",
  "libc",
  "mycel-node",
  "ndk-context",
@@ -3724,6 +3724,7 @@ dependencies = [
  "mycel-net",
  "mycel-sync",
  "mycel-trust",
+ "nix 0.31.3",
  "parking_lot",
  "serde_json",
  "tokio",
@@ -3766,6 +3767,7 @@ dependencies = [
  "mycel-net",
  "mycel-sync",
  "mycel-trust",
+ "nix 0.31.3",
  "parking_lot",
  "serde_json",
  "socket2",
@@ -3790,6 +3792,7 @@ dependencies = [
  "n0-future",
  "n0-mainline",
  "n0-watcher",
+ "nix 0.31.3",
  "noq-udp",
  "parking_lot",
  "postcard",
@@ -3888,7 +3891,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.21",
 ]
 
@@ -4251,6 +4254,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
