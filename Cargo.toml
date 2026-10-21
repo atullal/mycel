@@ -85,6 +85,11 @@ opt-level = 3
 # Its internal debug assertions walk whole documents on every edit: typing
 # grows quadratic in tests (flat in release), hiding our own costs.
 debug-assertions = false
+# Counters add with plain i64 arithmetic: increments any member sends can
+# overflow when merged. Release builds wrap, identically on every device;
+# with overflow checks a debug build would panic on what release builds
+# accept (found by fuzzing; docs/TESTING.md, "Fuzzing").
+overflow-checks = false
 [profile.dev.package.hexane]
 opt-level = 3
 [profile.dev.package.zlib-rs]
