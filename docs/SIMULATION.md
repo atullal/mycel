@@ -181,6 +181,108 @@ models airtime contention per collision domain, not collisions), fading
 (loss is i.i.d.), rate adaptation, battery. Tier-2 latencies are optimistic
 under load.
 
+### Wire sizes (tier 2)
+
+Tier 2 charges each frame what the node puts on the link for it
+(`tier2/global.rs` `wire_of`, `src/quic.rs`), so a format change (v2
+attestations, a new summary field) moves tier 2's byte counts and airtime
+with no change to the simulator. Three layers, each from the code:
+
+1. **Mycel's own encodings**, measured with `mycel_net::mesh`'s length
+   functions, which are tested byte for byte against the encoders on random
+   input (`lengths_match_the_encoders`, `stream_lengths_match_the_encoders`):
+   announcements batched per neighbour per routing step exactly as the
+   node's `exec` batches them (one alone as a `T_OGM` datagram, several
+   packed into `T_OGMS` datagrams of at most the hop's datagram size), seqno
+   requests, data frames split to the hop's datagram size, and the carrier's
+   streams (summary; offer, answer, payload after the offer, one-byte
+   verdict after the answer). End-to-end messages are one QUIC stream, cut
+   into packets of at most 1,200 bytes as noq cuts a stream.
+2. **QUIC as noq builds it** (`vendor/noq-proto`): a short header (1 byte
+   of flags, iroh's 8-byte connection id, a 1-byte packet number on a hop,
+   1–2 bytes end to end by window), a 16-byte AEAD tag, DATAGRAM frames with
+   their length, STREAM frames with type, a 2-byte stream id, the offset
+   and (only when it doesn't fill the packet) a length, noq's rule for
+   cutting a stream into packets, and a hop's datagram room: 1,414 bytes at
+   the 1,452-byte MTU path-MTU discovery reaches, 1,162 before it.
+3. **Each link's framing per packet**: 3 bytes on Bluetooth
+   (`mycel_link_ble::wire`: length and type), UDP over IPv6 (48) on AWDL
+   (`mycel-link-awdl` sends QUIC packets unframed over IPv6 link-local),
+   UDP over IPv4 (28) on Wi-Fi, Ethernet, UWB and the internet, compressed
+   6LoWPAN UDP (9) on Thread. The rates in the table above are payload
+   rates above this framing.
+
+What one frame costs, for example (simulated device names are 2–6 bytes):
+
+| Frame | Before (hand-written sizes) | Now, over Bluetooth | Now, over Wi-Fi or the internet |
+|---|---:|---:|---:|
+| one announcement alone | 121 B | 153 B | 178 B |
+| 11 announcements for one neighbour in one routing step | 11 frames, 1,331 B | 1 packet, 1,364 B | 1,389 B |
+| seqno request | 42 B | 73 B | 98 B |
+| 1 KB message straight to a neighbour (one packet) | 1,033 B (radio), 1,053 B (internet) | 1,058 B | 1,083 B |
+| the same packet over a mesh hop | 1,140 B | 1,194 B | 1,219 B |
+| 1 MB message, end to end | 840 packets, 1,007,560 B (radio) | 858 packets, 1,031,716 B | 1,053,166 B |
+
+**Fidelity.** Bytes are bytes: Mycel's encodings and QUIC's framing are
+exact (read from the code or the RFCs; `src/quic.rs` cites each constant).
+Four values depend on connection state tier 2 doesn't keep and are
+*estimates*, stated as such in `src/quic.rs`: a hop's packet number
+(1 byte: fewer than 128 packets unacknowledged), a stream id (2 bytes),
+the hop MTU (the 1,452 bytes discovery reaches; `MYCEL_SIM_HOP_MTU=1200`
+charges every hop as before discovery), and IPv4 rather than IPv6 on IP
+links. Airtime is still the disc model's (`size / rate`): the bytes are
+exact, the time they take is not.
+
+**Not modelled** (the remaining gap to real wire bytes):
+
+- ACK-only packets. A QUIC receiver acknowledges every second
+  ack-eliciting packet, or after 25 ms: about 34 bytes plus framing per
+  acknowledgement (noq's multipath PATH_ACK), sent the other way. On a
+  stream of full packets that is ~1.5% more bytes; on lone announcements
+  over Bluetooth up to one 37-byte acknowledgement per 153-byte
+  announcement, up to ~24% more routing bytes than charged (estimate;
+  less where an acknowledgement rides on the neighbour's own
+  announcements, as QUIC lets it). Tier 2's
+  end-to-end sender still acknowledges every packet (34 bytes each, as
+  before at 40), not every second one.
+- Flow-control credit (MAX_DATA, MAX_STREAMS), path probes and
+  keep-alives, and noq packing several small frames into one packet.
+- The rest of a handshake beyond its two padded 1,200-byte flights (about
+  200 bytes, estimate) and a relay's TLS/TCP framing on relayed paths.
+- Display names: tier-2 names are 2–6 bytes, a phone's can be up to 32
+  (`MAX_NAME`), which would add up to 26 bytes per announcement.
+
+`WP5` (real noq-proto in tier 2) would close the first three.
+
+**Cost.** The sizes come from length functions that don't allocate (an
+offer is encoded when it or its bundle is sent), so the simulator does no extra
+work per event beyond a few additions; batching announcements per
+neighbour sends fewer frames. Measured on the 18-core Mac with 4 threads
+while other agents' builds and simulations ran (load average ~11), so
+within that noise: CI's gate (`ci --seed 1000 --runs 10`) took 107–123 s
+wall and 415–480 s of CPU before (two runs) and 110 s and 428 s after;
+peak memory 1.0–1.2 GB before, 1.3 GB after. `global-scale` at 2,002
+devices, alternating before/after twice: 78.8 and 93.9 s of CPU before,
+89.6 and 90.4 s after (the global core's own run: 21 and 23 s wall
+before, 22 and 23 s after, for 27.0 M and 26.9 M events). So no cost
+beyond the machine's noise, which here is ±10%; there is no cheaper
+profile to keep (the hand-written sizes cost the same). Full-size
+`flood-scaling` peaked at 10.4 GB of memory after, 9.4 GB before (one
+run each, on different load: 1,297 s and 615 s wall).
+
+**What changed in tier 2's numbers** (same seeds, before → after; CI's
+gate is the median over its 10 seeds, every verdict still passes):
+
+| Scenario | Change | Why |
+|---|---|---|
+| `global-scale` (2,002 devices, seed 1) | control 707 → 918 B/s per device (target ≤ 1,000): routing 470 → 652 (+39%), carrier 236 → 265 (+12%); delivery 100%, p95 0.690 → 0.691 s, warm optimality p95 2.87 → 2.72× | Routing here is mostly announcements that go alone (1.15 announcements per datagram on average, counted in `churn`): each now pays its datagram's 29 bytes of QUIC and its link's framing (3 on Bluetooth, 28 on IP); seqno requests 42 → 70 B before framing. The carrier's receipts are 129 bytes as encoded (with the signature's length byte and the destination), not 96. With ACK-only packets (not modelled) it would be at or over its target: open 1 |
+| `churn` (1,001 devices, seed 1) | control 700 → 920 B/s per device (by kind: routing 470 → 664, carrier 254 → 290); delivery 100%, p95 61.1 s both, optimality p95 12.6× both, CVaR₉₅ 16.0 → 15.7× | As `global-scale` |
+| `flood-scaling` (full size, seed 1) | largest N: 3,351 → 3,921 B/s per device, 8.4 → 9.8% of a Bluetooth radio (objective ≤ 10%); the current settings +17–29% by size and variant ("before" +30–43%, routed 88 → 80% at 2,000) | Rebroadcasts to one neighbour in one tick share a datagram, so most of the 29 bytes of QUIC per packet are shared; each packet adds 3 bytes of Bluetooth framing. The heavier "before" settings now overflow the 16 KiB Bluetooth queues more often, so coverage falls |
+| `trace-replay` (CI size) | delivery median 99.0 → 98.75%; optimality p95 3.65 → 3.95× (paired difference median +0.11, from −1.2 to +0.55), CVaR₉₅ 10.4 → 11.0×; routing 15.7 → 20.0 B/s, carrier 22.6 → 28.5 B/s per device | Its messages are 500 kB–1 MB over 250 kB/s Bluetooth contacts: each bundle now carries ~2.5% of QUIC and framing (a 1,455-byte packet on the air per ~1,420 bytes of payload), and offers, answers and summaries are their encoded sizes in packets, so a few transfers no longer finish within a brief contact. The oracle stays a payload-only lower bound, so optimality ratios rise slightly everywhere |
+| `us-eu` (CI size) | latency p95 0.771 → 0.776 s, optimality p95 2.30 → 2.31× | 1 KB messages: 1,033 → 1,055-byte packets, plus framing per hop |
+| `gateway-choice` (CI size) | 1 KB optimality p50 1.704 → 1.706×; the seed that missed 2.00× still misses (2.03 → 2.04×) | As `us-eu` |
+| `mailbox`, `partial-route`, `routing-convergence`, `disaster-dtn`, `adversarial`, `flood-hop-limit` (CI size) | medians unchanged or within noise: `disaster-dtn` delivery 86.07 → 86.15%, replicas 7.44 both; `mailbox` drain 0.143 → 0.137 s; `adversarial` and `flood-hop-limit` unchanged | Few or small frames where the outcome is decided; batched announcements only change which frames carry them |
+
 ## 3. Scenarios and results
 
 Seed 1, full size unless noted. Candidate: the routing core and carrier
@@ -217,12 +319,12 @@ where the nearest-rank "p99" these rows used to print is the maximum.
 | `us-eu` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.737 s, optimality p50/p95 1.23/2.24×, CVaR₉₅ 2.34× (was p95 0.725 s, 2.15× on the shared streams) · CI size, 30 calibration seeds: optimality p95 2.22–2.37× | 1 s |
 | `gateway-choice` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 1.12 s, optimality p50/p95 6.26/9.15×, CVaR₉₅ 9.18× (100 KB and 1 MB messages against the pipelining bound) · 100% of relayed bytes via the far fibre gateway · CI size: 1 KB optimality p50 1.51–2.03× over 30 calibration seeds (target 2×, missed on 1) | 0 s |
 | `routing-convergence` | 2 | full | ✅ | global core: 99% routed in 1.1 s, 100% in 1.9 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never · CI size, 30 calibration seeds: 99% in 0.6–0.8 s, 0 loops on every seed | 15 s |
-| `flood-scaling` | 2 | full | ✅ | largest N (2,000): global core 8.3% of BLE in steady state (8.4% on the shared streams), 100% of pairs routed (before: 67.0%, 92% routed), main 136.2% | 333 s |
+| `flood-scaling` | 2 | full | ✅ | largest N (2,000): global core 9.8% of BLE in steady state with real wire sizes (§2; 8.4% with the hand-written sizes), 100% of pairs routed (before: 80.0%, 80% routed), main 136.2% (the modelled earlier mesh keeps hand-written sizes) | 615 s |
 | `partial-route` | 2 | full | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.6 s; sender-holds 100% p50 98.5 s · gap 300 m: global core + DTN 100%; stand-in custody 0%; sender-holds 0% | 0 s |
 | `disaster-dtn` | 2 | full, judged on 12 worlds from seed 1 | ✅ | **global core + DTN: mean 88.1% delivered** (target ≥ 80%; per world 78–100%; 87.2% on the shared streams) · seed 1: 93%, p95 7680 s, optimality p50/p95 1.45/5.38×, 21.3 replicas and 32.6 hand-offs per message (budget 32; mean of the 12 worlds 21.2) · latency p50 against epidemic's, median of the 12 worlds' ratios, 1.42× (per world 1.24–2.34×; target 3×) · PRoPHET 67%, spray-and-wait (L=8) 28%, epidemic 100%, on the same world (60 of 60 messages feasible for every router) · CI size (0.1, 48 messages, mean of 20 worlds): 81.1–91.0% over 30 calibration seeds, median 85.2% (finding 25) | 45 s |
 | `mailbox` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95 1.00/1.00× | 0 s |
-| `global-scale` | 2 | 2,002 devices (0.02) | ✅ | global core + DTN: 100% delivered, p95 0.690 s, optimality p50 3.76×, p95 10.0× · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.117 s, p95 0.211 s, optimality p95 2.76× (2.88× on the shared streams; 4.45× before fixed 19; 32.2× before fixed 18) · control 708 B/s per device (was 8,470): routing 470, carrier 238 (was 8,004, fixed 17) · CI size (1,499 devices, shared streams): warm optimality p95 2.65× (was 5.14×, failing) | 58 s |
-| `churn` | 2 | 1,001 devices (scale 0.1) | ✅ | global core + DTN: 100% delivered, p95 61.1 s, optimality p50/p95 5.99/12.6×, CVaR₉₅ 16.0× (p50/p95 5.87/12.5× on the shared streams); control 700 B/s per device: routing 2,659 → 471, carrier 4,540 → 256 (full size before the carrier fixes: 100%, p95 65.2 s) | 33 s |
+| `global-scale` | 2 | 2,002 devices (0.02) | ✅ | global core + DTN: 100% delivered, p95 0.691 s, optimality p50 3.82×, p95 10.0× · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.118 s, p95 0.209 s, optimality p95 2.72× (2.87× with the hand-written wire sizes; 4.45× before fixed 19; 32.2× before fixed 18) · control 918 B/s per device with real wire sizes (§2; 707 before, 8,470 before fixed 17): routing 652, carrier 265 · CI size (1,499 devices, shared streams): warm optimality p95 2.65× (was 5.14×, failing) | 73 s |
+| `churn` | 2 | 1,001 devices (scale 0.1) | ✅ | global core + DTN: 100% delivered, p95 61.1 s, optimality p50/p95 5.90/12.6×, CVaR₉₅ 15.7× (16.0× with the hand-written wire sizes); control 920 B/s per device with real wire sizes (700 before): routing 2,659 → 471 (fixed 14) → 664 (real sizes), carrier 4,540 → 256 (fixed 17) → 290 (full size before the carrier fixes: 100%, p95 65.2 s) | 35 s |
 | `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.091 s, optimality p50/p95 1.91/6.02×, CVaR₉₅ 7.84× (was 82%, p95 1.28 s, 36.6/170× p50/p95, failing: fixed 20) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (today's one-hop liar, judged ≥ 90%; a weak attacker: open 15): 91%, liar-free-reachable delivery 91% of a 100% ceiling (94% on the shared streams; 76% before fixed 21); 85.4% mean over seeds 1–20, and 78.4% for the chain-extending lie any liar can tell today (open 15) · CI size (0.1), 30 calibration seeds: lying plausibly 88.3–100%, median 96.7% | 265 s |
 | `liar-ceiling` | 2 | full, seeds 1–20 | ⏳ | ceiling 100% on every seed · each announcement format against its worst strategy: today 78.4% (chain-extending liar, min 69%), signed per-hop chain 78.4% (+0.0), chain + each hop's measured cost 98.9% (+20.6 ± 2.4 points) · by strategy: one-hop liar 85.4%, chain-extending liar 78.4%, honest dropper 98.9%, honest grey hole 99.5% (open 15) · CI size (seeds 1–20): 97.0% (one-hop liar), chain alone +0.3 ± 0.7, hop costs +2.7 ± 0.9 | 507 s |
 | `trace-replay` | 2 | full | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.0% of feasible (3,981 of 4,000 sent), p50 4.7 s, p95 1311 s, optimality p50 1.22×, p95 8.30× [6.24–13.8], CVaR₉₅ 23.1×, 3 of 396 over 30× (Wilson upper bound 2.2%), overhead 3.34 (was 8.38/18.0× p95/p99: fixed 21; pipelining-aware oracle, fixed 12) · ten full-size calibration seeds pooled (3,982 messages): p95 8.30× [7.73–9.20], CVaR₉₅ 39.8× (the p99 jump 36.8× → 46.9× on the shared streams: finding 26) · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 49 s |
@@ -843,8 +945,16 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
 
 1. **Bluetooth control traffic: what is left after fixed 14, 15 and 17.**
    - *(Carrier summaries: fixed 17. `conference` latency: fixed 15, the
-     emulator's Bluetooth queue.)* `global-scale` is at 706 B/s per device
-     (routing 470, carrier 235) against its 1 KB/s target.
+     emulator's Bluetooth queue.)* `global-scale` is at 918 B/s per device
+     (routing 652, carrier 265) against its 1 KB/s target, since tier 2
+     charges real wire sizes (§2, "Wire sizes"; 706 B/s with the
+     hand-written sizes before). The ACK-only packets tier 2 still leaves
+     out would add an estimated up to ~150 B/s to routing alone (about 4
+     routing packets per device per second, most alone, each acknowledged
+     with ~37 bytes unless the acknowledgement rides on traffic the other
+     way), which would put the scenario at or over its target: the
+     budget has less room than it showed. Real noq in tier 2 (WP5) would
+     settle it.
 
    Repro: `mycel-sim global-scale --scale 0.02`, `mycel-sim conference
    --scale 0.1`. Old routing settings for comparison:
@@ -1171,12 +1281,26 @@ reproduces the shape on a 100-device Bluetooth neighbourhood:
 
 | Devices | Now (16 s, full scope of 10 hops every 8th) | Now + flood reduction | Now, fisheye off | Before (2 s, 8 hops every 4th, flood reduction) | Earlier flooding mesh (40 s) |
 |---:|---:|---:|---:|---:|---:|
-| 250 | 2.5 kB/s (6.3%) [3.5], 100% routed | 2.0 kB/s (4.9%), 100% | 9.4 kB/s (23%), 100% | 18.3 kB/s (46%) [30.4], 92% | 48.0 kB/s (120%) |
-| 500 | 2.8 kB/s (7.0%) [4.3], 100% | 2.3 kB/s (5.8%), 100% | 12.2 kB/s (31%), 100% | 22.1 kB/s (55%) [35.4], 90% | 49.6 kB/s (124%) |
-| 1,000 | 3.1 kB/s (7.7%) [4.9], 100% | 2.5 kB/s (6.3%), 100% | 13.4 kB/s (34%), 100% | 23.4 kB/s (59%) [37.1], 92% | 52.2 kB/s (131%) |
-| 2,000 | 3.4 kB/s (8.4%) [5.8], 100% | 2.8 kB/s (6.9%), 100% | 15.7 kB/s (39%), 100% | 26.8 kB/s (67%) [41.2], 85% | 54.4 kB/s (136%) |
+| 250 | 3.0 kB/s (7.5%) [4.3], 100% routed | 2.5 kB/s (6.3%), 100% | 11.1 kB/s (28%), 100% | 22.8 kB/s (57%) [35.7], 92% | 48.0 kB/s (120%) |
+| 500 | 3.3 kB/s (8.3%) [5.5], 100% | 2.8 kB/s (7.0%), 100% | 13.8 kB/s (34%), 100% | 26.8 kB/s (67%) [41.2], 82% | 49.6 kB/s (124%) |
+| 1,000 | 3.6 kB/s (9.0%) [6.2], 100% | 3.1 kB/s (7.7%), 99% | 14.6 kB/s (36%), 100% | 27.9 kB/s (70%) [43.2], 82% | 52.2 kB/s (131%) |
+| 2,000 | 3.9 kB/s (9.8%) [7.1], 100% | 3.4 kB/s (8.5%), 100% | 15.6 kB/s (39%), 100% | 32.0 kB/s (80%) [47.8], 80% | 54.4 kB/s (136%) |
 
-Fisheye cuts traffic 4–5×. Flood reduction would save another 18% here, where every device sees every flood from several sides, but it leaves pairs unrouted in sparser meshes (`routing-convergence`), so it stays off. All variants greet new neighbours. Traffic grows slowly with N: the near scope costs the same at any size; the full scope reaches more devices.
+Bytes are real wire sizes (§2, "Wire sizes"): announcements in the
+datagrams the node packs them into, in QUIC packets, with Bluetooth's
+3 bytes of framing each. With the hand-written sizes before, the same
+runs (seed 1) gave 2.5 / 2.8 / 3.0 / 3.4 kB/s for "now", 2.0 / 2.3 / 2.5 /
+2.8 with flood reduction, 9.5 / 11.4 / 11.6 / 12.1 with fisheye off and
+17.5 / 19.2 / 20.0 / 22.3 kB/s (94 / 90 / 90 / 88% routed) for "before":
+real sizes add 17–21% for "now", 21–25% with flood reduction (fewer
+rebroadcasts share each datagram) and 17–29% with fisheye off, rising
+with N; "before" adds 30–43% and loses coverage, as its heavier
+traffic fills the 16 KiB Bluetooth queues. The earlier flooding
+mesh is a model with its own sizes, unchanged. "Now" at 2,000 devices is
+within its 10% objective by 0.2 points, before the ACK-only packets tier
+2 doesn't model (§2; open 1).
+
+Fisheye cuts traffic about 4×. Flood reduction would save another 14–17% here, where every device sees every flood from several sides, but it leaves pairs unrouted in sparser meshes (`routing-convergence`), so it stays off. All variants greet new neighbours. Traffic grows slowly with N: the near scope costs the same at any size; the full scope reaches more devices.
 
 Qualitative only: this model has no collisions, so usefulness falls through
 redundancy, not loss.
