@@ -135,6 +135,15 @@ ciphertext = XChaCha20-Poly1305(key = epoch key, nonce, aad = "mycel/v0/content"
 5. **cutoff rule:** for every winning revocation `w` of the author that is *not* in `past(auth_heads)`, the envelope must lie in the author's hash chain at or before `w.cutoff`. `cutoff` = the latest envelope from that member the revoker had seen. This blocks a removed member from backdating `auth_heads` to keep writing;
 6. the per-author chain is consistent: `author_prev` must be the author's envelope with `author_seq − 1`. Forks (equivocation) after a cutoff are excluded by rule 5. Before a cutoff, a fork is accepted but flagged.
 
+**Storage window** (before validity, so keepers apply it too): an envelope
+is stored only if its `author_seq` is below the author's *reach* plus 4,096,
+where reach is one past the highest seq held on a chain from seq 0. The rule
+depends only on what is held, never on arrival order, so peers that end up
+with the same items store the same set; it bounds a writer's dangling
+envelopes (no predecessor held) to 4,096 seqs per chain. Senders send each
+author's chain in ascending seq, so honest data never waits on it; a
+refused envelope is offered again once its prefix has arrived.
+
 **After decrypting** (members only):
 7. the Automerge change's actor ID must equal `header.author`. Authors cannot write under someone else's actor.
 
@@ -172,7 +181,8 @@ aad_i    = "mycel/v0/stream-chunk" ‖ len(A): u32 LE ‖ A ‖ chunk_size: u32 
 
 - **ALPN** `mycel/2`: one connection per pair of devices; sync, cards, ephemeral messages and blobs are QUIC streams on it, labelled by a stream-kind byte. Iroh authenticates the remote node ID, which equals the remote `sign_pk`.
 - **Responders serve a space only to its current members**, including Relays. Requests from non-members are refused.
-- **Sync order:** membership ops first, then envelopes (set difference over full ID inventories).
+- **Sync order:** membership ops first (resolution order, ancestry-closed), then envelopes, each author's chain in ascending seq. Sync v2 (stream kind `SyncV2`) finds the difference from a 32-byte digest and per-author chain heads (full ids); v1 (`Sync`, for builds without v2) by set difference over full ID inventories. Neither summary admits or hides anything: every item still goes through the receiver's checks, and a lying peer can only waste bounded bytes or withhold.
+- **Sync v2 limits** (none depends on the peer acknowledging anything): sessions that find a difference, per (peer, space): a burst of 32, then 4 per second (`Busy` beyond); bytes sent per (peer, space): one full catch-up of our set, then 1 MiB/min (the session stops and resumes later, keeping what arrived); phase-2 (fork placement) sessions: 6 per peer per hour; a peer's frontier: at most 65,536 authors, 64 chain heads each; probes: 16 ids each, 64 runs and 8 rounds per session; frames at most 1.1 MiB plus one envelope.
 - **Everything received is validated by the receiver.** Nothing is trusted because of who sent it.
 - **ALPN** `mycel/mesh/1`: hop connections between nearby devices for multi-hop relaying ([ARCHITECTURE.md](ARCHITECTURE.md) §8). Accepted from anyone nearby: relaying needs no membership. What crosses a relay is the QUIC traffic of a connection between two *other* devices, so the rules above still apply end to end. See §8b.
 
@@ -347,7 +357,9 @@ What this layer does **not** do:
 - **Scale.** Resolution is linear for linear history but O(n²) for heavily
   concurrent membership ops, and envelope validity is recomputed on each
   membership change. Rotation sends one lockbox per reader: fine up to a
-  few hundred members. Sync exchanges full ID inventories.
+  few hundred members. Sync v2 costs about what differs (an idle check is
+  one round trip and a few hundred bytes), but v1 sessions with builds
+  without it still exchange full ID inventories.
 - **Rebuild costs.** A batch carrying a lower-ID fork of an already-applied
   change costs one linear rebuild of that document, and the displaced
   change's descendants are dropped, as for revocations. Honest edits built

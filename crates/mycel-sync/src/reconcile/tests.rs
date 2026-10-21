@@ -952,3 +952,197 @@ mod replicas {
         assert_eq!(a.feed(&feed), b.feed(&feed), "documents agree");
     }
 }
+
+// ───────────── benchmarks ─────────────
+
+mod bench {
+    use std::time::Instant;
+
+    use mycel_crypto::{Hash32, SignPk};
+    use serde::Serialize;
+
+    use super::super::model::*;
+    use super::super::*;
+    use super::{copy, pk, space, sync_with};
+
+    /// v1's sync messages (mycel-net `wire::SyncMsg`), mirrored field for
+    /// field so postcard sizes are exact: variant tags, length prefixes, ids.
+    #[derive(Serialize)]
+    struct Inv {
+        ops: Vec<Hash32>,
+        envelopes: Vec<Hash32>,
+    }
+
+    #[derive(Serialize)]
+    struct Data<'a> {
+        ops: Vec<&'a ModelOp>,
+        envelopes: Vec<&'a ModelEnv>,
+    }
+
+    #[allow(dead_code)]
+    #[derive(Serialize)]
+    enum V1<'a> {
+        Hello { space: Hash32, inv: Inv, invite: Option<Vec<ModelOp>> },
+        Denied,
+        Removed { ops: Vec<ModelOp> },
+        NeedInvite,
+        Accept { inv: Inv, want: Inv },
+        DataAndWant { data: Data<'a>, want: Inv },
+        Data { data: Data<'a> },
+    }
+
+    fn inv(s: &ModelSet) -> Inv {
+        Inv { ops: s.op_ids().into_iter().collect(), envelopes: s.env_ids().into_iter().collect() }
+    }
+
+    fn want(of: &ModelSet, from: &ModelSet) -> Inv {
+        let (have_ops, have_envs) = (of.op_ids(), of.env_ids());
+        Inv {
+            ops: from.op_ids().into_iter().filter(|i| !have_ops.contains(i)).collect(),
+            envelopes: from.env_ids().into_iter().filter(|i| !have_envs.contains(i)).collect(),
+        }
+    }
+
+    fn data<'a>(s: &'a ModelSet, w: &Inv) -> Data<'a> {
+        Data { ops: Vec::new(), envelopes: w.envelopes.iter().filter_map(|id| s.envelope(id)).collect() }
+    }
+
+    /// Bytes of one v1 session (client, server): Hello, Accept, DataAndWant, Data.
+    fn v1_bytes(client: &ModelSet, server: &ModelSet) -> u64 {
+        let c_want = want(client, server);
+        let s_want = want(server, client);
+        let msgs = [
+            frame_len(&V1::Hello { space: space(), inv: inv(client), invite: None }),
+            frame_len(&V1::Accept { inv: inv(server), want: want(server, client) }),
+            frame_len(&V1::DataAndWant { data: data(client, &s_want), want: want(client, server) }),
+            frame_len(&V1::Data { data: data(server, &c_want) }),
+        ];
+        msgs.iter().sum::<usize>() as u64
+    }
+
+    /// A model envelope body that makes an envelope encode to ~351 bytes,
+    /// the measured mean of a chat envelope.
+    fn body_for_351() -> usize {
+        let probe = ModelEnv { author: pk(1), seq: 5000, prev: Some(Hash32([1; 32])), branch: 0, body: vec![0; 279] };
+        279 + 351 - encoded_len(&probe).min(351)
+    }
+
+    fn world(authors: u32, per: u64) -> ModelSet {
+        let body = body_for_351();
+        let mut s = ModelSet::new(space());
+        for a in 0..authors {
+            let mut k = [0u8; 32];
+            k[..4].copy_from_slice(&a.to_le_bytes());
+            s.append(SignPk(k), per, body);
+        }
+        s
+    }
+
+    fn author(a: u32) -> SignPk {
+        let mut k = [0u8; 32];
+        k[..4].copy_from_slice(&a.to_le_bytes());
+        SignPk(k)
+    }
+
+    fn row(name: &str, v1: u64, run: &PairRun, took: std::time::Duration) {
+        let data = run.client_stats.sent_data_bytes + run.server_stats.sent_data_bytes;
+        let control = run.bytes() - data;
+        println!(
+            "| {name} | {v1} B, 2 RTT | {} B ({} control + {} data), {} RTT, first data after {} | {:?} | {:.1?} |",
+            run.bytes(),
+            control,
+            data,
+            run.round_trips(),
+            run.first_data_flight.map_or("-".to_string(), |f| format!("{:.1} RTT", f as f64 / 2.0)),
+            (&run.client, run.client_stats.phase),
+            took,
+        );
+    }
+
+    /// `cargo test --release -p mycel-sync bench_sync_v2 -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_sync_v2() {
+        const AUTHORS: u32 = 50;
+        println!("envelope size: {} B", encoded_len(&world(1, 1).all().1[0]));
+        println!("| scenario | v1 | v2 | v2 outcome | v2 CPU (both sides) |");
+        println!("|---|---|---|---|---|");
+        let server = world(AUTHORS, 200); // 10k envelopes
+        // Idle, first contact (no record) and steady state (record).
+        let mut s = copy(&server);
+        let mut c = copy(&server);
+        let v1 = v1_bytes(&c, &s);
+        let t = Instant::now();
+        let run = sync_with(&mut c, &mut s, (None, None));
+        row("idle, 10k envelopes", v1, &run, t.elapsed());
+        let records = (run.client_record.clone(), run.server_record.clone());
+        // One new envelope (steady state: both remember the last session).
+        c.append(author(7), 1, body_for_351());
+        let v1 = v1_bytes(&c, &s);
+        let t = Instant::now();
+        let run = sync_with(&mut c, &mut s, records);
+        row("1 new envelope, record", v1, &run, t.elapsed());
+        // One new envelope, first contact (full 50-author frontier).
+        let mut c2 = copy(&server);
+        let mut s2 = copy(&server);
+        c2.append(author(7), 1, body_for_351());
+        let v1 = v1_bytes(&c2, &s2);
+        let t = Instant::now();
+        let run = sync_with(&mut c2, &mut s2, (None, None));
+        row("1 new envelope, first contact", v1, &run, t.elapsed());
+        // 1k missing: back online after 1,000 messages (20 per author).
+        let mut c3 = copy(&server);
+        let mut s3 = copy(&server);
+        let rec = sync_with(&mut c3, &mut s3, (None, None));
+        for a in 0..AUTHORS {
+            s3.append(author(a), 20, body_for_351());
+        }
+        let v1 = v1_bytes(&c3, &s3);
+        let t = Instant::now();
+        let run = sync_with(&mut c3, &mut s3, (rec.client_record, rec.server_record));
+        row("1k missing (of 11k), record", v1, &run, t.elapsed());
+        let mut c4 = copy(&server);
+        let mut s4 = copy(&s3);
+        let v1 = v1_bytes(&c4, &s4);
+        let t = Instant::now();
+        let run = sync_with(&mut c4, &mut s4, (None, None));
+        row("1k missing (of 11k), first contact", v1, &run, t.elapsed());
+        // Fresh join of 100k envelopes.
+        let mut big = world(AUTHORS, 2000);
+        let mut fresh = ModelSet::new(space());
+        let v1 = v1_bytes(&fresh, &big);
+        let t = Instant::now();
+        let run = sync_with(&mut fresh, &mut big, (None, None));
+        row("fresh join, 100k envelopes", v1, &run, t.elapsed());
+        assert_eq!(fresh.env_ids().len(), 100_000);
+        println!(
+            "fresh join over 40 kB/s Bluetooth (estimate from bytes): v1 {:.0} s with nothing usable until the end; v2 {:.0} s, first 64 KiB chunk after {:.1} s",
+            v1 as f64 / 40_000.0,
+            run.bytes() as f64 / 40_000.0,
+            (CHUNK_BYTES as f64) / 40_000.0
+        );
+        // Fork repair: fork at seq 5,000; one side 5,000 more on its branch,
+        // the other 100 on its own.
+        let mut a = world(2, 10);
+        let base = a.fork(author(99), None, 5000, 0).last().copied();
+        let mut b = copy(&a);
+        let rec = sync_with(&mut a, &mut b, (None, None));
+        a.fork(author(99), base, 5000, 1);
+        b.fork(author(99), base, 100, 2);
+        let v1 = v1_bytes(&a, &b);
+        let t = Instant::now();
+        let run = sync_with(&mut a, &mut b, (rec.client_record, rec.server_record));
+        row("fork at 5,000 (+5,000 vs +100)", v1, &run, t.elapsed());
+        println!("probes sent: {} + {}", run.client_stats.probes_sent, run.server_stats.probes_sent);
+        // Index and digest costs at scale.
+        let t = Instant::now();
+        let big = world(AUTHORS, 2000);
+        println!("build 100k-envelope model set (index maintained on insert): {:.1?}", t.elapsed());
+        let t = Instant::now();
+        let d = big.digest();
+        println!("digest of 100k envelopes / 50 authors, cold: {:.1?}", t.elapsed());
+        let t = Instant::now();
+        assert_eq!(big.digest(), d);
+        println!("digest, cached: {:.1?}", t.elapsed());
+    }
+}
