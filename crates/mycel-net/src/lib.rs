@@ -2732,10 +2732,11 @@ mod version_tests {
         for p in &peers[1..] {
             n.inner.offer_bundle(p.sign_pk(), space);
         }
-        let b = n.inner.bundles.lock();
-        assert!(b.over_budget >= 1, "sent {} before the budget", b.sent);
-        assert!(b.in_flight_bytes() <= bundles::SOURCE_BUDGET, "{} B in flight", b.in_flight_bytes());
-        drop(b);
+        {
+            let b = n.inner.bundles.lock();
+            assert!(b.over_budget >= 1, "sent {} before the budget", b.sent);
+            assert!(b.in_flight_bytes() <= bundles::SOURCE_BUDGET, "{} B in flight", b.in_flight_bytes());
+        }
         n.shutdown().await.unwrap();
     }
 

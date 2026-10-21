@@ -154,7 +154,7 @@ impl Replica {
     /// The runs of `author` that `member` is known to hold (highest first).
     pub fn held_runs(&self, member: &SignPk, author: &SignPk) -> Vec<Run> {
         let mut v = self.delivery.members.get(member).and_then(|m| m.get(author)).cloned().unwrap_or_default();
-        v.sort_by(|a, b| b.top.cmp(&a.top));
+        v.sort_by_key(|r| std::cmp::Reverse(r.top));
         v
     }
 
@@ -251,7 +251,7 @@ impl Replica {
 /// Keep the highest runs.
 fn trim(runs: &mut Vec<Run>) {
     if runs.len() > RUNS_PER_AUTHOR {
-        runs.sort_by(|a, b| b.top.cmp(&a.top));
+        runs.sort_by_key(|r| std::cmp::Reverse(r.top));
         runs.truncate(RUNS_PER_AUTHOR);
     }
 }

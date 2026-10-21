@@ -253,7 +253,7 @@ struct View {
     refused: BTreeSet<SignPk>,
     announced: Announced,
     /// Aggregated announcement: due time, changed entries, op tips.
-    ihave: Option<(u64, BTreeMap<SignPk, AuthorEntry>, Vec<OpId>, Option<SignPk>)>,
+    ihave: Option<PendingIHave>,
     /// Announced heads (and op tips) we don't cover, per announcer.
     missing: BTreeMap<SignPk, Missing>,
     seen: VecDeque<(Arc<Vec<u8>>, HashSet<SignPk>)>,
@@ -262,6 +262,10 @@ struct View {
     /// Round-robin position for anti-entropy partners.
     rr: usize,
 }
+
+/// Aggregated announcement: due time, changed entries, op tips, and the
+/// one peer all of it came from, if one did (not announced back to it).
+type PendingIHave = (u64, BTreeMap<SignPk, AuthorEntry>, Vec<OpId>, Option<SignPk>);
 
 struct Missing {
     due: u64,
@@ -467,7 +471,7 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
         let neighbours: Vec<SignPk> = view.neighbours().copied().collect();
         let outside: Vec<SignPk> =
             view.members.values().filter(|m| m.reachable && !view.is_neighbour(&m.key)).map(|m| m.key).collect();
-        if (coin % 4 == 0 || neighbours.is_empty()) && !outside.is_empty() {
+        if (coin.is_multiple_of(4) || neighbours.is_empty()) && !outside.is_empty() {
             return Some(outside[((coin / 4) % outside.len() as u64) as usize]);
         }
         if neighbours.is_empty() {

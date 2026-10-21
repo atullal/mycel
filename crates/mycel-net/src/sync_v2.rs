@@ -82,7 +82,8 @@ pub const V1_REMEMBERED: Duration = Duration::from_secs(30 * 60);
 /// A node with Sync v2 serves at most one v1 session per (peer, space) this
 /// often (design §12): a v1 member still re-syncs epidemically with every
 /// member after each change, which v2 nodes can't change, so they bound
-/// what it costs them. The excess is refused with [`SYNC_V1_LIMITED`].
+/// what it costs them. The excess is refused with `SYNC_V1_LIMITED`
+/// (`0x6d790003`, docs/PROTOCOL.md §3.2).
 pub const V1_SERVE_INTERVAL: Duration = Duration::from_secs(5);
 /// The reset code of a v1 session refused by [`V1_SERVE_INTERVAL`]. A build
 /// that knows it takes it as `Busy`; an older one sees a failed session and

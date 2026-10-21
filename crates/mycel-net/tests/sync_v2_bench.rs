@@ -168,6 +168,8 @@ async fn bench_sync_v2_sessions_over_quic() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn bench_dissemination_over_quic() {
+    /// Group bytes (stream, UDP), payload copies, sessions, time to all.
+    type Row = (u64, u64, u64, u64, Duration);
     let sizes: Vec<usize> = std::env::var("GROUP_SIZES")
         .unwrap_or_else(|_| "10,50".into())
         .split(',')
@@ -201,7 +203,7 @@ async fn bench_dissemination_over_quic() {
         .await;
         eventually("views formed", || nodes.iter().all(|m| m.gossip_neighbours(&space).len() >= 2.min(n - 1))).await;
         let all: Vec<&Node> = nodes.iter().collect();
-        let mut rows = Vec::new();
+        let mut rows: Vec<Row> = Vec::new();
         for k in 0..6usize {
             let author = &nodes[(k * 7) % n];
             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -224,8 +226,7 @@ async fn bench_dissemination_over_quic() {
         }
         // The first messages form the tree (prunes); report the last three.
         let tail = &rows[3..];
-        let avg =
-            |f: &dyn Fn(&(u64, u64, u64, u64, Duration)) -> f64| tail.iter().map(f).sum::<f64>() / tail.len() as f64;
+        let avg = |f: &dyn Fn(&Row) -> f64| tail.iter().map(f).sum::<f64>() / tail.len() as f64;
         let s = avg(&|r| r.0 as f64);
         let u = avg(&|r| r.1 as f64);
         let c = avg(&|r| r.2 as f64);

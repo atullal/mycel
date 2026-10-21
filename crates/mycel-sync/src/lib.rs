@@ -22,7 +22,7 @@ pub use mycel_trust;
 mod bounded_change;
 mod change_ops;
 mod change_resources;
-mod delivery;
+pub mod delivery;
 mod doc_index;
 #[cfg(fuzzing)]
 #[doc(hidden)]
