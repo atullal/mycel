@@ -496,7 +496,7 @@ impl Driver {
         pid: Option<Pid>,
     ) {
         let mut q = OutQueue::new(OUT_QUEUE_BYTES);
-        q.push(encode_hello(&self.hub.me, &self.hub.name())); // always the first frame
+        q.push(encode_hello(&self.hub.me)); // always the first frame
         let q = Arc::new(Mutex::new(q));
         self.hub.add_sink(chan, Arc::new(StreamSink { chan, q: q.clone(), driver: Arc::downgrade(self) }));
         self.input(Input::ChannelOpened { chan, pid });
@@ -1158,9 +1158,9 @@ mod tests {
         rx: Arc<tokio::sync::Mutex<mpsc::Receiver<crate::hub::Inbound>>>,
     }
 
-    fn dev(name: &str) -> Dev {
+    fn dev() -> Dev {
         let keys = DeviceKeys::generate();
-        let (hub, rx) = Hub::new(keys.sign_pk(), name);
+        let (hub, rx) = Hub::new(keys.sign_pk());
         let (tx, events) = mpsc::unbounded_channel();
         hub.set_events(Some(tx));
         hub.set_radio(Radio::On);
@@ -1178,8 +1178,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn quic_over_run_loop_streams() {
-        let mut a = dev("alice");
-        let mut b = dev("bob");
+        let mut a = dev();
+        let mut b = dev();
         // a small buffer forces partial writes and HasSpaceAvailable backpressure
         let (b_in, a_out) = bound(2048);
         let (a_in, b_out) = bound(2048);
@@ -1192,7 +1192,7 @@ mod tests {
                 Some(LinkEvent::Found { peer, addr, name }) => {
                     assert_eq!(peer, other);
                     assert_eq!(addr, addr_of(&peer));
-                    assert!(name.is_some());
+                    assert_eq!(name, None, "the hello carries no name");
                 }
                 other => panic!("unexpected {other:?}"),
             }

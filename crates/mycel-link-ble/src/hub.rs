@@ -3,7 +3,7 @@
 //! for status reporting. Thread-safe; backends call in from their own
 //! threads (CoreBluetooth's dispatch queue, the stream run loop).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,8 +62,12 @@ struct Routes {
 
 pub struct Hub {
     pub me: SignPk,
-    name: Mutex<String>,
     core: Mutex<Core>,
+    /// A restriction ([`Hub::restrict`]) not yet handed to the state
+    /// machine: it takes effect with the backend's next input (a tick comes
+    /// about every second), on the backend's thread, so the radio commands
+    /// it causes run there.
+    restrict: Mutex<Option<Option<BTreeSet<SignPk>>>>,
     routes: Mutex<Routes>,
     inbound: mpsc::Sender<Inbound>,
     events: Mutex<Option<mpsc::UnboundedSender<LinkEvent>>>,
@@ -81,12 +85,12 @@ pub fn key_of(addr: &CustomAddr) -> Option<SignPk> {
 }
 
 impl Hub {
-    pub fn new(me: SignPk, name: &str) -> (Arc<Hub>, mpsc::Receiver<Inbound>) {
+    pub fn new(me: SignPk) -> (Arc<Hub>, mpsc::Receiver<Inbound>) {
         let (tx, rx) = mpsc::channel(INBOUND_QUEUE);
         let hub = Hub {
             me,
-            name: Mutex::new(name.to_string()),
             core: Mutex::new(Core::new(me, Instant::now())),
+            restrict: Mutex::new(None),
             routes: Mutex::default(),
             inbound: tx,
             events: Mutex::new(None),
@@ -96,12 +100,11 @@ impl Hub {
         (Arc::new(hub), rx)
     }
 
-    pub fn name(&self) -> String {
-        self.name.lock().clone()
-    }
-
-    pub fn set_name(&self, name: &str) {
-        *self.name.lock() = name.to_string();
+    /// Link only with `peers` from the backend's next input on (`None`: with
+    /// anyone).
+    /// See [`Input::Restrict`].
+    pub fn restrict(&self, peers: Option<BTreeSet<SignPk>>) {
+        *self.restrict.lock() = Some(peers);
     }
 
     pub fn set_events(&self, events: Option<mpsc::UnboundedSender<LinkEvent>>) {
@@ -140,7 +143,12 @@ impl Hub {
         if !tick {
             crate::debug(format_args!("in  {i:?}"));
         }
-        let cmds = self.core.lock().handle(Instant::now(), i);
+        let now = Instant::now();
+        let mut cmds = Vec::new();
+        if let Some(peers) = self.restrict.lock().take() {
+            cmds = self.core.lock().handle(now, Input::Restrict(peers));
+        }
+        cmds.extend(self.core.lock().handle(now, i));
         if tick && !cmds.is_empty() {
             crate::debug(format_args!("in  Tick"));
         }
@@ -154,7 +162,7 @@ impl Hub {
                     self.routes.lock().by_key.remove(&key);
                 }
                 Cmd::Found { key, name } => {
-                    crate::info(format_args!("linked to {} \"{name}\"", short(&key)));
+                    crate::info(format_args!("linked to {}", short(&key)));
                     self.emit(LinkEvent::Found {
                         peer: key,
                         addr: addr_of(&key),

@@ -28,6 +28,12 @@
 //!   [`BACKOFF_MAX`], scanning restarts every [`RESCAN_EVERY`] so peers are
 //!   reported again, and a peer is only forgotten after [`FORGET_AFTER`]
 //!   without a single advertisement.
+//! - **Restricted** ([`Input::Restrict`], an iPhone with Mycel in the
+//!   background): no channel to, or from, a node outside the allowed set.
+//!   A device whose GATT key isn't allowed is hung up on right after the
+//!   read (the read reveals nothing about us) and not dialed again until
+//!   the restriction lifts; live channels to such nodes are closed when it
+//!   starts, and one a stranger opens is closed at its hello.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -115,6 +121,10 @@ pub enum Input {
     Tick,
     /// Bluetooth went off / unauthorized: every peripheral and channel is gone.
     RadioDown,
+    /// `Some`: link only with these nodes (the app is in the background:
+    /// opening a channel sends our node key, so a stranger advertising
+    /// Mycel must not get one). `None`: link with anyone again.
+    Restrict(Option<BTreeSet<SignPk>>),
 }
 
 /// What the platform (or the hub) must do.
@@ -167,6 +177,9 @@ enum Phase {
     Spare,
     /// The peripheral is this device. Never dialed.
     Myself,
+    /// A node outside the allowed set while restricted: not dialed until
+    /// the restriction lifts.
+    Stranger,
 }
 
 #[derive(Debug)]
@@ -201,6 +214,8 @@ pub struct Core {
     chans: BTreeMap<ChanId, Chan>,
     /// The one channel carrying packets for each reachable node.
     active: BTreeMap<SignPk, ChanId>,
+    /// While restricted, the only nodes we link with.
+    allowed: Option<BTreeSet<SignPk>>,
     last_scan: Instant,
     rng: u64,
     /// Upper bound of the random delay added to dials (tests set it to 0).
@@ -234,6 +249,7 @@ impl Core {
             periphs: BTreeMap::new(),
             chans: BTreeMap::new(),
             active: BTreeMap::new(),
+            allowed: None,
             last_scan: now,
             rng: h.finish() | 1,
             jitter_max: JITTER,
@@ -265,7 +281,7 @@ impl Core {
         let mut keys = BTreeSet::new();
         let mut unknown = 0usize;
         for p in self.periphs.values() {
-            if p.phase == Phase::Myself || now.saturating_duration_since(p.seen) >= RECENT {
+            if matches!(p.phase, Phase::Myself | Phase::Stranger) || now.saturating_duration_since(p.seen) >= RECENT {
                 continue;
             }
             match p.key {
@@ -289,6 +305,11 @@ impl Core {
         self.rng ^= self.rng >> 7;
         self.rng ^= self.rng << 17;
         Duration::from_millis(self.rng % (max + 1))
+    }
+
+    /// We may link with `key` (always, unless restricted).
+    fn allows(&self, key: &SignPk) -> bool {
+        self.allowed.as_ref().is_none_or(|a| a.contains(key))
     }
 
     /// How long to wait before opening a channel to `key` ourselves.
@@ -347,8 +368,49 @@ impl Core {
                 self.chans.clear();
                 self.periphs.clear();
             }
+            Input::Restrict(peers) => self.on_restrict(peers, now, &mut out),
         }
         out
+    }
+
+    fn on_restrict(&mut self, peers: Option<BTreeSet<SignPk>>, now: Instant, out: &mut Vec<Cmd>) {
+        self.allowed = peers;
+        let Some(allowed) = self.allowed.clone() else {
+            info(format_args!("linking with any Mycel device again"));
+            let mut pids = Vec::new();
+            for (pid, p) in self.periphs.iter_mut().filter(|(_, p)| p.phase == Phase::Stranger) {
+                p.phase = Phase::Idle;
+                p.retry_at = now;
+                pids.push(pid.clone());
+            }
+            for pid in pids {
+                self.maybe_dial(&pid, now, out);
+            }
+            return;
+        };
+        info(format_args!("linking only with {} known devices", allowed.len()));
+        // Connections first, so closing a stranger's channel below doesn't
+        // reopen one over its connection.
+        for (pid, p) in &mut self.periphs {
+            let Some(k) = p.key.filter(|k| !allowed.contains(k)) else { continue };
+            if p.phase == Phase::Myself || p.phase == Phase::Stranger {
+                continue;
+            }
+            if !matches!(p.phase, Phase::Idle) {
+                out.push(Cmd::Disconnect(pid.clone()));
+            }
+            info(format_args!("{}: node {} isn't a known device; hanging up", sp(pid), short(&k)));
+            p.phase = Phase::Stranger;
+        }
+        let strangers: Vec<ChanId> = self
+            .chans
+            .iter()
+            .filter(|(_, c)| c.key.is_some_and(|k| !allowed.contains(&k)))
+            .map(|(id, _)| *id)
+            .collect();
+        for c in strangers {
+            self.close(c, "not a known device", now, out);
+        }
     }
 
     fn phase(&self, pid: &Pid) -> Option<Phase> {
@@ -403,7 +465,7 @@ impl Core {
             }
             // A connection we had given up on completed after all: use it.
             Phase::Idle => info(format_args!("connected to {} (late); reading its info", sp(&pid))),
-            Phase::Myself => {
+            Phase::Myself | Phase::Stranger => {
                 out.push(Cmd::Disconnect(pid));
                 return;
             }
@@ -420,7 +482,7 @@ impl Core {
         match p.phase {
             // Not connected (a late callback for our own cancel; a pending
             // connect that fails is reported as ConnectFailed).
-            Phase::Idle | Phase::Connecting(_) | Phase::Myself => {}
+            Phase::Idle | Phase::Connecting(_) | Phase::Myself | Phase::Stranger => {}
             Phase::Reading(_) | Phase::Opening(_) => {
                 p.phase = Phase::Idle;
                 p.failures = p.failures.saturating_add(1);
@@ -452,6 +514,7 @@ impl Core {
             && now.saturating_duration_since(p.seen) < RECENT
             && p.key.is_none_or(|k| {
                 k != self.me
+                    && self.allows(&k)
                     && !self.active.contains_key(&k)
                     && !self.other_busy(pid, &k, |ph| !matches!(ph, Phase::Idle | Phase::Myself))
                     // The node advertises under a newer identifier (its
@@ -476,6 +539,7 @@ impl Core {
         let Some(p) = self.periphs.get(pid) else { return };
         let (Phase::Spare, Some(k), Some(psm)) = (p.phase, p.key, p.psm) else { return };
         if p.retry_at > now
+            || !self.allows(&k)
             || self.active.contains_key(&k)
             || self.other_busy(pid, &k, |ph| matches!(ph, Phase::Opening(_) | Phase::Linked))
         {
@@ -529,6 +593,14 @@ impl Core {
             self.periphs.get_mut(&pid).expect("present").phase = Phase::Myself;
             return;
         }
+        if !self.allows(&key) {
+            info(format_args!("{} is node {}, not a known device; hanging up", sp(&pid), short(&key)));
+            out.push(Cmd::Disconnect(pid.clone()));
+            let p = self.periphs.get_mut(&pid).expect("present");
+            p.key = Some(key);
+            p.phase = Phase::Stranger;
+            return;
+        }
         // The same node under an older identifier (its address rotated):
         // drop attempts in progress and idle handles; keep live connections.
         let others: Vec<(Pid, Phase)> = self
@@ -539,8 +611,8 @@ impl Core {
             .collect();
         for (id, ph) in others {
             match ph {
-                Phase::Connecting(_) | Phase::Reading(_) | Phase::Opening(_) | Phase::Idle => {
-                    if ph != Phase::Idle {
+                Phase::Connecting(_) | Phase::Reading(_) | Phase::Opening(_) | Phase::Idle | Phase::Stranger => {
+                    if !matches!(ph, Phase::Idle | Phase::Stranger) {
                         out.push(Cmd::Disconnect(id.clone()));
                     }
                     info(format_args!("{} replaces {} for node {}", sp(&pid), sp(&id), short(&key)));
@@ -557,7 +629,7 @@ impl Core {
         let p = self.periphs.get_mut(&pid).expect("present");
         p.key = Some(key);
         p.psm = Some(info_rec.psm);
-        let tag = format!("{} is node {} \"{}\" (psm {})", sp(&pid), short(&key), info_rec.name, info_rec.psm);
+        let tag = format!("{} is node {} (psm {})", sp(&pid), short(&key), info_rec.psm);
         if linked || connected_elsewhere {
             // Never hang up: this connection may share the radio link with the
             // channel that already works.
@@ -608,6 +680,10 @@ impl Core {
     }
 
     fn on_hello(&mut self, chan: ChanId, key: SignPk, name: String, now: Instant, out: &mut Vec<Cmd>) {
+        if !self.allows(&key) {
+            self.close(chan, "hello from a device that isn't known", now, out);
+            return;
+        }
         let Some(c) = self.chans.get_mut(&chan) else { return };
         if c.hello || key == self.me || c.key.is_some_and(|k| k != key) {
             self.close(chan, "unexpected hello", now, out);
@@ -617,7 +693,7 @@ impl Core {
         c.hello = true;
         let pid = c.pid.clone();
         let opened = c.opened;
-        info(format_args!("channel {chan}: hello from {} \"{name}\" after {}", short(&key), ms(now - opened)));
+        info(format_args!("channel {chan}: hello from {} after {}", short(&key), ms(now - opened)));
         match self.active.get(&key).copied() {
             None => {
                 self.active.insert(key, chan);
@@ -787,7 +863,7 @@ impl Core {
                 Phase::Opening(t) if now.saturating_duration_since(t) >= SETUP_TIMEOUT => {
                     self.fail(&pid, "opening the L2CAP channel timed out", now, out)
                 }
-                Phase::Idle if now.saturating_duration_since(p.seen) >= FORGET_AFTER => {
+                Phase::Idle | Phase::Stranger if now.saturating_duration_since(p.seen) >= FORGET_AFTER => {
                     info(format_args!("forgetting {} (not seen for {})", sp(&pid), ms(FORGET_AFTER)));
                     self.periphs.remove(&pid);
                     out.push(Cmd::Forget(pid));
@@ -845,6 +921,75 @@ mod tests {
             vec![Cmd::Unroute { key: key(2) }, Cmd::Lost { key: key(2) }, Cmd::OpenChannel("p".into(), 0x82)]
         );
         assert_eq!(c.peers(), 0);
+    }
+
+    /// Regression: with the `bluetooth-central` background mode a locked
+    /// iPhone dialed any device advertising Mycel and handed it its node key
+    /// in the hello. Restricted, it reads a stranger's key, hangs up, and
+    /// never opens a channel to it (nor keeps one a stranger opens), while a
+    /// known device links as usual.
+    #[test]
+    fn restricted_links_only_with_known_nodes() {
+        let t0 = Instant::now();
+        let mut c = core(1, t0);
+        assert!(c.handle(t0, Input::Restrict(Some([key(2)].into()))).is_empty());
+        // A stranger with the higher key: unrestricted, we would open a
+        // channel at once.
+        assert_eq!(c.handle(t0, Input::Discovered("s".into())), vec![Cmd::Connect("s".into())]);
+        c.handle(t0, Input::Connected("s".into()));
+        assert_eq!(c.handle(t0, Input::Info("s".into(), info(9))), vec![Cmd::Disconnect("s".into())]);
+        for i in 1..30 {
+            let mut out = c.handle(t0 + s(i), Input::Discovered("s".into()));
+            out.extend(c.handle(t0 + s(i), Input::Tick));
+            assert!(out.iter().all(|c| *c == Cmd::Rescan), "never dialed again: {out:?}");
+        }
+        assert_eq!(c.connecting(t0 + s(29)), 0, "a stranger isn't a device we're connecting to");
+        // A known device links.
+        let t1 = t0 + s(29);
+        assert_eq!(c.handle(t1, Input::Discovered("k".into())), vec![Cmd::Connect("k".into())]);
+        c.handle(t1, Input::Connected("k".into()));
+        assert_eq!(c.handle(t1, Input::Info("k".into(), info(2))), vec![Cmd::OpenChannel("k".into(), 0x82)]);
+        c.handle(t1, Input::ChannelOpened { chan: 7, pid: Some("k".into()) });
+        let out = c.handle(t1, Input::Hello { chan: 7, key: key(2), name: String::new() });
+        assert!(has(&out, |c| matches!(c, Cmd::Found { .. })));
+        // A channel a stranger opens to us is closed at its hello.
+        c.handle(t1, Input::ChannelOpened { chan: 20, pid: None });
+        assert_eq!(
+            c.handle(t1, Input::Hello { chan: 20, key: key(9), name: String::new() }),
+            vec![Cmd::CloseChannel(20)]
+        );
+        assert_eq!(c.peers(), 1);
+        // Back in the foreground: the stranger is dialed again.
+        assert!(has(&c.handle(t1, Input::Restrict(None)), |c| *c == Cmd::Connect("s".into())));
+    }
+
+    /// Going to the background hangs up on strangers already linked, and
+    /// doesn't reopen a channel to them over the old connection.
+    #[test]
+    fn restricting_hangs_up_on_linked_strangers() {
+        let t0 = Instant::now();
+        let mut c = core(1, t0);
+        c.handle(t0, Input::Discovered("p".into()));
+        c.handle(t0, Input::Connected("p".into()));
+        c.handle(t0, Input::Info("p".into(), info(9)));
+        c.handle(t0, Input::ChannelOpened { chan: 7, pid: Some("p".into()) });
+        c.handle(t0, Input::Hello { chan: 7, key: key(9), name: String::new() });
+        assert_eq!(c.peers(), 1);
+        assert_eq!(
+            c.handle(t0, Input::Restrict(Some([key(2)].into()))),
+            vec![
+                Cmd::Disconnect("p".into()),
+                Cmd::CloseChannel(7),
+                Cmd::Unroute { key: key(9) },
+                Cmd::Lost { key: key(9) }
+            ]
+        );
+        assert_eq!(c.peers(), 0);
+        for i in 1..20 {
+            let mut out = c.handle(t0 + s(i), Input::Discovered("p".into()));
+            out.extend(c.handle(t0 + s(i), Input::Tick));
+            assert!(out.iter().all(|c| *c == Cmd::Rescan), "{out:?}");
+        }
     }
 
     #[test]

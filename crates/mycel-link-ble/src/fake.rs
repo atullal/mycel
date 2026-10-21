@@ -180,7 +180,7 @@ impl Air {
             a.keys.push((me, name.to_string()));
             a.keys.len() - 1
         };
-        BleLink::new(me, name, Box::new(FakeBackend { air: self.clone(), me: n }))
+        BleLink::new(me, Box::new(FakeBackend { air: self.clone(), me: n }))
     }
 
     /// Radio silence: every channel drops, nothing connects.
@@ -333,7 +333,7 @@ impl Air {
                 self.job(Job::Input(n, Input::ChannelOpened { chan: cn, pid: Some(p) }));
                 self.job(Job::Input(o, Input::ChannelOpened { chan: co, pid: None }));
                 for (hub, chan, to, to_chan, me) in [(&hn, cn, o, co, kn), (&ho, co, n, cn, ko)] {
-                    let hello = encode_hello(&me.0, &me.1);
+                    let hello = encode_hello(&me.0);
                     if self.rate.is_some() {
                         let mut q = OutQueue::new(OUT_QUEUE_BYTES);
                         q.push(hello);
@@ -434,7 +434,9 @@ mod tests {
         })
         .await;
         eventually("exactly one channel for the pair", || air.channels() == 1).await;
-        assert_eq!(alice.peers()[&bob.id()].name.as_deref(), Some("bob"));
+        // Bluetooth never carries the name (the card does, encrypted).
+        assert_eq!(alice.peers()[&bob.id()].name, None);
+        assert_eq!(alice.fetch_card(bob.id()).await.unwrap().name, "bob");
         let st = alice_link.status();
         assert!(st.active && st.peers == 1 && st.detail.is_none(), "{st:?}");
 
@@ -640,5 +642,44 @@ mod tests {
             assert_eq!((found + f, lost + l), (2, 2), "one Lost and one Found per side, round {round}");
         }
         assert_eq!(air.harsh_kills(), 0);
+    }
+
+    /// A phone in the background (restricted to its friend's key) links
+    /// with the friend but never reports a stranger in range, and links
+    /// with the stranger again once it's back in the foreground.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restricted_link_ignores_strangers_until_lifted() {
+        let air = Air::new();
+        let keys: Vec<SignPk> = (0..3).map(|_| DeviceKeys::generate().sign_pk()).collect();
+        let (friend, stranger) = (keys[1], keys[2]);
+        let mut links: Links = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let l = air.link(*k, &format!("n{i}"));
+                if i == 0 {
+                    l.restrict_to(Some(&[friend])); // before it hears anyone
+                }
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                l.start(tx).unwrap();
+                (l, rx)
+            })
+            .collect();
+        eventually("linked with the friend", || links[0].0.status().peers == 1).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(links[0].0.status().peers, 1);
+        while let Ok(ev) = links[0].1.try_recv() {
+            if let mycel_net::LinkEvent::Found { peer, .. } = ev {
+                assert_eq!(peer, friend, "only the friend is reported");
+            }
+        }
+        links[0].0.restrict_to(None);
+        eventually_within("linked with the stranger too", Duration::from_secs(20), || links[0].0.status().peers == 2)
+            .await;
+        let mut found_stranger = false;
+        while let Ok(ev) = links[0].1.try_recv() {
+            found_stranger |= matches!(ev, mycel_net::LinkEvent::Found { peer, .. } if peer == stranger);
+        }
+        assert!(found_stranger);
     }
 }

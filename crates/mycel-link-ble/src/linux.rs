@@ -260,8 +260,8 @@ impl Driver {
         }
     }
 
-    /// The GATT service: one read-only characteristic with our PSM, key and
-    /// current name.
+    /// The GATT service: one read-only characteristic with our PSM and key
+    /// (never the name).
     fn gatt_app(self: &Arc<Self>, psm: u16) -> Application {
         let hub = self.hub.clone();
         Application {
@@ -447,7 +447,7 @@ impl Driver {
     fn attach(self: &Arc<Self>, stream: Stream, pid: Option<Pid>) {
         let chan = self.next_chan.fetch_add(1, Ordering::Relaxed);
         let mut q = OutQueue::new(OUT_QUEUE_BYTES);
-        q.push(encode_hello(&self.hub.me, &self.hub.name())); // always the first frame
+        q.push(encode_hello(&self.hub.me)); // always the first frame
         let q = Arc::new(Mutex::new(q));
         let wake = Arc::new(Notify::new());
         self.hub.add_sink(chan, Arc::new(Sink { q: q.clone(), wake: wake.clone() }));
