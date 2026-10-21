@@ -41,7 +41,7 @@ cargo tauri --version >/dev/null 2>&1 || { echo "cargo-tauri not found: cargo in
 rustup component add llvm-tools >/dev/null 2>&1 || true
 
 cd "$ROOT"
-[ -d node_modules ] || npm install
+[ -d node_modules ] || npm ci  # exactly package-lock.json
 # Keep this machine's paths (home directory, Cargo registry, toolchain) out of
 # the binaries.
 source "$ROOT/scripts/remap-paths.sh"

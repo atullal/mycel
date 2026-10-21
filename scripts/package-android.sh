@@ -40,7 +40,7 @@ command -v cargo >/dev/null || { echo "cargo not found: install Rust from https:
 cargo tauri --version >/dev/null 2>&1 || { echo "cargo-tauri not found: cargo install tauri-cli --version '^2' --locked" >&2; exit 1; }
 
 cd "$ROOT"
-[ -d node_modules ] || npm install
+[ -d node_modules ] || npm ci  # exactly package-lock.json
 # Keep this machine's paths (home directory, Cargo registry, toolchain) out of
 # the binaries.
 source "$ROOT/scripts/remap-paths.sh"
