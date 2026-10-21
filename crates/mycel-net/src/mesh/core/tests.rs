@@ -664,7 +664,8 @@ fn unacknowledged_packets_move_a_destination_off_its_next_hop() {
         sig: Sig([0; 64]),
     };
     let (liar, honest, d) = (key(2), key(3), key(9));
-    let mut r = Router::new(key(1), Config::default());
+    // the rule itself (the defences that refine it are tested below)
+    let mut r = Router::new(key(1), Config { defences: Defences::NONE, ..Config::default() });
     for n in [liar, honest] {
         r.set_direct(n, true, 0);
         r.hop_up(n, 0);
@@ -719,7 +720,7 @@ fn a_silent_path_moves_the_offered_route() {
         sig: Sig([0; 64]),
     };
     let (liar, honest, d, stranger) = (key(2), key(3), key(9), key(7));
-    let mut r = Router::new(key(1), Config { routes: 1, ..Config::default() });
+    let mut r = Router::new(key(1), Config { routes: 1, defences: Defences::NONE, ..Config::default() });
     for n in [liar, honest] {
         r.set_direct(n, true, 0);
         r.hop_up(n, 0);
@@ -1235,4 +1236,328 @@ fn security_verified_cache_stays_bounded_and_can_be_disabled() {
             assert!(router.verified.len() <= limit);
         }
     }
+}
+
+// ───────────────────────────── defences ─────────────────────────────
+
+fn ann(origin: SignPk, seq: u64, hops: u8, cost: u32) -> Announce {
+    Announce { hops, cost, origin, seq, flags: 0, scope: 8, uplink: 0, name: Arc::from(""), sig: Sig([0; 64]) }
+}
+
+/// A source that doesn't relay (so nothing it advertises narrows which
+/// routes are feasible), with these neighbours up at time 0, measured at
+/// 10 ms, and only these defences.
+fn source(neighbours: &[SignPk], defences: Defences) -> Router {
+    let mut r = Router::new(key(1), Config { relay: false, defences, ..Config::default() });
+    for n in neighbours {
+        r.set_direct(*n, true, 0);
+        r.hop_up(*n, 0);
+        r.set_cost(*n, 100);
+    }
+    r
+}
+
+/// Where a packet of ours to `d` goes now.
+fn sent_to(r: &mut Router, d: SignPk, t: Time) -> Vec<SignPk> {
+    r.send(d, key(1), Bytes::from_static(b"x"), false, t);
+    outcome(r).2
+}
+
+/// Two timeouts through `d`'s next hop, far enough apart to suspect it.
+fn suspect(r: &mut Router, d: SignPk, t: Time) {
+    sent_to(r, d, t);
+    r.feedback(d, false, t + 1_000);
+    r.feedback(d, false, t + 4_000);
+}
+
+/// A relay suspected for three destinations is avoided for every one
+/// (and not before: two could be bad luck), but stays reachable itself;
+/// one that carried acknowledgements for more destinations than it is
+/// suspected for is not shunned (a busy honest relay collects the most
+/// false suspicions).
+#[test]
+fn a_hop_suspected_for_several_destinations_is_avoided_for_all() {
+    let (liar, honest) = (key(2), key(3));
+    let ds: Vec<SignPk> = (10..15).map(key).collect();
+    let only = Defences { aggregate: true, ..Defences::NONE };
+    let mut r = source(&[liar, honest], only);
+    for d in &ds {
+        r.on_announce(liar, ann(*d, WALL, 1, 21), 10, WALL, |_| true);
+        r.on_announce(honest, ann(*d, WALL, 3, 500), 10, WALL, |_| true);
+    }
+    suspect(&mut r, ds[0], 100);
+    suspect(&mut r, ds[1], 5_000);
+    assert_eq!(r.stats().hops_suspected, 2);
+    assert_eq!(sent_to(&mut r, ds[3], 9_500), vec![liar], "two suspicions aren't enough");
+    suspect(&mut r, ds[2], 10_000);
+    assert_eq!(r.stats().hops_shunned, 1);
+    assert_eq!(sent_to(&mut r, ds[3], 14_500), vec![honest]);
+    assert_eq!(sent_to(&mut r, ds[4], 14_600), vec![honest]);
+    assert_eq!(r.next_hop_local(&liar, 14_700), Some(liar), "still reachable itself");
+    // without the defence, only the suspected destinations move
+    let mut plain = source(&[liar, honest], Defences::NONE);
+    for d in &ds {
+        plain.on_announce(liar, ann(*d, WALL, 1, 21), 10, WALL, |_| true);
+        plain.on_announce(honest, ann(*d, WALL, 3, 500), 10, WALL, |_| true);
+    }
+    for (i, d) in ds[..3].iter().enumerate() {
+        suspect(&mut plain, *d, 100 + 5_000 * i as Time);
+    }
+    assert_eq!(sent_to(&mut plain, ds[3], 14_500), vec![liar]);
+    // a relay that delivers for more destinations than it fails isn't shunned
+    let busy = key(4);
+    let mut r = source(&[busy, honest], only);
+    let more: Vec<SignPk> = (20..27).map(key).collect();
+    for d in ds.iter().chain(&more) {
+        r.on_announce(busy, ann(*d, WALL, 1, 21), 10, WALL, |_| true);
+        r.on_announce(honest, ann(*d, WALL, 3, 500), 10, WALL, |_| true);
+    }
+    for (i, d) in more.iter().enumerate() {
+        sent_to(&mut r, *d, 50 + i as Time);
+        r.feedback(*d, true, 60 + i as Time);
+    }
+    for (i, d) in ds[..4].iter().enumerate() {
+        suspect(&mut r, *d, 100 + 5_000 * i as Time);
+    }
+    assert_eq!(r.stats().hops_suspected, 4);
+    assert_eq!(r.stats().hops_shunned, 0);
+    assert_eq!(sent_to(&mut r, ds[4], 20_000), vec![busy]);
+}
+
+/// A much cheaper route that one neighbour suddenly claims, and no other
+/// backs, ranks behind the route already in use for a while; backed by a
+/// second neighbour, or after the hold-down, it takes over.
+#[test]
+fn a_sudden_uncorroborated_shortcut_waits_before_displacing_the_incumbent() {
+    let (honest, liar, other, d) = (key(2), key(3), key(4), key(9));
+    let only = Defences { corroborate: true, ..Defences::NONE };
+    let mut r = source(&[honest, liar, other], only);
+    r.on_announce(honest, ann(d, WALL, 3, 500), 10, WALL, |_| true);
+    assert_eq!(sent_to(&mut r, d, 100), vec![honest]);
+    r.on_announce(liar, ann(d, WALL, 1, 21), 1_000, WALL, |_| true);
+    assert_eq!(sent_to(&mut r, d, 1_100), vec![honest], "held down");
+    assert_eq!(sent_to(&mut r, d, 1_000 + HOLD_DOWN - 1), vec![honest]);
+    assert_eq!(sent_to(&mut r, d, 1_000 + HOLD_DOWN), vec![liar], "the hold-down ran out");
+    // a second neighbour's route within the factor backs it at once
+    let mut r = source(&[honest, liar, other], only);
+    r.on_announce(honest, ann(d, WALL, 3, 500), 10, WALL, |_| true);
+    r.on_announce(liar, ann(d, WALL, 1, 21), 1_000, WALL, |_| true);
+    r.on_announce(other, ann(d, WALL, 2, 100), 1_500, WALL, |_| true);
+    assert_eq!(sent_to(&mut r, d, 1_600), vec![liar]);
+    // no incumbent (both new): nothing to hold for
+    let mut r = source(&[honest, liar], only);
+    r.on_announce(liar, ann(d, WALL, 1, 21), 10, WALL, |_| true);
+    r.on_announce(honest, ann(d, WALL, 3, 500), 10, WALL, |_| true);
+    assert_eq!(sent_to(&mut r, d, 100), vec![liar]);
+    // without the defence: at once
+    let mut r = source(&[honest, liar], Defences::NONE);
+    r.on_announce(honest, ann(d, WALL, 3, 500), 10, WALL, |_| true);
+    r.on_announce(liar, ann(d, WALL, 1, 21), 1_000, WALL, |_| true);
+    assert_eq!(sent_to(&mut r, d, 1_100), vec![liar]);
+}
+
+/// Routes through relays outside our spaces rank costlier, those through
+/// members don't; with no spaces nobody is preferred. What we advertise is
+/// the route we chose, at its own cost.
+#[test]
+fn relays_far_from_our_spaces_rank_costlier() {
+    let (stranger, member, d) = (key(2), key(3), key(9));
+    let only = Defences { affinity: true, ..Defences::NONE };
+    let setup = |r: &mut Router| {
+        r.on_announce(stranger, ann(d, WALL, 2, 280), 10, WALL, |_| true); // 400 through it
+        r.on_announce(member, ann(d, WALL, 2, 380), 10, WALL, |_| true); // 500
+    };
+    let mut r = source(&[stranger, member], only);
+    setup(&mut r);
+    assert_eq!(sent_to(&mut r, d, 100), vec![stranger], "no spaces: no preference");
+    r.set_affinity([(member, 1)]);
+    assert_eq!(sent_to(&mut r, d, 200), vec![member]);
+    // two steps away it counts half as much, still more than 400 → 500
+    r.set_affinity([(member, 1), (stranger, 2)]);
+    assert_eq!(sent_to(&mut r, d, 300), vec![member]);
+    let mut plain = source(&[stranger, member], Defences::NONE);
+    setup(&mut plain);
+    plain.set_affinity([(member, 1)]);
+    assert_eq!(sent_to(&mut plain, d, 100), vec![stranger]);
+    // a smaller step: unknown counts 1.2×, 480 beats 500
+    let mut mild = source(&[stranger, member], only);
+    mild.cfg.affinity_step = 10;
+    setup(&mut mild);
+    mild.set_affinity([(member, 1)]);
+    assert_eq!(sent_to(&mut mild, d, 100), vec![stranger]);
+    // relaying: the announcement passed on carries the chosen route's cost
+    let third = key(4);
+    let mut r = Router::new(key(1), Config { defences: only, ..Config::default() });
+    for n in [stranger, member, third] {
+        r.set_direct(n, true, 0);
+        r.hop_up(n, 0);
+        r.set_cost(n, 100);
+    }
+    r.set_affinity([(member, 1), (third, 1)]);
+    let mut outs = Vec::new();
+    r.drain(&mut outs);
+    outs.clear();
+    setup(&mut r);
+    r.tick(100);
+    r.drain(&mut outs);
+    let to_third: Vec<u32> = outs
+        .iter()
+        .filter_map(|o| match o {
+            Out::Announce { to, ann } if *to == third && ann.origin == d => Some(ann.cost),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(to_third, vec![500]);
+}
+
+/// Relayed announcements to a slow hop take at most 2% of its capacity
+/// (after a burst of 64 KiB); the rest wait, fewest hops first, and go out
+/// as they stand when sent: a route lost meanwhile isn't advertised late,
+/// and retractions never wait.
+#[test]
+fn relayed_announcements_are_paced_to_the_hop_nearest_first() {
+    let (from, also, ble) = (key(2), key(4), key(3));
+    let defences = Defences { budget: true, ..Defences::NONE };
+    let mut r = Router::new(key(1), Config { defences, ..Config::default() });
+    for n in [from, also, ble] {
+        r.set_direct(n, true, 0);
+        r.hop_up(n, 0);
+        // BLE: 64 KiB in 1.67 s, so ~786 B/s for control
+        r.set_cost(n, if n == ble { 16_680 } else { 100 });
+    }
+    let mut outs = Vec::new();
+    r.drain(&mut outs);
+    outs.clear();
+    // 600 routes, from two neighbours (each may send 400 at once)
+    let origins: Vec<SignPk> = (100..700).map(key).collect();
+    for (i, o) in origins.iter().enumerate() {
+        let hops = 1 + (i % 3) as u8;
+        let n = if i % 2 == 0 { from } else { also };
+        r.on_announce(n, ann(*o, WALL, hops, 100 * hops as u32), 10, WALL, |_| true);
+    }
+    let to_ble = |outs: &mut Vec<Out>| {
+        let v: Vec<(SignPk, u8, u32)> = outs
+            .iter()
+            .filter_map(|o| match o {
+                Out::Announce { to, ann } if *to == ble => Some((ann.origin, ann.hops, ann.cost)),
+                _ => None,
+            })
+            .collect();
+        outs.clear();
+        v
+    };
+    r.tick(100);
+    r.drain(&mut outs);
+    let first = to_ble(&mut outs).len();
+    // a burst of 64 KiB: 560 announcements of 117 bytes
+    assert_eq!(first, 560);
+    assert_eq!(r.stats().announcements_deferred, 40);
+    // one waiting is lost meanwhile: never sent; its retraction is at once
+    let waiting =
+        origins.iter().copied().find(|o| r.nbs[&ble].ctl_q.iter().any(|a| a.origin == *o)).expect("something waits");
+    let i = origins.iter().position(|o| *o == waiting).expect("one of ours");
+    let n = if i % 2 == 0 { from } else { also };
+    r.on_announce(n, Announce { cost: INFINITY, ..ann(waiting, WALL, 1, 0) }, 200, WALL, |_| true);
+    r.drain(&mut outs);
+    assert!(to_ble(&mut outs).iter().any(|(o, _, c)| *o == waiting && *c == INFINITY));
+    // then ~786 B/s (6.7 a second), fewest hops first
+    let mut later = vec![];
+    for k in 1..=3 {
+        r.tick(100 + k * 1_000);
+        r.drain(&mut outs);
+        later.extend(to_ble(&mut outs));
+    }
+    assert!((19..=21).contains(&later.len()), "{} in 3 s", later.len());
+    assert!(later.windows(2).all(|w| w[0].1 <= w[1].1), "nearest first");
+    for k in 4..=10 {
+        r.tick(100 + k * 1_000);
+        r.drain(&mut outs);
+        later.extend(to_ble(&mut outs));
+    }
+    assert_eq!(later.len(), 39, "all but the lost one");
+    assert!(!later.iter().any(|(o, ..)| *o == waiting));
+    assert_eq!(r.stats().announcements_shed, 1);
+}
+
+/// Loop freedom with every defence on: link flaps, traffic, timeouts that
+/// suspect and shun hops, sudden shortcuts held down, paced announcements,
+/// and membership tables that reorder routes.
+#[test]
+fn churn_never_loops_with_every_defence() {
+    const N: usize = 30;
+    let edges = geometric(N, 100.0, 30.0, 11);
+    let mut net = Net::new(N, |i| Config {
+        announce_every: 500,
+        seed: i as u64 + 1,
+        defences: Defences::ALL,
+        ..Config::default()
+    });
+    let mut x: u64 = 7;
+    let mut rnd = move |m: usize| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        (x % m as u64) as usize
+    };
+    for i in 0..N {
+        let members: Vec<(SignPk, u8)> = (0..6).map(|_| (net.k(rnd(N)), 1 + rnd(3) as u8)).collect();
+        net.nodes[i].set_affinity(members);
+    }
+    for (a, b) in &edges {
+        net.link(*a, *b);
+    }
+    net.run(5_000);
+    let mut route_loops = 0;
+    let mut down: Vec<(usize, usize)> = vec![];
+    for round in 0..60 {
+        if round % 2 == 0 {
+            let (a, b) = edges[rnd(edges.len())];
+            if !down.contains(&(a, b)) {
+                net.cut(a, b);
+                down.push((a, b));
+            }
+        } else if !down.is_empty() {
+            let (a, b) = down.remove(rnd(down.len()));
+            net.link(a, b);
+        }
+        for _ in 0..5 {
+            let (s, d) = (rnd(N), rnd(N));
+            let (dst, me, now) = (net.k(d), net.k(s), net.now);
+            if s != d && !net.nodes[s].is_neighbour(&dst) {
+                net.nodes[s].send(dst, me, Bytes::from_static(b"p"), false, now);
+                if rnd(3) == 0 {
+                    net.nodes[s].feedback(dst, false, now);
+                }
+                net.effects(s);
+            }
+        }
+        for _ in 0..40 {
+            net.step();
+            route_loops += (0..N).map(|d| net.loops_toward(d)).sum::<usize>();
+        }
+    }
+    let suspected: u64 = net.nodes.iter().map(|r| r.stats().hops_suspected).sum();
+    eprintln!(
+        "churn, every defence: {} delivered, {} frame loops, {route_loops} route loops, {suspected} suspected",
+        net.delivered.len(),
+        net.frame_loops
+    );
+    assert_eq!(net.frame_loops, 0);
+    assert_eq!(route_loops, 0);
+    assert!(net.delivered.len() > 100);
+}
+
+/// The defences on by default (affinity costs route length everywhere, so
+/// it is opt-in), and the knobs the simulator measures them with.
+#[test]
+fn defences_default_and_knobs() {
+    assert_eq!(Config::default().defences, Defences { affinity: false, ..Defences::ALL });
+    let mut c = Config::default();
+    c.tune("defences=none,affinity=on,affinity_step=10").unwrap();
+    assert_eq!(c.defences, Defences { affinity: true, ..Defences::NONE });
+    assert_eq!(c.affinity_step, 10);
+    c.tune("defences=default").unwrap();
+    assert_eq!(c.defences, Defences::DEFAULT);
+    assert!(c.tune("affinity_step=far").is_err());
+    assert!(c.tune("jitter=on").is_err(), "dropped defences have no knob");
 }
