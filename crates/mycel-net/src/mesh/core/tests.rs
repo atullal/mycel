@@ -221,6 +221,8 @@ impl Net {
                         uplink: o.uplink,
                         name: Arc::from(""),
                         sig: Sig([0; 64]),
+                        chain: None,
+                        sign_link: None,
                     };
                     r.originate(a, now);
                 }
@@ -391,6 +393,8 @@ fn forged_stale_and_flooding_announcements_are_rejected() {
         uplink: 0,
         name: Arc::from(""),
         sig: Sig([0; 64]),
+                        chain: None,
+                        sign_link: None,
     };
     let mut r = Router::new(key(1), Config::default());
     let n = key(2);
@@ -621,6 +625,8 @@ fn a_neighbour_relaying_impossible_routes_is_not_routed_through() {
         uplink: 0,
         name: Arc::from(""),
         sig: Sig([0; 64]),
+                        chain: None,
+                        sign_link: None,
     };
     let (honest, liar, o, p, q) = (key(2), key(3), key(9), key(10), key(11));
     let mut r = Router::new(key(1), Config::default());
@@ -629,7 +635,7 @@ fn a_neighbour_relaying_impossible_routes_is_not_routed_through() {
         r.hop_up(n, 0);
         r.set_cost(n, 100);
     }
-    let ok = |_: &Announce| true;
+    let ok = |_: Check<'_>| true;
     r.on_announce(honest, ann(o, WALL, 2, 400), 10, WALL, ok);
     r.on_announce(liar, ann(liar, WALL, 0, 0), 10, WALL, ok);
     r.on_announce(liar, ann(q, WALL, 1, 50), 10, WALL, ok);
@@ -683,6 +689,8 @@ fn unacknowledged_packets_move_a_destination_off_its_next_hop() {
         uplink: 0,
         name: Arc::from(""),
         sig: Sig([0; 64]),
+                        chain: None,
+                        sign_link: None,
     };
     let (liar, honest, d) = (key(2), key(3), key(9));
     // the rule itself (the defences that refine it are tested below)
@@ -692,7 +700,7 @@ fn unacknowledged_packets_move_a_destination_off_its_next_hop() {
         r.hop_up(n, 0);
         r.set_cost(n, 100);
     }
-    let ok = |_: &Announce| true;
+    let ok = |_: Check<'_>| true;
     r.on_announce(liar, ann(d, WALL, 1, 21), 10, WALL, ok);
     r.on_announce(honest, ann(d, WALL, 3, 500), 10, WALL, ok);
     r.tick(20);
@@ -739,6 +747,8 @@ fn a_silent_path_moves_the_offered_route() {
         uplink: 0,
         name: Arc::from(""),
         sig: Sig([0; 64]),
+                        chain: None,
+                        sign_link: None,
     };
     let (liar, honest, d, stranger) = (key(2), key(3), key(9), key(7));
     let mut r = Router::new(key(1), Config { routes: 1, defences: Defences::NONE, ..Config::default() });
@@ -747,7 +757,7 @@ fn a_silent_path_moves_the_offered_route() {
         r.hop_up(n, 0);
         r.set_cost(n, 100);
     }
-    let ok = |_: &Announce| true;
+    let ok = |_: Check<'_>| true;
     r.on_announce(liar, ann(d, WALL, 1, 21), 10, WALL, ok);
     r.on_announce(honest, ann(d, WALL, 3, 500), 10, WALL, ok);
     r.tick(20);
@@ -1013,6 +1023,8 @@ fn an_announcement_storm_stops_at_the_first_relays() {
             uplink: o.uplink,
             name: Arc::from(""),
             sig: Sig([0; 64]),
+                        chain: None,
+                        sign_link: None,
         };
         r.originate(a, now);
         net.effects(0);
@@ -1224,7 +1236,7 @@ fn overhead_per_device_large_meshes() {
 
 #[test]
 fn security_verified_cache_binds_every_signed_field() {
-    use crate::mesh::wire::{sign_announce, verify_announce};
+    use crate::mesh::wire::{sign_announce, verify, verify_announce};
     let owner = mycel_crypto::DeviceKeys::generate();
     for field in 0..7 {
         let mut router = Router::new(key(1), Config::default());
@@ -1233,7 +1245,7 @@ fn security_verified_cache_binds_every_signed_field() {
         router.hop_up(neighbour, 0);
         let mut ann = sign_announce(&owner, Origination { seq: WALL, flags: 0, scope: 8, uplink: 0 }, "original");
         ann.cost = INFINITY;
-        router.on_announce(neighbour, ann.clone(), 0, WALL, verify_announce);
+        router.on_announce(neighbour, ann.clone(), 0, WALL, verify);
         // relayed: one hop (hops and cost aren't signed)
         ann.hops = 1;
         ann.cost = 100;
@@ -1248,7 +1260,7 @@ fn security_verified_cache_binds_every_signed_field() {
         }
         assert!(!verify_announce(&ann));
         let origin = ann.origin;
-        router.on_announce(neighbour, ann, 1, WALL, verify_announce);
+        router.on_announce(neighbour, ann, 1, WALL, verify);
         assert!(router.origin_name(&origin).is_none(), "field {field} bypassed verification");
         assert_eq!(router.stats().announcements_forged, 1);
     }
@@ -1256,7 +1268,7 @@ fn security_verified_cache_binds_every_signed_field() {
 
 #[test]
 fn security_verified_cache_allows_forwarded_hops_and_cost() {
-    use crate::mesh::wire::{sign_announce, verify_announce};
+    use crate::mesh::wire::{sign_announce, verify, verify_announce};
     let owner = mycel_crypto::DeviceKeys::generate();
     let mut router = Router::new(key(1), Config::default());
     let neighbour = key(2);
@@ -1264,7 +1276,7 @@ fn security_verified_cache_allows_forwarded_hops_and_cost() {
     router.hop_up(neighbour, 0);
     let mut ann = sign_announce(&owner, Origination { seq: WALL, flags: 0, scope: 8, uplink: 0 }, "original");
     ann.cost = INFINITY;
-    router.on_announce(neighbour, ann.clone(), 0, WALL, verify_announce);
+    router.on_announce(neighbour, ann.clone(), 0, WALL, verify);
     ann.cost = 123;
     ann.hops = 2;
     assert!(verify_announce(&ann));
@@ -1274,7 +1286,7 @@ fn security_verified_cache_allows_forwarded_hops_and_cost() {
 
 #[test]
 fn security_verified_cache_stays_bounded_and_can_be_disabled() {
-    use crate::mesh::wire::{sign_announce, verify_announce};
+    use crate::mesh::wire::{sign_announce, verify, verify_announce};
     for limit in [0, 1, 2] {
         let owner = mycel_crypto::DeviceKeys::generate();
         let mut router = Router::new(key(1), Config { verified_max: limit, ..Config::default() });
@@ -1286,7 +1298,7 @@ fn security_verified_cache_stays_bounded_and_can_be_disabled() {
                 sign_announce(&owner, Origination { seq: WALL + i, flags: 0, scope: 8, uplink: 0 }, "original");
             ann.hops = 1;
             ann.cost = 100;
-            router.on_announce(neighbour, ann, i, WALL, verify_announce);
+            router.on_announce(neighbour, ann, i, WALL, verify);
             assert!(router.verified.len() <= limit);
         }
     }
@@ -1295,7 +1307,7 @@ fn security_verified_cache_stays_bounded_and_can_be_disabled() {
 // ───────────────────────────── defences ─────────────────────────────
 
 fn ann(origin: SignPk, seq: u64, hops: u8, cost: u32) -> Announce {
-    Announce { hops, cost, origin, seq, flags: 0, scope: 8, uplink: 0, name: Arc::from(""), sig: Sig([0; 64]) }
+    Announce { hops, cost, origin, seq, flags: 0, scope: 8, uplink: 0, name: Arc::from(""), sig: Sig([0; 64]), chain: None, sign_link: None }
 }
 
 /// A source that doesn't relay (so nothing it advertises narrows which

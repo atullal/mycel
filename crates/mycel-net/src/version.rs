@@ -59,9 +59,7 @@ impl Caps {
     /// Every bit this build has a name for.
     pub const KNOWN: Caps = Caps(Self::SYNC_V2.0 | Self::ROUTE_ATTEST.0);
     /// What this build implements, and so advertises by default.
-    /// (`ROUTE_ATTEST` is registered for the work that implements it; a
-    /// build sets it here once it does.)
-    pub const SUPPORTED: Caps = Caps::SYNC_V2;
+    pub const SUPPORTED: Caps = Caps(Self::SYNC_V2.0 | Self::ROUTE_ATTEST.0);
 
     /// The raw bits, unknown ones included.
     pub const fn bits(self) -> u64 {
@@ -145,7 +143,7 @@ pub const CAPABILITIES: &[Capability] = &[
         cap: Caps::ROUTE_ATTEST,
         name: "ROUTE_ATTEST",
         protocol: "mesh",
-        summary: "per-hop attestations on route announcements",
+        summary: "per-hop route attestations on announcements, each hop's measured link cost bound in",
     },
 ];
 

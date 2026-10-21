@@ -6,15 +6,24 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes, BytesMut};
 use mycel_crypto::{DeviceKeys, Sig, SignPk};
 
-use super::core::{Announce, Frame, Origination, SeqReq};
+use super::core::{Announce, Check, Frame, Hop, MAX_CHAIN, NO_SIG, Origination, SeqReq, fields_digest, hop_signed};
 use crate::link::{CustomAddr, TRANSPORT_MESH};
 
 const OGM_CTX: &str = "mycel/v1/mesh-announce";
+/// What each hop of a route attestation signs under (`core::hop_signed`).
+const ATTEST_CTX: &str = "mycel/v2/mesh-attest-hop";
 pub(crate) const T_OGM: u8 = 1;
 pub(crate) const T_DATA: u8 = 2;
 pub(crate) const T_SEQREQ: u8 = 3;
 /// Several announcements for one neighbour in one datagram.
 pub(crate) const T_OGMS: u8 = 4;
+/// Several attested announcements (`ROUTE_ATTEST`) in one datagram, sent
+/// only to a neighbour whose hop hello has the capability.
+pub(crate) const T_AOGMS: u8 = 5;
+/// An attested announcement's flags: the origin's signature follows ...
+const A_BASE: u8 = 1;
+/// ... and the chain ends with its sender's own hop (naming the receiver).
+const A_OWN: u8 = 2;
 /// Data frame header: type, ttl, flags, dst, src, waypoint, id, offset, total.
 pub const DATA_HDR: usize = 3 + 32 * 3 + 4 + 2 + 2;
 const F_REACHED: u8 = 1;
@@ -77,6 +86,29 @@ pub fn sign_announce(keys: &DeviceKeys, o: Origination, name: &str) -> Announce 
         uplink: o.uplink,
         name: Arc::from(name),
         sig,
+        chain: None,
+        sign_link: None,
+    }
+}
+
+/// `a` with our own attestation hop signed for neighbour `to`, if the router
+/// asked for one ([`Announce::sign_link`]).
+pub fn sign_hop(keys: &DeviceKeys, a: Announce, to: &SignPk) -> Announce {
+    let Some(link) = a.sign_link else { return a };
+    let m = hop_signed(&fields_digest(&a), a.hops, a.cost, to, link);
+    let sig = keys.sign(ATTEST_CTX, &[&m]);
+    a.signed_by(keys.sign_pk(), sig)
+}
+
+/// A signature the router asks about ([`Check`]): the origin's, or one hop's
+/// of an attestation chain.
+pub fn verify(c: Check<'_>) -> bool {
+    match c {
+        Check::Origin(a) => verify_announce(a),
+        Check::Hop { ann, hop, pos, next } => {
+            let m = hop_signed(&fields_digest(ann), pos, hop.cost, &next, hop.link);
+            hop.signer.verify(ATTEST_CTX, &[&m], &hop.sig).is_ok()
+        }
     }
 }
 
@@ -145,7 +177,194 @@ pub fn decode_announce(b: &[u8]) -> Option<Announce> {
     }
     let name = std::str::from_utf8(&b[OGM_FIXED..OGM_FIXED + n]).ok()?;
     let sig = Sig(b[OGM_FIXED + n..].try_into().ok()?);
-    Some(Announce { hops, cost, origin, seq, flags, scope, uplink, name: Arc::from(name), sig })
+    Some(Announce { hops, cost, origin, seq, flags, scope, uplink, name: Arc::from(name), sig, chain: None, sign_link: None })
+}
+
+/// An attested announcement's fixed part: [`OGM_FIXED`] without the type
+/// byte, then its flags byte.
+const AOGM_FIXED: usize = OGM_FIXED; // no type byte; a flags byte instead
+/// The origin's hop (its cost is 0) and the sender's own (its cost is the
+/// announcement's): a link cost and a signature.
+const SHORT_HOP: usize = 4 + 64;
+/// A hop in between: its key, cost, link cost and signature.
+const RELAY_HOP: usize = 32 + 4 + 4 + 64;
+
+/// Whether the attested form of `a` (signed, or with `sign_link` still to
+/// sign) ends with its sender's own hop, and whether it carries the
+/// origin's signature: only then, since a receiver that won't pass it on
+/// needs neither (the chain's first hop covers the same fields).
+fn attested_shape(a: &Announce) -> (bool, bool) {
+    let own = a.sign_link.is_some() || a.chain_len() == a.hops as usize + 1;
+    (own, own && a.sig != NO_SIG)
+}
+
+/// Bytes of `a` on the wire: attested if it has a chain (or a hop to sign),
+/// else as version 1 sends it. What the control budget and the simulator
+/// count.
+pub fn wire_len(a: &Announce) -> usize {
+    if a.chain.is_none() && a.sign_link.is_none() {
+        return OGM_FIXED + a.name.len() + 64;
+    }
+    let (own, base) = attested_shape(a);
+    let between = (a.hops as usize).saturating_sub(1);
+    AOGM_FIXED
+        + a.name.len()
+        + if base { 64 } else { 0 }
+        + SHORT_HOP
+        + between * RELAY_HOP
+        + if own && a.hops > 0 { SHORT_HOP } else { 0 }
+}
+
+/// One attested announcement (signed: no `sign_link` left), appended to
+/// `b`. `None` if its chain isn't one a receiver could take (see
+/// [`decode_attested`]).
+fn put_attested(a: &Announce, b: &mut BytesMut) -> Option<()> {
+    let chain = a.chain.as_ref()?;
+    let hops: Vec<&Hop> = chain.iter().collect::<Vec<_>>().into_iter().rev().collect();
+    let h = a.hops as usize;
+    let (own, base) = attested_shape(a);
+    if a.sign_link.is_some() || a.cost == u32::MAX || hops.len() > MAX_CHAIN || hops.len() != h + own as usize {
+        return None;
+    }
+    if (h == 0 && !own) || hops[0].signer != a.origin || hops[0].cost != 0 || (own && hops[h].cost != a.cost) {
+        return None;
+    }
+    b.put_u8(a.hops);
+    b.put_u32(a.cost);
+    b.put_slice(&a.origin.0);
+    b.put_u64(a.seq);
+    b.put_u8(a.flags);
+    b.put_u8(a.scope);
+    b.put_u32(a.uplink);
+    b.put_u8(a.name.len() as u8);
+    b.put_slice(a.name.as_bytes());
+    b.put_u8(if base { A_BASE } else { 0 } | if own { A_OWN } else { 0 });
+    if base {
+        b.put_slice(&a.sig.0);
+    }
+    let between = h.saturating_sub(1);
+    for x in &hops[1..1 + between] {
+        b.put_slice(&x.signer.0);
+    }
+    b.put_u32(hops[0].link);
+    b.put_slice(&hops[0].sig.0);
+    for x in &hops[1..1 + between] {
+        b.put_u32(x.cost);
+        b.put_u32(x.link);
+        b.put_slice(&x.sig.0);
+    }
+    if own && h > 0 {
+        b.put_u32(hops[h].link);
+        b.put_slice(&hops[h].sig.0);
+    }
+    Some(())
+}
+
+/// Attested announcements for one neighbour, packed into as few `T_AOGMS`
+/// datagrams of at most `max` bytes as they fit in. Those that don't fit
+/// in one datagram, or aren't attested, come back for the caller to send
+/// unattested.
+pub fn encode_attested(anns: Vec<Announce>, max: usize) -> (Vec<Bytes>, Vec<Announce>) {
+    let mut out = Vec::new();
+    let mut rest = Vec::new();
+    let mut cur = BytesMut::new();
+    let mut one = BytesMut::new();
+    for a in anns {
+        one.clear();
+        if put_attested(&a, &mut one).is_none() || one.len() + 1 > max {
+            rest.push(Announce { chain: None, sign_link: None, ..a });
+            continue;
+        }
+        if !cur.is_empty() && cur.len() + one.len() > max {
+            out.push(std::mem::take(&mut cur).freeze());
+        }
+        if cur.is_empty() {
+            cur.put_u8(T_AOGMS);
+        }
+        cur.put_slice(&one);
+    }
+    if !cur.is_empty() {
+        out.push(cur.freeze());
+    }
+    (out, rest)
+}
+
+/// Reads fixed-size fields off the front of a slice.
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Option<&'a [u8]> {
+        if self.0.len() < n {
+            return None;
+        }
+        let (a, b) = self.0.split_at(n);
+        self.0 = b;
+        Some(a)
+    }
+    fn u8(&mut self) -> Option<u8> {
+        Some(self.take(1)?[0])
+    }
+    fn u32(&mut self) -> Option<u32> {
+        Some(u32::from_be_bytes(self.take(4)?.try_into().ok()?))
+    }
+    fn u64(&mut self) -> Option<u64> {
+        Some(u64::from_be_bytes(self.take(8)?.try_into().ok()?))
+    }
+    fn key(&mut self) -> Option<SignPk> {
+        Some(SignPk(self.take(32)?.try_into().ok()?))
+    }
+    fn sig(&mut self) -> Option<Sig> {
+        Some(Sig(self.take(64)?.try_into().ok()?))
+    }
+}
+
+fn get_attested(r: &mut Reader<'_>, from: &SignPk) -> Option<Announce> {
+    let hops = r.u8()?;
+    let cost = r.u32()?;
+    let origin = r.key()?;
+    let seq = r.u64()?;
+    let flags = r.u8()?;
+    let scope = r.u8()?;
+    let uplink = r.u32()?;
+    let n = r.u8()? as usize;
+    if n > MAX_NAME || cost == u32::MAX {
+        return None;
+    }
+    let name = std::str::from_utf8(r.take(n)?).ok()?;
+    let att = r.u8()?;
+    let (base, own) = (att & A_BASE != 0, att & A_OWN != 0);
+    let h = hops as usize;
+    if att & !(A_BASE | A_OWN) != 0 || (h == 0 && !own) || h + own as usize > MAX_CHAIN {
+        return None;
+    }
+    let sig = if base { r.sig()? } else { NO_SIG };
+    let between = h.saturating_sub(1);
+    let keys: Vec<SignPk> = (0..between).map(|_| r.key()).collect::<Option<_>>()?;
+    let mut chain = Arc::new(Hop { signer: origin, cost: 0, link: r.u32()?, sig: r.sig()?, prev: None });
+    for k in keys {
+        let (cost, link, sig) = (r.u32()?, r.u32()?, r.sig()?);
+        chain = Arc::new(Hop { signer: k, cost, link, sig, prev: Some(chain) });
+    }
+    if own && h > 0 {
+        chain = Arc::new(Hop { signer: *from, cost, link: r.u32()?, sig: r.sig()?, prev: Some(chain) });
+    }
+    let name = Arc::from(name);
+    Some(Announce { hops, cost, origin, seq, flags, scope, uplink, name, sig, chain: Some(chain), sign_link: None })
+}
+
+/// The attested announcements in a `T_AOGMS` datagram from neighbour `from`
+/// (none if any is malformed). Each chain has the hops at positions 0 to
+/// `hops` − 1, plus `from`'s own if the flag says so: the shape is checked
+/// here, what each hop may claim and its signature by the router.
+pub fn decode_attested(b: &[u8], from: &SignPk) -> Vec<Announce> {
+    let Some((&T_AOGMS, rest)) = b.split_first() else { return Vec::new() };
+    let mut r = Reader(rest);
+    let mut out = Vec::new();
+    while !r.0.is_empty() {
+        let Some(a) = get_attested(&mut r, from) else { return Vec::new() };
+        out.push(a);
+    }
+    out
 }
 
 /// The encoded length of the announcement starting at `b[0]`, if whole.

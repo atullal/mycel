@@ -40,6 +40,12 @@
 //!   (zero hops, or less cost than its hops add) gets its sender distrusted
 //!   for a while: the routes through it go, and the routes it relays are
 //!   ignored.
+//! - **Signed route attestations** (`ROUTE_ATTEST`, [`Config::attest`]):
+//!   with neighbours that take them, each hop signs what it advertises, who
+//!   it sends to and its measured cost to them ([`Hop`]); a relay can't
+//!   claim a shorter chain or a cheaper link than the device upstream of it
+//!   signed, and a chain that tries gets its sender distrusted. Routes
+//!   without a chain rank behind attested ones.
 //!
 //! # API (for drivers and simulators)
 //!
@@ -52,12 +58,16 @@
 //!   hop_up(peer, now)             a hop connection to peer is up (direct or internet)
 //!   hop_down(peer, now)           ... is gone
 //!   dial_failed(peer, now)        an Out::Dial didn't work
+//!   set_attests(peer, Option<bool>, now)   its hop hello has ROUTE_ATTEST (None: on the way)
 //!   set_cost(peer, units)         measured hop cost, 0.1 ms units
 //!   announce_due(now) -> bool     time to originate: then
 //!     next_announce(wall) -> Origination { seq, flags, scope, uplink }
 //!     originate(Announce, now)      the caller signs those fields
-//!   on_announce(from, Announce, now, wall, verify)   verify: FnOnce(&Announce) -> bool,
-//!                                 run once per unseen (origin, seq)
+//!   on_announce(from, Announce, now, wall, verify)   verify: FnMut(Check) -> bool,
+//!                                 run once per unseen (origin, seq) and per
+//!                                 unseen attestation hop
+//!   (an Out::Announce with `sign_link` set: the caller signs our hop for its
+//!    receiver and pushes it onto the chain, `Announce::signed_by`)
 //!   on_seqreq(from, SeqReq, now)  a neighbour wants a fresh seqno of an origin
 //!   send(dst, waypoint, payload, control, now) -> bool    a packet of ours
 //!   on_frame(from, Frame, now)    a frame from a neighbour
@@ -208,6 +218,29 @@ const ORIGIN_GAP: Time = 250;
 const REASM_TIMEOUT: Time = 2_000;
 const REASM_MAX: usize = 256;
 const VERIFIED_MAX: usize = 4096;
+/// Signed route attestations ([`Config::attest`], `docs/ROUTING.md` §6 item
+/// 13): a route that came without a verified chain ranks behind every
+/// usable attested route to the same destination, as a fallback (the
+/// downgrade policy of `ROUTE_ATTEST`, `docs/PROTOCOL.md` §6). A relay that
+/// stops attesting loses its routes instead of keeping them. (Above any
+/// cost: costs are `u32`.)
+const UNATTESTED_RANK: u64 = 1 << 34;
+/// Signature checks a neighbour's attested announcements may cost us per
+/// second (burst 4×): a chain costs one check per hop not seen before, and
+/// a neighbour inventing long chains of fresh keys would otherwise cost up
+/// to [`MAX_CHAIN`] checks per announcement. Honest copies mostly repeat
+/// a cached prefix (`docs/ROUTING.md` §6, item 13, measured there).
+const VERIFY_RATE: f64 = 4.0 * OGM_RATE;
+/// The longest attestation chain accepted (and decoded).
+pub const MAX_CHAIN: usize = 16;
+/// A new neighbour whose capability hello hasn't arrived yet is greeted
+/// once it does (so the greeting can be attested), or after this long.
+const HELLO_WAIT: Time = 1_000;
+/// An absent signature: an attested announcement whose receiver won't pass
+/// it on carries no origin signature (its chain's first hop, signed by the
+/// origin, covers the same fields). It never verifies: its `s` half is above
+/// the group order, which Ed25519 refuses (and its `R` half isn't a point).
+pub const NO_SIG: Sig = Sig([0xff; 64]);
 /// Changed origins remembered before `tick` redoes all of them instead.
 const DIRTY_MAX: usize = 1024;
 /// Frames waiting for a lookup or an internet dial: per key, keys, and how long.
@@ -326,6 +359,11 @@ pub struct Config {
     /// ... and how much costlier, in percent, a route through a relay
     /// ranks per step it is from our spaces ([`Defences::affinity`]).
     pub affinity_step: u16,
+    /// Signed route attestations with each hop's measured cost bound in
+    /// (`ROUTE_ATTEST`, `docs/ROUTING.md` §6 item 13): send them to
+    /// neighbours that have it ([`Router::set_attests`]), check the ones we
+    /// get, and rank routes without one behind those with.
+    pub attest: bool,
 }
 
 /// Defences against lying relays that need no wire change
@@ -386,6 +424,7 @@ impl Default for Config {
             seed: 0x6d79_6365_6c21,
             defences: Defences::default(),
             affinity_step: AFFINITY_STEP,
+            attest: true,
         }
     }
 }
@@ -395,7 +434,9 @@ impl Config {
     /// `every` (ms), `far` (periods), `hops`, `greet` (own, near, all), `fisheye`
     /// and `reduction` (on, off); the defences ([`Defences`]) all at once,
     /// `defences` (all, default, none), or one by one: `aggregate`, `corroborate`,
-    /// `affinity`, `budget` (on, off); `affinity_step` (percent).
+    /// `affinity`, `budget` (on, off); `affinity_step` (percent); `attest`
+    /// (on, off: signed route attestations); `verified` (signature cache
+    /// size).
     pub fn tune(&mut self, s: &str) -> Result<(), String> {
         let on = |kv: &str, v: &str| match v {
             "on" => Ok(true),
@@ -421,6 +462,8 @@ impl Config {
                 ("affinity", v) => self.defences.affinity = on(kv, v)?,
                 ("affinity_step", v) => self.affinity_step = v.parse().map_err(|_| format!("{kv}: not a number"))?,
                 ("budget", v) => self.defences.budget = on(kv, v)?,
+                ("attest", v) => self.attest = on(kv, v)?,
+                ("verified", n) => self.verified_max = n.parse().map_err(|e| format!("{kv}: {e}"))?,
                 _ => return Err(format!("{kv}: unknown knob")),
             }
         }
@@ -430,7 +473,8 @@ impl Config {
 
 /// An originator announcement. `origin`, `seq`, `flags`, `scope`, `uplink`
 /// and `name` are signed by the origin; `hops` and `cost` are filled in on
-/// the way (`cost` = [`INFINITY`]: a retraction).
+/// the way (`cost` = [`INFINITY`]: a retraction), and with `ROUTE_ATTEST`
+/// signed by each hop too (`chain`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Announce {
     pub hops: u8,
@@ -443,7 +487,142 @@ pub struct Announce {
     /// A gateway's internet cost (0.1 ms units).
     pub uplink: u32,
     pub name: Arc<str>,
+    /// The origin's signature over everything but `hops` and `cost`
+    /// ([`NO_SIG`]: absent, in an attested announcement its receiver won't
+    /// pass on).
     pub sig: Sig,
+    /// Signed route attestation (`ROUTE_ATTEST`), newest hop first: `None`,
+    /// unattested. In an announcement received from neighbour `n` at `hops`
+    /// = h it holds the hops at positions 0 (the origin) to h − 1, the last
+    /// naming `n`, and, if we may pass it on, `n`'s own at position h naming
+    /// us ([`Hop`]).
+    pub chain: Option<Arc<Hop>>,
+    /// Outgoing only: our own hop is still to be signed by the caller (the
+    /// router holds no keys), naming the receiver, with this link cost: a
+    /// [`Hop`] at position `hops` advertising `cost`, pushed onto `chain`
+    /// ([`Announce::signed_by`]).
+    pub sign_link: Option<u32>,
+}
+
+impl Announce {
+    /// With the hop the caller signed for it ([`Announce::sign_link`]).
+    pub fn signed_by(mut self, signer: SignPk, sig: Sig) -> Announce {
+        if let Some(link) = self.sign_link.take() {
+            let prev = self.chain.take();
+            self.chain = Some(Arc::new(Hop { signer, cost: self.cost, link, sig, prev }));
+        }
+        self
+    }
+
+    /// The hops of its chain.
+    pub fn chain_len(&self) -> usize {
+        self.chain.as_ref().map_or(0, |c| c.len())
+    }
+}
+
+/// One hop of a route attestation (`ROUTE_ATTEST`, `docs/ROUTING.md` §6
+/// item 13). The device at position `pos` of a route (0: the origin) signs
+/// the announcement's fields ([`fields_digest`]), `pos`, the cost it
+/// advertises, the neighbour it sends to, and its own measured cost to that
+/// neighbour ([`hop_signed`]). The next hop may advertise no less than
+/// `cost + link`: no device can claim a cheaper link than the device
+/// upstream of it measured, nor a shorter chain than it was sent (the
+/// origin signs for its real neighbours), nor reuse a hop naming someone
+/// else.
+///
+/// A persistent list, newest hop first: the copies a relay sends its
+/// neighbours share all but their own last hop.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Hop {
+    pub signer: SignPk,
+    /// What the signer advertised (0 for the origin).
+    pub cost: u32,
+    /// Its measured cost to the next hop, [`HOP_PENALTY`] included.
+    pub link: u32,
+    pub sig: Sig,
+    pub prev: Option<Arc<Hop>>,
+}
+
+impl Hop {
+    /// Hops in the chain ending here.
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    /// Never: a chain has at least this hop.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// This hop, then the ones before it (toward the origin).
+    pub fn iter(&self) -> impl Iterator<Item = &Hop> {
+        std::iter::successors(Some(self), |h| h.prev.as_deref())
+    }
+}
+
+/// A signature the router asks its caller to check: it holds no keys and
+/// does no signature cryptography (`wire::verify` checks Ed25519; a
+/// simulator answers from a stub).
+#[derive(Clone, Copy, Debug)]
+pub enum Check<'a> {
+    /// The origin's signature over everything but `hops` and `cost`.
+    Origin(&'a Announce),
+    /// Hop `pos` of the announcement's chain, naming `next`: the hop after
+    /// it, or the receiver.
+    Hop { ann: &'a Announce, hop: &'a Hop, pos: u8, next: SignPk },
+}
+
+/// The fields of `a` its origin fixes (origin, seqno, flags, scope, uplink,
+/// name), digested: what every hop of its attestation signs.
+pub fn fields_digest(a: &Announce) -> Hash32 {
+    static KEYED: std::sync::LazyLock<Digest> =
+        std::sync::LazyLock::new(|| Digest::new("mycel/v2/mesh-attest-fields"));
+    let mut d = KEYED.clone();
+    d.update(&a.origin.0)
+        .update(&a.seq.to_be_bytes())
+        .update(&[a.flags, a.scope])
+        .update(&a.uplink.to_be_bytes())
+        .update(&[a.name.len() as u8])
+        .update(a.name.as_bytes());
+    d.finalize()
+}
+
+/// What hop `pos` of an attestation signs (after its context string,
+/// `wire.rs`): the announcement's [`fields_digest`], `pos`, the cost the hop
+/// advertises, the neighbour it names and its measured cost to it.
+pub fn hop_signed(fields: &Hash32, pos: u8, cost: u32, next: &SignPk, link: u32) -> [u8; 73] {
+    let mut m = [0u8; 73];
+    m[..32].copy_from_slice(&fields.0);
+    m[32] = pos;
+    m[33..37].copy_from_slice(&cost.to_be_bytes());
+    m[37..69].copy_from_slice(&next.0);
+    m[69..].copy_from_slice(&link.to_be_bytes());
+    m
+}
+
+/// The signature cache's key for a checked hop: what it signed and the
+/// signature, so any change is checked again.
+fn hop_id(fields: &Hash32, pos: u8, hop: &Hop, next: &SignPk) -> Hash32 {
+    static KEYED: std::sync::LazyLock<Digest> =
+        std::sync::LazyLock::new(|| Digest::new("mycel/v0/mesh-verified-hop"));
+    let mut d = KEYED.clone();
+    d.update(&hop.signer.0).update(&hop_signed(fields, pos, hop.cost, next, hop.link)).update(&hop.sig.0);
+    d.finalize()
+}
+
+/// What checking a chain found.
+enum Verdict {
+    /// Every hop checks out: the link cost its sender measured to us, if it
+    /// signed its own hop.
+    Attested(u32),
+    /// A claim no honest chain carries: a hop advertising less than the
+    /// hop upstream of it plus the link that one measured, a bad
+    /// signature, or a malformed chain. Its sender lied.
+    Lie,
+    /// Over the sender's signature budget: dropped, not judged.
+    Limited,
+    /// A path through us (or through one device twice): a loop, not a lie.
+    Loop,
 }
 
 /// Insert into a map kept at most [`FEEDBACK_MAX`] long (an arbitrary entry
@@ -482,6 +661,11 @@ fn verified_id(a: &Announce) -> Hash32 {
         .update(a.name.as_bytes())
         .update(&a.sig.0);
     d.finalize()
+}
+
+/// The same signed fields (two copies of one seqno).
+fn same_fields(a: &Announce, b: &Announce) -> bool {
+    (a.origin, a.seq, a.flags, a.scope, a.uplink) == (b.origin, b.seq, b.flags, b.scope, b.uplink) && a.name == b.name
 }
 
 /// The fields of our next announcement, for the caller to sign.
@@ -580,6 +764,14 @@ pub struct Stats {
     pub announcements_shed: u64,
     /// Rebroadcasts skipped as redundant (flood reduction).
     pub announcements_suppressed: u64,
+    /// Announcements accepted with a verified attestation chain ...
+    pub announcements_attested: u64,
+    /// ... signatures checked (the origin's and each hop's), and those the
+    /// cache spared ...
+    pub signatures_checked: u64,
+    pub signatures_cached: u64,
+    /// ... and chains refused as lies (their senders are distrusted).
+    pub chains_refused: u64,
     /// Routes withdrawn at once on a loss, and fresh-seqno requests sent.
     pub retractions_sent: u64,
     pub seqreqs_sent: u64,
@@ -648,6 +840,19 @@ struct Nb {
     /// those waiting for it.
     ctl: Bucket,
     ctl_q: Vec<Announce>,
+    /// Whether it takes signed route attestations (`ROUTE_ATTEST`).
+    attests: Attests,
+    /// Signature checks its attested announcements may still cost us.
+    verify_budget: Bucket,
+}
+
+/// A neighbour's `ROUTE_ATTEST` capability, as its hop hello said.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Attests {
+    No,
+    /// Its hello is on the way (since then): its greeting waits for it.
+    Pending(Time),
+    Yes,
 }
 
 impl Nb {
@@ -659,7 +864,25 @@ impl Nb {
         ogm_budget.at = now;
         let mut ctl = Self::control_bucket(0);
         ctl.at = now;
-        Nb { direct: false, up: false, cost: 0, budget, ogm_budget, last_used: now, ctl, ctl_q: Vec::new() }
+        let mut verify_budget = Bucket::new(VERIFY_RATE, VERIFY_RATE * 4.0);
+        verify_budget.at = now;
+        Nb {
+            direct: false,
+            up: false,
+            cost: 0,
+            budget,
+            ogm_budget,
+            last_used: now,
+            ctl,
+            ctl_q: Vec::new(),
+            attests: Attests::No,
+            verify_budget,
+        }
+    }
+
+    /// Its greeting waits for its capability hello.
+    fn hello_pending(&self, now: Time) -> bool {
+        matches!(self.attests, Attests::Pending(t) if now < t + HELLO_WAIT)
     }
 
     fn hop_cost(&self) -> u32 {
@@ -672,6 +895,8 @@ impl Nb {
     /// the cap on the rate, are what the neighbour accepts from us.
     fn control_bucket(cost: u32) -> Bucket {
         let cost = if cost == 0 { UNMEASURED_CONTROL_COST } else { cost };
+        // (in bytes of unattested announcements: attested ones, larger,
+        // take more of it, `wire::wire_len`)
         let accepted = OGM_RATE * ANN_BYTES as f64;
         let rate = (CONTROL_SHARE * 65_536.0 * 10_000.0 / cost as f64).min(accepted);
         Bucket::new(rate, accepted * 4.0)
@@ -698,13 +923,23 @@ struct Via {
     /// origin (since it last lost it) or when its cost fell to that from no
     /// cheaper than all of them. `None`: it never did.
     since: Option<Time>,
+    /// It came with a verified attestation chain (kept in
+    /// [`Origin::chains`]).
+    attested: bool,
 }
 
 struct Origin {
     newest: u64,
-    /// The newest announcement itself (passed on with our cost added).
+    /// The newest announcement itself (passed on with our cost added),
+    /// without its chain ...
     latest: Announce,
+    /// ... and, while that one lacks the origin's signature ([`NO_SIG`]),
+    /// the newest that has it (a retraction needs one).
+    signed: Option<Announce>,
     via: Vec<(SignPk, Via)>,
+    /// The attestation chain each attested route came with, by neighbour
+    /// (what we extend when we advertise it).
+    chains: Vec<(SignPk, Arc<Hop>)>,
     /// Newest sequence number we have passed on (or decided not to), and
     /// when we last did.
     forwarded: u64,
@@ -732,6 +967,30 @@ impl Origin {
             None => true,
             Some((s, c)) => v.seq > s || (v.seq == s && v.adv < c),
         }
+    }
+
+    /// The chain the route through `n` came with.
+    fn chain_of(&self, n: &SignPk) -> Option<&Arc<Hop>> {
+        self.chains.iter().find(|(k, _)| k == n).map(|(_, c)| c)
+    }
+
+    fn set_chain(&mut self, n: SignPk, chain: Option<Arc<Hop>>) {
+        self.chains.retain(|(k, _)| *k != n);
+        if let Some(c) = chain {
+            self.chains.push((n, c));
+        }
+    }
+
+    /// Forget the chains of routes that are gone.
+    fn prune_chains(&mut self) {
+        let via = &self.via;
+        self.chains.retain(|(k, _)| via.iter().any(|(n, _)| n == k));
+    }
+
+    /// The newest announcement with the origin's signature (for a
+    /// retraction, which is never attested).
+    fn signed(&self) -> Option<&Announce> {
+        if self.latest.sig != NO_SIG { Some(&self.latest) } else { self.signed.as_ref() }
     }
 }
 
@@ -1109,7 +1368,7 @@ impl Router {
                 // we announced alone reached nobody)
                 self.next_announce = self.next_announce.min(now);
                 self.force_full = true;
-            } else if let Some(a) = self.own.clone() {
+            } else if let Some(a) = self.own_for(&peer) {
                 self.stats.announcements_sent += 1;
                 self.out.push(Out::Announce { to: peer, ann: a });
             }
@@ -1125,11 +1384,79 @@ impl Router {
     /// since the last greeting that told anyone anything.
     fn greet_next(&mut self, now: Time) {
         while self.last_greet.is_none_or(|t| now.saturating_sub(t) >= GREET_GAP) {
-            let Some(peer) = self.greet_q.pop_front() else { return };
+            // the first one ready: its capability hello came (or won't),
+            // so the greeting can be attested if it takes that
+            let ready = self.greet_q.iter().position(|p| self.nbs.get(p).is_none_or(|n| !n.hello_pending(now)));
+            let Some(peer) = ready.and_then(|i| self.greet_q.remove(i)) else { return };
             if self.nbs.get(&peer).is_some_and(|n| n.up && n.direct) && self.greet(peer, now) > 0 {
                 self.last_greet = Some(now);
             }
         }
+    }
+
+    /// Whether `peer` takes signed route attestations (`ROUTE_ATTEST` in
+    /// both hop hellos): `None` while its hello is on the way (its greeting
+    /// then waits for it, at most [`HELLO_WAIT`]). Without
+    /// [`Config::attest`] nobody is sent any. A neighbour that turns out to
+    /// take them gets our own announcement again, attested.
+    pub fn set_attests(&mut self, peer: SignPk, attests: Option<bool>, now: Time) {
+        if peer == self.me {
+            return;
+        }
+        let cfg = &self.cfg;
+        let n = self.nbs.entry(peer).or_insert_with(|| Nb::new(cfg, now));
+        let before = n.attests;
+        n.attests = match attests {
+            Some(true) if self.cfg.attest => Attests::Yes,
+            None if self.cfg.attest => Attests::Pending(now),
+            _ => Attests::No,
+        };
+        if n.attests == Attests::Yes
+            && before != Attests::Yes
+            && n.up
+            && n.direct
+            && let Some(a) = self.own_for(&peer)
+        {
+            self.stats.announcements_sent += 1;
+            self.out.push(Out::Announce { to: peer, ann: a });
+        }
+    }
+
+    /// Whether `peer` takes signed route attestations.
+    pub fn attests(&self, peer: &SignPk) -> bool {
+        self.nbs.get(peer).is_some_and(|n| n.attests == Attests::Yes)
+    }
+
+    /// Our own announcement for `peer`: with our first hop to sign for it
+    /// if it takes attestations.
+    fn own_for(&self, peer: &SignPk) -> Option<Announce> {
+        let mut a = self.own.clone()?;
+        if let Some(n) = self.nbs.get(peer).filter(|n| n.attests == Attests::Yes) {
+            a.sign_link = Some(n.hop_cost());
+        }
+        Some(a)
+    }
+
+    /// What we tell `to` of `origin` through our route `(n, via)` (at the
+    /// newest seqno, as every caller checks): attested if `to` takes
+    /// attestations and our route came with a chain we can extend (with our
+    /// own hop for the caller to sign if `to` may pass it on; else the chain
+    /// alone, which still bounds our claim); otherwise unattested, which
+    /// needs the origin's own signature. `None`: neither can be sent.
+    fn advert(&self, o: &Origin, n: &SignPk, via: &Via, to: &SignPk) -> Option<Announce> {
+        let mut a = Announce { hops: via.hops, cost: via.cost, ..o.latest.clone() };
+        let attesting = self.nbs.get(to).filter(|t| t.attests == Attests::Yes);
+        if let Some(t) = attesting
+            && via.attested
+            && let Some(c) = o.chain_of(n).filter(|c| c.len() == via.hops as usize)
+        {
+            a.chain = Some(c.clone());
+            if via.hops.saturating_add(1) < o.latest.scope.min(self.cfg.max_hops) {
+                a.sign_link = Some(t.hop_cost());
+            }
+            return Some(a);
+        }
+        (a.sig != NO_SIG).then_some(a)
     }
 
     /// Tell a new direct neighbour our current routes ([`Config::greet`])
@@ -1145,10 +1472,10 @@ impl Router {
         keys.sort();
         for origin in keys {
             // never back where it came from
-            let Some((_, via)) = self.best_route(&origin, now).filter(|(n, _)| *n != peer) else { continue };
+            let Some((n, via)) = self.best_route(&origin, now).filter(|(n, _)| *n != peer) else { continue };
             let max_hops = self.cfg.max_hops;
             let near = self.cfg.greet == Greet::Near;
-            let Some(o) = self.origins.get_mut(&origin) else { continue };
+            let Some(o) = self.origins.get(&origin) else { continue };
             let gateway = o.latest.flags & F_GATEWAY != 0;
             if via.seq != o.newest
                 || via.hops >= o.latest.scope.min(max_hops)
@@ -1157,9 +1484,8 @@ impl Router {
             {
                 continue;
             }
-            let mut a = o.latest.clone();
-            a.hops = via.hops;
-            a.cost = via.cost;
+            let Some(a) = self.origins.get(&origin).and_then(|o| self.advert(o, &n, &via, &peer)) else { continue };
+            let Some(o) = self.origins.get_mut(&origin) else { continue };
             o.fd = match o.fd {
                 Some((s, c)) if s == o.newest => Some((s, c.min(via.cost))),
                 _ => Some((o.newest, via.cost)),
@@ -1204,6 +1530,7 @@ impl Router {
             .filter_map(|(k, o)| {
                 let before = o.via.len();
                 o.via.retain(|(n, _)| *n != peer);
+                o.prune_chains();
                 (o.via.len() != before).then_some(*k)
             })
             .collect();
@@ -1290,22 +1617,25 @@ impl Router {
         let every = self.cfg.announce_every;
         let jitter = self.rand() % (every / 4 + 1);
         self.next_announce = now + every - every / 8 + jitter;
+        self.own = Some(Announce { chain: None, sign_link: None, ..ann });
         for pk in self.direct_up().collect::<Vec<_>>() {
+            let Some(a) = self.own_for(&pk) else { continue };
             self.stats.announcements_sent += 1;
-            self.out.push(Out::Announce { to: pk, ann: ann.clone() });
+            self.out.push(Out::Announce { to: pk, ann: a });
         }
-        self.own = Some(ann);
     }
 
-    /// An announcement from a neighbour. `verify` checks the origin's
-    /// signature; it runs once per signed identity, after the cheap checks.
+    /// An announcement from a neighbour. `verify` checks a signature (the
+    /// origin's, or a hop's of an attestation chain); it runs once per
+    /// signed identity, after the cheap checks, and with a chain only for
+    /// hops not checked before, within the neighbour's budget.
     pub fn on_announce(
         &mut self,
         from: SignPk,
-        a: Announce,
+        mut a: Announce,
         now: Time,
         wall: u64,
-        verify: impl FnOnce(&Announce) -> bool,
+        mut verify: impl FnMut(Check<'_>) -> bool,
     ) {
         let jitter = 10 + self.rand() % 40;
         if a.origin != from && self.distrusted.get(&from).is_some_and(|t| now < *t) {
@@ -1347,18 +1677,35 @@ impl Router {
             self.distrust(from, now);
             return;
         }
-        let verified = verified_id(&a);
-        if !self.verified.contains(&verified) {
-            if !verify(&a) {
-                self.stats.announcements_forged += 1;
-                return;
+        a.sign_link = None;
+        let chain = a.chain.take().filter(|_| self.cfg.attest && a.cost != INFINITY);
+        // the link cost its sender measured to us, if it signed for us
+        let mut link = 0;
+        if let Some(c) = &chain {
+            match self.check_chain(from, &a, c, &mut verify, now) {
+                Verdict::Attested(l) => link = l,
+                Verdict::Lie => {
+                    self.stats.chains_refused += 1;
+                    self.distrust(from, now);
+                    return;
+                }
+                Verdict::Limited => {
+                    self.stats.announcements_limited += 1;
+                    return;
+                }
+                Verdict::Loop => return,
             }
-            if self.verified.len() >= self.cfg.verified_max {
-                self.verified.clear();
+        }
+        // the origin's own signature: what an unattested announcement rests
+        // on, and what an attested one carries for us to pass on unattested
+        if (chain.is_none() || a.sig != NO_SIG) && !self.check_origin(&a, &mut verify) {
+            self.stats.announcements_forged += 1;
+            if chain.is_some() {
+                // it vouched for the chain it sent along
+                self.stats.chains_refused += 1;
+                self.distrust(from, now);
             }
-            if self.cfg.verified_max > 0 {
-                self.verified.insert(verified);
-            }
+            return;
         }
         if a.cost == INFINITY {
             self.on_retraction(from, a.origin, a.seq, now);
@@ -1368,7 +1715,12 @@ impl Router {
         if hops > self.cfg.max_hops {
             return;
         }
-        let cost = a.cost.saturating_add(hop_cost);
+        if chain.is_some() {
+            self.stats.announcements_attested += 1;
+        }
+        // with its hop signed, our link costs what the costlier end measured:
+        // a sender can't make us advertise less than it saw (bilateral)
+        let cost = a.cost.saturating_add(hop_cost.max(link));
         let relay = self.cfg.relay;
         let forward_scope = a.scope.min(self.cfg.max_hops);
         let (seq, adv) = (a.seq, a.cost);
@@ -1392,7 +1744,9 @@ impl Router {
         let o = self.origins.entry(a.origin).or_insert_with(|| Origin {
             newest: 0,
             latest: a.clone(),
+            signed: None,
             via: Vec::new(),
+            chains: Vec::new(),
             forwarded: 0,
             flooded: None,
             pending: None,
@@ -1406,13 +1760,23 @@ impl Router {
         o.seen = now;
         if seq > o.newest {
             o.newest = seq;
+            if a.sig != NO_SIG {
+                o.signed = None;
+            } else if o.latest.sig != NO_SIG {
+                o.signed = Some(o.latest.clone());
+            }
             o.latest = a;
             o.heard.clear();
+        } else if seq == o.newest && o.latest.sig == NO_SIG && a.sig != NO_SIG && same_fields(&o.latest, &a) {
+            // the origin's signature, which an earlier copy didn't carry
+            o.latest.sig = a.sig;
+            o.signed = None;
         }
         if seq == o.newest && !o.heard.iter().any(|(k, _)| *k == from) {
             o.heard.push((from, adv));
         }
-        let mut via = Via { seq, adv, cost, hops, at: now, since: sudden.then_some(now) };
+        let attested = chain.is_some();
+        let mut via = Via { seq, adv, cost, hops, at: now, since: sudden.then_some(now), attested };
         if !o.feasible(&via) {
             self.stats.infeasible += 1;
         }
@@ -1425,6 +1789,7 @@ impl Router {
             }
             None => o.via.push((from, via)),
         }
+        o.set_chain(from, chain);
         if o.feasible(&via) {
             o.retracted = false;
         }
@@ -1442,6 +1807,114 @@ impl Router {
         }
         // after: it may have become one
         self.touch(origin);
+    }
+
+    /// The origin's signature on `a`, checked once per signed identity.
+    fn check_origin(&mut self, a: &Announce, verify: &mut impl FnMut(Check<'_>) -> bool) -> bool {
+        if a.sig == NO_SIG {
+            return false;
+        }
+        let verified = verified_id(a);
+        if self.verified.contains(&verified) {
+            self.stats.signatures_cached += 1;
+            return true;
+        }
+        self.stats.signatures_checked += 1;
+        if !verify(Check::Origin(a)) {
+            return false;
+        }
+        self.remember(verified);
+        true
+    }
+
+    /// A signature checked: don't check it again (while the cache lasts).
+    fn remember(&mut self, id: Hash32) {
+        if self.verified.len() >= self.cfg.verified_max {
+            self.verified.clear();
+        }
+        if self.cfg.verified_max > 0 {
+            self.verified.insert(id);
+        }
+    }
+
+    /// An attested announcement's chain, from neighbour `from` (see
+    /// [`Announce::chain`] and [`Hop`]). Structure first, then what each hop
+    /// may advertise, then the signatures of hops not checked before (those
+    /// a copy through another neighbour shared are cached), within
+    /// `from`'s budget. Everything a chain claims was checked by every
+    /// honest device it passed (each checks the whole chain), so whatever
+    /// fails here is its sender's doing: [`Verdict::Lie`].
+    fn check_chain(
+        &mut self,
+        from: SignPk,
+        a: &Announce,
+        chain: &Arc<Hop>,
+        verify: &mut impl FnMut(Check<'_>) -> bool,
+        now: Time,
+    ) -> Verdict {
+        let h = a.hops as usize;
+        let mut hops: Vec<&Hop> = chain.iter().take(MAX_CHAIN + 1).collect();
+        if hops.len() > MAX_CHAIN {
+            return Verdict::Lie;
+        }
+        hops.reverse(); // the origin first: position = index
+        let n = hops.len();
+        // with its sender's own hop (position h, naming us), or without it
+        // (we may not pass it on; the last hop names the sender)
+        let own = n == h + 1;
+        if !own && !(n == h && h > 0) {
+            return Verdict::Lie;
+        }
+        if hops[0].signer != a.origin || hops[0].cost != 0 || (own && (hops[h].signer != from || hops[h].cost != a.cost))
+        {
+            return Verdict::Lie;
+        }
+        // a path through us, or through one device twice: a loop
+        let ends = if own { n - 1 } else { n };
+        for j in 0..n {
+            let k = hops[j].signer;
+            if k == self.me || (j < ends && k == from) || hops[..j].iter().any(|x| x.signer == k) {
+                return Verdict::Loop;
+            }
+        }
+        // no hop advertises less than the hop before it plus the link that
+        // one measured, and no link is cheaper than an honest hop's least
+        for j in 0..n {
+            if hops[j].link < MIN_HOP_COST {
+                return Verdict::Lie;
+            }
+            let after = match hops.get(j + 1) {
+                Some(next) => next.cost,
+                None if own => continue, // its link to us: our cost, not a claim
+                None => a.cost,
+            };
+            if (after as u64) < hops[j].cost as u64 + hops[j].link as u64 {
+                return Verdict::Lie;
+            }
+        }
+        let fields = fields_digest(a);
+        for j in 0..n {
+            let next = match hops.get(j + 1) {
+                Some(x) => x.signer,
+                None if own => self.me,
+                None => from,
+            };
+            let id = hop_id(&fields, j as u8, hops[j], &next);
+            if self.verified.contains(&id) {
+                self.stats.signatures_cached += 1;
+                continue;
+            }
+            if !self.nbs.get_mut(&from).is_some_and(|nb| nb.verify_budget.take(1.0, now)) {
+                return Verdict::Limited;
+            }
+            self.stats.signatures_checked += 1;
+            if !verify(Check::Hop { ann: a, hop: hops[j], pos: j as u8, next }) {
+                self.stats.announcements_forged += 1;
+                return Verdict::Lie;
+            }
+            self.remember(id);
+        }
+        Verdict::Attested(if own { hops[h].link } else { 0 })
     }
 
     /// `peer` sent a route no honest relay could have: a black hole
@@ -1474,6 +1947,7 @@ impl Router {
         let Some(o) = self.origins.get_mut(&origin) else { return };
         let before = o.via.len();
         o.via.retain(|(n, v)| !(*n == from && v.seq <= seq));
+        o.prune_chains();
         if o.via.len() != before {
             self.gc_check |= o.via.is_empty();
             self.touch(origin);
@@ -1494,9 +1968,13 @@ impl Router {
         }
         let targets: Vec<SignPk> = self.direct_up().filter(|k| Some(*k) != except && *k != origin).collect();
         let Some(o) = self.origins.get_mut(&origin) else { return };
-        if o.fd.is_some() && !o.retracted {
+        if o.fd.is_some()
+            && !o.retracted
+            && let Some(signed) = o.signed()
+        {
+            // (never attested: it only takes away our own route)
+            let mut a = signed.clone();
             o.retracted = true;
-            let mut a = o.latest.clone();
             a.cost = INFINITY;
             for t in &targets {
                 self.stats.retractions_sent += 1;
@@ -1528,17 +2006,16 @@ impl Router {
             return;
         }
         let best = self.best_route(&req.origin, now);
+        let advert = best.and_then(|(n, via)| self.origins.get(&req.origin).and_then(|o| self.advert(o, &n, &via, &from)));
         let Some(o) = self.origins.get_mut(&req.origin) else { return };
         if o.newest >= req.seq
             && let Some((_, via)) = best
             && via.seq == o.newest
+            && let Some(a) = advert
         {
             // we have it: send our current advertisement back, which (as
             // any advertisement) sets our feasibility distance (Babel,
             // RFC 8966 §3.7.3)
-            let mut a = o.latest.clone();
-            a.hops = via.hops;
-            a.cost = via.cost;
             o.fd = match o.fd {
                 Some((s, c)) if s == o.newest => Some((s, c.min(via.cost))),
                 _ => Some((o.newest, via.cost)),
@@ -1596,14 +2073,11 @@ impl Router {
             let newest = o.newest;
             o.forwarded = newest;
             o.flooded = Some(now);
-            let Some((_, via)) = best.filter(|(_, v)| v.seq == newest) else { continue };
+            let Some((n, via)) = best.filter(|(_, v)| v.seq == newest) else { continue };
             if dense && o.heard.iter().filter(|(_, adv)| *adv <= via.cost).count() >= REDUNDANT {
                 self.stats.announcements_suppressed += 1;
                 continue;
             }
-            let mut a = o.latest.clone();
-            a.hops = via.hops;
-            a.cost = via.cost;
             // Babel: the feasibility distance is the best we advertised
             o.fd = match o.fd {
                 Some((s, c)) if s == newest => Some((s, c.min(via.cost))),
@@ -1613,7 +2087,9 @@ impl Router {
             let targets: Vec<SignPk> =
                 direct.iter().filter(|pk| **pk != origin && !o.heard.iter().any(|(k, _)| k == *pk)).copied().collect();
             for pk in targets {
-                self.send_announce(pk, a.clone(), now);
+                // (each its own: attested or not, and our hop names it)
+                let Some(a) = self.origins.get(&origin).and_then(|o| self.advert(o, &n, &via, &pk)) else { continue };
+                self.send_announce(pk, a, now);
             }
         }
     }
@@ -1630,7 +2106,7 @@ impl Router {
             return;
         }
         let Some(n) = self.nbs.get_mut(&to) else { return };
-        let size = (ANN_BYTES + a.name.len()) as f64;
+        let size = super::wire::wire_len(&a) as f64;
         if n.ctl_q.is_empty() && n.ctl.take(size, now) {
             self.stats.announcements_sent += 1;
             self.out.push(Out::Announce { to, ann: a });
@@ -1673,20 +2149,20 @@ impl Router {
             // fewest hops first; popped from the end
             q.sort_by_key(|a| (Reverse(a.hops), a.origin));
             while let Some(a) = q.last() {
-                let size = (ANN_BYTES + a.name.len()) as f64;
                 let origin = a.origin;
-                let fresh = self.best_route(&origin, now).filter(|(k, _)| *k != to).and_then(|(_, via)| {
+                let fresh = self.best_route(&origin, now).filter(|(k, _)| *k != to).and_then(|(n, via)| {
                     let o = self.origins.get(&origin)?;
                     let ok = via.seq == o.newest
                         && via.hops < o.latest.scope.min(self.cfg.max_hops)
                         && !o.heard.iter().any(|(k, _)| *k == to);
-                    ok.then(|| Announce { hops: via.hops, cost: via.cost, ..o.latest.clone() })
+                    if ok { self.advert(o, &n, &via, &to) } else { None }
                 });
                 let Some(fresh) = fresh else {
                     q.pop();
                     self.stats.announcements_shed += 1;
                     continue;
                 };
+                let size = super::wire::wire_len(&fresh) as f64;
                 if !self.nbs.get_mut(&to).is_some_and(|n| n.ctl.take(size, now)) {
                     break;
                 }
@@ -1722,13 +2198,23 @@ impl Router {
     /// defences add. It only orders feasible routes, every one of them
     /// loop-free (Babel); what we advertise is the chosen route's own cost.
     fn rank(&self, o: &Origin, n: &SignPk, v: &Via, now: Time) -> u64 {
-        let mut r = self.affine(n, v.cost);
+        let mut r = self.base_rank(o, n, v, now);
         if self.cfg.defences.corroborate
             && let Some(incumbent) = self.held_down(o, n, v, now)
         {
             r = r.max(incumbent + 1);
         }
         r
+    }
+
+    /// [`Self::rank`] before the hold-down: the cost, costlier through a
+    /// relay far from our spaces ([`Defences::affinity`]), and behind every
+    /// usable attested route if it has no chain ([`UNATTESTED_RANK`]).
+    fn base_rank(&self, o: &Origin, n: &SignPk, v: &Via, now: Time) -> u64 {
+        let unattested = self.cfg.attest
+            && !v.attested
+            && o.via.iter().any(|(k, w)| w.attested && self.usable(o, k, w, now));
+        self.affine(n, v.cost) + if unattested { UNATTESTED_RANK } else { 0 }
     }
 
     /// `cost` through next hop `n`, costlier the farther `n` is from our
@@ -1751,10 +2237,13 @@ impl Router {
     /// Never the destination itself, next to us (its own announcement over
     /// its own authenticated hop; nobody else can claim 0 hops), nor a hop
     /// that carried an acknowledgement from it lately (kept with
-    /// [`Defences::aggregate`]; evidence that beats a second opinion).
+    /// [`Defences::aggregate`]; evidence that beats a second opinion), nor
+    /// an attested route: its chain proves the shortcut, each link's cost
+    /// signed by the device upstream of it.
     fn held_down(&self, o: &Origin, n: &SignPk, v: &Via, now: Time) -> Option<u64> {
         let since = v.since.filter(|t| now.saturating_sub(*t) < HOLD_DOWN)?;
-        if *n == o.latest.origin
+        if v.attested
+            || *n == o.latest.origin
             || self.vouched.get(n).is_some_and(|d| d.iter().any(|(k, t)| *k == o.latest.origin && now < *t))
         {
             return None;
@@ -1769,7 +2258,7 @@ impl Router {
                 return None; // corroborated
             }
             if w.since.is_none_or(|t| t < since) {
-                let r = self.affine(k, w.cost);
+                let r = self.base_rank(o, k, w, now);
                 incumbent = Some(incumbent.map_or(r, |i| i.min(r)));
             }
         }
@@ -2609,6 +3098,7 @@ impl Router {
                     keep
                 });
                 if o.via.len() != before {
+                    o.prune_chains();
                     silent.push(*k);
                     self.gc_check |= o.via.is_empty();
                 }

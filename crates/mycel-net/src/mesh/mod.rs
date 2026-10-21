@@ -73,13 +73,14 @@ use tokio::sync::mpsc;
 
 pub use self::core::Stats as MeshStats;
 use self::core::{Config, Out, Router, Time};
-use self::wire::{MIN_QUIC_MTU, T_DATA, T_OGM, T_OGMS, T_SEQREQ};
+use self::wire::{MIN_QUIC_MTU, T_AOGMS, T_DATA, T_OGM, T_OGMS, T_SEQREQ};
 pub use self::wire::{mesh_addr, parse_mesh_addr};
 use crate::link::{
     CustomAddr, Link, LinkEvent, LinkStatus, PathKind, TRANSPORT_MESH, n0_watcher, noq_udp, path_in_use,
 };
 use crate::version::{
-    AlpnTable, Hello, PeerProtocol, Protocol, WIRE_V1, WIRE_V2, WireVersion, alpn_table_ok, alpns_in, version_in,
+    AlpnTable, Caps, Hello, PeerProtocol, Protocol, WIRE_V1, WIRE_V2, WireVersion, alpn_table_ok, alpns_in,
+    version_in,
 };
 
 /// Hop connections between neighbours (and internet hops to gateways), wire
@@ -240,6 +241,8 @@ impl MeshOptions {
             gateways: self.gateways,
             defences: self.defences,
             seed: mycel_crypto::random_u64(),
+            // on a version 2 hop with the capability in both hellos
+            attest: self.protocol.version >= WIRE_V2 && self.protocol.caps.contains(Caps::ROUTE_ATTEST),
             ..Config::default()
         }
     }
@@ -673,11 +676,23 @@ impl Driver {
         }
         for (to, v) in anns {
             let Some(c) = self.conn(&to) else { continue };
+            let max = c.max_datagram_size().unwrap_or(MIN_QUIC_MTU);
+            // our own attestation hops, one per announcement and receiver
+            // (the router only asks for them for a neighbour that has the
+            // capability), then the attested ones in their own datagrams
+            let (attested, v): (Vec<_>, Vec<_>) = v
+                .into_iter()
+                .map(|a| wire::sign_hop(&self.keys, a, &to))
+                .partition(|a| a.chain.is_some());
+            let (grams, rest) = wire::encode_attested(attested, max);
+            for d in grams {
+                let _ = c.send_datagram(d);
+            }
+            let v: Vec<_> = v.into_iter().chain(rest).filter(|a| a.sig != core::NO_SIG).collect();
             if let [a] = &v[..] {
                 let _ = c.send_datagram(wire::encode_announce(a));
                 continue;
             }
-            let max = c.max_datagram_size().unwrap_or(MIN_QUIC_MTU);
             for d in wire::encode_announces(&v, max) {
                 let _ = c.send_datagram(d);
             }
@@ -815,7 +830,11 @@ impl Driver {
         }
         self.send_hello(&conn);
         let direct = self.hops.lock().get(&peer).is_some_and(|h| h.direct);
+        // on a version 2 hop its hello says whether it takes attestations:
+        // until then its greeting waits (briefly)
+        let hello = hop_version(&conn) >= WIRE_V2;
         self.with_router(|r, now| {
+            r.set_attests(peer, if hello { None } else { Some(false) }, now);
             r.hop_up(peer, now);
             r.tick(now);
         });
@@ -980,7 +999,7 @@ impl Driver {
             Some(&T_OGM) => {
                 if let Some(a) = wire::decode_announce(&d) {
                     let wall = wall_ms();
-                    self.with_router(|r, now| r.on_announce(from, a, now, wall, wire::verify_announce));
+                    self.with_router(|r, now| r.on_announce(from, a, now, wall, wire::verify));
                 }
             }
             Some(&T_OGMS) => {
@@ -989,7 +1008,18 @@ impl Driver {
                     let wall = wall_ms();
                     self.with_router(|r, now| {
                         for a in anns {
-                            r.on_announce(from, a, now, wall, wire::verify_announce);
+                            r.on_announce(from, a, now, wall, wire::verify);
+                        }
+                    });
+                }
+            }
+            Some(&T_AOGMS) => {
+                let anns = wire::decode_attested(&d, &from);
+                if !anns.is_empty() {
+                    let wall = wall_ms();
+                    self.with_router(|r, now| {
+                        for a in anns {
+                            r.on_announce(from, a, now, wall, wire::verify);
                         }
                     });
                 }
@@ -1160,13 +1190,21 @@ impl Driver {
     }
 
     /// A neighbour's capability hello: what both of us have on this hop.
-    fn on_hello(&self, from: SignPk, body: &[u8]) -> Result<()> {
+    fn on_hello(self: &Arc<Self>, from: SignPk, body: &[u8]) -> Result<()> {
         let theirs = Hello::decode(body)?;
-        let mut hops = self.hops.lock();
-        let Some(h) = hops.get_mut(&from) else { return Ok(()) };
-        if let Some(p) = h.protocol.filter(|p| p.version >= WIRE_V2) {
-            h.protocol = Some(PeerProtocol::agreed(p.version, self.opts.protocol.caps, theirs.caps));
-        }
+        let agreed = {
+            let mut hops = self.hops.lock();
+            let Some(h) = hops.get_mut(&from) else { return Ok(()) };
+            let Some(p) = h.protocol.filter(|p| p.version >= WIRE_V2) else { return Ok(()) };
+            let agreed = PeerProtocol::agreed(p.version, self.opts.protocol.caps, theirs.caps);
+            h.protocol = Some(agreed);
+            agreed
+        };
+        let attests = agreed.supports(Caps::ROUTE_ATTEST);
+        self.with_router(|r, now| {
+            r.set_attests(from, Some(attests), now);
+            r.tick(now);
+        });
         Ok(())
     }
 
