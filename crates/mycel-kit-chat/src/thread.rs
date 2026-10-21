@@ -139,16 +139,19 @@ pub struct Source<'a> {
     pub floor_ms: u64,
 }
 
-/// (time, source, index): sorting by it is the merged order.
-fn key(sources: &[Source], s: usize, i: usize) -> (u64, usize, usize) {
-    (sources[s].view.messages[i].order_ms.max(sources[s].floor_ms), s, i)
+/// (time, own time, source, index): sorting by it is the merged order. The
+/// own (unclamped) time breaks ties between a message written at a source's
+/// floor and older ones clamped up to it: those were written first.
+fn key(sources: &[Source], s: usize, i: usize) -> (u64, u64, usize, usize) {
+    let order = sources[s].view.messages[i].order_ms;
+    (order.max(sources[s].floor_ms), order, s, i)
 }
 
 /// Several causally ordered histories as one timeline of (source, index),
 /// oldest first. Each source keeps its causal order; across sources messages
 /// interleave by author time made monotone along each history
 /// ([`Message::order_ms`]) and clamped to the source's floor, ties broken by
-/// source position. So the same sources and floors always give the same
+/// the unclamped time, then by source position. So the same sources and floors always give the same
 /// order, a reply never precedes its parent, and no message precedes the
 /// arrival of the space it was written in.
 pub fn merge(sources: &[Source]) -> Vec<(usize, usize)> {
@@ -159,7 +162,7 @@ pub fn merge(sources: &[Source]) -> Vec<(usize, usize)> {
         }
     }
     let mut out = Vec::with_capacity(sources.iter().map(|s| s.view.messages.len()).sum());
-    while let Some((_, s, i)) = heads.pop_first() {
+    while let Some((.., s, i)) = heads.pop_first() {
         out.push((s, i));
         if i + 1 < sources[s].view.messages.len() {
             heads.insert(key(sources, s, i + 1));
@@ -179,7 +182,7 @@ pub fn last(sources: &[Source], mut keep: impl FnMut(usize, &Message) -> bool) -
             Some(key(sources, s, i))
         })
         .max()
-        .map(|(_, s, i)| (s, i))
+        .map(|(.., s, i)| (s, i))
 }
 
 /// Index of the first message of source `s` that sorts after `anchor` in
@@ -189,9 +192,9 @@ fn split(sources: &[Source], s: usize, anchor: (usize, usize)) -> usize {
     if s == anchor_source {
         return anchor_index + 1;
     }
-    let (k, ..) = key(sources, anchor_source, anchor_index);
+    let (k, own, ..) = key(sources, anchor_source, anchor_index);
     let floor = sources[s].floor_ms;
-    sources[s].view.messages.partition_point(|m| (m.order_ms.max(floor), s) < (k, anchor_source))
+    sources[s].view.messages.partition_point(|m| (m.order_ms.max(floor), m.order_ms, s) < (k, own, anchor_source))
 }
 
 /// The timeline backwards from just before `anchor` (from the newest
@@ -213,7 +216,7 @@ pub fn newest_first<'a>(
         }
     }
     std::iter::from_fn(move || {
-        let (_, s, i) = heads.pop()?;
+        let (.., s, i) = heads.pop()?;
         if i > 0 {
             heads.push(key(sources, s, i - 1));
         }
@@ -235,7 +238,7 @@ pub fn oldest_first<'a>(
         }
     }
     std::iter::from_fn(move || {
-        let Reverse((_, s, i)) = heads.pop()?;
+        let Reverse((.., s, i)) = heads.pop()?;
         if i + 1 < sources[s].view.messages.len() {
             heads.push(Reverse(key(sources, s, i + 1)));
         }
@@ -358,6 +361,21 @@ mod tests {
         assert_eq!(merge(&unclamped)[0], (1, 0));
     }
 
+    /// A message written in the very millisecond another alias was first
+    /// seen is newer than that alias's older messages, which are only
+    /// clamped up to that millisecond. (Ties used to go by source position:
+    /// a message just sent could show up above older ones.)
+    #[test]
+    fn a_message_at_the_floor_follows_the_older_messages_clamped_to_it() {
+        let mine = reduce(&[text(1, 1, 1000)]);
+        let alias = reduce(&[text(2, 2, 100), text(3, 2, 200)]);
+        let sources = [Source { view: &mine, floor_ms: 1000 }, Source { view: &alias, floor_ms: 1000 }];
+        let order: Vec<u8> = merge(&sources).into_iter().map(|(s, i)| sources[s].view.messages[i].id.0[0]).collect();
+        assert_eq!(order, vec![2, 3, 1]);
+        assert_eq!(last(&sources, |_, _| true), Some((0, 0)));
+        assert_eq!(newest_first(&sources, None).next(), Some((0, 0)));
+    }
+
     #[test]
     fn merge_keeps_each_history_causal_and_last_agrees_with_merge() {
         // Clock skew: a reply (3) carries an earlier time than its parent (2).
@@ -380,7 +398,8 @@ mod tests {
     fn paging_from_any_message_matches_the_merged_timeline() {
         let a = reduce(&[text(1, 1, 100), text(2, 1, 500), text(3, 2, 150), text(4, 1, 600), text(8, 1, 600)]);
         let b = reduce(&[text(5, 2, 120), text(6, 2, 550), text(7, 2, 900), text(9, 2, 600)]);
-        for floors in [(0, 0), (0, 580), (700, 0)] {
+        // (0, 600) and (600, 600): clamped times tie with written ones
+        for floors in [(0, 0), (0, 580), (700, 0), (0, 600), (600, 600)] {
             let sources = [Source { view: &a, floor_ms: floors.0 }, Source { view: &b, floor_ms: floors.1 }];
             let merged = merge(&sources);
             let newest: Vec<_> = newest_first(&sources, None).collect();

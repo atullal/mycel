@@ -149,7 +149,8 @@ async fn connect_call(alice: &Device, bob: &Device, space: Hash32, video: bool) 
     let out = alice.calls.start(space).await.unwrap();
     if video {
         let i = alice.calls.set_camera(&out.id, true).await.unwrap();
-        assert_eq!(i.state, CallPhase::Connecting);
+        // (or ringing already: the call runs on its own task)
+        assert!(matches!(i.state, CallPhase::Connecting | CallPhase::Ringing), "{i:?}");
     }
     let ring = eventually("bob's device rings", 15, || bob.incoming().filter(|r| r.id == out.id)).await;
     bob.calls.accept(&ring.id).await.unwrap();

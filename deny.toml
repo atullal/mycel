@@ -36,10 +36,28 @@ feature-depth = 1
 unmaintained = "all"
 unsound = "all"
 yanked = "deny"
+#
+# Each ignore names the one advisory, why Mycel isn't exposed, and when to
+# look again. The same list is in .cargo/audit.toml for `cargo audit`.
 ignore = [
-  # Linux only. Tauri's GTK 3 stack (gtk-rs 0.18) is the only user and has
-  # no release on a fixed glib. Mycel never calls glib::VariantStrIter.
+  # Unsound `Iterator` impls of glib::VariantStrIter (fixed in glib 0.20).
+  # Linux only: glib 0.18 comes with Tauri's GTK 3 webview (wry 0.57 and
+  # tao 0.37 need gtk 0.18; webkit2gtk is pinned at =2.0.2, also gtk 0.18).
+  # No Tauri release uses gtk 0.19 yet (tauri-apps/wry#1841 is open). No
+  # code in this repository or in any crate between us and glib calls
+  # VariantStrIter or Variant::array_iter_str (grep, 2026-10-20).
+  # Review by 2027-01-31, or when wry moves to gtk 0.19.
   { id = "RUSTSEC-2024-0429", reason = "glib 0.18 via Tauri's GTK 3 webview on Linux; VariantStrIter unused; no fixed version Tauri can use" },
+  # "Unmaintained" notices, not vulnerabilities: zbus 6.0 (2026-10-16)
+  # merged zvariant, zvariant_derive and zbus_names into itself. Linux only.
+  # zbus 5 stays in the graph through notify-rust 4.18 and
+  # tauri-plugin-opener 2.7 (both `zbus ^5`, no zbus 6 release yet), so
+  # moving mycel-link-iface alone would only add a second D-Bus stack.
+  # Review by 2027-01-31, or when both have moved: then move
+  # mycel-link-iface to zbus 6 too.
+  { id = "RUSTSEC-2026-0370", reason = "zvariant: merged into zbus 6; zbus 5 still required by notify-rust and tauri-plugin-opener (Linux)" },
+  { id = "RUSTSEC-2026-0371", reason = "zbus_names: merged into zbus 6; zbus 5 still required by notify-rust and tauri-plugin-opener (Linux)" },
+  { id = "RUSTSEC-2026-0372", reason = "zvariant_derive: merged into zbus 6; zbus 5 still required by notify-rust and tauri-plugin-opener (Linux)" },
   # Compile-time only: proc macros of glib-macros 0.18 (Tauri on Linux) and
   # of netlink-packet-core (Iroh's network monitor on Linux and Android).
   # Neither runs in the shipped binaries. No maintained drop-in release yet.
