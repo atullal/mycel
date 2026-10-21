@@ -44,17 +44,15 @@ pub fn parse_change(bytes: &[u8]) -> Option<Change> {
     crate::bounded_change::parse(bytes).ok()
 }
 
-/// Decode `change`'s operations with this crate's column decoder and check
-/// every row against Automerge's own decoding of the same change; panics on
-/// any difference. Returns the number of operations, or `None` if our decoder
-/// refused the change (refusing is allowed, disagreeing is not), or if a row
-/// names an actor the change doesn't list: the causal index refuses those
-/// (`doc_index.rs`), and Automerge's expansion of such a change panics. Also
-/// `None` if the change lists an actor twice (the index refuses that too):
-/// Automerge's expansion names actors by id, which can't tell the two apart.
-pub fn check_ops_against_upstream(change: &Change) -> Option<usize> {
-    let actors: Vec<ActorId> = change.actors().cloned().collect();
-    if actors.iter().collect::<HashSet<_>>().len() != actors.len() {
+/// Our column decoder's rows for `change`, if Automerge can expand the
+/// change without panicking: our decoder accepts it, it lists no actor
+/// twice (Automerge's expansion names actors by id, which can't tell the two
+/// apart), and no row names an actor the change doesn't list (Automerge's
+/// expansion panics on those). The causal index (`doc_index.rs`) refuses
+/// every change this returns `None` for, so Automerge never applies one.
+fn expandable(change: &Change) -> Option<Vec<(Obj, Key, bool, Vec<OpRef>)>> {
+    let actors = change.actors().count();
+    if change.actors().collect::<HashSet<_>>().len() != actors {
         return None;
     }
     let mut ours: Vec<(Obj, Key, bool, Vec<OpRef>)> = Vec::new();
@@ -63,7 +61,7 @@ pub fn check_ops_against_upstream(change: &Change) -> Option<usize> {
         Ok(())
     })
     .ok()?;
-    let listed = |r: &OpRef| r.actor < actors.len();
+    let listed = |r: &OpRef| r.actor < actors;
     let all_listed = ours.iter().all(|(obj, key, _, preds)| {
         let obj_ok = match obj {
             Obj::Op(r) => listed(r),
@@ -75,9 +73,18 @@ pub fn check_ops_against_upstream(change: &Change) -> Option<usize> {
         };
         obj_ok && key_ok && preds.iter().all(listed)
     });
-    if !all_listed {
-        return None;
-    }
+    all_listed.then_some(ours)
+}
+
+/// Decode `change`'s operations with this crate's column decoder and check
+/// every row against Automerge's own decoding of the same change; panics on
+/// any difference. Returns the number of operations, or `None` if our decoder
+/// refused the change (refusing is allowed, disagreeing is not), or if
+/// Automerge couldn't expand it (see `expandable`; the causal index refuses
+/// those).
+pub fn check_ops_against_upstream(change: &Change) -> Option<usize> {
+    let actors: Vec<ActorId> = change.actors().cloned().collect();
+    let ours = expandable(change)?;
     let expected = change.decode().operations;
     let convert = |id: &LegacyOpId| OpRef {
         counter: id.counter(),
@@ -102,6 +109,27 @@ pub fn check_ops_against_upstream(change: &Change) -> Option<usize> {
         assert_eq!(got, want, "operation {i} has different predecessors");
     }
     Some(ours.len())
+}
+
+/// Whether every counter value and increment in `change` lies within
+/// `±bound`. Automerge sums a counter's increments with plain `i64`
+/// arithmetic, which wraps in release builds (identically on every device:
+/// see `tests::concurrent_counter_increments_that_overflow_converge`) and
+/// panics where overflow checks are on, as they are in the fuzz targets. The
+/// targets that apply changes skip inputs that could reach that sum, and so
+/// keep overflow checks on for the rest of Automerge. A change Automerge
+/// couldn't expand counts as within: the causal index refuses it.
+pub fn counters_within(change: &Change, bound: i64) -> bool {
+    use automerge::ScalarValue;
+    use automerge::legacy::OpType;
+    if expandable(change).is_none() {
+        return true;
+    }
+    change.decode().operations.iter().all(|op| match &op.action {
+        OpType::Increment(by) => by.unsigned_abs() <= bound.unsigned_abs(),
+        OpType::Put(ScalarValue::Counter(c)) => i64::from(c).unsigned_abs() <= bound.unsigned_abs(),
+        _ => true,
+    })
 }
 
 /// One document's causal index (see `doc_index.rs`).

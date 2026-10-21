@@ -61,13 +61,12 @@ debug = 1
 codegen-units = 16
 incremental = false
 
-# As in the main workspace's profiles: Automerge's counters wrap, as they do
-# in release builds (see the root Cargo.toml). Naming debug assertions here
-# makes Cargo pass the overflow-checks setting explicitly, so cargo-fuzz's
-# `-Cdebug-assertions` doesn't turn them back on.
-[profile.release.package.automerge]
-debug-assertions = true
-overflow-checks = false
+# Every crate, Automerge included, is built with overflow checks (cargo-fuzz's
+# `-Cdebug-assertions` turns them on): Automerge parses and applies more
+# member-supplied bytes than anything else. The main workspace builds
+# Automerge without them (see the root Cargo.toml) because its counters wrap
+# in release builds; the targets that apply changes keep counter values small
+# instead (`sync_doc`, `sync_replica`).
 
 # Each target, in alphabetical order. `test`, `doc` and `bench` are off: they
 # are libFuzzer binaries, not test harnesses.

@@ -10,6 +10,12 @@
 //! the same envelopes in different orders (one in batches as they arrive,
 //! one restored from storage in reverse order) end in the same state:
 //! the same status for every envelope, the same documents and feeds.
+//!
+//! Automerge runs with overflow checks on here, so an input whose crafted
+//! change carries a counter value or increment beyond ±2^32 is skipped:
+//! Automerge sums those with plain `i64` arithmetic, which wraps in release
+//! builds, identically on every device (pinned by `mycel-sync`'s
+//! `concurrent_counter_increments_that_overflow_converge`).
 #![no_main]
 
 use std::sync::{Arc, LazyLock};
@@ -19,7 +25,7 @@ use automerge::ROOT;
 use automerge::transaction::Transactable;
 use libfuzzer_sys::fuzz_target;
 use mycel_crypto::DeviceKeys;
-use mycel_sync::fuzzing::{change_body, frame_change, seal};
+use mycel_sync::fuzzing::{change_body, counters_within, frame_change, parse_change, seal};
 use mycel_sync::{Envelope, EnvelopeId, FeedEntry, Replica, StreamId, StreamKind};
 use mycel_trust::{Role, SignedOp};
 
@@ -81,6 +87,11 @@ enum Msg {
     WireEnvelope(Vec<u8>),
     WireOp(Vec<u8>),
 }
+
+/// The largest counter value or increment a crafted change may carry (see
+/// above): 24 changes of at most 2^20 operations each can't sum past
+/// `i64::MAX`.
+const COUNTER_BOUND: i64 = 1 << 32;
 
 #[derive(Arbitrary, Debug)]
 struct Input {
@@ -169,6 +180,11 @@ fuzz_target!(|input: Input| {
                     }
                     Payload::Raw(bytes) => bytes,
                 };
+                if stream.kind == StreamKind::Doc
+                    && parse_change(&plaintext).is_some_and(|c| !counters_within(&c, COUNTER_BOUND))
+                {
+                    return;
+                }
                 let Ok(env) = seal(&writer, stream, &plaintext, seq, prev, nonce) else { continue };
                 if matches!(at, Chain::Next) {
                     chain.push((seq, env.id()));

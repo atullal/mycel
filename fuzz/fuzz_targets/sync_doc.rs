@@ -10,7 +10,15 @@
 //!   dependencies are (an honest edit is never refused);
 //! - safety: Automerge applies every admitted change, and the index's heads
 //!   stay Automerge's heads;
-//! - and nothing panics.
+//! - every honest change passes the network-wide parser (`bounded_change.rs`)
+//!   and our op decoder reads it as Automerge does (no false refusals);
+//! - and nothing panics, with overflow checks on in Automerge too.
+//!
+//! Counters and increments stay within ±2^32 (honest ones by construction,
+//! a crafted change or the input is skipped): Automerge sums them with plain
+//! `i64` arithmetic, which wraps in release builds (pinned by
+//! `mycel-sync`'s `concurrent_counter_increments_that_overflow_converge`)
+//! and would end the run here.
 #![no_main]
 
 use std::collections::HashSet;
@@ -19,7 +27,9 @@ use arbitrary::Arbitrary;
 use automerge::transaction::Transactable;
 use automerge::{ActorId, AutoCommit, Change, ChangeHash, ObjId, ObjType, ROOT, ReadDoc, ScalarValue};
 use libfuzzer_sys::fuzz_target;
-use mycel_sync::fuzzing::{DocIndex, change_body, frame_change, parse_change};
+use mycel_sync::fuzzing::{
+    DocIndex, change_body, check_ops_against_upstream, counters_within, frame_change, parse_change,
+};
 
 #[derive(Arbitrary, Debug)]
 enum Value {
@@ -42,7 +52,7 @@ impl From<Value> for ScalarValue {
             Value::F64(f) => ScalarValue::F64(f),
             Value::Bool(b) => ScalarValue::Boolean(b),
             Value::Null => ScalarValue::Null,
-            Value::Counter(c) => ScalarValue::counter(c),
+            Value::Counter(c) => ScalarValue::counter(small(c)),
             Value::Timestamp(t) => ScalarValue::Timestamp(t),
         }
     }
@@ -86,6 +96,16 @@ struct Input {
 }
 
 const AUTHORS: usize = 3;
+
+/// The largest counter value or increment fed to Automerge (see above): a
+/// change holds at most 2^20 operations and a document here a few dozen
+/// changes, so no sum of these reaches `i64::MAX`.
+const COUNTER_BOUND: i64 = 1 << 32;
+
+/// `v` scaled into ±[`COUNTER_BOUND`], keeping its sign.
+fn small(v: i64) -> i64 {
+    v >> 31
+}
 
 struct Author {
     doc: AutoCommit,
@@ -157,7 +177,7 @@ fn apply(a: &mut Author, edit: Edit) {
         }
         Edit::Increment { obj, key: k, by } => {
             if let Some(o) = a.obj(obj, &[Kind::Map]) {
-                let _ = a.doc.increment(&o, key(k), by);
+                let _ = a.doc.increment(&o, key(k), small(by));
             }
         }
         Edit::Splice { obj, index, delete, text } => {
@@ -268,6 +288,13 @@ fuzz_target!(|input: Input| {
             }
         }
     }
+    // no false refusals: what Automerge writes, the network-wide parser and
+    // our op decoder accept as it is
+    for c in &changes {
+        let parsed = parse_change(c.raw_bytes()).expect("an honest change parses");
+        assert_eq!(parsed.hash(), c.hash());
+        assert!(check_ops_against_upstream(&parsed).is_some(), "our op decoder refused an honest change");
+    }
     let mut honest: HashSet<ChangeHash> = changes.iter().map(Change::hash).collect();
     if let Some(m) = input.mutation
         && !changes.is_empty()
@@ -283,6 +310,9 @@ fuzz_target!(|input: Input| {
             }
         }
         if let Some(crafted) = parse_change(&frame_change(1, &body)) {
+            if !counters_within(&crafted, COUNTER_BOUND) {
+                return;
+            }
             // A crafted change may take an honest author's next slot (the
             // replica resolves such forks before validation; the index alone
             // refuses the second claimant), so that author's changes are no
