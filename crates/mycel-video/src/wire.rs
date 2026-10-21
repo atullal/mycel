@@ -117,6 +117,16 @@ pub enum VideoCtrl {
 }
 
 impl VideoCtrl {
+    /// The first call protocol version that has this message: a track on
+    /// an older leg never sends it ([`crate::TrackOptions::call_version`]).
+    /// Every message so far is in call/1; one added later says 2 or newer
+    /// (no catch-all, so nobody adds a variant without choosing).
+    pub fn since(&self) -> u16 {
+        match self {
+            VideoCtrl::KeyframeRequest { .. } | VideoCtrl::State { .. } | VideoCtrl::Dropped { .. } => 1,
+        }
+    }
+
     pub fn encode(&self) -> Bytes {
         let body = postcard::to_allocvec(self).expect("serializable");
         let mut b = BytesMut::with_capacity(2 + body.len());

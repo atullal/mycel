@@ -10,14 +10,14 @@ use parking_lot::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::BASE64URL_NOPAD;
-use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallManager};
+use mycel_call::{BoxFuture, CallEvent, CallHost, CallManager};
 use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, SignPk, SymKey, random};
 use mycel_kit_chat::alerts::{self, AlertPolicy, ChatAlert, Latest, ThreadState};
 #[cfg(test)]
 use mycel_kit_chat::reduce;
 use mycel_kit_chat::thread::{self as chat_thread, Direct, Membership, Source};
 use mycel_kit_chat::{AttachmentRef, ChatOp, ChatSignal, ChatState, ChatView, ProfileHistory, messages_feed};
-use mycel_net::{ContactCard, ExtraProtocol, NetEvent, NetMode, Node, NodeOptions, PathKind, PeerState};
+use mycel_net::{ContactCard, NetEvent, NetMode, Node, NodeOptions, PathKind, PeerState};
 use mycel_sync::{FeedCursor, Replica};
 use mycel_trust::{Role, SpaceId};
 use serde::{Deserialize, Serialize};
@@ -234,8 +234,7 @@ impl CallHost for RuntimeCallHost {
         let rt = self.rt.clone();
         Box::pin(async move {
             let rt = rt.upgrade().context("shutting down")?;
-            rt.node
-                .connect(peer, ALPN_CALL)
+            mycel_call::proto::connect(&rt.node, peer)
                 .await
                 .map_err(|e| anyhow!("{} can't be reached right now ({e:#})", rt.name_of(&peer)))
         })
@@ -730,7 +729,7 @@ impl Runtime {
         // ciphertext only: no calls.
         let (call_tx, call_rx) = tokio::sync::mpsc::unbounded_channel();
         if !opts.keeper {
-            nopts.extra_protocols.push(ExtraProtocol { alpn: ALPN_CALL.to_vec(), incoming: call_tx });
+            nopts.extra_protocols.extend(mycel_call::proto::extra_protocols(call_tx));
         }
         let engine =
             mycel_rules::RulesEngine::load(CHAT_RULES_WASM).map_err(|e| anyhow!("chat rules failed to load: {e:?}"))?;

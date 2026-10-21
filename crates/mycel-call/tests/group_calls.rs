@@ -11,7 +11,7 @@ use common::*;
 use mycel_call::audio::TestSource;
 use mycel_call::level::goertzel;
 use mycel_call::proto::{self, CallRef, Ctrl};
-use mycel_call::{ALPN_CALL, CallInfo, CallPhase, EndReason, ParticipantState};
+use mycel_call::{CallInfo, CallPhase, EndReason, ParticipantState};
 use mycel_crypto::Hash32;
 use mycel_net::link::{MemNet, PathKind};
 use mycel_trust::Role;
@@ -272,7 +272,7 @@ async fn outsiders_and_removed_members_are_refused() {
         (&alice, Ctrl::Watch { version: proto::VERSION, call: cref }),
         (&alice, Ctrl::Ring { version: proto::VERSION, call: own, group: true }),
     ] {
-        let conn = eve.node.connect(to.node.id(), ALPN_CALL).await.unwrap();
+        let conn = eve.node.connect(to.node.id(), proto::ALPN_CALL_V2).await.unwrap();
         let (mut tx, mut rx) = conn.open_bi().await.unwrap();
         proto::send(&mut tx, &msg).await.unwrap();
         assert_eq!(proto::recv(&mut rx).await.unwrap(), Some(Ctrl::Denied), "{msg:?}");

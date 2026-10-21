@@ -1,4 +1,5 @@
-//! Call signalling (ALPN `mycel/call/1`).
+//! Call signalling (ALPNs `mycel/call/2` and `mycel/call/1`, see
+//! [`ALPNS_CALL`]).
 //!
 //! A call is a full mesh: every participant has one QUIC connection (a
 //! "leg") to every other participant, dialed straight to their device key.
@@ -62,15 +63,30 @@ use anyhow::{Result, bail};
 use mycel_crypto::{Hash32, SignPk};
 use serde::{Deserialize, Serialize};
 
-/// The call protocol, major version 1 (docs/PROTOCOL.md §3.8). A change an
-/// older build would misread gets a new ALPN, offered beside this one.
-pub const ALPN_CALL: &[u8] = b"mycel/call/1";
-/// The minor revision within [`ALPN_CALL`], sent in `Ring`, `Join` and
-/// `Watch`. A newer one only adds what older builds may skip: control
-/// messages they don't know are passed over ([`recv`]), not fatal.
+/// The call protocol as pre-release builds speak it (docs/PROTOCOL.md
+/// §3.8). Those builds end a leg on a control message ([`Ctrl`], or video's
+/// `VideoCtrl`) of a variant they don't have, so a leg on this version is
+/// only ever sent the variants call/1 has ([`Ctrl::since`]).
+pub const ALPN_CALL_V1: &[u8] = b"mycel/call/1";
+/// The same bytes as [`ALPN_CALL_V1`], plus a promise: the receiver skips
+/// [`Ctrl`] and `VideoCtrl` variants it doesn't have ([`recv`]) instead of
+/// ending the leg. A later build may add messages of either kind and send
+/// them on call/2 legs, and only there.
+pub const ALPN_CALL_V2: &[u8] = b"mycel/call/2";
+/// Every version of the call protocol this build speaks, newest (preferred)
+/// first: dialers offer them in this order and listeners register them in
+/// it, so two devices land on the newest both speak. A change an older
+/// build would misread gets a new ALPN here, never new bytes under an old
+/// one.
+pub const ALPNS_CALL: [&[u8]; 2] = [ALPN_CALL_V2, ALPN_CALL_V1];
+/// The newest call protocol version this build speaks.
+pub const CALL_VERSION: u16 = 2;
+/// Sent in `Ring`, `Join` and `Watch` since call/1. Nothing reads it (a
+/// leg's version is its ALPN, [`version_of`]) and it stays 1, so those
+/// messages keep their call/1 bytes.
 pub const VERSION: u16 = 1;
 /// How many [`Ctrl`] variants this build knows (a message whose tag is past
-/// them comes from a newer minor revision).
+/// them comes from a newer build).
 const KNOWN_CTRL: u32 = 16;
 /// Most people in one call (you included).
 pub const MAX_PARTICIPANTS: usize = 8;
@@ -79,6 +95,37 @@ pub const MAX_CTRL: usize = 4096;
 const CTX_CALL_ID: &str = "mycel/v0/call-id";
 
 pub type CallId = Hash32;
+
+/// The call protocol version a leg's connection runs, from its ALPN
+/// (`Connection::alpn`); `None` for an ALPN that isn't the call protocol.
+pub fn version_of(alpn: &[u8]) -> Option<u16> {
+    match alpn {
+        ALPN_CALL_V1 => Some(1),
+        ALPN_CALL_V2 => Some(2),
+        _ => None,
+    }
+}
+
+/// [`version_of`] a leg's connection; 1 (send only what every build takes)
+/// when the ALPN isn't one of ours.
+pub fn leg_version(conn: &mycel_net::iroh::endpoint::Connection) -> u16 {
+    version_of(conn.alpn()).unwrap_or(1)
+}
+
+/// The call protocol's entries for `NodeOptions::extra_protocols`: every
+/// version this build speaks, newest first, all handed to `incoming`
+/// (`CallManager::serve`), which tells them apart by [`leg_version`].
+pub fn extra_protocols(
+    incoming: tokio::sync::mpsc::UnboundedSender<mycel_net::iroh::endpoint::Connection>,
+) -> Vec<mycel_net::ExtraProtocol> {
+    ALPNS_CALL.iter().map(|a| mycel_net::ExtraProtocol { alpn: a.to_vec(), incoming: incoming.clone() }).collect()
+}
+
+/// Dial `peer` for a call leg, offering every version this build speaks
+/// (for `CallHost::connect`).
+pub async fn connect(node: &mycel_net::Node, peer: SignPk) -> Result<mycel_net::iroh::endpoint::Connection> {
+    node.connect_offering(peer, &ALPNS_CALL).await
+}
 
 /// The id of a call placed by `caller` in `space`.
 pub fn call_id(space: &Hash32, caller: &SignPk, nonce: &[u8; 16]) -> CallId {
@@ -164,6 +211,31 @@ pub enum Ctrl {
 }
 
 impl Ctrl {
+    /// The first call protocol version that has this message: a leg of an
+    /// older version is never sent it ([`may_send`]). Every message so far
+    /// is in call/1. A variant added later says 2 (or newer) here, and the
+    /// match has no catch-all so that nobody can add one without choosing.
+    pub fn since(&self) -> u16 {
+        match self {
+            Ctrl::Ring { .. }
+            | Ctrl::Join { .. }
+            | Ctrl::Watch { .. }
+            | Ctrl::Ringing
+            | Ctrl::Accept
+            | Ctrl::Decline { .. }
+            | Ctrl::Busy
+            | Ctrl::Glare
+            | Ctrl::Existing { .. }
+            | Ctrl::Denied
+            | Ctrl::Full
+            | Ctrl::Started
+            | Ctrl::HangUp
+            | Ctrl::Mute { .. }
+            | Ctrl::Report { .. }
+            | Ctrl::Roster { .. } => 1,
+        }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let body = postcard::to_allocvec(self).expect("control messages serialize");
         let mut out = Vec::with_capacity(2 + body.len());
@@ -180,20 +252,38 @@ impl Ctrl {
     }
 }
 
+/// Whether a message introduced in call protocol version `since` may go
+/// on a leg of version `leg`. An older leg's peer may be a pre-release
+/// build, which ends the leg on a message it doesn't know.
+pub fn may_send(since: u16, leg: u16) -> bool {
+    since <= leg
+}
+
 pub async fn send(tx: &mut mycel_net::iroh::endpoint::SendStream, msg: &Ctrl) -> Result<()> {
     tx.write_all(&msg.encode()).await?;
     Ok(())
 }
 
-/// Whether `body` is a control message of a newer minor revision: one
-/// whose variant tag this build doesn't have.
+/// [`send`] on a leg of call protocol version `leg`: a message that leg
+/// doesn't have is not sent (`Ok(false)`). Every message a leg queues
+/// goes through here.
+pub async fn send_on(tx: &mut mycel_net::iroh::endpoint::SendStream, leg: u16, msg: &Ctrl) -> Result<bool> {
+    if !may_send(msg.since(), leg) {
+        return Ok(false);
+    }
+    send(tx, msg).await?;
+    Ok(true)
+}
+
+/// Whether `body` is a control message of a newer build: one whose variant
+/// tag this build doesn't have.
 fn from_newer_revision(body: &[u8]) -> bool {
     postcard::take_from_bytes::<u32>(body).is_ok_and(|(tag, _)| tag >= KNOWN_CTRL)
 }
 
 /// The next control message; `None` when the peer finished the stream.
-/// Messages from a newer minor revision ([`VERSION`]) are skipped; a
-/// malformed message is an error.
+/// Messages of a variant this build doesn't have (a newer build's, sent
+/// only on call/2 legs) are skipped; a malformed message is an error.
 pub async fn recv(rx: &mut mycel_net::iroh::endpoint::RecvStream) -> Result<Option<Ctrl>> {
     recv_from(rx).await
 }
@@ -259,6 +349,48 @@ mod tests {
         assert!(recv_from(&mut &garbage[..]).await.is_err());
         let too_big = ((MAX_CTRL + 1) as u16).to_le_bytes();
         assert!(recv_from(&mut &too_big[..]).await.is_err());
+    }
+
+    /// Versions are named by ALPN, newest first, one name each; a leg is
+    /// only sent messages its version has, and every message so far is in
+    /// call/1, so a pre-release peer (call/1 only) can take all of them.
+    #[test]
+    fn legs_get_only_the_messages_their_version_has() {
+        assert_eq!(ALPNS_CALL, [b"mycel/call/2".as_slice(), b"mycel/call/1"]);
+        for (i, alpn) in ALPNS_CALL.iter().enumerate() {
+            assert_eq!(version_of(alpn), Some(CALL_VERSION - i as u16));
+        }
+        assert_eq!(version_of(b"mycel/2"), None);
+        assert_eq!(version_of(b"mycel/call/3"), None);
+        assert!(may_send(1, 1) && may_send(1, 2) && may_send(2, 2));
+        assert!(!may_send(2, 1), "a newer message never goes on a call/1 leg");
+        let call = CallRef::new(Hash32([5; 32]), SignPk([8; 32]), [6; 16]);
+        let all = [
+            Ctrl::Ring { version: VERSION, call, group: true },
+            Ctrl::Join { version: VERSION, call },
+            Ctrl::Watch { version: VERSION, call },
+            Ctrl::Ringing,
+            Ctrl::Accept,
+            Ctrl::Decline { missed: false },
+            Ctrl::Busy,
+            Ctrl::Glare,
+            Ctrl::Existing { call },
+            Ctrl::Denied,
+            Ctrl::Full,
+            Ctrl::Started,
+            Ctrl::HangUp,
+            Ctrl::Mute { muted: false },
+            Ctrl::Report { loss_ppm: 0, jitter_ms: 0, bitrate: 0 },
+            Ctrl::Roster { joined: vec![] },
+        ];
+        assert_eq!(all.len() as u32, KNOWN_CTRL, "every variant listed");
+        for m in &all {
+            assert_eq!(m.since(), 1, "{m:?} is a call/1 message");
+            assert!(may_send(m.since(), 1));
+        }
+        // the leg-opening messages keep their call/1 bytes
+        let ring = Ctrl::Ring { version: VERSION, call, group: false }.encode();
+        assert_eq!(&ring[2..4], &[0, 1], "variant 0, version 1");
     }
 
     #[test]

@@ -49,7 +49,8 @@ pub trait CallHost: Send + Sync + 'static {
     fn title(&self, _space: &Hash32) -> Option<String> {
         None
     }
-    /// Dial `peer`'s device for ALPN `mycel/call/1`.
+    /// Dial `peer`'s device for a call leg, offering every call protocol
+    /// version ([`crate::proto::connect`] does this with a node).
     fn connect(&self, peer: SignPk) -> BoxFuture<Result<Connection>>;
     /// A call connection is working (marks the peer online, notes the path).
     fn note_connection(&self, _peer: &SignPk, _conn: &Connection) {}
@@ -677,8 +678,9 @@ fn dial(mgr: &Arc<Mgr>, call: &Arc<Call>, peer: SignPk, why: Why, first: Ctrl) -
                 // handled (a `Started` handled first would join a leg
                 // without a connection: no path, no media)
                 let _ = ev.send(Ev::Dialed { peer, serial, conn: conn.clone() });
+                let version = proto::leg_version(&conn);
                 spawn_reader(ev.clone(), peer, serial, rx, conn);
-                write_loop(tx, out_rx).await;
+                write_loop(tx, version, out_rx).await;
             }
             other => {
                 let error = match other {
@@ -694,9 +696,12 @@ fn dial(mgr: &Arc<Mgr>, call: &Arc<Call>, peer: SignPk, why: Why, first: Ctrl) -
     leg
 }
 
-async fn write_loop(mut tx: SendStream, mut out: mpsc::UnboundedReceiver<Ctrl>) {
+/// Send what the leg queues, on a leg of call protocol version `version`:
+/// a message that version doesn't have is dropped here, never sent (the
+/// peer may be a pre-release build that ends the leg on it).
+async fn write_loop(mut tx: SendStream, version: u16, mut out: mpsc::UnboundedReceiver<Ctrl>) {
     while let Some(m) = out.recv().await {
-        if proto::send(&mut tx, &m).await.is_err() {
+        if proto::send_on(&mut tx, version, &m).await.is_err() {
             return;
         }
     }
@@ -733,7 +738,7 @@ fn attach_incoming(
     rx: RecvStream,
 ) -> mpsc::UnboundedSender<Ctrl> {
     let (out, out_rx) = mpsc::unbounded_channel();
-    tokio::spawn(write_loop(tx, out_rx));
+    tokio::spawn(write_loop(tx, proto::leg_version(conn), out_rx));
     spawn_reader(ev.clone(), peer, serial, rx, conn.clone());
     out
 }

@@ -206,6 +206,8 @@ struct Latest {
 
 struct Shared {
     conn: Connection,
+    /// [`TrackOptions::call_version`].
+    call_version: u16,
     me: [u8; 32],
     peer: [u8; 32],
     ui: broadcast::Sender<UiFrame>,
@@ -291,6 +293,12 @@ pub struct TrackOptions {
     pub me: [u8; 32],
     pub peer: [u8; 32],
     pub path: Option<PathKind>,
+    /// The call protocol version of the leg `conn` is (mycel-call's
+    /// `proto::leg_version`). A control message newer than it
+    /// ([`VideoCtrl::since`]) is not sent: on a version 1 leg the peer may
+    /// be a pre-release build, which ends the control stream on a variant
+    /// it doesn't have.
+    pub call_version: u16,
 }
 
 /// One direction-pair of video with one peer, for stats and the UI.
@@ -337,6 +345,7 @@ impl VideoTrack {
         let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
         let shared = Arc::new(Shared {
             conn: conn.clone(),
+            call_version: opts.call_version,
             me: opts.me,
             peer: opts.peer,
             ui,
@@ -795,6 +804,9 @@ async fn send_frames(sh: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<EncodedFra
 async fn write_ctrl(sh: Arc<Shared>, mut rx: mpsc::UnboundedReceiver<VideoCtrl>) {
     let mut stream: Option<SendStream> = None;
     while let Some(m) = rx.recv().await {
+        if m.since() > sh.call_version {
+            continue;
+        }
         let body = m.encode();
         if stream.is_none() {
             let mut d = Vec::with_capacity(1 + body.len());

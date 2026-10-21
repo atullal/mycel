@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use common::*;
 use mycel_call::audio::{AudioDiag, AudioHandle, AudioIo, AudioPorts, TestAudio, TestSource};
 use mycel_call::proto::{self, CallRef, Ctrl, call_id};
-use mycel_call::{ALPN_CALL, CallEvent, CallPhase, EndReason};
+use mycel_call::{CallEvent, CallPhase, EndReason};
 use mycel_crypto::Hash32;
 use mycel_net::MeshOptions;
 use mycel_net::link::{MemNet, PathKind};
@@ -160,7 +160,7 @@ async fn decline_timeout_busy_and_strangers() {
     // there, and if she rings Alice about it directly, Alice's device refuses.
     assert!(carol.calls.start(space).await.is_err());
     for bound_to in [carol.node.id(), bob.node.id()] {
-        let conn = carol.node.connect(alice.node.id(), ALPN_CALL).await.unwrap();
+        let conn = carol.node.connect(alice.node.id(), proto::ALPN_CALL_V2).await.unwrap();
         let (mut tx, mut rx) = conn.open_bi().await.unwrap();
         let nonce = [7u8; 16];
         // a valid id for Carol, or Bob's id replayed by Carol: both refused
@@ -312,6 +312,37 @@ async fn both_call_at_once_higher_key_slow_to_place_it() {
 #[tokio::test(flavor = "multi_thread")]
 async fn both_call_at_once_lower_key_slow_to_place_it() {
     glare_one_side_slow(false).await;
+}
+
+/// A device that speaks only `mycel/call/1` (as pre-release builds do) and
+/// a current one call each other both ways: the legs land on call/1 (so
+/// the current device sends only call/1 messages on them, see
+/// `proto::send_on`), audio flows, and two current devices land on call/2.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_1_device_and_a_call_2_device_call_on_call_1() {
+    let old = device_speaking("old", sine(440.0), &[proto::ALPN_CALL_V1]).await;
+    let new = device("new", sine(660.0), true, &[]).await;
+    let newer = device("newer", sine(880.0), true, &[]).await;
+    for (a, b) in [(&old, &new), (&new, &newer)] {
+        a.node.add_peer_addr(b.node.addr());
+        b.node.add_peer_addr(a.node.addr());
+    }
+    let legs = |d: &Device, id: &str| -> Vec<u16> {
+        d.calls.connections(id).iter().map(|(_, c)| proto::version_of(c.alpn()).unwrap()).collect()
+    };
+    for (caller, callee, hz) in [(&new, &old, 660.0), (&old, &new, 440.0)] {
+        let space = shared_space(caller, callee).await;
+        let id = connect_call(caller, callee, space).await;
+        assert_eq!((legs(caller, &id), legs(callee, &id)), (vec![1], vec![1]));
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let heard = callee.heard(1.0).expect("callee hears the caller");
+        assert!((heard - hz).abs() < 8.0, "heard {heard} Hz");
+        caller.calls.end(&id).unwrap();
+        eventually("ended", 10, || (callee.call(&id)?.state == CallPhase::Ended).then_some(())).await;
+    }
+    let space = shared_space(&new, &newer).await;
+    let id = connect_call(&new, &newer, space).await;
+    assert_eq!((legs(&new, &id), legs(&newer, &id)), (vec![2], vec![2]));
 }
 
 /// No IP at all: the call starts on peer-to-peer Wi-Fi, then that link is

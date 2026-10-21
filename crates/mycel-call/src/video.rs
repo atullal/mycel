@@ -14,7 +14,7 @@ use tokio::sync::broadcast;
 
 use crate::engine::TrackSink;
 use crate::manager::selected_path;
-use crate::proto::CallId;
+use crate::proto::{self, CallId};
 
 pub struct VideoHub {
     me: SignPk,
@@ -140,7 +140,7 @@ impl TrackSink for VideoHub {
             // (under the early lock, so a stream can't slip in between
             // adding the track and draining what arrived before it)
             let mut early = self.early.lock();
-            v.add_peer(peer.0, conn.clone(), selected_path(conn).0);
+            v.add_peer(peer.0, conn.clone(), selected_path(conn).0, proto::leg_version(conn));
             for (kind, rx) in early.remove(&(*call, *peer)).unwrap_or_default() {
                 let _ = v.stream(&peer.0, kind, rx);
             }
