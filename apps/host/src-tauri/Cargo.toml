@@ -49,7 +49,7 @@ objc2-ui-kit = { version = "0.3", default-features = false, features = ["std", "
 # Calls into MainActivity and MycelService (attachments, notifications, a
 # window for a reopened activity).
 [target.'cfg(target_os = "android")'.dependencies]
-jni = "0.21"
+jni = "0.22"
 ndk-context = "0.1"
 
 # WebKitGTK's camera capture is off unless turned on (the page captures for
