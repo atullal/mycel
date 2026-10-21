@@ -62,9 +62,10 @@ The first public version. It contains:
 - A suspended iPhone or iPad doesn't receive messages until Mycel is opened
   again.
 - Devices in a space should run builds with the same chat rules (they are
-  built in), and pre-release builds older than the `dev-2026-10-09-apps`
-  release may not interoperate (what is checked:
-  [PROTOCOL.md](docs/PROTOCOL.md) §5).
+  built in). The `dev-2026-10-09-apps` release speaks the same wire format
+  (version 1) and passed a basic cross-build check, but validates some data
+  differently from newer builds; older pre-release builds may not
+  interoperate ([PROTOCOL.md](docs/PROTOCOL.md) §5).
 
 More in [ARCHITECTURE.md](docs/ARCHITECTURE.md) §7 and
 [TRUST.md](docs/TRUST.md) §10.
