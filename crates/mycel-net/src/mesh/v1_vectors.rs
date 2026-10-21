@@ -10,12 +10,19 @@
 //! exactly. Never regenerate them from this build; a mismatch means a
 //! version 1 format changed, which needs a new wire version instead
 //! (§6).
+//!
+//! To check them against the pre-release code yourself:
+//! `scripts/v1-compat/run.sh` checks out `98d9b7b`, prints every vector
+//! with its encoders (`scripts/v1-compat/gen_vectors.rs`, the same inputs
+//! as here) and compares them with this file, then runs a `98d9b7b` node
+//! against a node of this build.
 
 use bytes::Bytes;
-use mycel_crypto::{DeviceKeys, Hash32, SignPk};
-use mycel_trust::EpochId;
+use mycel_crypto::{DeviceKeys, Hash32, Sig, SignPk};
+use mycel_sync::{Envelope, Header, StreamId};
+use mycel_trust::{Action, EpochId, Op, SignedOp};
 
-use super::core::{Frame, Origination};
+use super::core::{Frame, Origination, SeqReq};
 use super::dtn::{Bundle, BundleFormat};
 use super::{
     K_SUMMARY, RECEIPT_CTX, WireAnswer, WireSummary, bundle_id_of, bundle_sig_ok, bundle_signed, decode_offer,
@@ -120,6 +127,57 @@ const DATA_FRAME: &[&str] = &[
     "0a0a0a0102030400000003706b74",
 ];
 
+const SYNC_DATA_FULL: &[&str] = &[
+    "060101030303030303030303030303030303030303030303030303030303030303030301040404040404040404040404",
+    "04040404040404040404040404040404040404048a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801",
+    "b40f6f5c0705010505050505050505050505050505050505050505050505050505050505050505403910e32e573c92eb",
+    "cf9a00679bb8c8d84fde15e65b81ea2d1100a31ab0bb2ac4d1174fa40c0a5b72bddf6bae58f1f56f519d8f291c092e2e",
+    "e98555b6845ee008010303030303030303030303030303030303030303030303030303030303030303010b0b0b0b0b0b",
+    "0b0b0b0b0b0b0b0b0b0b8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c020105050505",
+    "050505050505050505050505050505050505050505050505050505050104040404040404040404040404040404040404",
+    "040404040404040404040404040606060606060606060606060606060607070707070707070707070707070707070707",
+    "070707070703010203400c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+    "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c",
+];
+
+const BLOB_REQ_GET: &[&str] = &[
+    "000303030303030303030303030303030303030303030303030303030303030303050505050505050505050505050505",
+    "0505050505050505050505050505050505",
+];
+
+const BLOB_REQ_PUT: &[&str] = &[
+    "010303030303030303030303030303030303030303030303030303030303030303050505050505050505050505050505",
+    "0505050505050505050505050505050505f0a204",
+];
+
+const BLOB_REQ_GET_FROM: &[&str] = &[
+    "020303030303030303030303030303030303030303030303030303030303030303050505050505050505050505050505",
+    "0505050505050505050505050505050505ac02",
+];
+
+const BLOB_REQ_OFFER: &[&str] = &[
+    "030303030303030303030303030303030303030303030303030303030303030303050505050505050505050505050505",
+    "0505050505050505050505050505050505f0a204",
+];
+
+const BLOB_RESPS: &[&str] = &["00f0a20401020305ac020607"];
+
+const OGMS: &[&str] = &[
+    "040100000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000000000000002a01",
+    "06000003090341646142abd9ed95668f7366c96e6e8a7bd2872c52caf0c9e3da03164ef32ea28fe31a9f85ce550b2c6e",
+    "36f204933c4273b4e4d192eeb9bfc5ac1e378b3d8747bfd6070100000000008139770ea87d175f56a35466c34c7ecccb",
+    "8d8a91b4ee37a25df60f5b8fc9b394000000000000000700020000000002426f74407642183a6635abf291311b78b1cf",
+    "9ad3884179c43cdd939d2a64e0c6debc40d37f89fcab832d3b53d6939f8d38378ace9eb9113879633d7ed32497807c07",
+];
+
+const SEQREQ: &[&str] = &["038a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c000000000000002b02"];
+
+const CONTROL_FRAME: &[&str] = &[
+    "0209028139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3948a88e3dd7409f195fd52db2d3c",
+    "ba5d72ca6709bf1d94121bf3748801b40f6f5c0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+    "0a0a0a010203040000000301aabb",
+];
+
 fn golden(parts: &[&str]) -> Vec<u8> {
     let hex = parts.concat();
     (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
@@ -136,6 +194,34 @@ struct Inputs {
     space: Hash32,
     op: Hash32,
     env: Hash32,
+}
+
+/// The data of `SYNC_DATA_FULL`, as `gen_vectors.rs` builds it: one signed
+/// op and one envelope (whose signature is a fixed pattern: only its bytes
+/// are pinned).
+fn full_data(a: &DeviceKeys, space: Hash32, op: Hash32, env: Hash32) -> Data {
+    let signed = SignedOp::sign(
+        a,
+        Op {
+            space: Some(space),
+            parents: vec![op],
+            author: a.sign_pk(),
+            nonce: 7,
+            action: Action::Leave { cutoff: Some(env) },
+        },
+    );
+    let header = Header {
+        space,
+        stream: StreamId { kind: mycel_sync::StreamKind::Feed, id: [11; 16] },
+        author: a.sign_pk(),
+        author_seq: 2,
+        author_prev: Some(env),
+        auth_heads: vec![op],
+        epoch: EpochId([6; 16]),
+        nonce: [7; 24],
+    };
+    let envelope = Envelope { header, ciphertext: vec![1, 2, 3], sig: Sig([12; 64]) };
+    Data { ops: vec![signed], envelopes: vec![envelope] }
 }
 
 fn inputs() -> Inputs {
@@ -166,9 +252,18 @@ fn version_1_alpns_and_stream_kinds() {
 /// blob requests and answers.
 #[test]
 fn version_1_node_protocol_messages() {
-    let Inputs { space, op, env, .. } = inputs();
+    let Inputs { a, space, op, env, .. } = inputs();
     let inv = Inventory { ops: vec![op], envelopes: vec![env] };
-    let cases: [(&[&str], Vec<u8>); 13] = [
+    let resps = [
+        pc(&BlobResp::Found { len: 70000 }),
+        pc(&BlobResp::NotFound),
+        pc(&BlobResp::Denied),
+        pc(&BlobResp::Stored),
+        pc(&BlobResp::SendFrom { offset: 300 }),
+        pc(&BlobResp::NoSpace),
+        pc(&BlobResp::Busy),
+    ];
+    let cases: [(&[&str], Vec<u8>); 19] = [
         (SYNC_HELLO, pc(&SyncMsg::Hello { space, inv: inv.clone(), invite: None })),
         (SYNC_HELLO_INVITE, pc(&SyncMsg::Hello { space, inv: Inventory::default(), invite: Some(vec![]) })),
         (SYNC_DENIED, pc(&SyncMsg::Denied)),
@@ -177,10 +272,16 @@ fn version_1_node_protocol_messages() {
         (SYNC_ACCEPT, pc(&SyncMsg::Accept { inv: inv.clone(), want: Inventory::default() })),
         (SYNC_DATA_AND_WANT, pc(&SyncMsg::DataAndWant { data: Data::default(), want: inv.clone() })),
         (SYNC_DATA, pc(&SyncMsg::Data { data: Data::default() })),
+        (SYNC_DATA_FULL, pc(&SyncMsg::Data { data: full_data(&a, space, op, env) })),
         (DTN_PAYLOAD, pc(&DtnPayload { space, data: Data::default() })),
         (EPH, pc(&EphMsg { space, epoch: EpochId([6; 16]), nonce: [7; 24], ciphertext: vec![8, 9] })),
         (BLOB_REQ_GET_RANGE, pc(&BlobReq::GetRange { space, hash: env, offset: 300, len: 70000 })),
+        (BLOB_REQ_GET, pc(&BlobReq::Get { space, hash: env })),
+        (BLOB_REQ_PUT, pc(&BlobReq::Put { space, hash: env, len: 70000 })),
+        (BLOB_REQ_GET_FROM, pc(&BlobReq::GetFrom { space, hash: env, offset: 300 })),
+        (BLOB_REQ_OFFER, pc(&BlobReq::Offer { space, hash: env, len: 70000 })),
         (BLOB_RESP_RANGE, pc(&BlobResp::Range { total: 70000, offset: 300 })),
+        (BLOB_RESPS, resps.concat()),
         (ANSWERS, [pc(&WireAnswer::Take(300)), pc(&WireAnswer::Duplicate), pc(&WireAnswer::Refuse(true))].concat()),
     ];
     for (i, (want, got)) in cases.iter().enumerate() {
@@ -200,6 +301,19 @@ fn version_1_node_protocol_messages() {
     }
     match postcard::from_bytes(&golden(BLOB_REQ_GET_RANGE)).unwrap() {
         BlobReq::GetRange { offset, len, .. } => assert_eq!((offset, len), (300, 70000)),
+        other => panic!("{other:?}"),
+    }
+    match postcard::from_bytes(&golden(SYNC_DATA_FULL)).unwrap() {
+        SyncMsg::Data { data } => {
+            assert_eq!(data.ops.len(), 1);
+            data.ops[0].verify_standalone().unwrap();
+            assert_eq!(data.ops[0].op.action, Action::Leave { cutoff: Some(env) });
+            let e = &data.envelopes[0];
+            assert_eq!(
+                (e.header.author_seq, e.header.author_prev, &e.ciphertext[..]),
+                (2, Some(env), &[1u8, 2, 3][..])
+            );
+        }
         other => panic!("{other:?}"),
     }
     let eph: EphMsg = postcard::from_bytes(&golden(EPH)).unwrap();
@@ -227,6 +341,16 @@ fn version_1_mesh_datagrams() {
     assert!(super::wire::verify_announce(&theirs));
     assert_eq!((theirs.origin, theirs.seq, &*theirs.name), (a.sign_pk(), 42, "Ada"));
 
+    let bo = super::wire::sign_announce(&b, Origination { seq: 7, flags: 0, scope: 2, uplink: 0 }, "Bo");
+    let ogms = super::wire::encode_announces(&[ann.clone(), bo], 1200);
+    assert_eq!(ogms.iter().map(|d| d.to_vec()).collect::<Vec<_>>(), vec![golden(OGMS)]);
+    let theirs = super::wire::decode_announces(&golden(OGMS));
+    assert_eq!(theirs.iter().map(|a| (a.origin, a.seq)).collect::<Vec<_>>(), vec![(a.sign_pk(), 42), (b.sign_pk(), 7)]);
+    assert!(theirs.iter().all(super::wire::verify_announce));
+    let req = SeqReq { origin: a.sign_pk(), seq: 43, hops: 2 };
+    assert_eq!(super::wire::encode_seqreq(&req).to_vec(), golden(SEQREQ));
+    assert_eq!(super::wire::decode_seqreq(&golden(SEQREQ)), Some(req));
+
     let frame = Frame {
         ttl: 9,
         reached: true,
@@ -244,6 +368,11 @@ fn version_1_mesh_datagrams() {
     let theirs = super::wire::decode_frame(Bytes::from(golden(DATA_FRAME))).unwrap();
     assert!(theirs.reached && !theirs.control && theirs.ext == 0);
     assert_eq!((theirs.ttl, theirs.id, theirs.dst, &theirs.payload[..]), (9, 0x01020304, b.sign_pk(), &b"pkt"[..]));
+    // a control message (for the destination's router): a reachability record's kind byte
+    let control = Frame { reached: false, control: true, payload: Bytes::from_static(&[1, 0xaa, 0xbb]), ..frame };
+    assert_eq!(super::wire::encode_frame(&control, 1200).unwrap().remove(0).to_vec(), golden(CONTROL_FRAME));
+    let theirs = super::wire::decode_frame(Bytes::from(golden(CONTROL_FRAME))).unwrap();
+    assert!(!theirs.reached && theirs.control && theirs.ext == 0 && theirs.payload[0] == 1);
 }
 
 /// Store-and-forward: a version 1 bundle's id and signature, its offer on
