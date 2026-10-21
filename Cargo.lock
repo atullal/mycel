@@ -3724,6 +3724,7 @@ dependencies = [
  "mycel-net",
  "mycel-sync",
  "mycel-trust",
+ "nix 0.31.3",
  "parking_lot",
  "serde_json",
  "tokio",
@@ -3766,6 +3767,7 @@ dependencies = [
  "mycel-net",
  "mycel-sync",
  "mycel-trust",
+ "nix 0.31.3",
  "parking_lot",
  "serde_json",
  "socket2",
@@ -3790,6 +3792,7 @@ dependencies = [
  "n0-future",
  "n0-mainline",
  "n0-watcher",
+ "nix 0.31.3",
  "noq-udp",
  "parking_lot",
  "postcard",
@@ -4250,6 +4253,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]

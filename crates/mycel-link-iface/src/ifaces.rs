@@ -10,68 +10,42 @@ use crate::classify::{Hw, IfaceInfo};
 /// Every interface, by name.
 #[cfg(unix)]
 pub fn list() -> Vec<IfaceInfo> {
+    use nix::net::if_::{InterfaceFlags as F, if_nametoindex};
     let mut by_name: BTreeMap<String, IfaceInfo> = BTreeMap::new();
-    let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills a linked list that we free with freeifaddrs.
-    if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
+    let Ok(addrs) = nix::ifaddrs::getifaddrs() else {
         return Vec::new();
-    }
-    let mut cur = addrs;
-    while !cur.is_null() {
-        // SAFETY: `cur` is a node of the list getifaddrs returned.
-        let ifa = unsafe { &*cur };
-        cur = ifa.ifa_next;
-        if ifa.ifa_name.is_null() {
-            continue;
-        }
-        // SAFETY: ifa_name is a NUL-terminated C string.
-        let cname = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) };
-        let name = cname.to_string_lossy().into_owned();
-        let flags = ifa.ifa_flags as libc::c_int;
-        let e = by_name.entry(name.clone()).or_insert_with(|| IfaceInfo {
-            // SAFETY: a NUL-terminated name.
-            index: unsafe { libc::if_nametoindex(cname.as_ptr()) },
-            up: flags & libc::IFF_UP != 0 && flags & libc::IFF_RUNNING != 0,
-            multicast: flags & libc::IFF_MULTICAST != 0,
-            loopback: flags & libc::IFF_LOOPBACK != 0,
+    };
+    for ifa in addrs {
+        let flags = ifa.flags;
+        let e = by_name.entry(ifa.interface_name.clone()).or_insert_with(|| IfaceInfo {
+            index: if_nametoindex(ifa.interface_name.as_str()).unwrap_or(0),
+            up: flags.contains(F::IFF_UP | F::IFF_RUNNING),
+            multicast: flags.contains(F::IFF_MULTICAST),
+            loopback: flags.contains(F::IFF_LOOPBACK),
             hw: Hw::Unknown,
             link_local: None,
             routable: false,
-            name,
+            name: ifa.interface_name,
         });
-        if ifa.ifa_addr.is_null() {
-            continue;
-        }
-        // SAFETY: ifa_addr points to a sockaddr of the family it names.
-        unsafe {
-            match i32::from((*ifa.ifa_addr).sa_family) {
-                libc::AF_INET => {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                    let ip = std::net::Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr));
-                    e.routable |= !ip.is_link_local() && !ip.is_loopback() && !ip.is_unspecified();
-                }
-                libc::AF_INET6 => {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
-                    let ip = unscoped(Ipv6Addr::from(sa.sin6_addr.s6_addr));
-                    if ip.is_unicast_link_local() {
-                        e.link_local.get_or_insert(ip);
-                    } else if e.loopback && ip.is_loopback() {
-                        // Linux's lo has no link-local address; tests use ::1
-                    } else {
-                        e.routable |= !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast();
-                    }
-                }
-                #[cfg(any(target_os = "macos", target_os = "ios"))]
-                libc::AF_LINK => {
-                    let sdl = &*(ifa.ifa_addr as *const libc::sockaddr_dl);
-                    e.hw = hw_of_ift(sdl.sdl_type);
-                }
-                _ => {}
+        let Some(addr) = ifa.address else { continue };
+        if let Some(sa) = addr.as_sockaddr_in() {
+            let ip = sa.ip();
+            e.routable |= !ip.is_link_local() && !ip.is_loopback() && !ip.is_unspecified();
+        } else if let Some(sa) = addr.as_sockaddr_in6() {
+            let ip = unscoped(sa.ip());
+            if ip.is_unicast_link_local() {
+                e.link_local.get_or_insert(ip);
+            } else if e.loopback && ip.is_loopback() {
+                // Linux's lo has no link-local address; tests use ::1
+            } else {
+                e.routable |= !ip.is_loopback() && !ip.is_unspecified() && !ip.is_multicast();
             }
         }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        if let Some(sdl) = addr.as_link_addr() {
+            e.hw = hw_of_ift(sdl.datalink_type());
+        }
     }
-    // SAFETY: frees the list allocated above.
-    unsafe { libc::freeifaddrs(addrs) };
     let mut out: Vec<IfaceInfo> = by_name.into_values().collect();
     for i in &mut out {
         if i.loopback {
@@ -237,5 +211,16 @@ mod tests {
             assert!(all.iter().any(|i| i.loopback), "{all:?}");
             assert!(all.iter().all(|i| i.index > 0), "{all:?}");
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn loopback_is_classified() {
+        let all = list();
+        let lo = all.iter().find(|i| i.name == "lo" || i.name == "lo0").unwrap_or_else(|| panic!("{all:?}"));
+        assert!(lo.loopback && lo.up && lo.hw == Hw::Loopback, "{lo:?}");
+        assert!(lo.link_local.is_some_and(|ll| ll.is_unicast_link_local() || ll.is_loopback()), "{lo:?}");
+        assert!(!lo.routable, "loopback addresses are not routable: {lo:?}");
+        assert_eq!(nix::net::if_::if_nametoindex(lo.name.as_str()).ok(), Some(lo.index));
     }
 }

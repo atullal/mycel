@@ -690,41 +690,20 @@ fn path_debug() -> bool {
 /// Local IP → interface name (`en0`, `bridge0`, `lo0`, ...).
 #[cfg(unix)]
 fn interface_names() -> HashMap<IpAddr, String> {
-    let mut out = HashMap::new();
-    let mut addrs: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: getifaddrs fills a linked list that we free with freeifaddrs.
-    if unsafe { libc::getifaddrs(&mut addrs) } != 0 {
-        return out;
-    }
-    let mut cur = addrs;
-    while !cur.is_null() {
-        // SAFETY: `cur` is a node of the list getifaddrs returned.
-        let ifa = unsafe { &*cur };
-        cur = ifa.ifa_next;
-        if ifa.ifa_addr.is_null() || ifa.ifa_name.is_null() {
-            continue;
-        }
-        // SAFETY: ifa_addr points to a sockaddr of the family it names.
-        let ip = unsafe {
-            match i32::from((*ifa.ifa_addr).sa_family) {
-                libc::AF_INET => {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                    IpAddr::from(u32::from_be(sa.sin_addr.s_addr).to_be_bytes())
-                }
-                libc::AF_INET6 => {
-                    let sa = &*(ifa.ifa_addr as *const libc::sockaddr_in6);
-                    IpAddr::from(sa.sin6_addr.s6_addr)
-                }
-                _ => continue,
-            }
-        };
-        // SAFETY: ifa_name is a NUL-terminated C string.
-        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) };
-        out.insert(ip, name.to_string_lossy().into_owned());
-    }
-    // SAFETY: frees the list allocated above.
-    unsafe { libc::freeifaddrs(addrs) };
-    out
+    let Ok(addrs) = nix::ifaddrs::getifaddrs() else {
+        return HashMap::new();
+    };
+    addrs
+        .filter_map(|ifa| {
+            let addr = ifa.address?;
+            let ip = match (addr.as_sockaddr_in(), addr.as_sockaddr_in6()) {
+                (Some(sa), _) => IpAddr::V4(sa.ip()),
+                (_, Some(sa)) => IpAddr::V6(sa.ip()),
+                _ => return None,
+            };
+            Some((ip, ifa.interface_name))
+        })
+        .collect()
 }
 
 #[cfg(not(unix))]
@@ -1074,6 +1053,17 @@ impl CustomSender for MemSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn loopback_addresses_name_the_loopback_interface() {
+        let names = interface_names();
+        let lo = names.get(&IpAddr::from([127, 0, 0, 1])).unwrap_or_else(|| panic!("{names:?}"));
+        assert!(lo == "lo" || lo == "lo0", "{names:?}");
+        if let Some(lo6) = names.get(&IpAddr::from(std::net::Ipv6Addr::LOCALHOST)) {
+            assert_eq!(lo6, lo, "::1 is on the same interface");
+        }
+    }
 
     #[test]
     fn medium_codes_round_trip() {
