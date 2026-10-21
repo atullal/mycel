@@ -15,8 +15,9 @@ What works on which platform, and how each was tested, is in
 
 **Use the same build on every device you test with when you can.** Builds
 since wire version 2 negotiate the protocol version with each other and
-with the pre-release builds just before them ([PROTOCOL.md](PROTOCOL.md)),
-but older pre-release builds changed formats unannounced: one can miss a
+with pre-release builds since the `dev-2026-10-09-apps` release
+([PROTOCOL.md](PROTOCOL.md) §5), but older pre-release builds changed
+formats unannounced: one can miss a
 newer one's messages or not see it on the network at all.
 
 | Device | File | First launch |

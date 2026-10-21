@@ -273,8 +273,11 @@ something changes.
     announcement format and costs a signature per hop, so it waits for the
     next protocol version; `docs/TRUST.md` §8b. The capability bit is
     registered (`ROUTE_ATTEST`, `docs/PROTOCOL.md` §4): attested
-    announcements will go only to neighbours whose hop hello has it, so
-    unattested hops keep working beside them.
+    announcements will go only to neighbours whose hop hello has it. That
+    alone would let a lying relay opt out by not advertising the bit, so
+    its downgrade policy (`docs/PROTOCOL.md` §6) is part of the design:
+    once a device has attesting neighbours, routes through hops that don't
+    attest rank below attested ones and serve only as a fallback.
 14. **Short queues under the hops, so control traffic gets through.**
     Announcements, seqno requests, keep-alives and the end-to-end
     connections' acknowledgements share each hop with the bulk data, and

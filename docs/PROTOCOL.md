@@ -28,6 +28,12 @@ that only add something, as QUIC and HTTP/3 do.
 
 **Versions by ALPN.** A dialer offers every version it speaks, newest first
 (`wire::alpns`, `mesh::alpns`, through iroh's `ConnectOptions::with_additional_alpns`).
+Each protocol's names are one table (`wire::ALPNS`, `mesh::ALPNS`, of type
+`version::AlpnTable`) whose length follows `WIRE_VERSION`, and a
+compile-time check (`version::alpn_table_ok`) requires every version in
+place under its own name: raising `WIRE_VERSION` without naming the new
+version's ALPN doesn't build, so one version's bytes can't reach a peer
+under another version's name.
 The listener registers its versions newest first and TLS picks the first of
 its own that the dialer offered, so two devices land on the newest version
 both speak, and a device that only speaks an old one keeps working. Nothing
@@ -55,7 +61,7 @@ send the same one.
 
 | Version | Built by | What it is |
 |---|---|---|
-| **1** | Pre-release builds (everything before this document) | No negotiation, no hello. Named by the ALPNs `mycel/2` and `mycel/mesh/1`. |
+| **1** | Pre-release builds (everything before this document; exactly which ones in §5) | No negotiation, no hello. Named by the ALPNs `mycel/2` and `mycel/mesh/1`. |
 | **2** | This build and later | Version 1 plus: a capability hello on the node protocol and on mesh hops; stream kinds a device doesn't know refused with a typed error; versioned bundle offers and bundle header v2; data-frame flags carried end to end. |
 
 A device speaks every version from `MIN_WIRE_VERSION` (1) to
@@ -67,6 +73,11 @@ a pre-release build, which the mixed-version tests use (§8).
 What was agreed with a peer is in `PeerState::protocol`, and
 `Node::negotiate(peer)` returns it (dialing if needed, waiting for the hello
 on a new connection). For a mesh neighbour: `Mesh::neighbour_protocol`.
+`PeerState::protocol` is set for peers we dialed, and on connections a peer
+dialed only for a device we already track or share a space with: anyone can
+dial (a fresh key costs nothing) and `PeerState` entries are never removed,
+so a stranger's connection or hello creates no state (the connection itself
+still knows its version).
 
 ---
 
@@ -91,7 +102,9 @@ that speaks those is supported. Test-only ALPNs (`mycel-sim/bulk`,
 
 Every exchange is a QUIC stream whose first byte is its kind
 (`wire::StreamKind`). Frames on it are a 4-byte little-endian length and a
-postcard body (at most 64 MiB; 4 KiB for cards, blob requests and hellos).
+postcard body (at most 64 MiB; 4 KiB for cards and blob requests; 256 bytes,
+`version::MAX_HELLO`, for hellos, the same limit as on mesh hops, so a hello
+one protocol takes the other takes too).
 
 | Kind | Byte | Stream | Since | Body |
 |---|---|---|---|---|
@@ -170,7 +183,7 @@ store-and-forward uses streams on the same connection.
 | Stream | Kind byte | Since | Body |
 |---|---|---|---|
 | uni | `1` summary | v1 | postcard `WireSummary` (what a carrier holds, receipts, predictabilities, room); ends with the stream |
-| uni | `2` hello | v2 | `Hello{caps}`; each side sends one per hop |
+| uni | `2` hello | v2 | `Hello{caps}` (at most `MAX_HELLO`, 256 bytes); each side sends one per hop |
 | bi | `3` offer | v1 | 4-byte big-endian length + postcard `WireOffer`, answered `WireAnswer`, then the payload and a 1-byte receipt |
 | bi | `4` offer v2 | v2 | The same, with the bundle's `(version, kind)` in front of the offer |
 
@@ -242,6 +255,11 @@ connection) and otherwise fall back to v1.
   `0x01` audio (10-byte frame header), `0x10` video frame, `0x11` video
   control (2-byte length + postcard `VideoCtrl`). Kinds a device doesn't
   know go to the call's `TrackSink`, which drops them.
+- `VideoCtrl` variants are only ever appended. A device skips a control
+  message whose variant tag it doesn't have (`CtrlDeframer::next_msg`) and
+  reads on, so a newer build's message doesn't end the control stream (and
+  with it keyframe requests for the rest of the call); a message that
+  doesn't decode is still an error.
 
 ### 3.9 Links
 
@@ -253,6 +271,16 @@ of the wire version (QUIC and ALPN negotiate above them):
 | Bluetooth LE | `VERSION` byte (1) in the GATT info record and the L2CAP hello (`MYCL` + version) | GATT record ignored; channel closed as "unsupported version" |
 | Peer-to-peer Wi-Fi (AWDL) | TXT `v=1`; control datagrams' 8-byte magic ends in a version byte (`\xffMYCAWD\x01`) | Not recognised as control (treated as a QUIC packet, which fails authentication) |
 | Interface link | Beacon magic `MYCELIF\x01` | Beacon ignored |
+
+**Not negotiated yet.** Each link format carries one version and rejects
+any other; neither side can offer two. So the first change to a link's
+framing would split mixed-version radio neighbourhoods: devices on
+different builds would stop finding each other over Bluetooth or AWDL,
+the offline case Mycel exists for. Until links negotiate (the L2CAP hello
+and GATT record carrying a min–max version range, both sides using the
+highest they share), a link framing change **must keep accepting version 1
+beside the new one** and keep sending version 1 to devices that only
+announce it (§9).
 
 ### 3.10 Spaces: trust ops, envelopes, rules
 
@@ -277,25 +305,39 @@ context already says `v1` for the same reason (it was changed once).
 
 **Changing them** is a space-level change, not a connection-level one:
 every member must resolve every op the same way, so a member that can't
-parse a new op kind would see a different membership. A new op `Action`,
-envelope header field or stream kind therefore (1) gets a capability bit,
-(2) is used in a space only once every current member has advertised that
-capability, and (3) is never sent to a peer whose hello lacks it. Old
-records stay valid forever under their old contexts.
+parse a new op kind would see a different membership. Worse, sync carries
+typed `Vec<SignedOp>` in `SyncMsg`, so one op of an unknown variant makes
+the whole `Hello`/`Data` frame fail to decode and sync with that peer stops
+until it upgrades. A new op `Action`, envelope header field or stream kind
+therefore must (1) get a capability bit, (2) be used in a space only once
+every current member's devices support it, and (3) never be sent to a peer
+whose hello lacks it. Old records stay valid forever under their old
+contexts.
+
+**Rule (2) has no mechanism yet.** Capabilities are known per connection
+only: they are not recorded in the space, and nothing carries them for
+members reached only through relays or store-and-forward, or for members
+who are offline, so no device can check "every current member" today. It
+needs a per-device capability statement recorded in the space, signed by
+the device and stored with its membership (for example in a member or
+device op), which does not exist yet (§9). **Until it lands, no change
+may add an op `Action` variant or an envelope field.**
 
 ### 3.11 On disk
 
 | File | Versioned by | Unknown version |
 |---|---|---|
-| `mycel.redb` (ops, envelopes, key-values, quarantine) | `STORE_FORMAT` (1) in the key-value entry `__format` (u32 LE). A store from before formats were recorded is format 1. | A newer format is refused untouched (`VersionError::Unsupported { what: "store" }`): never misread, never overwritten. Older formats would be migrated forward on open (there are none yet). |
+| `mycel.redb` (ops, envelopes, key-values, quarantine) | `STORE_FORMAT` (1) under `format` (u32 LE) in the `meta` table, read before any other table is opened. A store from before formats were recorded (no `meta` table) is format 1. | A newer format is refused untouched (`VersionError::Unsupported { what: "store" }`): never misread, never overwritten, no table created. Older formats would be migrated forward on open (there are none yet). |
 | `identity-state.json` | `version: 1`, `deny_unknown_fields` | Refused ("unsupported identity marker version"); the identity is left alone |
 | `identity.key` | 32 raw bytes, checked against the marker's public key | Refused |
 | Records in the store | postcard of the wire types above; undecodable rows are quarantined, not deleted | Set aside, startup continues |
 
-Pre-release builds don't check `__format`, so a future format 2 store must
-not be openable by them by accident: its migration will rename the tables
-it changes (redb table names), so an old build finds them missing rather
-than misreading them.
+The `meta` table and its `format` key are permanent: no migration renames
+or reshapes them, so every build finds the format first even if a newer
+format renamed every other table. Pre-release builds don't check the
+format, so a future format 2 store must not be openable by them by
+accident: its migration will rename the tables it changes (redb table
+names), so an old build finds them missing rather than misreading them.
 
 ---
 
@@ -332,6 +374,19 @@ A v2 device and a v1 (pre-release) device:
 
 Two v2 devices use v2 on both protocols and the capabilities they share.
 
+**Which pre-release builds are version 1.** Version 1 is the node and mesh
+wire format of main at commit `98d9b7b` (the last commit before
+versioning). Its bytes are pinned by golden vectors that `98d9b7b`'s own
+`mycel-net` printed (`mesh::v1_vectors`, and the contact code in
+`mycel-node`): every version 1 encoder and decoder in this build must
+match them byte for byte. The same generator run against the
+`dev-2026-10-09-apps` release's `mycel-net` printed identical bytes, so
+that release (the one testers run) speaks the same version 1 on the wire.
+Not checked by a test: whether that release's trust-op and envelope
+formats match `98d9b7b`'s (reading the diff, their types gained no
+variants); pre-release builds older than `dev-2026-10-09-apps` are not
+checked at all.
+
 Pre-release builds stay usable, with one limit from before versioning:
 the chat rules bundle a space runs is not recorded in the space
 ([RULES_ABI.md](RULES_ABI.md) §6), so devices in one space should still run
@@ -347,6 +402,14 @@ builds with the same rules.
 2. **Is it an addition an older device can do without?** Then it is a
    capability: append a bit to `CAPABILITIES` and this document §4, use it
    only when `PeerProtocol::supports` says both sides have it.
+   **A capability that adds security must state its downgrade policy**:
+   anyone can simply not advertise a bit, so "used only when both sides
+   have it" alone lets an attacker opt out. Say how peers without it are
+   treated once enough peers have it. For `ROUTE_ATTEST`: once a device
+   has attesting neighbours, routes through hops that don't attest rank
+   below attested ones and are used only as a fallback (a lying relay
+   that stops advertising the bit loses its routes instead of keeping
+   them).
 3. **New stream kind:** next free byte; older devices refuse it with
    `STREAM_REFUSED`, so it must also be behind a capability.
 4. **New enum variant** in a postcard message: only appended, and only sent
@@ -360,7 +423,11 @@ builds with the same rules.
    skip it and new readers can name the version they don't support.
 8. **Tests:** a device offering only the old version against one with the
    new (`Protocol { version: WIRE_V1, .. }` in `mycel-net`), and a test that
-   unknown values are refused or ignored as the format says.
+   unknown values are refused or ignored as the format says. Those tests
+   run this build's code on both sides, so they can't see an old format
+   changing by accident: the golden vectors (`mesh::v1_vectors`) can. Never
+   regenerate a version's vectors from a newer build; a new version gets
+   its own, printed once by the build that introduces it.
 
 ---
 
@@ -381,7 +448,8 @@ No decoder panics on input from a peer, and none guesses: a version or kind
 it doesn't know is refused or, where the format says so (capability bits,
 data-frame extension flags, mesh uni-stream and control kinds, bundle
 payload kinds at a carrier, call control messages from a newer minor
-revision), ignored or carried unread.
+revision, video control messages of a newer variant), ignored or carried
+unread.
 
 ---
 
@@ -392,14 +460,38 @@ revision), ignored or carried unread.
 
 | Test | Shows |
 |---|---|
-| `version_tests::current_devices_negotiate_version_2_and_common_capabilities` | Two v2 nodes agree v2 and exactly the shared capabilities; an unknown bit is ignored; one dial, one hello |
+| `version_tests::current_devices_negotiate_version_2_and_common_capabilities` | Two v2 nodes agree v2 and exactly the shared capabilities; an unknown bit is ignored; one dial, and one hello served (counted) for two `negotiate` calls |
+| `version_tests::strangers_that_dial_leave_no_peer_state` | 8 strangers (4 on v1, 4 with a v2 hello) dial a node and fetch its card: it answers all and keeps no `PeerState` for them; a member that dials is noted |
+| `version_tests::every_version_has_its_own_alpns` | One ALPN per version per protocol, none shared, each maps back to its version; the compile-time table check refuses duplicates, misplaced versions and empty names |
 | `version_tests::a_version_1_device_and_a_version_2_device_talk_version_1` | A v1-only node and a v2 node pick v1 whoever dials, send no hello, and sync a space both ways and fetch cards |
 | `version_tests::unknown_stream_kinds_are_refused_cleanly` | An unknown bi or uni stream kind is refused in under 5 s with `StreamRefused` and the connection carries on; a hello on a v1 connection is refused too |
 | `version_tests::bundles_of_an_unknown_payload_kind_are_refused_unread` | The destination refuses an unknown payload kind with a typed error |
 | `mesh::tests::hops_negotiate_versions_and_capabilities` | Mesh hops: v2 with shared capabilities between v2 devices, v1 with none to a v1 device |
 | `mesh::tests::bundles_cross_hops_by_their_format` | A carrier carries a v2 bundle of an unknown payload kind, refuses an unknown header version, and a v2 bundle is never offered over a v1 hop (v1 bundles cross both) |
+| `mesh::tests::the_planner_sends_bundles_only_over_hops_that_take_their_format` | Through the planner (`Mesh::send_bundle_as`): a v2 bundle reaches only the v2 neighbour, never the v1 one; a v1 bundle then reaches both |
+| `mesh::v1_vectors::*` | Every version 1 encoding byte for byte against vectors printed by main `98d9b7b`: ALPNs, stream kinds, every `SyncMsg`, `DtnPayload`, `EphMsg`, a blob request and answer, a contact card and its signature, a signed announcement, a data-frame header, a bundle id and signature, a `K_OFFER` frame, offer answers, a receipt, a carrier summary; and that this build decodes them |
 | `mesh::core::tests::relays_carry_unknown_frame_flags_unchanged`, `mesh::wire::tests::frames_round_trip_with_flags` | End-to-end extension flags survive relaying and fragmentation |
 | `version::tests::*` | Registry bits unique and outside the reserved range; unknown and reserved bits ignored; hellos carry one reserved bit and may grow at the end |
-| `store::tests::stores_record_their_format_and_newer_ones_are_refused`, `stores_from_before_formats_open_as_format_1` | Store format recorded; a newer one refused untouched |
-| `runtime::tests::contact_codes_carry_their_format` | `mycel2:` codes refused with a typed error; `mycel:` and bare codes read |
-| `proto::tests::messages_round_trip` (mycel-call) | Call control messages from a newer minor revision are recognised and skipped; garbage is still an error |
+| `store::tests::stores_record_their_format_and_newer_ones_are_refused`, `stores_from_before_formats_open_as_format_1`, `a_newer_store_without_the_tables_we_know_is_refused` | Store format recorded in `meta`; a newer one refused untouched, even when it renamed every other table |
+| `runtime::tests::contact_codes_carry_their_format`, `version_1_contact_codes_are_pinned` | `mycel2:` codes refused with a typed error; `mycel:` and bare codes read; a version 1 code byte for byte as `98d9b7b` writes it |
+| `proto::tests::messages_round_trip`, `recv_skips_messages_from_a_newer_revision` (mycel-call) | Call control messages from a newer minor revision are skipped on a stream and the next message arrives; garbage is still an error |
+| `wire::tests::ctrl_messages_from_newer_builds_are_skipped` (mycel-video) | Video control messages of a newer variant are skipped and the next one arrives; garbage is still an error |
+
+---
+
+## 9. Not done yet
+
+What versioning does not cover yet, so that no other change relies on it:
+
+- **Capabilities recorded in a space** (§3.10): a signed per-device
+  capability statement stored with membership. Until it exists, no op
+  `Action` variant or envelope field may be added.
+- **Link framing negotiation** (§3.9): Bluetooth LE and AWDL carry one
+  framing version each. A framing change must keep accepting version 1
+  beside the new one until the L2CAP hello and GATT record carry a version
+  range.
+- **`ROUTE_ATTEST` ranking** (§6): the downgrade policy above is the rule
+  the attestation work must implement; nothing implements it yet.
+- **Cross-build interop test**: the golden vectors pin version 1 bytes, but
+  no test runs a real pre-release build (for example `mycel-net` at
+  `98d9b7b` as a renamed dev-dependency) against this one.
