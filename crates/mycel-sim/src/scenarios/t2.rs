@@ -1073,6 +1073,8 @@ struct ConvResult {
     reconv_99: Option<f64>,
     stretch: f64,
     ctrl_b_s: f64,
+    /// The exogenous hash at the end (the hub's failure included).
+    exo_hash: String,
 }
 
 fn converge<R: Router + NextHop>(mut sim: Sim<R>, n: usize, seed: u64, max_hops: u8) -> ConvResult {
@@ -1150,6 +1152,7 @@ fn converge<R: Router + NextHop>(mut sim: Sim<R>, n: usize, seed: u64, max_hops:
         reconv_99,
         stretch: if stretch.is_empty() { f64::NAN } else { stretch.iter().sum::<f64>() / stretch.len() as f64 },
         ctrl_b_s: ctrl as f64 / n as f64 / (t as f64 / SEC as f64),
+        exo_hash: hex(&sim.exo_hash()),
     }
 }
 
@@ -1182,6 +1185,8 @@ fn convergence(o: Opts) -> ScenarioResult {
     let cfg = Rc::new(Cfg::main());
     let msim = Sim::new(w.areas.clone(), w.specs.clone(), o.seed, |i, _| Mycel::new(i, cfg.clone(), Role::Honest));
     let mr = converge(msim, n, o.seed, 8);
+    r.world_hash("world", &gr.exo_hash);
+    r.world_hash("world", &mr.exo_hash);
     let f = |x: Option<f64>| x.map_or("never".into(), |v| format!("{v:.1} s"));
     let c = if o.candidate == Candidate::Main { &mr } else { &gr };
     // main's loops and convergence are its known gap (NEEDS_GLOBAL), not
@@ -2382,6 +2387,7 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
             sim.start();
             sim.run(2 * SEC + msgs as Time * 2 * SEC + 10 * SEC);
             sends.push(sim.core.msgs.iter().map(|m| (m.sent, m.src)).collect());
+            r.world_hash("world", &hex(&sim.exo_hash()));
             let reached = flood.reached.borrow();
             let rb = flood.rebroadcasts.borrow();
             let (mut reach, mut useful) = (0.0, 0.0);
