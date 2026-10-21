@@ -14,7 +14,7 @@ export interface BackgroundStatus {
   standbyBucket: string | null;
   /** Android: the phone's manufacturer (lower case). */
   manufacturer: string | null;
-  /** When the last background catch-up finished (ms since the epoch). */
+  /** When the last background catch-up that synced finished (ms since the epoch); one cut short doesn't count. */
   lastCatchUp: number | null;
 }
 
@@ -71,7 +71,7 @@ export function backgroundCopy(status: BackgroundStatus, now = Date.now()): Back
   if (status.platform === "ios") {
     const details = [
       "iPhone and iPad pause Mycel soon after you leave it. Mycel has no push server, so nothing can wake it the moment someone sends you a message.",
-      "Instead, Mycel checks in when iOS lends it time (a few times a day if you use it often, more while charging), and over Bluetooth when someone running Mycel is nearby. Messages wait safely on the sender's device, or on devices that carry them, until then.",
+      "Instead, Mycel checks in when iOS lends it time (a few times a day if you use it often, more while charging), and over Bluetooth when a computer running Mycel, or a phone with Mycel open, is nearby. Messages wait safely on the sender's device, or on devices that carry them, until then.",
       "Swiping Mycel away in the app switcher stops these checks until you open it again.",
     ];
     if (status.lastCatchUp) details.push(`Last background check: ${since(status.lastCatchUp, now)}.`);

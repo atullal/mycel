@@ -17,8 +17,9 @@
 // Registered here, before the app finishes launching (iOS requires it), with
 // the identifiers in Info.plist's BGTaskSchedulerPermittedIdentifiers.
 
-extern "C" bool mycel_background_catch_up(uint32_t seconds);
-extern "C" void mycel_background_cancel(void);
+extern "C" uint64_t mycel_background_begin(void);
+extern "C" bool mycel_background_catch_up(uint64_t ticket, uint32_t seconds);
+extern "C" void mycel_background_cancel(uint64_t ticket);
 
 static NSString *const MycelRefreshTask = @"dev.mycel.refresh";
 static NSString *const MycelProcessingTask = @"dev.mycel.processing";
@@ -56,16 +57,20 @@ static void MycelRunBackgroundTask(BGTask *task, uint32_t seconds) {
   // is cut short.
   MycelScheduleBackgroundTasks();
   auto done = std::make_shared<std::atomic<bool>>(false);
+  // This launch's catch-up, taken before the expiration handler is set: a
+  // cancel stops it even before the queued block starts, and never stops
+  // another launch's.
+  uint64_t ticket = mycel_background_begin();
   // Weak: the task holds its expiration handler.
   __weak BGTask *expiring = task;
   task.expirationHandler = ^{
-    mycel_background_cancel();
+    mycel_background_cancel(ticket);
     if (!done->exchange(true)) {
       [expiring setTaskCompletedWithSuccess:NO];
     }
   };
   dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-    bool ok = mycel_background_catch_up(seconds);
+    bool ok = mycel_background_catch_up(ticket, seconds);
     if (!done->exchange(true)) {
       [task setTaskCompletedWithSuccess:ok];
     }

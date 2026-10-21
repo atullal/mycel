@@ -42,6 +42,11 @@ pub const EVENT: &str = "mycel://event";
 pub type Rt = Arc<Runtime>;
 
 fn network_mode(data_dir: &std::path::Path) -> Result<NetworkMode, String> {
+    // Tests never reach a network (nor read the environment, which other
+    // threads may be changing).
+    if cfg!(test) {
+        return Ok(NetworkMode::Local);
+    }
     match std::env::var("MYCEL_NET").ok().as_deref().map(str::trim) {
         // An unreadable saved mode means local paths only, never wider.
         None | Some("") => Ok(Runtime::launch_network_mode(data_dir, NetworkMode::Internet)),
@@ -598,6 +603,15 @@ pub(crate) fn core() -> Option<&'static Core> {
 fn open_core(data_dir: &Path, app: Option<AppHandle>) -> Result<Option<&'static Core>, String> {
     let _opening = OPENING.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(core) = CORE.get() {
+        // One profile per process: say so if a caller wanted another folder
+        // (both entry points read MYCEL_DATA_DIR, so they shouldn't).
+        if core.runtime.data_dir() != data_dir {
+            eprintln!(
+                "mycel-host: asked to open {} but {} is open; using it",
+                data_dir.display(),
+                core.runtime.data_dir().display()
+            );
+        }
         if let Some(app) = app {
             let _ = core.app.set(app);
         }
@@ -642,6 +656,11 @@ fn open_core(data_dir: &Path, app: Option<AppHandle>) -> Result<Option<&'static 
     Ok(Some(CORE.get_or_init(|| Core { runtime, notifier, app: slot })))
 }
 
+/// `MYCEL_DATA_DIR`, if set: the data folder instead of the app's own.
+fn data_dir_override() -> Option<PathBuf> {
+    std::env::var_os("MYCEL_DATA_DIR").filter(|dir| !dir.is_empty()).map(PathBuf::from)
+}
+
 /// Open the runtime with no window (Android after a reboot or an update, a
 /// restarted service, a background catch-up), for an existing profile only.
 /// True once a runtime is running in this process.
@@ -652,6 +671,8 @@ pub(crate) fn start_in_background(data_dir: PathBuf) -> bool {
     }
     #[cfg(target_os = "android")]
     env_from_properties();
+    // The same folder a window would open (`start`).
+    let data_dir = data_dir_override().unwrap_or(data_dir);
     if std::fs::create_dir_all(&data_dir).is_err() {
         return false;
     }
@@ -672,9 +693,9 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
     if CORE.get().is_none() {
         env_from_properties();
     }
-    let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => app.path().app_data_dir().map_err(|e| format!("cannot find the app data folder: {e}"))?,
+    let data_dir = match data_dir_override() {
+        Some(dir) => dir,
+        None => app.path().app_data_dir().map_err(|e| format!("cannot find the app data folder: {e}"))?,
     };
     std::fs::create_dir_all(&data_dir).map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
     // Also after a background start: tao points stderr at logcat when the
@@ -822,4 +843,98 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Tests that touch the process-wide core, the one-catch-up-at-a-time
+    /// flag or the catch-up tickets take this, so they never overlap.
+    pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("mycel-host-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Regression: the `bluetooth-peripheral` background mode kept a locked
+    /// iPhone advertising and serving its node key to anyone in Bluetooth
+    /// range, all day. Background modes in both copies of the iOS
+    /// Info.plist (Tauri's source and the Xcode project's).
+    #[test]
+    fn ios_never_advertises_over_bluetooth_in_the_background() {
+        for plist in [include_str!("../Info.ios.plist"), include_str!("../gen/apple/mycel-host_iOS/Info.plist")] {
+            let modes = plist.split("<key>UIBackgroundModes</key>").nth(1).expect("background modes declared");
+            let modes = &modes[..modes.find("</array>").expect("an array")];
+            assert!(!modes.contains("bluetooth-peripheral"), "{modes}");
+            for mode in ["fetch", "processing", "bluetooth-central"] {
+                assert!(modes.contains(&format!("<string>{mode}</string>")), "{mode} missing: {modes}");
+            }
+        }
+    }
+
+    /// The whole windowless lifecycle in one test: the core is one per
+    /// process, so its steps can't run as separate tests.
+    #[test]
+    fn a_windowless_start_opens_only_an_existing_profile_and_catches_up() {
+        let _serial = serial();
+        assert!(CORE.get().is_none(), "nothing else in this binary opens the core");
+
+        // With no runtime there is nothing to catch up with.
+        assert!(!background::catch_up_now(background::begin_catch_up(), Duration::from_secs(5)));
+
+        // No profile: nothing opens, nothing is created behind the user's back.
+        let empty = temp_dir("empty");
+        assert!(open_core(&empty, None).unwrap().is_none());
+        assert!(CORE.get().is_none());
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0, "the folder stays empty");
+
+        // A profile made in the app (here directly), then closed.
+        let dir = temp_dir("profile");
+        let made = tauri::async_runtime::block_on(Runtime::open_with(RuntimeOptions {
+            data_dir: dir.clone(),
+            mode: NetworkMode::Local,
+            name: Some("alice".into()),
+            default_name: None,
+            keeper: false,
+            port: 0,
+        }))
+        .unwrap();
+        let id = made.profile().id;
+        tauri::async_runtime::block_on(made.shutdown()).unwrap();
+        drop(made);
+
+        // Opened with no window, as that profile.
+        let core = open_core(&dir, None).unwrap().expect("an existing profile opens");
+        assert_eq!(core.runtime.profile().id, id);
+        assert_eq!(core.runtime.data_dir(), dir.as_path());
+        assert!(core.app.get().is_none(), "no window yet");
+
+        // Later opens (the window's, a second background start) adopt it
+        // rather than opening the profile twice. A different folder gets
+        // the open core too (logged), never a second runtime.
+        assert!(std::ptr::eq(open_core(&dir, None).unwrap().unwrap(), core));
+        assert!(std::ptr::eq(open_core(&empty, None).unwrap().unwrap(), core));
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+        assert!(std::ptr::eq(super::core().unwrap(), core));
+
+        // A catch-up against the real runtime: sync (nothing to sync with,
+        // so at once), linger, flush; only a completed one is recorded.
+        let ticket = background::begin_catch_up();
+        let start = std::time::Instant::now();
+        assert!(background::catch_up_for_test(ticket, Duration::from_secs(15), Duration::from_millis(200)));
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(background::last_catch_up_for_test().is_some());
+
+        tauri::async_runtime::block_on(core.runtime.shutdown()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
 }

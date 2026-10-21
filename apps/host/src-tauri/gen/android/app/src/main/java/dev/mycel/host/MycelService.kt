@@ -34,22 +34,22 @@ import androidx.core.content.ContextCompat
 class MycelService : Service() {
   override fun onBind(intent: Intent?): IBinder? = null
 
+  /** Every start so far: a late start never stops what a newer one kept. */
+  private val starts = ServiceStarts()
+
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
     // A null intent is Android restarting the sticky service.
     val fromApp = intent?.getBooleanExtra(EXTRA_FROM_APP, false) ?: false
     val foreground = goForeground()
+    starts.begin(startId, foreground)
     MycelRuntime.startAsync(this) { running ->
-      when {
-        // The app opens (or is creating) the profile itself.
-        fromApp -> {}
-        // No profile yet: nothing to keep alive until the app makes one.
-        !running -> stopOnMain()
-        // Android 12+ refuses a foreground service started from the
-        // background unless Mycel may ignore battery optimisation: catch up
-        // once while Android lets this background service run, then stop.
-        !foreground -> {
-          MycelRuntime.catchUp(CATCH_UP_SECONDS)
-          stopOnMain()
+      when (starts.after(fromApp, running, foreground)) {
+        AfterStart.STAY -> {}
+        AfterStart.STOP -> stopOnMain(startId)
+        // Catch up once while Android lets this background service run.
+        AfterStart.CATCH_UP_THEN_STOP -> {
+          MycelRuntime.catchUp(MycelRuntime.beginCatchUp(), CATCH_UP_SECONDS)
+          stopOnMain(startId)
         }
       }
     }
@@ -58,8 +58,16 @@ class MycelService : Service() {
     return START_STICKY
   }
 
-  private fun stopOnMain() {
-    Handler(Looper.getMainLooper()).post { stopSelf() }
+  /**
+   * Stop for start `startId`, unless a newer start arrived meanwhile (the
+   * user opened Mycel during a catch-up, say) or one made the service
+   * foreground: plain `stopSelf()` would stop it regardless, and a service
+   * stopped that way is never restarted as sticky.
+   */
+  private fun stopOnMain(startId: Int) {
+    Handler(Looper.getMainLooper()).post {
+      if (starts.mayStop(startId)) stopSelfResult(startId)
+    }
   }
 
   /** Show the "connected" notification and become a foreground service. */
@@ -85,14 +93,22 @@ class MycelService : Service() {
       .setSilent(true)
       .setPriority(NotificationCompat.PRIORITY_MIN)
       .build()
-    // "Connected device": exchanging data with nearby devices over Wi-Fi,
-    // the LAN and Bluetooth. No daily time limit (unlike "data sync", capped
-    // at 6 h a day from Android 15), and it may start after a reboot. Its
-    // prerequisite is a Wi-Fi or network permission in the manifest.
+    // "Connected device": keeping connections to other devices running Mycel
+    // on the same Wi-Fi or LAN (found by mDNS) and the phones and computers
+    // reached through them. (Mycel has no Bluetooth link on Android yet.)
+    // No daily time limit (unlike "data sync", capped at 6 h a day from
+    // Android 15), and it may start after a reboot. Its prerequisite is a
+    // Wi-Fi or network permission in the manifest. docs/PLATFORMS.md has the
+    // Play Console declaration, and the "special use" fallback.
     val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0
     return try {
       ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
-      true
+      // A user restriction in Settings ("background usage: restricted")
+      // makes Android ignore the call without an exception (it logs "not
+      // allowed due to bg restriction"): ask whether it took.
+      val took = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || foregroundServiceType != 0
+      if (!took) Log.w("Mycel", "not allowed to stay connected: background use is restricted")
+      took
     } catch (e: Exception) {
       // ForegroundServiceStartNotAllowedException (Android 12+, started from
       // the background) or a missing prerequisite (SecurityException).

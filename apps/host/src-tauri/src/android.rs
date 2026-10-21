@@ -24,7 +24,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
-use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint};
+use jni::sys::{JNI_FALSE, JNI_TRUE, jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
 
 use crate::background::BackgroundStatus;
@@ -62,8 +62,22 @@ fn share_context() {
 
 /// `MycelRuntime.handOverContext()`, from `MainActivity.onCreate` before
 /// tao's: empty `ndk_context` if a background start filled it in, and never
-/// fill it in again. A lookup in the moment between falls back like a
-/// missing context (both users catch it).
+/// fill it in again.
+///
+/// Known hazard, small but real: until tao fills it in again (the rest of
+/// `WryActivity.onCreate` before `Rust.onCreate`: `AppCompatActivity`'s
+/// setup and two `registerForActivityResult` calls, milliseconds) the
+/// context is empty, and only some lookups survive that. The DNS resolver
+/// catches the missing context and falls back to public resolvers for that
+/// query. `netdev` 0.46 does not: it probes once, behind `catch_unwind`, and
+/// caches "available" in a `OnceLock`; every later lookup calls
+/// `ndk_context::android_context()` unguarded, which panics when empty. A
+/// network-interface query that lands in the window (netwatch reads them
+/// whenever the network may have changed)
+/// panics that task, and the runtime may stop noticing network changes
+/// until Mycel restarts. Only a window opened after a background start in
+/// the same process hits this. Closing it needs tao to accept a filled-in
+/// context (it asserts it is empty), or netdev to guard every lookup.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_mycel_host_MycelRuntime_handOverContext(_env: JNIEnv, _class: JClass) {
     let mut ndk = NDK_CONTEXT.lock().unwrap_or_else(|e| e.into_inner());
@@ -192,21 +206,29 @@ pub extern "system" fn Java_dev_mycel_host_MycelRuntime_start(
     if started { JNI_TRUE } else { JNI_FALSE }
 }
 
-/// `MycelRuntime.catchUp(seconds)`: one catch-up round (WorkManager's
+/// `MycelRuntime.beginCatchUp()`: a ticket for one catch-up, taken before
+/// anything that may be cancelled.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_dev_mycel_host_MycelRuntime_beginCatchUp(_env: JNIEnv, _class: JClass) -> jlong {
+    crate::background::begin_catch_up() as jlong
+}
+
+/// `MycelRuntime.catchUp(ticket, seconds)`: one catch-up round (WorkManager's
 /// backstop, or a sticky restart that couldn't become a foreground service).
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_dev_mycel_host_MycelRuntime_catchUp(
     _env: JNIEnv,
     _class: JClass,
+    ticket: jlong,
     seconds: jint,
 ) -> jboolean {
     let budget = Duration::from_secs(seconds.clamp(0, 600) as u64);
-    let done = std::panic::catch_unwind(|| crate::background::catch_up_now(budget)).unwrap_or(false);
+    let done = std::panic::catch_unwind(|| crate::background::catch_up_now(ticket as u64, budget)).unwrap_or(false);
     if done { JNI_TRUE } else { JNI_FALSE }
 }
 
-/// `MycelRuntime.cancelCatchUp()`: WorkManager stopped the job.
+/// `MycelRuntime.cancelCatchUp(ticket)`: WorkManager stopped that job.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_dev_mycel_host_MycelRuntime_cancelCatchUp(_env: JNIEnv, _class: JClass) {
-    crate::background::cancel_catch_up();
+pub extern "system" fn Java_dev_mycel_host_MycelRuntime_cancelCatchUp(_env: JNIEnv, _class: JClass, ticket: jlong) {
+    crate::background::cancel_catch_up(ticket as u64);
 }

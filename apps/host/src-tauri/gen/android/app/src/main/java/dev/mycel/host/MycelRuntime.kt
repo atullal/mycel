@@ -30,11 +30,18 @@ object MycelRuntime {
   /** Open the runtime for `dataDir` (blocks: never on the main thread). */
   @JvmStatic private external fun start(context: Context, dataDir: String): Boolean
 
-  /** One catch-up round of at most `seconds` (blocks). */
-  @JvmStatic external fun catchUp(seconds: Int): Boolean
+  /**
+   * A ticket for one catch-up: take it before anything that may be
+   * cancelled, pass it to [catchUp], and [cancelCatchUp] it to stop that
+   * catch-up (also before it began) without touching any other.
+   */
+  @JvmStatic external fun beginCatchUp(): Long
 
-  /** Stop a running [catchUp] now. */
-  @JvmStatic external fun cancelCatchUp()
+  /** One catch-up round of at most `seconds` (blocks). */
+  @JvmStatic external fun catchUp(ticket: Long, seconds: Int): Boolean
+
+  /** Stop the [catchUp] holding `ticket` now, or as soon as it begins. */
+  @JvmStatic external fun cancelCatchUp(ticket: Long)
 
   /**
    * Called by [MainActivity] before Tauri's activity setup: the runtime

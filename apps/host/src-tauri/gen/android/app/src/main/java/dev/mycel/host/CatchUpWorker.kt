@@ -20,23 +20,30 @@ import java.util.concurrent.TimeUnit
  * with no internet, which Android doesn't count as "connected".
  */
 class CatchUpWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
+  /** This run's catch-up ([MycelRuntime.beginCatchUp]); 0 until it has one. */
+  @Volatile private var ticket = 0L
+
   override fun doWork(): Result {
-    if (!MycelRuntime.startBlocking(applicationContext)) {
-      // No profile yet (or the runtime can't open): nothing to catch up on.
-      return Result.success()
+    // Taken first, so a stop from here on cancels this run's catch-up (and
+    // only this run's: the service may be catching up too); a stop before
+    // shows in isStopped, which planCatchUp reads.
+    ticket = MycelRuntime.beginCatchUp()
+    val plan = planCatchUp(
+      stopped = { isStopped },
+      openRuntime = { MycelRuntime.startBlocking(applicationContext) },
+      // Allowed when Mycel may ignore battery optimisation: then the service
+      // keeps it connected from here on.
+      startService = { MycelService.startFromBackground(applicationContext) },
+    )
+    if (plan == CatchUpPlan.CATCH_UP) {
+      MycelRuntime.catchUp(ticket, CATCH_UP_SECONDS)
     }
-    // Allowed when Mycel may ignore battery optimisation: then the service
-    // keeps it connected from here on.
-    if (MycelService.startFromBackground(applicationContext)) {
-      return Result.success()
-    }
-    MycelRuntime.catchUp(CATCH_UP_SECONDS)
     return Result.success()
   }
 
-  /** WorkManager took the time back: end the catch-up now. */
+  /** WorkManager took the time back: end this run's catch-up now. */
   override fun onStopped() {
-    MycelRuntime.cancelCatchUp()
+    ticket.takeIf { it != 0L }?.let(MycelRuntime::cancelCatchUp)
   }
 
   companion object {
