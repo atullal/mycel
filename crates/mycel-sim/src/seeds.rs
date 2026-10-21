@@ -50,7 +50,10 @@ pub const CI_SUITE: &[(&str, f64)] = &[
     ("disaster-dtn", 0.1),
 ];
 
-/// The nightly soak's: the gate's, the heavier ones, and the liar ceiling.
+/// The nightly soak's: the gate's, the heavier ones, and the liar ceiling
+/// at a size where liars cost delivery (225 phones; at CI size the formats
+/// can't be told apart: docs/SIMULATION.md §4, open 15). It is a known gap
+/// there, so the soak guards its invariant and flags the day it passes.
 pub const SOAK_SUITE: &[(&str, f64)] = &[
     ("us-eu", 0.1),
     ("gateway-choice", 0.1),
@@ -61,7 +64,7 @@ pub const SOAK_SUITE: &[(&str, f64)] = &[
     ("adversarial", 0.1),
     ("routing-convergence", 0.1),
     ("disaster-dtn", 0.1),
-    ("liar-ceiling", 0.1),
+    ("liar-ceiling", 0.75),
     ("flood-scaling", 0.1),
     ("global-scale", 0.01),
     ("churn", 0.05),
@@ -70,8 +73,15 @@ pub const SOAK_SUITE: &[(&str, f64)] = &[
 /// Seeds that once failed, kept as regressions: (scenario, scale, seed).
 /// Every objective must pass on each.
 pub const PINNED: &[(&str, f64, u64)] = &[
-    // the hop-limit shape check compared different broadcasts at each limit
+    // the hop-limit shape check compared different broadcasts at each
+    // limit; on today's streams this seed guards the paired criterion, and
+    // the scenario's own invariant ("every hop limit sends the same
+    // broadcasts") guards the pairing (docs/SIMULATION.md §4, fixed 24)
     ("flood-hop-limit", 0.2, 3),
+    // one 12-message world "failed" at 6 of 8 and 9 of 12 delivered: now a
+    // mean of 20 worlds of 48 messages each (fixed 25)
+    ("disaster-dtn", 0.1, 2),
+    ("disaster-dtn", 0.1, 3),
 ];
 
 /// The default for "at least m of k seeds": 80%, rounded up (8 of 10).
@@ -200,14 +210,14 @@ pub fn verdict(results: &[ScenarioResult], min_pass: usize) -> Verdict {
     let ratios: Vec<f64> = results.iter().flat_map(|r| r.optimality.iter().copied()).collect();
     v.pooled = (!ratios.is_empty()).then(|| Tail::of(&ratios));
     for r in results {
-        // a known gap: failing is what's expected of this candidate
-        let expected = r.expected_fail.is_some();
         let mut quality_ok = true;
         for s in r.slos.iter().filter(|s| !s.pass) {
             let what = format!("{}: {} (target {})", s.name, s.actual, s.target);
-            if s.invariant && !expected {
+            // an expected failure (a known gap) covers quality, never an
+            // invariant ([`ScenarioResult::finish`])
+            if s.invariant {
                 v.invariant_failures.push((r.seed, what));
-            } else if !s.invariant {
+            } else {
                 quality_ok = false;
                 v.quality_misses.push((r.seed, what));
             }
@@ -215,6 +225,8 @@ pub fn verdict(results: &[ScenarioResult], min_pass: usize) -> Verdict {
         let ok = match r.status {
             Status::ExpectedFail => true,
             Status::UnexpectedPass => false,
+            // with an invariant broken, quality is judged on its own
+            _ if r.expected_fail.is_some() => !quality_ok,
             _ => quality_ok,
         };
         v.quality_passes += ok as usize;
@@ -327,6 +339,13 @@ mod tests {
         assert!(v.markdown().contains("--seed 5"), "{}", v.markdown());
         rs[5] = result(5, false, true);
         assert!(!verdict(&rs, 8).pass, "7 of 10");
+        // a known gap excuses quality, never an invariant
+        let mut gap = result(3, false, false);
+        gap.expect_fail("a known gap");
+        gap.finish();
+        assert_eq!(gap.status, Status::Fail);
+        let v = verdict(&[gap], 1);
+        assert!(!v.pass && v.invariant_failures.len() == 1 && v.quality_passes == 1, "{v:?}");
     }
 
     #[test]

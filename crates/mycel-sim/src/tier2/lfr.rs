@@ -14,7 +14,8 @@
 //!   forward included, so mobility and DTN count.
 //! - **LFR delivery** = delivered / LFR-reachable: how much of what *could*
 //!   be saved was. Raw delivery is delivered / feasible, as everywhere.
-//! - **Liar-cut**: feasible pairs that every path crosses a dropper on.
+//! - **Liar-cut**: feasible messages every path of which crosses a
+//!   dropper, and the distinct (source, destination) pairs they're between.
 //! - **f + 1 disjoint paths**: pairs with at least f + 1 vertex-disjoint
 //!   paths (f = the number of droppers), which no placement of the
 //!   droppers can cut, and the honest pairs' own count of disjoint paths
@@ -44,8 +45,11 @@ pub struct Ceiling {
     /// With a path through honest devices only.
     pub reachable: usize,
     pub reachable_delivered: usize,
-    /// Feasible, but every path crosses a dropper.
+    /// Messages feasible, but every path of which crosses a dropper.
     pub cut: usize,
+    /// Distinct (source, destination) pairs of those messages.
+    #[serde(default)]
+    pub cut_pairs: usize,
     /// Delivered although cut: should be 0 (droppers relay nothing); a
     /// check on the oracle and the roles.
     pub cut_delivered: usize,
@@ -75,8 +79,8 @@ impl Ceiling {
 
     pub fn line(&self) -> String {
         format!(
-            "raw {:.1}% ({}/{}), LFR {:.1}% ({}/{} liar-free-reachable), ceiling {:.1}%, liar-cut {} (delivered {}); \
-             pairs {}: {} with ≥ f+1 = {} disjoint paths, by disjoint honest paths 0/1/2/≥3: {}/{}/{}/{}",
+            "raw {:.1}% ({}/{}), LFR {:.1}% ({}/{} liar-free-reachable), ceiling {:.1}%, liar-cut messages {} \
+             (delivered {}) between {} pairs; pairs {}: {} with ≥ f+1 = {} disjoint paths, by disjoint honest paths 0/1/2/≥3: {}/{}/{}/{}",
             100.0 * self.raw(),
             self.delivered,
             self.feasible,
@@ -86,6 +90,7 @@ impl Ceiling {
             100.0 * self.ceiling(),
             self.cut,
             self.cut_delivered,
+            self.cut_pairs,
             self.pairs,
             self.pairs_f1_disjoint,
             self.droppers + 1,
@@ -108,6 +113,7 @@ pub fn ceiling<R: Router>(sim: &Sim<R>, oracle: &Oracle, droppers: &[NodeId]) ->
     }
     let mut c = Ceiling { droppers: droppers.len(), ..Ceiling::default() };
     let mut pairs: Vec<(NodeId, NodeId)> = Vec::new();
+    let mut cut: Vec<(NodeId, NodeId)> = Vec::new();
     let mut first: Option<Time> = None;
     for m in sim.core.msgs.iter().filter(|m| m.checked && !avoid[m.src as usize] && !avoid[m.dst as usize]) {
         c.messages += 1;
@@ -125,11 +131,15 @@ pub fn ceiling<R: Router>(sim: &Sim<R>, oracle: &Oracle, droppers: &[NodeId]) ->
         } else {
             c.cut += 1;
             c.cut_delivered += ok as usize;
+            cut.push((m.src, m.dst));
         }
     }
     pairs.sort_unstable();
     pairs.dedup();
     c.pairs = pairs.len();
+    cut.sort_unstable();
+    cut.dedup();
+    c.cut_pairs = cut.len();
     let Some(t0) = first else { return c };
     // radio links that can carry a small message, and the internet as one
     // hub no dropper sits in

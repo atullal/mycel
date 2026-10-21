@@ -28,6 +28,12 @@ impl Slo {
     pub fn invariant(&mut self) {
         self.invariant = true;
     }
+
+    /// An invariant only where the candidate models it (`on`); elsewhere a
+    /// quality objective, which an expected failure covers.
+    pub fn invariant_if(&mut self, on: bool) {
+        self.invariant = on;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,8 +141,15 @@ impl ScenarioResult {
         self.notes.push(s.into());
     }
 
-    /// Settle the status from the SLOs and the expectation.
+    /// Settle the status from the SLOs and the expectation. An expectation
+    /// covers quality objectives only: a broken invariant fails the
+    /// scenario whatever is expected of it (a candidate that doesn't model
+    /// one mustn't emit it as an invariant).
     pub fn finish(&mut self) {
+        if self.slos.iter().any(|s| s.invariant && !s.pass) {
+            self.status = Status::Fail;
+            return;
+        }
         let ok = self.slos.iter().all(|s| s.pass);
         self.status = match (ok, self.expected_fail.is_some()) {
             (true, false) => Status::Pass,
@@ -215,4 +228,21 @@ pub fn markdown(results: &[ScenarioResult]) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_expected_failure_never_hides_a_broken_invariant() {
+        let mut r = ScenarioResult::new("x", "x", 2, 1, 1.0);
+        r.at_least("delivery", 80.0, 90.0, "%");
+        r.expect_fail("a known gap");
+        r.finish();
+        assert_eq!(r.status, Status::ExpectedFail);
+        r.at_most("loops", 1.0, 0.0, "").invariant();
+        r.finish();
+        assert_eq!(r.status, Status::Fail, "the gap is expected, the loop isn't");
+    }
 }

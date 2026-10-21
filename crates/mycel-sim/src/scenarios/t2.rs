@@ -146,6 +146,26 @@ impl Plan {
     fn role(&self, i: NodeId) -> Role {
         self.roles.get(&i).copied().unwrap_or_default()
     }
+
+    /// What sets this plan's run apart from others on the same world and
+    /// seed, for file names: its attackers by role and count, and the
+    /// poisoned directory (e.g. `, liar 15`); empty without attackers.
+    fn label(&self) -> String {
+        let mut by_role: Vec<(String, usize)> = Vec::new();
+        for r in self.roles.values() {
+            let name = format!("{r:?}").to_lowercase();
+            match by_role.iter_mut().find(|(n, _)| *n == name) {
+                Some((_, k)) => *k += 1,
+                None => by_role.push((name, 1)),
+            }
+        }
+        by_role.sort();
+        let mut s: String = by_role.iter().map(|(n, k)| format!(", {n} {k}")).collect();
+        if let Some(p) = self.poison {
+            s.push_str(&format!(", poison {p}"));
+        }
+        s
+    }
 }
 
 /// GLOBAL core settings a scenario may vary.
@@ -269,7 +289,7 @@ fn go<R: Router>(
     let wall = t.elapsed().as_secs_f64();
     let oracle = Oracle::new(&sim);
     oracle.annotate(&mut sim, sample);
-    dump_messages(&sim, name, seed);
+    dump_messages(&sim, name, &plan.label(), seed);
     let mut droppers: Vec<NodeId> = plan.roles.iter().filter(|(_, r)| r.drops()).map(|(i, _)| *i).collect();
     droppers.sort_unstable();
     let lfr = (!droppers.is_empty()).then(|| crate::tier2::lfr::ceiling(&sim, &oracle, &droppers));
@@ -293,17 +313,24 @@ fn go<R: Router>(
 }
 
 /// With `MYCEL_SIM_DUMP=<dir>`, every message of a run (sent, delivered,
-/// the oracle's bound, copies...) goes to `<dir>/<model>-<seed>.json`, for
-/// per-message comparisons between commits on the same trace and seed
-/// (common random numbers: the same message ids exist in both runs).
-fn dump_messages<R: Router>(sim: &Sim<R>, name: &str, seed: u64) {
+/// the oracle's bound, copies...) goes to `<dir>/<model><plan>-<seed>.json`
+/// (`<plan>` is [`Plan::label`]: empty without attackers), for per-message
+/// comparisons between commits on the same trace and seed (common random
+/// numbers: the same message ids exist in both runs). Runs that go in
+/// parallel on one model and seed differ in their plan, so each has its
+/// own file; each is written whole and then renamed into place.
+fn dump_messages<R: Router>(sim: &Sim<R>, name: &str, label: &str, seed: u64) {
     let Ok(dir) = std::env::var("MYCEL_SIM_DUMP") else { return };
-    let file: String =
-        name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
+    let file: String = format!("{name}{label}")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect();
     let path = std::path::Path::new(&dir).join(format!("{file}-{seed}.json"));
-    let written = std::fs::create_dir_all(&dir)
-        .map_err(anyhow::Error::from)
-        .and_then(|_| Ok(std::fs::write(&path, serde_json::to_vec(&sim.core.msgs)?)?));
+    let tmp = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let written = std::fs::create_dir_all(&dir).map_err(anyhow::Error::from).and_then(|_| {
+        std::fs::write(&tmp, serde_json::to_vec(&sim.core.msgs)?)?;
+        Ok(std::fs::rename(&tmp, &path)?)
+    });
     if let Err(e) = written {
         eprintln!("MYCEL_SIM_DUMP: {}: {e}", path.display());
     }
@@ -995,12 +1022,15 @@ fn convergence(o: Opts) -> ScenarioResult {
     let mr = converge(msim, n, o.seed, 8);
     let f = |x: Option<f64>| x.map_or("never".into(), |v| format!("{v:.1} s"));
     let c = if o.candidate == Candidate::Main { &mr } else { &gr };
+    // main's loops and convergence are its known gap (NEEDS_GLOBAL), not
+    // invariants
+    let inv = o.candidate != Candidate::Main;
     r.at_most("cold start: 99% of pairs within 8 hops routed", c.cold_99.unwrap_or(f64::INFINITY), 12.0, "s");
-    r.at_most("loops seen while walking routes (every 100 ms)", c.loops as f64, 0.0, "").invariant();
+    r.at_most("loops seen while walking routes (every 100 ms)", c.loops as f64, 0.0, "").invariant_if(inv);
     r.at_most("after the busiest device fails: 99% routed again", c.reconv_99.unwrap_or(f64::INFINITY), 8.0, "s");
     // converging at all (within the 40 s and 30 s watched) holds on every seed
-    r.check("converges: 99% of pairs routed", c.cold_99.is_some(), f(c.cold_99)).invariant();
-    r.check("re-converges after the busiest device fails", c.reconv_99.is_some(), f(c.reconv_99)).invariant();
+    r.check("converges: 99% of pairs routed", c.cold_99.is_some(), f(c.cold_99)).invariant_if(inv);
+    r.check("re-converges after the busiest device fails", c.reconv_99.is_some(), f(c.reconv_99)).invariant_if(inv);
     r.at_most("route length vs shortest (hops)", c.stretch, 1.5, "×");
     if o.candidate == Candidate::Main {
         r.expect_fail(NEEDS_GLOBAL);
@@ -1221,8 +1251,10 @@ fn partial_route(o: Opts) -> ScenarioResult {
 /// Seeds the full `disaster-dtn` is judged on (the mean of their deliveries)...
 const DISASTER_SEEDS: u64 = 12;
 /// ... and at CI size, where one world's delivery ranged 43–100% over 30
-/// calibration seeds (48 messages each: the spread is the worlds', not the
-/// messages'). The mean of 6 fell below 80% on 2 of 30 (min 73.6%), and so
+/// calibration seeds. Each world sends 48 messages, but only those with a
+/// path count, roughly 20 to 48 of them (seed 2: about 22, so one message
+/// is ~4.5 points of that world's delivery): the spread is mostly the
+/// worlds', which a mean over many absorbs. The mean of 6 fell below 80% on 2 of 30 (min 73.6%), and so
 /// did the mean of 10 (min 78.2%, median 86.3%): a few % false alarm per
 /// change at 8 of 10. The mean of 20 ran 81.1–91.0% on the same 30 seeds
 /// (median 85.2%) and passed on all of them (docs/SIMULATION.md §4, 25).
@@ -1259,8 +1291,9 @@ fn disaster_world(o: &Opts) -> (World, Vec<(NodeId, NodeId)>) {
         w.specs.push(dev(1, (i as f64 * 1000.0, 0.0), &[], Some(world::home(&mut rng))));
     }
     let mut pairs = Vec::new();
-    // at least 48 messages even in a small world: with 12, one message was
-    // 8 points of delivery, and seeds "failed" at 6 of 8 (75%)
+    // at least 48 messages sent even in a small world (with 12, one message
+    // was 8 points of delivery, and seeds "failed" at 6 of 8, 75%); fewer
+    // are feasible, so the verdict is a mean over worlds
     for k in 0..o.n(60, 48) {
         let sc = k % camps.len();
         let src = members[sc][rng.below(per)];
@@ -1587,7 +1620,7 @@ fn adversarial(o: Opts) -> ScenarioResult {
     r.check("storm announcements rate-limited", limited > 0, format!("{limited} dropped by per-neighbour limits"));
     r.check("replayed announcements dropped as stale", stale > 0, format!("{stale} stale"));
     r.at_least(
-        "delivery with 5% black holes lying plausibly, dropping packets and bundles (of feasible)",
+        "delivery with 5% black holes lying plausibly (one hop from everyone), dropping packets and bundles (of feasible)",
         100.0 * liars.m.delivery_ratio,
         90.0,
         "%",
@@ -1624,6 +1657,7 @@ fn adversarial(o: Opts) -> ScenarioResult {
         v.extend(lfr_rows);
     }
     r.note(row(&clean.m));
+    r.note("The plausible liars judged here are today's one-hop liars, a weak attacker: at full size a liar that extends the cheapest chain it was sent does more damage, and `liar-ceiling` judges every format by its worst strategy (docs/SIMULATION.md §4, open 15).");
     r.note(format!(
         "Black holes lying plausibly (the same devices claim to be one hop from everyone at the least cost an honest relay could report, and drop packets and bundles alike; nothing an announcement shows gives them away, but the destination's acknowledgements don't come back: the source moves off a next hop after two timeouts and spreads its bundle's copies; docs/SIMULATION.md §4, fixed 21): {}",
         row(&liars.m)
@@ -1643,12 +1677,31 @@ fn adversarial(o: Opts) -> ScenarioResult {
 
 /// Seeds `liar-ceiling` runs at full size: 1–20 from `--seed 1`, the
 /// seeds `adversarial`'s plausible liars were first measured on among them.
+/// (3 below full size; `MYCEL_SIM_LIAR_SEEDS=k` for k at any size.)
 const LIAR_SEEDS: u64 = 20;
 
-/// What `liar-ceiling`'s bad devices do, run by run: today's liar, one held
-/// to signed per-hop attestations, and one that can't lie at all.
-const LIAR_ROLES: [(Role, &str); 3] =
-    [(Role::Liar, "liar"), (Role::AttestedLiar, "attested liar"), (Role::Dropper, "honest dropper")];
+/// What `liar-ceiling`'s bad devices do, run by run: today's liar (one hop
+/// from everyone), a liar that extends the cheapest chain it was sent (the
+/// most signed per-hop attestations let it say), and two that announce the
+/// truth: one drops everything, a grey hole drops half the messages.
+const LIAR_ROLES: [(Role, &str); 4] = [
+    (Role::Liar, "one-hop liar"),
+    (Role::AttestedLiar, "chain-extending liar"),
+    (Role::Dropper, "honest dropper"),
+    (Role::GreyHole, "honest grey hole"),
+];
+
+/// The strategies open to a bad device under each announcement format, as
+/// indices into [`LIAR_ROLES`]: with no attestations it can say anything;
+/// held to a signed per-hop chain it can only extend one it was sent (or
+/// announce the truth); with each hop's measured cost signed in too, only
+/// the truth. Each regime's worst case is the worst of its strategies, seed
+/// by seed.
+const REGIMES: [(&str, &[usize]); 3] = [
+    ("no attestation (today)", &[0, 1, 2, 3]),
+    ("signed per-hop chain", &[1, 2, 3]),
+    ("chain + each hop's measured cost", &[2, 3]),
+];
 
 /// One seed of `liar-ceiling`: a run per [`LIAR_ROLES`] entry, on the same
 /// world and traffic.
@@ -1665,11 +1718,11 @@ fn mean_se(xs: &[f64]) -> (f64, f64) {
     (mean, (var / k).sqrt())
 }
 
-/// How much of the plausible liars' damage is inherent (pairs every path
-/// of which crosses a liar), and how much signed per-hop attestations
-/// would win back: `adversarial`'s plausible-liar run on many seeds, with
-/// liar-free-reachable delivery, against a liar that can only extend
-/// chains it was sent (attested) and one that can't lie at all.
+/// How much of plausible liars' damage is inherent (pairs every path of
+/// which crosses a liar), and how much each announcement format would win
+/// back: `adversarial`'s plausible-liar run on many seeds, with
+/// liar-free-reachable delivery, once per strategy in [`LIAR_ROLES`], each
+/// format judged by the worst strategy it leaves open ([`REGIMES`]).
 fn liar_ceiling(o: Opts) -> ScenarioResult {
     let mut r = ScenarioResult::new(
         "liar-ceiling",
@@ -1678,11 +1731,16 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
         o.seed,
         o.scale,
     );
-    let k = if o.scale >= 1.0 { LIAR_SEEDS } else { 3 };
+    let k = std::env::var("MYCEL_SIM_LIAR_SEEDS").ok().and_then(|v| v.parse().ok()).unwrap_or(if o.scale >= 1.0 {
+        LIAR_SEEDS
+    } else {
+        3
+    });
     let model = Model::of(o.candidate);
-    let seeds: Vec<LiarSeed> = (o.seed..o.seed + k)
+    let seeds: Vec<LiarSeed> = (0..k)
         .into_par_iter()
-        .map(|seed| {
+        .map(|i| {
+            let seed = o.seed.wrapping_add(i);
             let a = adversaries(&Opts { seed, ..o });
             let runs = LIAR_ROLES
                 .par_iter()
@@ -1708,56 +1766,100 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
                 n("seqreqs_sent"),
                 n("routes_through_droppers")
             ));
-            row[label.replace(' ', "_")] = json!({"lfr": lfr(x), "metrics": x.m, "extra": x.extra});
+            row[label.replace([' ', '-'], "_")] = json!({"lfr": lfr(x), "metrics": x.m, "extra": x.extra});
         }
         rows.push(row);
     }
-    // per role: raw, LFR and ceiling, one value per seed
+    // per role: raw and LFR delivery, one value per seed
     let col = |i: usize, f: fn(&crate::tier2::lfr::Ceiling) -> f64| -> Vec<f64> {
         seeds.iter().map(|s| 100.0 * f(&lfr(&s.runs[i]))).collect()
     };
     let raw: Vec<Vec<f64>> = (0..LIAR_ROLES.len()).map(|i| col(i, |c| c.raw())).collect();
     let lfr_d: Vec<Vec<f64>> = (0..LIAR_ROLES.len()).map(|i| col(i, |c| c.lfr())).collect();
     let ceil = col(0, |c| c.ceiling());
+    // per regime: the worst of its strategies, seed by seed
+    let worst = |v: &[Vec<f64>], roles: &[usize]| -> Vec<f64> {
+        (0..seeds.len()).map(|s| roles.iter().map(|i| v[*i][s]).fold(f64::INFINITY, f64::min)).collect()
+    };
+    let raw_w: Vec<Vec<f64>> = REGIMES.iter().map(|(_, roles)| worst(&raw, roles)).collect();
+    let lfr_w: Vec<Vec<f64>> = REGIMES.iter().map(|(_, roles)| worst(&lfr_d, roles)).collect();
     let m = |v: &[f64]| mean_se(v).0;
     let min = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
-    // paired against today's liar, seed by seed
-    let gap = |i: usize| {
-        let d: Vec<f64> = raw[i].iter().zip(&raw[0]).map(|(a, l)| a - l).collect();
+    // paired, seed by seed: mean difference ± two standard errors
+    let paired = |a: &[f64], b: &[f64]| {
+        let d: Vec<f64> = a.iter().zip(b).map(|(a, b)| a - b).collect();
         let (gm, se) = mean_se(&d);
         let better = d.iter().filter(|g| **g > 0.0).count();
         let worse = d.iter().filter(|g| **g < 0.0).count();
         format!("{gm:+.1} ± {:.1} points ({better} seeds better, {worse} worse)", 2.0 * se)
     };
+    let last = o.seed.wrapping_add(k.saturating_sub(1));
     r.headline(format!(
-        "seeds {}–{}: liars raw {:.1}% (min {:.0}%), LFR {:.1}% (min {:.0}%), ceiling {:.1}% · attested liars raw {:.1}%, LFR {:.1}%, vs liars {} · honest droppers raw {:.1}%, LFR {:.1}%, vs liars {}",
+        "seeds {}–{last}: ceiling {:.1}% · worst case raw (LFR) by format: today {:.1}% ({:.1}%, min {:.0}%), signed chain {:.1}% ({:.1}%), {} vs today, chain + hop costs {:.1}% ({:.1}%), {} vs chain alone",
         o.seed,
-        o.seed + k - 1,
-        m(&raw[0]),
-        min(&raw[0]),
-        m(&lfr_d[0]),
-        min(&lfr_d[0]),
         m(&ceil),
-        m(&raw[1]),
-        m(&lfr_d[1]),
-        gap(1),
-        m(&raw[2]),
-        m(&lfr_d[2]),
-        gap(2),
+        m(&raw_w[0]),
+        m(&lfr_w[0]),
+        min(&lfr_w[0]),
+        m(&raw_w[1]),
+        m(&lfr_w[1]),
+        paired(&raw_w[1], &raw_w[0]),
+        m(&raw_w[2]),
+        m(&lfr_w[2]),
+        paired(&raw_w[2], &raw_w[1]),
     ));
-    // a message delivered although every path crossed a dropper would mean
-    // the oracle or a role is wrong
-    let leaked: usize = seeds.iter().flat_map(|s| s.runs.iter().map(|x| lfr(x).cut_delivered)).sum();
-    r.at_most("delivered although every path crosses a liar", leaked as f64, 0.0, "messages").invariant();
-    r.at_least("liar-free-reachable delivery with plausible liars, mean over seeds", m(&lfr_d[0]), 90.0, "%");
-    r.note("Liar-free-reachable (LFR): the honest pair still has a path, on the time-expanded contact graph, once every liar is removed. LFR delivery = delivered / LFR-reachable is what the defence saved of what could be saved; the ceiling (LFR-reachable / feasible) is the most any routing can deliver while liars drop everything. Attested liar: advertises only what signed per-hop route attestations allow (the cheapest chain it was sent, plus one hop and the 2.1 ms floor). Honest dropper: announces truthfully (what is left if attestations also bind each hop's measured cost). All three drop every packet and bundle they relay. Gaps are paired per seed against today's liar on the same world and traffic: mean of the differences in raw delivery ± two standard errors.");
+    r.headline(format!(
+        "by strategy, raw: {}",
+        LIAR_ROLES
+            .iter()
+            .enumerate()
+            .map(|(i, (_, label))| {
+                let vs = if i == 0 { String::new() } else { format!(", {} vs one-hop", paired(&raw[i], &raw[0])) };
+                format!("{label} {:.1}% (min {:.0}%){vs}", m(&raw[i]), min(&raw[i]))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
+    ));
+    for (j, (regime, roles)) in REGIMES.iter().enumerate() {
+        let picks: Vec<&str> = (0..seeds.len())
+            .map(|s| {
+                let i = roles.iter().copied().min_by(|a, b| raw[*a][s].total_cmp(&raw[*b][s])).unwrap_or(0);
+                LIAR_ROLES[i].1
+            })
+            .collect();
+        r.note(format!(
+            "{regime}: worst case raw {:.1}% (min {:.1}%), LFR {:.1}%; the worst strategy per seed: {}",
+            m(&raw_w[j]),
+            min(&raw_w[j]),
+            m(&lfr_w[j]),
+            picks.join(", ")
+        ));
+    }
+    // a message delivered although every path crossed a device that drops
+    // everything would mean the oracle or a role is wrong (a grey hole
+    // forwards half, so its runs don't count)
+    let leaked: usize = seeds
+        .iter()
+        .flat_map(|s| s.runs.iter().zip(&LIAR_ROLES).filter(|(_, (role, _))| *role != Role::GreyHole))
+        .map(|(x, _)| lfr(x).cut_delivered)
+        .sum();
+    r.at_most("delivered although every path crosses a liar", leaked as f64, 0.0, "messages")
+        .invariant_if(o.candidate == Candidate::Global);
+    r.at_least(
+        "liar-free-reachable delivery against the worst unattested strategy, mean over seeds",
+        m(&lfr_w[0]),
+        90.0,
+        "%",
+    );
+    r.note("Liar-free-reachable (LFR): the honest pair still has a path, on the time-expanded contact graph, once every bad device is removed. LFR delivery = delivered / LFR-reachable is what the defence saved of what could be saved; the ceiling (LFR-reachable / feasible) is the most any routing can deliver while they drop everything. One-hop liar: claims to be one hop from every origin at the 2.1 ms floor (today's `Role::Liar`). Chain-extending liar: the cheapest chain it was sent, plus one hop and the 2.1 ms floor; the most a signed per-hop chain lets a liar say, and open to an unattested liar too. Honest dropper and grey hole: announce the truth (all a liar can do once each hop's measured cost is signed into the chain as well); the dropper drops everything, the grey hole half the messages. Each format is judged by the worst strategy it leaves open, seed by seed (a bad device can pick its strategy for its world). Not modelled: what attestations give the defence (blaming the last signer of a chain that loses traffic), or a liar that adapts within a run. Paired gaps: mean of the per-seed differences in raw delivery ± two standard errors.");
     r.metrics = serde_json::Value::Array(rows);
     if o.candidate != Candidate::Global {
         r.expect_fail("liars and attestation are modelled for the GLOBAL routing core only");
-    } else if o.scale >= 1.0 {
-        // seeds 1–20: 85.4% (77–91%), with a ceiling of 100% on every seed
+    } else if o.scale >= 0.75 {
+        // seeds 1–20 at 0.75 (225 phones): worst case 84.3%, at full size
+        // 78.4%; at 0.5 it is 92.3% (min 79%), borderline, and at 0.1 96.7%
         r.expect_fail(
-            "docs/SIMULATION.md §4, open 15: at full size the defences lose pairs that liar-free paths could serve",
+            "docs/SIMULATION.md §4, open 15: from 225 phones on the defences lose pairs that liar-free paths could serve",
         );
     }
     r
@@ -1946,7 +2048,7 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
     // sources from one shared stream, so neighbouring limits compared
     // different messages: at CI size, seed 3, reach "fell" from 99% to 95%
     // at hop 7 on 20 messages from other devices.)
-    let msgs = o.n(60, 40);
+    let msgs = o.n(160, 160);
     let mut rng = Rng::new(stream_seed(o.seed, Stream::Workload));
     let sources: Vec<NodeId> = (0..msgs).map(|_| rng.below(n) as NodeId).collect();
     let mut rows = Vec::new();
@@ -1954,6 +2056,8 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
     let mut useful_by_h = Vec::new();
     // per hop limit (suppressed rebroadcasts): each broadcast's reach
     let mut per_msg: Vec<Vec<f64>> = Vec::new();
+    // (sent, source) of every run's broadcasts, as the engine recorded them
+    let mut sends: Vec<Vec<(Time, NodeId)>> = Vec::new();
     for h in 1..=7u8 {
         for suppress in [1u8, 255] {
             let flood: Rc<crate::tier2::dtn::FloodStats> = Rc::default();
@@ -1966,6 +2070,7 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
             }
             sim.start();
             sim.run(2 * SEC + msgs as Time * 2 * SEC + 10 * SEC);
+            sends.push(sim.core.msgs.iter().map(|m| (m.sent, m.src)).collect());
             let reached = flood.reached.borrow();
             let rb = flood.rebroadcasts.borrow();
             let (mut reach, mut useful) = (0.0, 0.0);
@@ -1997,8 +2102,9 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
     // qualitative Meshtasticator check: reach rises with the hop limit and
     // saturates, while each transmission reaches fewer new devices. "Rises"
     // is judged on the paired per-broadcast differences between neighbouring
-    // limits: no step may fall by more than its noise (the mean difference
-    // plus two standard errors below zero, and more than 2 points). Reach
+    // limits, as non-inferiority with a 2-point margin: no step may fall by
+    // more than its noise (the mean difference plus two standard errors
+    // below zero) and more than 2 points. Reach
     // needn't rise exactly: with duplicate suppression a device that first
     // hears a copy late, over a long path, has fewer hops left to pass on.
     let falls: Vec<String> = per_msg
@@ -2014,12 +2120,21 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
     let rising = falls.is_empty();
     let gain =
         |a: usize, b: usize| reach_by_h.get(b).copied().unwrap_or(0.0) - reach_by_h.get(a).copied().unwrap_or(0.0);
-    // paired too: hop 6→7's gain minus half of 2→3's, per broadcast; not
-    // diminishing only if that is above zero by more than its noise
+    // paired too: hop 6→7's gain minus half of 2→3's, per broadcast; it
+    // must be below zero by more than its noise (evidence of diminishing
+    // returns, not just no evidence against them)
     let excess: Vec<f64> =
         (0..msgs).map(|m| (per_msg[6][m] - per_msg[5][m]) - (per_msg[2][m] - per_msg[1][m]) / 2.0).collect();
     let (ex_mean, ex_se) = mean_se(&excess);
-    let diminishing = ex_mean - 2.0 * ex_se < 0.0;
+    let diminishing = ex_mean + 2.0 * ex_se < 0.0;
+    // the pairing itself: every run sent the same broadcasts
+    let differ = sends.iter().filter(|x| **x != sends[0]).count();
+    r.check(
+        "every hop limit sends the same broadcasts (paired runs)",
+        differ == 0 && sends[0].len() == msgs,
+        format!("{} runs of {msgs} broadcasts, {differ} differ from the first", sends.len()),
+    )
+    .invariant();
     let falling = useful_by_h.windows(2).all(|w| w[1] <= w[0] + 0.05);
     r.check(
         "reach rises with the hop limit (paired, per broadcast)",
@@ -2044,6 +2159,7 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tier2::global::{ATTESTED_HOP_FLOOR, Chain};
 
     /// Bluetooth-only phones outdoors (60 m range) at `xy`.
     fn ble_world(xy: &[(f64, f64)]) -> World {
@@ -2056,13 +2172,22 @@ mod tests {
     /// One 1 kB message from `a` to `b` after the routes settle, with the
     /// devices in `liars` lying plausibly.
     fn one_message(w: &World, a: NodeId, b: NodeId, liars: &[NodeId]) -> crate::tier2::lfr::Ceiling {
+        one_message_as(w, a, b, liars, Role::Liar)
+    }
+
+    fn one_message_as(w: &World, a: NodeId, b: NodeId, bad: &[NodeId], role: Role) -> crate::tier2::lfr::Ceiling {
         let plan = Plan {
             sends: vec![(20 * SEC, a, b, 1000, false)],
-            roles: liars.iter().map(|l| (*l, Role::Liar)).collect(),
+            roles: bad.iter().map(|l| (*l, role)).collect(),
             ..Plan::default()
         };
         let x = run(Model::Global(GCfg::default()), w, &plan, 1, 120 * SEC, None);
         x.lfr.expect("a run with droppers measures what they must cost")
+    }
+
+    /// A line, 50 m apart: 0 — 1 — 2 — 3 — 4.
+    fn line5() -> World {
+        ble_world(&[(0.0, 0.0), (50.0, 0.0), (100.0, 0.0), (150.0, 0.0), (200.0, 0.0)])
     }
 
     #[test]
@@ -2083,14 +2208,69 @@ mod tests {
         assert_eq!((c.feasible, c.reachable, c.cut), (1, 1, 0), "{c:?}");
         // two disjoint paths in all (≥ f + 1 = 2), one avoiding the liar
         assert_eq!((c.pairs_f1_disjoint, c.pairs_by_honest_paths), (1, [0, 1, 0, 0]));
-        assert_eq!(c.lfr(), c.reachable_delivered as f64);
+        // and the defence finds it: the message gets through, round the liar
+        assert_eq!((c.delivered, c.reachable_delivered, c.cut_pairs), (1, 1, 0), "{c:?}");
+        assert_eq!((c.raw(), c.lfr(), c.ceiling()), (1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn an_honest_dropper_announces_the_truth_and_relays_nothing() {
+        // the only path from 0 to 4 crosses 1
+        let c = one_message_as(&line5(), 0, 4, &[1], Role::Dropper);
+        assert_eq!((c.feasible, c.reachable, c.cut, c.cut_pairs, c.delivered), (1, 0, 1, 1, 0), "{c:?}");
+        // what 0 hears from it is what an honest 1 says, all along
+        assert_eq!(heard_via(Role::Dropper, 4), heard_via(Role::Honest, 4));
+    }
+
+    #[test]
+    fn walking_routes_finds_the_ones_through_a_device() {
+        // 0 — 1 — 2, all honest, one message 0 → 2: its route runs via 1
+        let w = ble_world(&[(0.0, 0.0), (50.0, 0.0), (100.0, 0.0)]);
+        let shared = Rc::new(Shared::default());
+        let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), 1, |i, _| {
+            Global::new(i, global_cfg(GCfg::routing(), 1, i), shared.clone())
+        });
+        sim.send_at(20 * SEC, 0, 2, 1000);
+        sim.start();
+        sim.run(40 * SEC);
+        assert_eq!(routes_through(&sim, &[1]), 1);
+        assert_eq!(routes_through(&sim, &[]), 0);
+        // a pair with an end among the devices isn't counted
+        assert_eq!(routes_through(&sim, &[2]), 0);
+        assert_eq!(routes_through(&sim, &[1, 2]), 0);
+    }
+
+    /// On [`line5`] with `role` at device 1, each second from 30 s to
+    /// 90 s: the last announcement of `origin` device 0 heard from 1, and
+    /// the one 1 heard from 2 (seq, hops, cost).
+    fn heard_via(role: Role, origin: NodeId) -> Vec<(Option<Chain>, Option<Chain>)> {
+        let w = line5();
+        let shared = Rc::new(Shared::default());
+        let g = GCfg::default();
+        let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), 1, |i, _| {
+            let mut r = Global::new(i, global_cfg(g, 1, i), shared.clone());
+            r.heard = Some(Map::default());
+            if i == 1 {
+                r.role = role;
+            }
+            r
+        });
+        sim.start();
+        let heard = |sim: &Sim<Global>, at: usize, from: NodeId| {
+            sim.routers[at].heard.as_ref().and_then(|h| h.get(&(from, key(origin))).copied())
+        };
+        (30..=90)
+            .map(|t| {
+                sim.run(t * SEC);
+                (heard(&sim, 0, 1), heard(&sim, 1, 2))
+            })
+            .collect()
     }
 
     /// The hops `observer` holds for its route to `origin` through `via`,
     /// each second from 30 s to 90 s, with `role` at `via`.
     fn hops_via(role: Role, observer: NodeId, via: NodeId, origin: NodeId) -> Vec<Option<u8>> {
-        // a line, 50 m apart: 0 — 1 — 2 — 3 — 4
-        let w = ble_world(&[(0.0, 0.0), (50.0, 0.0), (100.0, 0.0), (150.0, 0.0), (200.0, 0.0)]);
+        let w = line5();
         let shared = Rc::new(Shared::default());
         let g = GCfg::default();
         let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), 1, |i, _| {
@@ -2123,5 +2303,41 @@ mod tests {
         let liar = hops_via(Role::Liar, 0, 1, 4);
         assert!(liar.iter().all(|h| h.is_none() || *h == Some(2)), "{liar:?}");
         assert!(liar.contains(&Some(2)) && liar.contains(&None), "{liar:?}");
+    }
+
+    #[test]
+    fn a_chain_extending_liar_understates_only_its_own_link() {
+        use mycel_net::mesh::core::INFINITY;
+        // what 0 heard from 1 with what 1 heard from 2, of the same seqno
+        let same_seq = |v: &[(Option<Chain>, Option<Chain>)]| -> Vec<(Chain, Chain)> {
+            v.iter()
+                .filter_map(|x| match *x {
+                    (Some(a), Some(b)) if a.0 == b.0 && a.2 != INFINITY && b.2 != INFINITY => Some((a, b)),
+                    _ => None,
+                })
+                .collect()
+        };
+        // device 4 is three hops from device 1, over Bluetooth links that
+        // cost far more than the 2.1 ms floor
+        let honest = same_seq(&heard_via(Role::Honest, 4));
+        let attested = same_seq(&heard_via(Role::AttestedLiar, 4));
+        assert!(!honest.is_empty() && !attested.is_empty());
+        let (h, h2) = honest[0];
+        let link = h.2 - h2.2;
+        assert!(link > 100 * ATTESTED_HOP_FLOOR, "a Bluetooth hop costs {link}, the floor {ATTESTED_HOP_FLOOR}");
+        for (h, h2) in &honest {
+            assert_eq!((h.1, h.2), (h2.1 + 1, h2.2 + link), "honest: one hop and its own link");
+        }
+        // held to the chain 2 sent it: one hop and the floor on top, so
+        // cheaper than the truth by its link less the floor, hops as honest
+        for (a, a2) in &attested {
+            assert_eq!((a.1, a.2), (a2.1 + 1, a2.2 + ATTESTED_HOP_FLOOR), "{a:?} from {a2:?}");
+            assert_eq!(a2.2, h2.2, "2's own route to 4 doesn't change");
+            assert_eq!((a.1, h.2 - a.2), (h.1, link - ATTESTED_HOP_FLOOR));
+        }
+        // today's liar: one hop at the floor, cheaper still
+        let liar: Vec<Chain> =
+            heard_via(Role::Liar, 4).iter().filter_map(|x| x.0).filter(|l| l.2 != INFINITY).collect();
+        assert!(!liar.is_empty() && liar.iter().all(|l| (l.1, l.2) == (1, ATTESTED_HOP_FLOOR)), "{liar:?}");
     }
 }

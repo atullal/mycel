@@ -268,6 +268,8 @@ pub struct Summary {
     pub mean: f64,
     pub p50: f64,
     pub p95: f64,
+    /// Not written out for optimality ratios below [`P99_MIN_N`].
+    #[serde(default)]
     pub p99: f64,
     pub max: f64,
 }

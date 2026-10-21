@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 pub use engine::{Action, Area, HOUR, Inet, MIN, MS, MsgId, NodeId, NodeSpec, Router, SEC, Sim, Techs, Time};
 
-use crate::stats::{Summary, Tail, jain, max_share};
+use crate::stats::{P99_MIN_N, Summary, Tail, jain, max_share};
 
 /// What a tier-2 run measured.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -29,7 +29,10 @@ pub struct T2Metrics {
     pub delivery_ratio: f64,
     /// Seconds from send to delivery.
     pub latency_s: Summary,
-    /// achieved / optimal latency, per delivered message with an oracle answer.
+    /// achieved / optimal latency, per delivered message with an oracle
+    /// answer. Written out without p99 below [`P99_MIN_N`] ratios: at a few
+    /// hundred it is one of the few slowest ([`Tail`] has what holds).
+    #[serde(serialize_with = "ratios_without_small_p99")]
     pub optimality: Summary,
     /// The tail of the same ratios in numbers that hold at a few hundred
     /// messages (p95 with its interval, CVaR₉₅, counts over 10× and 30×).
@@ -55,6 +58,23 @@ pub struct T2Metrics {
     pub peak_stored: u64,
     pub events: u64,
     pub wall_s: f64,
+}
+
+/// [`T2Metrics::optimality`] as written out: p99 only from [`P99_MIN_N`]
+/// ratios on.
+fn ratios_without_small_p99<S: serde::Serializer>(s: &Summary, ser: S) -> Result<S::Ok, S::Error> {
+    #[derive(Serialize)]
+    struct Ratios {
+        n: usize,
+        mean: f64,
+        p50: f64,
+        p95: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        p99: Option<f64>,
+        max: f64,
+    }
+    Ratios { n: s.n, mean: s.mean, p50: s.p50, p95: s.p95, p99: (s.n >= P99_MIN_N).then_some(s.p99), max: s.max }
+        .serialize(ser)
 }
 
 /// Summarise a finished run (`finish` + oracle annotations done).
@@ -120,5 +140,21 @@ pub fn metrics<R: Router>(
         peak_stored: sim.core.counters.iter().map(|c| c.stored_peak).max().unwrap_or(0),
         events: sim.core.events_run,
         wall_s,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optimality_p99_is_written_only_from_4000_ratios() {
+        let few = T2Metrics { optimality: Summary::of(&[1.0; 400]), ..T2Metrics::default() };
+        let v = serde_json::to_value(&few).expect("json");
+        assert!(v["optimality"].get("p99").is_none() && v["optimality"]["p95"] == 1.0, "{v}");
+        let many = T2Metrics { optimality: Summary::of(&vec![1.0; P99_MIN_N]), ..T2Metrics::default() };
+        assert_eq!(serde_json::to_value(&many).expect("json")["optimality"]["p99"], 1.0);
+        // latency keeps its p99 (a summary of seconds, not a verdict)
+        assert!(v["latency_s"].get("p99").is_some());
     }
 }

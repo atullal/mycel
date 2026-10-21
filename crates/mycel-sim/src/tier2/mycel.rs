@@ -77,14 +77,15 @@ pub enum Role {
     /// gets, packets and store-and-forward bundles alike (tier-2 GLOBAL core
     /// only).
     Liar,
-    /// A liar held to what signed per-hop route attestations would let it
-    /// say (the planned wire change, docs/ROUTING.md §6 item 13): it can't
-    /// invent a short chain, only extend one it received, by one hop and
-    /// the least cost an honest hop adds (2.1 ms); so it advertises the
-    /// cheapest route it heard plus one hop and 2.1 ms, understating only
-    /// its own link. It drops everything all the same (tier-2 GLOBAL core
-    /// only). The gap between [`Role::Liar`] and this is what the wire
-    /// change can buy.
+    /// A liar that extends the cheapest chain it was sent, by one hop and
+    /// the least cost an honest hop adds (2.1 ms), understating only its
+    /// own link, and drops everything (tier-2 GLOBAL core only). It is the
+    /// most a liar held to signed per-hop route attestations can say (the
+    /// planned wire change, docs/ROUTING.md §6 item 13: it can't invent a
+    /// short chain, only extend one it received); an unattested liar can
+    /// say it too, since without attestations it can say anything. So the
+    /// worst unattested liar is at least as bad as the worse of this and
+    /// [`Role::Liar`] (docs/SIMULATION.md §4, open 15).
     AttestedLiar,
     /// Announces honestly and drops everything (packets and bundles): all
     /// that is left of a liar once announcements can't lie at all (route
@@ -92,6 +93,12 @@ pub enum Role {
     /// next hop, so not even its own link can be understated). The real
     /// world's "believable liar": a relay that truly is close, and drops.
     Dropper,
+    /// A grey hole: announces honestly, and drops half of the messages it
+    /// relays, chosen per message ([`Role::swallows`]: every packet and
+    /// acknowledgement of a chosen message, and its bundle), forwarding
+    /// the rest. Some traffic through it is acknowledged, so the
+    /// end-to-end defence sees mixed evidence (tier-2 GLOBAL core only).
+    GreyHole,
     /// Announces every 10 ms.
     Storm,
     /// Re-sends announcements it heard long ago.
@@ -102,7 +109,18 @@ impl Role {
     /// It drops what it is given to relay (packets, and with the GLOBAL
     /// core bundles too).
     pub fn drops(self) -> bool {
-        matches!(self, Role::BlackHole | Role::Liar | Role::AttestedLiar | Role::Dropper)
+        matches!(self, Role::BlackHole | Role::Liar | Role::AttestedLiar | Role::Dropper | Role::GreyHole)
+    }
+
+    /// It drops traffic of message `msg` that it relays (`None`: traffic
+    /// that belongs to no message). A [`Role::GreyHole`] drops the half of
+    /// messages whose id hashes odd (Fibonacci hashing, so neighbouring ids
+    /// don't alternate); every other dropper, everything.
+    pub fn swallows(self, msg: Option<u32>) -> bool {
+        match self {
+            Role::GreyHole => msg.is_some_and(|m| m.wrapping_mul(0x9e37_79b1) >> 31 == 1),
+            r => r.drops(),
+        }
     }
 }
 
