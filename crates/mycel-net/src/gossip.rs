@@ -268,15 +268,22 @@ pub(crate) async fn serve(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) 
         if !r.is_member(&peer) {
             bail!("gossip from a non-member");
         }
+        let data = carries_data(&msg);
         // (bound first: a guard in the match scrutinee would live through
         // the arms, which lock the disseminator again)
         let res = inner.gossip.d.lock().on_msg(r, peer, msg, now);
         let pushed = match res {
             Ok(p) => p,
             // We hold the space but don't gossip in it yet (our own `Add`
-            // hasn't reached us): a session with the sender brings it.
+            // hasn't reached us, or the view forms at the next scheduler
+            // round): a session with the sender brings what it pushed or
+            // announced. Control messages (a graft from a member whose view
+            // formed first, a prune, `Have`) need none: our view will
+            // choose its edges, and a push makes the sender a neighbour.
             Err(reconcile::gossip::GossipError::UnknownSpace) => {
-                inner.gossip.d.lock().pull(peer, space);
+                if data {
+                    inner.gossip.d.lock().pull(peer, space);
+                }
                 return anyhow::Ok(None);
             }
             Err(e) => return Err(e.into()),
@@ -327,7 +334,34 @@ pub(crate) async fn serve(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) 
     Ok(())
 }
 
+/// A push or an announcement: in a space whose view hasn't formed yet,
+/// a session with the sender brings what it carried. Control messages
+/// need none (a graft that beat our view used to start a session).
+fn carries_data(msg: &GMsg) -> bool {
+    matches!(msg, GossipMsg::Push { .. } | GossipMsg::IHave { .. })
+}
+
 /// Keep the senders map from growing with peers we no longer talk to.
 pub(crate) fn reap(inner: &Inner) {
     inner.gossip.senders.lock().retain(|_, tx| !tx.is_closed());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_data_needs_a_session_before_the_view_forms() {
+        let space = mycel_crypto::Hash32([3; 32]);
+        let push = GMsg::Push { space, ops: vec![], items: vec![], entries: vec![], seen: vec![] };
+        let ihave = GMsg::IHave { space, ops: vec![], entries: vec![], seen: vec![] };
+        assert!(carries_data(&push) && carries_data(&ihave));
+        for control in [
+            GMsg::Graft { space },
+            GMsg::Prune { space, drop: true, alternatives: vec![] },
+            GMsg::Have { space, ids: vec![] },
+        ] {
+            assert!(!carries_data(&control), "{control:?}");
+        }
+    }
 }
