@@ -310,6 +310,8 @@ pub fn compose(s: &Spec, k: &Knobs, size: Size, swarm: &Swarm, seed: u64) -> any
     let attackers = assign_adversaries(s, k, n, swarm, seed, &mut plan);
     os_actions(s, k, n, size.duration, swarm, seed, &mut plan);
     outages(s, &w, n, swarm, &mut plan);
+    // "near" destinations: the same cluster or city, or within 200 m
+    // (estimate: a walk across a campus or a festival field)
     let near = |a: usize, b: usize| -> bool {
         match r.layout {
             Layout::Clusters => a % clusters == b % clusters,
@@ -333,6 +335,8 @@ pub fn compose(s: &Spec, k: &Knobs, size: Size, swarm: &Swarm, seed: u64) -> any
 }
 
 fn inet_for(mix: AccessMix, ua: f64, un: f64, nat_hard: f64) -> Inet {
+    // cellular: 40% of phones on 5G, the rest LTE (estimate; it only picks
+    // the access class's latency and uplink in models.rs)
     let cellular = |ua: f64, un: f64| Inet {
         access: if ua < 0.4 { Access::FiveG } else { Access::Lte },
         nat: if un < nat_hard { Nat::Hard } else { Nat::Easy },
@@ -393,6 +397,8 @@ fn assign_adversaries(s: &Spec, k: &Knobs, n: usize, swarm: &Swarm, seed: u64, p
 /// Battery deaths, churn and restart storms, as scheduled actions.
 fn os_actions(s: &Spec, k: &Knobs, n: usize, until: Time, swarm: &Swarm, seed: u64, plan: &mut Plan) {
     if let (Some(median), true) = (k.battery_median_h, swarm.on("battery")) {
+        // σ of ln(time to death): 0.5 by default (estimate; WP9's energy
+        // model replaces the whole stand-in)
         let sigma = s.os.battery_sigma.unwrap_or(0.5);
         for i in 0..n {
             // log-normal time to death around the median, keyed per device
