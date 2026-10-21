@@ -16,6 +16,18 @@
 //! Neither ever blocks on Iroh, and Iroh never blocks on them: packets to
 //! send go into a bounded per-channel [`OutQueue`] and a block is posted to R
 //! to drain it; packets received go into the hub's bounded inbound queue.
+//!
+//! iOS / iPadOS in the background: the app declares the Bluetooth background
+//! modes, so scanning (always filtered by the Mycel service, as background
+//! scans must be) and advertising carry on while it's suspended, and
+//! CoreBluetooth events wake it briefly. Both managers opt into state
+//! restoration ([`RESTORE_CENTRAL`], [`RESTORE_PERIPHERAL`]): when iOS ended
+//! Mycel for memory, it relaunches it in the background for a Bluetooth
+//! event. Not after the user swipes it away. A backgrounded iPhone
+//! advertises its service only in Apple's "overflow area", which only other
+//! Apple devices scanning for it can see. Restored peripherals are dropped
+//! and found again by scanning: the link state machine doesn't survive a
+//! relaunch, and L2CAP channels aren't restored.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -32,10 +44,11 @@ use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AllocAnyThread, DefinedClass, Message, define_class, msg_send};
 use objc2_core_bluetooth::{
     CBAdvertisementDataLocalNameKey, CBAdvertisementDataServiceUUIDsKey, CBAttributePermissions, CBCentralManager,
-    CBCentralManagerDelegate, CBCentralManagerScanOptionAllowDuplicatesKey, CBCharacteristic,
-    CBCharacteristicProperties, CBL2CAPChannel, CBManager, CBManagerAuthorization, CBManagerState,
-    CBMutableCharacteristic, CBMutableService, CBPeripheral, CBPeripheralDelegate, CBPeripheralManager,
-    CBPeripheralManagerDelegate, CBService, CBUUID,
+    CBCentralManagerDelegate, CBCentralManagerOptionRestoreIdentifierKey, CBCentralManagerRestoredStatePeripheralsKey,
+    CBCentralManagerScanOptionAllowDuplicatesKey, CBCharacteristic, CBCharacteristicProperties, CBL2CAPChannel,
+    CBManager, CBManagerAuthorization, CBManagerState, CBMutableCharacteristic, CBMutableService, CBPeripheral,
+    CBPeripheralDelegate, CBPeripheralManager, CBPeripheralManagerDelegate,
+    CBPeripheralManagerOptionRestoreIdentifierKey, CBService, CBUUID,
 };
 use objc2_core_foundation::{CFAbsoluteTimeGetCurrent, CFRetained, CFRunLoop, CFRunLoopTimer, kCFRunLoopDefaultMode};
 use objc2_foundation::{
@@ -199,6 +212,9 @@ struct CbState {
     peripherals: HashMap<Pid, Retained<CBPeripheral>>,
     /// Must stay referenced or CoreBluetooth closes the channel.
     channels: HashMap<ChanId, Retained<CBL2CAPChannel>>,
+    /// Connections iOS restored after relaunching Mycel in the background,
+    /// cancelled once the radio is on (the state machine starts afresh).
+    restored: Vec<Retained<CBPeripheral>>,
     /// Scanning reports every advertisement; pass each peripheral on at
     /// most once per [`REPORT_EVERY`].
     reported: HashMap<Pid, std::time::Instant>,
@@ -364,12 +380,13 @@ impl Driver {
     /// On Q: create the managers. Their first state callback follows.
     fn create_managers(self: &Arc<Self>) {
         let delegate = CbDelegate::new(Arc::downgrade(self));
+        let (central_options, pm_options) = manager_options();
         let central = unsafe {
             CBCentralManager::initWithDelegate_queue_options(
                 CBCentralManager::alloc(),
                 Some(ProtocolObject::from_ref(&*delegate)),
                 Some(&self.queue),
-                None,
+                central_options.as_deref(),
             )
         };
         let pm = unsafe {
@@ -377,7 +394,7 @@ impl Driver {
                 CBPeripheralManager::alloc(),
                 Some(ProtocolObject::from_ref(&*delegate)),
                 Some(&self.queue),
-                None,
+                pm_options.as_deref(),
             )
         };
         let mut cb = self.cb.lock();
@@ -449,6 +466,7 @@ impl Driver {
         }
         cb.peripherals.clear();
         cb.channels.clear();
+        cb.restored.clear();
         cb.service = None;
         cb.delegate = None;
     }
@@ -491,6 +509,31 @@ impl Driver {
             let (input, output) = streams.into_inner();
             install_streams(d, chan, input, output, q);
         });
+    }
+}
+
+/// State restoration identifiers (iOS): fixed, so a relaunched Mycel gets
+/// its managers back. Never change them.
+const RESTORE_CENTRAL: &str = "org.mycel.ble.central";
+const RESTORE_PERIPHERAL: &str = "org.mycel.ble.peripheral";
+
+type Options = Option<Retained<NSDictionary<NSString, AnyObject>>>;
+
+/// The managers' options: on iOS, opt into state restoration. macOS has
+/// nothing to restore (apps aren't relaunched for Bluetooth events).
+fn manager_options() -> (Options, Options) {
+    if !cfg!(target_os = "ios") {
+        return (None, None);
+    }
+    let one = |key: &NSString, id: &str| {
+        let id = NSString::from_str(id);
+        Some(NSDictionary::<NSString, AnyObject>::from_slices(&[key], &[&*id as &AnyObject]))
+    };
+    unsafe {
+        (
+            one(CBCentralManagerOptionRestoreIdentifierKey, RESTORE_CENTRAL),
+            one(CBPeripheralManagerOptionRestoreIdentifierKey, RESTORE_PERIPHERAL),
+        )
     }
 }
 
@@ -560,11 +603,29 @@ define_class!(
             d.hub.set_radio(radio.clone());
             if radio == Radio::On {
                 d.hub.set_problem(None);
+                let restored = std::mem::take(&mut d.cb.lock().0.restored);
+                for p in &restored {
+                    unsafe { central.cancelPeripheralConnection(p) };
+                }
                 scan(central);
                 info(format_args!("scanning for Mycel devices"));
             } else {
                 d.radio_down();
             }
+        }
+
+        /// iOS relaunched Mycel in the background for a Bluetooth event (or
+        /// this is the first launch after it ended Mycel for memory).
+        #[unsafe(method(centralManager:willRestoreState:))]
+        fn central_restored(&self, _central: &CBCentralManager, state: &NSDictionary<NSString, AnyObject>) {
+            let Some(d) = self.driver() else { return };
+            let peripherals: Vec<Retained<CBPeripheral>> = state
+                .objectForKey(unsafe { CBCentralManagerRestoredStatePeripheralsKey })
+                .and_then(|o| o.downcast::<NSArray>().ok())
+                .map(|a| a.iter().filter_map(|p| p.downcast::<CBPeripheral>().ok()).collect())
+                .unwrap_or_default();
+            info(format_args!("restored by iOS with {} Bluetooth connection(s)", peripherals.len()));
+            d.cb.lock().0.restored = peripherals;
         }
 
         #[unsafe(method(centralManager:didDiscoverPeripheral:advertisementData:RSSI:))]
@@ -712,6 +773,13 @@ define_class!(
             info(format_args!("peripheral state: {:?}", radio_of(state)));
             let mut cb = d.cb.lock();
             if state == CBManagerState::PoweredOn {
+                // Start clean: iOS may have restored the previous launch's
+                // service and advertisement, and a radio that was off and on
+                // again may keep the old service.
+                unsafe {
+                    pm.stopAdvertising();
+                    pm.removeAllServices();
+                }
                 cb.0.publishing = true;
                 unsafe { pm.publishL2CAPChannelWithEncryption(false) };
             } else {
@@ -719,6 +787,12 @@ define_class!(
                 cb.0.service = None;
                 cb.0.publishing = false;
             }
+        }
+
+        /// The peripheral side of a background relaunch (see the central's).
+        #[unsafe(method(peripheralManager:willRestoreState:))]
+        fn pm_restored(&self, _pm: &CBPeripheralManager, _state: &NSDictionary<NSString, AnyObject>) {
+            debug(format_args!("peripheral manager restored by iOS"));
         }
 
         #[unsafe(method(peripheralManager:didPublishL2CAPChannel:error:))]
