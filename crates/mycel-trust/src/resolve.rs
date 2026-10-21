@@ -49,15 +49,28 @@
 //!
 //! The winners loop is path dependent (a winner that fails in round k is
 //! dropped for good, and what failed depends on the round's transient
-//! states), so the resolver stores every round, not just the last one: one
-//! validity and one winner flag per op per round, and one head state per
-//! round. Rounds beyond the first appear only when a revocation winner fails.
+//! states), so the resolver keeps every round, not just the last one.
+//! Rounds beyond the first appear only when a revocation winner fails, and
+//! they usually differ only in that winner and the few ops it affects. So
+//! each op's flags are stored as runs over the rounds (`Flags`: one byte for
+//! an op that is the same in every round), and rounds whose valid ops agree
+//! share one head state and undo log. A removed member's k concurrent
+//! `Leave`s make k + 1 rounds (each wins one round, then fails) at a cost of
+//! O(k) plus what actually differs, not O(n · k); a later op is checked once
+//! per distinct head state when what it reads is the same in every round.
+//!
+//! **Costs that remain** (TRUST.md §10): a new op whose parents are older
+//! than every kept cut re-resolves everything since the newest cut it can
+//! use, up to the whole history, and any key ever named can send one; and a
+//! revocation that sorts ahead of earlier concurrent candidates by its
+//! author re-resolves them, in every round: the i-th of k concurrent
+//! `Leave`s re-resolves up to i ops in each of i rounds.
 //!
 //! Tests replay random concurrent histories through both resolvers and
 //! require identical results (`diff_tests.rs`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::rc::Rc;
+use std::sync::Arc;
 
 use mycel_crypto::SignPk;
 
@@ -122,7 +135,7 @@ struct PState {
     log: Log,
 }
 
-type Log = Option<Rc<LogNode>>;
+type Log = Option<Arc<LogNode>>;
 
 #[derive(Debug)]
 struct LogNode {
@@ -132,7 +145,30 @@ struct LogNode {
 
 impl PState {
     fn push(&mut self, u: RoleUndo) {
-        self.log = Some(Rc::new(LogNode { u, prev: self.log.take() }));
+        self.log = Some(Arc::new(LogNode { u, prev: self.log.take() }));
+    }
+}
+
+/// A round's state at the valid heads (`PState`), plus the length of its
+/// log. Rounds whose valid ops agree share one.
+#[derive(Clone, Debug, Default)]
+struct HeadState {
+    st: RoleState,
+    log: Log,
+    len: usize,
+}
+
+impl HeadState {
+    fn push(&mut self, u: RoleUndo) {
+        self.log = Some(Arc::new(LogNode { u, prev: self.log.take() }));
+        self.len += 1;
+    }
+
+    fn pop(&mut self, meta: &[Meta]) {
+        let node = self.log.take().expect("popping within the log");
+        self.log = node.prev.clone();
+        undo_role(&mut self.st, meta, node.u);
+        self.len -= 1;
     }
 }
 
@@ -142,7 +178,7 @@ impl Drop for LogNode {
     fn drop(&mut self) {
         let mut next = self.prev.take();
         while let Some(rc) = next {
-            match Rc::try_unwrap(rc) {
+            match Arc::try_unwrap(rc) {
                 Ok(mut node) => next = node.prev.take(),
                 Err(_) => break,
             }
@@ -150,20 +186,142 @@ impl Drop for LogNode {
     }
 }
 
-/// One round of the winners loop (TRUST.md §5 steps 3–6), or round 0:
-/// authorization ignoring concurrency, which fixes seniority.
+/// Round 0: authorization ignoring concurrency, which fixes seniority.
 #[derive(Clone, Debug, Default)]
-struct Round {
-    /// Per op: valid in this round.
+struct Pre {
+    /// Per op: valid in round 0.
     valid: Vec<bool>,
-    /// Per op: a revocation that wins this round (always false in round 0).
-    win: Vec<bool>,
-    /// Winners that failed authorization this round (dropped from then on),
-    /// by slot.
-    fails: Vec<u32>,
     /// State of the round's valid ops in the past of the valid heads.
     st: RoleState,
     log: Vec<RoleUndo>,
+}
+
+/// One round of the winners loop (TRUST.md §5 steps 3–6). Per-op flags
+/// live in `Flags`.
+#[derive(Clone, Debug, Default)]
+struct Round {
+    /// Winners that failed authorization this round (dropped from then on),
+    /// by slot.
+    fails: Vec<u32>,
+    /// State of the round's valid ops in the past of the valid heads. Rounds
+    /// whose valid ops there agree share it, so k rounds that differ only in
+    /// which failed winner they drop cost one state, not k. (`None` only
+    /// while it is taken out to be updated in place.)
+    head: Option<Arc<HeadState>>,
+}
+
+impl Round {
+    fn head(&self) -> &Arc<HeadState> {
+        self.head.as_ref().expect("head state in place")
+    }
+}
+
+const VALID: u8 = 1;
+const WIN: u8 = 2;
+const ANY_VALID: u8 = 4;
+const ANY_WIN: u8 = 8;
+const VARIES: u8 = 16;
+
+/// `ANY_VALID` / `ANY_WIN` for a `VALID | WIN` value.
+fn any_bits(v: u8) -> u8 {
+    ((v & VALID) * ANY_VALID) | ((v & WIN) / WIN * ANY_WIN)
+}
+
+/// `VALID | WIN` for one op in one round.
+fn flag(valid: bool, win: bool) -> u8 {
+    (u8::from(valid) * VALID) | (u8::from(win) * WIN)
+}
+
+/// Per op, its validity and winner flag in each round of the winners loop
+/// (round index 0 = round 1). Rounds differ only in the ops a failed
+/// winner affects, so flags are stored as runs, not one per op per round:
+/// a removed member's k concurrent `Leave`s make k + 1 rounds, which would
+/// otherwise cost O(n · k) memory and time on every later insert.
+#[derive(Clone, Debug, Default)]
+struct Flags {
+    /// Per op: `VALID | WIN` in every round, or `VARIES` (see `runs`); plus
+    /// `ANY_VALID` / `ANY_WIN` over all rounds.
+    bits: Vec<u8>,
+    /// Ops whose flags differ between rounds: `(first round index, VALID |
+    /// WIN)`, sorted, the first at round index 0. Rounds past the last
+    /// stored one repeat its value (new rounds copy the last round).
+    runs: HashMap<u32, Vec<(u32, u8)>>,
+}
+
+impl Flags {
+    fn push(&mut self) {
+        self.bits.push(0);
+    }
+
+    fn get(&self, k: usize, y: u32) -> u8 {
+        let b = self.bits[y as usize];
+        if b & VARIES == 0 {
+            return b & (VALID | WIN);
+        }
+        let runs = &self.runs[&y];
+        runs[runs.partition_point(|&(s, _)| s as usize <= k) - 1].1
+    }
+
+    fn valid(&self, k: usize, y: u32) -> bool {
+        self.get(k, y) & VALID != 0
+    }
+
+    fn win(&self, k: usize, y: u32) -> bool {
+        self.get(k, y) & WIN != 0
+    }
+
+    fn any_valid(&self, y: u32) -> bool {
+        self.bits[y as usize] & ANY_VALID != 0
+    }
+
+    fn any_win(&self, y: u32) -> bool {
+        self.bits[y as usize] & ANY_WIN != 0
+    }
+
+    /// Same in every round?
+    fn uniform(&self, y: u32) -> bool {
+        self.bits[y as usize] & VARIES == 0
+    }
+
+    /// Set `y`'s flags in rounds 0, 1, … from `vals`.
+    fn set(&mut self, y: u32, vals: impl IntoIterator<Item = u8>) {
+        let mut runs: Vec<(u32, u8)> = Vec::new();
+        let mut any = 0;
+        for (k, v) in vals.into_iter().enumerate() {
+            any |= v;
+            if runs.last().is_none_or(|l| l.1 != v) {
+                runs.push((k as u32, v));
+            }
+        }
+        self.bits[y as usize] = match runs.as_slice() {
+            [] => 0,
+            [(_, v)] => {
+                self.runs.remove(&y);
+                *v | any_bits(*v)
+            }
+            _ => {
+                self.runs.insert(y, runs);
+                VARIES | any_bits(any)
+            }
+        };
+    }
+
+    /// Keep rounds `0..k` only.
+    fn truncate(&mut self, k: usize) {
+        let mut now_uniform = Vec::new();
+        for (&y, runs) in self.runs.iter_mut() {
+            runs.truncate(runs.partition_point(|&(s, _)| (s as usize) < k).max(1));
+            let any = runs.iter().fold(0, |a, r| a | r.1);
+            self.bits[y as usize] = VARIES | any_bits(any);
+            if runs.len() == 1 {
+                now_uniform.push(y);
+            }
+        }
+        for y in now_uniform {
+            let v = self.runs.remove(&y).expect("listed above")[0].1;
+            self.bits[y as usize] = v | any_bits(v);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -215,8 +373,39 @@ struct Cut {
     /// descends from the frontier, so only older ops outside its past can be
     /// concurrent with it, and an op invalid and losing in every round
     /// cannot be changed by a revocation (`affected_by`) nor revoke anything
-    /// (the pools hold winners only).
-    loose: Vec<u32>,
+    /// (the pools hold winners only). Consecutive cuts usually share it.
+    loose: Arc<Loose>,
+}
+
+/// A cut's loose ops, indexed (see `Cut::loose`).
+#[derive(Debug, Default)]
+struct Loose {
+    ops: Vec<u32>,
+    by_author: HashMap<SignPk, Vec<u32>>,
+    /// The revocations among them, by target.
+    by_target: HashMap<SignPk, Vec<u32>>,
+}
+
+impl Loose {
+    fn new(ops: Vec<u32>, meta: &[Meta]) -> Self {
+        let mut l = Loose { ops, ..Default::default() };
+        for &y in &l.ops {
+            let m = &meta[y as usize];
+            l.by_author.entry(m.author).or_default().push(y);
+            if let Some(t) = m.target {
+                l.by_target.entry(t).or_default().push(y);
+            }
+        }
+        l
+    }
+
+    fn by_author(&self, pk: &SignPk) -> &[u32] {
+        self.by_author.get(pk).map_or(&[], Vec::as_slice)
+    }
+
+    fn against(&self, pk: &SignPk) -> &[u32] {
+        self.by_target.get(pk).map_or(&[], Vec::as_slice)
+    }
 }
 
 /// Revocations that can be concurrent with the ops being resolved, by target.
@@ -265,8 +454,9 @@ pub struct Resolution {
     epoch_ops: HashMap<EpochId, Vec<u32>>,
     /// First (in `order`) op valid in round 0 that names each key.
     seniority: HashMap<SignPk, u32>,
-    pre: Round,
+    pre: Pre,
     rounds: Vec<Round>,
+    flags: Flags,
     full_log: Vec<FullUndo>,
     aux: Aux,
     head_slots: Vec<u32>,
@@ -406,7 +596,7 @@ impl Resolution {
     /// Resolve a DAG holding only `genesis`.
     pub(crate) fn new(ops: &HashMap<OpId, SignedOp>, genesis: OpId) -> Self {
         let mut res = Resolution {
-            cuts: vec![Cut { slot: 0, frontier: vec![], lens: vec![0], full_len: 0, loose: vec![] }],
+            cuts: vec![Cut { slot: 0, frontier: vec![], lens: vec![0], full_len: 0, loose: Arc::default() }],
             ..Default::default()
         };
         res.add(ops, &[genesis]);
@@ -414,7 +604,7 @@ impl Resolution {
     }
 
     pub fn is_valid(&self, id: &OpId) -> bool {
-        self.slot.get(id).is_some_and(|&s| self.final_round().valid[s as usize])
+        self.slot.get(id).is_some_and(|&s| self.flags.valid(self.fin(), s))
     }
 
     /// Is `a` in the causal past of (or equal to one of) `heads`?
@@ -427,18 +617,18 @@ impl Resolution {
 
     /// Winning revocations, in candidate order (TRUST.md §5 step 3).
     pub fn winners(&self) -> Vec<OpId> {
-        let fin = self.final_round();
+        let fin = self.fin();
         let mut w: Vec<u32> =
-            self.cands_by_target.values().flatten().copied().filter(|&c| fin.win[c as usize]).collect();
+            self.cands_by_target.values().flatten().copied().filter(|&c| self.flags.win(fin, c)).collect();
         w.sort_by_key(|&c| self.key(c));
         w.into_iter().map(|c| self.ids[c as usize]).collect()
     }
 
     /// Winning revocations of `pk`, in candidate order.
     pub(crate) fn winners_against(&self, pk: &SignPk) -> Vec<OpId> {
-        let fin = self.final_round();
+        let fin = self.fin();
         let mut w: Vec<u32> =
-            self.cands_by_target.get(pk).into_iter().flatten().copied().filter(|&c| fin.win[c as usize]).collect();
+            self.cands_by_target.get(pk).into_iter().flatten().copied().filter(|&c| self.flags.win(fin, c)).collect();
         w.sort_by_key(|&c| self.key(c));
         w.into_iter().map(|c| self.ids[c as usize]).collect()
     }
@@ -448,12 +638,12 @@ impl Resolution {
         let mut seen = vec![false; self.ids.len()];
         let mut stack: Vec<u32> = heads.iter().map(|h| self.slot[h]).collect();
         let mut set = Vec::new();
-        let fin = self.final_round();
+        let fin = self.fin();
         while let Some(s) = stack.pop() {
             if std::mem::replace(&mut seen[s as usize], true) {
                 continue;
             }
-            if fin.valid[s as usize] {
+            if self.flags.valid(fin, s) {
                 set.push(s);
             }
             stack.extend(self.meta[s as usize].parents.iter().copied().filter(|&p| !seen[p as usize]));
@@ -471,12 +661,15 @@ impl Resolution {
     #[doc(hidden)]
     pub fn debug_sizes(&self) -> String {
         format!(
-            "reach [{}], cuts {} loose {}, full_log {}, round logs {}, epochs {} recipients {}, keyrings {}",
+            "reach [{}], cuts {} loose {}, full_log {}, rounds {} head states {} varying ops {}, round 0 log {}, epochs {} recipients {}, keyrings {}",
             self.reach.debug_sizes(),
             self.cuts.len(),
-            self.cuts.iter().map(|c| c.loose.len()).sum::<usize>(),
+            self.cuts.iter().map(|c| c.loose.ops.len()).sum::<usize>(),
             self.full_log.len(),
-            std::iter::once(&self.pre).chain(&self.rounds).map(|r| r.log.len()).sum::<usize>(),
+            self.rounds.len(),
+            self.head_groups().len(),
+            self.flags.runs.len(),
+            self.pre.log.len(),
             self.state.epochs.len(),
             self.state.epochs.iter().map(|e| e.recipients.len()).sum::<usize>(),
             self.aux.keyrings.values().map(|k| k.frontier.len()).sum::<usize>(),
@@ -496,8 +689,70 @@ impl Resolution {
         self.cuts.len()
     }
 
-    fn final_round(&self) -> &Round {
-        self.rounds.last().expect("resolved at least once")
+    /// Distinct head states across the rounds, and ops whose flags differ
+    /// between rounds (tests).
+    #[cfg(test)]
+    pub(crate) fn round_sizes(&self) -> (usize, usize) {
+        (self.head_groups().len(), self.flags.runs.len())
+    }
+
+    /// Index of the final round of the winners loop.
+    fn fin(&self) -> usize {
+        self.rounds.len().checked_sub(1).expect("resolved at least once")
+    }
+
+    fn head(&self, k: usize) -> &Arc<HeadState> {
+        self.rounds[k].head()
+    }
+
+    /// Round indices grouped by shared head state.
+    fn head_groups(&self) -> Vec<Vec<usize>> {
+        let mut by: Vec<(*const HeadState, usize)> =
+            self.rounds.iter().enumerate().map(|(k, r)| (Arc::as_ptr(r.head()), k)).collect();
+        by.sort_unstable();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for (i, &(p, k)) in by.iter().enumerate() {
+            if i > 0 && by[i - 1].0 == p {
+                groups.last_mut().expect("pushed").push(k);
+            } else {
+                groups.push(vec![k]);
+            }
+        }
+        groups
+    }
+
+    /// Take the head state of rounds `ks` out to update it: in place when
+    /// `ks` is its whole group, else a copy (the group splits).
+    fn take_head(&mut self, ks: &[usize], group: &[usize]) -> Arc<HeadState> {
+        if ks.len() == group.len() {
+            for &k in &group[1..] {
+                self.rounds[k].head = None;
+            }
+            self.rounds[group[0]].head.take().expect("head state in place")
+        } else {
+            Arc::new((**self.head(ks[0])).clone())
+        }
+    }
+
+    fn put_head(&mut self, ks: &[usize], head: Arc<HeadState>) {
+        for &k in ks {
+            self.rounds[k].head = Some(head.clone());
+        }
+    }
+
+    /// Apply op `s` to the head state of every round `on` selects.
+    fn apply_to_rounds(&mut self, op: &SignedOp, s: u32, on: impl Fn(usize) -> bool) {
+        for group in self.head_groups() {
+            let ks: Vec<usize> = group.iter().copied().filter(|&k| on(k)).collect();
+            if ks.is_empty() {
+                continue;
+            }
+            let mut head = self.take_head(&ks, &group);
+            let h = Arc::make_mut(&mut head);
+            let prev = apply_role(&mut h.st, op);
+            h.push(RoleUndo { slot: s, prev });
+            self.put_head(&ks, head);
+        }
     }
 
     fn le(&self, a: u32, b: u32) -> bool {
@@ -574,10 +829,8 @@ impl Resolution {
         self.dead.push(0);
         self.ids.push(id);
         self.slot.insert(id, slot);
-        for r in std::iter::once(&mut self.pre).chain(&mut self.rounds) {
-            r.valid.push(false);
-            r.win.push(false);
-        }
+        self.pre.valid.push(false);
+        self.flags.push();
     }
 
     /// The newest cut new op `x` can be re-resolved from (module docs).
@@ -602,8 +855,8 @@ impl Resolution {
     /// Is there a loose op by `t`, concurrent with its revocation `x`, whose
     /// result `x` can change (`affected_by`)? (`x` descends from the cut's
     /// frontier, so a loose op not in its past is concurrent with it.)
-    fn has_partner(&self, loose: &[u32], t: SignPk, x: u32) -> bool {
-        loose.iter().any(|&y| self.meta[y as usize].author == t && !self.le(y, x) && self.affected_by(y, x))
+    fn has_partner(&self, loose: &Loose, t: SignPk, x: u32) -> bool {
+        loose.by_author(&t).iter().any(|&y| !self.le(y, x) && self.affected_by(y, x))
     }
 
     /// Can a revocation `x` of `y`'s author, concurrent with `y`, change
@@ -613,8 +866,7 @@ impl Resolution {
     /// dangling ops of a revoked member do not pull every later revocation
     /// of them back to before their time.
     fn affected_by(&self, y: u32, x: u32) -> bool {
-        let y_ = y as usize;
-        self.rounds.iter().any(|r| r.valid[y_]) || (self.rounds.iter().any(|r| r.win[y_]) && self.key(x) < self.key(y))
+        self.flags.any_valid(y) || (self.flags.any_win(y) && self.key(x) < self.key(y))
     }
 
     /// Is every op in `x`'s past that is outside the cut's past and outside
@@ -637,7 +889,7 @@ impl Resolution {
             #[cfg(test)]
             self.searched.set(self.searched.get() + 1);
             let y_ = y as usize;
-            if self.pre.valid[y_] || self.rounds.iter().any(|r| r.valid[y_]) {
+            if self.pre.valid[y_] || self.flags.any_valid(y) {
                 return false;
             }
             stack.extend_from_slice(&self.meta[y_].parents);
@@ -660,36 +912,64 @@ impl Resolution {
         // Rounds 1…
         let k_old = self.rounds.len();
         let k_pre = self.prefix_rounds(x);
-        let pool = self.pool(&self.cuts[self.cuts.len() - 1].loose, x..x + 1);
+        let author = self.meta[xu].author;
+        let target = self.meta[xu].target;
+        // The revocations of x's author that can be concurrent with it: the
+        // loose ones, and x itself (a `Leave`).
+        let mut against = self.cuts[self.cuts.len() - 1].loose.against(&author).to_vec();
+        against.extend((target == Some(author)).then_some(x));
+        let epoch = rotation_of(op).map(|r| r.epoch);
+        let fresh_in = |k: usize| epoch.is_none_or(|e| self.fresh_epoch(x, &e, |j| j != x && self.flags.valid(k, j)));
+        // Rounds sharing a head state, where x reads the same flags, agree.
+        let mut memo: Vec<(*const HeadState, bool, bool)> = Vec::new();
+        let mut authorized_in = |k: usize, fresh: bool| {
+            let head = self.head(k);
+            let p = Arc::as_ptr(head);
+            if let Some(m) = memo.iter().find(|m| m.0 == p && m.1 == fresh) {
+                return m.2;
+            }
+            let ok = authorized(op, idx, &head.st, |_| fresh);
+            memo.push((p, fresh, ok));
+            ok
+        };
         let mut res: Vec<(bool, bool)> = Vec::new(); // (valid, win) per round
-        let mut removed = false;
-        let mut k = 1;
-        loop {
-            let r = &self.rounds[k.min(k_old) - 1];
-            let win_at = |w: u32| r.win[w as usize];
-            let win = self.meta[xu].target.is_some() && !removed && !self.loses(x, &pool, |w| w != x && win_at(w));
-            let excl = self.excluded(x, &pool, win_at);
-            let valid =
-                !excl && authorized(op, idx, &r.st, |e| self.fresh_epoch(x, e, |j| j != x && r.valid[j as usize]));
-            res.push((valid, win));
-            let failed = win && !valid;
-            if failed {
-                removed = true;
+        let uniform = target.is_none()
+            && against.iter().all(|&w| self.flags.uniform(w))
+            && epoch.is_none_or(|e| self.epoch_ops[&e].iter().all(|&j| j == x || self.flags.uniform(j)));
+        if uniform {
+            // Not a candidate, so it never fails and the loop stops at
+            // `k_pre`; what it reads is the same in every round but the
+            // head state.
+            let excl = self.excluded(x, &against, |w| self.flags.win(0, w));
+            let fresh = fresh_in(0);
+            res.extend((0..k_pre).map(|k| (!excl && authorized_in(k, fresh), false)));
+        } else {
+            let mut removed = false;
+            let mut k = 1;
+            loop {
+                let kk = k.min(k_old) - 1;
+                let win_at = |w: u32| w != x && self.flags.win(kk, w);
+                let win = target.is_some() && !removed && !self.loses(x, &against, win_at);
+                let excl = self.excluded(x, &against, win_at);
+                let valid = !excl && authorized_in(kk, fresh_in(kk));
+                res.push((valid, win));
+                let failed = win && !valid;
+                if failed {
+                    removed = true;
+                }
+                if k >= k_pre && !failed {
+                    break;
+                }
+                k += 1;
             }
-            if k >= k_pre && !failed {
-                break;
-            }
-            k += 1;
         }
         let k_new = res.len();
         self.resize_rounds(k_new);
         let fin_valid = res[k_new - 1].0;
+        self.flags.set(x, res.iter().map(|&(v, w)| flag(v, w)));
         for (k, &(valid, win)) in res.iter().enumerate() {
-            let r = &mut self.rounds[k];
-            r.valid[xu] = valid;
-            r.win[xu] = win;
             if win && !valid {
-                r.fails.push(x);
+                self.rounds[k].fails.push(x);
             }
         }
         if fin_valid {
@@ -699,13 +979,7 @@ impl Resolution {
                 let prev = apply_role(&mut self.pre.st, op);
                 self.pre.log.push(RoleUndo { slot: x, prev });
             }
-            for (k, &(valid, _)) in res.iter().enumerate() {
-                if valid {
-                    let r = &mut self.rounds[k];
-                    let prev = apply_role(&mut r.st, op);
-                    r.log.push(RoleUndo { slot: x, prev });
-                }
-            }
+            self.apply_to_rounds(op, x, |k| res[k].0);
             self.push_full(ops, x, x);
         }
         self.stats.fast += 1;
@@ -740,9 +1014,9 @@ impl Resolution {
     /// descend from the frontier of the cut whose loose ops are `loose`):
     /// those in the region and the loose ones. Any other revocation is in
     /// the frontier's past, so in the past of every region op.
-    fn pool(&self, loose: &[u32], region: std::ops::Range<u32>) -> Pool {
-        let mut pool = Pool::new();
-        for c in loose.iter().copied().chain(region) {
+    fn pool(&self, loose: &Loose, region: std::ops::Range<u32>) -> Pool {
+        let mut pool: Pool = loose.by_target.clone();
+        for c in region {
             if let Some(t) = self.meta[c as usize].target {
                 pool.entry(t).or_default().push(c);
             }
@@ -752,17 +1026,15 @@ impl Resolution {
 
     /// Does candidate `r` lose to an earlier-ordered concurrent winner that
     /// revokes its author (TRUST.md §5 step 3)?
-    fn loses(&self, r: u32, pool: &Pool, win_at: impl Fn(u32) -> bool) -> bool {
+    /// (`against`: the revocations of its author that can be concurrent.)
+    fn loses(&self, r: u32, against: &[u32], win_at: impl Fn(u32) -> bool) -> bool {
         let kr = self.key(r);
-        pool.get(&self.meta[r as usize].author)
-            .into_iter()
-            .flatten()
-            .any(|&w| win_at(w) && self.key(w) < kr && self.concurrent(w, r))
+        against.iter().any(|&w| win_at(w) && self.key(w) < kr && self.concurrent(w, r))
     }
 
     /// Is `i` concurrent with a winner revoking its author (step 4)?
-    fn excluded(&self, i: u32, pool: &Pool, win_at: impl Fn(u32) -> bool) -> bool {
-        pool.get(&self.meta[i as usize].author).into_iter().flatten().any(|&w| win_at(w) && self.concurrent(w, i))
+    fn excluded(&self, i: u32, against: &[u32], win_at: impl Fn(u32) -> bool) -> bool {
+        against.iter().any(|&w| win_at(w) && self.concurrent(w, i))
     }
 
     /// The winners in `pool` (per `win_at`) by target, for
@@ -902,37 +1174,41 @@ impl Resolution {
     /// Make exactly `k` rounds. New rounds copy the last one, whose ops are
     /// at their fixed point (the loop stopped there).
     fn resize_rounds(&mut self, k: usize) {
-        while self.rounds.len() < k {
-            let mut last = self.rounds.last().cloned().unwrap_or_else(|| Round {
-                valid: vec![false; self.ids.len()],
-                win: vec![false; self.ids.len()],
-                ..Default::default()
-            });
-            last.fails.clear();
-            self.rounds.push(last);
+        if k < self.rounds.len() {
+            self.flags.truncate(k);
+            self.rounds.truncate(k);
         }
-        self.rounds.truncate(k);
+        while self.rounds.len() < k {
+            let head = self.rounds.last().map_or_else(Arc::default, |r| r.head().clone());
+            self.rounds.push(Round { fails: Vec::new(), head: Some(head) });
+        }
     }
 
     /// Record a cut after re-resolving the region from slot `from`, which
     /// started at the newest cut.
     fn push_cut(&mut self, from: u32) {
-        let lens = std::iter::once(&self.pre).chain(&self.rounds).map(|r| r.log.len()).collect();
+        let lens = std::iter::once(self.pre.log.len()).chain(self.rounds.iter().map(|r| r.head().len)).collect();
         let n = self.ids.len() as u32;
-        let prev = &self.cuts[self.cuts.len() - 1].loose;
-        let loose = prev
-            .iter()
-            .copied()
-            .chain(from..n)
-            .filter(|&y| {
-                let y_ = y as usize;
-                self.rounds.iter().any(|r| r.valid[y_] || r.win[y_]) && !self.head_slots.iter().any(|&h| self.le(y, h))
-            })
-            .collect();
+        let prev = &self.cuts[self.cuts.len() - 1];
+        let is_loose = |y: u32| {
+            (self.flags.any_valid(y) || self.flags.any_win(y)) && !self.head_slots.iter().any(|&h| self.le(y, h))
+        };
+        // One new op whose parents are all in the past of the previous
+        // frontier: the previous loose ops stay loose (they are outside that
+        // past, and the new heads add only the new op to it).
+        let loose = if from + 1 == n
+            && self.meta[from as usize].parents.iter().all(|&p| prev.frontier.iter().any(|&f| self.le(p, f)))
+            && !is_loose(from)
+        {
+            prev.loose.clone()
+        } else {
+            let ops = prev.loose.ops.iter().copied().chain(from..n).filter(|&y| is_loose(y)).collect();
+            Arc::new(Loose::new(ops, &self.meta))
+        };
         // Mark the region's dead ops (see `dead`), parents first.
         for y in from..n {
             let y_ = y as usize;
-            let invalid = !self.pre.valid[y_] && !self.rounds.iter().any(|r| r.valid[y_]);
+            let invalid = !self.pre.valid[y_] && !self.flags.any_valid(y);
             let closed = invalid
                 && self.meta[y_]
                     .parents
@@ -972,12 +1248,24 @@ impl Resolution {
     fn rewind(&mut self, ops: &HashMap<OpId, SignedOp>, ci: usize) {
         let cut = self.cuts[ci].clone();
         let last = *cut.lens.last().unwrap();
-        for (k, r) in std::iter::once(&mut self.pre).chain(&mut self.rounds).enumerate() {
-            let len = cut.lens.get(k).copied().unwrap_or(last);
-            while r.log.len() > len {
-                let u = r.log.pop().unwrap();
-                undo_role(&mut r.st, &self.meta, u);
+        while self.pre.log.len() > cut.lens[0] {
+            let u = self.pre.log.pop().unwrap();
+            undo_role(&mut self.pre.st, &self.meta, u);
+        }
+        // Rounds that share a head state now shared it then (or were copied
+        // from one that existed then), so their lengths at the cut agree.
+        for group in self.head_groups() {
+            let len = cut.lens.get(group[0] + 1).copied().unwrap_or(last);
+            debug_assert!(group.iter().all(|&k| cut.lens.get(k + 1).copied().unwrap_or(last) == len));
+            if self.head(group[0]).len == len {
+                continue;
             }
+            let mut head = self.take_head(&group, &group);
+            let h = Arc::make_mut(&mut head);
+            while h.len > len {
+                h.pop(&self.meta);
+            }
+            self.put_head(&group, head);
         }
         while self.full_log.len() > cut.full_len {
             match self.full_log.pop().unwrap() {
@@ -1118,7 +1406,7 @@ impl Resolution {
                 |w| self.prefix_win(pk, w),
                 &mut rwin,
             );
-            let base = if k_old == 0 { RoleState::default() } else { self.rounds[pk].st.clone() };
+            let base = if k_old == 0 { RoleState::default() } else { self.head(pk).st.clone() };
             let mut rvalid = vec![false; rn];
             {
                 let rwin = &rwin;
@@ -1159,10 +1447,12 @@ impl Resolution {
         // Write the rounds back.
         let k_new = results.len();
         self.resize_rounds(k_new);
-        for (k, (rvalid, rwin, fails)) in results.into_iter().enumerate() {
+        for o in 0..rn {
+            let vals = results.iter().map(|(rvalid, rwin, _)| flag(rvalid[o], rwin[o]));
+            self.flags.set(from + o as u32, vals);
+        }
+        for (k, (_, _, fails)) in results.into_iter().enumerate() {
             let r = &mut self.rounds[k];
-            r.valid[from as usize..].copy_from_slice(&rvalid);
-            r.win[from as usize..].copy_from_slice(&rwin);
             let keep = r.fails.partition_point(|&f| f < from);
             r.fails.truncate(keep);
             r.fails.extend(fails);
@@ -1170,10 +1460,10 @@ impl Resolution {
 
         // New valid heads: the maximal valid region ops (each descends from
         // the whole cut frontier), or the frontier if none is valid.
-        let fin = self.rounds.len() - 1;
+        let fin = self.fin();
         let mut heads: Vec<u32> = Vec::new();
         for &s in &region {
-            if self.rounds[fin].valid[s as usize] {
+            if self.flags.valid(fin, s) {
                 heads.retain(|&h| !self.le(h, s));
                 heads.push(s);
             }
@@ -1184,18 +1474,39 @@ impl Resolution {
         let below: Vec<bool> = region.iter().map(|&s| heads.iter().any(|&h| self.le(s, h))).collect();
 
         // Head states: each round's valid region ops in the heads' past.
-        for k in 0..=self.rounds.len() {
-            let mut r = std::mem::take(if k == 0 { &mut self.pre } else { &mut self.rounds[k - 1] });
-            for (o, &s) in region.iter().enumerate() {
-                if below[o] && r.valid[s as usize] {
-                    let prev = apply_role(&mut r.st, &ops[&self.ids[s as usize]]);
-                    r.log.push(RoleUndo { slot: s, prev });
+        // Rounds sharing a head state keep sharing it where they apply the
+        // same ops.
+        let applied: Vec<u32> = region.iter().zip(&below).filter(|&(_, &b)| b).map(|(&s, _)| s).collect();
+        for &s in &applied {
+            if self.pre.valid[s as usize] {
+                let prev = apply_role(&mut self.pre.st, &ops[&self.ids[s as usize]]);
+                self.pre.log.push(RoleUndo { slot: s, prev });
+            }
+        }
+        for group in self.head_groups() {
+            let mut parts: Vec<(Vec<bool>, Vec<usize>)> = Vec::new();
+            for &k in &group {
+                let sig: Vec<bool> = applied.iter().map(|&s| self.flags.valid(k, s)).collect();
+                match parts.iter_mut().find(|p| p.0 == sig) {
+                    Some(p) => p.1.push(k),
+                    None => parts.push((sig, vec![k])),
                 }
             }
-            *(if k == 0 { &mut self.pre } else { &mut self.rounds[k - 1] }) = r;
+            for (sig, ks) in parts {
+                if !sig.contains(&true) {
+                    continue;
+                }
+                let mut head = self.take_head(&ks, &group);
+                let h = Arc::make_mut(&mut head);
+                for (&s, _) in applied.iter().zip(&sig).filter(|&(_, &v)| v) {
+                    let prev = apply_role(&mut h.st, &ops[&self.ids[s as usize]]);
+                    h.push(RoleUndo { slot: s, prev });
+                }
+                self.put_head(&ks, head);
+            }
         }
         for &s in &region {
-            if self.rounds[fin].valid[s as usize] {
+            if self.flags.valid(fin, s) {
                 self.push_full(ops, s, from);
             }
         }
@@ -1206,11 +1517,11 @@ impl Resolution {
     }
 
     fn prefix_win(&self, k: usize, w: u32) -> bool {
-        self.rounds.get(k).is_some_and(|r| r.win[w as usize])
+        k < self.rounds.len() && self.flags.win(k, w)
     }
 
     fn prefix_valid(&self, k: usize, j: u32) -> bool {
-        self.rounds.get(k).is_some_and(|r| r.valid[j as usize])
+        k < self.rounds.len() && self.flags.valid(k, j)
     }
 
     /// Walk the region in topological order, deciding each op's validity
@@ -1229,8 +1540,8 @@ impl Resolution {
         decide: impl Fn(&Self, u32, &RoleState, &[bool]) -> bool,
     ) {
         let from = w.from;
-        let base = Rc::new(PState { st: base.clone(), log: None });
-        let mut post: Vec<Option<Rc<PState>>> = vec![None; region.len()];
+        let base = Arc::new(PState { st: base.clone(), log: None });
+        let mut post: Vec<Option<Arc<PState>>> = vec![None; region.len()];
         let mut left = w.children.clone();
         for &i in region {
             let rp: Vec<u32> = self.meta[i as usize].parents.iter().copied().filter(|&p| p >= from).collect();
@@ -1252,7 +1563,7 @@ impl Resolution {
             if left[io] > 0 {
                 let mut st = cst;
                 if v {
-                    let m = Rc::make_mut(&mut st);
+                    let m = Arc::make_mut(&mut st);
                     let prev = apply_role(&mut m.st, &ops[&self.ids[i as usize]]);
                     m.push(RoleUndo { slot: i, prev });
                 }
@@ -1266,10 +1577,10 @@ impl Resolution {
         &self,
         ops: &HashMap<OpId, SignedOp>,
         w: &mut Walk,
-        post: &[Option<Rc<PState>>],
+        post: &[Option<Arc<PState>>],
         rp: &[u32],
         rvalid: &[bool],
-    ) -> Rc<PState> {
+    ) -> Arc<PState> {
         let from = w.from;
         let p1 = *rp.iter().max_by_key(|&&p| self.pos[p as usize]).unwrap();
         let first = post[(p1 - from) as usize].clone().expect("parent state kept until its last child");
@@ -1308,7 +1619,7 @@ impl Resolution {
             let prev = apply_role(&mut st.st, &ops[&self.ids[s as usize]]);
             st.push(RoleUndo { slot: s, prev });
         }
-        Rc::new(st)
+        Arc::new(st)
     }
 
     /// Apply valid op `s` to the full state (TRUST.md §5 step 7), logging

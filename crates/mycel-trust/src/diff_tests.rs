@@ -975,10 +975,13 @@ fn dead_chain_is_searched_once() {
 /// member's pairwise-concurrent `Leave`s are all revocation candidates; each
 /// round the earliest wins, beats the rest and then fails authorization, so
 /// the winners loop runs once per `Leave`, and the resolver keeps each
-/// round.
+/// round. Regression: the rounds differ only in which `Leave` wins, so they
+/// share one head state and store flags only for the `Leave`s; each round
+/// used to copy every op's flags and the whole undo log, and every later
+/// insert paid for every round (O(k²) for k `Leave`s, forever).
 #[test]
 fn concurrent_leaves_by_a_removed_member_add_one_round_each() {
-    const LEAVES: usize = 8;
+    const LEAVES: usize = 30;
     for fast in [true, false] {
         with_fast_path(fast, || {
             let mut w = World::new(false);
@@ -997,10 +1000,18 @@ fn concurrent_leaves_by_a_removed_member_add_one_round_each() {
                 check(&g);
             }
             assert_eq!(g.resolution().rounds(), LEAVES + 1);
-            let rotation = w.rotation([w.pk(a)].into(), None);
-            let op = w.op(a, g.heads(), Action::Rotate { rotation });
-            g.insert(op).unwrap();
-            check(&g);
+            assert_eq!(g.resolution().round_sizes(), (1, LEAVES));
+            for _ in 0..5 {
+                let before = g.resolution().stats;
+                let rotation = w.rotation([w.pk(a)].into(), None);
+                let op = w.op(a, g.heads(), Action::Rotate { rotation });
+                g.insert(op).unwrap();
+                check(&g);
+                if fast {
+                    assert_eq!(g.resolution().stats.fast, before.fast + 1);
+                }
+            }
+            assert_eq!(g.resolution().round_sizes(), (1, LEAVES));
         });
     }
 }

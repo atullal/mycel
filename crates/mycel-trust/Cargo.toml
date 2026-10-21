@@ -28,5 +28,10 @@ name = "resolve"
 harness = false
 required-features = ["oracle"]
 
+[[bench]]
+name = "adversarial"
+harness = false
+required-features = ["oracle"]
+
 [lints]
 workspace = true
