@@ -401,13 +401,22 @@ struct RangesFile {
     done: Ranges,
 }
 
+/// A `.ranges` file's contents, if they describe a blob of `total` bytes:
+/// sorted, disjoint, non-empty ranges within it, as [`Ranges::insert`] keeps
+/// them. A damaged file (or one another program wrote) is refused: its
+/// ranges would break the resume arithmetic.
+fn parse_ranges(bytes: &[u8], total: Option<u64>) -> Option<Ranges> {
+    let f: RangesFile = postcard::from_bytes(bytes).ok()?;
+    let ranges = &f.done.0;
+    let valid = ranges.iter().all(|&(a, b)| a < b && b <= f.total) && ranges.windows(2).all(|w| w[0].1 < w[1].0);
+    (valid && total.is_none_or(|t| t == f.total)).then_some(f.done)
+}
+
 /// What a `.part` file holds, for a blob of `total` bytes (`None`: unknown yet).
 async fn load_done(part: &Path, total: Option<u64>) -> Ranges {
     if let Ok(bytes) = tokio::fs::read(ranges_path(part)).await {
-        return match postcard::from_bytes::<RangesFile>(&bytes) {
-            Ok(f) if total.is_none_or(|t| t == f.total) => f.done,
-            _ => Ranges::default(), // stale or damaged: start over
-        };
+        // stale or damaged: start over
+        return parse_ranges(&bytes, total).unwrap_or_default();
     }
     let mut r = Ranges::default();
     let len = part_len(part).await;
@@ -1049,6 +1058,41 @@ mod security_tests {
         task.abort();
         let _ = task.await;
         assert_eq!(*RESERVED.lock(), before);
+    }
+
+    /// Found by fuzzing (`fuzz/fuzz_targets/blob_ranges.rs`): a damaged
+    /// `.ranges` file loaded as it was, and a reversed range made the bytes
+    /// held underflow (a panic in debug builds; in release ones a wrapped
+    /// count that called the download complete). Overlapping or out-of-blob
+    /// ranges overstated what was held the same way. Such a file now means
+    /// starting the download over.
+    #[test]
+    fn a_damaged_ranges_file_is_refused() {
+        let file = |total: u64, done: &[(u64, u64)]| {
+            postcard::to_allocvec(&RangesFile { total, done: Ranges(done.to_vec()) }).unwrap()
+        };
+        let good = file(100, &[(0, 10), (20, 30)]);
+        assert_eq!(parse_ranges(&good, Some(100)), Some(Ranges(vec![(0, 10), (20, 30)])));
+        assert_eq!(parse_ranges(&good, None).unwrap().covered(), 20);
+        assert_eq!(parse_ranges(&good, Some(99)), None, "for another size: stale");
+        for bad in [
+            file(100, &[(10, 5)]),           // reversed
+            file(100, &[(5, 5)]),            // empty
+            file(100, &[(0, 50), (40, 60)]), // overlapping
+            file(100, &[(0, 10), (10, 20)]), // touching: insert merges these
+            file(100, &[(20, 30), (0, 10)]), // unsorted
+            file(100, &[(90, 101)]),         // beyond the blob
+            file(u64::MAX, &[(0, u64::MAX), (0, u64::MAX)]),
+            b"download ranges".to_vec(),
+        ] {
+            assert_eq!(parse_ranges(&bad, None), None, "{bad:?}");
+        }
+        // what a download saves always loads back
+        let mut r = Ranges::default();
+        for (a, b) in [(50, 60), (0, 10), (10, 20), (55, 70), (99, 100)] {
+            r.insert(a, b);
+        }
+        assert_eq!(parse_ranges(&file(100, &r.0), Some(100)), Some(r));
     }
 
     #[test]
