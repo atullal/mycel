@@ -156,6 +156,7 @@ fn replications(a: &Args, picked: &[(&scenarios::Scenario, f64)], candidate: Can
     use mycel_sim::seeds::{min_pass, replicate, verdict};
     let seeds = mycel_sim::stats::run_seeds(a.seed, a.runs);
     let m = a.min_pass.unwrap_or_else(|| min_pass(a.runs));
+    anyhow::ensure!(m <= a.runs, "--min-pass {m} is more than --runs {}: every scenario would fail", a.runs);
     eprintln!("base seed {}, {} runs: seeds {seeds:?}; quality must pass on ≥ {m}", a.seed, a.runs);
     let judge = |(s, scale): &(&scenarios::Scenario, f64)| {
         eprintln!("▶ {} at scale {scale} on {} seeds", s.name, seeds.len());
@@ -199,10 +200,27 @@ fn replications(a: &Args, picked: &[(&scenarios::Scenario, f64)], candidate: Can
     std::fs::write(a.out.join("results.json"), serde_json::to_string_pretty(&results)?)?;
     std::fs::write(a.out.join("verdicts.json"), serde_json::to_string_pretty(&verdicts)?)?;
     eprintln!("wrote {}", a.out.join("report.md").display());
-    // the seeds to pin, once their cause is fixed
-    for v in verdicts.iter().filter(|v| !v.failing_seeds().is_empty()) {
+    // the seeds to pin, once their cause is fixed; then what missed within
+    // the m-of-k slack (the gate's seeds are fixed, so such a seed misses on
+    // every run until the code changes) and where a known gap closed
+    for v in &verdicts {
         for seed in v.failing_seeds() {
             println!("failing seed: {} {}  ({})", v.name, seed, v.repro(seed));
+        }
+        for seed in v.missed_within_slack() {
+            println!(
+                "quality miss (within {} of {}): {} {}  ({})",
+                v.min_pass,
+                v.seeds.len(),
+                v.name,
+                seed,
+                v.repro(seed)
+            );
+        }
+        if v.pass {
+            for (seed, _) in &v.unexpected_passes {
+                println!("known gap closed: {} {}  ({})", v.name, seed, v.repro(*seed));
+            }
         }
     }
     for p in &pinned {

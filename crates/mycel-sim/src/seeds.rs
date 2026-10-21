@@ -14,6 +14,11 @@
 //!   pass with probability 0.95 fails the gate 1.2% of the time
 //!   ([`crate::stats::spurious_fail`]); three seeds that all pass bound a
 //!   seed's failure rate only below 63%.
+//! - A **known gap** (a scenario expected to fail) is judged the other way
+//!   round: its invariants on every seed, and its quality objectives must
+//!   still fail on more than k − m seeds. Once they pass on m or more the
+//!   expectation is stale and the verdict fails, naming those seeds; fewer
+//!   are reported ("gap closed on j of k") without failing.
 //!
 //! Thresholds are calibrated on [`CALIBRATION_BASE`]'s seeds, never on the
 //! gate's ([`GATE_BASE`]), and a nightly soak runs fresh bases: every
@@ -178,8 +183,16 @@ pub struct Verdict {
     pub min_pass: usize,
     /// Seeds on which every quality objective passed.
     pub quality_passes: usize,
-    /// (seed, objective: actual vs target) for each quality miss.
+    /// (seed, objective: actual vs target) for each quality miss. For a
+    /// known gap these are the gap itself, not failing seeds.
     pub quality_misses: Vec<(u64, String)>,
+    /// Why the scenario is expected to fail, if it is (a known gap).
+    #[serde(default)]
+    pub known_gap: Option<String>,
+    /// (seed, what passed) for each seed of a known gap on which every
+    /// quality objective passed: the gap closed there.
+    #[serde(default)]
+    pub unexpected_passes: Vec<(u64, String)>,
     /// (seed, objective: actual vs target) for each invariant broken.
     pub invariant_failures: Vec<(u64, String)>,
     pub spread: Vec<Spread>,
@@ -201,6 +214,8 @@ pub fn verdict(results: &[ScenarioResult], min_pass: usize) -> Verdict {
         min_pass,
         quality_passes: 0,
         quality_misses: Vec::new(),
+        known_gap: results.iter().find_map(|r| r.expected_fail.clone()),
+        unexpected_passes: Vec::new(),
         invariant_failures: Vec::new(),
         spread: Vec::new(),
         pooled: None,
@@ -222,14 +237,12 @@ pub fn verdict(results: &[ScenarioResult], min_pass: usize) -> Verdict {
                 v.quality_misses.push((r.seed, what));
             }
         }
-        let ok = match r.status {
-            Status::ExpectedFail => true,
-            Status::UnexpectedPass => false,
-            // with an invariant broken, quality is judged on its own
-            _ if r.expected_fail.is_some() => !quality_ok,
-            _ => quality_ok,
-        };
-        v.quality_passes += ok as usize;
+        v.quality_passes += quality_ok as usize;
+        if quality_ok && r.expected_fail.is_some() {
+            let what: Vec<String> =
+                r.slos.iter().filter(|s| !s.invariant).map(|s| format!("{} {}", s.name, s.actual)).collect();
+            v.unexpected_passes.push((r.seed, format!("passed although expected to fail: {}", what.join("; "))));
+        }
         for s in &r.slos {
             let i = match v.spread.iter().position(|x| x.name == s.name) {
                 Some(i) => i,
@@ -251,7 +264,7 @@ pub fn verdict(results: &[ScenarioResult], min_pass: usize) -> Verdict {
             x.values.extend(s.value.filter(|v| v.is_finite()));
         }
     }
-    v.pass = v.invariant_failures.is_empty() && v.quality_passes >= min_pass;
+    v.pass = v.invariant_failures.is_empty() && v.quality_ok();
     v
 }
 
@@ -261,26 +274,72 @@ impl Verdict {
         format!("cargo run --release -p mycel-sim -- {} --scale {} --seed {seed}", self.name, self.scale)
     }
 
-    /// Seeds with any miss (quality or invariant), each once, in order.
+    /// Quality as the gate judges it: passes on at least `min_pass` seeds;
+    /// for a known gap, on fewer (from `min_pass` on it has closed).
+    fn quality_ok(&self) -> bool {
+        if self.known_gap.is_some() {
+            self.quality_passes < self.min_pass
+        } else {
+            self.quality_passes >= self.min_pass
+        }
+    }
+
+    /// The seeds to blame, each once, in order: every seed that broke an
+    /// invariant and, when the verdict fails on quality, the seeds that
+    /// made it fail (quality misses; for a known gap, the seeds where it
+    /// closed). What a seed may miss within m of k isn't here
+    /// ([`Verdict::missed_within_slack`]), nor a known gap's own misses.
     pub fn failing_seeds(&self) -> Vec<u64> {
-        let mut v: Vec<u64> = self.seeds.clone();
-        v.retain(|s| {
-            self.quality_misses.iter().any(|(x, _)| x == s) || self.invariant_failures.iter().any(|(x, _)| x == s)
-        });
-        v
+        let on_quality = !self.quality_ok();
+        let blamed = |s: &u64| {
+            self.invariant_failures.iter().any(|(x, _)| x == s)
+                || (on_quality
+                    && if self.known_gap.is_some() {
+                        self.unexpected_passes.iter().any(|(x, _)| x == s)
+                    } else {
+                        self.quality_misses.iter().any(|(x, _)| x == s)
+                    })
+        };
+        self.seeds.iter().copied().filter(blamed).collect()
+    }
+
+    /// Seeds that missed a quality objective without failing the verdict
+    /// (the m-of-k slack), each once, in order. With fixed gate seeds and a
+    /// deterministic tier 2, such a seed misses on every run: it uses up
+    /// slack until the code changes.
+    pub fn missed_within_slack(&self) -> Vec<u64> {
+        if self.known_gap.is_some() {
+            return Vec::new();
+        }
+        let failing = self.failing_seeds();
+        self.seeds
+            .iter()
+            .copied()
+            .filter(|s| !failing.contains(s) && self.quality_misses.iter().any(|(x, _)| x == s))
+            .collect()
     }
 
     pub fn markdown(&self) -> String {
+        let quality = match &self.known_gap {
+            None => format!(
+                "quality: {} of {} seeds pass (gate ≥ {})",
+                self.quality_passes,
+                self.seeds.len(),
+                self.min_pass
+            ),
+            Some(why) => format!(
+                "known gap ({why}): closed on {} of {} seeds (a stale expectation from {})",
+                self.quality_passes,
+                self.seeds.len(),
+                self.min_pass
+            ),
+        };
         let mut s = format!(
-            "### `{}` at scale {} on {} seeds: {}\n\n\
-             quality: {} of {} seeds pass (gate ≥ {}); invariants broken: {}; {:.0} s of runs\n",
+            "### `{}` at scale {} on {} seeds: {}\n\n{quality}; invariants broken: {}; {:.0} s of runs\n",
             self.name,
             self.scale,
             self.seeds.len(),
             if self.pass { "✅ pass" } else { "❌ FAIL" },
-            self.quality_passes,
-            self.seeds.len(),
-            self.min_pass,
             self.invariant_failures.len(),
             self.wall_s
         );
@@ -296,8 +355,12 @@ impl Verdict {
         for (seed, what) in &self.invariant_failures {
             s.push_str(&format!("\n- ❌ invariant, seed {seed}: {what}\n  replay: `{}`", self.repro(*seed)));
         }
+        let kind = if self.known_gap.is_some() { "known-gap miss" } else { "quality miss" };
         for (seed, what) in &self.quality_misses {
-            s.push_str(&format!("\n- quality miss, seed {seed}: {what}\n  replay: `{}`", self.repro(*seed)));
+            s.push_str(&format!("\n- {kind}, seed {seed}: {what}\n  replay: `{}`", self.repro(*seed)));
+        }
+        for (seed, what) in &self.unexpected_passes {
+            s.push_str(&format!("\n- ⚠️ gap closed, seed {seed}: {what}\n  replay: `{}`", self.repro(*seed)));
         }
         s.push('\n');
         s
@@ -328,7 +391,8 @@ mod tests {
         let mut rs: Vec<ScenarioResult> = (0..10).map(|s| result(s, s >= 2, true)).collect();
         let v = verdict(&rs, 8);
         assert!(v.pass, "8 of 10 pass");
-        assert_eq!((v.quality_passes, v.failing_seeds()), (8, vec![0, 1]));
+        assert_eq!((v.quality_passes, v.missed_within_slack()), (8, vec![0, 1]));
+        assert!(v.failing_seeds().is_empty(), "within the slack");
         assert_eq!(v.spread[0].values.len(), 10);
         assert_eq!(v.pooled.as_ref().map(|t| t.n), Some(4000), "400 ratios per seed, pooled");
         assert!(v.pooled.as_ref().is_some_and(|t| t.p99.is_some()) && v.markdown().contains("p99"));
@@ -345,7 +409,57 @@ mod tests {
         gap.finish();
         assert_eq!(gap.status, Status::Fail);
         let v = verdict(&[gap], 1);
-        assert!(!v.pass && v.invariant_failures.len() == 1 && v.quality_passes == 1, "{v:?}");
+        assert!(!v.pass && v.invariant_failures.len() == 1 && v.quality_passes == 0, "{v:?}");
+        assert_eq!(v.failing_seeds(), vec![3]);
+    }
+
+    /// Ten seeds of a known gap, the gap closed on the seeds in `closed`.
+    fn gap(closed: &[u64]) -> Vec<ScenarioResult> {
+        (0..10)
+            .map(|s| {
+                let mut r = result(s, closed.contains(&s), true);
+                r.expect_fail("a known gap");
+                r.finish();
+                r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_known_gaps_own_misses_are_not_seeds_to_pin() {
+        let v = verdict(&gap(&[]), 8);
+        assert!(v.pass && v.quality_misses.len() == 10, "{v:?}");
+        assert!(v.failing_seeds().is_empty() && v.missed_within_slack().is_empty(), "the gap, not a regression");
+        assert!(v.markdown().contains("known-gap miss") && !v.markdown().contains("quality miss"));
+    }
+
+    #[test]
+    fn a_known_gap_that_closes_is_named_seed_by_seed() {
+        // closed on a few seeds: reported, not failed
+        let v = verdict(&gap(&[4, 7]), 8);
+        assert!(v.pass && v.failing_seeds().is_empty(), "{v:?}");
+        assert_eq!(v.unexpected_passes.iter().map(|x| x.0).collect::<Vec<_>>(), vec![4, 7]);
+        assert!(v.markdown().contains("gap closed, seed 4") && v.markdown().contains("closed on 2 of 10"));
+        // closed on m of k: the expectation is stale, and the seeds are named
+        let closed = [0, 1, 2, 3, 4, 5, 6, 7];
+        let v = verdict(&gap(&closed), 8);
+        assert!(!v.pass);
+        assert_eq!(v.failing_seeds(), closed.to_vec());
+        // one seed, as `mycel-sim <scenario>` judges it: an unexpected pass fails
+        let v = verdict(&gap(&[0])[..1], 1);
+        assert!(!v.pass && v.failing_seeds() == vec![0], "{v:?}");
+    }
+
+    #[test]
+    fn a_miss_within_the_slack_is_not_a_failing_seed() {
+        let rs: Vec<ScenarioResult> = (0..10).map(|s| result(s, s != 6, true)).collect();
+        let v = verdict(&rs, 8);
+        assert!(v.pass && v.failing_seeds().is_empty(), "{v:?}");
+        assert_eq!(v.missed_within_slack(), vec![6]);
+        // over the slack, every missing seed is to blame
+        let rs: Vec<ScenarioResult> = (0..10).map(|s| result(s, s > 2, true)).collect();
+        let v = verdict(&rs, 8);
+        assert!(!v.pass && v.failing_seeds() == vec![0, 1, 2] && v.missed_within_slack().is_empty());
     }
 
     #[test]

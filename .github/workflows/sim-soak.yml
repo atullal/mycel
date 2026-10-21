@@ -64,7 +64,8 @@ jobs:
           {
             echo "## Failing seeds"
             echo
-            echo "Pin each in crates/mycel-sim/src/seeds.rs (PINNED) once its cause is fixed."
+            echo "Pin each 'failing seed' in crates/mycel-sim/src/seeds.rs (PINNED) once its cause is fixed."
+            echo "'quality miss (within m of k)' and 'known gap closed' lines are for information."
             echo
             echo '```'
             cat "$RUNNER_TEMP/failing-seeds.txt" || true

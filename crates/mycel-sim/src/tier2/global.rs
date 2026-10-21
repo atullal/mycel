@@ -189,15 +189,18 @@ fn keep_chain(chains: &mut Map<SignPk, Chain>, a: &Announce) {
 }
 
 /// [`Role::AttestedLiar`] sends `ann`: the cheapest chain it was sent of
-/// that seqno, extended by one hop at the least an honest hop adds. With
-/// no chain of that seqno (one newer arrived since the core chose its
-/// route) it can't sign for this one, and sends the honest announcement.
+/// that seqno, extended by one hop at the least an honest hop adds, when
+/// that is cheaper than what the core chose; otherwise the core's own
+/// announcement (hops and cost always of one route, never mixed). With no
+/// chain of that seqno (one newer arrived since the core chose its route)
+/// it can't sign for this one, and sends the honest announcement.
 fn extend_chain(ann: &mut Announce, chain: Option<&Chain>) {
     if let Some(&(seq, hops, cost)) = chain
         && seq == ann.seq
+        && cost.saturating_add(ATTESTED_HOP_FLOOR) < ann.cost
     {
         ann.hops = hops.saturating_add(1);
-        ann.cost = ann.cost.min(cost.saturating_add(ATTESTED_HOP_FLOOR));
+        ann.cost = cost.saturating_add(ATTESTED_HOP_FLOOR);
     }
 }
 
@@ -1014,10 +1017,14 @@ mod tests {
         let mut a = honest.clone();
         extend_chain(&mut a, Some(&(5, 3, 30_000)));
         assert_eq!((a.hops, a.cost), (4, 30_000 + ATTESTED_HOP_FLOOR), "only its own link understated");
-        // a chain cheaper than any it could extend honestly is never raised
+        // a route cheaper than any chain it could extend is never raised,
+        // and keeps its own hop count: (hops, cost) stay one route's
         let mut a = ann(5, 4, 100);
         extend_chain(&mut a, Some(&(5, 3, 30_000)));
-        assert_eq!(a.cost, 100);
+        assert_eq!((a.hops, a.cost), (4, 100));
+        let mut a = ann(5, 7, 30_000 + ATTESTED_HOP_FLOOR);
+        extend_chain(&mut a, Some(&(5, 3, 30_000)));
+        assert_eq!((a.hops, a.cost), (7, 30_000 + ATTESTED_HOP_FLOOR), "no cheaper, so the core's own");
         // it holds a newer seqno's chain, not this one's: it can't sign for
         // this one, so it sends what the core chose
         let mut a = honest.clone();

@@ -68,8 +68,9 @@ bound at all. So the tail is reported, and judged, in numbers that hold at
 that size (`stats::Tail`): p95 with its exact interval; CVaR₉₅, the mean of
 the worst 5% (it moves with every message in the tail, not with one order
 statistic); and how many messages are over 10× and over 30×, with Wilson
-95% intervals on the share. p99 is reported only for 4,000 messages or
-more, pooled over seeds (`--runs`). Tier 1 has tens of messages per run
+95% intervals on the share (`trace-replay` gates all four: p95, CVaR₉₅
+and the upper Wilson bounds over 10× and over 30×). p99 is reported only
+for 4,000 messages or more, pooled over seeds (`--runs`). Tier 1 has tens of messages per run
 and reports the slowest instead.
 
 **Seeds and verdicts** (`src/seeds.rs`, `src/stats.rs`). A seed is a
@@ -100,7 +101,19 @@ Objectives come in two kinds (`Slo::invariant`):
   8 of 10 seeds. If each seed passes with probability 0.95, that gate fails
   1.2% of the time (exact binomial, `stats::spurious_fail`), while three
   seeds that all pass bound a seed's failure rate only below 63% (ten:
-  26%).
+  26%). The gate's seeds are fixed and tier 2 is deterministic, so that
+  1.2% describes fresh seeds (the soak), not the gate: there a seed that
+  misses, misses on every run until the code changes, and uses up slack.
+  `gateway-choice` has 1 of its 2 allowed misses used (1 KB optimality
+  p50 2.03× against 2×, on 1 of the 10 gate seeds); every other gated
+  scenario passes on all 10. Such a seed is printed as a "quality miss
+  (within 8 of 10)", not as a failing seed.
+- **A known gap** (a scenario expected to fail, like `liar-ceiling` from
+  225 phones) is judged the other way round: its invariants on every
+  seed, and its quality objectives must keep failing. Its own misses are
+  "known-gap misses", never seeds to pin. A seed where it passes is
+  printed ("known gap closed"); once it passes on 8 of 10 (16 of 20) the
+  expectation is stale, the verdict fails and those seeds are named.
 
 Thresholds are calibrated on base 2000's seeds (30 at CI size), never on
 the gate's (base 1000). CI's "Simulation" job (`.github/workflows/ci.yml`)
@@ -108,26 +121,31 @@ runs `mycel-sim ci --seed 1000 --runs 10`: the nine tier-2 scenarios of
 `seeds::CI_SUITE` at CI size, ten seeds each, in parallel, then the pinned
 regression seeds (`seeds::PINNED`), every objective; every failing seed is
 printed with the command that replays it, and the verdicts go to the job
-summary. A nightly soak (`.github/workflows/sim-soak.yml`) runs the gate's
+summary. `--min-pass` above `--runs` is refused rather than failing every
+scenario. A nightly soak (`.github/workflows/sim-soak.yml`) runs the gate's
 scenarios, the heavier ones and `liar-ceiling` on 20 fresh seeds (the base
 is the run's id) and prints each failing seed, to be pinned once its cause
 is fixed (TigerBeetle's VOPR keeps every seed for the same reason).
 `liar-ceiling` runs there at scale 0.75 (225 phones, 3 worlds per seed),
 where liars cost delivery and the announcement formats differ (at CI size
 they can't be told apart: open 15); it is a known gap at that size, so the
-soak guards its invariant and flags the day it passes. On 4 seeds the soak
-took 170 s wall here and 595 s of CPU summed over its runs (`global-scale`
-238 s, `churn` 184 s), with `liar-ceiling` at CI size; at 0.75 it adds
-about 150 s of CPU per seed (from 20 worlds at 0.75: 1,010 s of CPU). So
-20 seeds is an estimated 100 CPU-minutes, roughly 30–60 minutes on the
-4-vCPU runner (an estimate; the job's limit is 150).
+soak guards its invariant and flags the day it passes. The soak as
+configured (`liar-ceiling` at 0.75 included) ran end to end on 4 seeds
+(`mycel-sim soak --seed 4242 --runs 4`, the 18-core Mac, 4 threads): 170 s
+wall, 1,308 s of CPU, 2.9 GB peak memory; every verdict passed, the gap
+closed on 0 of 4. Summed run times: `liar-ceiling` 680 s (four runs at a
+time), `global-scale` 287 s, `churn` 262 s, the rest 147 s. So 20 seeds
+is an estimated 110 CPU-minutes, roughly 30–60 minutes on the 4-vCPU
+runner (an extrapolation, not run there; the job's limit is 150), with
+memory bounded by `liar-ceiling`'s cap of 4 runs in flight (open 15).
 `cargo test --release -p mycel-sim` runs the same gate scenario by
 scenario. Runtime, measured on the 18-core Mac with 4 threads while other
-jobs ran (load average ~16): `mycel-sim ci --seed 1000 --runs 10` took
-92 s wall, 360 s of CPU summed over the 90 runs (`adversarial` 179 s and
-`disaster-dtn` 166 s of it; the other seven 14 s together), and
-`cargo test --release -p mycel-sim` 145 s for the scenario tests (tier 1's
-CI three included), 263 s with an incremental build. On CI's 4-vCPU
+jobs ran: `mycel-sim ci --seed 1000 --runs 10` took 93 s wall, 367 s of
+CPU and 1.3 GB peak memory (runs summed: `adversarial` 181 s,
+`disaster-dtn` 146 s with epidemic now run on each of its 20 worlds, the
+other seven 17 s together), and `cargo test --release -p mycel-sim`
+156 s for the scenario tests (tier 1's CI three included), 245 s with an
+incremental build. On CI's 4-vCPU
 runner we estimate (not measured) about 3–6 minutes for the gate plus
 the release build; the job's limit is 45 minutes.
 
@@ -201,14 +219,14 @@ where the nearest-rank "p99" these rows used to print is the maximum.
 | `routing-convergence` | 2 | full | ✅ | global core: 99% routed in 1.1 s, 100% in 1.9 s, 0 loops, re-converged in 0.1 s, stretch 1.01× (before: 99% never, re-converged never) · main: 99% in never · CI size, 30 calibration seeds: 99% in 0.6–0.8 s, 0 loops on every seed | 15 s |
 | `flood-scaling` | 2 | full | ✅ | largest N (2,000): global core 8.3% of BLE in steady state (8.4% on the shared streams), 100% of pairs routed (before: 67.0%, 92% routed), main 136.2% | 333 s |
 | `partial-route` | 2 | full | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 97.6 s; sender-holds 100% p50 98.5 s · gap 300 m: global core + DTN 100%; stand-in custody 0%; sender-holds 0% | 0 s |
-| `disaster-dtn` | 2 | full, judged on 12 worlds from seed 1 | ✅ | **global core + DTN: mean 88.1% delivered** (target ≥ 80%; per world 78–100%; 87.2% on the shared streams) · seed 1: 93%, p95 7680 s, optimality p50/p95 1.45/5.38×, 21.3 replicas and 32.6 hand-offs per message (budget 32) · PRoPHET 67%, spray-and-wait (L=8) 28%, epidemic 100%, on the same world (60 of 60 messages feasible for every router) · CI size (0.1, 48 messages, mean of 20 worlds): 81.1–91.0% over 30 calibration seeds, median 85.2% (finding 25) | 117 s |
+| `disaster-dtn` | 2 | full, judged on 12 worlds from seed 1 | ✅ | **global core + DTN: mean 88.1% delivered** (target ≥ 80%; per world 78–100%; 87.2% on the shared streams) · seed 1: 93%, p95 7680 s, optimality p50/p95 1.45/5.38×, 21.3 replicas and 32.6 hand-offs per message (budget 32; mean of the 12 worlds 21.2) · latency p50 against epidemic's, median of the 12 worlds' ratios, 1.42× (per world 1.24–2.34×; target 3×) · PRoPHET 67%, spray-and-wait (L=8) 28%, epidemic 100%, on the same world (60 of 60 messages feasible for every router) · CI size (0.1, 48 messages, mean of 20 worlds): 81.1–91.0% over 30 calibration seeds, median 85.2% (finding 25) | 45 s |
 | `mailbox` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95 1.00/1.00× | 0 s |
 | `global-scale` | 2 | 2,002 devices (0.02) | ✅ | global core + DTN: 100% delivered, p95 0.690 s, optimality p50 3.76×, p95 10.0× · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.117 s, p95 0.211 s, optimality p95 2.76× (2.88× on the shared streams; 4.45× before fixed 19; 32.2× before fixed 18) · control 708 B/s per device (was 8,470): routing 470, carrier 238 (was 8,004, fixed 17) · CI size (1,499 devices, shared streams): warm optimality p95 2.65× (was 5.14×, failing) | 58 s |
 | `churn` | 2 | 1,001 devices (scale 0.1) | ✅ | global core + DTN: 100% delivered, p95 61.1 s, optimality p50/p95 5.99/12.6×, CVaR₉₅ 16.0× (p50/p95 5.87/12.5× on the shared streams); control 700 B/s per device: routing 2,659 → 471, carrier 4,540 → 256 (full size before the carrier fixes: 100%, p95 65.2 s) | 33 s |
 | `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.091 s, optimality p50/p95 1.91/6.02×, CVaR₉₅ 7.84× (was 82%, p95 1.28 s, 36.6/170× p50/p95, failing: fixed 20) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (today's one-hop liar, judged ≥ 90%; a weak attacker: open 15): 91%, liar-free-reachable delivery 91% of a 100% ceiling (94% on the shared streams; 76% before fixed 21); 85.4% mean over seeds 1–20, and 78.4% for the chain-extending lie any liar can tell today (open 15) · CI size (0.1), 30 calibration seeds: lying plausibly 88.3–100%, median 96.7% | 265 s |
-| `liar-ceiling` | 2 | full, seeds 1–20 | ⏳ | ceiling 100% on every seed · worst case by announcement format: today 78.4% (min 69%), signed per-hop chain 78.4% (+0.0), chain + each hop's measured cost 98.9% (+20.6 ± 2.4 points) · by strategy: one-hop liar 85.4%, chain-extending liar 78.4%, honest dropper 98.9%, honest grey hole 99.5% (open 15) · CI size (seeds 1–20): 96.6%, +0.8, +2.7 | 548 s |
+| `liar-ceiling` | 2 | full, seeds 1–20 | ⏳ | ceiling 100% on every seed · each announcement format against its worst strategy: today 78.4% (chain-extending liar, min 69%), signed per-hop chain 78.4% (+0.0), chain + each hop's measured cost 98.9% (+20.6 ± 2.4 points) · by strategy: one-hop liar 85.4%, chain-extending liar 78.4%, honest dropper 98.9%, honest grey hole 99.5% (open 15) · CI size (seeds 1–20): 97.0% (one-hop liar), chain alone +0.3 ± 0.7, hop costs +2.7 ± 0.9 | 507 s |
 | `trace-replay` | 2 | full | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.0% of feasible (3,981 of 4,000 sent), p50 4.7 s, p95 1311 s, optimality p50 1.22×, p95 8.30× [6.24–13.8], CVaR₉₅ 23.1×, 3 of 396 over 30× (Wilson upper bound 2.2%), overhead 3.34 (was 8.38/18.0× p95/p99: fixed 21; pipelining-aware oracle, fixed 12) · ten full-size calibration seeds pooled (3,982 messages): p95 8.30× [7.73–9.20], CVaR₉₅ 39.8× (the p99 jump 36.8× → 46.9× on the shared streams: finding 26) · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 49 s |
-| `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 32%, 52%, 69%, 83%, 90%, 93% (160 broadcasts, the same at every limit; the shape checks are paired: finding 24) | 0 s |
+| `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 52%, 70%, 83%, 91%, 94% (640 broadcasts, the same at every limit; the shape checks are paired, "reach rises" a non-inferiority test, weakest step 6→7 +3.1 ± 1.5 points: finding 24) | 0.5 s |
 
 ## 4. Findings
 
@@ -665,11 +683,13 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    quality objective on all 30. Three missed once each: `gateway-choice`
    (1 KB optimality p50 2.03×, target 2.00×), `adversarial` (plausible
    liars 88.3%, target 90%) and `disaster-dtn` (latency p50 3.42× epidemic's,
-   target 3×). At a per-seed pass rate of 29/30 a scenario fails 8 of 10
-   0.37% of the time, and the suite about 1.1% per change (point
-   estimates). The trace-replay tail thresholds sit above the worst of
-   the 30 (p95 6.43× against 8×, CVaR₉₅ 86.0× against 120×, Wilson bound
-   over 30× 4.49% against 6%). The gate's own seeds (base 1000) all pass;
+   target 3×, on one world's 20-odd deliveries; now the median over its 20
+   worlds, which ran 0.96–1.01× over the same 30: fixed 25). At a per-seed
+   pass rate of 29/30 a scenario fails 8 of 10 0.37% of the time, and the
+   suite about 1.1% per change (point estimates). The trace-replay tail
+   thresholds sit above the worst of the 30 (p95 6.43× against 8×, CVaR₉₅
+   86.0× against 120×, Wilson bound over 10× 8.01% against 12%, over 30×
+   4.49% against 6%). The gate's own seeds (base 1000) all pass;
    `gateway-choice` on 9 of 10 (2.03× again).
 24. **`flood-hop-limit`'s shape check compared different broadcasts.**
    (It is a check on the managed-flooding baseline, not Mycel's router.)
@@ -677,19 +697,28 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    neighbouring limits compared different messages: at CI size with
    seed 3, reach "fell" from 99% to 95% at hop 7 on 20 broadcasts. Every
    limit now sends the same broadcasts (sources and times, from the
-   workload stream), 160 at any size (was 20 at CI size, 60 at full), and
+   workload stream), 640 at any size (was 20 at CI size, 60 at full), and
    both shape checks are paired, per broadcast:
-   - "Reach rises" is deliberately a non-inferiority test with a 2-point
-     margin: a step fails only if the mean per-broadcast difference falls
-     by more than 2 points *and* by more than two standard errors. Reach
-     needn't rise exactly: with duplicate suppression, a device that
+   - "Reach rises" is a non-inferiority test with a 3-point margin: every
+     step up in the hop limit must *show* it loses less than 3 points, the
+     mean per-broadcast difference minus two standard errors above −3
+     points, so a noisy or underpowered run fails rather than passes.
+     Reach needn't rise exactly: with duplicate suppression, a device that
      first hears a copy late, over a long path, has fewer hops left to
-     pass it on.
+     pass it on. (An earlier version passed unless there was evidence of
+     a fall, the reverse of non-inferiority, and was labelled as one.)
+     One broadcast's reach swings by ~15 points between runs, so with 160
+     broadcasts two standard errors of a step were 2–5 points and the
+     true test failed on 9 of 30 calibration seeds (mean falls of at most
+     2.4 points, most within half a point of zero);
+     with 640 they are 1–2.5 points, and on the 30 calibration seeds the
+     weakest step's mean was −0.9 points and its lower bound −2.2 (the
+     gate's 10 seeds: −1.6). All 40 pass.
    - "Diminishing returns" needs positive evidence: hop 6→7's gain minus
      half of 2→3's must be below zero by more than two standard errors.
      (With 40 broadcasts that missed on 2 of 30 calibration seeds, on
-     noise; with 160, on 1 of 30: 0.06 against 0.18 / 2, a world that
-     saturates late. All 30 seeds from the gate's base pass.)
+     noise; with 160, on 1 of 30, a world that saturates late; with 640
+     it passes on all 30 and on the gate's 10.)
    - The pairing itself is an invariant of the scenario: every hop
      limit's run must have sent the same (time, source) broadcasts, as
      the engine recorded them. Drawing each run's sources afresh again
@@ -709,11 +738,20 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    per cent false alarm per change at 8 of 10. The mean of 20 (CI size
    now) ran 81.1–91.0% over the 30 (p10 82.0%, median 85.2%, p90 88.3%)
    and passed on all 30; at full size the mean of 12 is 88.1% (per world
-   78–100%). The 20 worlds cost about 20 s of CPU per seed. "48 messages"
-   is what each world sends; only those with a path count, roughly 20 to
-   48 per world (seed 2's own world has about 22, so one message there is
-   ~4.5 points), which is why the verdict is the mean over worlds. Seeds
-   2 and 3 at CI size are pinned (`seeds::PINNED`) and pass.
+   78–100%). "48 messages" is what each world sends; only those with a
+   path count, roughly 20 to 48 per world (seed 2's own world has about
+   22, so one message there is ~4.5 points), which is why the verdict is
+   over worlds. The other two objectives are judged over the same worlds
+   now (they were judged on the given seed's world alone, and latency
+   missed once in 30 calibration seeds on that: 3.42× against 3×): copies
+   per message on the mean, and latency p50 against epidemic's on the
+   median of the per-world ratios, epidemic run on every world (one
+   world's p50 over a handful of deliveries swings: 0.50–1.85× within one
+   seed's 20). Over the 30 calibration seeds the median ran 0.96–1.01×
+   and the mean copies 6.8–7.6 (budget 32); at full size, seed 1, 1.42×
+   (per world 1.24–2.34×) and 21.2. The 20 worlds, with epidemic on
+   each, cost about 17 s of CPU per seed at CI size (503 s for the 30).
+   Seeds 2 and 3 at CI size are pinned (`seeds::PINNED`) and pass.
 26. **The `trace-replay` p99 jump (36.8× → 46.9×) was one message
    changing places.** Tier 2 is deterministic, so the two commits were
    run on the same synthetic trace (full size: 40 devices, 400 messages
@@ -753,15 +791,17 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    which 1 MB message catches which contact: a reshuffle of the slowest
    few, not a regression. The p99 of 400 can't tell the two apart (its
    95% interval runs from the 9th-largest ratio to the largest), which is
-   why the gate is now p95, CVaR₉₅ and the share over 30× (§1), and p99
+   why the gate is now p95, CVaR₉₅ and the shares over 10× and 30× (§1), and p99
    is reported only pooled over 4,000 messages or more. On the ten full-size
    calibration seeds (base 2000, split streams) each seed's p95 ran
    6.30–11.8×, CVaR₉₅ 22.9–67.6× and the Wilson upper bound on the share
-   over 30× 2.20–3.92%; pooled, 3,982 messages: p50 1.22×, p95 8.30×
+   over 30× 2.20–3.92% (over 10×: 3.90–9.11%); pooled, 3,982 messages: p50 1.22×, p95 8.30×
    [7.73–9.20], CVaR₉₅ 39.8×, 159 over 10× (3.4–4.6%), 57 over 30×
    (1.1–1.8%), 18 short of a pooled p99. The gate: p95 ≤ 15×, CVaR₉₅ ≤
-   100×, over 30× ≤ 6% (upper bound) at full size; 8×, 120× and 6% at CI
-   size, where the worst of 30 seeds was 6.43×, 86.0× and 4.49%.
+   100×, over 10× ≤ 12% and over 30× ≤ 6% (upper bounds) at full size;
+   8×, 120×, 12% and 6% at CI size, where the worst of 30 seeds was
+   6.43×, 86.0×, 8.01% and 4.49% (the gate's 10: 5.28×, 23.0×, 5.03%,
+   3.61%).
 
 ### Open findings
 
@@ -857,11 +897,19 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
 
    Attestation only takes lies away: whatever an attested liar can say,
    an unattested one can say too. So each announcement format is judged
-   by the worst strategy it leaves open, seed by seed: with no
-   attestation (today) all four; with a signed per-hop chain, all but the
+   by the worst strategy it leaves open: with no attestation (today) all
+   four; with a signed per-hop chain, all but the
    one-hop lie; with each hop's measured cost signed into the chain too
    (each upstream entry carries the upstream's cost to the named next
-   hop), only the truthful two. Liar-free-reachable (LFR) delivery counts
+   hop), only the truthful two. "Worst" is the strategy with the lowest
+   mean over the seeds, fixed before two formats are compared, so a gain
+   is a paired difference between two strategies seed by seed. (An
+   earlier version took each seed's worst strategy: over nested strategy
+   sets every per-seed difference is then ≥ 0 by construction, and taking
+   the minimum of noisy outcomes biases the gain upward, so its "± 2 SE"
+   looked like evidence when it was selection. That per-seed worst, a
+   bad device that knew which strategy hurts most in its world, is kept
+   as an upper bound on each gain, without error bars.) Liar-free-reachable (LFR) delivery counts
    only the pairs still connected once every bad device is removed, on
    the time-expanded contact graph (`tier2/lfr.rs`).
 
@@ -872,21 +920,27 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    | honest dropper | 98.9% (97.0–100%) | +13.6 ± 1.5 points, better on 20 of 20 |
    | honest grey hole | 99.5% (98.0–100%) | +14.1 ± 1.5 points, better on 20 of 20 |
 
-   | Worst case by format, full size | Delivered (mean, min) | Gained over the format before, paired |
-   |---|---|---|
-   | no attestation (today) | 78.4% (69.3%) | |
-   | signed per-hop chain | 78.4% (69.3%) | +0.0 ± 0.0 points (the chain-extending lie is the worst on every seed either way) |
-   | chain + each hop's measured cost | 98.9% (97.0%) | +20.6 ± 2.4 points, better on 20 of 20 |
+   | Each format against its worst strategy, full size | Strategy | Delivered (mean, min) | Gained over the format before, paired |
+   |---|---|---|---|
+   | no attestation (today) | chain-extending liar | 78.4% (69.3%) | |
+   | signed per-hop chain | chain-extending liar | 78.4% (69.3%) | +0.0 ± 0.0 points (the same strategy: nothing taken away that mattered) |
+   | chain + each hop's measured cost | honest dropper | 98.9% (97.0%) | +20.6 ± 2.4 points, better on 20 of 20 |
 
-   (± two standard errors of the per-seed differences.) By scale, seeds
-   1–20 each (the paired gains as above):
+   (± two standard errors of the per-seed differences.) At full size the
+   per-seed worst picks the same strategy on every seed, so the upper
+   bounds equal these. By scale, seeds 1–20 each:
 
-   | Scale (phones, liars) | Today's worst case | Signed chain alone | + each hop's cost | One-hop vs chain-extending lie |
-   |---|---|---|---|---|
-   | 0.1 (80, 4) | 96.6% (min 92%) | +0.8 ± 0.5 | +2.7 ± 0.9 → 100.0% | 97.0% vs 97.3% |
-   | 0.5 (150, 7) | 92.3% (min 79%) | +0.6 ± 0.4 | +6.7 ± 2.0 → 99.6% | 93.2% vs 92.9% |
-   | 0.75 (225, 11) | 84.3% (min 75%) | +0.2 ± 0.4 | +15.1 ± 2.5 → 99.6% | 88.2% vs 84.5% |
-   | 1.0 (300, 15) | 78.4% (min 69%) | +0.0 ± 0.0 | +20.6 ± 2.4 → 98.9% | 85.4% vs 78.4% |
+   | Scale (phones, liars) | Today's worst strategy | Signed chain alone | + each hop's cost | Per-seed worst: today, chain gain, cost gain (upper bounds) | One-hop vs chain-extending lie |
+   |---|---|---|---|---|---|
+   | 0.1 (80, 4) | one-hop liar, 97.0% (min 92%) | +0.3 ± 0.7 (7 seeds better, 5 worse) | +2.7 ± 0.9 → 100.0% | 96.6%, +0.8, +2.7 | 97.0% vs 97.3% |
+   | 0.5 (150, 7) | chain-extending, 92.9% (min 79%) | +0.0 ± 0.0 | +6.7 ± 2.0 → 99.6% | 92.3%, +0.6, +6.7 | 93.2% vs 92.9% |
+   | 0.75 (225, 11) | chain-extending, 84.5% (min 75%) | +0.0 ± 0.0 | +15.1 ± 2.5 → 99.6% | 84.3%, +0.2, +15.1 | 88.2% vs 84.5% |
+   | 1.0 (300, 15) | chain-extending, 78.4% (min 69%) | +0.0 ± 0.0 | +20.6 ± 2.4 → 98.9% | 78.4%, +0.0, +20.6 | 85.4% vs 78.4% |
+
+   (The per-seed-worst gains of +0.8, +0.6 and +0.2 that an earlier
+   version of this table gave for the chain alone were that selection
+   artefact: with one strategy fixed per format they are +0.3 ± 0.7, in
+   noise, at 0.1 and exactly 0 above.)
 
    What the numbers say:
    - **Nothing here is inherent.** The liar-free ceiling is 100% on every
@@ -922,8 +976,9 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
      weak attacker, and the honest worst case today is 78.4% at full
      size, not 85.4%.
    - **A signed per-hop chain alone buys nothing** against a liar that
-     picks its lie: +0.0 points at full size, under a point at every
-     scale.
+     picks its lie: +0.0 points from 150 phones on (the chain-extending
+     lie is the worst strategy with or without it), +0.3 ± 0.7 at 80
+     phones, within noise.
    - **Binding each hop's measured cost is what pays:** +20.6 points at
      full size (to 98.9%; latency p95 1.5 s, median of the seeds, against
      53 s with the one-hop liar). So step 12 of the routing plan is worth
@@ -947,18 +1002,25 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
      defence's to win (it detects only by losing traffic first, and per
      source and destination).
 
-   `liar-ceiling` fails as expected from scale 0.75 on (worst-case LFR
-   delivery 84.3% there, 78.4% at full size, target 90%); at CI size (80
-   phones, 4 liars, seeds 1–3) it passes with 96.7%, and the nightly soak
+   `liar-ceiling` fails as expected from scale 0.75 on (LFR delivery
+   against the worst unattested strategy 84.5% there, 78.4% at full size,
+   target 90%); at CI size (80 phones, 4 liars, seeds 1–3) it passes with
+   96.7% (one-hop liar; chain alone +0.6 ± 1.1, hop costs +2.8 ± 2.2), and the nightly soak
    runs it at 0.75 on fresh seeds (§1), where its invariant (nothing
    delivered between a pair every path of which crosses a dropper) is
    checked in the regime that matters. Repro: `mycel-sim liar-ceiling`
-   (seeds 1–20 at full size, 548 s wall and 6.1 GB peak memory on the
-   18-core Mac with 4 threads; the three strategies the first version
-   ran gave identical numbers per seed on this build);
-   `MYCEL_SIM_LIAR_SEEDS=20 mycel-sim liar-ceiling --scale 0.75` (263 s),
-   `--scale 0.5` (91 s), `--scale 0.1` (18 s); `mycel-sim adversarial
-   --seed 2`.
+   (seeds 1–20 at full size: 80 runs). The scenario runs at most
+   `MYCEL_SIM_MAX_PAR` runs at once (default 4, never more than rayon's
+   threads), on one pool shared by every caller, the soak's parallel
+   seeds included: a full-size run holds about 1 GB at its peak (995 MB
+   with one in flight, measured by a reviewer), so one per core, as
+   before, was an estimated 13–18 GB on the 18-core Mac. Measured on that
+   Mac with `RAYON_NUM_THREADS=4` and the default cap: full size 507 s
+   wall, 4.2 GB peak; `MYCEL_SIM_LIAR_SEEDS=20 mycel-sim liar-ceiling
+   --scale 0.75` 246 s, 1.9 GB; `--scale 0.5` 92 s, 1.1 GB; `--scale
+   0.1` 20 s, 0.26 GB. Per seed the numbers are identical to the runs
+   before the cap (and to the first version's three strategies);
+   `mycel-sim adversarial --seed 2`.
 16. **Today's liar makes its neighbourhood ask for seqnos millions of
    times a run.** The mechanism is open 15's: routes it claims at 1 hop
    expire on the near scope's schedule and come back only at the far

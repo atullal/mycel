@@ -1308,6 +1308,30 @@ fn disaster_world(o: &Opts) -> (World, Vec<(NodeId, NodeId)>) {
     (w, pairs)
 }
 
+/// One `disaster-dtn` world, judged: the candidate's delivery (% of
+/// feasible), its replicas per message, and its latency p50 over
+/// epidemic's on the same world (∞ where either delivered nothing).
+struct DisasterWorld {
+    delivery: f64,
+    copies: f64,
+    latency_vs_epidemic: f64,
+}
+
+impl DisasterWorld {
+    fn of(c: &T2Metrics, epidemic: &T2Metrics) -> DisasterWorld {
+        let ratio = if epidemic.delivered == 0 {
+            f64::INFINITY
+        } else {
+            inf_if_none(c, c.latency_s.p50 / epidemic.latency_s.p50.max(1e-9))
+        };
+        DisasterWorld {
+            delivery: 100.0 * c.delivery_ratio,
+            copies: inf_if_none(c, c.copies_per_msg),
+            latency_vs_epidemic: ratio,
+        }
+    }
+}
+
 fn disaster_dtn(o: Opts) -> ScenarioResult {
     let mut r = ScenarioResult::new(
         "disaster-dtn",
@@ -1328,12 +1352,19 @@ fn disaster_dtn(o: Opts) -> ScenarioResult {
     let until = 3 * HOUR;
     // One run swings by tens of points with timing alone (seed to seed, or a
     // few bytes more per summary: docs/SIMULATION.md §4, open 12), so the
-    // scenario is judged on the mean of 12 seeds at full size and 20 at CI
-    // size (worlds and runs), the given seed first.
+    // scenario is judged over 12 seeds at full size and 20 at CI size
+    // (worlds and runs), the given seed first: delivery and copies on their
+    // means, latency against epidemic's on the median of the per-world
+    // ratios (a world with a handful of deliveries has a wild p50).
     let more_seeds = |k: u64| {
         let ok = Opts { seed: o.seed.wrapping_add(k), ..o };
         let (w, pairs) = disaster_world(&ok);
-        100.0 * run(Model::of(o.candidate), &w, &plan_for(&pairs), ok.seed, until, None).m.delivery_ratio
+        let plan = plan_for(&pairs);
+        let (c, e) = rayon::join(
+            || run(Model::of(o.candidate), &w, &plan, ok.seed, until, None).m,
+            || run(Model::Epidemic, &w, &plan, ok.seed, until, None).m,
+        );
+        DisasterWorld::of(&c, &e)
     };
     let seeds = if o.scale >= 1.0 { DISASTER_SEEDS } else { DISASTER_SEEDS_CI };
     let ((cand, others), more) = rayon::join(
@@ -1348,11 +1379,12 @@ fn disaster_dtn(o: Opts) -> ScenarioResult {
                 &[Model::Main, Model::StandIn, Model::Prophet, Model::Spray(8), Model::Epidemic, Model::Flood(7)],
             )
         },
-        || (1..seeds).into_par_iter().map(more_seeds).collect::<Vec<f64>>(),
+        || (1..seeds).into_par_iter().map(more_seeds).collect::<Vec<DisasterWorld>>(),
     );
     let epi = others.iter().find(|x| x.m.model == "epidemic").map(|x| x.m.clone()).unwrap_or_default();
-    let mut per_seed = vec![100.0 * cand.m.delivery_ratio];
-    per_seed.extend(more);
+    let mut worlds = vec![DisasterWorld::of(&cand.m, &epi)];
+    worlds.extend(more);
+    let per_seed: Vec<f64> = worlds.iter().map(|x| x.delivery).collect();
     let mean = per_seed.iter().sum::<f64>() / per_seed.len() as f64;
     let (lo, hi) = per_seed.iter().fold((f64::INFINITY, 0.0f64), |(l, h), x| (l.min(*x), h.max(*x)));
     // (the name doesn't carry the seed: replications are judged by name)
@@ -1367,17 +1399,24 @@ fn disaster_dtn(o: Opts) -> ScenarioResult {
     // The bound is the carrier's own copy budget for 2 kB bundles (32, set
     // for chat speed: docs/BENCHMARKS.md §6.3); 8 copies deliver less here
     let budget = dtn_cfg(&plan).copies_for(2000) as f64;
-    r.at_most("copies per message (replicas)", inf_if_none(&cand.m, cand.m.copies_per_msg), budget, "");
+    let copies = worlds.iter().map(|x| x.copies).sum::<f64>() / worlds.len() as f64;
+    r.at_most(&format!("copies per message (replicas), mean of {seeds} seeds"), copies, budget, "");
     r.note(format!(
-        "{}: {:.1} replicas and {:.1} carrier-to-carrier hand-offs per message (custody moves make up the difference).",
-        cand.m.model, cand.m.copies_per_msg, cand.m.handoffs_per_msg
+        "{}: {:.1} replicas and {:.1} carrier-to-carrier hand-offs per message on seed {} (custody moves make up the difference).",
+        cand.m.model, cand.m.copies_per_msg, cand.m.handoffs_per_msg, o.seed
     ));
-    r.at_most(
-        "latency p50 vs epidemic's",
-        inf_if_none(&cand.m, cand.m.latency_s.p50 / epi.latency_s.p50.max(1e-9)),
-        3.0,
-        "×",
-    );
+    let mut ratios: Vec<f64> = worlds.iter().map(|x| x.latency_vs_epidemic).collect();
+    ratios.sort_by(f64::total_cmp);
+    let median = if ratios.len() % 2 == 1 {
+        ratios[ratios.len() / 2]
+    } else {
+        (ratios[ratios.len() / 2 - 1] + ratios[ratios.len() / 2]) / 2.0
+    };
+    r.at_most(&format!("latency p50 vs epidemic's, median of {seeds} seeds"), median, 3.0, "×");
+    r.note(format!(
+        "latency p50 vs epidemic's by seed: {}",
+        worlds.iter().map(|x| format!("{}×", fmt(x.latency_vs_epidemic))).collect::<Vec<_>>().join(", ")
+    ));
     for x in &others {
         headline(&mut r, &x.m);
     }
@@ -1695,13 +1734,44 @@ const LIAR_ROLES: [(Role, &str); 4] = [
 /// indices into [`LIAR_ROLES`]: with no attestations it can say anything;
 /// held to a signed per-hop chain it can only extend one it was sent (or
 /// announce the truth); with each hop's measured cost signed in too, only
-/// the truth. Each regime's worst case is the worst of its strategies, seed
-/// by seed.
+/// the truth. Each format is judged by the strategy of its set with the
+/// worst mean over the seeds, fixed before formats are compared
+/// ([`worst_fixed`]).
 const REGIMES: [(&str, &[usize]); 3] = [
     ("no attestation (today)", &[0, 1, 2, 3]),
     ("signed per-hop chain", &[1, 2, 3]),
     ("chain + each hop's measured cost", &[2, 3]),
 ];
+
+/// Default for `MYCEL_SIM_MAX_PAR`, the most `liar-ceiling` runs in flight
+/// at once.
+const LIAR_MAX_PAR: usize = 4;
+
+/// The most `liar-ceiling` runs in flight at once, process-wide:
+/// `MYCEL_SIM_MAX_PAR` (default [`LIAR_MAX_PAR`]), never more than rayon's
+/// threads. A full-size run holds about 1 GB at its peak (measured: 995 MB
+/// for one run in flight), so one per core would exhaust a laptop's memory
+/// before its cores (docs/SIMULATION.md §4, open 15).
+fn liar_max_par() -> usize {
+    let cap = std::env::var("MYCEL_SIM_MAX_PAR").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0);
+    cap.unwrap_or(LIAR_MAX_PAR).min(rayon::current_num_threads()).max(1)
+}
+
+/// Run `f` on the pool every `liar-ceiling` run shares, of
+/// [`liar_max_par`] threads: however many scenarios or seeds call it at
+/// once (the soak replicates seeds in parallel too), at most that many
+/// runs are in flight, since a run never waits on rayon work itself.
+fn in_liar_pool<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(liar_max_par())
+            .thread_name(|i| format!("liar-ceiling-{i}"))
+            .build()
+            .expect("liar-ceiling's thread pool")
+    })
+    .install(f)
+}
 
 /// One seed of `liar-ceiling`: a run per [`LIAR_ROLES`] entry, on the same
 /// world and traffic.
@@ -1716,6 +1786,28 @@ fn mean_se(xs: &[f64]) -> (f64, f64) {
     let mean = xs.iter().sum::<f64>() / k;
     let var = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (k - 1.0).max(1.0);
     (mean, (var / k).sqrt())
+}
+
+/// Of `roles` (indices into `by_role`, one value per seed each), the one
+/// with the lowest mean: the strategy a format is judged by. Fixed across
+/// the seeds, so that comparing two formats compares two strategies seed
+/// by seed. Taking each seed's minimum instead would pick every seed's
+/// unluckiest draw: over nested strategy sets every per-seed difference
+/// is then ≥ 0 by construction and the gain biased upward, noise reading
+/// as evidence.
+fn worst_fixed(by_role: &[Vec<f64>], roles: &[usize]) -> usize {
+    let mean = |i: usize| mean_se(&by_role[i]).0;
+    roles.iter().copied().min_by(|a, b| mean(*a).total_cmp(&mean(*b))).expect("a format leaves a strategy open")
+}
+
+/// Paired, seed by seed: the mean of `a − b` ± two standard errors, and on
+/// how many seeds `a` is better and worse.
+fn paired(a: &[f64], b: &[f64]) -> String {
+    let d: Vec<f64> = a.iter().zip(b).map(|(a, b)| a - b).collect();
+    let (gm, se) = mean_se(&d);
+    let better = d.iter().filter(|g| **g > 0.0).count();
+    let worse = d.iter().filter(|g| **g < 0.0).count();
+    format!("{gm:+.1} ± {:.1} points ({better} seeds better, {worse} worse)", 2.0 * se)
 }
 
 /// How much of plausible liars' damage is inherent (pairs every path of
@@ -1737,21 +1829,23 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
         3
     });
     let model = Model::of(o.candidate);
-    let seeds: Vec<LiarSeed> = (0..k)
-        .into_par_iter()
-        .map(|i| {
-            let seed = o.seed.wrapping_add(i);
-            let a = adversaries(&Opts { seed, ..o });
-            let runs = LIAR_ROLES
-                .par_iter()
-                .map(|(role, _)| {
-                    let plan = Plan { roles: a.bad.iter().map(|b| (*b, *role)).collect(), ..a.plan.clone() };
-                    run(model, &a.w, &plan, seed, a.until, None)
-                })
-                .collect();
-            LiarSeed { seed, runs }
-        })
-        .collect();
+    let seeds: Vec<LiarSeed> = in_liar_pool(|| {
+        (0..k)
+            .into_par_iter()
+            .map(|i| {
+                let seed = o.seed.wrapping_add(i);
+                let a = adversaries(&Opts { seed, ..o });
+                let runs = LIAR_ROLES
+                    .par_iter()
+                    .map(|(role, _)| {
+                        let plan = Plan { roles: a.bad.iter().map(|b| (*b, *role)).collect(), ..a.plan.clone() };
+                        run(model, &a.w, &plan, seed, a.until, None)
+                    })
+                    .collect();
+                LiarSeed { seed, runs }
+            })
+            .collect()
+    });
     let lfr = |x: &Run| x.lfr.clone().unwrap_or_default();
     let mut rows = Vec::new();
     for s in &seeds {
@@ -1777,36 +1871,32 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
     let raw: Vec<Vec<f64>> = (0..LIAR_ROLES.len()).map(|i| col(i, |c| c.raw())).collect();
     let lfr_d: Vec<Vec<f64>> = (0..LIAR_ROLES.len()).map(|i| col(i, |c| c.lfr())).collect();
     let ceil = col(0, |c| c.ceiling());
-    // per regime: the worst of its strategies, seed by seed
-    let worst = |v: &[Vec<f64>], roles: &[usize]| -> Vec<f64> {
-        (0..seeds.len()).map(|s| roles.iter().map(|i| v[*i][s]).fold(f64::INFINITY, f64::min)).collect()
-    };
-    let raw_w: Vec<Vec<f64>> = REGIMES.iter().map(|(_, roles)| worst(&raw, roles)).collect();
-    let lfr_w: Vec<Vec<f64>> = REGIMES.iter().map(|(_, roles)| worst(&lfr_d, roles)).collect();
     let m = |v: &[f64]| mean_se(v).0;
     let min = |v: &[f64]| v.iter().copied().fold(f64::INFINITY, f64::min);
-    // paired, seed by seed: mean difference ± two standard errors
-    let paired = |a: &[f64], b: &[f64]| {
-        let d: Vec<f64> = a.iter().zip(b).map(|(a, b)| a - b).collect();
-        let (gm, se) = mean_se(&d);
-        let better = d.iter().filter(|g| **g > 0.0).count();
-        let worse = d.iter().filter(|g| **g < 0.0).count();
-        format!("{gm:+.1} ± {:.1} points ({better} seeds better, {worse} worse)", 2.0 * se)
+    // per format: the strategy with the worst mean, fixed across the seeds
+    let fixed: Vec<usize> = REGIMES.iter().map(|(_, roles)| worst_fixed(&raw, roles)).collect();
+    // and the per-seed worst (a bad device that knew, world by world, which
+    // strategy hurts most): its gains are upper bounds, with no error bars
+    let per_seed = |roles: &[usize]| -> Vec<f64> {
+        (0..seeds.len()).map(|s| roles.iter().map(|i| raw[*i][s]).fold(f64::INFINITY, f64::min)).collect()
     };
+    let upper: Vec<Vec<f64>> = REGIMES.iter().map(|(_, roles)| per_seed(roles)).collect();
     let last = o.seed.wrapping_add(k.saturating_sub(1));
+    let f = |j: usize| &raw[fixed[j]];
     r.headline(format!(
-        "seeds {}–{last}: ceiling {:.1}% · worst case raw (LFR) by format: today {:.1}% ({:.1}%, min {:.0}%), signed chain {:.1}% ({:.1}%), {} vs today, chain + hop costs {:.1}% ({:.1}%), {} vs chain alone",
+        "seeds {}–{last}: ceiling {:.1}% · each format against its worst strategy, raw (LFR): today ({}) {:.1}% ({:.1}%, min {:.0}%), signed chain ({}) {:.1}%, {} vs today, chain + hop costs ({}) {:.1}%, {} vs chain alone",
         o.seed,
         m(&ceil),
-        m(&raw_w[0]),
-        m(&lfr_w[0]),
-        min(&lfr_w[0]),
-        m(&raw_w[1]),
-        m(&lfr_w[1]),
-        paired(&raw_w[1], &raw_w[0]),
-        m(&raw_w[2]),
-        m(&lfr_w[2]),
-        paired(&raw_w[2], &raw_w[1]),
+        LIAR_ROLES[fixed[0]].1,
+        m(f(0)),
+        m(&lfr_d[fixed[0]]),
+        min(&lfr_d[fixed[0]]),
+        LIAR_ROLES[fixed[1]].1,
+        m(f(1)),
+        paired(f(1), f(0)),
+        LIAR_ROLES[fixed[2]].1,
+        m(f(2)),
+        paired(f(2), f(1)),
     ));
     r.headline(format!(
         "by strategy, raw: {}",
@@ -1820,6 +1910,14 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
             .collect::<Vec<_>>()
             .join(" · ")
     ));
+    r.headline(format!(
+        "per-seed worst strategy (upper bounds on the gains, selection-biased, no error bars): today {:.1}%, signed chain {:.1}% ({:+.1}), chain + hop costs {:.1}% ({:+.1})",
+        m(&upper[0]),
+        m(&upper[1]),
+        m(&upper[1]) - m(&upper[0]),
+        m(&upper[2]),
+        m(&upper[2]) - m(&upper[1]),
+    ));
     for (j, (regime, roles)) in REGIMES.iter().enumerate() {
         let picks: Vec<&str> = (0..seeds.len())
             .map(|s| {
@@ -1828,10 +1926,12 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
             })
             .collect();
         r.note(format!(
-            "{regime}: worst case raw {:.1}% (min {:.1}%), LFR {:.1}%; the worst strategy per seed: {}",
-            m(&raw_w[j]),
-            min(&raw_w[j]),
-            m(&lfr_w[j]),
+            "{regime}: judged against the {} (worst mean), raw {:.1}% (min {:.1}%), LFR {:.1}%; per-seed worst {:.1}%, the worst strategy per seed: {}",
+            LIAR_ROLES[fixed[j]].1,
+            m(f(j)),
+            min(f(j)),
+            m(&lfr_d[fixed[j]]),
+            m(&upper[j]),
             picks.join(", ")
         ));
     }
@@ -1847,11 +1947,11 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
         .invariant_if(o.candidate == Candidate::Global);
     r.at_least(
         "liar-free-reachable delivery against the worst unattested strategy, mean over seeds",
-        m(&lfr_w[0]),
+        m(&lfr_d[fixed[0]]),
         90.0,
         "%",
     );
-    r.note("Liar-free-reachable (LFR): the honest pair still has a path, on the time-expanded contact graph, once every bad device is removed. LFR delivery = delivered / LFR-reachable is what the defence saved of what could be saved; the ceiling (LFR-reachable / feasible) is the most any routing can deliver while they drop everything. One-hop liar: claims to be one hop from every origin at the 2.1 ms floor (today's `Role::Liar`). Chain-extending liar: the cheapest chain it was sent, plus one hop and the 2.1 ms floor; the most a signed per-hop chain lets a liar say, and open to an unattested liar too. Honest dropper and grey hole: announce the truth (all a liar can do once each hop's measured cost is signed into the chain as well); the dropper drops everything, the grey hole half the messages. Each format is judged by the worst strategy it leaves open, seed by seed (a bad device can pick its strategy for its world). Not modelled: what attestations give the defence (blaming the last signer of a chain that loses traffic), or a liar that adapts within a run. Paired gaps: mean of the per-seed differences in raw delivery ± two standard errors.");
+    r.note("Liar-free-reachable (LFR): the honest pair still has a path, on the time-expanded contact graph, once every bad device is removed. LFR delivery = delivered / LFR-reachable is what the defence saved of what could be saved; the ceiling (LFR-reachable / feasible) is the most any routing can deliver while they drop everything. One-hop liar: claims to be one hop from every origin at the 2.1 ms floor (today's `Role::Liar`). Chain-extending liar: the cheapest chain it was sent, plus one hop and the 2.1 ms floor; the most a signed per-hop chain lets a liar say, and open to an unattested liar too. Honest dropper and grey hole: announce the truth (all a liar can do once each hop's measured cost is signed into the chain as well); the dropper drops everything, the grey hole half the messages. Each format is judged by the strategy it leaves open with the worst mean over the seeds, fixed before formats are compared; the per-seed worst (a bad device that knew which strategy hurts most in its world) is reported as an upper bound on each gain. Not modelled: what attestations give the defence (blaming the last signer of a chain that loses traffic), or a liar that adapts within a run. Paired gaps: mean of the per-seed differences in raw delivery ± two standard errors. At most `MYCEL_SIM_MAX_PAR` runs (default 4) are in flight at once, about 1 GB each at full size.");
     r.metrics = serde_json::Value::Array(rows);
     if o.candidate != Candidate::Global {
         r.expect_fail("liars and attestation are modelled for the GLOBAL routing core only");
@@ -1905,15 +2005,16 @@ fn trace_world(t: &crate::traces::Trace) -> (World, Vec<(Time, Action)>) {
 
 /// `trace-replay`'s tail objectives for the candidate (achieved / fastest
 /// feasible): the most for optimality p95, for CVaR₉₅, and for the Wilson
-/// upper bound of the share of messages over 30× (%). Calibrated on the
-/// calibration seeds, never the gate's (docs/SIMULATION.md §1), with
-/// headroom over the worst seed, since one seed's few hundred messages
-/// swing the tail: at CI size (12 devices, 200 messages) the worst of 30
-/// was 6.43×, 86.0× and 4.49%; at full size (40 devices, 400 checked) the
-/// worst of 10 was 11.8×, 67.6× and 3.92%. A regression gate on the
-/// synthetic trace, not a target for real ones.
-fn trace_tail_max(scale: f64) -> (f64, f64, f64) {
-    if scale >= 1.0 { (15.0, 100.0, 6.0) } else { (8.0, 120.0, 6.0) }
+/// upper bounds of the shares of messages over 10× and over 30× (%).
+/// Calibrated on the calibration seeds, never the gate's
+/// (docs/SIMULATION.md §1), with headroom over the worst seed, since one
+/// seed's few hundred messages swing the tail: at CI size (12 devices, 200
+/// messages) the worst of 30 was 6.43×, 86.0×, 8.01% and 4.49%; at full
+/// size (40 devices, 400 checked) the worst of 10 was 11.8×, 67.6×, 9.11%
+/// and 3.92%. A regression gate on the synthetic trace, not a target for
+/// real ones.
+fn trace_tail_max(scale: f64) -> (f64, f64, f64, f64) {
+    if scale >= 1.0 { (15.0, 100.0, 12.0, 6.0) } else { (8.0, 120.0, 12.0, 6.0) }
 }
 
 fn trace_replay(o: Opts) -> ScenarioResult {
@@ -1995,13 +2096,19 @@ fn trace_replay(o: Opts) -> ScenarioResult {
             // of 400 is "one of the nine worst"); thresholds calibrated on
             // seeds the gate never uses (docs/SIMULATION.md §1)
             let t: &Tail = &x.m.optimality_tail;
-            let (p95_max, cvar_max, over_30_max) = trace_tail_max(o.scale);
+            let (p95_max, cvar_max, over_10_max, over_30_max) = trace_tail_max(o.scale);
             r.at_most("global + DTN: optimality p95", inf_if_none(&x.m, t.p95), p95_max, "×");
             r.at_most(
                 "global + DTN: optimality CVaR95 (mean of the worst 5%)",
                 inf_if_none(&x.m, t.cvar95),
                 cvar_max,
                 "×",
+            );
+            r.at_most(
+                "global + DTN: messages over 10× optimal (upper 95% Wilson bound)",
+                if t.n == 0 { f64::INFINITY } else { 100.0 * t.over_10_ci.1 },
+                over_10_max,
+                "%",
             );
             r.at_most(
                 "global + DTN: messages over 30× optimal (upper 95% Wilson bound)",
@@ -2028,6 +2135,19 @@ fn trace_replay(o: Opts) -> ScenarioResult {
 
 // ───────────────────────────── flooding hop limit ─────────────────────────────
 
+/// `flood-hop-limit`'s non-inferiority margin: no step up in the hop limit
+/// may lose 3 points of reach (as a share of devices) or more. With
+/// duplicate suppression reach can truly fall a little near saturation:
+/// on the 30 calibration seeds at CI size the weakest step's mean was
+/// −0.9 points and its lower bound (mean − 2 SE) −2.2.
+const HOP_LIMIT_MARGIN: f64 = 0.03;
+
+/// Broadcasts `flood-hop-limit` sends at every hop limit, at any size: one
+/// broadcast's reach swings by ~15 points between runs (rebroadcast
+/// jitter), so 160 left two standard errors of a step's mean at 2–5
+/// points, too wide to show non-inferiority; 640 bring them to ~1–2.
+const HOP_LIMIT_BROADCASTS: usize = 640;
+
 fn flood_hop_limit(o: Opts) -> ScenarioResult {
     let mut r = ScenarioResult::new(
         "flood-hop-limit",
@@ -2048,7 +2168,7 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
     // sources from one shared stream, so neighbouring limits compared
     // different messages: at CI size, seed 3, reach "fell" from 99% to 95%
     // at hop 7 on 20 messages from other devices.)
-    let msgs = o.n(160, 160);
+    let msgs = o.n(HOP_LIMIT_BROADCASTS, HOP_LIMIT_BROADCASTS);
     let mut rng = Rng::new(stream_seed(o.seed, Stream::Workload));
     let sources: Vec<NodeId> = (0..msgs).map(|_| rng.below(n) as NodeId).collect();
     let mut rows = Vec::new();
@@ -2102,21 +2222,28 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
     // qualitative Meshtasticator check: reach rises with the hop limit and
     // saturates, while each transmission reaches fewer new devices. "Rises"
     // is judged on the paired per-broadcast differences between neighbouring
-    // limits, as non-inferiority with a 2-point margin: no step may fall by
-    // more than its noise (the mean difference plus two standard errors
-    // below zero) and more than 2 points. Reach
-    // needn't rise exactly: with duplicate suppression a device that first
-    // hears a copy late, over a long path, has fewer hops left to pass on.
-    let falls: Vec<String> = per_msg
+    // limits, as non-inferiority with a 3-point margin: every step must show
+    // it falls by less than 3 points (the mean difference minus two standard
+    // errors above −3 points), so a noisy or underpowered run fails rather
+    // than passes. Reach needn't rise exactly: with duplicate suppression a
+    // device that first hears a copy late, over a long path, has fewer hops
+    // left to pass on.
+    // per step: (hop limit before, mean difference, its standard error)
+    let steps: Vec<(usize, f64, f64)> = per_msg
         .windows(2)
         .enumerate()
-        .filter_map(|(i, w)| {
+        .map(|(i, w)| {
             let d: Vec<f64> = w[1].iter().zip(&w[0]).map(|(b, a)| b - a).collect();
             let (mean, se) = mean_se(&d);
-            (mean + 2.0 * se < 0.0 && mean < -0.02)
-                .then(|| format!("hop {}→{}: {:+.1} ± {:.1} points", i + 1, i + 2, 100.0 * mean, 200.0 * se))
+            (i + 1, mean, se)
         })
         .collect();
+    let step = |(h, mean, se): &(usize, f64, f64)| {
+        format!("hop {h}→{}: {:+.1} ± {:.1} points", h + 1, 100.0 * mean, 200.0 * se)
+    };
+    let falls: Vec<String> =
+        steps.iter().filter(|(_, mean, se)| mean - 2.0 * se <= -HOP_LIMIT_MARGIN).map(step).collect();
+    let weakest = steps.iter().min_by(|a, b| (a.1 - 2.0 * a.2).total_cmp(&(b.1 - 2.0 * b.2)));
     let rising = falls.is_empty();
     let gain =
         |a: usize, b: usize| reach_by_h.get(b).copied().unwrap_or(0.0) - reach_by_h.get(a).copied().unwrap_or(0.0);
@@ -2139,7 +2266,11 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
     r.check(
         "reach rises with the hop limit (paired, per broadcast)",
         rising,
-        if rising { format!("{reach_by_h:.2?}") } else { format!("{reach_by_h:.2?}; falls: {}", falls.join(", ")) },
+        if rising {
+            format!("{reach_by_h:.2?}; weakest step {}", weakest.map(step).unwrap_or_default())
+        } else {
+            format!("{reach_by_h:.2?}; not shown to lose < 3 points: {}", falls.join(", "))
+        },
     );
     r.check(
         "diminishing returns (hop 6→7 gains < half of 2→3, paired)",
@@ -2160,6 +2291,39 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
 mod tests {
     use super::*;
     use crate::tier2::global::{ATTESTED_HOP_FLOOR, Chain};
+
+    #[test]
+    fn liar_ceiling_runs_at_most_max_par_at_once_however_many_callers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (now, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let job = || {
+            let n = now.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(n, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            now.fetch_sub(1, Ordering::SeqCst);
+        };
+        // as the soak calls it, from a pool wider than the cap: many seeds
+        // at once, each with nested parallel strategies
+        let wide = rayon::ThreadPoolBuilder::new().num_threads(16).build().expect("pool");
+        wide.install(|| {
+            (0..16).into_par_iter().for_each(|_| in_liar_pool(|| (0..4).into_par_iter().for_each(|_| job())));
+        });
+        let cap = in_liar_pool(rayon::current_num_threads);
+        if std::env::var_os("MYCEL_SIM_MAX_PAR").is_none() {
+            assert!(cap <= LIAR_MAX_PAR, "{cap}");
+        }
+        assert!(peak.load(Ordering::SeqCst) <= cap, "{} runs in flight, cap {cap}", peak.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_format_is_judged_by_one_strategy_fixed_across_seeds() {
+        // strategy 1 is worse on average, strategy 0 on seed 2 alone
+        let by_role = vec![vec![90.0, 90.0, 70.0], vec![80.0, 80.0, 80.0]];
+        assert_eq!(worst_fixed(&by_role, &[0, 1]), 1);
+        assert_eq!(worst_fixed(&by_role, &[0]), 0);
+        // the same strategy on both sides: no gain at all, not a positive one
+        assert!(paired(&by_role[1], &by_role[1]).starts_with("+0.0 ± 0.0"));
+    }
 
     /// Bluetooth-only phones outdoors (60 m range) at `xy`.
     fn ble_world(xy: &[(f64, f64)]) -> World {
