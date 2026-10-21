@@ -36,6 +36,14 @@ enum Cmd {
     /// `to` receives what `from` has: all of it in causal order, or a random
     /// part in random order (some of it parked as pending).
     Sync { from: u8, to: u8, part: u8, seed: u64 },
+    /// An admin (or anyone) adds a member and the member at once revokes
+    /// someone; another replica receives both in one update: a batch, or
+    /// promoted together from the pending pool once their parents arrive.
+    /// The new member's seniority then moves inside the update.
+    AddRevoke { replica: u8, admin: u8, member: u8, victim: u8, to: u8, kind: u8, parents: u8 },
+    /// A key, often a removed member, sends a few pairwise-concurrent
+    /// revocations (leaves or removals) on one base.
+    Spam { replica: u8, author: u8, victim: u8, count: u8, parents: u8, leave: bool },
 }
 
 fn cmd(storm: bool) -> impl Strategy<Value = Cmd> {
@@ -57,7 +65,13 @@ fn cmd(storm: bool) -> impl Strategy<Value = Cmd> {
         part,
         seed,
     });
-    prop_oneof![6 => author, 1 => fork, 3 => sync]
+    let add_revoke = (any::<[u8; 7]>()).prop_map(|[replica, admin, member, victim, to, kind, parents]| {
+        Cmd::AddRevoke { replica, admin, member, victim, to, kind, parents }
+    });
+    let spam = (any::<[u8; 5]>(), any::<bool>()).prop_map(|([replica, author, victim, count, parents], leave)| {
+        Cmd::Spam { replica, author, victim, count, parents, leave }
+    });
+    prop_oneof![6 => author, 1 => fork, 3 => sync, 1 => add_revoke, 1 => spam]
 }
 
 /// splitmix64: deterministic shuffles and picks from a proptest seed.
@@ -272,6 +286,65 @@ impl World {
         self.deliver(r, second);
     }
 
+    fn add_revoke(&mut self, c: &Cmd) {
+        let Cmd::AddRevoke { replica, admin, member, victim, to, kind, parents } = *c else { unreachable!() };
+        let (r, to) = (replica as usize % REPLICAS, to as usize % REPLICAS);
+        let st = self.replicas[r].state().clone();
+        let admins: Vec<usize> = (0..KEYS).filter(|&i| st.role(&self.pk(i)).is_some_and(Role::is_admin)).collect();
+        let a = if kind % 4 != 0 && !admins.is_empty() {
+            admins[admin as usize % admins.len()]
+        } else {
+            admin as usize % KEYS
+        };
+        let (m, v) = (member as usize % KEYS, victim as usize % KEYS);
+        let mut rng = Rng(u64::from(parents) << 16 | u64::from(kind));
+        let ps = self.parents(r, parents, &mut rng);
+        let x = self.op(a, ps, self.add(m, Role::Admin));
+        let mut readers = st.readers();
+        readers.insert(self.pk(m));
+        readers.remove(&self.pk(v));
+        let action = match kind % 3 {
+            0 => {
+                let rotation = self.rotation(readers, None);
+                Action::Remove { member: self.pk(v), revocation: Revocation { cutoff: None }, rotation }
+            }
+            1 => Action::SetRole {
+                member: self.pk(v),
+                role: Role::Relay,
+                revocation: Some(Revocation { cutoff: None }),
+                rotation: Some(self.rotation(readers, None)),
+            },
+            _ => Action::Leave { cutoff: None },
+        };
+        let y = self.op(m, vec![x.id()], action);
+        self.deliver(r, x.clone());
+        self.deliver(r, y.clone());
+        let known = |w: &Self, id: OpId| w.all.iter().any(|o| o.id() == id);
+        if to != r && known(self, x.id()) && known(self, y.id()) {
+            self.replicas[to].insert_many([x, y]);
+            check(&self.replicas[to]);
+        }
+    }
+
+    fn spam(&mut self, c: &Cmd) {
+        let Cmd::Spam { replica, author, victim, count, parents, leave } = *c else { unreachable!() };
+        let r = replica as usize % REPLICAS;
+        let (a, v) = (author as usize % KEYS, victim as usize % KEYS);
+        let mut rng = Rng(u64::from(parents) << 8 | u64::from(count));
+        let ps = self.parents(r, parents, &mut rng);
+        let readers = self.replicas[r].state().readers();
+        for _ in 0..2 + count % 5 {
+            let action = if leave {
+                Action::Leave { cutoff: None }
+            } else {
+                let rotation = self.rotation(readers.clone(), None);
+                Action::Remove { member: self.pk(v), revocation: Revocation { cutoff: None }, rotation }
+            };
+            let op = self.op(a, ps.clone(), action);
+            self.deliver(r, op);
+        }
+    }
+
     /// Insert an op authored at replica `r` (rejected ops are dropped).
     fn deliver(&mut self, r: usize, op: SignedOp) {
         if self.replicas[r].insert(op.clone()).is_ok() {
@@ -304,6 +377,8 @@ impl World {
             match c {
                 Cmd::Author { .. } => self.author(c),
                 Cmd::Fork { .. } => self.fork(c),
+                Cmd::AddRevoke { .. } => self.add_revoke(c),
+                Cmd::Spam { .. } => self.spam(c),
                 Cmd::Sync { from, to, part, seed } => {
                     let (from, to) = (*from as usize % REPLICAS, *to as usize % REPLICAS);
                     if from != to {
@@ -455,9 +530,14 @@ fn property(storm: bool, cmds: &[Cmd], seed: u64) {
     let b = with_fast_path(false, || w.observe(seed ^ 0x5eed));
     assert_eq!(a.resolution().order, b.resolution().order);
     assert_eq!(a.state(), b.state());
-    // Every replica converges once it has everything.
+    // Every replica converges once it has everything. (A sync refuses an op
+    // that sorts before the only op naming its author, as a peer would; the
+    // next sync delivers it.)
     let ids: HashSet<OpId> = a.resolution().order.iter().copied().collect();
-    for _ in 0..3 {
+    for _ in 0..3 * REPLICAS {
+        if w.replicas.iter().all(|g| g.len() == ids.len()) {
+            break;
+        }
         for r in 0..REPLICAS {
             w.sync(r, (r + 1) % REPLICAS, 0, 0);
         }
@@ -921,6 +1001,97 @@ fn concurrent_leaves_by_a_removed_member_add_one_round_each() {
             let op = w.op(a, g.heads(), Action::Rotate { rotation });
             g.insert(op).unwrap();
             check(&g);
+        });
+    }
+}
+
+/// The ops of `seniority_flip_in_one_update`: A adds B and C (admins); A
+/// removes C (`ra`) concurrently with C removing B (`rc`); B adds T as a
+/// reader on `rc` (`a_t`: invalid in round 0, valid once `rc` loses); A
+/// rotates on both (`m`); T removes P (`z`, on `a_t`): T is a member with no
+/// seniority and P is no member, so `z` wins round 1 and then fails. Then A
+/// adds P as an admin on `m` (`x`) and P removes T (`y`, on `x`). Returns
+/// (history up to `z`, `m`, `z`, `x`, `y`), with `z` before `y` in the
+/// topological order.
+fn seniority_flip_ops() -> (World, Vec<SignedOp>, SignedOp, SignedOp, SignedOp, SignedOp) {
+    let remove = |w: &mut World, by: usize, who: usize, rest: &[usize], parents: Vec<OpId>| {
+        let rotation = w.rotation(rest.iter().map(|&i| w.pk(i)).collect(), None);
+        let action = Action::Remove { member: w.pk(who), revocation: Revocation { cutoff: None }, rotation };
+        w.op(by, parents, action)
+    };
+    for attempt in 0.. {
+        let mut w = World::new(false);
+        w.nonce = attempt * 1000;
+        let (a, b, c, t, p) = (0, 1, 2, 3, 4);
+        let g0 = w.genesis.id();
+        let add_b = w.op(a, vec![g0], w.add(b, Role::Admin));
+        let add_c = w.op(a, vec![add_b.id()], w.add(c, Role::Admin));
+        let ra = remove(&mut w, a, c, &[a, b], vec![add_c.id()]);
+        let rc = remove(&mut w, c, b, &[a, c], vec![add_c.id()]);
+        let a_t = w.op(b, vec![rc.id()], w.add(t, Role::Reader));
+        let mut ps = vec![ra.id(), a_t.id()];
+        ps.sort();
+        let rotation = w.rotation([w.pk(a), w.pk(b), w.pk(t)].into(), None);
+        let m = w.op(a, ps, Action::Rotate { rotation });
+        let z = remove(&mut w, t, p, &[a], vec![a_t.id()]);
+        let x = w.op(a, vec![m.id()], w.add(p, Role::Admin));
+        let y = remove(&mut w, p, t, &[a, b, p], vec![x.id()]);
+        let history = vec![add_b, add_c, ra, rc, a_t];
+        let all: HashSet<OpId> = history.iter().chain([&m, &z, &x, &y]).map(SignedOp::id).collect();
+        let mut g = SpaceGraph::from_genesis(w.genesis.clone()).unwrap();
+        g.insert_many(history.iter().chain([&m, &z, &x, &y]).cloned());
+        assert_eq!(g.len(), all.len() + 1);
+        let order = &g.resolution().order;
+        let pos = |id: OpId| order.iter().position(|o| *o == id).unwrap();
+        if pos(z.id()) < pos(y.id()) {
+            return (w, history, m, z, x, y);
+        }
+    }
+    unreachable!()
+}
+
+/// Regression (seniority moved inside one update): `x` gives P seniority and
+/// `y` (P removes T) arrives in the same update, by a batch or by promotion
+/// from the pending pool. The cut was chosen with P unranked, so `y` sorted
+/// after the loose failed winner `z` (T removes P, concurrent with `y`) and
+/// could not change it; once round 0 ranks P, `y` sorts first and beats `z`.
+/// Resolving from that cut kept `z` as a stale round-1 winner and dropped
+/// `y`, unlike the oracle (and unlike inserting the ops one at a time).
+#[test]
+fn seniority_flip_in_one_update() {
+    let (w, history, m, z, x, y) = seniority_flip_ops();
+    for fast in [true, false] {
+        with_fast_path(fast, || {
+            // Batched.
+            let mut g = SpaceGraph::from_genesis(w.genesis.clone()).unwrap();
+            for op in history.iter().chain([&m, &z]) {
+                assert_eq!(g.insert(op.clone()).unwrap(), Inserted::New);
+                check(&g);
+            }
+            assert!(!g.is_valid(&z.id()) && g.is_valid(&m.id()));
+            let (added, rejected) = g.insert_many([x.clone(), y.clone()]);
+            assert_eq!((added.len(), rejected), (2, 0));
+            check(&g);
+            assert!(g.is_valid(&y.id()), "P (ranked by x) beats T's failed removal of P");
+            let batched = g.state().clone();
+            // Promoted from the pending pool: x and y wait for m.
+            let mut g = SpaceGraph::from_genesis(w.genesis.clone()).unwrap();
+            for op in history.iter().chain([&z]) {
+                assert_eq!(g.insert(op.clone()).unwrap(), Inserted::New);
+                check(&g);
+            }
+            assert_eq!(g.insert(x.clone()).unwrap(), Inserted::Pending);
+            assert_eq!(g.insert(y.clone()).unwrap(), Inserted::Pending);
+            assert_eq!(g.insert(m.clone()).unwrap(), Inserted::New);
+            check(&g);
+            assert_eq!(g.state(), &batched);
+            // One at a time.
+            let mut g = SpaceGraph::from_genesis(w.genesis.clone()).unwrap();
+            for op in history.iter().chain([&m, &z, &x, &y]) {
+                assert_eq!(g.insert(op.clone()).unwrap(), Inserted::New);
+                check(&g);
+            }
+            assert_eq!(g.state(), &batched);
         });
     }
 }

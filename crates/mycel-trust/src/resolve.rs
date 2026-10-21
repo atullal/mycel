@@ -591,14 +591,19 @@ impl Resolution {
             // An op by the revoked member, before the cut and concurrent
             // with `x` (`x` descends from the frontier, so it is loose),
             // whose result `x` can change.
-            let partner = target.is_some_and(|t| {
-                cut.loose.iter().any(|&y| self.meta[y as usize].author == t && !self.le(y, x) && self.affected_by(y, x))
-            });
+            let partner = target.is_some_and(|t| self.has_partner(&cut.loose, t, x));
             if !partner && self.outside_past_invalid(x, cut) {
                 return ci;
             }
         }
         0
+    }
+
+    /// Is there a loose op by `t`, concurrent with its revocation `x`, whose
+    /// result `x` can change (`affected_by`)? (`x` descends from the cut's
+    /// frontier, so a loose op not in its past is concurrent with it.)
+    fn has_partner(&self, loose: &[u32], t: SignPk, x: u32) -> bool {
+        loose.iter().any(|&y| self.meta[y as usize].author == t && !self.le(y, x) && self.affected_by(y, x))
     }
 
     /// Can a revocation `x` of `y`'s author, concurrent with `y`, change
@@ -1067,10 +1072,25 @@ impl Resolution {
                 self.pre.valid[from as usize + o] = v;
             }
             // Seniority from new valid naming ops, in topological order.
+            let mut ranked = Vec::new();
             for &s in &region {
-                if (s >= pre_from) && self.pre.valid[s as usize] && !self.note_seniority(s, from) {
-                    abort = true;
+                if (s >= pre_from) && self.pre.valid[s as usize] {
+                    abort |= !self.note_seniority(s, from);
+                    ranked.extend(self.meta[s as usize].names);
                 }
+            }
+            // `choose_cut` checked the region's candidates against the cut's
+            // loose ops with their authors' old ranks. A candidate whose
+            // author was just ranked (or moved up) can now sort ahead of a
+            // loose op of its target that won a round, and so change that
+            // op's result: the cut no longer holds. (Rare: it takes a valid
+            // `Add` and a revocation by the added member in one update.)
+            if !abort && ci != 0 && !ranked.is_empty() {
+                let loose = &self.cuts[ci].loose;
+                abort = region.iter().any(|&c| {
+                    let m = &self.meta[c as usize];
+                    m.target.is_some_and(|t| ranked.contains(&m.author) && self.has_partner(loose, t, c))
+                });
             }
             if abort && ci != 0 {
                 // Undo nothing else: the full recompute rebuilds everything.
