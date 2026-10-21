@@ -79,6 +79,15 @@ const WAIT_FOR_SERVED: Duration = Duration::from_secs(30);
 /// How long a peer that refused `SyncV2` is synced with v1 before v2 is
 /// tried again (it may have been updated).
 pub const V1_REMEMBERED: Duration = Duration::from_secs(30 * 60);
+/// A node with Sync v2 serves at most one v1 session per (peer, space) this
+/// often (design §12): a v1 member still re-syncs epidemically with every
+/// member after each change, which v2 nodes can't change, so they bound
+/// what it costs them. The excess is refused with [`SYNC_V1_LIMITED`].
+pub const V1_SERVE_INTERVAL: Duration = Duration::from_secs(5);
+/// The reset code of a v1 session refused by [`V1_SERVE_INTERVAL`]. A build
+/// that knows it takes it as `Busy`; an older one sees a failed session and
+/// retries on its own schedule.
+pub(crate) const SYNC_V1_LIMITED: u32 = 0x6d79_0003;
 /// Memory for session records, all peers and spaces together.
 const RECORDS_BYTES: usize = 8 * 1024 * 1024;
 const SESSION_BURST: f64 = 32.0;
@@ -115,6 +124,9 @@ pub(crate) struct V2 {
     active: Mutex<HashMap<(SignPk, SpaceId), (bool, bool)>>,
     /// Ambiguous refusals (a bare end of stream) in a row, per peer.
     refusals: Mutex<HashMap<SignPk, u8>>,
+    /// When we last served a v1 session per (peer, space) (mixed groups,
+    /// see [`V2::allow_v1`]).
+    v1_served: Mutex<HashMap<(SignPk, SpaceId), Instant>>,
     totals: Mutex<V2Totals>,
 }
 
@@ -141,6 +153,10 @@ pub struct V2Totals {
     /// Sessions that ended without a successful outcome (aborted, broken,
     /// stalled, refused or unconverged), both roles.
     pub failed: u64,
+    /// v1 sessions served, and v1 sessions refused because the same peer
+    /// had one in the same space less than [`V1_SERVE_INTERVAL`] ago.
+    pub v1_served: u64,
+    pub v1_refused: u64,
 }
 
 #[derive(Default)]
@@ -326,6 +342,25 @@ impl V2 {
         }
         e.1 = true;
         Some(ActiveGuard { v2: self, key: (peer, space), client: false })
+    }
+
+    /// May we serve `peer` a v1 session in `space` now? `Err(retry after ms)`
+    /// when it had one less than [`V1_SERVE_INTERVAL`] ago.
+    pub(crate) fn allow_v1(&self, peer: SignPk, space: SpaceId) -> std::result::Result<(), u32> {
+        let mut served = self.v1_served.lock();
+        let now = Instant::now();
+        if let Some(t) = served.get(&(peer, space))
+            && now.duration_since(*t) < V1_SERVE_INTERVAL
+        {
+            self.totals.lock().v1_refused += 1;
+            return Err((V1_SERVE_INTERVAL - now.duration_since(*t)).as_millis().max(1) as u32);
+        }
+        if served.len() >= 4096 {
+            served.retain(|_, t| now.duration_since(*t) < V1_SERVE_INTERVAL);
+        }
+        served.insert((peer, space), now);
+        self.totals.lock().v1_served += 1;
+        Ok(())
     }
 
     /// Count an ambiguous refusal; true when it should be remembered.
@@ -1053,6 +1088,66 @@ pub(crate) fn moved(stats: &SyncStats) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn node(name: &str) -> crate::Node {
+        let opts = crate::NodeOptions::new(crate::NetMode::Local, name);
+        crate::Node::spawn(Arc::new(mycel_crypto::DeviceKeys::generate()), opts).await.unwrap()
+    }
+
+    /// Design §12: a `Busy` answer never makes a client fall back to v1, over
+    /// real QUIC. While the server is busy with the client in that space, the
+    /// client gets `PeerBusy` (no fallback, nothing remembered, no v1 session
+    /// served); once it isn't, the next session runs v2.
+    #[tokio::test]
+    async fn busy_never_falls_back_to_v1() {
+        let a = node("a").await;
+        let b = node("b").await;
+        a.add_peer_addr(b.addr());
+        b.add_peer_addr(a.addr());
+        let (space, genesis) = a.create_space().unwrap();
+        a.with_space(&space, |r| r.add_member(b.keys().public(), mycel_trust::Role::Writer)).unwrap().unwrap();
+        b.join_space(genesis).unwrap();
+        b.sync_with(a.id(), space, true).await.unwrap();
+        a.with_space(&space, |r| r.append(mycel_sync::StreamId::new_feed(), b"hi".to_vec())).unwrap().unwrap();
+        let before_a = a.sync_v2_totals();
+        let before_b = b.sync_v2_totals();
+        {
+            // b is serving a in this space (as during a crossing session)
+            let _held = b.inner.v2.begin_server(b.id(), a.id(), space).unwrap();
+            for _ in 0..3 {
+                let err = crate::sync_session(&a.inner, b.id(), space, false).await.unwrap_err();
+                assert!(err.downcast_ref::<PeerBusy>().is_some(), "{err:#}");
+            }
+        }
+        let (ta, tb) = (a.sync_v2_totals(), b.sync_v2_totals());
+        assert_eq!(ta.busy_received - before_a.busy_received, 3, "{ta:?}");
+        assert_eq!(tb.busy_sent - before_b.busy_sent, 3, "{tb:?}");
+        assert_eq!((ta.fallbacks, ta.remembered_v1), (before_a.fallbacks, before_a.remembered_v1), "{ta:?}");
+        assert!(!a.inner.v2.is_v1_only(&b.id()));
+        assert_eq!(tb.v1_served, before_b.v1_served, "no v1 session was served");
+        // Not busy any more: v2.
+        crate::sync_session(&a.inner, b.id(), space, false).await.unwrap();
+        assert_eq!(b.with_space(&space, |r| r.envelope_ids().len()).unwrap(), 1);
+        assert_eq!(a.sync_v2_totals().client_sessions, ta.client_sessions + 1);
+        assert_eq!(b.sync_v2_totals().v1_served, before_b.v1_served);
+        for n in [a, b] {
+            n.shutdown().await.unwrap();
+        }
+    }
+
+    #[test]
+    fn v1_sessions_are_served_once_per_interval_per_peer_and_space() {
+        let v2 = V2::default();
+        let (p, q) = (SignPk([1; 32]), SignPk([2; 32]));
+        let (s, t) = (Hash32([5; 32]), Hash32([6; 32]));
+        assert!(v2.allow_v1(p, s).is_ok());
+        let retry = v2.allow_v1(p, s).unwrap_err();
+        assert!(retry > 0 && u128::from(retry) <= V1_SERVE_INTERVAL.as_millis());
+        assert!(v2.allow_v1(p, t).is_ok(), "per space");
+        assert!(v2.allow_v1(q, s).is_ok(), "per peer");
+        let totals = v2.totals();
+        assert_eq!((totals.v1_served, totals.v1_refused), (3, 1));
+    }
 
     #[test]
     fn one_session_per_peer_and_space_in_either_role() {

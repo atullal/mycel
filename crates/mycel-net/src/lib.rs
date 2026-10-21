@@ -91,7 +91,7 @@ pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_fr
 pub use iroh;
 pub use link::{Link, LinkEvent, LinkStatus, PathKind, path_in_use};
 pub use mesh::{Mesh, MeshOptions, MeshRoute, MeshStats, Tap};
-pub use sync_v2::{V1_REMEMBERED, V2Totals};
+pub use sync_v2::{V1_REMEMBERED, V1_SERVE_INTERVAL, V2Totals};
 pub use version::{Caps, PeerProtocol, Protocol, VersionError, WireVersion};
 use version::{Hello, STREAM_REFUSED, WIRE_V2};
 use wire::*;
@@ -105,6 +105,10 @@ pub const POOL_IDLE: Duration = Duration::from_secs(60);
 /// away only fails once the peer has had [`resources::REPLY_TIMEOUT`] to
 /// answer, and a passer-by who could carry it may be gone by then.
 const BUNDLE_AFTER: Duration = Duration::from_secs(10);
+/// Bounds on how long a sync waits for a new connection's capability
+/// hello before it uses v1 (see `hello_wait`).
+const HELLO_WAIT_MIN: Duration = Duration::from_millis(750);
+const HELLO_WAIT_MAX: Duration = Duration::from_secs(3);
 /// How long [`Node::sync_with`] keeps retrying a peer that answers `Busy`.
 pub const EXPLICIT_BUSY_WAIT: Duration = Duration::from_secs(300);
 /// Background retries after `Busy` (see `sync_once`).
@@ -353,6 +357,9 @@ struct Inner {
     /// Tests: refuse this many hellos we're sent, as a lossy path would.
     #[cfg(test)]
     drop_hellos: std::sync::atomic::AtomicU32,
+    /// Tests: never answer hellos.
+    #[cfg(test)]
+    stall_hellos: std::sync::atomic::AtomicBool,
     /// The last store-and-forward bundle sent per (member, space).
     bundled: Mutex<HashMap<(SignPk, SpaceId), Hash32>>,
     /// See [`NodeOptions::max_ephemeral`].
@@ -1048,6 +1055,11 @@ async fn serve_hello(
         tx.reset(0u32.into()).ok();
         bail!("test: hello dropped");
     }
+    #[cfg(test)]
+    if inner.stall_hellos.load(Ordering::SeqCst) {
+        // (a hello that never gets an answer, as on a path that black-holes it)
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
     inner.hellos_served.fetch_add(1, Ordering::Relaxed);
     inner.note_accepted_protocol(peer, PeerProtocol::agreed(version, inner.protocol.caps, theirs.caps));
     send(&mut tx, &Hello::ours(inner.protocol.caps)).await?;
@@ -1093,6 +1105,17 @@ async fn serve_sync(
                 SyncMsg::Accept { inv: inventory(r), want: missing(r, &inv) }
             })
         })?;
+        if reply.is_some()
+            && inner.sync_v2
+            && let Err(retry_ms) = inner.v2.allow_v1(peer, space)
+        {
+            // Mixed groups: one v1 session per (peer, space) per
+            // `V1_SERVE_INTERVAL` (see `sync_v2::allow_v1`).
+            let code = iroh::endpoint::VarInt::from_u32(sync_v2::SYNC_V1_LIMITED);
+            tx.reset(code).ok();
+            rx.stop(code).ok();
+            bail!("v1 session refused: one per {:?} (retry in {retry_ms} ms)", sync_v2::V1_SERVE_INTERVAL);
+        }
         let Some(reply) = reply else {
             let proof = inner.with_space(&space, |r| r.revocation_proof(&peer))?;
             if proof.is_empty() {
@@ -1310,16 +1333,51 @@ async fn sync_session(inner: &Arc<Inner>, peer: SignPk, space: SpaceId, trust_pe
     let hello =
         inner.with_space(&space, |r| (trust_peer || r.is_member(&peer)).then(|| (inventory(r), r.all_ops())))?;
     let (inv, ops) = hello.ok_or_else(|| anyhow!("peer is not a member of this space"))?;
-    on_conn!(inner, &peer, |conn| sync_exchange(inner, &conn, peer, space, inv.clone(), ops.clone()))
+    let res = on_conn!(inner, &peer, |conn| sync_exchange(inner, &conn, peer, space, inv.clone(), ops.clone()));
+    // A v2 node limiting the v1 sessions it serves: as `Busy`, not a failure.
+    match res {
+        Err(e) if reset_with(&e, sync_v2::SYNC_V1_LIMITED) => {
+            Err(sync_v2::PeerBusy(sync_v2::V1_SERVE_INTERVAL.as_millis() as u32).into())
+        }
+        res => res,
+    }
+}
+
+/// Did `err` come from the peer resetting (or stopping) the stream with `code`?
+fn reset_with(err: &anyhow::Error, code: u32) -> bool {
+    use iroh::endpoint::{ReadError, ReadExactError, WriteError};
+    let code = iroh::endpoint::VarInt::from_u32(code);
+    err.chain().any(|e| {
+        matches!(e.downcast_ref::<ReadError>(), Some(ReadError::Reset(c)) if *c == code)
+            || matches!(e.downcast_ref::<ReadExactError>(), Some(ReadExactError::ReadError(ReadError::Reset(c))) if *c == code)
+            || matches!(e.downcast_ref::<WriteError>(), Some(WriteError::Stopped(c)) if *c == code)
+            || e.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).is_some_and(|inner| {
+                matches!(inner.downcast_ref::<ReadError>(), Some(ReadError::Reset(c)) if *c == code)
+                    || matches!(inner.downcast_ref::<ReadExactError>(), Some(ReadExactError::ReadError(ReadError::Reset(c))) if *c == code)
+                    || matches!(inner.downcast_ref::<WriteError>(), Some(WriteError::Stopped(c)) if *c == code)
+            })
+    })
 }
 
 /// Whether `peer`'s hello agreed [`Caps::SYNC_V2`] on the pooled connection
 /// (dialed if there is none). On a new connection this waits for its hello,
-/// sent as soon as it was dialed, so normally one round trip; a peer on
-/// wire version 1, or whose hello failed or is late, gets v1 this time.
+/// sent as soon as it was dialed, so normally one round trip, but only
+/// [`hello_wait`]: a peer on wire version 1, or whose hello failed or is
+/// late, gets v1 this time (a hung hello must not hold a sync for a whole
+/// reply timeout).
 async fn peer_has_sync_v2(inner: &Arc<Inner>, peer: SignPk) -> Result<bool> {
     let conn = pooled(inner, &peer).await?;
-    Ok(conn.protocol(resources::REPLY_TIMEOUT).await.supports(Caps::SYNC_V2))
+    let wait = hello_wait(&conn);
+    Ok(conn.protocol(wait).await.supports(Caps::SYNC_V2))
+}
+
+/// How long a sync waits for the peer's hello: four round trips on the
+/// path in use plus a margin, within [`HELLO_WAIT_MIN`, `HELLO_WAIT_MAX`]
+/// (the hello is one round trip; a multi-hop Bluetooth path takes about
+/// half a second per round trip).
+fn hello_wait(conn: &Connection) -> Duration {
+    let rtt = link::path_in_use(&conn.paths()).map(|p| p.rtt()).unwrap_or(HELLO_WAIT_MAX);
+    (rtt * 4 + Duration::from_millis(250)).clamp(HELLO_WAIT_MIN, HELLO_WAIT_MAX)
 }
 
 /// One sync session on its own stream of `conn`.
@@ -1731,6 +1789,8 @@ impl Node {
             hellos_failed: AtomicU64::new(0),
             #[cfg(test)]
             drop_hellos: Default::default(),
+            #[cfg(test)]
+            stall_hellos: Default::default(),
             bundled: Mutex::default(),
             max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
             // (a node without Sync v2 doesn't advertise it)
@@ -2483,6 +2543,31 @@ mod version_tests {
         new.sync_with(old.id(), space, false).await.unwrap();
         assert_eq!(old.with_space(&space, |r| r.envelope_ids().len()).unwrap(), 1, "v1: the invitation and its data");
         for n in [new, old, peer] {
+            n.shutdown().await.unwrap();
+        }
+    }
+
+    /// A hello that never gets an answer (a path that black-holes it) holds
+    /// a sync on a fresh connection only for the short hello wait, not a
+    /// whole reply timeout: the sync runs v1 and succeeds. Regression test
+    /// for the integration finding that it waited `REPLY_TIMEOUT` (60 s).
+    #[tokio::test]
+    async fn a_hung_hello_falls_back_to_v1_quickly() {
+        let a = node("a", Protocol::default()).await;
+        let b = node("b", Protocol::default()).await;
+        b.inner.stall_hellos.store(true, Ordering::SeqCst);
+        a.add_peer_addr(b.addr());
+        b.add_peer_addr(a.addr());
+        let (space, _) = a.create_space().unwrap();
+        a.with_space(&space, |r| r.add_member(b.keys().public(), Role::Writer)).unwrap().unwrap();
+        a.with_space(&space, |r| r.append(mycel_sync::StreamId::new_feed(), b"hi".to_vec())).unwrap().unwrap();
+        let started = Instant::now();
+        a.sync_with(b.id(), space, false).await.unwrap();
+        let took = started.elapsed();
+        assert!(took < HELLO_WAIT_MAX + Duration::from_secs(2), "took {took:?}");
+        assert_eq!(b.with_space(&space, |r| r.envelope_ids().len()).unwrap(), 1);
+        assert_eq!(a.sync_v2_totals().client_sessions, 0, "no hello: v1");
+        for n in [a, b] {
             n.shutdown().await.unwrap();
         }
     }

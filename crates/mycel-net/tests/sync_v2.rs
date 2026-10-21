@@ -123,6 +123,32 @@ async fn a_build_without_v2_is_synced_with_v1_without_trying_v2() {
     old.shutdown().await.unwrap();
 }
 
+/// Mixed groups (design §12): a v2 node serves a v1 peer at most one v1
+/// session per space every `V1_SERVE_INTERVAL`, however often the v1 peer
+/// re-syncs. A build that knows the refusal takes it as `Busy` and retries,
+/// so an explicit sync still succeeds, only later.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_v2_node_limits_the_v1_sessions_it_serves() {
+    let alice = node("alice", true).await;
+    let old = node("old", false).await;
+    introduce(&[&alice, &old]);
+    let (space, genesis) = alice.create_space().unwrap();
+    alice.with_space(&space, |r| r.add_member(old.keys().public(), Role::Writer)).unwrap().unwrap();
+    old.join_space(genesis).unwrap();
+    old.sync_with(alice.id(), space, true).await.unwrap();
+    let started = Instant::now();
+    for text in ["one", "two"] {
+        old.with_space(&space, |r| r.append(feed(), text.as_bytes().to_vec())).unwrap().unwrap();
+        old.sync_with(alice.id(), space, false).await.unwrap();
+    }
+    let t = alice.sync_v2_totals();
+    assert!(t.v1_refused >= 1, "{t:?}");
+    assert!(started.elapsed() >= mycel_net::V1_SERVE_INTERVAL / 2, "the second waited: {:?}", started.elapsed());
+    eventually("both reached alice", || alice.with_space(&space, |r| r.feed_len(&feed())).unwrap() == 2).await;
+    alice.shutdown().await.unwrap();
+    old.shutdown().await.unwrap();
+}
+
 /// A stream kind this build doesn't know (a newer build's) is reset at once
 /// with `STREAM_REFUSED`, so the opener can fall back without a timeout.
 #[tokio::test(flavor = "multi_thread")]

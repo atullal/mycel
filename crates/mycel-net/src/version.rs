@@ -98,6 +98,15 @@ impl Caps {
     pub const fn unknown(self) -> Caps {
         self.difference(Self::KNOWN)
     }
+
+    /// These capabilities as advertised in `protocol`'s hello (`"node"` or
+    /// `"mesh"`, see [`Capability::protocol`]): named bits registered for
+    /// another protocol are left out (a hop has no use for a node stream
+    /// kind, and advertising it would only tell neighbours more about the
+    /// build), unknown bits are kept.
+    pub fn for_protocol(self, protocol: &str) -> Caps {
+        CAPABILITIES.iter().filter(|c| c.protocol != protocol).fold(self, |caps, c| caps.difference(c.cap))
+    }
 }
 
 impl std::ops::BitOr for Caps {

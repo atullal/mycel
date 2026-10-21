@@ -204,7 +204,9 @@ async fn hops_negotiate_versions_and_capabilities() {
         let p = d.mesh.neighbour_protocol(&peer).unwrap();
         assert_eq!((p.version, p.caps), (WIRE_V2, Caps::ROUTE_ATTEST), "{p:?}");
     }
-    assert!(b.mesh.neighbour_protocol(&pa).unwrap().advertised.contains(future));
+    let seen = b.mesh.neighbour_protocol(&pa).unwrap().advertised;
+    assert!(seen.contains(future));
+    assert!(!seen.contains(Caps::SYNC_V2), "a node-only capability isn't advertised on hops: {seen:?}");
     for (d, peer) in [(&a, po), (&old, pa), (&b, po), (&old, pb)] {
         assert_eq!(d.mesh.neighbour_protocol(&peer), Some(PeerProtocol::baseline(WIRE_V1)));
     }

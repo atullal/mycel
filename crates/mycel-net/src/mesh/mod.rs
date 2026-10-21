@@ -79,7 +79,7 @@ use crate::link::{
     CustomAddr, Link, LinkEvent, LinkStatus, PathKind, TRANSPORT_MESH, n0_watcher, noq_udp, path_in_use,
 };
 use crate::version::{
-    AlpnTable, Hello, PeerProtocol, Protocol, WIRE_V1, WIRE_V2, WireVersion, alpn_table_ok, alpns_in, version_in,
+    AlpnTable, Caps, Hello, PeerProtocol, Protocol, WIRE_V1, WIRE_V2, WireVersion, alpn_table_ok, alpns_in, version_in,
 };
 
 /// Hop connections between neighbours (and internet hops to gateways), wire
@@ -1146,7 +1146,7 @@ impl Driver {
             return;
         }
         let mut msg = vec![K_HELLO];
-        msg.extend_from_slice(&Hello::ours(self.opts.protocol.caps).encode());
+        msg.extend_from_slice(&Hello::ours(self.hop_caps()).encode());
         let conn = conn.clone();
         self.keep(tokio::spawn(async move {
             let open = crate::resources::within(crate::resources::REPLY_TIMEOUT, "no stream", conn.open_uni());
@@ -1165,9 +1165,15 @@ impl Driver {
         let mut hops = self.hops.lock();
         let Some(h) = hops.get_mut(&from) else { return Ok(()) };
         if let Some(p) = h.protocol.filter(|p| p.version >= WIRE_V2) {
-            h.protocol = Some(PeerProtocol::agreed(p.version, self.opts.protocol.caps, theirs.caps));
+            h.protocol = Some(PeerProtocol::agreed(p.version, self.hop_caps(), theirs.caps));
         }
         Ok(())
+    }
+
+    /// What we advertise on hops: only the mesh protocol's capabilities
+    /// (the node's options list the node's too).
+    fn hop_caps(&self) -> Caps {
+        self.opts.protocol.caps.for_protocol("mesh")
     }
 
     async fn on_summary_stream(self: Arc<Self>, from: SignPk, mut rx: iroh::endpoint::RecvStream) -> Result<()> {
