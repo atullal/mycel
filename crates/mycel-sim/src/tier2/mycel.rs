@@ -79,13 +79,20 @@ pub enum Role {
     Liar,
     /// A liar that extends the cheapest chain it was sent, by one hop and
     /// the least cost an honest hop adds (2.1 ms), understating only its
-    /// own link, and drops everything (tier-2 GLOBAL core only). It is the
-    /// most a liar held to signed per-hop route attestations can say (the
-    /// planned wire change, docs/ROUTING.md §6 item 13: it can't invent a
-    /// short chain, only extend one it received); an unattested liar can
-    /// say it too, since without attestations it can say anything. So the
-    /// worst unattested liar is at least as bad as the worse of this and
-    /// [`Role::Liar`] (docs/SIMULATION.md §4, open 15).
+    /// own link, and drops everything (tier-2 GLOBAL core only). Without
+    /// attestations it can say anything, this included; it is the most a
+    /// signed per-hop chain *without* cost binding would let it say. With
+    /// the attested router (`attest=on`) it signs its own hop over that lie,
+    /// and honest devices refuse the chain (its upstream signed a costlier
+    /// link) and distrust it (docs/SIMULATION.md §4, open 15).
+    ChainLiar,
+    /// A liar held to cost-bound attestations (the attested router): it
+    /// advertises the least its chain allows, its upstream's cost plus the
+    /// link that upstream measured to it, signs the least link to the
+    /// receiver (who takes the costlier end), and drops everything. On the
+    /// simulator's symmetric links that is what an honest relay says, so it
+    /// is an honest dropper with the router's real chains (tier-2 GLOBAL
+    /// core only).
     AttestedLiar,
     /// Announces honestly and drops everything (packets and bundles): all
     /// that is left of a liar once announcements can't lie at all (route
@@ -109,7 +116,7 @@ impl Role {
     /// It drops what it is given to relay (packets, and with the GLOBAL
     /// core bundles too).
     pub fn drops(self) -> bool {
-        matches!(self, Role::BlackHole | Role::Liar | Role::AttestedLiar | Role::Dropper | Role::GreyHole)
+        matches!(self, Role::BlackHole | Role::Liar | Role::ChainLiar | Role::AttestedLiar | Role::Dropper | Role::GreyHole)
     }
 
     /// It drops traffic of message `msg` that it relays (`None`: traffic

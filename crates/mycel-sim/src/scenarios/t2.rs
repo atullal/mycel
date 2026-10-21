@@ -179,6 +179,10 @@ pub struct GCfg {
     pub flood_reduction: bool,
     /// GLOBAL's store-and-forward carrier on top of routing.
     pub dtn: bool,
+    /// Signed route attestations (`Config::attest`). Off by default here:
+    /// the scenarios' numbers were measured before them; `flood-scaling`
+    /// and `liar-ceiling` run them too (`MYCEL_CORE=attest=on` for any).
+    pub attest: bool,
 }
 
 impl Default for GCfg {
@@ -191,6 +195,7 @@ impl Default for GCfg {
             max_hops: c.max_hops,
             flood_reduction: c.flood_reduction,
             dtn: true,
+            attest: false,
         }
     }
 }
@@ -374,8 +379,10 @@ fn global_cfg(g: GCfg, seed: u64, i: NodeId) -> Config {
         // one well-mixed sub-stream per device (xorshift from seeds a few
         // bits apart starts out correlated)
         seed: crate::stats::mix64(stream_seed(seed, Stream::Routers) ^ (i as u64 + 1)).max(1),
-        // signatures are stubbed (always valid): the cache only costs memory
-        verified_max: 64,
+        // signatures are stubbed: the cache only costs memory (with
+        // attestations, the node's size, so checks count as they would)
+        verified_max: if g.attest { Config::default().verified_max } else { 64 },
+        attest: g.attest,
         ..Config::default()
     };
     if let Ok(k) = std::env::var("MYCEL_CORE") {
@@ -448,6 +455,10 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                         t.gateway_out += s.gateway_out;
                         t.dropped_budget += s.dropped_budget;
                         t.dropped_queue += s.dropped_queue;
+                        t.announcements_attested += s.announcements_attested;
+                        t.signatures_checked += s.signatures_checked;
+                        t.signatures_cached += s.signatures_cached;
+                        t.chains_refused += s.chains_refused;
                     }
                     let mut d = mycel_net::mesh::dtn::DtnStats::default();
                     let (mut peak, mut avg) = (0u64, 0.0f64);
@@ -472,7 +483,7 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                     let n = sim.routers.len().max(1) as f64;
                     let secs = (sim.now as f64 / SEC as f64).max(1e-9);
                     let through = (!droppers.is_empty()).then(|| routes_through(sim, &droppers));
-                    json!({"loops": sh.loops.get(), "routes_through_droppers": through, "announcements_sent": t.announcements_sent,
+                    let mut v = json!({"loops": sh.loops.get(), "routes_through_droppers": through, "announcements_sent": t.announcements_sent,
                            "announcements_received": t.announcements_received, "announcements_limited": t.announcements_limited,
                            "announcements_stale": t.announcements_stale, "announcements_suppressed": t.announcements_suppressed,
                            "announcements_implausible": t.announcements_implausible, "neighbours_distrusted": t.neighbours_distrusted, "hops_suspected": t.hops_suspected,
@@ -487,7 +498,13 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                            "buffer_peak_bytes": peak, "buffer_avg_bytes": avg / n,
                            "control_b_s_per_device": {
                                "routing": kinds[0] as f64 / n / secs, "carrier": kinds[1] as f64 / n / secs,
-                               "dials": kinds[2] as f64 / n / secs, "other": kinds[3] as f64 / n / secs}})
+                               "dials": kinds[2] as f64 / n / secs, "other": kinds[3] as f64 / n / secs}});
+                    // (apart: the macro's recursion limit)
+                    v["announcements_attested"] = json!(t.announcements_attested);
+                    v["signatures_checked"] = json!(t.signatures_checked);
+                    v["signatures_cached"] = json!(t.signatures_cached);
+                    v["chains_refused"] = json!(t.chains_refused);
+                    v
                 },
             )
         }
@@ -1724,28 +1741,40 @@ fn adversarial(o: Opts) -> ScenarioResult {
 /// (3 below full size; `MYCEL_SIM_LIAR_SEEDS=k` for k at any size.)
 const LIAR_SEEDS: u64 = 20;
 
-/// What `liar-ceiling`'s bad devices do, run by run: today's liar (one hop
-/// from everyone), a liar that extends the cheapest chain it was sent (the
-/// most signed per-hop attestations let it say), and two that announce the
-/// truth: one drops everything, a grey hole drops half the messages.
-const LIAR_ROLES: [(Role, &str); 4] = [
-    (Role::Liar, "one-hop liar"),
-    (Role::AttestedLiar, "chain-extending liar"),
-    (Role::Dropper, "honest dropper"),
-    (Role::GreyHole, "honest grey hole"),
+/// What `liar-ceiling`'s bad devices do, run by run, and whether every
+/// device runs the attested router (`Config::attest`). Without it: today's
+/// liar (one hop from everyone), a liar that extends the cheapest chain it
+/// was sent (the most a signed chain without cost binding would let it
+/// say), and two that announce the truth: one drops everything, a grey hole
+/// drops half the messages. With it, the same lies against real chains
+/// (the one-hop liar can only send it unattested; the chain-extending liar
+/// signs its lie and is refused), the most cost-bound chains let a liar say
+/// ([`Role::AttestedLiar`]), and the two truthful ones.
+const LIAR_ROLES: [(Role, bool, &str); 9] = [
+    (Role::Liar, false, "one-hop liar"),
+    (Role::ChainLiar, false, "chain-extending liar"),
+    (Role::Dropper, false, "honest dropper"),
+    (Role::GreyHole, false, "honest grey hole"),
+    (Role::Liar, true, "attested router: one-hop liar"),
+    (Role::ChainLiar, true, "attested router: chain-extending liar"),
+    (Role::AttestedLiar, true, "attested router: cost-bound liar"),
+    (Role::Dropper, true, "attested router: honest dropper"),
+    (Role::GreyHole, true, "attested router: honest grey hole"),
 ];
 
 /// The strategies open to a bad device under each announcement format, as
 /// indices into [`LIAR_ROLES`]: with no attestations it can say anything;
 /// held to a signed per-hop chain it can only extend one it was sent (or
 /// announce the truth); with each hop's measured cost signed in too, only
-/// the truth. Each format is judged by the strategy of its set with the
-/// worst mean over the seeds, fixed before formats are compared
-/// ([`worst_fixed`]).
-const REGIMES: [(&str, &[usize]); 3] = [
-    ("no attestation (today)", &[0, 1, 2, 3]),
-    ("signed per-hop chain", &[1, 2, 3]),
-    ("chain + each hop's measured cost", &[2, 3]),
+/// the truth (these two modelled on the router without attestations); the
+/// attested router as built, against everything above. Each format is
+/// judged by the strategy of its set with the worst mean over the seeds,
+/// fixed before formats are compared ([`worst_fixed`]).
+const REGIMES: [(&str, &[usize]); 4] = [
+    ("no attestation", &[0, 1, 2, 3]),
+    ("signed per-hop chain (modelled)", &[1, 2, 3]),
+    ("chain + each hop's measured cost (modelled)", &[2, 3]),
+    ("attested router (built)", &[4, 5, 6, 7, 8]),
 ];
 
 /// Default for `MYCEL_SIM_MAX_PAR`, the most `liar-ceiling` runs in flight
@@ -1842,8 +1871,12 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
                 let a = adversaries(&Opts { seed, ..o });
                 let runs = LIAR_ROLES
                     .par_iter()
-                    .map(|(role, _)| {
+                    .map(|(role, attest, _)| {
                         let plan = Plan { roles: a.bad.iter().map(|b| (*b, *role)).collect(), ..a.plan.clone() };
+                        let model = match model {
+                            Model::Global(g) => Model::Global(GCfg { attest: *attest, ..g }),
+                            m => m,
+                        };
                         run(model, &a.w, &plan, seed, a.until, None)
                     })
                     .collect();
@@ -1855,17 +1888,19 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
     let mut rows = Vec::new();
     for s in &seeds {
         let mut row = json!({"seed": s.seed});
-        for ((_, label), x) in LIAR_ROLES.iter().zip(&s.runs) {
+        for ((_, _, label), x) in LIAR_ROLES.iter().zip(&s.runs) {
             let n = |k: &str| x.extra.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
             r.note(format!(
-                "seed {}: {label}: {}; hops suspected {}, seqno requests {}, honest routes through a liar at the end {}",
+                "seed {}: {label}: {}; hops suspected {}, seqno requests {}, honest routes through a liar at the end {}, chains refused {}, neighbours distrusted {}",
                 s.seed,
                 lfr(x).line(),
                 n("hops_suspected"),
                 n("seqreqs_sent"),
-                n("routes_through_droppers")
+                n("routes_through_droppers"),
+                n("chains_refused"),
+                n("neighbours_distrusted")
             ));
-            row[label.replace([' ', '-'], "_")] = json!({"lfr": lfr(x), "metrics": x.m, "extra": x.extra});
+            row[label.replace([' ', '-', ':'], "_")] = json!({"lfr": lfr(x), "metrics": x.m, "extra": x.extra});
         }
         rows.push(row);
     }
@@ -1889,26 +1924,35 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
     let last = o.seed.wrapping_add(k.saturating_sub(1));
     let f = |j: usize| &raw[fixed[j]];
     r.headline(format!(
-        "seeds {}–{last}: ceiling {:.1}% · each format against its worst strategy, raw (LFR): today ({}) {:.1}% ({:.1}%, min {:.0}%), signed chain ({}) {:.1}%, {} vs today, chain + hop costs ({}) {:.1}%, {} vs chain alone",
+        "seeds {}–{last}: ceiling {:.1}% · each format against its worst strategy, raw (LFR): no attestation ({}) {:.1}% ({:.1}%, min {:.0}%), signed chain ({}) {:.1}%, {} vs none, chain + hop costs ({}) {:.1}%, {} vs chain alone",
         o.seed,
         m(&ceil),
-        LIAR_ROLES[fixed[0]].1,
+        LIAR_ROLES[fixed[0]].2,
         m(f(0)),
         m(&lfr_d[fixed[0]]),
         min(&lfr_d[fixed[0]]),
-        LIAR_ROLES[fixed[1]].1,
+        LIAR_ROLES[fixed[1]].2,
         m(f(1)),
         paired(f(1), f(0)),
-        LIAR_ROLES[fixed[2]].1,
+        LIAR_ROLES[fixed[2]].2,
         m(f(2)),
         paired(f(2), f(1)),
+    ));
+    r.headline(format!(
+        "attested router as built, against its worst strategy ({}): {:.1}% (LFR {:.1}%, min {:.0}%), {} vs no attestation, {} vs the modelled cost binding",
+        LIAR_ROLES[fixed[3]].2,
+        m(f(3)),
+        m(&lfr_d[fixed[3]]),
+        min(&lfr_d[fixed[3]]),
+        paired(f(3), f(0)),
+        paired(f(3), f(2)),
     ));
     r.headline(format!(
         "by strategy, raw: {}",
         LIAR_ROLES
             .iter()
             .enumerate()
-            .map(|(i, (_, label))| {
+            .map(|(i, (_, _, label))| {
                 let vs = if i == 0 { String::new() } else { format!(", {} vs one-hop", paired(&raw[i], &raw[0])) };
                 format!("{label} {:.1}% (min {:.0}%){vs}", m(&raw[i]), min(&raw[i]))
             })
@@ -1916,23 +1960,25 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
             .join(" · ")
     ));
     r.headline(format!(
-        "per-seed worst strategy (upper bounds on the gains, selection-biased, no error bars): today {:.1}%, signed chain {:.1}% ({:+.1}), chain + hop costs {:.1}% ({:+.1})",
+        "per-seed worst strategy (upper bounds on the gains, selection-biased, no error bars): no attestation {:.1}%, signed chain {:.1}% ({:+.1}), chain + hop costs {:.1}% ({:+.1}), attested router {:.1}% ({:+.1} vs none)",
         m(&upper[0]),
         m(&upper[1]),
         m(&upper[1]) - m(&upper[0]),
         m(&upper[2]),
         m(&upper[2]) - m(&upper[1]),
+        m(&upper[3]),
+        m(&upper[3]) - m(&upper[0]),
     ));
     for (j, (regime, roles)) in REGIMES.iter().enumerate() {
         let picks: Vec<&str> = (0..seeds.len())
             .map(|s| {
                 let i = roles.iter().copied().min_by(|a, b| raw[*a][s].total_cmp(&raw[*b][s])).unwrap_or(0);
-                LIAR_ROLES[i].1
+                LIAR_ROLES[i].2
             })
             .collect();
         r.note(format!(
             "{regime}: judged against the {} (worst mean), raw {:.1}% (min {:.1}%), LFR {:.1}%; per-seed worst {:.1}%, the worst strategy per seed: {}",
-            LIAR_ROLES[fixed[j]].1,
+            LIAR_ROLES[fixed[j]].2,
             m(f(j)),
             min(f(j)),
             m(&lfr_d[fixed[j]]),
@@ -1945,14 +1991,18 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
     // forwards half, so its runs don't count)
     let leaked: usize = seeds
         .iter()
-        .flat_map(|s| s.runs.iter().zip(&LIAR_ROLES).filter(|(_, (role, _))| *role != Role::GreyHole))
+        .flat_map(|s| s.runs.iter().zip(&LIAR_ROLES).filter(|(_, (role, _, _))| *role != Role::GreyHole))
         .map(|(x, _)| lfr(x).cut_delivered)
         .sum();
     r.at_most("delivered although every path crosses a liar", leaked as f64, 0.0, "messages")
         .invariant_if(o.candidate == Candidate::Global);
+    r.note(format!(
+        "liar-free-reachable delivery against the worst strategy without attestations (a build with ROUTE_ATTEST off, or a mesh of version 1 devices): {:.1}%, mean over seeds",
+        m(&lfr_d[fixed[0]])
+    ));
     r.at_least(
-        "liar-free-reachable delivery against the worst unattested strategy, mean over seeds",
-        m(&lfr_d[fixed[0]]),
+        "liar-free-reachable delivery against the worst strategy left to liars by the attested router, mean over seeds",
+        m(&lfr_d[fixed[3]]),
         90.0,
         "%",
     );
@@ -2413,9 +2463,12 @@ mod tests {
     /// 90 s: the last announcement of `origin` device 0 heard from 1, and
     /// the one 1 heard from 2 (seq, hops, cost).
     fn heard_via(role: Role, origin: NodeId) -> Vec<(Option<Chain>, Option<Chain>)> {
+        heard_via_with(GCfg::default(), role, origin)
+    }
+
+    fn heard_via_with(g: GCfg, role: Role, origin: NodeId) -> Vec<(Option<Chain>, Option<Chain>)> {
         let w = line5();
         let shared = Rc::new(Shared::default());
-        let g = GCfg::default();
         let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), 1, |i, _| {
             let mut r = Global::new(i, global_cfg(g, 1, i), shared.clone());
             r.heard = Some(Map::default());
@@ -2439,9 +2492,19 @@ mod tests {
     /// The hops `observer` holds for its route to `origin` through `via`,
     /// each second from 30 s to 90 s, with `role` at `via`.
     fn hops_via(role: Role, observer: NodeId, via: NodeId, origin: NodeId) -> Vec<Option<u8>> {
+        hops_via_with(GCfg::default(), role, observer, via, origin).0
+    }
+
+    /// [`hops_via`] with `g`, and the observer's router counters at the end.
+    fn hops_via_with(
+        g: GCfg,
+        role: Role,
+        observer: NodeId,
+        via: NodeId,
+        origin: NodeId,
+    ) -> (Vec<Option<u8>>, mycel_net::mesh::core::Stats) {
         let w = line5();
         let shared = Rc::new(Shared::default());
-        let g = GCfg::default();
         let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), 1, |i, _| {
             let mut r = Global::new(i, global_cfg(g, 1, i), shared.clone());
             if i == via {
@@ -2450,21 +2513,51 @@ mod tests {
             r
         });
         sim.start();
-        (30..=90)
+        let hops = (30..=90)
             .map(|t| {
                 sim.run(t * SEC);
                 sim.routers[observer as usize].core.route_hops(&key(origin), &key(via))
             })
-            .collect()
+            .collect();
+        (hops, sim.routers[observer as usize].core.stats())
     }
 
     #[test]
-    fn an_attested_liar_only_extends_the_chain_it_was_sent() {
+    fn the_attested_router_refuses_a_chain_extending_lie_and_distrusts_the_liar() {
+        let g = GCfg { attest: true, ..GCfg::default() };
+        // honest: 0 holds 4 at 4 hops through 1, attested
+        let (honest, s) = hops_via_with(g, Role::Honest, 0, 1, 4);
+        assert!(honest.iter().all(|h| *h == Some(4)), "{honest:?}");
+        assert!(s.announcements_attested > 0 && s.chains_refused == 0, "{s:?}");
+        // 1 signs its hop over a cost below what 2 signed for their link:
+        // 0 refuses it and stops routing through 1 (its only way to 4)
+        let (lie, s) = hops_via_with(g, Role::ChainLiar, 0, 1, 4);
+        assert!(lie.iter().all(Option::is_none), "{lie:?}");
+        assert!(s.chains_refused > 0 && s.neighbours_distrusted > 0, "{s:?}");
+    }
+
+    #[test]
+    fn a_cost_bound_liar_can_say_only_what_an_honest_relay_says() {
+        let g = GCfg { attest: true, ..GCfg::default() };
+        // on symmetric links the least its chain allows is the truth: what 0
+        // hears from it is what it hears from an honest 1
+        assert_eq!(heard_via_with(g, Role::AttestedLiar, 4), heard_via_with(g, Role::Honest, 4));
+        let (_, s) = hops_via_with(g, Role::AttestedLiar, 0, 1, 4);
+        assert!(s.chains_refused == 0 && s.announcements_attested > 0, "{s:?}");
+        // a one-hop lie can't be attested: kept, but behind attested routes
+        // (here there is none other, so it is used, as a fallback)
+        let (one_hop, s) = hops_via_with(g, Role::Liar, 0, 1, 4);
+        assert!(one_hop.contains(&Some(2)), "{one_hop:?}");
+        assert_eq!(s.chains_refused, 0);
+    }
+
+    #[test]
+    fn a_chain_liar_only_extends_the_chain_it_was_sent() {
         // device 4 is three hops from device 1: honest, 1 relays 4 at 3
         // hops, so 0 holds 4 hops through it, all along
         assert!(hops_via(Role::Honest, 0, 1, 4).iter().all(|h| *h == Some(4)));
         // held to a signed chain it can only add itself: the honest count
-        assert!(hops_via(Role::AttestedLiar, 0, 1, 4).iter().all(|h| *h == Some(4)));
+        assert!(hops_via(Role::ChainLiar, 0, 1, 4).iter().all(|h| *h == Some(4)));
         // today's liar claims to be one hop from everyone; 0 holds that
         // near-scope route only between the far origin's announcements, the
         // only ones the liar can refresh it from (docs/SIMULATION.md §4,
@@ -2489,7 +2582,7 @@ mod tests {
         // device 4 is three hops from device 1, over Bluetooth links that
         // cost far more than the 2.1 ms floor
         let honest = same_seq(&heard_via(Role::Honest, 4));
-        let attested = same_seq(&heard_via(Role::AttestedLiar, 4));
+        let attested = same_seq(&heard_via(Role::ChainLiar, 4));
         assert!(!honest.is_empty() && !attested.is_empty());
         let (h, h2) = honest[0];
         let link = h.2 - h2.2;

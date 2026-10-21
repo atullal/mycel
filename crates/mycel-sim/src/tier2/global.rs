@@ -23,7 +23,14 @@
 //!   each complete message; the sender retransmits unacked messages with
 //!   exponential backoff (1 s → 30 s, for 10 min), as QUIC and Mycel's sync
 //!   would. The ack's arrival is the message's receipt (round trip).
-//! - **Signatures** are always valid here (tested in `mesh/wire.rs`).
+//! - **Signatures** are stubbed: the origin's always valid; each hop of a
+//!   route attestation (with `attest=on`, `Config::attest`) is a keyed
+//!   digest of its signer and what it signs ([`stub_sig`]), checked as the
+//!   node checks Ed25519 (`mesh/wire.rs`), so a device can sign only its
+//!   own hops and an altered chain fails as it would for real. Each copy's
+//!   size is what the wire would carry (`wire::wire_len`), and an attested
+//!   copy whose receiver won't pass it on drops the origin's signature as
+//!   the wire does.
 //! - **Loops**: a packet (source, id) arriving at the same device twice is
 //!   counted as a loop.
 //! - **Store-and-forward** (optional, `with_dtn`): GLOBAL's carrier
@@ -45,8 +52,8 @@ use std::sync::Arc;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use mycel_crypto::Hash32;
-use mycel_crypto::{Sig, SignPk};
-use mycel_net::mesh::core::{self as mc, Announce, Config, Out, SeqReq};
+use mycel_crypto::{Digest, Sig, SignPk};
+use mycel_net::mesh::core::{self as mc, Announce, Check, Config, Hop, Out, SeqReq};
 use mycel_net::mesh::dtn::{
     Accepted, Answer, Bundle, BundleFormat, Carrier, DtnConfig, Offer, Receipt, Summary as DtnSummary,
 };
@@ -213,7 +220,7 @@ pub struct Global {
     conns: Map<NodeId, Time>,
     buffer_at: Time,
     buffer_now: u64,
-    /// [`Role::AttestedLiar`]: per origin, the cheapest announcement it was
+    /// [`Role::ChainLiar`]: per origin, the cheapest announcement it was
     /// sent of the newest seqno (seq, hops, cost), as received.
     chains: Map<SignPk, Chain>,
     /// For tests: with `Some`, the last announcement heard from each
@@ -229,7 +236,7 @@ pub type Chain = (u64, u8, u32);
 /// 2.1 ms): what a liar claims for its own link.
 pub const ATTESTED_HOP_FLOOR: u32 = 1 + mc::HOP_PENALTY;
 
-/// [`Role::AttestedLiar`] hears `a`: keep the cheapest chain of the newest
+/// [`Role::ChainLiar`] hears `a`: keep the cheapest chain of the newest
 /// seqno (every chain it is sent is one it could extend).
 fn keep_chain(chains: &mut Map<SignPk, Chain>, a: &Announce) {
     let e = chains.entry(a.origin).or_insert((a.seq, a.hops, a.cost));
@@ -238,7 +245,7 @@ fn keep_chain(chains: &mut Map<SignPk, Chain>, a: &Announce) {
     }
 }
 
-/// [`Role::AttestedLiar`] sends `ann`: the cheapest chain it was sent of
+/// [`Role::ChainLiar`] sends `ann`: the cheapest chain it was sent of
 /// that seqno, extended by one hop at the least an honest hop adds, when
 /// that is cheaper than what the core chose; otherwise the core's own
 /// announcement (hops and cost always of one route, never mixed). With no
@@ -252,6 +259,84 @@ fn extend_chain(ann: &mut Announce, chain: Option<&Chain>) {
         ann.hops = hops.saturating_add(1);
         ann.cost = cost.saturating_add(ATTESTED_HOP_FLOOR);
     }
+}
+
+/// A stubbed signature: a keyed digest of the signer and what it signs.
+/// Only the simulator's own code makes them, for the device's own hops, so
+/// a chain verifies exactly when the node's Ed25519 one would.
+pub fn stub_sig(signer: &SignPk, msg: &[u8]) -> Sig {
+    let h = Digest::new("mycel/sim/stub-signature").update(&signer.0).update(msg).finalize();
+    let mut s = [0u8; 64];
+    s[..32].copy_from_slice(&h.0);
+    s[32..].copy_from_slice(&h.0);
+    Sig(s)
+}
+
+/// [`stub_sig`]'s check, for the router's [`Check`]s (the origin's own
+/// signature always passes: nothing here forges one).
+pub fn stub_verify(c: Check<'_>) -> bool {
+    match c {
+        Check::Origin(_) => true,
+        Check::Hop { ann, hop, pos, next } => {
+            let m = mc::hop_signed(&mc::fields_digest(ann), pos, hop.cost, &next, hop.link);
+            hop.sig == stub_sig(&hop.signer, &m)
+        }
+    }
+}
+
+/// `ann` with our own hop signed for `to` (stubbed), if the router asked.
+fn sign_for(me: &SignPk, ann: Announce, to: &SignPk) -> Announce {
+    let Some(link) = ann.sign_link else { return ann };
+    let m = mc::hop_signed(&mc::fields_digest(&ann), ann.hops, ann.cost, to, link);
+    let sig = stub_sig(me, &m);
+    ann.signed_by(*me, sig)
+}
+
+/// What an attested copy carries on the wire: no origin signature unless it
+/// ends with its sender's own hop (`wire::encode_attested`).
+fn as_on_the_wire(mut ann: Announce) -> Announce {
+    if ann.chain.is_some() && ann.chain_len() != ann.hops as usize + 1 {
+        ann.sig = mc::NO_SIG;
+    }
+    ann
+}
+
+/// The hop upstream of `me` in `ann`'s chain, and whether `me` signed its
+/// own on top (it does when the receiver may pass the announcement on).
+fn upstream(me: &SignPk, ann: &Announce) -> Option<(Arc<Hop>, bool)> {
+    let c = ann.chain.as_ref()?;
+    if c.signer == *me { Some((c.prev.clone()?, true)) } else { Some((c.clone(), false)) }
+}
+
+/// [`Role::AttestedLiar`], held to cost-bound attestations, sends `ann`
+/// (signed by the core's route): the least the chain allows, its upstream's
+/// cost plus the link its upstream measured (an honest relay adds the
+/// costlier of that and its own measurement), and the least link to the
+/// receiver (who takes the costlier end anyway). Without a chain it can't
+/// lower anything: the core's own.
+fn cost_bound(me: &SignPk, ann: Announce, to: &SignPk) -> Announce {
+    let Some((up, own)) = upstream(me, &ann) else { return ann };
+    let least = up.cost.saturating_add(up.link);
+    if least >= ann.cost {
+        return ann;
+    }
+    let a = Announce { cost: least, chain: Some(up), sign_link: own.then_some(ATTESTED_HOP_FLOOR), ..ann };
+    sign_for(me, a, to)
+}
+
+/// [`Role::ChainLiar`] with the attested router: the chain-extending lie
+/// (its upstream's cost plus the 2.1 ms floor), its own hop signed over it
+/// where it signs one. Honest devices refuse the chain and distrust the
+/// liar: it can't claim a cheaper link than its upstream signed.
+fn chain_lie(me: &SignPk, ann: Announce, to: &SignPk) -> Announce {
+    let Some((up, own)) = upstream(me, &ann) else { return ann };
+    let lie = up.cost.saturating_add(ATTESTED_HOP_FLOOR);
+    if lie >= ann.cost {
+        return ann;
+    }
+    let link = ann.chain.as_ref().map_or(ATTESTED_HOP_FLOOR, |c| c.link);
+    let a = Announce { cost: lie, chain: Some(up), sign_link: own.then_some(link), ..ann };
+    sign_for(me, a, to)
 }
 
 /// A bundle's id for message `msg` (the same message is the same bundle).
@@ -450,24 +535,29 @@ impl Global {
         let now = Self::ms(cx);
         for o in outs.drain(..) {
             match o {
-                Out::Announce { to, mut ann } => {
+                Out::Announce { to, ann } => {
+                    let mut ann = sign_for(&self.pk, ann, &to);
                     if ann.origin != self.pk && ann.cost != mc::INFINITY {
                         match self.role {
-                            Role::BlackHole => ann.cost = 0, // "everyone is right here"
+                            Role::BlackHole => {
+                                // "everyone is right here" (no chain says so)
+                                (ann.cost, ann.chain) = (0, None);
+                            }
                             Role::Liar => {
                                 // "everyone is one hop from me", as cheaply as
-                                // an honest relay could say it
-                                ann.hops = 1;
-                                ann.cost = ATTESTED_HOP_FLOOR;
+                                // an honest relay could say it: no chain can
+                                (ann.hops, ann.cost, ann.chain) = (1, ATTESTED_HOP_FLOOR, None);
                             }
-                            Role::AttestedLiar => {
+                            Role::ChainLiar if ann.chain.is_some() => ann = chain_lie(&self.pk, ann, &to),
+                            Role::ChainLiar => {
                                 let chain = self.chains.get(&ann.origin).copied();
                                 extend_chain(&mut ann, chain.as_ref());
                             }
+                            Role::AttestedLiar => ann = cost_bound(&self.pk, ann, &to),
                             _ => {}
                         }
                     }
-                    self.send_to(cx, node(&to), Frame::Ann(ann), None);
+                    self.send_to(cx, node(&to), Frame::Ann(as_on_the_wire(ann)), None);
                 }
                 Out::SeqReq { to, req } => {
                     self.send_to(cx, node(&to), Frame::Req(req), None);
@@ -658,7 +748,7 @@ impl Router for Global {
 
     fn size(f: &Frame) -> u32 {
         match f {
-            Frame::Ann(a) => (1 + 1 + 4 + 32 + 8 + 1 + 1 + 4 + 1 + a.name.len() + 64) as u32,
+            Frame::Ann(a) => mycel_net::mesh::wire::wire_len(a) as u32,
             Frame::Req(_) => 1 + 32 + 8 + 1,
             Frame::Data(d) => (mycel_net::mesh::wire::DATA_HDR + d.payload.len()) as u32,
             Frame::Direct(p) => p.len() as u32 + 20,
@@ -709,6 +799,9 @@ impl Router for Global {
         let (pk, now) = (key(nb), Self::ms(cx));
         if up {
             self.core.set_direct(pk, true, now);
+            // every device runs this build: attestations whenever it's on
+            let attest = self.core.config().attest;
+            self.core.set_attests(pk, Some(attest), now);
             self.core.hop_up(pk, now);
             self.core.set_cost(pk, radio_units(techs));
             if let Some(c) = self.dtn.as_mut() {
@@ -747,13 +840,13 @@ impl Router for Global {
                 if self.role == Role::Replayer && self.old.len() < 200 {
                     self.old.push(a.clone());
                 }
-                if self.role == Role::AttestedLiar && a.cost != mc::INFINITY && a.origin != self.pk {
+                if self.role == Role::ChainLiar && a.cost != mc::INFINITY && a.origin != self.pk {
                     keep_chain(&mut self.chains, &a);
                 }
                 if let Some(h) = self.heard.as_mut() {
                     h.insert((from, a.origin), (a.seq, a.hops, a.cost));
                 }
-                self.core.on_announce(fpk, a, now, WALL_MS + now, |_| true)
+                self.core.on_announce(fpk, a, now, WALL_MS + now, stub_verify)
             }
             Frame::Req(r) => self.core.on_seqreq(fpk, r, now),
             Frame::Data(d) => {
@@ -786,7 +879,7 @@ impl Router for Global {
             Frame::Bundle(b, copies) => {
                 let id = b.id;
                 let msg = bundle_msg(&id);
-                if matches!(self.role, Role::Liar | Role::AttestedLiar | Role::Dropper | Role::GreyHole)
+                if matches!(self.role, Role::Liar | Role::ChainLiar | Role::AttestedLiar | Role::Dropper | Role::GreyHole)
                     && self.role.swallows(Some(msg))
                     && b.dst != self.pk
                 {
@@ -887,6 +980,8 @@ impl Router for Global {
                         uplink: o.uplink,
                         name: self.name.clone(),
                         sig: Sig([0; 64]),
+                        chain: None,
+                        sign_link: None,
                     };
                     self.core.originate(a, now);
                     self.busy(cx);
@@ -1046,11 +1141,13 @@ mod tests {
             uplink: 0,
             name: Arc::from("n9"),
             sig: Sig([0; 64]),
+            chain: None,
+            sign_link: None,
         }
     }
 
     #[test]
-    fn an_attested_liar_keeps_the_cheapest_chain_of_the_newest_seqno() {
+    fn a_chain_liar_keeps_the_cheapest_chain_of_the_newest_seqno() {
         let mut chains = Map::default();
         keep_chain(&mut chains, &ann(5, 3, 900));
         keep_chain(&mut chains, &ann(5, 4, 700)); // cheaper, same seqno
@@ -1062,7 +1159,7 @@ mod tests {
     }
 
     #[test]
-    fn an_attested_liar_extends_only_a_chain_of_the_seqno_it_sends() {
+    fn a_chain_liar_extends_only_a_chain_of_the_seqno_it_sends() {
         // the core would send 4 hops at 50,000 (its own link 20,000 of it)
         let honest = ann(5, 4, 50_000);
         let mut a = honest.clone();
