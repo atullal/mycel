@@ -20,12 +20,15 @@
 //!   environment variables (a phone), a `link-diagnostics` file in the data
 //!   folder holding the level turns them on (see `link_diagnostics`).
 
+#[cfg(target_os = "android")]
+mod android;
+mod background;
 mod commands;
 mod notify;
 mod open_file;
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use mycel_node::api::{Event, NetworkMode};
 use mycel_node::{Runtime, RuntimeOptions};
@@ -56,9 +59,14 @@ pub(crate) fn set_window_title(app: &AppHandle, name: &str) {
     }
 }
 
+/// The app, once there is a window: a phone can run the runtime before
+/// (Android, `start_in_background`), and the window adopts it.
+pub(crate) type AppSlot = Arc<OnceLock<AppHandle>>;
+
 /// Forward runtime events to the webview until the runtime shuts down. The
 /// chat layer's alerts go to the notification bridge instead (never blocks).
-fn forward_events(app: AppHandle, runtime: Rt, notifier: Arc<notify::Notifier>) {
+/// With no window yet, only the alerts go anywhere.
+fn forward_events(app: AppSlot, runtime: Rt, notifier: Arc<notify::Notifier>) {
     // Subscribe before spawning so nothing emitted after startup is missed.
     let mut rx = runtime.subscribe();
     tauri::async_runtime::spawn(async move {
@@ -66,11 +74,13 @@ fn forward_events(app: AppHandle, runtime: Rt, notifier: Arc<notify::Notifier>) 
             match rx.recv().await {
                 Ok(event) if event.is_for_shell() => notifier.on_event(&event),
                 Ok(event) => {
+                    let Some(app) = app.get() else { continue };
                     if let Err(e) = app.emit(EVENT, &event) {
                         eprintln!("mycel-host: failed to emit event: {e}");
                     }
                 }
                 Err(RecvError::Lagged(skipped)) => {
+                    let Some(app) = app.get() else { continue };
                     // We dropped events: tell the UI to refresh everything it shows.
                     eprintln!("mycel-host: event stream lagged by {skipped}; asking UI to refresh");
                     let mut refresh = vec![
@@ -234,7 +244,9 @@ fn log_in_use(path: &std::path::Path) -> bool {
 /// (`xcrun devicectl device copy to --domain-type appDataContainer ...` on a
 /// development-signed build). Debug builds turn level 1 on by themselves.
 fn link_diagnostics(data_dir: &std::path::Path) {
-    if std::env::var_os("MYCEL_BLE_LOG").is_some() {
+    // Set once, before the runtime starts: never again once it runs (a
+    // window adopting a background start logs to the file again).
+    if std::env::var_os("MYCEL_BLE_LOG").is_some() || CORE.get().is_some() {
         return;
     }
     let level = diagnostics_level(&data_dir.join("link-diagnostics")).or(cfg!(debug_assertions).then_some(1));
@@ -559,24 +571,49 @@ fn env_from_properties() {
     }
 }
 
-/// Open the runtime and wire it to the app.
-fn start(app: &mut tauri::App) -> Result<(), String> {
-    #[cfg(target_os = "android")]
-    env_from_properties();
-    let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => app.path().app_data_dir().map_err(|e| format!("cannot find the app data folder: {e}"))?,
-    };
-    std::fs::create_dir_all(&data_dir).map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
-    log_to_file(&data_dir);
-    let mode = network_mode(&data_dir)?;
-    let name = std::env::var("MYCEL_NAME").ok().filter(|n| !n.trim().is_empty());
+/// What runs with or without a window: the runtime, the alert bridge and
+/// the event forwarder. One per process.
+pub(crate) struct Core {
+    pub(crate) runtime: Rt,
+    pub(crate) notifier: Arc<notify::Notifier>,
+    app: AppSlot,
+}
 
+static CORE: OnceLock<Core> = OnceLock::new();
+/// Held while opening, so a background start and a window opening at the
+/// same moment never both open the profile: the second adopts the first's.
+static OPENING: Mutex<()> = Mutex::new(());
+
+/// The open core, if any (background catch-ups use it).
+#[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
+pub(crate) fn core() -> Option<&'static Core> {
+    CORE.get()
+}
+
+/// Open the core for `data_dir`, once per process. `app`: the window's app;
+/// `None` is a start with nobody watching (no window), which opens only an
+/// existing profile (`Ok(None)` otherwise): a new profile is named and
+/// created in the app, never behind the user's back. A core opened in the
+/// background is adopted by the window that opens later.
+fn open_core(data_dir: &Path, app: Option<AppHandle>) -> Result<Option<&'static Core>, String> {
+    let _opening = OPENING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(core) = CORE.get() {
+        if let Some(app) = app {
+            let _ = core.app.set(app);
+        }
+        return Ok(Some(core));
+    }
+    let watched = app.is_some();
+    if !watched && !Runtime::profile_exists(data_dir).unwrap_or(false) {
+        return Ok(None);
+    }
+    let mode = network_mode(data_dir)?;
+    let name = std::env::var("MYCEL_NAME").ok().filter(|n| !n.trim().is_empty());
     let runtime: Rt = tauri::async_runtime::block_on(Runtime::open_with(RuntimeOptions {
-        data_dir: data_dir.clone(),
+        data_dir: data_dir.to_path_buf(),
         mode,
         name,
-        default_name: device_name(),
+        default_name: if watched { device_name() } else { None },
         keeper: false,
         port: 0,
     }))
@@ -588,15 +625,67 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
             };
             format!("cannot open Mycel data in {}: {e:#}{hint}", data_dir.display())
         })?;
+    let slot: AppSlot = Arc::new(OnceLock::new());
+    if let Some(app) = app {
+        let _ = slot.set(app);
+    }
+    let notifier = notify::Notifier::start(slot.clone(), data_dir);
+    // Nobody is looking until a window says so.
+    notifier.set_away(!watched);
+    forward_events(slot.clone(), runtime.clone(), notifier.clone());
+    eprintln!(
+        "mycel-host: data dir {}, network {:?}{}",
+        data_dir.display(),
+        mode,
+        if watched { "" } else { ", started in the background" }
+    );
+    Ok(Some(CORE.get_or_init(|| Core { runtime, notifier, app: slot })))
+}
 
-    allow_attachment_files(app, &data_dir)?;
+/// Open the runtime with no window (Android after a reboot or an update, a
+/// restarted service, a background catch-up), for an existing profile only.
+/// True once a runtime is running in this process.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn start_in_background(data_dir: PathBuf) -> bool {
+    if CORE.get().is_some() {
+        return true;
+    }
+    #[cfg(target_os = "android")]
+    env_from_properties();
+    if std::fs::create_dir_all(&data_dir).is_err() {
+        return false;
+    }
+    log_to_file(&data_dir);
+    match open_core(&data_dir, None) {
+        Ok(core) => core.is_some(),
+        Err(msg) => {
+            eprintln!("mycel-host: background start failed: {msg}");
+            false
+        }
+    }
+}
 
-    let notifier = notify::Notifier::start(app.handle().clone(), &data_dir);
-    forward_events(app.handle().clone(), runtime.clone(), notifier.clone());
-    app.manage(notifier);
-    app.manage(runtime);
-
-    eprintln!("mycel-host: data dir {}, network {:?}", data_dir.display(), mode);
+/// Open the runtime (or adopt the one a background start opened) and wire
+/// it to the app.
+fn start(app: &mut tauri::App) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    if CORE.get().is_none() {
+        env_from_properties();
+    }
+    let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
+        _ => app.path().app_data_dir().map_err(|e| format!("cannot find the app data folder: {e}"))?,
+    };
+    std::fs::create_dir_all(&data_dir).map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
+    // Also after a background start: tao points stderr at logcat when the
+    // first activity is created, so this takes it back (the background
+    // start's log becomes mycel.log.1).
+    log_to_file(&data_dir);
+    let core = open_core(&data_dir, Some(app.handle().clone()))?.ok_or("Mycel couldn't open its data")?;
+    // The folder actually open (a background start was told it by Android).
+    allow_attachment_files(app, core.runtime.data_dir())?;
+    app.manage(core.notifier.clone());
+    app.manage(core.runtime.clone());
     Ok(())
 }
 
@@ -639,6 +728,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            background::background_status,
+            background::request_background_exemption,
             notify::prepare_notifications,
             notify::set_notification_context,
             notify::notification_target,
