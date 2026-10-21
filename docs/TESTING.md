@@ -24,9 +24,20 @@ scripts/security-check.sh                     # security regressions, npm audit,
   within each test binary, and can still miss their deadlines on a heavily
   loaded machine.
 - On a Mac, three tests need the terminal to have Local Network access
-  (`lan_discovery_via_mdns`, `one_path_per_interface`,
-  `sync_over_an_interface_with_ip_off`). Without it they fail with "No route
-  to host": allow it in System Settings > Privacy & Security > Local Network.
+  (`lan_discovery_via_mdns` in `mycel-net`, mDNS discovery;
+  `one_path_per_interface` and `sync_over_an_interface_with_ip_off` in
+  `mycel-link-iface`, QUIC over each interface's link-local address).
+  Without it their sends fail with "No route to host" and each times out
+  waiting to discover the other node ("alice sees bob nearby", "bob found
+  over the interface", "found on every interface: []"): allow it in System
+  Settings > Privacy & Security > Local Network. CI's macOS runner can't
+  answer the prompt, so it skips exactly these three (`--exact --skip`,
+  which never skips another test whose name contains one); Linux and
+  Windows run them.
+  The other tests use loopback and in-memory links, except `mycel-node`'s
+  `truncated_network_mode_starts_local_only_and_is_repaired`, which opens a
+  node in LAN mode (the fallback under test) but checks nothing on the
+  network, so it doesn't need the access.
 - Most tests start real nodes speaking real QUIC, over loopback or over
   in-memory links with a set rate, latency and loss (`mycel_net::MemNet`,
   `mycel_net::emu::EmuNet`). Emulated links can carry any medium label
@@ -162,23 +173,35 @@ cargo install cargo-fuzz --version 0.13.2 --locked
 fuzz/run.sh 600                       # every target for 10 minutes, 2 at a time
 JOBS=1 fuzz/run.sh 60 mesh_wire       # one target for a minute
 cargo +nightly fuzz run mesh_wire fuzz/artifacts/mesh_wire/crash-…   # replay an input
-cd fuzz && cargo run --example seeds  # rewrite the seed corpora
+fuzz/seeds.sh                         # rewrite the generated seeds (keeps regression inputs)
 ```
 
 `fuzz/run.sh` builds every target once, then runs each with the corpus in
 `fuzz/corpus/<target>` (started from the committed seeds in
 `fuzz/seeds/<target>`: for targets that read raw bytes, real messages
 encoded by the code a node sends them with; for every target, each input
-that once failed), a 10 s limit per input (a hang), a 2 GiB memory limit
-and a 512 MiB limit on any single allocation (no input of a few KiB should
-need that). Structure-aware targets (`arbitrary`) build their messages
-from the fuzzer's bytes, so real encodings would not help them; they run
+that once failed, named `regression-*`), a 10 s limit per input (a hang),
+a 2 GiB memory limit and a 512 MiB limit on any single allocation (no
+input of a few KiB should need that). Structure-aware targets
+(`arbitrary`) build their messages from the fuzzer's bytes, so real
+encodings would not help them; they run
 with `-max_len=16384 -len_control=0`, so their inputs are long enough for
 whole scenarios (64 edits, 24 messages, 128 steps) from the first minute
 rather than after libFuzzer's slow length ramp. Failing inputs land in
 `fuzz/artifacts/<target>/`. Every run appends a line to
 `fuzz/logs/runs.tsv` (target, start, CPU and wall seconds, inputs run,
 revision), from which the totals below can be checked.
+
+`fuzz/seeds.sh` (`fuzz/examples/seeds.rs`) writes the generated seeds
+deterministically, so a rerun changes a file only when an encoding
+changed: keys come from fixed seeds, and what the code draws from the OS's
+randomness (space ids, epoch keys, HPKE lockboxes, AEAD nonces, Automerge
+actors) comes from a fixed BLAKE3 stream instead, through getrandom's
+`custom` backend, which only that program defines and only `seeds.sh`
+turns on. The one seed that carries the time (a reachability record: its
+expiry and pkarr timestamp) is written only when missing. It never deletes
+a file or touches a `regression-*` input, and lists files it no longer
+makes for a person to remove.
 
 Where a value can be encoded again, targets check the round trip
 (decode → encode gives the input back, or a value that decodes equal);
@@ -187,9 +210,9 @@ first byte of a raw input often selects the decoder.
 
 | Target | What it feeds, and the properties beyond "no panic" |
 |---|---|
-| `mesh_wire` | Mesh datagrams (`mesh/wire.rs`): announcements, batches, seqno requests, data frames and fragments, mesh addresses. Canonical re-encoding; a frame split for any hop MTU reassembles |
-| `mesh_router` | The router (`mesh/core.rs`) driven by hostile neighbours: raw datagrams dispatched as the driver does, and structured announcements, frames and seqno requests that pass the decoder (signatures decided by the input: a liar may hold a valid one), plus links, sends, lookups and time. The router never addresses itself, what it emits re-encodes, a relayed frame's TTL goes down |
-| `dtn` | Store-and-forward (`mesh/dtn.rs`): summary, offer and answer messages, then a carrier fed hostile summaries (NaN predictabilities included), offers, bundles, partial transfers and receipts. Never plans a bundle to ourselves; what we tell neighbours are probabilities; after every step, what the carrier remembers from neighbours (their predictabilities and bundle ids, the transitive predictabilities they gave us) is within its caps (inputs reach the per-neighbour cap of 80 predictabilities; the 4,096-entry caps need more bytes than one input holds, and unit tests cover them) |
+| `mesh_wire` | Mesh datagrams (`mesh/wire.rs`): announcements, batches, seqno requests, data frames and fragments, mesh addresses. Canonical re-encoding, the flag bits no version assigns yet included; a frame split for any hop MTU reassembles, and every fragment keeps the frame's flags |
+| `mesh_router` | The router (`mesh/core.rs`) driven by hostile neighbours: raw datagrams dispatched as the driver does, and structured announcements, frames and seqno requests that pass the decoder (signatures decided by the input: a liar may hold a valid one), plus links, sends, lookups and time; frames carry any of the flag bits no version assigns yet (`F_EXTENSIONS`, wire version 2). The router never addresses itself, what it emits re-encodes, a relayed frame's TTL goes down and its unassigned flag bits pass unchanged (a later version can mark frames end to end through relays that don't know the mark) |
+| `dtn` | Store-and-forward (`mesh/dtn.rs`): summary, offer and answer messages, then a carrier fed hostile summaries (NaN predictabilities included), offers, bundles, partial transfers and receipts in every bundle format: version 1, version 2 with the space-sync payload kind or one this build doesn't know, and formats it can't check (a later header version; a version 1 header with a kind version 1 never had), which the carrier refuses; the node itself originates only formats it can check. An offer (its whole first frame, kind byte included) re-encodes to the same offer for a version 2 hop, and for a version 1 hop only if it is of a version 1 bundle (one of a later format is never offered there: a version 1 carrier would read it as version 1 and find the signature bad). Never plans a bundle to ourselves; what we tell neighbours are probabilities; after every step, what the carrier remembers from neighbours (their predictabilities and bundle ids, the transitive predictabilities they gave us) is within its caps (inputs reach the per-neighbour cap of 80 predictabilities; the 4,096-entry caps need more bytes than one input holds, and unit tests cover them) |
 | `net_stream` | A peer's stream read as the node reads it (`wire.rs`): length prefix against the limit and the peer's memory budget, then postcard, for sync sessions, ephemeral messages, blob requests and answers, contact cards. Canonical re-encoding; **no allocation beyond what arrived**: a counting allocator checks that the most memory live at once while reading an input stays within 16 times its length plus 2 MiB (serde trusts a declared sequence length for up to 1 MiB of preallocation), so a length prefix alone can't reserve a frame |
 | `postcard_messages` | Every other postcard decoder of untrusted bytes: store-and-forward payloads, feed entries, keyrings, membership ops and envelopes (from peers and from storage), contact cards, chat payloads, the rules ABI, call and video control. Round trip; signature checks run |
 | `sync_change` | Document changes (`bounded_change.rs`, `change_ops.rs`), raw or re-framed with a valid checksum so mutations reach the column decoders. **Differential**: our op-column decoder (`change_ops.rs`) reads exactly the rows Automerge 0.12's own decoder does. Consistency (not a differential: our parser is a preflight in front of Automerge's loader): what we accept, Automerge loads again with the same hash and bytes, and parses again. Over-strict refusals are checked in `sync_doc`, which has honest changes to check them on |
@@ -240,7 +263,13 @@ Also fixed while writing the targets: a store-and-forward resume offset
 from a neighbour was cast to `usize` before being bounded (it would
 truncate on 32-bit devices). The DTN summary and offer conversions moved
 into functions the driver and the `dtn` target share, so the target feeds
-the production decoders.
+the production decoders. Since wire versioning, the offer helpers carry
+the bundle format: `mesh::encode_offer(version, &Offer)` gives the first
+frame for a hop of that wire version (kind byte included; nothing for a
+version 1 hop and a later format), and `mesh::decode_offer` reads one back
+with its format (nothing for an offer kind this build doesn't know, which
+is left unanswered). The target reaches them through `fuzzing::dtn_offer`
+and `fuzzing::encode_dtn_offer`.
 
 Harness bugs, not product bugs (fixed in the targets): `trust_graph`
 compared op counts without the pending ops; `link_ble` reused channel ids,

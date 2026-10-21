@@ -122,11 +122,13 @@ jobs:
         run: |
           set -o pipefail
           # macOS asks before a process may use the local network, and a CI
-          # runner can't answer: these LAN discovery tests run on Linux and
-          # Windows only.
+          # runner can't answer: the three tests that use real interfaces
+          # (mDNS discovery; QUIC over each interface's link-local address)
+          # run on Linux and Windows only (docs/TESTING.md). `--exact`
+          # skips those names only, never a test whose name contains one.
           skip=()
           if [ "$RUNNER_OS" = macOS ]; then
-            skip=(--skip lan_discovery_via_mdns --skip one_path_per_interface --skip sync_over_an_interface_with_ip_off)
+            skip=(--exact --skip lan_discovery_via_mdns --skip one_path_per_interface --skip sync_over_an_interface_with_ip_off)
           fi
           cargo test --locked --no-fail-fast \
             -p mycel-crypto -p mycel-trust -p mycel-sync -p mycel-rules -p mycel-kit-chat \
