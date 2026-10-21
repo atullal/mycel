@@ -31,7 +31,13 @@
 //! vectors, which hold only chains that are open (or partly reached) at a
 //! merge: O(n · k) in the worst case for `k` such chains, where `k` is at
 //! most the number of chain starts among ops that have children, against
-//! the n² bits of an ancestor matrix. This is the chain cover idea Synapse
+//! the n² bits of an ancestor matrix. Whoever can append ops controls `k`:
+//! merges that each name a non-tip op of many side chains keep those chains
+//! open (only a chain whose tip is merged closes), so m such ops can cost
+//! O(m²) entries, and so can ops that are invalid, since ancestry runs
+//! through every stored op (`open_chains_cost`, ignored, prints the
+//! growth). Bounding the vectors is future work (TRUST.md §10).
+//! This is the chain cover idea Synapse
 //! uses for Matrix auth chains (Jagadish 1990), with the absorption pruning
 //! and the waiting sinks added so that closed branches and dead ends cost
 //! nothing afterwards.
@@ -407,6 +413,39 @@ mod tests {
             vec![26, 37],
         ];
         check(&parents);
+    }
+
+    /// The adversarial worst case (module docs): each round puts 63
+    /// three-op side chains on the first op and one merge naming each
+    /// chain's first op (not its tip) plus the previous merge. Prints the
+    /// vector entries; they grow 4× per doubling of the op count.
+    /// `cargo test -p mycel-trust --release --lib open_chains_cost -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn open_chains_cost() {
+        for rounds in [100usize, 200, 400] {
+            let mut r = Reach::default();
+            let first = r.push(&[]);
+            let mut prev: Option<u32> = None;
+            let t = std::time::Instant::now();
+            for _ in 0..rounds {
+                let mut ps: Vec<u32> = (0..63)
+                    .map(|_| {
+                        let a = r.push(&[first]);
+                        let b = r.push(&[a]);
+                        r.push(&[b]);
+                        a
+                    })
+                    .collect();
+                ps.extend(prev);
+                ps.sort_unstable();
+                prev = Some(r.push(&ps));
+            }
+            r.push(&[prev.unwrap()]);
+            let entries: usize = r.vecs.iter().map(|v| v.len()).sum();
+            let max = r.vecs.iter().map(|v| v.len()).max().unwrap();
+            eprintln!("{} ops: {entries} vector entries (max {max}), built in {:?}", r.chain.len(), t.elapsed());
+        }
     }
 
     #[test]
