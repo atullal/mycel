@@ -1579,3 +1579,57 @@ pinned seeds pass, as before. Wall time 101 s and 104 s (noise; the
 machine was running other jobs). `report.md` now has Fidelity, Region and
 Robust-pass columns on every row; the gate's tier-2 scenarios get the
 tier's default, L0, with no region studied.
+
+### 7.7 Robustness studies: a DTN scenario and a crowd
+
+The design asks the DTN and crowd scenarios to publish Morris rankings,
+Sobol indices with intervals and a searched worst case. Both ran on the
+18-core Mac with 4 threads while other agents' jobs ran; every number is
+L0 (the disc), and the region is today's ignorance, not a calibrated
+error bar.
+
+**`rural-starlink`** (DTN: 90 devices in 6 clusters over 2 × 2 km, one
+satellite gateway, walkers between clusters; delivery of feasible ≥ 80%),
+CI size, region `range_mult` × `mule_share` × `walk_speed` × `pause_s`.
+
+*First on 3 seeds per point* (`robust rural-starlink --points 32 --runs 3
+--morris-r 8 --confirm 3 --seed 1`, 222 runs, 522 s), with the framework
+as it was. It looked like an answer and was not one: 27 of 32 points
+passed, the emulator's leave-one-out Q² was 0.53 and the Sobol indices
+named `mule_share` and `pause_s`. Reading the runs showed that one run's
+spread over seeds is about 10 points of delivery (one point gave 53.7,
+67.7 and 89.2), so a 3-seed mean's noise variance (48) was two thirds of
+the variance between points' means (70): **seed noise allowed a Q² of
+about 0.32, and the emulator's 0.53 meant it had fitted noise** (a length
+scale of 0.085 on `mule_share`). Its searched worst case, predicted 68.8,
+measured 94.0 on fresh seeds. The first-order indices had intervals ±0.5
+wide (one was −0.15), from the uncentred estimator (§7.3). That is why
+studies now measure seed noise and judge everything against it (§7.3).
+
+*Then on 8 seeds per point*, with the noise-aware framework (`--points 32
+--runs 8 --morris-r 6 --confirm 8 --seed 1`, 512 runs, 743 s wall, 49
+CPU-minutes):
+
+| | |
+|---|---|
+| Seed noise | one run's sd 12.6 points of delivery; an 8-seed mean's sd 4.5; **73%** of the spread between points is signal |
+| Nominal point | 86.6% (pass) |
+| Robust pass | **28 of 32** (Wilson 95% 72–95%); none of the 4 failing points fails beyond seed noise; worst sampled 72.0% |
+| Morris (μ*, noise floor) | `mule_share` 16.6 (floor 5.9, **above**; μ = −16.6), `walk_speed` 8.7 (6.0), `pause_s` 7.9 (7.4), `range_mult` 6.1 (2.4): only `mule_share` clears its floor |
+| Emulator | Q² 0.71 where noise allows 0.73; held-out RMSE 6.4 on 30 Morris runs: adequate |
+| Sobol total (first order) | `mule_share` **0.88** [0.85–0.91] (0.88), `range_mult` **0.11** [0.11–0.12] (0.11), `pause_s` 0.01, `walk_speed` 0.01 |
+| Worst case searched | at a corner of the region (range ×1.58, 30% walkers at 1.6 m/s pausing 30 s): predicted 71.6%, measured **98.4%** on 8 fresh seeds: did not hold up |
+
+Verdict: **not robust** by the strict rule (every point passes), but the
+failures are within seed noise, so the honest summary is "passes on
+about 72–95% of the region; no failure shown beyond noise". It hinges on
+**`mule_share`** and, much less, **`range_mult`**: those are what WP14
+should measure first for a village (who walks between houses, and the
+real radio range outdoors). The direction is a finding: **more walkers
+lower the share of feasible messages delivered** (μ = −16.6). Walkers add
+paths the oracle counts as feasible, and the carrier does not use them as
+well as the oracle does; not yet explained further. The searched worst
+case missed because the corner it found is extrapolation for an emulator
+fitted on 32 points: fast walkers with short pauses deliver well there.
+A failing worst sampled point is now also rechecked on fresh seeds (added
+after this run).
