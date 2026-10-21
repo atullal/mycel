@@ -347,6 +347,15 @@ mod tests {
         assert_eq!(got, vec![Frame::Hello { key: key(7), name: String::new() }]);
     }
 
+    /// The tier-2 simulator charges 3 bytes per QUIC packet on Bluetooth
+    /// (`mycel_sim::quic::BLE_FRAMING`): the length and the type byte.
+    #[test]
+    fn packet_framing_is_three_bytes() {
+        for n in [1, 40, 1200, 1452] {
+            assert_eq!(encode_packet(&vec![9; n]).unwrap().len(), n + 3);
+        }
+    }
+
     #[test]
     fn frames_survive_any_chunking() {
         let pkts: Vec<Vec<u8>> = (0..20).map(|i| vec![i as u8; 1 + i * 97]).collect();

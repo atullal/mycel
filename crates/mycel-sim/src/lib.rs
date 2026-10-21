@@ -17,6 +17,7 @@
 
 pub mod latency;
 pub mod models;
+pub mod quic;
 pub mod report;
 pub mod scenarios;
 pub mod seeds;

@@ -14,7 +14,8 @@
 //! - **Records**: `Out::PublishReach` puts the device's record in the
 //!   directory; `Out::Resolve` looks one up (DHT-like delay).
 //! - **Data**: an app message is split into packets of at most 1,200 bytes
-//!   (QUIC's packets), sent with `Router::send`, or straight to the peer
+//!   (QUIC's packets, cut as noq cuts a stream: [`crate::quic`]), sent with
+//!   `Router::send`, or straight to the peer
 //!   where a direct path exists: over the radio to a neighbour, or over the
 //!   internet once two devices with the internet have a connection (the
 //!   node's Iroh connection, pooled for [`mycel_net::POOL_IDLE`]; the
@@ -23,6 +24,11 @@
 //!   each complete message; the sender retransmits unacked messages with
 //!   exponential backoff (1 s → 30 s, for 10 min), as QUIC and Mycel's sync
 //!   would. The ack's arrival is the message's receipt (round trip).
+//! - **Wire sizes** are Mycel's own: each frame is charged what the node
+//!   puts on the link for it, measured with `mycel_net::mesh`'s encoders
+//!   (announcements batched per neighbour as the node batches them, data
+//!   frames split to the hop's datagram size, the carrier's streams), in
+//!   noq's QUIC packets with each link's framing ([`crate::quic`]).
 //! - **Signatures** are always valid here (tested in `mesh/wire.rs`).
 //! - **Loops**: a packet (source, id) arriving at the same device twice is
 //!   counted as a loop.
@@ -50,16 +56,22 @@ use mycel_net::mesh::core::{self as mc, Announce, Config, Out, SeqReq};
 use mycel_net::mesh::dtn::{
     Accepted, Answer, Bundle, BundleFormat, Carrier, DtnConfig, Offer, Receipt, Summary as DtnSummary,
 };
+use mycel_net::mesh::{self as mesh, wire};
+use mycel_net::version::WIRE_VERSION;
+
+use crate::quic::{self, Wire};
 
 use super::engine::{Cx, MS, MsgId, NodeId, Over, Router, SEC, Techs, Time};
 use super::mycel::Role;
 
 const WALL_MS: u64 = 1_700_000_000_000;
-const PACKET: u32 = 1200;
+/// The simulator's own header in an end-to-end packet (tag, message, part,
+/// parts): it sits in bytes the real packet spends on its QUIC header, so
+/// it costs nothing extra (a short header is at least 10 bytes).
 const PKT_HDR: usize = 1 + 4 + 2 + 2;
+const _: () = assert!(PKT_HDR <= quic::FLAGS + quic::CID + 1);
 const TAG_DATA: u8 = 1;
 const TAG_ACK: u8 = 2;
-const HANDSHAKE: u32 = 1200;
 /// [`mycel_net::POOL_IDLE`] in engine time.
 const POOL_IDLE_US: Time = 60 * SEC;
 
@@ -125,7 +137,10 @@ pub fn spaces(specs: &[super::engine::NodeSpec], roles: &Map<NodeId, Role>, seed
 
 #[derive(Clone, Debug)]
 pub enum Frame {
-    Ann(Announce),
+    /// The announcements one routing step produced for a neighbour, sent
+    /// together as the node sends them
+    /// ([`mycel_net::mesh::wire::encode_announcements`]).
+    Anns(Vec<Announce>),
     Req(SeqReq),
     Data(mc::Frame),
     /// A packet straight to a radio neighbour (not through the mesh).
@@ -165,6 +180,8 @@ struct Outgoing {
     dst: NodeId,
     size: u32,
     parts: u16,
+    /// Each part's packet on the wire, as noq cuts the message's stream.
+    sizes: Vec<u16>,
     acked: Vec<bool>,
     left: u16,
     /// part → when sent
@@ -418,12 +435,27 @@ impl Global {
         }
     }
 
+    /// What `f` costs on the way to `to`: its QUIC packets, each framed as
+    /// the radio that will carry it frames them, or as an internet path does.
+    fn wire_size(cx: &Cx<Frame>, to: NodeId, f: &Frame) -> u32 {
+        let w = wire_of(f);
+        match cx.radios_to(to).and_then(|t| t.best(w.bytes)) {
+            Some(t) => w.framed(quic::framing(t)),
+            None => w.framed(quic::INTERNET_FRAMING),
+        }
+    }
+
+    /// What `f` costs over the internet.
+    fn inet_size(f: &Frame) -> u32 {
+        wire_of(f).framed(quic::INTERNET_FRAMING)
+    }
+
     fn send_to(&mut self, cx: &mut Cx<Frame>, to: NodeId, f: Frame, msg: Option<MsgId>) -> bool {
-        let size = Self::size(&f);
+        let size = Self::wire_size(cx, to, &f);
         let control = Self::is_control(&f);
         if control {
             let kind = match &f {
-                Frame::Ann(_) | Frame::Req(_) => 0,
+                Frame::Anns(_) | Frame::Req(_) => 0,
                 Frame::Summary(_) | Frame::Offer(_) | Frame::Answer { .. } | Frame::BundleAck { .. } => 1,
                 Frame::Dial | Frame::DialAck | Frame::Hangup => 2,
                 _ => 3,
@@ -448,6 +480,9 @@ impl Global {
         let mut outs = std::mem::take(&mut self.buf);
         self.core.drain(&mut outs);
         let now = Self::ms(cx);
+        // announcements go out batched per neighbour, after the rest (as
+        // the node's `exec` sends them)
+        let mut anns: Vec<(SignPk, Vec<Announce>)> = Vec::new();
         for o in outs.drain(..) {
             match o {
                 Out::Announce { to, mut ann } => {
@@ -467,7 +502,10 @@ impl Global {
                             _ => {}
                         }
                     }
-                    self.send_to(cx, node(&to), Frame::Ann(ann), None);
+                    match anns.iter_mut().find(|(k, _)| *k == to) {
+                        Some((_, v)) => v.push(ann),
+                        None => anns.push((to, vec![ann])),
+                    }
                 }
                 Out::SeqReq { to, req } => {
                     self.send_to(cx, node(&to), Frame::Req(req), None);
@@ -476,6 +514,9 @@ impl Global {
                     if relayed && self.role.swallows(packet_of(&frame.payload)) {
                         continue; // swallowed
                     }
+                    if wire::frame_lens(&frame, quic::datagram_max(quic::hop_mtu())).is_none() {
+                        continue; // the node drops what it can't split to fit
+                    }
                     let msg = packet_msg(&frame.payload);
                     self.send_to(cx, node(&to), Frame::Data(frame), msg);
                 }
@@ -483,13 +524,13 @@ impl Global {
                 Out::Control { .. } => {}
                 Out::Dial(peer) => {
                     let p = node(&peer);
-                    if !cx.has_inet() || !cx.send_inet(p, Frame::Dial, HANDSHAKE, true, None) {
+                    if !cx.has_inet() || !cx.send_inet(p, Frame::Dial, Self::inet_size(&Frame::Dial), true, None) {
                         self.core.dial_failed(peer, now);
                     }
                 }
                 Out::Hangup(peer) => {
                     self.core.hop_down(peer, now);
-                    cx.send_inet(node(&peer), Frame::Hangup, 50, true, None);
+                    cx.send_inet(node(&peer), Frame::Hangup, Self::inet_size(&Frame::Hangup), true, None);
                 }
                 Out::Resolve(peer) => {
                     if !cx.reach_get(node(&peer), node(&peer) as u64) {
@@ -502,6 +543,9 @@ impl Global {
                 Out::RouteUp { .. } => self.shared.routes_up.set(self.shared.routes_up.get() + 1),
                 Out::RouteDown { .. } => self.shared.routes_down.set(self.shared.routes_down.get() + 1),
             }
+        }
+        for (to, v) in anns {
+            self.send_to(cx, node(&to), Frame::Anns(v), None);
         }
         self.buf = outs;
         // effects may have queued more (e.g. a resolve answered inline)
@@ -566,16 +610,17 @@ impl Global {
     }
 
     fn ack(&mut self, cx: &mut Cx<Frame>, to: NodeId, msg: MsgId, part: u16) {
-        let p = packet(TAG_ACK, msg, part, 1, 40);
+        let p = packet(TAG_ACK, msg, part, 1, quic::ACK_PACKET);
         self.send_packet(cx, to, p);
     }
 
     fn send_packet(&mut self, cx: &mut Cx<Frame>, dst: NodeId, p: Bytes) {
         let msg = packet_msg(&p);
-        let size = p.len() as u32;
         if cx.radios_to(dst).is_some() {
             // a direct path: never through the mesh
-            cx.send_radio(dst, Frame::Direct(p), size, false, msg);
+            let f = Frame::Direct(p);
+            let size = Self::wire_size(cx, dst, &f);
+            cx.send_radio(dst, f, size, false, msg);
             return;
         }
         let (now_us, pk) = (cx.now(), key(dst));
@@ -583,7 +628,9 @@ impl Global {
         // node; the core refuses data for a neighbour, and an internet hop
         // is one)
         if self.conn_warm(dst, now_us) || self.core.is_neighbour(&pk) {
-            if cx.send_inet(dst, Frame::Direct(p.clone()), size + 20, false, msg) {
+            let f = Frame::Direct(p.clone());
+            let size = Self::inet_size(&f);
+            if cx.send_inet(dst, f, size, false, msg) {
                 self.conns.insert(dst, now_us);
                 return;
             }
@@ -609,8 +656,7 @@ impl Global {
         let now = cx.now();
         let Some(o) = self.outbox.get_mut(&msg) else { return };
         let room = (o.cwnd as usize).saturating_sub(o.inflight.len());
-        let body = PACKET - PKT_HDR as u32;
-        let (dst, size, parts) = (o.dst, o.size, o.parts);
+        let (dst, parts) = (o.dst, o.parts);
         let mut send = Vec::new();
         for i in 0..parts {
             if send.len() >= room {
@@ -618,12 +664,11 @@ impl Global {
             }
             if !o.acked[i as usize] && !o.inflight.contains_key(&i) {
                 o.inflight.insert(i, now);
-                send.push(i);
+                send.push((i, o.sizes[i as usize]));
             }
         }
-        for i in send {
-            let len = if i + 1 == parts { size - i as u32 * body } else { body };
-            let p = packet(TAG_DATA, msg, i, parts, len as usize + PKT_HDR);
+        for (i, len) in send {
+            let p = packet(TAG_DATA, msg, i, parts, len as usize);
             self.send_packet(cx, dst, p);
         }
     }
@@ -653,29 +698,62 @@ fn packet_of(p: &Bytes) -> Option<MsgId> {
         .then(|| u32::from_be_bytes(p[1..5].try_into().expect("4")))
 }
 
+/// The packets an end-to-end connection sends a `size`-byte message in:
+/// one stream, cut as noq cuts it at the mesh's 1,200-byte MTU
+/// ([`quic::stream_packets`]), with the packet-number length its window
+/// reaches (1 byte, 2 for a message of over 126 packets).
+fn e2e_packets(size: u32) -> Vec<u16> {
+    let cut = |pn| -> Vec<u16> {
+        quic::stream_packets(0, size as usize, quic::INITIAL_MTU, pn).map(|(_, p)| p as u16).collect()
+    };
+    let one = cut(1);
+    let unacked = (one.len() as u64).min(MAX_WINDOW as u64);
+    if quic::pn_len(unacked) == 1 { one } else { cut(quic::pn_len(unacked)) }
+}
+
+/// A store-and-forward offer's first frame on a current hop.
+fn offer_len(o: &Offer) -> usize {
+    mesh::offer_stream_len(WIRE_VERSION, o).expect("a current hop takes every bundle format")
+}
+
+/// What the node puts on a hop for `f`, in QUIC packets, before the link's
+/// framing: Mycel's own encodings (`mycel_net::mesh`) in noq's packets
+/// ([`crate::quic`]). Datagrams (announcements, seqno requests, mesh data)
+/// at the hop's datagram size; the carrier's exchanges on their streams
+/// (offer, then answer back, then the payload after the offer, then the
+/// one-byte verdict after the answer); end-to-end packets as they are.
+fn wire_of(f: &Frame) -> Wire {
+    let mtu = quic::hop_mtu();
+    let max = quic::datagram_max(mtu);
+    match f {
+        Frame::Anns(v) => Wire::datagrams(wire::announcements_lens(v, max)),
+        Frame::Req(_) => Wire::datagrams([wire::SEQREQ_LEN]),
+        Frame::Data(d) => Wire::datagrams(wire::frame_lens(d, max).unwrap_or_default()),
+        Frame::Direct(p) => Wire::one(p.len()),
+        Frame::Dial | Frame::DialAck => Wire::one(quic::HANDSHAKE_FLIGHT),
+        // the node closes an idle hop with the reason "idle"
+        Frame::Hangup => Wire::one(quic::close_packet(b"idle".len())),
+        Frame::Offer(o) => quic::stream(0, offer_len(o), mtu),
+        Frame::Answer { answer, .. } => quic::stream(0, mesh::answer_stream_len(*answer), mtu),
+        Frame::Bundle(b, copies) => quic::stream(offer_len(&Offer::of(b, *copies)) as u64, b.payload.len(), mtu),
+        // (bundles go whole here: the answer was always "from byte 0")
+        Frame::BundleAck { .. } => {
+            let answer = mesh::answer_stream_len(Answer::Take { from: 0 });
+            quic::stream(answer as u64, mesh::BUNDLE_VERDICT_LEN, mtu)
+        }
+        Frame::Summary(s) => {
+            quic::stream(0, mesh::summary_stream_len(s).expect("the carrier's caps keep a summary small"), mtu)
+        }
+    }
+}
+
 impl Router for Global {
     type Frame = Frame;
 
+    /// Its QUIC packets before a link's framing ([`wire_of`]; what is
+    /// charged adds the framing of the link that carries it).
     fn size(f: &Frame) -> u32 {
-        match f {
-            Frame::Ann(a) => (1 + 1 + 4 + 32 + 8 + 1 + 1 + 4 + 1 + a.name.len() + 64) as u32,
-            Frame::Req(_) => 1 + 32 + 8 + 1,
-            Frame::Data(d) => (mycel_net::mesh::wire::DATA_HDR + d.payload.len()) as u32,
-            Frame::Direct(p) => p.len() as u32 + 20,
-            Frame::Dial | Frame::DialAck => HANDSHAKE,
-            Frame::Hangup => 50,
-            Frame::Offer(_) => 200,
-            Frame::Answer { .. } => 60,
-            Frame::Bundle(b, _) => b.payload.len() as u32 + 80,
-            Frame::BundleAck { .. } => 80,
-            Frame::Summary(s) => {
-                (16 + 32 * s.ids.len()
-                    + 96 * s.receipts.len()
-                    + 36 * s.preds.len()
-                    + 16 * s.evictable.len()
-                    + 32 * s.wants.len()) as u32
-            }
-        }
+        wire_of(f).bytes
     }
 
     fn is_control(f: &Frame) -> bool {
@@ -743,17 +821,19 @@ impl Router for Global {
         }
         let (fpk, now) = (key(from), Self::ms(cx));
         match f {
-            Frame::Ann(a) => {
-                if self.role == Role::Replayer && self.old.len() < 200 {
-                    self.old.push(a.clone());
+            Frame::Anns(v) => {
+                for a in v {
+                    if self.role == Role::Replayer && self.old.len() < 200 {
+                        self.old.push(a.clone());
+                    }
+                    if self.role == Role::AttestedLiar && a.cost != mc::INFINITY && a.origin != self.pk {
+                        keep_chain(&mut self.chains, &a);
+                    }
+                    if let Some(h) = self.heard.as_mut() {
+                        h.insert((from, a.origin), (a.seq, a.hops, a.cost));
+                    }
+                    self.core.on_announce(fpk, a, now, WALL_MS + now, |_| true)
                 }
-                if self.role == Role::AttestedLiar && a.cost != mc::INFINITY && a.origin != self.pk {
-                    keep_chain(&mut self.chains, &a);
-                }
-                if let Some(h) = self.heard.as_mut() {
-                    h.insert((from, a.origin), (a.seq, a.hops, a.cost));
-                }
-                self.core.on_announce(fpk, a, now, WALL_MS + now, |_| true)
             }
             Frame::Req(r) => self.core.on_seqreq(fpk, r, now),
             Frame::Data(d) => {
@@ -774,7 +854,7 @@ impl Router for Global {
                 self.core.hop_up(fpk, now);
                 let c = Self::inet_units(cx, from);
                 self.core.set_cost(fpk, c);
-                cx.send_inet(from, Frame::DialAck, HANDSHAKE, true, None);
+                cx.send_inet(from, Frame::DialAck, Self::inet_size(&Frame::DialAck), true, None);
             }
             Frame::DialAck => {
                 self.conns.insert(from, cx.now());
@@ -869,9 +949,7 @@ impl Router for Global {
                     let old: Vec<Announce> =
                         self.old.drain(..50).map(|a| Announce { seq: a.seq.saturating_sub(3_600_000), ..a }).collect();
                     for nb in cx.neighbours() {
-                        for a in &old {
-                            self.send_to(cx, nb.0, Frame::Ann(a.clone()), None);
-                        }
+                        self.send_to(cx, nb.0, Frame::Anns(old.clone()), None);
                     }
                 }
                 let storm = self.role == Role::Storm && cx.online();
@@ -963,13 +1041,15 @@ impl Router for Global {
 
     fn on_send(&mut self, cx: &mut Cx<Frame>, msg: MsgId, dst: NodeId, size: u32) {
         cx.copied(msg);
-        let parts = size.div_ceil(PACKET - PKT_HDR as u32).max(1) as u16;
+        let sizes = e2e_packets(size);
+        let parts = sizes.len() as u16;
         self.outbox.insert(
             msg,
             Outgoing {
                 dst,
                 size,
                 parts,
+                sizes,
                 acked: vec![false; parts as usize],
                 left: parts,
                 inflight: Map::default(),
@@ -1084,6 +1164,119 @@ mod tests {
         let mut a = honest.clone();
         extend_chain(&mut a, None);
         assert_eq!(a, honest);
+    }
+
+    /// The documented overhead of one datagram on a hop: a short header
+    /// (flags, 8-byte connection id, 1-byte packet number), the DATAGRAM
+    /// frame's type and length, and the 16-byte tag (docs/SIMULATION.md §2,
+    /// "Wire sizes"). Spelled out here rather than taken from `quic`.
+    fn datagram_on_hop(len: usize) -> u32 {
+        (1 + 8 + 1 + 1 + quic::varint_len(len as u64) + len + 16) as u32
+    }
+
+    /// WP2's property: for random frames, what tier 2 charges is the real
+    /// encoding plus the documented QUIC overhead, packet by packet. The
+    /// datagrams are encoded here with `mycel_net::mesh::wire`'s public
+    /// encoders; the carrier's encoders are crate-private, and their length
+    /// functions are tested against them byte for byte in `mycel-net`
+    /// (`stream_lengths_match_the_encoders`).
+    #[test]
+    fn tier2_charges_the_real_encoding_plus_quic_overhead() {
+        let mut r = crate::stats::Rng::new(7);
+        let max = quic::datagram_max(quic::hop_mtu());
+        let pk = |r: &mut crate::stats::Rng| SignPk([r.below(256) as u8; 32]);
+        for _ in 0..500 {
+            // announcements, as one routing step's batch for a neighbour
+            let anns: Vec<Announce> = (0..1 + r.below(30))
+                .map(|_| Announce {
+                    name: Arc::from("x".repeat(r.below(wire::MAX_NAME + 1)).as_str()),
+                    origin: pk(&mut r),
+                    ..ann(r.u64() >> 20, r.below(16) as u8, r.below(1 << 20) as u32)
+                })
+                .collect();
+            let grams = wire::encode_announcements(&anns, max);
+            let w = wire_of(&Frame::Anns(anns));
+            assert_eq!(w.packets as usize, grams.len());
+            assert_eq!(w.bytes, grams.iter().map(|d| datagram_on_hop(d.len())).sum::<u32>());
+            // a mesh data frame carrying an end-to-end packet
+            let len = r.below(quic::INITIAL_MTU + 1);
+            let d = mc::Frame {
+                ttl: 8,
+                reached: false,
+                control: false,
+                ext: 0,
+                dst: pk(&mut r),
+                src: pk(&mut r),
+                waypoint: pk(&mut r),
+                id: r.below(1 << 20) as u32,
+                offset: 0,
+                total: len as u16,
+                payload: Bytes::from(vec![0; len]),
+            };
+            let grams = wire::encode_frame(&d, max).expect("fits a hop");
+            let w = wire_of(&Frame::Data(d));
+            assert_eq!(w.packets as usize, grams.len());
+            assert_eq!(w.bytes, grams.iter().map(|g| datagram_on_hop(g.len())).sum::<u32>());
+            // a carrier summary on its uni-stream: kind byte and encoding, in
+            // stream packets
+            let s = DtnSummary {
+                full: r.chance(0.5),
+                ids: (0..r.below(520)).map(|i| bundle_id(i as MsgId, 1)).collect(),
+                receipts: (0..r.below(260))
+                    .map(|i| Receipt { id: bundle_id(i as MsgId, 2), dst: pk(&mut r), sig: Sig([1; 64]) })
+                    .collect(),
+                preds: (0..r.below(80)).map(|_| (pk(&mut r), r.f64() as f32)).collect(),
+                free: r.u64() >> r.below(64),
+                evictable: (0..r.below(32)).map(|_| (r.u64() >> 30, r.u64() >> 40)).collect(),
+                wants: (0..r.below(16)).map(|_| pk(&mut r)).collect(),
+            };
+            let body = mesh::summary_stream_len(&s).expect("small enough");
+            assert_eq!(wire_of(&Frame::Summary(Rc::new(s))), quic::stream(0, body, quic::hop_mtu()));
+            // an offer, then the payload after it on the same stream
+            let b = Bundle {
+                format: BundleFormat::V1,
+                id: bundle_id(r.below(1000) as MsgId, 3),
+                src: pk(&mut r),
+                dst: pk(&mut r),
+                created: WALL_MS + r.u64() % (1 << 32),
+                lifetime: r.u64() % (1 << 36),
+                payload: Bytes::from(vec![0; r.below(300_000)]),
+                sig: Sig([0; 64]),
+            };
+            let copies = 1 + r.below(32) as u8;
+            let o = Offer::of(&b, copies);
+            let head = mesh::offer_stream_len(WIRE_VERSION, &o).expect("a current hop");
+            assert_eq!(wire_of(&Frame::Offer(o)), quic::stream(0, head, quic::hop_mtu()));
+            let payload = b.payload.len();
+            assert_eq!(wire_of(&Frame::Bundle(b, copies)), quic::stream(head as u64, payload, quic::hop_mtu()));
+        }
+        // fixed-size ones
+        let req = SeqReq { origin: key(1), seq: 9, hops: 2 };
+        assert_eq!(wire_of(&Frame::Req(req)).bytes, datagram_on_hop(wire::encode_seqreq(&req).len()));
+        let p = packet(TAG_DATA, 1, 0, 1, 700);
+        assert_eq!(wire_of(&Frame::Direct(p)), Wire::one(700), "an end-to-end packet is already a QUIC packet");
+        assert_eq!(wire_of(&Frame::Dial), Wire::one(1200));
+    }
+
+    /// End-to-end messages: every byte in exactly one packet, packets of at
+    /// most 1,200 bytes; a 1 KB message is one packet of 1,024 bytes plus
+    /// 32 of QUIC (header 10, STREAM frame 5, tag 16, and the 1-byte
+    /// packet-number growth is not reached).
+    #[test]
+    fn messages_go_in_quic_sized_packets() {
+        assert_eq!(e2e_packets(1024), vec![1 + 8 + 1 + (1 + 2 + 2) + 1024 + 16]);
+        for size in [0u32, 1, 1166, 1171, 1172, 100_000, 1_000_000] {
+            let p = e2e_packets(size);
+            assert!(p.iter().all(|l| *l as usize <= quic::INITIAL_MTU && *l as usize >= PKT_HDR));
+            let carried: usize =
+                quic::stream_packets(0, size as usize, quic::INITIAL_MTU, if p.len() > 126 { 2 } else { 1 })
+                    .map(|c| c.0)
+                    .sum();
+            assert_eq!(carried, size as usize);
+        }
+        // a 1 MB message: 1,000,000 bytes in ~860 packets, ~2.9% overhead
+        let mb: u32 = e2e_packets(1_000_000).iter().map(|l| *l as u32).sum();
+        assert!((1_027_000..1_031_000).contains(&mb), "{mb}");
     }
 
     #[test]
