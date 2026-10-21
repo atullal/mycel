@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use mycel_crypto::DeviceKeys;
 use mycel_net::iroh::endpoint::Connection;
 use mycel_net::link::{Link, MemNet, PathKind};
+use mycel_net::mesh::core::Defences;
 use mycel_net::{ExtraProtocol, MeshOptions, NetMode, Node, NodeOptions};
 use mycel_sync::{
     Replica,
@@ -102,9 +103,11 @@ async fn push(conn: &Connection, bytes: u64) -> Duration {
 #[tokio::test(flavor = "multi_thread")]
 async fn line_a_b_c_syncs_through_a_non_member() {
     let (ab, bc) = (edge(0), edge(1));
-    let a = device("alice", &[&ab], fast()).await;
-    let b = device("bob", &[&ab, &bc], fast()).await;
-    let c = device("carol", &[&bc], fast()).await;
+    // relay affinity on (opt-in), so the members' tables are built
+    let affine = || MeshOptions { defences: Defences { affinity: true, ..Defences::DEFAULT }, ..fast() };
+    let a = device("alice", &[&ab], affine()).await;
+    let b = device("bob", &[&ab, &bc], affine()).await;
+    let c = device("carol", &[&bc], affine()).await;
 
     // everything B relays, to look for plaintext in
     let seen: Arc<Mutex<Vec<u8>>> = Arc::default();
@@ -418,6 +421,8 @@ async fn route_heals_when_a_middle_device_leaves() {
     let _x = device("x", &[&e[3], &e[4]], fast()).await;
     mesh_route(&a, &c).await;
     let space = shared(&a, &c).await;
+    // relay affinity is opt-in: by default no table is built
+    assert_eq!(a.mesh().unwrap().affinity(&c.id()), None);
     write_and_sync(&a, &c, space, "via b").await;
 
     b.shutdown().await.unwrap();

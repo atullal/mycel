@@ -160,6 +160,9 @@ pub struct MeshOptions {
     /// announcement; in a crowd, a few well-spread neighbours route as well
     /// as all of them (docs/SIMULATION.md §4, finding 1).
     pub max_neighbours: usize,
+    /// Routing defences that need no wire change ([`core::Defences`]; the
+    /// trust-graph relay preference is off by default).
+    pub defences: core::Defences,
 }
 
 impl Default for MeshOptions {
@@ -179,6 +182,7 @@ impl Default for MeshOptions {
             directory: None,
             store_and_forward: Some(dtn::DtnConfig::default()),
             max_neighbours: 6,
+            defences: c.defences,
         }
     }
 }
@@ -195,6 +199,7 @@ impl MeshOptions {
             gateway: self.gateway,
             gateway_rate: self.gateway_rate,
             gateways: self.gateways,
+            defences: self.defences,
             seed: mycel_crypto::random_u64(),
             ..Config::default()
         }
@@ -1571,9 +1576,16 @@ impl Mesh {
     /// is sent.
     pub fn set_affinity(&self, table: impl IntoIterator<Item = (SignPk, u8)>) {
         self.d.with_router(|r, now| {
-            r.set_affinity(table);
-            r.tick(now); // the routes we offer may change
+            if r.set_affinity(table) {
+                r.tick(now); // the routes we offer may change
+            }
         });
+    }
+
+    /// Whether routes are ranked by [`Mesh::set_affinity`]'s table
+    /// ([`MeshOptions::defences`]); if not, there is no need to build it.
+    pub fn uses_affinity(&self) -> bool {
+        self.d.router.lock().config().defences.affinity
     }
 
     /// `peer`'s distance as [`Mesh::set_affinity`] last set it.

@@ -311,9 +311,10 @@ impl Inner {
     /// Tell the mesh who shares a space with us: relays it prefers
     /// (`Router::set_affinity`). Members of a space we are in are one step
     /// away; we don't know other devices' spaces, so everyone else counts as
-    /// unknown. Nothing about it leaves this device.
+    /// unknown. Nothing about it leaves this device. Nothing is built
+    /// unless the mesh uses it ([`MeshOptions::defences`]).
     fn refresh_affinity(&self) {
-        let Some(mesh) = &self.mesh else { return };
+        let Some(mesh) = self.mesh.as_ref().filter(|m| m.uses_affinity()) else { return };
         let me = self.keys.sign_pk();
         let near: HashSet<SignPk> = self
             .spaces

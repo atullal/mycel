@@ -119,22 +119,31 @@ const SUSPECT_FOR: Time = 2 * 60_000;
 const FEEDBACK_MAX: usize = 1024;
 const SUSPECTS_PER_DST: usize = 4;
 /// Cross-destination aggregation ([`Defences::aggregate`]): a next hop
-/// suspected for this many distinct destinations at once, and for more of
-/// them than it carried acknowledgements for lately, is avoided for every
-/// destination for [`SUSPECT_FOR`]. A high bar on purpose: a well-connected
-/// relay carries many destinations, so it also collects the most false
-/// suspicions (BGP route-flap damping's lesson, RFC 7196) ...
+/// suspected for this many distinct destinations at once, each of which
+/// then acknowledged through another hop (so it was alive, and the silence
+/// was the suspect's), and for more of them than it carried
+/// acknowledgements for lately, is avoided for every destination for
+/// [`SUSPECT_FOR`]. A high bar on purpose: a well-connected relay carries
+/// many destinations, so it also collects the most false suspicions (BGP
+/// route-flap damping's lesson, RFC 7196) ...
 const AGGREGATE_MIN: usize = 3;
 /// ... counting at most this many destinations it carried
-/// acknowledgements for (enough to outvote [`AGGREGATE_MIN`] and more).
+/// acknowledgements for (enough to outvote [`AGGREGATE_MIN`] and more) ...
 const VOUCHED_PER_HOP: usize = 8;
+/// ... and once avoided, fresh seqnos are asked for (at most this many
+/// requests in all) for our destinations that went through it within
+/// [`SUSPECT_FOR`]: the traffic that has to move, not everyone ever sent to.
+const SHUN_SEQREQS: usize = 32;
 /// Corroboration hold-down ([`Defences::corroborate`]): a route one
-/// neighbour claims at less than 1/this of the incumbent's cost (an older
-/// route through another neighbour), with no other neighbour's route within
-/// this factor of it, ranks just behind the incumbent ...
+/// neighbour suddenly claims at less than 1/this of the incumbent's cost
+/// (an older route through another neighbour), with no other neighbour's
+/// route within this factor of it, ranks just behind the incumbent ...
 const CORROBORATE_FACTOR: u64 = 2;
-/// ... for this long after it appeared (two announcement periods: time for
-/// a real shortcut to be heard through a second neighbour).
+/// ... for this long after its claim became that cheap (it appeared, or it
+/// fell from no cheaper than the others' to that): two announcement
+/// periods, time for a real shortcut to be heard through a second
+/// neighbour. An acknowledgement from the destination through the hop ends
+/// it early; the destination itself, next to us, is never held.
 const HOLD_DOWN: Time = 32_000;
 /// Trust-graph preference ([`Defences::affinity`]): by default a route
 /// ranks this many percent costlier per step its next hop is from us in the
@@ -146,13 +155,20 @@ pub const AFFINITY_UNKNOWN: u8 = 3;
 /// relayed announcements to a neighbour take at most this share of the
 /// hop's capacity (estimated from its cost: the time to move 64 KiB) ...
 const CONTROL_SHARE: f64 = 0.02;
-/// ... with this many seconds of it, and at least [`CONTROL_BURST_MIN`]
-/// bytes, as a burst (a greeting's table, a full-scope period, a crowd
-/// switching on at once); past that they queue, fewest hops first ...
+/// ... with this many seconds of it as a burst (a greeting's table, a
+/// full-scope period, a crowd switching on at once) ...
 const CONTROL_BURST_S: f64 = 30.0;
-const CONTROL_BURST_MIN: f64 = 65_536.0;
+/// ... and never more than this share of what the neighbour accepts from
+/// one neighbour ([`OGM_RATE`] a second, 4 s of it at once): beyond that it
+/// would throw them away. Past the budget they queue, fewest hops first ...
+const CONTROL_OF_ACCEPTED: f64 = 0.75;
 /// ... at most this many per neighbour (the farthest make way).
 const CONTROL_QUEUE: usize = 1024;
+/// A hop not measured yet is budgeted as the slowest radio (Bluetooth LE
+/// at ~40 kB/s: 64 KiB in 1.6 s) until it is: a new neighbour is greeted
+/// before its first measurement, and a whole table sent unpaced would fill
+/// a slow link for seconds.
+const UNMEASURED_CONTROL_COST: u32 = 16_384;
 /// Bytes of an announcement on the wire without its name (`wire.rs`).
 const ANN_BYTES: usize = 117;
 /// An internet hop's cost before it is measured (100 ms).
@@ -316,9 +332,10 @@ pub struct Config {
 /// Defences against lying relays that need no wire change
 /// (`docs/ROUTING.md` §6, item 15). Each can be turned off on its own
 /// (`Config::tune`), which is how the simulator measures them one at a
-/// time. None of them changes what we advertise or which routes are
-/// feasible: they only rank feasible routes (all loop-free, Babel), decide
-/// when evidence counts, or pace what we send.
+/// time. None of them changes which routes are feasible or what an
+/// advertisement says about its route (its own hops and cost): they rank
+/// feasible routes (all loop-free, Babel), and so choose which one we use
+/// and advertise, decide when evidence counts, or pace what we send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Defences {
     /// A next hop suspected for several destinations is avoided for all.
@@ -649,11 +666,13 @@ impl Nb {
 
     /// The control budget for a hop of this cost: its cost is the time to
     /// move 64 KiB over it (and its round trip), so its capacity is about
-    /// 64 KiB / cost. Unmeasured: as an unmeasured hop is costed.
+    /// 64 KiB / cost. Unmeasured (0): as the slowest radio. Capped by what
+    /// the neighbour accepts from us.
     fn control_bucket(cost: u32) -> Bucket {
-        let cost = if cost == 0 { DEFAULT_COST } else { cost };
-        let rate = CONTROL_SHARE * 65_536.0 * 10_000.0 / cost as f64;
-        Bucket::new(rate, (rate * CONTROL_BURST_S).max(CONTROL_BURST_MIN))
+        let cost = if cost == 0 { UNMEASURED_CONTROL_COST } else { cost };
+        let accepted = CONTROL_OF_ACCEPTED * OGM_RATE * ANN_BYTES as f64;
+        let rate = (CONTROL_SHARE * 65_536.0 * 10_000.0 / cost as f64).min(accepted);
+        Bucket::new(rate, (rate * CONTROL_BURST_S).min(accepted * 4.0))
     }
 
     fn internet(&self) -> bool {
@@ -671,9 +690,12 @@ struct Via {
     cost: u32,
     hops: u8,
     at: Time,
-    /// When this neighbour first gave us a route to the origin (since it
-    /// last lost it).
-    since: Time,
+    /// When this neighbour's claim became a sudden shortcut
+    /// ([`Defences::corroborate`]): under 1/[`CORROBORATE_FACTOR`] of every
+    /// other usable route's cost, when it first gave us a route to the
+    /// origin (since it last lost it) or when its cost fell to that from no
+    /// cheaper than all of them. `None`: it never did.
+    since: Option<Time>,
 }
 
 struct Origin {
@@ -788,9 +810,9 @@ pub struct Router {
     /// Neighbours caught lying about routes, until when we ignore the
     /// routes they relay.
     distrusted: Map<SignPk, Time>,
-    /// The next hop our own packets to each destination last took, for
-    /// [`Router::feedback`] ...
-    sent_via: Map<SignPk, SignPk>,
+    /// The next hop our own packets to each destination last took, and
+    /// when, for [`Router::feedback`] ...
+    sent_via: Map<SignPk, (SignPk, Time)>,
     /// ... timeouts in a row with nothing acknowledged through it, since
     /// when ...
     strikes: Map<SignPk, (SignPk, u8, Time)>,
@@ -799,8 +821,11 @@ pub struct Router {
     /// Next hops avoided for every destination, until when
     /// ([`Defences::aggregate`]) ...
     shunned: Map<SignPk, Time>,
-    /// ... and the destinations each carried acknowledgements for lately.
+    /// ... the destinations each carried acknowledgements for lately ...
     vouched: Map<SignPk, Vec<(SignPk, Time)>>,
+    /// ... and the hop each destination last acknowledged through, and
+    /// when (evidence it was alive while another hop was silent).
+    acked_via: Map<SignPk, (SignPk, Time)>,
     /// Neighbours' distance from us in our spaces' membership graph
     /// ([`Router::set_affinity`]).
     affinity: Map<SignPk, u8>,
@@ -879,6 +904,7 @@ impl Router {
             suspects: Map::default(),
             shunned: Map::default(),
             vouched: Map::default(),
+            acked_via: Map::default(),
             affinity: Map::default(),
             ctl_waiting: Vec::new(),
             own: None,
@@ -1015,14 +1041,18 @@ impl Router {
     /// [`AFFINITY_UNKNOWN`] away. An empty table (no spaces) prefers nobody.
     /// Whanau's and SybilLimit's argument: what an attacker can then do is
     /// bounded by the members who vouch for its devices, not by how many it
-    /// runs. It only ranks feasible routes; nothing about it is sent.
-    pub fn set_affinity(&mut self, table: impl IntoIterator<Item = (SignPk, u8)>) {
+    /// runs. It only ranks feasible routes, and so which route we
+    /// advertise, never its content (its hops and cost are its own).
+    /// Returns whether the table changed.
+    pub fn set_affinity(&mut self, table: impl IntoIterator<Item = (SignPk, u8)>) -> bool {
         let table: Map<SignPk, u8> =
             table.into_iter().filter(|(k, _)| *k != self.me).map(|(k, d)| (k, d.max(1))).collect();
-        if table != self.affinity {
-            self.affinity = table;
-            self.touch_all();
+        if table == self.affinity {
+            return false;
         }
+        self.affinity = table;
+        self.touch_all();
+        true
     }
 
     /// `peer`'s distance in the table [`Router::set_affinity`] last set.
@@ -1340,6 +1370,18 @@ impl Router {
         let forward_scope = a.scope.min(self.cfg.max_hops);
         let (seq, adv) = (a.seq, a.cost);
         let origin = a.origin;
+        // [`Defences::corroborate`]: a claim much cheaper than every other
+        // route is a sudden shortcut when it appears, and when it falls to
+        // that from no cheaper than all of them (else a liar would first
+        // offer a plausible route, wait, then drop its cost)
+        let sudden = self.cfg.defences.corroborate
+            && self.origins.get(&origin).is_some_and(|o| {
+                let others =
+                    o.via.iter().filter(|(k, w)| *k != from && self.usable(o, k, w, now)).map(|(_, w)| w.cost).min();
+                let Some(c) = others else { return false };
+                let was_cheapest = o.via.iter().any(|(k, old)| *k == from && old.cost < c);
+                !was_cheapest && cost as u64 * CORROBORATE_FACTOR < c as u64
+            });
         // before the update: it may stop being a gateway
         self.touch(origin);
         let expires = self.expires(now, hops);
@@ -1367,13 +1409,15 @@ impl Router {
         if seq == o.newest && !o.heard.iter().any(|(k, _)| *k == from) {
             o.heard.push((from, adv));
         }
-        let mut via = Via { seq, adv, cost, hops, at: now, since: now };
+        let mut via = Via { seq, adv, cost, hops, at: now, since: sudden.then_some(now) };
         if !o.feasible(&via) {
             self.stats.infeasible += 1;
         }
         match o.via.iter_mut().find(|(k, _)| *k == from) {
             Some((_, v)) => {
-                via.since = v.since;
+                if !sudden {
+                    via.since = v.since;
+                }
                 *v = via;
             }
             None => o.via.push((from, via)),
@@ -1486,11 +1530,20 @@ impl Router {
             && let Some((_, via)) = best
             && via.seq == o.newest
         {
-            // we have it: send our current advertisement back
+            // we have it: send our current advertisement back, which (as
+            // any advertisement) sets our feasibility distance (Babel,
+            // RFC 8966 §3.7.3)
             let mut a = o.latest.clone();
             a.hops = via.hops;
             a.cost = via.cost;
+            o.fd = match o.fd {
+                Some((s, c)) if s == o.newest => Some((s, c.min(via.cost))),
+                _ => Some((o.newest, via.cost)),
+            };
+            o.retracted = false;
+            self.stats.announcements_sent += 1;
             self.out.push(Out::Announce { to: from, ann: a });
+            self.touch(req.origin); // its feasibility distance may have changed
             return;
         }
         if req.hops > 1 && (req.seq, req.hops) > o.req_forwarded {
@@ -1668,7 +1721,6 @@ impl Router {
     fn rank(&self, o: &Origin, n: &SignPk, v: &Via, now: Time) -> u64 {
         let mut r = self.affine(n, v.cost);
         if self.cfg.defences.corroborate
-            && now.saturating_sub(v.since) < HOLD_DOWN
             && let Some(incumbent) = self.held_down(o, n, v, now)
         {
             r = r.max(incumbent + 1);
@@ -1686,12 +1738,24 @@ impl Router {
         cost as u64 * (100 + self.cfg.affinity_step as u64 * (far - 1)) / 100
     }
 
-    /// [`Defences::corroborate`]: if the route through `n` is a sudden, much
-    /// cheaper claim nobody else backs (an older usable route through
-    /// another neighbour costs over [`CORROBORATE_FACTOR`] times as much, and
-    /// no other neighbour's route is within that factor of it), the
-    /// incumbent's rank, which it then ranks just behind.
+    /// [`Defences::corroborate`]: if the route through `n` became a sudden
+    /// shortcut less than [`HOLD_DOWN`] ago and nobody else backs it yet (an
+    /// older usable route through another neighbour costs over
+    /// [`CORROBORATE_FACTOR`] times as much, and no other neighbour's route
+    /// is within that factor of it), the incumbent's rank, which it then
+    /// ranks just behind.
+    ///
+    /// Never the destination itself, next to us (its own announcement over
+    /// its own authenticated hop; nobody else can claim 0 hops), nor a hop
+    /// that carried an acknowledgement from it lately (kept with
+    /// [`Defences::aggregate`]; evidence that beats a second opinion).
     fn held_down(&self, o: &Origin, n: &SignPk, v: &Via, now: Time) -> Option<u64> {
+        let since = v.since.filter(|t| now.saturating_sub(*t) < HOLD_DOWN)?;
+        if *n == o.latest.origin
+            || self.vouched.get(n).is_some_and(|d| d.iter().any(|(k, t)| *k == o.latest.origin && now < *t))
+        {
+            return None;
+        }
         let cheap = v.cost as u64 * CORROBORATE_FACTOR;
         let mut incumbent: Option<u64> = None;
         for (k, w) in &o.via {
@@ -1701,7 +1765,7 @@ impl Router {
             if w.cost as u64 <= cheap {
                 return None; // corroborated
             }
-            if w.since < v.since {
+            if w.since.is_none_or(|t| t < since) {
                 let r = self.affine(k, w.cost);
                 incumbent = Some(incumbent.map_or(r, |i| i.min(r)));
             }
@@ -1789,12 +1853,12 @@ impl Router {
     pub fn feedback(&mut self, dst: SignPk, acked: bool, now: Time) -> bool {
         if acked {
             self.strikes.remove(&dst);
-            if let Some(hop) = self.sent_via.get(&dst).copied() {
+            if let Some((hop, _)) = self.sent_via.get(&dst).copied() {
                 self.vouch(hop, dst, now);
             }
             return false;
         }
-        let Some(hop) = self.sent_via.get(&dst).copied() else { return false };
+        let Some((hop, _)) = self.sent_via.get(&dst).copied() else { return false };
         self.strike(dst, hop, now, now)
     }
 
@@ -1811,6 +1875,17 @@ impl Router {
         }
         v.push((dst, now + SUSPECT_FOR));
         bounded_insert(&mut self.vouched, hop, v);
+        // the destination is alive: a silence through another hop suspected
+        // for it now counts against that hop
+        bounded_insert(&mut self.acked_via, dst, (hop, now));
+        let others: Vec<SignPk> = self
+            .suspects
+            .get(&dst)
+            .map(|v| v.iter().filter(|(k, t)| *k != hop && now < *t).map(|(k, _)| *k).collect())
+            .unwrap_or_default();
+        for k in others {
+            self.aggregate(k, now);
+        }
     }
 
     /// The same evidence from the node's QUIC connections, one path at a
@@ -1875,7 +1950,7 @@ impl Router {
         self.stats.hops_suspected += 1;
         self.next_sweep = self.next_sweep.min(now + SUSPECT_FOR);
         self.touch(dst); // the routes offered for it change
-        self.ask_around(dst, hop, now);
+        self.ask_around(dst, hop, usize::MAX, now);
         if self.cfg.defences.aggregate {
             self.aggregate(hop, now);
         }
@@ -1885,36 +1960,53 @@ impl Router {
     /// The routes to `dst` other than through `hop` may be infeasible: we
     /// advertised the cheap one (Babel's feasibility distance). If none is
     /// left, a fresh seqno from the origin makes them usable, as after a
-    /// loss: ask for it, not through `hop`.
-    fn ask_around(&mut self, dst: SignPk, hop: SignPk, now: Time) {
-        if self.best_unsuspected_route(&dst, None, now).is_some() {
-            return;
+    /// loss: ask for it, not through `hop`, of at most `limit` neighbours
+    /// (those that offered a route to it first, cheapest first). Returns
+    /// the requests sent.
+    fn ask_around(&mut self, dst: SignPk, hop: SignPk, limit: usize, now: Time) -> usize {
+        if limit == 0 || self.best_unsuspected_route(&dst, None, now).is_some() {
+            return 0;
         }
-        let targets: Vec<SignPk> = self.direct_up().filter(|k| *k != hop && *k != dst).collect();
-        if let Some(o) = self.origins.get_mut(&dst)
-            && o.last_req.is_none_or(|t| now.saturating_sub(t) >= SEQREQ_GAP)
-        {
-            o.last_req = Some(now);
-            let req = SeqReq { origin: dst, seq: o.newest + 1, hops: SEQREQ_HOPS };
-            for t in targets {
-                self.stats.seqreqs_sent += 1;
-                self.out.push(Out::SeqReq { to: t, req });
-            }
+        let mut targets: Vec<SignPk> = self.direct_up().filter(|k| *k != hop && *k != dst).collect();
+        if targets.len() > limit {
+            let o = self.origins.get(&dst);
+            let cost =
+                |k: &SignPk| o.and_then(|o| o.via.iter().find(|(n, _)| n == k)).map_or(u32::MAX, |(_, v)| v.cost);
+            targets.sort_by_key(|k| (cost(k), k.0));
+            targets.truncate(limit);
         }
+        let Some(o) = self.origins.get_mut(&dst) else { return 0 };
+        if o.last_req.is_some_and(|t| now.saturating_sub(t) < SEQREQ_GAP) {
+            return 0;
+        }
+        o.last_req = Some(now);
+        let req = SeqReq { origin: dst, seq: o.newest + 1, hops: SEQREQ_HOPS };
+        for t in &targets {
+            self.stats.seqreqs_sent += 1;
+            self.out.push(Out::SeqReq { to: *t, req });
+        }
+        targets.len()
     }
 
-    /// [`Defences::aggregate`]: `hop` was just suspected for a destination.
-    /// Suspected now for at least [`AGGREGATE_MIN`] distinct destinations,
-    /// and for more than it carried acknowledgements for lately, it is
-    /// avoided for every destination (but itself) for [`SUSPECT_FOR`]. Only
-    /// our own evidence counts (no one else's accusations, so nobody can
-    /// badmouth a relay to us), and a relay that delivers for most of what
-    /// it carries is never shunned for the rest.
+    /// [`Defences::aggregate`]: `hop` was just suspected for a destination,
+    /// or a destination it is suspected for acknowledged through another.
+    /// Suspected now for at least [`AGGREGATE_MIN`] distinct destinations
+    /// that acknowledged through another hop since (alive: not merely
+    /// offline), and for more than it carried acknowledgements for lately,
+    /// it is avoided for every destination (but itself) for
+    /// [`SUSPECT_FOR`]. Only our own evidence counts (no one else's
+    /// accusations), and a relay that delivers for most of what it carries
+    /// is never shunned for the rest. What it can't tell: whether the hop
+    /// or someone past it drops (an honest relay in front of a liar is
+    /// blamed too, as for one destination).
     fn aggregate(&mut self, hop: SignPk, now: Time) {
+        let acked_since = |d: &SignPk, until: Time| {
+            self.acked_via.get(d).is_some_and(|(via, at)| *via != hop && *at + SUSPECT_FOR >= until)
+        };
         let bad: Vec<SignPk> = self
             .suspects
             .iter()
-            .filter(|(_, v)| v.iter().any(|(k, t)| *k == hop && now < *t))
+            .filter(|(d, v)| v.iter().any(|(k, t)| *k == hop && now < *t && acked_since(d, *t)))
             .map(|(d, _)| *d)
             .collect();
         let good = self.vouched.get(&hop).map_or(0, |v| v.iter().filter(|(d, t)| now < *t && !bad.contains(d)).count());
@@ -1925,13 +2017,18 @@ impl Router {
         self.stats.hops_shunned += 1;
         self.next_sweep = self.next_sweep.min(now + SUSPECT_FOR);
         self.touch_all();
-        // our own destinations through it may need a fresh seqno too
-        let mut mine: Vec<SignPk> = self.sent_via.iter().filter(|(_, h)| **h == hop).map(|(d, _)| *d).collect();
-        mine.sort();
-        for dst in mine {
-            if dst != hop {
-                self.ask_around(dst, hop, now);
-            }
+        // our own recent destinations through it may need a fresh seqno too,
+        // the latest first, within a bound
+        let mut mine: Vec<(Time, SignPk)> = self
+            .sent_via
+            .iter()
+            .filter(|(d, (h, at))| *h == hop && **d != hop && now.saturating_sub(*at) < SUSPECT_FOR)
+            .map(|(d, (_, at))| (*at, *d))
+            .collect();
+        mine.sort_by_key(|(at, d)| (Reverse(*at), *d));
+        let mut left = SHUN_SEQREQS;
+        for (_, dst) in mine {
+            left -= self.ask_around(dst, hop, left, now);
         }
     }
 
@@ -2198,7 +2295,7 @@ impl Router {
             Next::Via(next) => {
                 // ours, along a mesh route: what `feedback` judges
                 if from.is_none() && !f.control && self.is_route_via(&target, &next) {
-                    bounded_insert(&mut self.sent_via, target, next);
+                    bounded_insert(&mut self.sent_via, target, (next, now));
                 }
                 self.forward(f, from, next, now)
             }
@@ -2593,6 +2690,7 @@ impl Router {
             v.retain(|(_, t)| now < *t);
             !v.is_empty()
         });
+        self.acked_via.retain(|_, (_, at)| now.saturating_sub(*at) < SUSPECT_FOR);
         // a long-quiet peer starts again from the minimum backoff
         self.backoff.retain(|_, (at, _)| now < *at + DIAL_BACKOFF_MAX);
         let mut next = Time::MAX;
