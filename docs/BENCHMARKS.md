@@ -901,8 +901,8 @@ messages of a 10 ms step delivered in order, no transport overhead;
 
 | Members | Gossip B per message (group), in step / jittered | Per member | Payload copies | Pulls |
 |---|---|---|---|---|
-| 10 | 8,332 / 8,582 | 833 / 858 | 9.0 | 0 |
-| 50 | 42,137 / 43,251 | 842 / 865 | 49.0 | 0 |
+| 10 | 8,332 / 8,498 | 833 / 849 | 9.0 | 0 |
+| 50 | 42,137 / 42,859 | 842 / 857 | 49.0 | 0 |
 | 200 | 170,275 / 172,431 | 851 / 862 | 199.0 | 0 |
 
 - The tree settles at one payload copy per member and about 850–900 B of

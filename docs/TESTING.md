@@ -289,6 +289,10 @@ Pro, two fuzzers at a time), in three rounds:
   a gossip announcement capped only by entry count could exceed the
   receiver's 64 KiB frame when an equivocating author lists 64 runs;
   entries are now capped at 24 KiB per message as well.
+- Round 5 (2026-10-21, after the tree fixes of BENCHMARKS.md §8.1, with a
+  new step in `sync_gossip`: a session or bundle from a peer):
+  `sync_gossip` 10 minutes at f54f5abe, 587 CPU-s (18,455 inputs, from
+  `fuzz/logs/runs.tsv`). Nothing failed.
 
 Totals per target range from about 10 minutes (`link_ble`, `trust_graph`)
 to about an hour (`sync_doc`); `mesh_wire` and `sync_change` are at about
