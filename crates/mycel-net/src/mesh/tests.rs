@@ -218,7 +218,7 @@ async fn hops_negotiate_versions_and_capabilities() {
 #[tokio::test(flavor = "multi_thread")]
 async fn bundles_cross_hops_by_their_format() {
     use super::dtn::{Bundle, BundleFormat};
-    use super::{Sent, bundle_id_of, bundle_signed, send_bundle, wall_ms};
+    use super::{Sent, bundle_id_of, bundle_signed, encode_offer, send_bundle, wall_ms};
     let net = MemNet::new(1, PathKind::Bluetooth);
     let a = versioned(Protocol::default(), &net).await;
     let b = versioned(Protocol::default(), &net).await;
@@ -247,7 +247,13 @@ async fn bundles_cross_hops_by_their_format() {
     assert!(!b.mesh.holds_bundle(&unknown_version.id));
 
     let v2 = signed(BundleFormat::v2(super::dtn::KIND_SPACE_SYNC), b"version 2");
+    // never offered (not merely refused: a v1 carrier would find the
+    // signature bad, after the offer had cost the hop its bytes)
+    assert!(encode_offer(WIRE_V1, &v2, 1).unwrap().is_none());
+    assert!(encode_offer(WIRE_V2, &v2, 1).unwrap().is_some());
+    assert!(encode_offer(WIRE_V1, &signed(BundleFormat::V1, b"v1"), 1).unwrap().is_some());
     assert!(matches!(send_bundle(&to_old, WIRE_V1, &v2, 1, &frames).await.unwrap(), Sent::Refused(false)));
+    assert_eq!(old.mesh.dtn_stats().refused, 0, "the version 1 carrier was never offered it");
     let v1 = signed(BundleFormat::V1, b"version 1");
     assert!(matches!(send_bundle(&to_old, WIRE_V1, &v1, 1, &frames).await.unwrap(), Sent::Took));
     assert!(old.mesh.holds_bundle(&v1.id) && !old.mesh.holds_bundle(&v2.id));
@@ -291,6 +297,7 @@ async fn the_planner_sends_bundles_only_over_hops_that_take_their_format() {
     // the planner has run many times since: the version 1 hop never got it
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!old.mesh.holds_bundle(&v2), "a version 2 bundle reached a version 1 carrier");
+    assert_eq!(old.mesh.dtn_stats().refused, 0, "nor was it offered there (it would refuse the signature)");
 }
 
 /// The queue management on a hop ([`super::Aqm`]), on a fake clock: a brief

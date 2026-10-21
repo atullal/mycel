@@ -17,7 +17,10 @@
 //! control and loss recovery; stream priorities send messages ahead of
 //! file bytes. No handshake per sync, and the connection's extra paths
 //! (links, other interfaces) stay open and measured. On wire version 2 the
-//! dialer's first stream is a capability hello ([`wire::StreamKind::Hello`]).
+//! dialer sends a capability hello ([`wire::StreamKind::Hello`]) on a
+//! stream of its own, beside the exchange it dialed for: the two race, so
+//! nothing may assume the hello arrives (or is answered) first, and a hello
+//! that fails is tried again later on the same connection.
 //!
 //! Sync protocol (stream kind `Sync`), one bi-stream, strictly alternating so
 //! neither side can deadlock on flow control:
@@ -53,7 +56,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, PublicKey, SecretKey,
     address_lookup::{MemoryLookup, UserData},
-    endpoint::{Connection, RecvStream, SendStream, presets},
+    endpoint::{ConnectOptions, Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
@@ -297,6 +300,11 @@ struct Inner {
     blob_served: AtomicU64,
     /// Capability hellos answered (one per connection a v2 peer dials).
     hellos_served: AtomicU64,
+    /// Capability hellos we sent that failed (see [`ConnectionCounts`]).
+    hellos_failed: AtomicU64,
+    /// Tests: refuse this many hellos we're sent, as a lossy path would.
+    #[cfg(test)]
+    drop_hellos: std::sync::atomic::AtomicU32,
     /// The last store-and-forward bundle sent per (member, space).
     bundled: Mutex<HashMap<(SignPk, SpaceId), Hash32>>,
     /// See [`NodeOptions::max_ephemeral`].
@@ -316,6 +324,10 @@ pub struct ConnectionCounts {
     pub dialed: u64,
     /// Accepted from peers.
     pub accepted: u64,
+    /// Capability hellos we sent on dialed connections that failed (lost
+    /// stream, timeout). Each is tried again later on the same connection,
+    /// a few times; meanwhile that connection has no capabilities.
+    pub hellos_failed: u64,
 }
 
 impl Inner {
@@ -792,6 +804,11 @@ async fn serve_hello(
     mut rx: RecvStream,
 ) -> Result<()> {
     let theirs = recv_hello(&mut rx, resources::FIRST_FRAME, &inner.frames(&peer)).await?;
+    #[cfg(test)]
+    if inner.drop_hellos.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+        tx.reset(0u32.into()).ok();
+        bail!("test: hello dropped");
+    }
     inner.hellos_served.fetch_add(1, Ordering::Relaxed);
     inner.note_accepted_protocol(peer, PeerProtocol::agreed(version, inner.protocol.caps, theirs.caps));
     send(&mut tx, &Hello::ours(inner.protocol.caps)).await?;
@@ -940,15 +957,19 @@ async fn serve_eph(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) -> Resu
 
 // ─────────────────────────────── client side ───────────────────────────────
 
-/// A fresh connection for another protocol ([`Node::connect`]).
-async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpn: &[u8]) -> Result<Connection> {
+/// A fresh connection for another protocol ([`Node::connect_offering`]):
+/// `alpns` newest first, the peer picks one.
+async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpns: &[&[u8]]) -> Result<Connection> {
     let addr = inner.addr_of(peer)?;
-    match tokio::time::timeout(CONNECT_TIMEOUT, inner.endpoint.connect(addr, alpn)).await {
+    let (first, rest) = alpns.split_first().ok_or_else(|| anyhow!("no protocol to offer"))?;
+    let options = ConnectOptions::new().with_additional_alpns(rest.iter().map(|a| a.to_vec()).collect());
+    let connect = async { anyhow::Ok(inner.endpoint.connect_with_opts(addr, first, options).await?.await?) };
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(c)) => {
             inner.watch(&c);
             Ok(c)
         }
-        Ok(Err(e)) => Err(e.into()),
+        Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow!("connect timed out")),
     }
 }
@@ -958,13 +979,14 @@ async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpn: &[u8]) -> Result<Conne
 pub(crate) async fn pooled(inner: &Arc<Inner>, peer: &SignPk) -> Result<PooledConn> {
     let c = inner.pool.get(peer).await?;
     inner.watch(&c);
-    if c.fresh {
+    if c.claim_hello() {
         start_hello(inner, *peer, &c);
     }
     Ok(c)
 }
 
-/// A connection we just dialed: agree on capabilities, beside whatever
+/// A connection we just dialed (or whose last hello failed a while ago:
+/// [`PooledConn::claim_hello`]): agree on capabilities, beside whatever
 /// exchange it was dialed for (nothing waits for this unless it needs a
 /// capability: [`PooledConn::protocol`]). Version 1 has no hello.
 fn start_hello(inner: &Arc<Inner>, peer: SignPk, c: &PooledConn) {
@@ -984,12 +1006,18 @@ fn start_hello(inner: &Arc<Inner>, peer: SignPk, c: &PooledConn) {
             tx.finish()?;
             recv_hello(&mut rx, resources::reply_timeout(len), &inner.reply_frames(&peer)).await
         };
-        let p = match hello.await {
-            Ok(theirs) => PeerProtocol::agreed(version, caps, theirs.caps),
-            Err(_) => PeerProtocol::baseline(version),
-        };
-        conn.set_protocol(p);
-        inner.note_protocol(peer, p);
+        match hello.await {
+            Ok(theirs) => {
+                let p = PeerProtocol::agreed(version, caps, theirs.caps);
+                conn.set_protocol(p);
+                inner.note_protocol(peer, p);
+            }
+            // (no capabilities until a later try succeeds)
+            Err(_) => {
+                inner.hellos_failed.fetch_add(1, Ordering::Relaxed);
+                conn.hello_failed(PeerProtocol::baseline(version));
+            }
+        }
     });
 }
 
@@ -1395,6 +1423,9 @@ impl Node {
             accepted: AtomicU64::new(0),
             blob_served: AtomicU64::new(0),
             hellos_served: AtomicU64::new(0),
+            hellos_failed: AtomicU64::new(0),
+            #[cfg(test)]
+            drop_hellos: Default::default(),
             bundled: Mutex::default(),
             max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
             protocol: opts.protocol,
@@ -1616,7 +1647,15 @@ impl Node {
     /// [`ExtraProtocol`]): dialed by key over every path the node knows
     /// (network, links, relay), with multipath failover.
     pub async fn connect(&self, peer: SignPk, alpn: &[u8]) -> Result<Connection> {
-        let res = connect(&self.inner, &peer, alpn).await;
+        self.connect_offering(peer, &[alpn]).await
+    }
+
+    /// [`Node::connect`] offering several versions of a protocol, newest
+    /// (preferred) first: the peer's TLS picks the first of its own it was
+    /// offered, which `Connection::alpn` then names. That is how a protocol
+    /// served beside the node's gets versions too (docs/PROTOCOL.md §1).
+    pub async fn connect_offering(&self, peer: SignPk, alpns: &[&[u8]]) -> Result<Connection> {
+        let res = connect(&self.inner, &peer, alpns).await;
         match &res {
             Ok(c) => {
                 self.inner.note_path(peer, c);
@@ -1646,6 +1685,7 @@ impl Node {
         ConnectionCounts {
             dialed: self.inner.pool.dialed.load(Ordering::Relaxed),
             accepted: self.inner.accepted.load(Ordering::Relaxed),
+            hellos_failed: self.inner.hellos_failed.load(Ordering::Relaxed),
         }
     }
 
@@ -1882,6 +1922,46 @@ mod version_tests {
         b.shutdown().await.unwrap();
     }
 
+    /// A hello lost on the way (as on a flaky Bluetooth or multi-hop path)
+    /// doesn't cost the connection its capabilities for good: it is
+    /// counted, the connection has none for now, and a later use of the
+    /// same connection tries again and agrees them. Tries are bounded.
+    #[tokio::test]
+    async fn a_failed_hello_is_retried_on_the_same_connection() {
+        let a = node("a", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        let b = node("b", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        a.add_peer_addr(b.addr());
+        b.inner.drop_hellos.store(1, Ordering::SeqCst);
+        let p = a.negotiate(b.id()).await.unwrap();
+        assert_eq!((p.version, p.caps), (WIRE_V2, Caps::NONE), "no capabilities while the hello failed");
+        assert_eq!(a.connection_counts().hellos_failed, 1);
+        // too soon to try again: still none, nothing sent
+        assert_eq!(a.negotiate(b.id()).await.unwrap().caps, Caps::NONE);
+        tokio::time::sleep(pool::HELLO_RETRY + Duration::from_millis(100)).await;
+        let p = a.negotiate(b.id()).await.unwrap();
+        assert_eq!((p.version, p.caps), (WIRE_V2, Caps::SYNC_V2), "agreed on the retry");
+        assert_eq!(a.peers()[&b.id()].protocol, Some(p));
+        let counts = a.connection_counts();
+        assert_eq!((counts.dialed, counts.hellos_failed), (1, 1), "same connection, one failure");
+        assert_eq!(b.inner.hellos_served.load(Ordering::Relaxed), 1);
+        a.shutdown().await.unwrap();
+
+        // every try lost: bounded, then the connection stays without
+        let c = node("c", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        c.add_peer_addr(b.addr());
+        b.inner.drop_hellos.store(u32::MAX, Ordering::SeqCst);
+        for i in 0..pool::HELLO_TRIES + 2 {
+            assert_eq!(c.negotiate(b.id()).await.unwrap().caps, Caps::NONE);
+            tokio::time::sleep(pool::HELLO_RETRY * 2u32.pow(i.min(pool::HELLO_TRIES)) + Duration::from_millis(50))
+                .await;
+        }
+        assert_eq!(c.connection_counts().hellos_failed, pool::HELLO_TRIES as u64);
+        assert_eq!(c.connection_counts().dialed, 1);
+        b.inner.drop_hellos.store(0, Ordering::SeqCst);
+        c.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
     /// Devices b has never dealt with (fresh keys cost nothing) dial it,
     /// on version 1 and with a hello on version 2: b answers them all but
     /// keeps no state about them, which nothing would ever remove. A member
@@ -1973,6 +2053,29 @@ mod version_tests {
         let _ = send(&mut tx, &Hello::ours(Caps::NONE)).await;
         let err = recv::<Hello>(&mut rx).await.unwrap_err();
         assert_eq!(err.downcast_ref::<VersionError>(), Some(&VersionError::StreamRefused), "{err:#}");
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    /// A node serves its versions newest first, so a dialer that offers
+    /// several lands on the newest, on the node protocol and on mesh hops
+    /// alike, even one listing the oldest first (TLS goes by the listener's
+    /// order). A node registering an old version first would quietly put
+    /// every current pair on it.
+    #[tokio::test]
+    async fn a_node_serves_its_newest_versions_first() {
+        let a = node("a", Protocol::default()).await;
+        let mut opts = NodeOptions::new(NetMode::Local, "b");
+        opts.mesh = Some(MeshOptions::default());
+        let b = Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap();
+        for (table, newest) in [(&wire::ALPNS, wire::ALPN_V2), (&mesh::ALPNS, mesh::ALPN_V2)] {
+            let oldest_first: Vec<&[u8]> = table.iter().map(|(_, a)| *a).collect();
+            let (first, rest) = oldest_first.split_first().unwrap();
+            let options = ConnectOptions::new().with_additional_alpns(rest.iter().map(|a| a.to_vec()).collect());
+            let conn = a.inner.endpoint.connect_with_opts(b.addr(), first, options).await.unwrap().await.unwrap();
+            assert_eq!(conn.alpn(), newest, "offered {oldest_first:?}");
+            conn.close(0u32.into(), b"");
+        }
         a.shutdown().await.unwrap();
         b.shutdown().await.unwrap();
     }

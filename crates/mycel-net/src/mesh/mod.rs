@@ -103,6 +103,12 @@ pub fn alpns(newest: WireVersion) -> Vec<&'static [u8]> {
     alpns_in(&ALPNS, newest)
 }
 
+/// The mesh wire version a hop connection runs: the one its handshake
+/// chose (1 for an ALPN that isn't ours, which a hop never has).
+fn hop_version(conn: &Connection) -> WireVersion {
+    version_of(conn.alpn()).unwrap_or(WIRE_V1)
+}
+
 /// The wire version a negotiated mesh ALPN stands for.
 pub fn version_of(alpn: &[u8]) -> Option<WireVersion> {
     version_in(&ALPNS, alpn)
@@ -606,11 +612,6 @@ impl Driver {
         self.hops.lock().get(peer).and_then(|h| h.live().cloned())
     }
 
-    /// The wire version of the hop connection to `peer` (1 if unknown).
-    fn hop_version(&self, peer: &SignPk) -> WireVersion {
-        self.hops.lock().get(peer).and_then(|h| h.protocol).map_or(WIRE_V1, |p| p.version)
-    }
-
     /// Dial a hop connection, offering every mesh version we speak.
     async fn dial_hop(&self, ep: &Endpoint, peer: SignPk) -> Option<Connection> {
         let id = iroh::PublicKey::from_bytes(&peer.0).ok()?;
@@ -805,7 +806,7 @@ impl Driver {
             h.dialed_by_us = conn.side().is_client();
             h.dgram_cap = conn.datagram_send_buffer_space();
             h.failures = 0;
-            h.protocol = Some(PeerProtocol::baseline(version_of(conn.alpn()).unwrap_or(WIRE_V1)));
+            h.protocol = Some(PeerProtocol::baseline(hop_version(&conn)));
         }
         self.send_hello(&conn);
         let direct = self.hops.lock().get(&peer).is_some_and(|h| h.direct);
@@ -1392,7 +1393,9 @@ impl Driver {
                 continue;
             };
             let me = self.clone();
-            let version = self.hop_version(&t.to);
+            // (from the connection itself: a hop replaced since `conn` was
+            // read can't pair this connection with another's version)
+            let version = hop_version(&conn);
             self.keep(tokio::spawn(async move {
                 let _slot = slot;
                 let frames = me.frames.peer(&t.to);

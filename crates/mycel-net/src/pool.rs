@@ -14,7 +14,11 @@
 //! A dial offers every wire version the node speaks (newest first, see
 //! [`crate::wire::alpns`]); the entry remembers the one the handshake chose
 //! and, on version 2 and later, the capabilities agreed in the hello
-//! (`crate::start_hello`).
+//! (`crate::start_hello`). A hello that fails (a stream lost on a flaky
+//! Bluetooth or multi-hop path, a timeout) is tried again on a later use of
+//! the connection, at most [`HELLO_TRIES`] times in all and no sooner than
+//! [`HELLO_RETRY`] (doubling) after the last failure; until one succeeds
+//! the connection has no capabilities.
 
 use std::collections::HashMap;
 use std::ops::Deref;
@@ -32,6 +36,24 @@ use tokio::sync::watch;
 use crate::version::{PeerProtocol, WireVersion};
 use crate::{CONNECT_TIMEOUT, to_endpoint_id, wire};
 
+/// Most capability hellos sent on one connection (the first and retries).
+pub(crate) const HELLO_TRIES: u32 = 3;
+/// How long after a failed hello the next one may go; doubled after each.
+pub(crate) const HELLO_RETRY: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(30) };
+
+/// Where a connection's capability hello stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HelloState {
+    /// Not sent yet: the connection was just dialed.
+    Due,
+    /// On its way (`tries` failed before it).
+    Sending { tries: u32 },
+    /// The last one failed at `at`; `tries` have failed in all.
+    Failed { at: Instant, tries: u32 },
+    /// Agreed (or version 1, which has no hello), or out of tries.
+    Done,
+}
+
 struct Entry {
     conn: Connection,
     /// Exchanges using it right now, and when the last one ended.
@@ -40,8 +62,9 @@ struct Entry {
     /// The wire version the handshake chose.
     version: WireVersion,
     /// What was agreed with the peer: set once its hello has been answered
-    /// (at once on version 1, which has none).
+    /// (at once on version 1, which has none), or failed.
     protocol: watch::Sender<Option<PeerProtocol>>,
+    hello: Mutex<HelloState>,
 }
 
 #[derive(Default)]
@@ -63,8 +86,6 @@ pub(crate) struct Pool {
 /// A pooled connection, held while one exchange uses it.
 pub(crate) struct PooledConn {
     entry: Arc<Entry>,
-    /// Dialed just now, for this lease: its hello is still to be sent.
-    pub(crate) fresh: bool,
 }
 
 impl PooledConn {
@@ -78,9 +99,43 @@ impl PooledConn {
         lease(&self.entry)
     }
 
+    /// Whether this lease should send the connection's hello: the
+    /// connection was just dialed, or its last hello failed long enough ago
+    /// and tries are left. True for one caller only; that caller then
+    /// reports the outcome ([`Self::set_protocol`] or
+    /// [`Self::hello_failed`]). Until a retry's outcome, the connection's
+    /// protocol is unknown again, so whoever needs a capability waits for it.
+    pub(crate) fn claim_hello(&self) -> bool {
+        let mut hello = self.entry.hello.lock();
+        let tries = match *hello {
+            HelloState::Due => 0,
+            HelloState::Failed { at, tries } if tries < HELLO_TRIES && at.elapsed() >= retry_after(tries) => {
+                self.entry.protocol.send_replace(None);
+                tries
+            }
+            _ => return false,
+        };
+        *hello = HelloState::Sending { tries };
+        true
+    }
+
     /// Record what was agreed with the peer (the hello's outcome).
     pub(crate) fn set_protocol(&self, p: PeerProtocol) {
+        *self.entry.hello.lock() = HelloState::Done;
         self.entry.protocol.send_replace(Some(p));
+    }
+
+    /// The hello failed: no capabilities for now (`baseline`), and another
+    /// try on a later use if any are left. Returns how many have failed.
+    pub(crate) fn hello_failed(&self, baseline: PeerProtocol) -> u32 {
+        let mut hello = self.entry.hello.lock();
+        let tries = match *hello {
+            HelloState::Sending { tries } => tries + 1,
+            _ => 1,
+        };
+        *hello = if tries < HELLO_TRIES { HelloState::Failed { at: Instant::now(), tries } } else { HelloState::Done };
+        self.entry.protocol.send_replace(Some(baseline));
+        tries
     }
 
     /// What was agreed with the peer, waiting up to `wait` for its hello
@@ -112,7 +167,12 @@ impl Drop for PooledConn {
 
 fn lease(entry: &Arc<Entry>) -> PooledConn {
     entry.users.fetch_add(1, Ordering::SeqCst);
-    PooledConn { entry: entry.clone(), fresh: false }
+    PooledConn { entry: entry.clone() }
+}
+
+/// How long after the `tries`-th failed hello the next may go.
+fn retry_after(tries: u32) -> Duration {
+    HELLO_RETRY * 2u32.saturating_pow(tries.saturating_sub(1))
 }
 
 impl Pool {
@@ -164,9 +224,9 @@ impl Pool {
             last_used: Mutex::new(Instant::now()),
             version,
             protocol: watch::Sender::new(None),
+            hello: Mutex::new(HelloState::Due),
         });
-        let mut leased = lease(&entry);
-        leased.fresh = true;
+        let leased = lease(&entry);
         *slot.entry.lock() = Some(entry);
         Ok(leased)
     }
