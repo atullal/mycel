@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run on a configured development machine with Rust, Node, and cargo-audit.
+# Run on a configured development machine with Rust, Node, and cargo-deny.
 # No retries: a failed security regression must remain a failure.
 set -euo pipefail
 cd "$(dirname "$0")/.."
