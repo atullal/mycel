@@ -30,32 +30,53 @@ static NSString *const MycelProcessingTask = @"dev.mycel.processing";
 static const uint32_t MycelRefreshSeconds = 25;
 static const uint32_t MycelProcessingSeconds = 120;
 
-/// Ask for the next launches. iOS decides when (or whether) they happen; the
-/// Simulator never runs them and refuses the request.
-static void MycelScheduleBackgroundTasks(void) {
-  BGTaskScheduler *scheduler = [BGTaskScheduler sharedScheduler];
+/// Ask for the next launch of kind `identifier`. iOS decides when (or
+/// whether) it happens; the Simulator never runs them and refuses the
+/// request. A request replaces a pending one with the same identifier
+/// (pushing its earliest date out again), so callers only ask for a kind
+/// that just ran or isn't queued.
+static void MycelScheduleBackgroundTask(NSString *identifier) {
+  BGTaskRequest *request = nil;
+  if ([identifier isEqualToString:MycelRefreshTask]) {
+    BGAppRefreshTaskRequest *refresh = [[BGAppRefreshTaskRequest alloc] initWithIdentifier:MycelRefreshTask];
+    refresh.earliestBeginDate = [NSDate dateWithTimeIntervalSinceNow:15 * 60];
+    request = refresh;
+  } else {
+    BGProcessingTaskRequest *processing = [[BGProcessingTaskRequest alloc] initWithIdentifier:MycelProcessingTask];
+    processing.earliestBeginDate = [NSDate dateWithTimeIntervalSinceNow:60 * 60];
+    processing.requiresNetworkConnectivity = NO; // peers may be on a Wi-Fi with no internet
+    processing.requiresExternalPower = NO;
+    request = processing;
+  }
   NSError *error = nil;
-  BGAppRefreshTaskRequest *refresh = [[BGAppRefreshTaskRequest alloc] initWithIdentifier:MycelRefreshTask];
-  refresh.earliestBeginDate = [NSDate dateWithTimeIntervalSinceNow:15 * 60];
-  if (![scheduler submitTaskRequest:refresh error:&error]) {
-    NSLog(@"mycel: background refresh not scheduled: %@", error.localizedDescription);
+  if (![[BGTaskScheduler sharedScheduler] submitTaskRequest:request error:&error]) {
+    NSLog(@"mycel: background task %@ not scheduled: %@", identifier, error.localizedDescription);
   }
-  BGProcessingTaskRequest *processing = [[BGProcessingTaskRequest alloc] initWithIdentifier:MycelProcessingTask];
-  processing.earliestBeginDate = [NSDate dateWithTimeIntervalSinceNow:60 * 60];
-  processing.requiresNetworkConnectivity = NO; // peers may be on a Wi-Fi with no internet
-  processing.requiresExternalPower = NO;
-  error = nil;
-  if (![scheduler submitTaskRequest:processing error:&error]) {
-    NSLog(@"mycel: background processing not scheduled: %@", error.localizedDescription);
-  }
+}
+
+/// Ask for whichever kinds aren't queued already (leaving queued ones and
+/// their dates alone: resubmitting the processing task each time the user
+/// leaves the app would keep it an hour away forever).
+static void MycelScheduleMissingBackgroundTasks(void) {
+  [[BGTaskScheduler sharedScheduler] getPendingTaskRequestsWithCompletionHandler:^(NSArray<BGTaskRequest *> *pending) {
+    for (NSString *identifier in @[ MycelRefreshTask, MycelProcessingTask ]) {
+      BOOL queued = NO;
+      for (BGTaskRequest *request in pending) {
+        queued = queued || [request.identifier isEqualToString:identifier];
+      }
+      if (!queued) {
+        MycelScheduleBackgroundTask(identifier);
+      }
+    }
+  }];
 }
 
 /// Catch up for at most `seconds`, off the main thread; completes the task
 /// exactly once, early if iOS takes the time back.
 static void MycelRunBackgroundTask(BGTask *task, uint32_t seconds) {
-  // Schedule the next launch first, so one stays queued even if this one
-  // is cut short.
-  MycelScheduleBackgroundTasks();
+  // Schedule the next launch of this kind first, so one stays queued even
+  // if this one is cut short (the other kind keeps its own date).
+  MycelScheduleBackgroundTask(task.identifier);
   auto done = std::make_shared<std::atomic<bool>>(false);
   // This launch's catch-up, taken before the expiration handler is set: a
   // cancel stops it even before the queued block starts, and never stops
@@ -89,12 +110,12 @@ static void MycelRegisterBackgroundTasks(void) {
                              launchHandler:^(__kindof BGTask *task) {
                                MycelRunBackgroundTask(task, MycelProcessingSeconds);
                              }];
-  // Ask again every time the user leaves the app.
+  // Every time the user leaves the app, ask for the kinds not queued.
   [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
                                                     object:nil
                                                      queue:nil
                                                 usingBlock:^(NSNotification *note) {
-                                                  MycelScheduleBackgroundTasks();
+                                                  MycelScheduleMissingBackgroundTasks();
                                                 }];
 }
 
