@@ -264,8 +264,11 @@ wall and 415–480 s of CPU before (two runs) and 110 s and 428 s after;
 peak memory 1.0–1.2 GB before, 1.3 GB after. `global-scale` at 2,002
 devices, alternating before/after twice: 78.8 and 93.9 s of CPU before,
 89.6 and 90.4 s after (the global core's own run: 21 and 23 s wall
-before, 22 and 23 s after, for 27.0 M and 26.9 M events). So no cost
-beyond the machine's noise, which here is ±10%; there is no cheaper
+before, 22 and 23 s after, for 27.0 M and 26.9 M events). Full-size
+`adversarial`: 240 → 308 s wall in one pair of runs, 213 → 179 s (475 →
+418 s of CPU) in the next; at scale 0.3, alternating twice, 19.0 and
+19.1 s of CPU before, 19.6 and 19.4 s after. So no cost we can tell from
+the machine's noise, which here is ±10–20% between runs; there is no cheaper
 profile to keep (the hand-written sizes cost the same). Full-size
 `flood-scaling` peaked at 10.4 GB of memory after, 9.4 GB before (one
 run each, on different load: 1,297 s and 615 s wall).
