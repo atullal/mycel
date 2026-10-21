@@ -23,6 +23,8 @@ fn space() -> mycel_trust::SpaceId {
 }
 
 type D = Disseminator<ModelOp, ModelEnv>;
+/// A message on its way: due time, delivery order, from, to.
+type InFlight = (u64, u64, usize, usize, GossipMsg<ModelOp, ModelEnv>);
 
 struct Net {
     keys: Vec<SignPk>,
@@ -39,7 +41,7 @@ struct Net {
     /// Jittered delivery: each message takes `lo..=hi` ms (seeded), so
     /// pushes cross and arrive out of order as on a real network.
     jitter: Option<Jitter>,
-    inflight: Vec<(u64, u64, usize, usize, GossipMsg<ModelOp, ModelEnv>)>,
+    inflight: Vec<InFlight>,
     step_ms: u64,
     /// Announcements delivered, per (from, to).
     ihaves: HashMap<(usize, usize), u64>,
@@ -576,6 +578,64 @@ fn an_author_hears_back_from_neighbours_its_push_reached() {
     for i in 1..3 {
         assert!(net.ihaves.get(&(i, 0)).copied().unwrap_or(0) >= 1, "{i} announced back to the author");
     }
+}
+
+/// Are the eager edges one connected tree over everyone?
+fn eager_connected(net: &Net) -> bool {
+    let mut seen = BTreeSet::from([0usize]);
+    let mut stack = vec![0usize];
+    while let Some(i) = stack.pop() {
+        for (p, eager) in net.ds[i].neighbours(&space()) {
+            let j = net.ix(&p);
+            if eager && seen.insert(j) {
+                stack.push(j);
+            }
+        }
+    }
+    seen.len() == net.ds.len()
+}
+
+/// Regression (QUIC benchmark, 50 members: messages bimodal at 50 ms and
+/// 1.3 s): a session with a member outside our neighbours (an author's
+/// session to a member whose hello it hasn't seen, or anti-entropy) that
+/// is faster than the tree used to cut the tree. The receiver pushed the
+/// item on and pruned its tree parent's late push as a duplicate; the
+/// parent pruned the receiver's push likewise, so the edge went lazy at
+/// both ends and the receiver's subtree hung off nothing: every later
+/// message reached it only after an announcement timed out. Now such a
+/// session's items are announced, not pushed, and only items that reached
+/// us along the tree make an edge redundant.
+#[test]
+fn a_session_faster_than_the_tree_does_not_cut_it() {
+    let n = 30;
+    let mut net = Net::new(n as u16, internet).jittered(7, 2, 30);
+    net.run(500);
+    for w in 0..5 {
+        net.write(w, 1, 300);
+        net.run(3_000);
+    }
+    assert!(eager_connected(&net), "the tree formed");
+    for w in 0..6 {
+        let author = (w * 7) % n;
+        let ids = net.write(author, 1, 300);
+        // Members outside the author's neighbours get it by session at once.
+        let outside: Vec<usize> =
+            (0..n).filter(|j| *j != author && !net.ds[author].is_neighbour(&space(), &net.keys[*j])).take(3).collect();
+        for j in outside {
+            net.session(j, author);
+        }
+        net.run(3_000);
+        assert_eq!(net.holders(&ids[0]), n);
+    }
+    assert!(eager_connected(&net), "sessions faster than the tree didn't cut it");
+    let timeouts: u64 = net.ds.iter().map(|d| d.stats().ihave_timeouts).sum();
+    let before: u64 = net.copies.iter().sum();
+    let ids = net.write(11, 1, 300);
+    net.run(3_000);
+    assert_eq!(net.holders(&ids[0]), n);
+    assert_eq!(net.ds.iter().map(|d| d.stats().ihave_timeouts).sum::<u64>(), timeouts, "no repair needed");
+    let copies = net.copies.iter().sum::<u64>() - before;
+    assert!(copies as f64 <= 1.5 * (n - 1) as f64, "{copies} copies");
 }
 
 /// Dissemination cost on model sets (real postcard sizes, no transport

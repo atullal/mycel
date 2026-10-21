@@ -101,17 +101,26 @@ const QUEUE_ITEMS: usize = 256;
 const QUEUE_BYTES: usize = 256 * 1024;
 /// Ids a neighbour said it has, remembered per link.
 const SKIP_REMEMBERED: usize = 4096;
+/// Ids that reached us along the tree (a push, or our own write),
+/// remembered to tell a redundant edge from a session that was faster.
+const TREE_REMEMBERED: usize = 2048;
 
 const CTX_VIEW: &str = "mycel/v2/gossip-view";
 
-/// An envelope as gossip sees it: its id.
+/// An envelope as gossip sees it: its id and author (forwarding queues
+/// are per author).
 pub trait GossipItem {
     fn gossip_id(&self) -> EnvelopeId;
+    fn gossip_author(&self) -> SignPk;
 }
 
 impl GossipItem for crate::Envelope {
     fn gossip_id(&self) -> EnvelopeId {
         self.id()
+    }
+
+    fn gossip_author(&self) -> SignPk {
+        self.header.author
     }
 }
 
@@ -119,6 +128,10 @@ impl GossipItem for crate::Envelope {
 impl GossipItem for super::model::ModelEnv {
     fn gossip_id(&self) -> EnvelopeId {
         self.id()
+    }
+
+    fn gossip_author(&self) -> SignPk {
+        self.author
     }
 }
 
@@ -222,7 +235,10 @@ pub struct GossipStats {
     pub haves_sent: u64,
     pub grafts_sent: u64,
     pub prunes_sent: u64,
+    /// Sessions asked for, and of those, announcements that weren't
+    /// covered in time (the tree missed something, or was slow).
     pub pulls: u64,
+    pub ihave_timeouts: u64,
     /// Items received by push, and those already held.
     pub items_received: u64,
     pub duplicates: u64,
@@ -261,6 +277,17 @@ struct View {
     seen_set: HashSet<Hash32>,
     /// Round-robin position for anti-entropy partners.
     rr: usize,
+}
+
+/// What [`Disseminator::on_msg`] learnt of a push before the driver
+/// ingested it.
+struct LastPush<E> {
+    from: SignPk,
+    /// All of it had reached us along the tree already (a redundant edge).
+    redundant: bool,
+    /// Items we held, but only from a session or bundle (announced, never
+    /// pushed on): the tree reached us now, so they go on down it.
+    off_tree: Vec<(SignPk, E)>,
 }
 
 /// Aggregated announcement.
@@ -371,6 +398,11 @@ pub struct Disseminator<O, E> {
     links: HashMap<SignPk, Link<E>>,
     out: VecDeque<Action<O, E>>,
     stats: GossipStats,
+    /// Recent ids that reached us along the tree (see [`Self::after_push`]).
+    tree_ids: HashSet<EnvelopeId>,
+    tree_order: VecDeque<EnvelopeId>,
+    /// The last push [`Self::on_msg`] saw, for [`Self::after_push`].
+    last_push: Option<LastPush<E>>,
 }
 
 impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E> {
@@ -382,6 +414,9 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
             links: HashMap::new(),
             out: VecDeque::new(),
             stats: Default::default(),
+            tree_ids: HashSet::new(),
+            tree_order: VecDeque::new(),
+            last_push: None,
         }
     }
 
@@ -526,12 +561,30 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
         if changed.is_empty() && !ops_changed {
             return;
         }
+        // Where the change came from decides whether it travels the tree.
+        // A local write, a push, or a session with a neighbour: pushed on
+        // (a session with a lazy neighbour that brought something means
+        // the tree missed it: the edge becomes eager, as after a graft).
+        // A session or bundle from anyone else: only announced. Pushing it
+        // would race the tree's own push, and the duplicates on both sides
+        // would prune the edge to our tree parent and cut us off.
+        let tree = match from {
+            None => true,
+            Some(p) if view.is_neighbour(&p) => {
+                if view.lazy.remove(&p) {
+                    self.out.push_back(Action::Send { to: p, msg: GossipMsg::Graft { space } });
+                    self.stats.grafts_sent += 1;
+                }
+                true
+            }
+            Some(_) => false,
+        };
         // What is new: per changed author, the seqs above what the last
         // announcement covered on that branch.
         let mut items: Vec<(SignPk, E)> = Vec::new();
         let mut bytes = 0usize;
-        let mut fits = true;
-        'authors: for e in &changed {
+        let mut fits = tree;
+        'authors: for e in changed.iter().filter(|_| tree) {
             let old = view.announced.entries.get(&e.author);
             for run in &e.runs {
                 let lo = old
@@ -556,6 +609,11 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
             }
         }
         let mut new_ops: Vec<O> = Vec::new();
+        if fits {
+            for (_, env) in &items {
+                remember_tree(&mut self.tree_ids, &mut self.tree_order, env.gossip_id());
+            }
+        }
         if ops_changed && fits {
             let base: Vec<OpId> = view.announced.ops.iter().filter(|o| set.holds_op(o)).copied().collect();
             let after = set.ops_after(&base);
@@ -586,35 +644,10 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
                     self.stats.pushes_sent += 1;
                 }
             }
-            let (fast, slow, burst) = (self.cfg.fast_rate, self.cfg.slow_rate, self.cfg.burst);
-            for p in &eager {
-                let slow_link = view.members.get(p).is_some_and(|m| m.slow);
-                let link =
-                    self.links.entry(*p).or_insert_with(|| Link::new(if slow_link { slow } else { fast }, burst, now));
-                for (author, env) in &items {
-                    let id = env.gossip_id();
-                    if link.skip.contains(&id) {
-                        self.stats.skipped_by_have += 1;
-                        continue;
-                    }
-                    let size = encoded_len(env);
-                    let (q, qbytes) = link.queues.entry(*author).or_insert_with(|| (VecDeque::new(), 0));
-                    if q.is_empty() {
-                        link.order.push_back(*author);
-                    }
-                    q.push_back(Queued { space, author: *author, id, size, item: env.clone() });
-                    *qbytes += size;
-                    while q.len() > QUEUE_ITEMS || *qbytes > QUEUE_BYTES {
-                        if let Some(old) = q.pop_front() {
-                            *qbytes -= old.size;
-                            self.stats.queue_dropped += 1;
-                        }
-                    }
-                }
-            }
         } else {
-            // Too much for a push: announce to eager neighbours too (they
-            // pull what they lack in a session).
+            // Too much for a push, or not from the tree: announce to eager
+            // neighbours too (they pull what they lack in a session, unless
+            // the tree brings it first).
             for p in &eager {
                 let seen = take_seen(view, p);
                 self.out.push_back(Action::Send {
@@ -629,6 +662,10 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
                 self.stats.ihaves_sent += 1;
             }
         }
+        if fits {
+            self.enqueue(space, &eager, &items, now);
+        }
+        let Some(view) = self.views.get_mut(&space) else { return };
         // Lazy announcement, aggregated.
         let due = now + IHAVE_DELAY_MS;
         let ack = from.filter(|f| entries.iter().any(|e| e.author == *f) && view.is_neighbour(f));
@@ -648,6 +685,38 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
             agg.from = None;
         }
         view.announced = Announced { entries: cur, ops };
+    }
+
+    /// Queue `items` (author, item) to each of `to`'s links, unless the
+    /// neighbour said it has them; a queue over its cap drops its oldest.
+    fn enqueue(&mut self, space: SpaceId, to: &[SignPk], items: &[(SignPk, E)], now: u64) {
+        let (fast, slow, burst) = (self.cfg.fast_rate, self.cfg.slow_rate, self.cfg.burst);
+        let Some(view) = self.views.get(&space) else { return };
+        for p in to {
+            let slow_link = view.members.get(p).is_some_and(|m| m.slow);
+            let link =
+                self.links.entry(*p).or_insert_with(|| Link::new(if slow_link { slow } else { fast }, burst, now));
+            for (author, env) in items {
+                let id = env.gossip_id();
+                if link.skip.contains(&id) {
+                    self.stats.skipped_by_have += 1;
+                    continue;
+                }
+                let size = encoded_len(env);
+                let (q, qbytes) = link.queues.entry(*author).or_insert_with(|| (VecDeque::new(), 0));
+                if q.is_empty() {
+                    link.order.push_back(*author);
+                }
+                q.push_back(Queued { space, author: *author, id, size, item: env.clone() });
+                *qbytes += size;
+                while q.len() > QUEUE_ITEMS || *qbytes > QUEUE_BYTES {
+                    if let Some(old) = q.pop_front() {
+                        *qbytes -= old.size;
+                        self.stats.queue_dropped += 1;
+                    }
+                }
+            }
+        }
     }
 
     /// A message from `from` (whose membership of the message's space the
@@ -689,6 +758,27 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
                     }
                 }
                 self.stats.items_received += items.len() as u64;
+                // Redundant (Plumtree's duplicate): everything had reached
+                // us along the tree already. Items a session brought first
+                // don't make the edge redundant: it may be our tree parent.
+                let redundant = !items.is_empty()
+                    && items
+                        .iter()
+                        .all(|e| set.index().holds(&e.gossip_id()) && self.tree_ids.contains(&e.gossip_id()));
+                let off_tree: Vec<(SignPk, E)> = items
+                    .iter()
+                    .filter(|e| set.index().holds(&e.gossip_id()) && !self.tree_ids.contains(&e.gossip_id()))
+                    .map(|e| (e.gossip_author(), e.clone()))
+                    .collect();
+                for (_, e) in &off_tree {
+                    remember_tree(&mut self.tree_ids, &mut self.tree_order, e.gossip_id());
+                }
+                self.last_push = Some(LastPush { from, redundant, off_tree });
+                for e in &items {
+                    if !set.index().holds(&e.gossip_id()) {
+                        remember_tree(&mut self.tree_ids, &mut self.tree_order, e.gossip_id());
+                    }
+                }
                 // IDONTWANT: large new items, before we forward them.
                 let large: Vec<EnvelopeId> = items
                     .iter()
@@ -818,6 +908,12 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
     /// new makes the edge eager on our side too, and is forwarded
     /// ([`Self::on_changed`]).
     ///
+    /// "Nothing new" counts only if all of it had reached us along the tree
+    /// (by push, or as our own write), as [`Self::on_msg`] saw the push
+    /// just before: an item a session or bundle brought first says nothing
+    /// about the edge, which may be our tree parent's. Such an item was
+    /// only announced when it came; it is pushed on down the tree now.
+    ///
     /// Both rules keep the two ends of an edge agreeing, which the tree
     /// depends on: a `Prune` and a `Graft` that cross, or a prune lost with
     /// a failed path, leave one end eager and the other lazy. Without them
@@ -825,31 +921,44 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
     /// ours to it.
     pub fn after_push<S: SyncSet<Op = O, Env = E>>(&mut self, set: &S, from: SignPk, items: usize, new: u64, now: u64) {
         let space = set.space();
-        if new == 0 {
-            if items > 0 {
-                self.stats.duplicates += items as u64;
-                // A prune even if the edge is lazy here already: the sender
-                // still treats it as eager.
-                if let Some(view) = self.views.get_mut(&space)
-                    && view.is_neighbour(&from)
-                {
-                    view.lazy.insert(from);
-                    self.out.push_back(Action::Send {
-                        to: from,
-                        msg: GossipMsg::Prune { space, drop: false, alternatives: Vec::new() },
-                    });
-                    self.stats.prunes_sent += 1;
-                }
+        let (redundant, off_tree) = match self.last_push.take() {
+            Some(l) if l.from == from => (l.redundant, l.off_tree),
+            _ => (false, Vec::new()),
+        };
+        if new == 0 && items > 0 {
+            self.stats.duplicates += items as u64;
+        } else {
+            self.stats.duplicates += (items as u64).saturating_sub(new);
+        }
+        let Some(view) = self.views.get_mut(&space) else { return };
+        if !view.is_neighbour(&from) {
+            if new > 0 {
+                self.on_changed(set, Some(from), now);
             }
             return;
         }
-        self.stats.duplicates += (items as u64).saturating_sub(new);
-        if let Some(view) = self.views.get_mut(&space)
-            && view.is_neighbour(&from)
-        {
-            view.lazy.remove(&from);
+        if new == 0 && items > 0 && redundant {
+            // A prune even if the edge is lazy here already: the sender
+            // still treats it as eager.
+            view.lazy.insert(from);
+            self.out.push_back(Action::Send {
+                to: from,
+                msg: GossipMsg::Prune { space, drop: false, alternatives: Vec::new() },
+            });
+            self.stats.prunes_sent += 1;
+            return;
         }
-        self.on_changed(set, Some(from), now);
+        if new == 0 && off_tree.is_empty() {
+            return;
+        }
+        view.lazy.remove(&from);
+        if !off_tree.is_empty() {
+            let eager = view.eager(Some(from));
+            self.enqueue(space, &eager, &off_tree, now);
+        }
+        if new > 0 {
+            self.on_changed(set, Some(from), now);
+        }
     }
 
     /// Ask for a session with `peer` in `space` now (a push the set
@@ -984,6 +1093,7 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
                 }
                 self.out.push_back(Action::Pull { peer: p, space: *space });
                 self.stats.pulls += 1;
+                self.stats.ihave_timeouts += 1;
             }
         }
     }
@@ -1101,6 +1211,18 @@ impl std::fmt::Display for GossipError {
 }
 
 impl std::error::Error for GossipError {}
+
+/// Remember an id that reached us along the tree (bounded, oldest out).
+fn remember_tree(ids: &mut HashSet<EnvelopeId>, order: &mut VecDeque<EnvelopeId>, id: EnvelopeId) {
+    if ids.insert(id) {
+        order.push_back(id);
+        if order.len() > TREE_REMEMBERED
+            && let Some(old) = order.pop_front()
+        {
+            ids.remove(&old);
+        }
+    }
+}
 
 /// At most [`MAX_ENTRIES`] entries and [`ENTRIES_BYTES`] of them.
 fn cap_entries(entries: impl Iterator<Item = AuthorEntry>) -> Vec<AuthorEntry> {

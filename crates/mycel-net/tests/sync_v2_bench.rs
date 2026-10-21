@@ -224,6 +224,20 @@ async fn bench_dissemination_over_quic() {
             let sessions = nodes.iter().map(|m| m.sync_v2_totals().client_sessions).sum::<u64>() - sessions0;
             rows.push((after.0 - before.0, after.1 - before.1, copies, sessions, took));
         }
+        let st = |f: &dyn Fn(&mycel_net::GossipStats) -> u64| nodes.iter().map(|m| f(&m.gossip_stats())).sum::<u64>();
+        let tt = |f: &dyn Fn(&mycel_net::GossipTotals) -> u64| nodes.iter().map(|m| f(&m.gossip_totals())).sum::<u64>();
+        println!(
+            "<!-- {n}: totals: prunes {} grafts {} pulls {} (timeouts {}) duplicates {} queue drops {} send failures {}; eager edges {} of {} -->",
+            st(&|s| s.prunes_sent),
+            st(&|s| s.grafts_sent),
+            st(&|s| s.pulls),
+            st(&|s| s.ihave_timeouts),
+            st(&|s| s.duplicates),
+            st(&|s| s.queue_dropped),
+            tt(&|t| t.send_failures),
+            nodes.iter().map(|m| m.gossip_neighbours(&space).iter().filter(|(_, e)| *e).count()).sum::<usize>(),
+            nodes.iter().map(|m| m.gossip_neighbours(&space).len()).sum::<usize>(),
+        );
         // The first messages form the tree (prunes); report the last five.
         let tail = &rows[5..];
         let avg = |f: &dyn Fn(&Row) -> f64| tail.iter().map(f).sum::<f64>() / tail.len() as f64;
@@ -233,7 +247,10 @@ async fn bench_dissemination_over_quic() {
         let ss = avg(&|r| r.3 as f64);
         let t = avg(&|r| r.4.as_secs_f64() * 1000.0);
         println!("| {n} | {s:.0} | {:.0} | {u:.0} | {c:.1} | {ss:.1} | {t:.0} ms |", s / n as f64);
-        println!("<!-- {n}: warm-up rows {:?} -->", &rows[..5].iter().map(|r| (r.0, r.2, r.3)).collect::<Vec<_>>());
+        println!(
+            "<!-- {n}: rows (stream B, copies, sessions, ms) {:?} -->",
+            rows.iter().map(|r| (r.0, r.2, r.3, r.4.as_millis())).collect::<Vec<_>>()
+        );
         for m in nodes {
             m.shutdown().await.unwrap();
         }
