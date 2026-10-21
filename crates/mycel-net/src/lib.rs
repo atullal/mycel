@@ -22,8 +22,13 @@
 //! nothing may assume the hello arrives (or is answered) first, and a hello
 //! that fails is tried again later on the same connection.
 //!
-//! Sync protocol (stream kind `Sync`), one bi-stream, strictly alternating so
-//! neither side can deadlock on flow control:
+//! Sync v2 (stream kind `SyncV2`, wire version 2 and later, `sync_v2.rs`
+//! driving `mycel_sync::reconcile`): an idle check costs one round trip and
+//! a few hundred bytes, a difference costs about what differs. It is used
+//! with a peer whose hello agreed [`Caps::SYNC_V2`]; with any other peer,
+//! or one that refuses the stream anyway, the opener uses v1 (stream kind
+//! `Sync`), one bi-stream, strictly alternating so neither side can
+//! deadlock on flow control:
 //!
 //! ```text
 //! C → S  Hello{space, inv, invite?}
@@ -31,6 +36,15 @@
 //! C → S  DataAndWant{data, want}
 //! S → C  Data{data}
 //! ```
+//!
+//! Scheduling: after a change a device syncs the space with every member in
+//! groups of up to [`FULL_MESH`] devices, and otherwise with a bounded view
+//! (two nearby members, two chosen at random by rendezvous hash, and those
+//! that recently chose it), forwarding what it learns the same way; so a
+//! change costs O(members) sessions, not O(members²). Periodic
+//! anti-entropy backs off from 15 s to 10 min while it finds nothing, and
+//! returns to 15 s on signs of loss (a periodic session that moved items, a
+//! membership change, a local write, a newly reachable peer).
 
 mod blobs;
 pub mod emu;
@@ -40,6 +54,7 @@ pub mod mesh;
 mod native_mdns;
 mod pool;
 mod resources;
+mod sync_v2;
 pub mod version;
 pub mod wire;
 
@@ -71,6 +86,7 @@ pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_fr
 pub use iroh;
 pub use link::{Link, LinkEvent, LinkStatus, PathKind, path_in_use};
 pub use mesh::{Mesh, MeshOptions, MeshRoute, MeshStats, Tap};
+pub use sync_v2::{V1_REMEMBERED, V2Totals};
 pub use version::{Caps, PeerProtocol, Protocol, VersionError, WireVersion};
 use version::{Hello, STREAM_REFUSED, WIRE_V2};
 use wire::*;
@@ -84,7 +100,28 @@ pub const POOL_IDLE: Duration = Duration::from_secs(60);
 /// away only fails once the peer has had [`resources::REPLY_TIMEOUT`] to
 /// answer, and a passer-by who could carry it may be gone by then.
 const BUNDLE_AFTER: Duration = Duration::from_secs(10);
+/// How long [`Node::sync_with`] keeps retrying a peer that answers `Busy`.
+pub const EXPLICIT_BUSY_WAIT: Duration = Duration::from_secs(300);
+/// Background retries after `Busy` (see `sync_once`).
+const BUSY_RETRIES: u32 = 3;
+/// Periodic anti-entropy: the first interval, and the cap it backs off to
+/// while periodic sessions find nothing.
 const PERIODIC_SYNC: Duration = Duration::from_secs(15);
+const PERIODIC_MAX: Duration = Duration::from_secs(600);
+/// Groups up to this size sync every member after a change; larger ones a
+/// bounded view (see the crate docs).
+pub const FULL_MESH: usize = 6;
+/// The bounded view: nearby members, random members, and at most this many
+/// members that recently chose us.
+const VIEW_NEARBY: usize = 2;
+const VIEW_RANDOM: usize = 2;
+const VIEW_INBOUND: usize = 8;
+/// The author of a change pushes it to every member in groups up to this
+/// size (one hop to everyone it can reach, O(members) sessions); larger
+/// groups use the bounded view for the author too.
+pub const AUTHOR_FULL: usize = 32;
+/// Views are re-drawn this often.
+const VIEW_EPOCH: Duration = Duration::from_secs(600);
 /// How long shutting down waits for peers to acknowledge the close.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const ONLINE_WINDOW: Duration = Duration::from_secs(45);
@@ -159,6 +196,11 @@ pub struct NodeOptions {
     /// the node protocol and the mesh alike (docs/PROTOCOL.md). Default:
     /// everything this build speaks.
     pub protocol: Protocol,
+    /// Speak Sync v2 (default). Off: behave as a build without it (don't
+    /// advertise [`Caps::SYNC_V2`] even if `protocol` lists it, run only v1
+    /// sessions, refuse `SyncV2` streams as an unknown kind, sync every
+    /// member), for mixed groups in tests and v1 baselines.
+    pub sync_v2: bool,
 }
 
 /// Another protocol served on the node's endpoint: incoming connections with
@@ -188,6 +230,7 @@ impl NodeOptions {
             mesh: None,
             max_ephemeral: MAX_EPHEMERAL,
             protocol: Protocol::default(),
+            sync_v2: true,
         }
     }
 }
@@ -315,6 +358,71 @@ struct Inner {
     /// the rest (`resources.rs`).
     member_frames: resources::Frames,
     stranger_frames: resources::Frames,
+    /// See [`NodeOptions::sync_v2`].
+    sync_v2: bool,
+    /// Spaces with a local write since the last periodic round (sessions
+    /// then send the frontier in `Open`, saving a round trip).
+    local_writes: Mutex<HashSet<SpaceId>>,
+    /// Spaces with a local write not yet pushed (the author pushes to more
+    /// members than a forwarder: see [`AUTHOR_FULL`]).
+    dirty_local: Mutex<HashSet<SpaceId>>,
+    v2: sync_v2::V2,
+    /// Periodic anti-entropy schedule per space.
+    periodic: Mutex<HashMap<SpaceId, Backoff>>,
+}
+
+/// Why a sync runs: only some outcomes are signs of loss for the backoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Trigger {
+    /// A local write or forwarded items (event-driven).
+    Change,
+    /// Periodic anti-entropy.
+    Periodic,
+    /// A peer became reachable.
+    Discovery,
+    /// The app asked.
+    Manual,
+}
+
+/// Idle backoff for periodic anti-entropy in one space: the interval starts
+/// at [`PERIODIC_SYNC`] and doubles each round up to [`PERIODIC_MAX`],
+/// unless a sign of loss arrived since the last round, which brings it back
+/// to the start. Rounds are jittered ±20% so devices don't synchronise.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Backoff {
+    interval: Duration,
+    next: Instant,
+    reset: bool,
+}
+
+impl Backoff {
+    /// The first round comes soon (within ~2 s): it also tells the members
+    /// of our view that we chose them, so they push to us (symmetric edges).
+    fn new(now: Instant, jitter: f64) -> Self {
+        Backoff { interval: PERIODIC_SYNC / 2, next: now + (PERIODIC_SYNC / 8).mul_f64(jitter), reset: true }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next
+    }
+
+    /// A round runs now; `jitter` in [0.8, 1.2].
+    fn round(&mut self, now: Instant, jitter: f64) {
+        self.interval = if self.reset { PERIODIC_SYNC } else { (self.interval * 2).min(PERIODIC_MAX) };
+        self.reset = false;
+        self.next = now + self.interval.mul_f64(jitter);
+    }
+
+    /// A sign of loss: the next round comes within the first interval.
+    fn signal(&mut self, now: Instant) {
+        self.reset = true;
+        self.interval = PERIODIC_SYNC;
+        self.next = self.next.min(now + PERIODIC_SYNC);
+    }
+}
+
+fn jitter() -> f64 {
+    (0.8 + (mycel_crypto::random_u64() % 4001) as f64 / 10_000.0).min(1.2)
 }
 
 /// How many QUIC connections (handshakes) a node has made.
@@ -452,7 +560,8 @@ impl Inner {
             let shared: Vec<SpaceId> =
                 self.spaces.lock().iter().filter(|(_, r)| r.is_member(&peer)).map(|(s, _)| *s).collect();
             for s in shared {
-                tokio::spawn(sync_once(self.clone(), peer, s));
+                self.loss_signal(s);
+                tokio::spawn(sync_once(self.clone(), peer, s, Trigger::Discovery));
             }
         }
     }
@@ -608,6 +717,113 @@ impl Inner {
         self.wake.notify_one();
     }
 
+    /// New items arrived in `space` (from any sync or a bundle): tell the
+    /// app and forward them (epidemic: others may not reach the author). A
+    /// membership change is also a sign of loss for the backoff.
+    fn on_new_items(&self, space: SpaceId, membership: bool) {
+        self.emit(NetEvent::SpaceChanged { space });
+        if membership {
+            self.loss_signal(space);
+        }
+        self.schedule(space);
+    }
+
+    /// Did we write to `space` locally since the last periodic round? Then
+    /// a session sends its frontier in `Open` (saving a round trip) even
+    /// without a record of the peer.
+    fn dirty_since_last(&self, _peer: &SignPk, space: &SpaceId) -> bool {
+        self.local_writes.lock().contains(space)
+    }
+
+    /// We just learned how to reach `peer` (an address hint): a sign of a
+    /// reachability change. Sync the spaces we share with it now, without
+    /// waiting out a failure backoff or the periodic schedule.
+    fn peer_reachable(self: &Arc<Self>, peer: SignPk) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let shared: Vec<SpaceId> =
+            self.spaces.lock().iter().filter(|(_, r)| r.is_member(&peer)).map(|(s, _)| *s).collect();
+        if shared.is_empty() {
+            return;
+        }
+        if let Some(p) = self.peers.lock().get_mut(&peer) {
+            p.failures = 0;
+        }
+        for s in shared {
+            self.loss_signal(s);
+            rt.spawn(sync_once(self.clone(), peer, s, Trigger::Discovery));
+        }
+    }
+
+    /// See [`Backoff::signal`].
+    fn loss_signal(&self, space: SpaceId) {
+        let now = Instant::now();
+        let mut periodic = self.periodic.lock();
+        periodic.entry(space).or_insert_with(|| Backoff::new(now, jitter())).signal(now);
+        drop(periodic);
+        self.wake.notify_one();
+    }
+
+    /// Who to sync `space` with after a change or in a periodic round
+    /// (excluding us): every member in small groups and on builds without
+    /// v2; otherwise the bounded view (see the crate docs).
+    fn targets(&self, space: &SpaceId, r: &Replica, peers: &HashMap<SignPk, PeerState>, local: bool) -> Vec<SignPk> {
+        let me = self.keys.sign_pk();
+        let members: Vec<SignPk> = r.members().into_iter().map(|(k, _)| k.sign_pk).filter(|pk| *pk != me).collect();
+        let full = if local { AUTHOR_FULL } else { FULL_MESH };
+        if !self.sync_v2 || members.len() <= full {
+            return members;
+        }
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() / VIEW_EPOCH.as_secs());
+        let score =
+            |p: &SignPk| Hash32::digest("mycel/v2/view", &[&space.0[..], &me.0, &p.0, &epoch.to_le_bytes()].concat());
+        let mut ranked: Vec<(Hash32, SignPk)> = members.iter().map(|p| (score(p), *p)).collect();
+        ranked.sort();
+        let mut out: Vec<SignPk> = ranked
+            .iter()
+            .filter(|(_, p)| peers.get(p).is_some_and(PeerState::is_directly_discovered))
+            .take(VIEW_NEARBY)
+            .map(|(_, p)| *p)
+            .collect();
+        // Random edges (by rendezvous hash over the whole member list, so
+        // physical clusters can't split the overlay), preferring members
+        // with recent evidence of reachability: one that fails drops a
+        // tier and the next by rank takes its place (HyParView's active
+        // view), so offline picks can't cut a device off for an epoch.
+        let tier = |p: &SignPk| match peers.get(p) {
+            Some(s) if s.backing_off() => 2,
+            Some(s) if s.online() => 0,
+            _ => 1,
+        };
+        let random = pick_ranked(&ranked, &out, VIEW_RANDOM, tier);
+        out.extend(random);
+        for p in self.v2.inbound(space, VIEW_INBOUND) {
+            if members.contains(&p) && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        // Members on builds without v2 still re-sync epidemically with
+        // everyone; only the two members nearest each of them by
+        // rendezvous hash push to it, so they hear of changes once.
+        for v in self.v2.v1_only_peers() {
+            if out.contains(&v) || !members.contains(&v) {
+                continue;
+            }
+            let mut by: Vec<(Hash32, SignPk)> = members
+                .iter()
+                .chain(std::iter::once(&me))
+                .filter(|m| **m != v)
+                .map(|m| (Hash32::digest("mycel/v2/v1-designated", &[&space.0[..], &v.0, &m.0].concat()), *m))
+                .collect();
+            by.sort();
+            if by.iter().take(2).any(|(_, m)| *m == me) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
     /// Blobs are stored per space: a member of one space can't fetch or fill
     /// another space's blobs.
     fn blob_path(&self, space: &SpaceId, hash: &Hash32) -> Option<PathBuf> {
@@ -629,9 +845,7 @@ impl Inner {
             res
         };
         if res.changed() {
-            self.emit(NetEvent::SpaceChanged { space: *space });
-            // Epidemic forwarding: others may not be reachable by the author.
-            self.schedule(*space);
+            self.on_new_items(*space, res.ops > 0);
         } else if !sent.is_empty() {
             // delivery status changed
             self.emit(NetEvent::SpaceChanged { space: *space });
@@ -780,6 +994,7 @@ async fn serve_bi(
         // No total deadline: over a slow link a large sync takes minutes,
         // and each wait inside is bounded while bytes keep moving.
         StreamKind::Sync => serve_sync(inner, conn, peer, tx, rx).await,
+        StreamKind::SyncV2 => sync_v2::serve(inner, conn, peer, tx, rx).await,
         StreamKind::Card => serve_card(inner, tx).await,
         StreamKind::Blob => blobs::serve(inner, peer, tx, rx).await,
         StreamKind::Hello => serve_hello(inner, version, peer, tx, rx).await,
@@ -1061,10 +1276,26 @@ pub(crate) async fn open_bi_raw(conn: &Connection, kind: u8, priority: i32) -> R
 }
 
 async fn sync_session(inner: &Arc<Inner>, peer: SignPk, space: SpaceId, trust_peer: bool) -> Result<SyncStats> {
+    if inner.sync_v2 && !inner.v2.is_v1_only(&peer) && peer_has_sync_v2(inner, peer).await? {
+        let eager = inner.dirty_since_last(&peer, &space);
+        if let Some(stats) = sync_v2::sync(inner, peer, space, trust_peer, eager).await? {
+            return Ok(stats);
+        }
+        // The peer doesn't speak v2 (remembered): v1 below.
+    }
     let hello =
         inner.with_space(&space, |r| (trust_peer || r.is_member(&peer)).then(|| (inventory(r), r.all_ops())))?;
     let (inv, ops) = hello.ok_or_else(|| anyhow!("peer is not a member of this space"))?;
     on_conn!(inner, &peer, |conn| sync_exchange(inner, &conn, peer, space, inv.clone(), ops.clone()))
+}
+
+/// Whether `peer`'s hello agreed [`Caps::SYNC_V2`] on the pooled connection
+/// (dialed if there is none). On a new connection this waits for its hello,
+/// sent as soon as it was dialed, so normally one round trip; a peer on
+/// wire version 1, or whose hello failed or is late, gets v1 this time.
+async fn peer_has_sync_v2(inner: &Arc<Inner>, peer: SignPk) -> Result<bool> {
+    let conn = pooled(inner, &peer).await?;
+    Ok(conn.protocol(resources::REPLY_TIMEOUT).await.supports(Caps::SYNC_V2))
 }
 
 /// One sync session on its own stream of `conn`.
@@ -1121,7 +1352,7 @@ async fn sync_exchange(
     Ok(inner.ingest(&space, peer, data, &sent))
 }
 
-async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
+async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Trigger) {
     {
         let mut inflight = inner.inflight.lock();
         if let Some(again) = inflight.get_mut(&(peer, space)) {
@@ -1132,6 +1363,7 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
         inflight.insert((peer, space), false);
     }
     let _slot = inner.sync_slots.acquire().await;
+    let mut busy_retries = 0;
     loop {
         // No total deadline (a large sync over Bluetooth takes minutes):
         // every wait inside is bounded, and a dead connection fails it.
@@ -1144,9 +1376,34 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
                 session.await
             }
         };
+        // `Busy`: the peer is syncing this space with us already, or over
+        // its limits. Not a failure: no backoff, no bundle. A crossing
+        // session carries our set only as of its start, so try again a few
+        // times even without a new change (cheap: an idle check or what came
+        // after, once the crossing session has ended).
+        if let Err(e) = &res
+            && let Some(busy) = e.downcast_ref::<sync_v2::PeerBusy>()
+        {
+            let retry = busy.retry_after();
+            if busy_retries < BUSY_RETRIES {
+                busy_retries += 1;
+                if let Some(a) = inner.inflight.lock().get_mut(&(peer, space)) {
+                    *a = false;
+                }
+                tokio::time::sleep(retry).await;
+                continue;
+            }
+            inner.inflight.lock().remove(&(peer, space));
+            return;
+        }
         let ok = res.is_ok();
-        if ok {
+        if let Ok(stats) = &res {
             inner.mark_ok(peer);
+            // A periodic session that found something means pushes are
+            // being missed: back to the short interval.
+            if trigger == Trigger::Periodic && sync_v2::moved(stats) {
+                inner.loss_signal(space);
+            }
         } else {
             inner.mark_fail(peer);
             inner.offer_bundle(peer, space);
@@ -1162,39 +1419,60 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
     }
 }
 
-/// Push dirty spaces to their members; periodically sync everything.
+/// Push dirty spaces to their members (or the bounded view); run periodic
+/// anti-entropy per space on its backoff schedule.
 async fn scheduler(inner: Arc<Inner>) {
-    let mut last_full = Instant::now();
     loop {
+        let wait = {
+            let now = Instant::now();
+            let periodic = inner.periodic.lock();
+            periodic.values().map(|b| b.next.saturating_duration_since(now)).min().unwrap_or(PERIODIC_SYNC)
+        };
         tokio::select! {
             _ = inner.wake.notified() => {}
-            _ = tokio::time::sleep(PERIODIC_SYNC) => {}
+            _ = tokio::time::sleep(wait.max(DEBOUNCE)) => {}
         }
         tokio::time::sleep(DEBOUNCE).await;
-        let periodic = last_full.elapsed() >= PERIODIC_SYNC;
         let explicit: HashSet<SpaceId> = std::mem::take(&mut *inner.dirty.lock());
-        let mut dirty = explicit.clone();
-        if periodic {
-            last_full = Instant::now();
-            dirty.extend(inner.spaces.lock().keys().copied());
-        }
-        let me = inner.keys.sign_pk();
-        let targets: Vec<(SignPk, SpaceId)> = {
-            let spaces = inner.spaces.lock();
-            let peers = inner.peers.lock();
-            dirty
-                .iter()
-                .filter_map(|s| spaces.get(s).map(|r| (s, r)))
-                // No longer a member: only push explicit local changes (e.g. our
-                // own Leave op); periodic syncs would just be refused.
-                .filter(|(s, r)| explicit.contains(*s) || r.my_role().is_some())
-                .flat_map(|(s, r)| r.members().into_iter().map(move |(k, _)| (k.sign_pk, *s)).collect::<Vec<_>>())
-                .filter(|(pk, _)| *pk != me)
-                .filter(|(pk, _)| !peers.get(pk).is_some_and(|p| p.backing_off() && !p.nearby))
+        let local: HashSet<SpaceId> = std::mem::take(&mut *inner.dirty_local.lock());
+        let now = Instant::now();
+        let due: HashSet<SpaceId> = {
+            let spaces: Vec<SpaceId> = inner.spaces.lock().keys().copied().collect();
+            let mut periodic = inner.periodic.lock();
+            periodic.retain(|s, _| spaces.contains(s));
+            spaces
+                .into_iter()
+                .filter(|s| {
+                    let b = periodic.entry(*s).or_insert_with(|| Backoff::new(now, jitter()));
+                    let due = b.due(now);
+                    if due {
+                        b.round(now, jitter());
+                        inner.local_writes.lock().remove(s);
+                    }
+                    due
+                })
                 .collect()
         };
-        for (peer, space) in targets {
-            tokio::spawn(sync_once(inner.clone(), peer, space));
+        let targets: Vec<(SignPk, SpaceId, Trigger)> = {
+            let spaces = inner.spaces.lock();
+            let peers = inner.peers.lock();
+            explicit
+                .iter()
+                .map(|s| (*s, Trigger::Change))
+                .chain(due.iter().filter(|s| !explicit.contains(*s)).map(|s| (*s, Trigger::Periodic)))
+                .filter_map(|(s, t)| spaces.get(&s).map(|r| (s, t, r)))
+                // No longer a member: only push explicit local changes (e.g. our
+                // own Leave op); periodic syncs would just be refused.
+                .filter(|(s, _, r)| explicit.contains(s) || r.my_role().is_some())
+                .flat_map(|(s, t, r)| {
+                    let local = t == Trigger::Change && local.contains(&s);
+                    inner.targets(&s, r, &peers, local).into_iter().map(move |pk| (pk, s, t)).collect::<Vec<_>>()
+                })
+                .filter(|(pk, _, _)| !peers.get(pk).is_some_and(|p| p.backing_off() && !p.nearby))
+                .collect()
+        };
+        for (peer, space, trigger) in targets {
+            tokio::spawn(sync_once(inner.clone(), peer, space, trigger));
         }
     }
 }
@@ -1236,7 +1514,8 @@ fn on_lan_discovery(inner: &Arc<Inner>, source: &'static str, ev: DiscoveryEvent
                 let shared: Vec<SpaceId> =
                     inner.spaces.lock().iter().filter(|(_, r)| r.is_member(&pk)).map(|(s, _)| *s).collect();
                 for s in shared {
-                    tokio::spawn(sync_once(inner.clone(), pk, s));
+                    inner.loss_signal(s);
+                    tokio::spawn(sync_once(inner.clone(), pk, s, Trigger::Discovery));
                 }
             }
         }
@@ -1428,9 +1707,19 @@ impl Node {
             drop_hellos: Default::default(),
             bundled: Mutex::default(),
             max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
-            protocol: opts.protocol,
+            // (a node without Sync v2 doesn't advertise it)
+            protocol: if opts.sync_v2 {
+                opts.protocol
+            } else {
+                Protocol { caps: opts.protocol.caps.difference(Caps::SYNC_V2), ..opts.protocol }
+            },
             member_frames: resources::Frames::members(),
             stranger_frames: resources::Frames::strangers(),
+            sync_v2: opts.sync_v2,
+            local_writes: Mutex::default(),
+            dirty_local: Mutex::default(),
+            v2: sync_v2::V2::default(),
+            periodic: Mutex::default(),
         });
         // (the router's order is the listener's preference: newest first)
         let mut router = Router::builder(endpoint);
@@ -1539,12 +1828,15 @@ impl Node {
                 a = a.with_ip_addr(*x);
             }
             self.inner.memory.add_endpoint_info(a);
+            self.inner.peer_reachable(peer);
         }
     }
 
     /// Tell the node how to reach a peer directly (tests / manual pairing).
     pub fn add_peer_addr(&self, addr: EndpointAddr) {
+        let peer = to_sign_pk(&addr.id);
         self.inner.memory.add_endpoint_info(addr);
+        self.inner.peer_reachable(peer);
     }
 
     /// The mesh router, if this node relays.
@@ -1615,20 +1907,48 @@ impl Node {
     /// Local change happened: push to members soon and notify the app.
     pub fn changed(&self, space: SpaceId) {
         self.inner.emit(NetEvent::SpaceChanged { space });
+        self.inner.local_writes.lock().insert(space);
+        self.inner.dirty_local.lock().insert(space);
+        self.inner.loss_signal(space);
         self.inner.schedule(space);
+    }
+
+    /// Sync v2 counters (sessions, fallbacks, bytes): for tests and the
+    /// Network panel.
+    pub fn sync_v2_totals(&self) -> V2Totals {
+        self.inner.v2.totals()
     }
 
     /// One full bidirectional sync of `space` with `peer`, now.
     ///
     /// `trust_peer` lets a freshly-invited device sync with its inviter before
     /// it has learned (via that very sync) that the inviter is a member.
+    ///
+    /// A peer that is syncing this space with us already (it opened to us at
+    /// the same moment) or is over its session limits answers `Busy`: not a
+    /// failure. This waits and runs its own session then (cheap once the
+    /// crossing one has ended), for up to [`EXPLICIT_BUSY_WAIT`].
     pub async fn sync_with(&self, peer: SignPk, space: SpaceId, trust_peer: bool) -> Result<SyncStats> {
-        let res = sync_session(&self.inner, peer, space, trust_peer).await;
-        match &res {
-            Ok(_) => self.inner.mark_ok(peer),
-            Err(_) => self.inner.mark_fail(peer),
+        let deadline = Instant::now() + EXPLICIT_BUSY_WAIT;
+        loop {
+            let res = sync_session(&self.inner, peer, space, trust_peer).await;
+            if let Err(e) = &res
+                && let Some(busy) = e.downcast_ref::<sync_v2::PeerBusy>()
+            {
+                let retry = busy.retry_after();
+                if Instant::now() + retry < deadline {
+                    tokio::time::sleep(retry).await;
+                    continue;
+                }
+                // (no backoff: the peer is up)
+                return res;
+            }
+            match &res {
+                Ok(_) => self.inner.mark_ok(peer),
+                Err(_) => self.inner.mark_fail(peer),
+            }
+            return res;
         }
-        res
     }
 
     /// Sync `space` with every member now and wait (best effort).
@@ -1638,7 +1958,7 @@ impl Node {
             self.with_space(&space, |r| r.members().into_iter().map(|(k, _)| k.sign_pk).collect()).unwrap_or_default();
         let mut set = tokio::task::JoinSet::new();
         for pk in members.into_iter().filter(|p| *p != me) {
-            set.spawn(sync_once(self.inner.clone(), pk, space));
+            set.spawn(sync_once(self.inner.clone(), pk, space, Trigger::Manual));
         }
         while set.join_next().await.is_some() {}
     }
@@ -1678,7 +1998,7 @@ impl Node {
         targets.sort_by_key(|(rank, _, _)| *rank);
         let mut set = tokio::task::JoinSet::new();
         for (_, pk, space) in targets {
-            set.spawn(sync_once(inner.clone(), pk, space));
+            set.spawn(sync_once(inner.clone(), pk, space, Trigger::Manual));
         }
         while set.join_next().await.is_some() {}
     }
@@ -1829,6 +2149,35 @@ impl Node {
 mod discovery_tests {
     use super::*;
     use link::{CustomAddr, TRANSPORT_BLUETOOTH, TRANSPORT_MESH, TRANSPORT_PEER_WIFI};
+
+    #[test]
+    fn periodic_backoff_doubles_to_its_cap_and_resets_on_loss() {
+        let t0 = Instant::now();
+        let mut b = Backoff::new(t0, 1.0);
+        assert!(b.next - t0 <= Duration::from_secs(2), "the first round comes soon");
+        let mut now = b.next;
+        b.round(now, 1.0);
+        assert_eq!(b.interval, PERIODIC_SYNC);
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            now = b.next;
+            b.round(now, 1.0);
+            seen.push(b.interval.as_secs());
+        }
+        assert_eq!(seen, [30, 60, 120, 240, 480, 600, 600, 600]);
+        // A sign of loss: the next round is within the first interval, and
+        // the schedule starts over.
+        let mid = now + Duration::from_secs(100);
+        b.signal(mid);
+        assert!(b.next <= mid + PERIODIC_SYNC);
+        b.round(b.next, 1.0);
+        assert_eq!(b.interval, PERIODIC_SYNC);
+        b.round(b.next, 1.0);
+        assert_eq!(b.interval, PERIODIC_SYNC * 2);
+        for _ in 0..1000 {
+            assert!((0.8..=1.2).contains(&jitter()));
+        }
+    }
 
     #[test]
     fn direct_discovery_excludes_mesh_and_recent_exchanges() {
@@ -2073,6 +2422,42 @@ mod version_tests {
         old.shutdown().await.unwrap();
     }
 
+    /// Sync v2 is chosen by capability: two current devices use it, and a
+    /// device that refuses the stream all the same (here: a build without
+    /// Sync v2, opened regardless of its hello) is synced with v1 and
+    /// remembered as v1-only at once, since the refusal is explicit.
+    #[tokio::test]
+    async fn a_refused_sync_v2_falls_back_and_is_remembered() {
+        let new = node("new", Protocol::default()).await;
+        let mut opts = NodeOptions::new(NetMode::Local, "old");
+        opts.sync_v2 = false;
+        let old = Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap();
+        let peer = node("peer", Protocol::default()).await;
+        for (a, b) in [(&new, &old), (&old, &new), (&new, &peer), (&peer, &new)] {
+            a.add_peer_addr(b.addr());
+        }
+        assert!(new.negotiate(peer.id()).await.unwrap().supports(Caps::SYNC_V2));
+        assert!(!new.negotiate(old.id()).await.unwrap().supports(Caps::SYNC_V2));
+        let (space, _) = new.create_space().unwrap();
+        new.with_space(&space, |r| r.add_member(old.keys().public(), Role::Writer)).unwrap().unwrap();
+        new.with_space(&space, |r| r.add_member(peer.keys().public(), Role::Writer)).unwrap().unwrap();
+        new.with_space(&space, |r| r.append(mycel_sync::StreamId::new_feed(), b"hi".to_vec())).unwrap().unwrap();
+        new.sync_with(peer.id(), space, false).await.unwrap();
+        assert_eq!(peer.with_space(&space, |r| r.envelope_ids().len()).unwrap(), 1);
+        assert!(new.sync_v2_totals().client_sessions >= 1, "both have it: v2");
+        // Opened despite the hello: refused, so nothing ran, and remembered.
+        let ran = sync_v2::sync(&new.inner, old.id(), space, false, false).await.unwrap();
+        assert!(ran.is_none());
+        let t = new.sync_v2_totals();
+        assert_eq!((t.fallbacks, t.remembered_v1), (1, 1), "{t:?}");
+        assert!(new.inner.v2.is_v1_only(&old.id()));
+        new.sync_with(old.id(), space, false).await.unwrap();
+        assert_eq!(old.with_space(&space, |r| r.envelope_ids().len()).unwrap(), 1, "v1: the invitation and its data");
+        for n in [new, old, peer] {
+            n.shutdown().await.unwrap();
+        }
+    }
+
     /// A stream kind the device doesn't know (a newer build's) is refused
     /// at once with a typed error: never a timeout, never bytes read as
     /// something else; the connection carries on. A version 1 connection
@@ -2135,7 +2520,9 @@ mod version_tests {
         assert_eq!(StreamKind::on(WIRE_V2, 5), Some(StreamKind::Hello));
         assert_eq!(StreamKind::on(WIRE_V1, 5), None, "version 1 has no hello");
         assert_eq!(StreamKind::on(WIRE_V1, 1), Some(StreamKind::Sync));
-        assert!((6..=255).all(|b| StreamKind::on(WIRE_V2, b).is_none()) && StreamKind::on(WIRE_V2, 0).is_none());
+        assert_eq!(StreamKind::on(WIRE_V2, 6), Some(StreamKind::SyncV2));
+        assert_eq!(StreamKind::on(WIRE_V1, 6), None, "version 1 has no Sync v2");
+        assert!((7..=255).all(|b| StreamKind::on(WIRE_V2, b).is_none()) && StreamKind::on(WIRE_V2, 0).is_none());
         assert_eq!(wire::alpns(WIRE_V2), vec![wire::ALPN_V2, wire::ALPN_V1]);
         assert_eq!(wire::alpns(WIRE_V1), vec![wire::ALPN_V1]);
         assert_eq!(wire::version_of(b"mycel/node/3"), None);
@@ -2326,5 +2713,35 @@ mod security_exchange_tests {
         assert!(node.send_ephemeral(space, vec![42; MAX_EPHEMERAL]).is_ok());
         assert!(node.send_ephemeral(space, vec![42; MAX_EPHEMERAL + 1]).is_err());
         node.shutdown().await.unwrap();
+    }
+}
+
+/// `n` members of `ranked` (rendezvous order) not in `skip`: lowest `tier`
+/// first (0 recently reachable, 1 unknown, 2 failing), by rank within a tier.
+fn pick_ranked(ranked: &[(Hash32, SignPk)], skip: &[SignPk], n: usize, tier: impl Fn(&SignPk) -> u8) -> Vec<SignPk> {
+    let mut picks: Vec<(u8, usize, SignPk)> =
+        ranked.iter().enumerate().filter(|(_, (_, p))| !skip.contains(p)).map(|(i, (_, p))| (tier(p), i, *p)).collect();
+    picks.sort_unstable();
+    picks.into_iter().take(n).map(|(_, _, p)| p).collect()
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn view_replaces_unreachable_members_by_rank() {
+        let ranked: Vec<(Hash32, SignPk)> = (0..10u8).map(|i| (Hash32([i; 32]), SignPk([i; 32]))).collect();
+        let pk = |i: u8| SignPk([i; 32]);
+        // Nothing known: the first two by rank.
+        assert_eq!(pick_ranked(&ranked, &[], 2, |_| 1), vec![pk(0), pk(1)]);
+        // The first two fail: the next two by rank replace them.
+        let failing = |p: &SignPk| if p.0[0] < 2 { 2 } else { 1 };
+        assert_eq!(pick_ranked(&ranked, &[], 2, failing), vec![pk(2), pk(3)]);
+        // A recently reachable member is preferred over unknown ones.
+        let seen = |p: &SignPk| if p.0[0] == 7 { 0 } else { 1 };
+        assert_eq!(pick_ranked(&ranked, &[pk(0)], 2, seen), vec![pk(7), pk(1)]);
+        // Everyone failing: still the best by rank (retried after backoff).
+        assert_eq!(pick_ranked(&ranked, &[], 2, |_| 2), vec![pk(0), pk(1)]);
     }
 }

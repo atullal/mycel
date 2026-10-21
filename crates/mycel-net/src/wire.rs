@@ -59,6 +59,11 @@ pub enum StreamKind {
     /// Bi-stream, wire version 2 and later: the dialer's [`Hello`], then
     /// the listener's, once per connection.
     Hello = 5,
+    /// Bi-stream, wire version 2 and later: one Sync v2 session
+    /// (`sync_v2.rs`, `mycel_sync::reconcile`), opened only to a peer that
+    /// agreed [`crate::Caps::SYNC_V2`]. A device that refuses it anyway is
+    /// synced with `Sync`.
+    SyncV2 = 6,
 }
 
 impl StreamKind {
@@ -66,7 +71,7 @@ impl StreamKind {
     /// `version`; `None` for a kind that version doesn't have (the stream
     /// is then refused, see [`crate::version::STREAM_REFUSED`]).
     pub fn on(version: WireVersion, b: u8) -> Option<Self> {
-        Self::from_byte(b).filter(|k| *k != StreamKind::Hello || version >= WIRE_V2)
+        Self::from_byte(b).filter(|k| !matches!(k, StreamKind::Hello | StreamKind::SyncV2) || version >= WIRE_V2)
     }
 
     pub fn from_byte(b: u8) -> Option<Self> {
@@ -76,6 +81,7 @@ impl StreamKind {
             3 => StreamKind::Ephemeral,
             4 => StreamKind::Blob,
             5 => StreamKind::Hello,
+            6 => StreamKind::SyncV2,
             _ => return None,
         })
     }
@@ -181,6 +187,17 @@ pub(crate) async fn recv_held<T: DeserializeOwned>(
     frames: &PeerFrames,
 ) -> Result<(T, FramePermit)> {
     recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, MAX_FRAME, frames).await
+}
+
+/// [`recv_held`] with a smaller frame limit (`max`): a bigger declared
+/// length is refused before anything is buffered.
+pub(crate) async fn recv_bounded<T: DeserializeOwned>(
+    r: &mut RecvStream,
+    wait: Duration,
+    max: usize,
+    frames: &PeerFrames,
+) -> Result<(T, FramePermit)> {
+    recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, max, frames).await
 }
 
 /// [`recv_held`] for messages that are always small (blob requests and

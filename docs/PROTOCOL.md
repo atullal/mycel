@@ -114,9 +114,11 @@ one protocol takes the other takes too).
 | `Ephemeral` | 3 | uni | v1 | `EphMsg{space, epoch, nonce, ciphertext}` |
 | `Blob` | 4 | bi | v1 | `BlobReq` → `BlobResp` + raw bytes. New request variants are only ever appended. |
 | `Hello` | 5 | bi | v2 | The dialer's `Hello{caps}`, then the listener's |
+| `SyncV2` | 6 | bi | v2, `SYNC_V2` | One Sync v2 session (`mycel_sync::reconcile::Msg`, `Open` first), opened only to a peer whose hello agreed `SYNC_V2`. A listener that fails after accepting it resets with `0x6d790002` (`SYNC_V2_FAILED`), never with `STREAM_REFUSED`; a device that refuses it all the same is synced with `Sync` and not offered `SyncV2` for 30 min |
 
 **Unknown kinds.** A kind the stream's connection version doesn't have
-(any byte not in the table, or `Hello` on a v1 connection) is refused at
+(any byte not in the table, or `Hello` or `SyncV2` on a v1 connection, or
+`SyncV2` at a device without Sync v2) is refused at
 once: the listener stops the receive side and resets the send side with the
 QUIC application error `STREAM_REFUSED` (`0x6d790001`). The opener's next
 read or write fails, and `version::refusal` turns that into
@@ -362,9 +364,10 @@ parse a new op kind would see a different membership. Worse, sync carries
 typed `Vec<SignedOp>` in `SyncMsg`, so one op of an unknown variant makes
 the whole `Hello`/`Data` frame fail to decode (an untyped postcard error,
 not a `VersionError`) and sync of the whole space with that peer stops
-until it upgrades. The fix belongs to the `SYNC_V2` stream (branch
-`v2/sync-v2`): it should carry ops and envelopes as length-delimited
-opaque items, each decoded on its own, so one a device can't read is set
+until it upgrades. `SyncV2` sessions still carry typed items
+(`reconcile::Msg<SignedOp, Envelope>`), so the same holds there. The
+fix belongs to the `SYNC_V2` stream: it should carry ops and envelopes as
+length-delimited opaque items, each decoded on its own, so one a device can't read is set
 aside (quarantined, with `VersionError::Unsupported`) while the rest of
 the frame syncs. A new op `Action`, envelope header field or stream kind
 therefore must (1) get a capability bit, (2) be used in a space only once
@@ -405,13 +408,13 @@ names), so an old build finds them missing rather than misreading them.
 
 | Bit | Name | Protocol | Meaning | Status |
 |---|---|---|---|---|
-| 0 | `SYNC_V2` | node | Negotiated set-reconciliation sync: a new stream kind whose cost tracks the difference, not the history | Registered; being built (branch `v2/sync-v2`) |
+| 0 | `SYNC_V2` | node | Negotiated set-reconciliation sync: a new stream kind whose cost tracks the difference, not the history | Implemented (stream kind `SyncV2`, `mycel_sync::reconcile`); advertised by default (`Caps::SUPPORTED`) unless `NodeOptions::sync_v2` is off |
 | 1 | `ROUTE_ATTEST` | mesh | Per-hop attestations on route announcements | Registered; future |
 | 2–47 | | | Free, assigned in order | |
 | 48–63 | reserved | | Grease: one random bit per hello, never assigned | |
 
-`Caps::SUPPORTED` (what a build advertises by default) is empty in this
-build: a bit is added there in the change that implements it.
+`Caps::SUPPORTED` (what a build advertises by default) is `SYNC_V2` in
+this build: a bit is added there in the change that implements it.
 
 ---
 

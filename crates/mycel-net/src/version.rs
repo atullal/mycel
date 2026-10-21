@@ -58,10 +58,10 @@ impl Caps {
     pub const RESERVED: Caps = Caps(0xffff << 48);
     /// Every bit this build has a name for.
     pub const KNOWN: Caps = Caps(Self::SYNC_V2.0 | Self::ROUTE_ATTEST.0);
-    /// What this build implements, and so advertises by default. (`SYNC_V2`
-    /// and `ROUTE_ATTEST` are registered for the work that implements them;
-    /// a build sets them here once it does.)
-    pub const SUPPORTED: Caps = Caps::NONE;
+    /// What this build implements, and so advertises by default.
+    /// (`ROUTE_ATTEST` is registered for the work that implements it; a
+    /// build sets it here once it does.)
+    pub const SUPPORTED: Caps = Caps::SYNC_V2;
 
     /// The raw bits, unknown ones included.
     pub const fn bits(self) -> u64 {

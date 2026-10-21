@@ -6,8 +6,9 @@ binary Spray-and-Wait, MaxProp and Direct Delivery. Both replay the same
 real Bluetooth contact traces and the same message workloads.
 
 Everything here ran on one Mac (18 cores, 24 GB). Simulations of Mycel's own
-routing at scale are in [SIMULATION.md](SIMULATION.md). §7 measures
-something else: the cost of resolving a space's membership graph.
+routing at scale are in [SIMULATION.md](SIMULATION.md). §7 and §8 measure
+something else: the cost of resolving a space's membership graph, and the
+bytes and round trips of Sync v2 against v1.
 
 ## Headline
 
@@ -765,3 +766,62 @@ Correctness is checked separately: `cargo test -p mycel-trust` runs
 random concurrent histories through both resolvers (TRUST.md §9).
 `PROPTEST_CASES=6000` (18,000 histories, each checked after every insert)
 passed on the final version.
+
+## 8. Sync v2 against v1: bytes and round trips per session
+
+Not against an external tool: the two sync protocols, session by session.
+`cargo test --release -p mycel-sync --lib bench_sync_v2 -- --ignored --nocapture`
+(`crates/mycel-sync/src/reconcile/tests.rs`), run on the 18-core Mac while
+other builds ran (2026-10-21).
+
+**Method.** Two model sets (`reconcile::model`: real postcard encodings,
+no signatures) run the real `Session` state machine in memory; each flight
+delivers everything both sides queued, so round trips are flights / 2. A
+model envelope is padded to the measured mean of a real chat envelope
+(351 B); there are 50 authors. v1's bytes are its four messages (`Hello`,
+`Accept`, `DataAndWant`, `Data`) encoded through a field-for-field mirror of
+`mycel-net`'s `wire::SyncMsg` over the same ids and items, so both columns
+count postcard bytes plus the 4-byte frame length, and neither counts QUIC
+or IP overhead (about 70 B per packet, **estimate**). "Record" means both
+sides remember their last converged session with each other (the steady
+state); "first contact" means neither does. CPU is both sessions together,
+model items only (validation by `Replica::ingest_batch`, 41 µs per envelope
+measured in the design notes, is extra).
+
+| Scenario (50 authors) | v1 | v2 | v2 outcome | v2 CPU |
+|---|---|---|---|---|
+| Idle, 10,000 envelopes | 640,131 B, 2 RTT | **129 B**, 1 RTT | `InSync` | 0.13 ms |
+| 1 new envelope, record | 640,546 B, 2 RTT | **852 B** (495 control + 357 data), 2 RTT | phase 1 | 0.09 ms |
+| 1 new envelope, first contact | 640,546 B, 2 RTT | 7,562 B (7,205 control: two full frontiers), 2.5 RTT | phase 1 | 0.10 ms |
+| 1,000 missing of 11,000, record | 1,055,133 B, 2 RTT | **354,917 B** (3,876 control, 1.1%), 2 RTT, data from 1 RTT | phase 1 | 3.6 ms |
+| 1,000 missing of 11,000, first contact | 1,055,133 B, 2 RTT | 358,246 B, 2.5 RTT, data from 2 RTT | phase 1 | 4.1 ms |
+| Fresh join, 100,000 envelopes | 41,492,135 B (one 41 MB frame), 2 RTT | **35,099,499 B** (3,755 control), 2.5 RTT, in 64 KiB chunks | phase 1 | 386 ms |
+| Fork at seq 5,000: one side +5,000 on its branch, the other +100 on its own (16-byte bodies) | 1,081,313 B, 2 RTT | 437,407 B (3,852 control), 6 RTT, 3 probes each way | phase 2 | 10 ms |
+
+- **Idle** is constant: 129 B whatever the history (the same test at 1,000
+  and 10,000 envelopes per author is in the unit tests). Between two real
+  nodes over QUIC that remember each other it is **261 B on the stream**
+  (`crates/mycel-net/tests/sync_v2.rs`; the `Open` then also names the record
+  and carries an empty delta).
+- **Over 40 kB/s Bluetooth** (arithmetic on the bytes above, **estimate**):
+  an idle check goes from 16 s to under 10 ms of airtime; the 100k fresh join
+  from 1,037 s with nothing usable until the very end (and a restart from
+  zero if the link drops) to 877 s with the first 64 KiB chunk after 1.6 s,
+  each chunk durable as it lands.
+- **Where v2 costs more:** round trips. A fork that neither side can place
+  from the frontiers takes 6 RTT instead of 2 (probing), and a first contact
+  without a local write takes 2.5 instead of 2 (the server asks for the
+  client's frontier). Bytes are always lower.
+- **Index and digest** (100,000 envelopes, 50 authors): building the set with
+  the chain index maintained on every insert took 262 ms (2.6 µs per
+  envelope, including model hashing); a cold digest 18.8 µs; a cached one
+  0.3 µs.
+- **Group fan-out**, real nodes over loopback QUIC: one message in a
+  10-member group took 57 sessions in total (`tests/sync_v2.rs`); v1's
+  epidemic re-sync starts about m(m−1) = 90. Most of the 57 are idle
+  one-round-trip checks.
+
+Not measured here: QUIC and radio overhead per packet, the group-chat and
+community scenarios of the design (the tier-2 `group-sync` simulator
+scenario is not built yet), and real-replica sessions at 100k (the real
+envelope path adds signature checks and validation, not bytes).

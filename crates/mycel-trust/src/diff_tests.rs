@@ -12,6 +12,11 @@
 //! a random order (out of order, in batches, with duplicates), once with the
 //! fast path and once without.
 //!
+//! Admission (rule A2: only named keys author ops; others wait in the
+//! unnamed pool) happens in `SpaceGraph` before either resolver runs, so
+//! both always resolve the same admitted op set and the oracle needs no
+//! copy of the rule.
+//!
 //! `PROPTEST_CASES=<n>` scales every property up for a longer fuzz run.
 
 use std::collections::{BTreeSet, HashSet};
@@ -345,9 +350,15 @@ impl World {
         }
     }
 
-    /// Insert an op authored at replica `r` (rejected ops are dropped).
+    /// Insert an op authored at replica `r` (rejected ops are dropped). An
+    /// op whose author isn't named yet (admission rule A2) is rejected but
+    /// held, and joins the graph if a later op names its author, so it is
+    /// kept too: every replica and observer then decides it the same way.
     fn deliver(&mut self, r: usize, op: SignedOp) {
-        if self.replicas[r].insert(op.clone()).is_ok() {
+        let id = op.id();
+        let res = self.replicas[r].insert(op.clone());
+        let held = |g: &SpaceGraph| g.unnamed.get(&op.op.author).is_some_and(|ops| ops.contains_key(&id));
+        if res.is_ok() || held(&self.replicas[r]) {
             self.all.push(op);
             check(&self.replicas[r]);
         }
@@ -1092,8 +1103,11 @@ fn seniority_flip_in_one_update() {
                 check(&g);
             }
             assert_eq!(g.insert(x.clone()).unwrap(), Inserted::Pending);
-            assert_eq!(g.insert(y.clone()).unwrap(), Inserted::Pending);
+            // (P is named only once `x` is stored: until then `y` waits in
+            // the unnamed pool, rule A2, and joins in the same update)
+            assert!(g.insert(y.clone()).is_err());
             assert_eq!(g.insert(m.clone()).unwrap(), Inserted::New);
+            assert_eq!(g.take_released(), vec![y.id()]);
             check(&g);
             assert_eq!(g.state(), &batched);
             // One at a time.
