@@ -296,13 +296,27 @@ async fn outsiders_and_removed_members_are_refused() {
     let _ = carol.calls.accept(&id).await;
     let c = eventually("carol's join is refused", 15, || carol.call(&id).filter(|c| c.state == CallPhase::Ended)).await;
     eprintln!("removed member's join ended as {:?}", c.end_reason);
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // For the next 2 s neither device in the call has Carol joined or hears
+    // anything from her, checked every 100 ms rather than once at the end.
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        for (d, name) in [(&alice, "alice"), (&bob, "bob")] {
+            let info = d.call(&id).expect("call still there");
+            for p in info.participants.iter().filter(|p| p.id == carol.hex()) {
+                assert_ne!(p.state, ParticipantState::Joined, "{name} has carol joined");
+                assert_eq!(p.level, 0.0, "{name} has a level for carol");
+            }
+        }
+    }
     let a = talking_to(&alice, &id, 1).expect("alice still talking to bob only");
     assert!(a.participants.iter().all(|p| p.id != carol.hex() || p.state != ParticipantState::Joined));
-    // Against the other voice, not the noise floor: a late frame's
-    // concealment leaves faint artifacts all over, a real leak is loud.
+    // Both bounds: no louder than the noise floor allows (`hears`), and far
+    // below the other voice.
     assert_hears(&alice, "alice", &[660.0], &[CAROL]);
     assert_hears(&bob, "bob", &[440.0], &[CAROL]);
+    for (d, name) in [(&alice, "alice"), (&bob, "bob")] {
+        assert!(!hears(d, CAROL), "{name} hears carol (snr {:.1})", snr(d, 1.5, CAROL));
+    }
     alice.calls.end(&id).unwrap();
 }
 
