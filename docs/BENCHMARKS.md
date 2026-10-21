@@ -846,48 +846,78 @@ the server's epidemic re-sync it triggers), which is v1's real cost per
 change. v2's UDP overhead over its stream bytes is about 300 B per idle
 check and 3–12% on bulk transfers.
 
-**Dissemination** (`bench_dissemination_over_quic`): a group of real nodes
-on loopback, one new message by a different author each time, after the
-gossip tree formed (5 warm-up messages, the next 5 averaged). Bytes are all
-nodes' gossip and session frames (stream) and all UDP they sent, for the
-whole group per message. Payload copies count envelopes received by push
-(the author's own excluded, so the floor is members − 1).
+**Dissemination** (`bench_dissemination_over_quic`, `GROUP_SIZES=10,50,200`):
+a group of real nodes on loopback, one new message by a different author
+each time (so every message is its author's first), after the gossip tree
+formed (5 warm-up messages, the next 5 averaged). Bytes are all nodes'
+gossip and session frames (stream) and all UDP they sent, for the whole
+group per message. Payload copies count envelopes received by push (the
+author's own excluded, so the floor is members − 1). Sessions are all
+sessions started in the window. Measured 2026-10-21 after the tree fixes
+below, one run:
 
 | Members | Stream B per message (group) | Per member | UDP B per message (group) | Payload copies | Sessions per message | Time to everyone |
 |---|---|---|---|---|---|---|
-| 10 | 8,012 | 801 | 88,408 | 9.0 | 0.2 | 52 ms |
-| 50 | 63,408 | 1,268 | 341,994 | 88.2 | 4.4 | 794 ms |
-| 200 | 250,482 | 1,252 | 1,526,169 | 372.0 | 17.2 | 996 ms |
+| 10 | 8,734 | 873 | 143,303 | 9.0 | 1.2 | 52 ms |
+| 50 | 45,072 | 901 | 779,525 | 49.0 | 2.8 | 52 ms |
+| 200 | 169,786 | 849 | 1,912,092 | 199.0 | 8.4 | 84 ms |
+
+After the warm-up the eager edges were exactly a spanning tree (49 of 187
+edges eager at 50 members, 199 of 669 at 200) and no announcement timed
+out at 10 or 50 members (at 200, 64 timed out, all in the warm-up, where
+28 sends also failed while 200 nodes in one debug process set up their
+connections). The sessions in the window are not repairs: they are not
+broken down by cause, but with no timeouts they are the author's sessions
+to members whose hello it hasn't seen (the strict coverage rule for own
+writes) and the periodic anti-entropy that the window catches.
+
+Before the fixes (same bench, 2026-10-21, earlier the same day): 88.2 and
+372.0 payload copies (1.8 and 1.9 per member), 4.4 and 17.2 sessions per
+message, 794 ms and 996 ms to everyone at 50 and 200 members. Two causes,
+both found with this bench's counters and reproduced on model sets:
+
+- *Sessions faster than the tree cut it.* An author's session to a member
+  whose hello it hadn't seen (or an anti-entropy session) delivered first;
+  the member pushed the item on and pruned its tree parent's late push as
+  a duplicate, the parent did the same, and the member's subtree hung off
+  nothing until announcements timed out (50 members: each message took
+  either 50 ms or 1.3 s). Now a session or bundle with a non-neighbour is
+  only announced, only items that reached a device along the tree make a
+  push redundant, and an item held from a session goes on down the tree
+  when the tree's push arrives.
+- *Edges eager at one end only.* A prune lost with a failed send, or a
+  prune and a graft that crossed, left one end pushing every message for
+  ever: a duplicate from an edge already lazy here sent no prune, and a
+  push from a non-neighbour at the degree cap was ignored. Now every
+  redundant push prunes, a push with new items makes the edge eager at
+  the receiving end, and the over-cap pusher gets a dropping prune. When
+  several announcers' waits run out together, one is grafted and pulled
+  (Plumtree's second timer).
 
 The same on model sets (`bench_gossip_dissemination_cost` in
 `reconcile/gossip_tests.rs`: the real `Disseminator`, postcard sizes, all
-messages of a 10 ms step delivered in order, no transport overhead):
+messages of a 10 ms step delivered in order, no transport overhead;
+`bench_gossip_jittered`: every message delayed 2–60 ms, in any order):
 
-| Members | Gossip B per message (group) | Per member | Payload copies | Pulls |
+| Members | Gossip B per message (group), in step / jittered | Per member | Payload copies | Pulls |
 |---|---|---|---|---|
-| 10 | 8,024 | 802 | 9.0 | 0 |
-| 50 | 41,661 | 833 | 49.0 | 0 |
-| 200 | 169,967 | 849 | 199.0 | 0 |
+| 10 | 8,332 / 8,582 | 833 / 858 | 9.0 | 0 |
+| 50 | 42,137 / 43,251 | 842 / 865 | 49.0 | 0 |
+| 200 | 170,275 / 172,431 | 851 / 862 | 199.0 | 0 |
 
-- In the model the tree settles at one payload copy per member and about
-  830 B of gossip per member per message (the push, about 430 B, plus lazy
-  announcements), flat from 10 to 200 members. v1 started about m(m−1)
-  sessions per change (2,450 at 50 members; at 640 KB per session with a
-  10,000-envelope history, about 1.5 GB group-wide, **estimate** from §8).
-- Over real QUIC the 10-member group matches the model. The 50- and
-  200-member groups do not yet: 1.8 and 1.9 payload copies per member and
-  about 4 and 17 pulls per message
-  (an `IHave` that timed out, then a graft and a session), so the eager tree
-  keeps losing edges to crossing pushes and is repaired by pulls. The
-  design's gate is at most 1.5 copies per member after warm-up; 50 and 200
-  members over QUIC miss it. Still, a message costs the 200-member group
-  about 1.25 KB of frames per member and reaches everyone in about 1 s,
-  where v1 would start about 39,800 sessions. Tuning (prune rules under concurrency, the
-  `IHave` wait) belongs with the simulator's `group-chat-50` scenario.
-- UDP bytes per message exceed stream bytes several-fold in groups: every
+- The tree settles at one payload copy per member and about 850–900 B of
+  frames per member per message (the push, about 430 B, plus lazy
+  announcements and the neighbours' announcements back to the author for
+  its delivery state, about 3% of the bytes), flat from 10 to 200
+  members, over QUIC as on model sets. The design's gate (at most 1.5
+  copies per member after warm-up) holds at all three sizes. v1 started
+  about m(m−1) sessions per change (2,450 at 50 members; at 640 KB per
+  session with a 10,000-envelope history, about 1.5 GB group-wide,
+  **estimate** from §8).
+- UDP bytes per message exceed stream bytes many-fold in groups: every
   device keeps a QUIC connection per neighbour, each with acknowledgements
-  and 1.5 s keep-alives, and the first messages to a new neighbour pay its
-  handshake.
+  and 1.5 s keep-alives over the 2–3 s window, and the window's sessions
+  add their handshakes and hellos.
 
 Not measured here: radio overhead per packet, the group-chat and community
 scenarios of the design over intermittent links (the tier-2 `group-sync`

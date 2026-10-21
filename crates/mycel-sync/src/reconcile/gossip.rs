@@ -34,6 +34,19 @@
 //!   its share, whatever it writes. A queue over its cap drops its oldest
 //!   items (repaired by `IHave` and anti-entropy).
 //!
+//! - **Tree discipline.** Only items that reached a device along the tree
+//!   (by push, or as its own write) make a later push of them redundant;
+//!   what a session or bundle with a non-neighbour brought is announced,
+//!   not pushed, and goes on down the tree when the tree's push arrives.
+//!   Otherwise a session faster than the tree makes both ends of the
+//!   receiver's tree edge prune it, and cuts the receiver's subtree off.
+//!
+//! Driver contract: call [`Disseminator::on_msg`] for a push and then,
+//! after ingesting its items, [`Disseminator::after_push`] for the same
+//! sender and space before that sender's next push in that space; call
+//! [`Disseminator::on_changed`] with the session's or bundle's peer as
+//! `from` (`None` only for local writes).
+//!
 //! Nothing here is trusted: every item still goes through
 //! `Replica::ingest_batch`, frontier entries only decide who to ask, and
 //! every per-peer amount is bounded. Like [`super::Session`], this is
@@ -104,6 +117,8 @@ const SKIP_REMEMBERED: usize = 4096;
 /// Ids that reached us along the tree (a push, or our own write),
 /// remembered to tell a redundant edge from a session that was faster.
 const TREE_REMEMBERED: usize = 2048;
+/// Pushes between `on_msg` and `after_push` remembered at once.
+const LAST_PUSHES: usize = 64;
 
 const CTX_VIEW: &str = "mycel/v2/gossip-view";
 
@@ -282,7 +297,6 @@ struct View {
 /// What [`Disseminator::on_msg`] learnt of a push before the driver
 /// ingested it.
 struct LastPush<E> {
-    from: SignPk,
     /// All of it had reached us along the tree already (a redundant edge).
     redundant: bool,
     /// Items we held, but only from a session or bundle (announced, never
@@ -401,8 +415,9 @@ pub struct Disseminator<O, E> {
     /// Recent ids that reached us along the tree (see [`Self::after_push`]).
     tree_ids: HashSet<EnvelopeId>,
     tree_order: VecDeque<EnvelopeId>,
-    /// The last push [`Self::on_msg`] saw, for [`Self::after_push`].
-    last_push: Option<LastPush<E>>,
+    /// The push [`Self::on_msg`] saw last per (space, sender), for
+    /// [`Self::after_push`] (a driver may serve spaces concurrently).
+    last_push: HashMap<(SpaceId, SignPk), LastPush<E>>,
 }
 
 impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E> {
@@ -416,7 +431,7 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
             stats: Default::default(),
             tree_ids: HashSet::new(),
             tree_order: VecDeque::new(),
-            last_push: None,
+            last_push: HashMap::new(),
         }
     }
 
@@ -773,7 +788,11 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
                 for (_, e) in &off_tree {
                     remember_tree(&mut self.tree_ids, &mut self.tree_order, e.gossip_id());
                 }
-                self.last_push = Some(LastPush { from, redundant, off_tree });
+                if self.last_push.len() >= LAST_PUSHES {
+                    // (a driver that skipped `after_push`: forget, don't grow)
+                    self.last_push.clear();
+                }
+                self.last_push.insert((space, from), LastPush { redundant, off_tree });
                 for e in &items {
                     if !set.index().holds(&e.gossip_id()) {
                         remember_tree(&mut self.tree_ids, &mut self.tree_order, e.gossip_id());
@@ -921,9 +940,9 @@ impl<O: Clone + Serialize, E: Clone + Serialize + GossipItem> Disseminator<O, E>
     /// ours to it.
     pub fn after_push<S: SyncSet<Op = O, Env = E>>(&mut self, set: &S, from: SignPk, items: usize, new: u64, now: u64) {
         let space = set.space();
-        let (redundant, off_tree) = match self.last_push.take() {
-            Some(l) if l.from == from => (l.redundant, l.off_tree),
-            _ => (false, Vec::new()),
+        let (redundant, off_tree) = match self.last_push.remove(&(space, from)) {
+            Some(l) => (l.redundant, l.off_tree),
+            None => (false, Vec::new()),
         };
         if new == 0 && items > 0 {
             self.stats.duplicates += items as u64;

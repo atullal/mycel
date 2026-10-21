@@ -45,6 +45,8 @@ enum Step {
     Tick(u16),
     PathDown(u8),
     Seen(Vec<u8>),
+    /// A session (or bundle) with `from` brought some of its items.
+    Session { from: u8, n: u8 },
 }
 
 #[derive(Arbitrary, Debug)]
@@ -144,6 +146,14 @@ fuzz_target!(|input: Input| {
                     let (new, _) = set.apply(Received { ops: p.ops, envelopes: p.envelopes });
                     d.after_push(&set, from, n, new, now);
                 }
+            }
+            Step::Session { from, n } => {
+                let from = key(*from);
+                peer_set.append(from, 1, 64);
+                let (ops, envs) = peer_set.all();
+                let take = usize::from(*n).min(envs.len());
+                set.apply(Received { ops, envelopes: envs[envs.len() - take..].to_vec() });
+                d.on_changed(&set, Some(from), now);
             }
             Step::Tick(ms) => now += u64::from(*ms),
             Step::PathDown(p) => d.path_down(&key(*p)),
