@@ -596,6 +596,18 @@ impl Replica {
         }
     }
 
+    /// Persist the ops the graph admitted from its pool of ops by authors
+    /// not yet named (except those of the current batch, persisted already).
+    fn persist_released(&mut self, batch: &HashSet<OpId>) {
+        for id in self.graph.take_released() {
+            if !batch.contains(&id)
+                && let Some(op) = self.graph.get(&id)
+            {
+                self.persist_op(&op.clone());
+            }
+        }
+    }
+
     fn persist_envelope(&self, env: &Envelope) {
         if let Some(s) = &self.store {
             s.put_envelope(&self.space_id(), env);
@@ -691,7 +703,10 @@ impl Replica {
     /// Ingest a membership op from anyone. Returns true if it was new.
     pub fn ingest_op(&mut self, op: SignedOp) -> Result<bool> {
         let id = op.id();
-        let new = self.graph.insert(op)? == Inserted::New;
+        let inserted = self.graph.insert(op);
+        // Ops of earlier inserts whose author this one named.
+        self.persist_released(&HashSet::from([id]));
+        let new = inserted? == Inserted::New;
         if let Some(op) = self.graph.get(&id) {
             // Persist pending ops too: they become valid once parents arrive.
             self.persist_op(&op.clone());
@@ -776,6 +791,9 @@ impl Replica {
                     self.persist_op(&op.clone());
                 }
             }
+            // Ops of earlier batches whose author this batch named.
+            let batch: HashSet<OpId> = ids.into_iter().collect();
+            self.persist_released(&batch);
         }
         let mut new_envs = Vec::new();
         for env in envelopes {
