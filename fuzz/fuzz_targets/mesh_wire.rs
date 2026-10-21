@@ -4,7 +4,8 @@
 //!
 //! Properties: no decoder panics; every accepted datagram re-encodes to the
 //! same bytes (announcements, batches, attested batches with chains of the
-//! shape the router expects, seqno requests) or to a frame that
+//! shape the router expects or none, refreshes without their chain, seqno
+//! requests) or to a frame that
 //! decodes to the same fields; a decoded frame split into fragments for any
 //! hop MTU reassembles into the same payload.
 #![no_main]
@@ -39,10 +40,15 @@ fuzz_target!(|data: &[u8]| {
         if !batch.is_empty() {
             for a in &batch {
                 assert!(a.name.len() <= wire::MAX_NAME);
+                assert!(a.cost != u32::MAX && a.sign_link.is_none());
+                // a refresh without its chain, or a chain of the expected shape
                 let n = a.chain.as_ref().map_or(0, |c| c.len());
-                assert!(n == a.hops as usize || n == a.hops as usize + 1, "{n} hops for {}", a.hops);
-                assert!(n <= mycel_net::mesh::core::MAX_CHAIN);
-                assert!(a.chain_len() > 0 && a.cost != u32::MAX);
+                if a.same {
+                    assert_eq!(n, 0);
+                } else {
+                    assert!(n == a.hops as usize || n == a.hops as usize + 1, "{n} hops for {}", a.hops);
+                    assert!(n <= mycel_net::mesh::core::MAX_CHAIN && n > 0);
+                }
                 assert_eq!(wire::wire_len(a), {
                     let (g, r) = wire::encode_attested(vec![a.clone()], usize::MAX);
                     assert!(r.is_empty(), "a decoded announcement encodes");

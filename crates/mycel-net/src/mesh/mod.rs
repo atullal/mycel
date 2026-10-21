@@ -79,8 +79,7 @@ use crate::link::{
     CustomAddr, Link, LinkEvent, LinkStatus, PathKind, TRANSPORT_MESH, n0_watcher, noq_udp, path_in_use,
 };
 use crate::version::{
-    AlpnTable, Caps, Hello, PeerProtocol, Protocol, WIRE_V1, WIRE_V2, WireVersion, alpn_table_ok, alpns_in,
-    version_in,
+    AlpnTable, Caps, Hello, PeerProtocol, Protocol, WIRE_V1, WIRE_V2, WireVersion, alpn_table_ok, alpns_in, version_in,
 };
 
 /// Hop connections between neighbours (and internet hops to gateways), wire
@@ -680,15 +679,14 @@ impl Driver {
             // our own attestation hops, one per announcement and receiver
             // (the router only asks for them for a neighbour that has the
             // capability), then the attested ones in their own datagrams
-            let (attested, v): (Vec<_>, Vec<_>) = v
-                .into_iter()
-                .map(|a| wire::sign_hop(&self.keys, a, &to))
-                .partition(|a| a.chain.is_some());
+            // (refreshes without their chain among them)
+            let (attested, v): (Vec<_>, Vec<_>) =
+                v.into_iter().map(|a| wire::sign_hop(&self.keys, a, &to)).partition(|a| a.attested());
             let (grams, rest) = wire::encode_attested(attested, max);
             for d in grams {
                 let _ = c.send_datagram(d);
             }
-            let v: Vec<_> = v.into_iter().chain(rest).filter(|a| a.sig != core::NO_SIG).collect();
+            let v: Vec<_> = v.into_iter().chain(rest).collect();
             if let [a] = &v[..] {
                 let _ = c.send_datagram(wire::encode_announce(a));
                 continue;

@@ -421,7 +421,10 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                 sample,
                 &name,
                 |i, _| {
-                    let mut r = Global::new(i, global_cfg(g, seed, i), shared.clone());
+                    let mut cfg = global_cfg(g, seed, i);
+                    // a liar re-signs every lie: each copy carries its chain
+                    cfg.chain_reuse &= !plan.role(i).signs_lies();
+                    let mut r = Global::new(i, cfg, shared.clone());
                     if g.dtn {
                         r = r.with_dtn(dtn_cfg(plan));
                         r.bundle_lifetime_ms = plan.bundle_lifetime_ms.unwrap_or(24 * 3600 * 1000);
@@ -1090,7 +1093,8 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
     // (`MYCEL_SIM_FLOOD_SIZES=2000`, `MYCEL_SIM_FLOOD_VARIANTS=now,attested`
     // and `MYCEL_SIM_FLOOD_MAIN=0` run part of it: a 2,000-device run holds
     // a GB or more)
-    let env_list = |k: &str| std::env::var(k).ok().map(|v| v.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>());
+    let env_list =
+        |k: &str| std::env::var(k).ok().map(|v| v.split(',').map(|x| x.trim().to_string()).collect::<Vec<_>>());
     let mut sizes: Vec<usize> = if o.scale >= 1.0 { vec![250, 500, 1000, 2000] } else { vec![o.n(250, 60)] };
     if let Some(only) = env_list("MYCEL_SIM_FLOOD_SIZES") {
         sizes = only.iter().filter_map(|x| x.parse().ok()).collect();
@@ -1223,7 +1227,12 @@ fn flood_scaling(o: Opts) -> ScenarioResult {
         r.note(line);
     }
     if attested_worst > 0.0 {
-        r.at_most("attested announcement traffic at the largest N, as a share of one BLE radio", 100.0 * attested_worst, 15.0, "%");
+        r.at_most(
+            "attested announcement traffic at the largest N, as a share of one BLE radio",
+            100.0 * attested_worst,
+            15.0,
+            "%",
+        );
         if o.candidate == Candidate::Global {
             r.at_least("pairs within 8 hops routed with attestations, every N", 100.0 * attested_cov, 95.0, "%");
         }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use bytes::{BufMut, Bytes, BytesMut};
 use mycel_crypto::{DeviceKeys, Sig, SignPk};
 
-use super::core::{Announce, Check, Frame, Hop, MAX_CHAIN, NO_SIG, Origination, SeqReq, fields_digest, hop_signed};
+use super::core::{Announce, Check, Frame, Hop, MAX_CHAIN, Origination, SeqReq, hop_message, own_hop_message};
 use crate::link::{CustomAddr, TRANSPORT_MESH};
 
 const OGM_CTX: &str = "mycel/v1/mesh-announce";
@@ -20,10 +20,12 @@ pub(crate) const T_OGMS: u8 = 4;
 /// Several attested announcements (`ROUTE_ATTEST`) in one datagram, sent
 /// only to a neighbour whose hop hello has the capability.
 pub(crate) const T_AOGMS: u8 = 5;
-/// An attested announcement's flags: the origin's signature follows ...
-const A_BASE: u8 = 1;
-/// ... and the chain ends with its sender's own hop (naming the receiver).
-const A_OWN: u8 = 2;
+/// An attested announcement's flags: its chain ends with its sender's own
+/// hop (naming the receiver) ...
+const A_OWN: u8 = 1;
+/// ... or no chain follows: the one its sender last sent for this origin,
+/// this epoch (`Announce::same`; alone, without `A_OWN`).
+const A_SAME: u8 = 2;
 /// Data frame header: type, ttl, flags, dst, src, waypoint, id, offset, total.
 pub const DATA_HDR: usize = 3 + 32 * 3 + 4 + 2 + 2;
 const F_REACHED: u8 = 1;
@@ -88,6 +90,7 @@ pub fn sign_announce(keys: &DeviceKeys, o: Origination, name: &str) -> Announce 
         sig,
         chain: None,
         sign_link: None,
+        same: false,
     }
 }
 
@@ -95,7 +98,7 @@ pub fn sign_announce(keys: &DeviceKeys, o: Origination, name: &str) -> Announce 
 /// asked for one ([`Announce::sign_link`]).
 pub fn sign_hop(keys: &DeviceKeys, a: Announce, to: &SignPk) -> Announce {
     let Some(link) = a.sign_link else { return a };
-    let m = hop_signed(&fields_digest(&a), a.hops, a.cost, to, link);
+    let m = own_hop_message(&a, to, link);
     let sig = keys.sign(ATTEST_CTX, &[&m]);
     a.signed_by(keys.sign_pk(), sig)
 }
@@ -106,7 +109,7 @@ pub fn verify(c: Check<'_>) -> bool {
     match c {
         Check::Origin(a) => verify_announce(a),
         Check::Hop { ann, hop, pos, next } => {
-            let m = hop_signed(&fields_digest(ann), pos, hop.cost, &next, hop.link);
+            let m = hop_message(ann, hop, pos, &next);
             hop.signer.verify(ATTEST_CTX, &[&m], &hop.sig).is_ok()
         }
     }
@@ -177,12 +180,25 @@ pub fn decode_announce(b: &[u8]) -> Option<Announce> {
     }
     let name = std::str::from_utf8(&b[OGM_FIXED..OGM_FIXED + n]).ok()?;
     let sig = Sig(b[OGM_FIXED + n..].try_into().ok()?);
-    Some(Announce { hops, cost, origin, seq, flags, scope, uplink, name: Arc::from(name), sig, chain: None, sign_link: None })
+    Some(Announce {
+        hops,
+        cost,
+        origin,
+        seq,
+        flags,
+        scope,
+        uplink,
+        name: Arc::from(name),
+        sig,
+        chain: None,
+        sign_link: None,
+        same: false,
+    })
 }
 
-/// An attested announcement's fixed part: [`OGM_FIXED`] without the type
-/// byte, then its flags byte.
-const AOGM_FIXED: usize = OGM_FIXED; // no type byte; a flags byte instead
+// An attested announcement: a `T_OGM` without its type byte (the origin's
+// signature included), then a flags byte (as long, together), then its
+// chain unless `A_SAME`:
 /// The origin's hop (its cost is 0) and the sender's own (its cost is the
 /// announcement's): a link cost and a signature.
 const SHORT_HOP: usize = 4 + 64;
@@ -190,43 +206,46 @@ const SHORT_HOP: usize = 4 + 64;
 const RELAY_HOP: usize = 32 + 4 + 4 + 64;
 
 /// Whether the attested form of `a` (signed, or with `sign_link` still to
-/// sign) ends with its sender's own hop, and whether it carries the
-/// origin's signature: only then, since a receiver that won't pass it on
-/// needs neither (the chain's first hop covers the same fields).
-fn attested_shape(a: &Announce) -> (bool, bool) {
-    let own = a.sign_link.is_some() || a.chain_len() == a.hops as usize + 1;
-    (own, own && a.sig != NO_SIG)
+/// sign) ends with its sender's own hop.
+fn ends_with_own(a: &Announce) -> bool {
+    a.sign_link.is_some() || a.chain_len() == a.hops as usize + 1
 }
 
 /// Bytes of `a` on the wire: attested if it has a chain (or a hop to sign),
-/// else as version 1 sends it. What the control budget and the simulator
-/// count.
+/// as many as version 1 sends if it goes without its chain
+/// ([`Announce::same`]) or unattested. What the control budget and the
+/// simulator count.
 pub fn wire_len(a: &Announce) -> usize {
-    if a.chain.is_none() && a.sign_link.is_none() {
-        return OGM_FIXED + a.name.len() + 64;
+    let plain = OGM_FIXED + a.name.len() + 64;
+    if a.same || (a.chain.is_none() && a.sign_link.is_none()) {
+        return plain;
     }
-    let (own, base) = attested_shape(a);
     let between = (a.hops as usize).saturating_sub(1);
-    AOGM_FIXED
-        + a.name.len()
-        + if base { 64 } else { 0 }
-        + SHORT_HOP
-        + between * RELAY_HOP
-        + if own && a.hops > 0 { SHORT_HOP } else { 0 }
+    plain + SHORT_HOP + between * RELAY_HOP + if ends_with_own(a) && a.hops > 0 { SHORT_HOP } else { 0 }
 }
 
 /// One attested announcement (signed: no `sign_link` left), appended to
 /// `b`. `None` if its chain isn't one a receiver could take (see
 /// [`decode_attested`]).
 fn put_attested(a: &Announce, b: &mut BytesMut) -> Option<()> {
-    let chain = a.chain.as_ref()?;
-    let hops: Vec<&Hop> = chain.iter().collect::<Vec<_>>().into_iter().rev().collect();
     let h = a.hops as usize;
-    let (own, base) = attested_shape(a);
-    if a.sign_link.is_some() || a.cost == u32::MAX || hops.len() > MAX_CHAIN || hops.len() != h + own as usize {
+    let hops: Vec<&Hop> = match &a.chain {
+        _ if a.same => Vec::new(),
+        Some(c) => c.iter().collect::<Vec<_>>().into_iter().rev().collect(),
+        None => return None,
+    };
+    let own = ends_with_own(a);
+    if a.sign_link.is_some() || a.cost == u32::MAX || (a.same && a.chain.is_some()) {
         return None;
     }
-    if (h == 0 && !own) || hops[0].signer != a.origin || hops[0].cost != 0 || (own && hops[h].cost != a.cost) {
+    if !a.same
+        && (hops.len() > MAX_CHAIN
+            || hops.len() != h + own as usize
+            || (h == 0 && !own)
+            || hops[0].signer != a.origin
+            || hops[0].cost != 0
+            || (own && hops[h].cost != a.cost))
+    {
         return None;
     }
     b.put_u8(a.hops);
@@ -238,10 +257,12 @@ fn put_attested(a: &Announce, b: &mut BytesMut) -> Option<()> {
     b.put_u32(a.uplink);
     b.put_u8(a.name.len() as u8);
     b.put_slice(a.name.as_bytes());
-    b.put_u8(if base { A_BASE } else { 0 } | if own { A_OWN } else { 0 });
-    if base {
-        b.put_slice(&a.sig.0);
+    b.put_slice(&a.sig.0);
+    if a.same {
+        b.put_u8(A_SAME);
+        return Some(());
     }
+    b.put_u8(if own { A_OWN } else { 0 });
     let between = h.saturating_sub(1);
     for x in &hops[1..1 + between] {
         b.put_slice(&x.signer.0);
@@ -272,7 +293,7 @@ pub fn encode_attested(anns: Vec<Announce>, max: usize) -> (Vec<Bytes>, Vec<Anno
     for a in anns {
         one.clear();
         if put_attested(&a, &mut one).is_none() || one.len() + 1 > max {
-            rest.push(Announce { chain: None, sign_link: None, ..a });
+            rest.push(Announce { chain: None, sign_link: None, same: false, ..a });
             continue;
         }
         if !cur.is_empty() && cur.len() + one.len() > max {
@@ -330,16 +351,18 @@ fn get_attested(r: &mut Reader<'_>, from: &SignPk) -> Option<Announce> {
     if n > MAX_NAME || cost == u32::MAX {
         return None;
     }
-    let name = std::str::from_utf8(r.take(n)?).ok()?;
+    let name: Arc<str> = Arc::from(std::str::from_utf8(r.take(n)?).ok()?);
+    let sig = r.sig()?;
     let att = r.u8()?;
-    let (base, own) = (att & A_BASE != 0, att & A_OWN != 0);
+    if att == A_SAME {
+        let (chain, sign_link, same) = (None, None, true);
+        return Some(Announce { hops, cost, origin, seq, flags, scope, uplink, name, sig, chain, sign_link, same });
+    }
+    let own = att & A_OWN != 0;
     let h = hops as usize;
-    // (the origin's signature only with the sender's own hop, as we send it:
-    // every accepted encoding is the one we would send)
-    if att & !(A_BASE | A_OWN) != 0 || (base && !own) || (h == 0 && !own) || h + own as usize > MAX_CHAIN {
+    if att & !A_OWN != 0 || (h == 0 && !own) || h + own as usize > MAX_CHAIN {
         return None;
     }
-    let sig = if base { r.sig().filter(|s| *s != NO_SIG)? } else { NO_SIG };
     let between = h.saturating_sub(1);
     let keys: Vec<SignPk> = (0..between).map(|_| r.key()).collect::<Option<_>>()?;
     let mut chain = Arc::new(Hop { signer: origin, cost: 0, link: r.u32()?, sig: r.sig()?, prev: None });
@@ -350,14 +373,15 @@ fn get_attested(r: &mut Reader<'_>, from: &SignPk) -> Option<Announce> {
     if own && h > 0 {
         chain = Arc::new(Hop { signer: *from, cost, link: r.u32()?, sig: r.sig()?, prev: Some(chain) });
     }
-    let name = Arc::from(name);
-    Some(Announce { hops, cost, origin, seq, flags, scope, uplink, name, sig, chain: Some(chain), sign_link: None })
+    let chain = Some(chain);
+    Some(Announce { hops, cost, origin, seq, flags, scope, uplink, name, sig, chain, sign_link: None, same: false })
 }
 
 /// The attested announcements in a `T_AOGMS` datagram from neighbour `from`
 /// (none if any is malformed). Each chain has the hops at positions 0 to
-/// `hops` − 1, plus `from`'s own if the flag says so: the shape is checked
-/// here, what each hop may claim and its signature by the router.
+/// `hops` − 1, plus `from`'s own if the flag says so, or is the one `from`
+/// sent before (`same`): the shape is checked here, what each hop may claim
+/// and its signature by the router.
 pub fn decode_attested(b: &[u8], from: &SignPk) -> Vec<Announce> {
     let Some((&T_AOGMS, rest)) = b.split_first() else { return Vec::new() };
     let mut r = Reader(rest);
@@ -496,6 +520,7 @@ pub fn decode_frame(b: Bytes) -> Option<Frame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh::core::{ATTEST_EPOCH, attest_epoch};
 
     #[test]
     fn announcements_round_trip_and_verify() {
@@ -571,10 +596,7 @@ mod tests {
                     continue; // the origin always signs its hop
                 }
                 let path: Vec<&DeviceKeys> = keys[1..1 + relays].iter().collect();
-                let mut a = attested(&keys[0], &path, me, own);
-                if !own {
-                    a.sig = NO_SIG; // nobody it passes it on to needs it
-                }
+                let a = attested(&keys[0], &path, me, own);
                 let from = path.last().map_or(keys[0].sign_pk(), |k| k.sign_pk());
                 let (grams, rest) = encode_attested(vec![a.clone()], 1200);
                 assert!(rest.is_empty() && grams.len() == 1);
@@ -587,9 +609,23 @@ mod tests {
                 for (j, h) in hops.iter().enumerate() {
                     let next = hops.get(j + 1).map_or(if own { me } else { from }, |x| x.signer);
                     assert!(verify(Check::Hop { ann: &a, hop: h, pos: j as u8, next }));
-                    assert!(!verify(Check::Hop { ann: &a, hop: h, pos: j as u8, next: DeviceKeys::generate().sign_pk() }));
+                    assert!(!verify(Check::Hop {
+                        ann: &a,
+                        hop: h,
+                        pos: j as u8,
+                        next: DeviceKeys::generate().sign_pk()
+                    }));
                 }
-                assert_eq!(verify(Check::Origin(&a)), own, "the origin's own signature, when carried");
+                assert!(verify(Check::Origin(&a)), "the origin's own signature, always carried");
+                // the same within the epoch: its refreshes' copies verify too
+                let later = Announce { seq: a.seq + 16_000, ..a.clone() };
+                let stale = Announce { seq: a.seq + ATTEST_EPOCH, ..a.clone() };
+                for (j, h) in hops.iter().enumerate() {
+                    let next = hops.get(j + 1).map_or(if own { me } else { from }, |x| x.signer);
+                    let same_epoch = attest_epoch(&a.origin, later.seq) == attest_epoch(&a.origin, a.seq);
+                    assert_eq!(verify(Check::Hop { ann: &later, hop: h, pos: j as u8, next }), same_epoch);
+                    assert!(!verify(Check::Hop { ann: &stale, hop: h, pos: j as u8, next }), "an epoch later");
+                }
                 // truncated anywhere, or with a byte too many: nothing
                 for cut in 1..grams[0].len() {
                     assert!(decode_attested(&grams[0][..cut], &from).is_empty(), "cut at {cut}");
@@ -607,11 +643,11 @@ mod tests {
         let me = DeviceKeys::generate().sign_pk();
         let a = attested(&o, &[&r], me, true);
         let g = encode_attested(vec![a.clone()], 1200).0.remove(0);
-        let flags_at = 1 + 1 + 4 + 32 + 8 + 1 + 1 + 4 + 1 + a.name.len();
-        for bad in [4u8, 0x80] {
+        let flags_at = 1 + 1 + 4 + 32 + 8 + 1 + 1 + 4 + 1 + a.name.len() + 64;
+        for bad in [4u8, 0x80, A_SAME] {
             let mut x = g.to_vec();
             x[flags_at] |= bad;
-            assert!(decode_attested(&x, &r.sign_pk()).is_empty(), "unknown flag {bad}");
+            assert!(decode_attested(&x, &r.sign_pk()).is_empty(), "unknown flag {bad}, or a chain after A_SAME");
         }
         // an origin's own announcement without its hop
         let own = attested(&o, &[], me, true);
@@ -631,8 +667,28 @@ mod tests {
         let (grams, rest) = encode_attested(vec![plain.clone(), a.clone()], wire_len(&a));
         assert!(grams.is_empty());
         assert_eq!(rest, vec![plain.clone(), plain]);
-        // an absent signature never verifies
-        assert!(!verify(Check::Origin(&Announce { sig: NO_SIG, ..a })));
+        // without its chain: nothing may follow the flags but the next one
+        let same = Announce { chain: None, same: true, ..a.clone() };
+        let mut x = encode_attested(vec![same], 1200).0.remove(0).to_vec();
+        x.push(0);
+        assert!(decode_attested(&x, &r.sign_pk()).is_empty());
+    }
+
+    #[test]
+    fn refreshes_without_their_chain_cost_what_version_1_does() {
+        let (o, r) = (DeviceKeys::generate(), DeviceKeys::generate());
+        let me = DeviceKeys::generate().sign_pk();
+        let full = attested(&o, &[&r], me, true);
+        let same = Announce { seq: full.seq + 16_000, chain: None, same: true, ..full.clone() };
+        let plain = Announce { chain: None, ..full.clone() };
+        assert_eq!(wire_len(&same), wire_len(&plain));
+        let (grams, rest) = encode_attested(vec![same.clone(), full.clone(), same.clone()], 1200);
+        assert!(rest.is_empty() && grams.len() == 1);
+        assert_eq!(grams[0].len(), 1 + 2 * wire_len(&same) + wire_len(&full));
+        assert_eq!(decode_attested(&grams[0], &r.sign_pk()), vec![same.clone(), full.clone(), same.clone()]);
+        // the encoder never sends a chain marked as the same one
+        let both = Announce { chain: full.chain.clone(), ..same };
+        assert!(encode_attested(vec![both], 1200).0.is_empty());
     }
 
     /// What one attestation hop costs a device: `cargo test --release -p

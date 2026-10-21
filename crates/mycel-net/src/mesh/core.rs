@@ -45,7 +45,9 @@
 //!   it sends to and its measured cost to them ([`Hop`]); a relay can't
 //!   claim a shorter chain or a cheaper link than the device upstream of it
 //!   signed, and a chain that tries gets its sender distrusted. Routes
-//!   without a chain rank behind attested ones.
+//!   without a chain rank behind attested ones. Hops sign an epoch of the
+//!   origin's clock ([`ATTEST_EPOCH`]), so a refresh within it travels
+//!   without its chain when the receiver holds it ([`Announce::same`]).
 //!
 //! # API (for drivers and simulators)
 //!
@@ -67,8 +69,10 @@
 //!                                 run once per unseen (origin, seq) and per
 //!                                 unseen attestation hop
 //!   (an Out::Announce with `sign_link` set: the caller signs our hop for its
-//!    receiver and pushes it onto the chain, `Announce::signed_by`)
+//!    receiver and pushes it onto the chain, `Announce::signed_by`; one with
+//!    `same` set goes attested without its chain)
 //!   on_seqreq(from, SeqReq, now)  a neighbour wants a fresh seqno of an origin
+//!                                 (or, one it was sent, its chain again)
 //!   send(dst, waypoint, payload, control, now) -> bool    a packet of ours
 //!   on_frame(from, Frame, now)    a frame from a neighbour
 //!   on_resolved(target, Option<Vec<(gateway, cost)>>, now)   answer to Out::Resolve
@@ -236,11 +240,19 @@ pub const MAX_CHAIN: usize = 16;
 /// A new neighbour whose capability hello hasn't arrived yet is greeted
 /// once it does (so the greeting can be attested), or after this long.
 const HELLO_WAIT: Time = 1_000;
-/// An absent signature: an attested announcement whose receiver won't pass
-/// it on carries no origin signature (its chain's first hop, signed by the
-/// origin, covers the same fields). It never verifies: its `s` half is above
-/// the group order, which Ed25519 refuses (and its `R` half isn't a point).
-pub const NO_SIG: Sig = Sig([0xff; 64]);
+/// How long one attestation hop stays good (ms of the origin's seqno, which
+/// is its clock): each hop signs the epoch of the announcement, not its
+/// seqno, so the origin's refreshes within an epoch travel without their
+/// chain when the receiver holds it already ([`Announce::same`]). It is
+/// also how stale a chain a relay can replay: a route it had up to this
+/// long ago, never a cheaper link than its upstream measured. Four of
+/// Babel's 16 s periods.
+pub const ATTEST_EPOCH: u64 = 64_000;
+/// A relay re-signs its hop for a neighbour within an epoch only when the
+/// chain below it changed, or its cost or its link fell by more than
+/// 1/this (it may advertise up to that much over its cost meanwhile:
+/// measured costs jitter, and each change would cost a chain).
+const RESIGN_FRACTION: u32 = 8;
 /// Changed origins remembered before `tick` redoes all of them instead.
 const DIRTY_MAX: usize = 1024;
 /// Frames waiting for a lookup or an internet dial: per key, keys, and how long.
@@ -364,6 +376,11 @@ pub struct Config {
     /// neighbours that have it ([`Router::set_attests`]), check the ones we
     /// get, and rank routes without one behind those with.
     pub attest: bool,
+    /// With `attest`: send a neighbour that holds our chain for an origin
+    /// (this epoch, [`ATTEST_EPOCH`]) the origin's refreshes without it
+    /// ([`Announce::same`]). Off: every copy carries its chain (what the
+    /// simulator's liars do, re-signing each lie).
+    pub chain_reuse: bool,
 }
 
 /// Defences against lying relays that need no wire change
@@ -425,6 +442,7 @@ impl Default for Config {
             defences: Defences::default(),
             affinity_step: AFFINITY_STEP,
             attest: true,
+            chain_reuse: true,
         }
     }
 }
@@ -435,8 +453,9 @@ impl Config {
     /// and `reduction` (on, off); the defences ([`Defences`]) all at once,
     /// `defences` (all, default, none), or one by one: `aggregate`, `corroborate`,
     /// `affinity`, `budget` (on, off); `affinity_step` (percent); `attest`
-    /// (on, off: signed route attestations); `verified` (signature cache
-    /// size).
+    /// (on, off: signed route attestations); `reuse` (on, off: refreshes
+    /// without their chain, [`Config::chain_reuse`]); `verified` (signature
+    /// cache size).
     pub fn tune(&mut self, s: &str) -> Result<(), String> {
         let on = |kv: &str, v: &str| match v {
             "on" => Ok(true),
@@ -463,6 +482,7 @@ impl Config {
                 ("affinity_step", v) => self.affinity_step = v.parse().map_err(|_| format!("{kv}: not a number"))?,
                 ("budget", v) => self.defences.budget = on(kv, v)?,
                 ("attest", v) => self.attest = on(kv, v)?,
+                ("reuse", v) => self.chain_reuse = on(kv, v)?,
                 ("verified", n) => self.verified_max = n.parse().map_err(|e| format!("{kv}: {e}"))?,
                 _ => return Err(format!("{kv}: unknown knob")),
             }
@@ -487,9 +507,7 @@ pub struct Announce {
     /// A gateway's internet cost (0.1 ms units).
     pub uplink: u32,
     pub name: Arc<str>,
-    /// The origin's signature over everything but `hops` and `cost`
-    /// ([`NO_SIG`]: absent, in an attested announcement its receiver won't
-    /// pass on).
+    /// The origin's signature over everything but `hops` and `cost`.
     pub sig: Sig,
     /// Signed route attestation (`ROUTE_ATTEST`), newest hop first: `None`,
     /// unattested. In an announcement received from neighbour `n` at `hops`
@@ -502,6 +520,12 @@ pub struct Announce {
     /// [`Hop`] at position `hops` advertising `cost`, pushed onto `chain`
     /// ([`Announce::signed_by`]).
     pub sign_link: Option<u32>,
+    /// Attested by the chain its sender last sent us for this origin, in
+    /// this announcement's epoch ([`ATTEST_EPOCH`]), which travels again
+    /// only when something in it changed (`chain` is then `None`). Its
+    /// receiver checks the claim against that chain as it held it: the
+    /// sender may advertise more than its hop signed, never less.
+    pub same: bool,
 }
 
 impl Announce {
@@ -518,13 +542,19 @@ impl Announce {
     pub fn chain_len(&self) -> usize {
         self.chain.as_ref().map_or(0, |c| c.len())
     }
+
+    /// It goes attested: with a chain, a hop to sign, or [`Announce::same`].
+    pub fn attested(&self) -> bool {
+        self.chain.is_some() || self.sign_link.is_some() || self.same
+    }
 }
 
 /// One hop of a route attestation (`ROUTE_ATTEST`, `docs/ROUTING.md` §6
 /// item 13). The device at position `pos` of a route (0: the origin) signs
-/// the announcement's fields ([`fields_digest`]), `pos`, the cost it
-/// advertises, the neighbour it sends to, and its own measured cost to that
-/// neighbour ([`hop_signed`]). The next hop may advertise no less than
+/// the origin, the announcement's epoch ([`attest_epoch`]), `pos`, the cost
+/// it advertises, the neighbour it sends to, and its own measured cost to
+/// that neighbour ([`hop_signed`]). The origin's own signature covers the
+/// rest (the seqno among it). The next hop may advertise no less than
 /// `cost + link`: no device can claim a cheaper link than the device
 /// upstream of it measured, nor a shorter chain than it was sent (the
 /// origin signs for its real neighbours), nor reuse a hop naming someone
@@ -572,41 +602,45 @@ pub enum Check<'a> {
     Hop { ann: &'a Announce, hop: &'a Hop, pos: u8, next: SignPk },
 }
 
-/// The fields of `a` its origin fixes (origin, seqno, flags, scope, uplink,
-/// name), digested: what every hop of its attestation signs.
-pub fn fields_digest(a: &Announce) -> Hash32 {
-    static KEYED: std::sync::LazyLock<Digest> =
-        std::sync::LazyLock::new(|| Digest::new("mycel/v2/mesh-attest-fields"));
-    let mut d = KEYED.clone();
-    d.update(&a.origin.0)
-        .update(&a.seq.to_be_bytes())
-        .update(&[a.flags, a.scope])
-        .update(&a.uplink.to_be_bytes())
-        .update(&[a.name.len() as u8])
-        .update(a.name.as_bytes());
-    d.finalize()
+/// The attestation epoch of `origin`'s seqno `seq` ([`ATTEST_EPOCH`]), each
+/// origin's epochs offset by its key so that not every chain in a mesh is
+/// re-signed at once.
+pub fn attest_epoch(origin: &SignPk, seq: u64) -> u64 {
+    let offset = u64::from_be_bytes(origin.0[..8].try_into().unwrap_or_default()) % ATTEST_EPOCH;
+    seq.saturating_add(offset) / ATTEST_EPOCH
 }
 
 /// What hop `pos` of an attestation signs (after its context string,
-/// `wire.rs`): the announcement's [`fields_digest`], `pos`, the cost the hop
-/// advertises, the neighbour it names and its measured cost to it.
-pub fn hop_signed(fields: &Hash32, pos: u8, cost: u32, next: &SignPk, link: u32) -> [u8; 73] {
-    let mut m = [0u8; 73];
-    m[..32].copy_from_slice(&fields.0);
-    m[32] = pos;
-    m[33..37].copy_from_slice(&cost.to_be_bytes());
-    m[37..69].copy_from_slice(&next.0);
-    m[69..].copy_from_slice(&link.to_be_bytes());
+/// `wire.rs`): the origin, the epoch, `pos`, the cost the hop advertises,
+/// the neighbour it names and its measured cost to it.
+pub fn hop_signed(origin: &SignPk, epoch: u64, pos: u8, cost: u32, next: &SignPk, link: u32) -> [u8; 81] {
+    let mut m = [0u8; 81];
+    m[..32].copy_from_slice(&origin.0);
+    m[32..40].copy_from_slice(&epoch.to_be_bytes());
+    m[40] = pos;
+    m[41..45].copy_from_slice(&cost.to_be_bytes());
+    m[45..77].copy_from_slice(&next.0);
+    m[77..].copy_from_slice(&link.to_be_bytes());
     m
 }
 
+/// What `hop`, at position `pos` of `ann`'s chain and naming `next`, signed.
+pub fn hop_message(ann: &Announce, hop: &Hop, pos: u8, next: &SignPk) -> [u8; 81] {
+    hop_signed(&ann.origin, attest_epoch(&ann.origin, ann.seq), pos, hop.cost, next, hop.link)
+}
+
+/// What our own hop on `a` signs for `to` ([`Announce::sign_link`]).
+pub fn own_hop_message(a: &Announce, to: &SignPk, link: u32) -> [u8; 81] {
+    hop_signed(&a.origin, attest_epoch(&a.origin, a.seq), a.hops, a.cost, to, link)
+}
+
 /// The signature cache's key for a checked hop: what it signed and the
-/// signature, so any change is checked again.
-fn hop_id(fields: &Hash32, pos: u8, hop: &Hop, next: &SignPk) -> Hash32 {
-    static KEYED: std::sync::LazyLock<Digest> =
-        std::sync::LazyLock::new(|| Digest::new("mycel/v0/mesh-verified-hop"));
+/// signature, so any change is checked again. (Hops sign an epoch, not a
+/// seqno: the origin's refreshes within it hit the cache.)
+fn hop_id(ann: &Announce, pos: u8, hop: &Hop, next: &SignPk) -> Hash32 {
+    static KEYED: std::sync::LazyLock<Digest> = std::sync::LazyLock::new(|| Digest::new("mycel/v0/mesh-verified-hop"));
     let mut d = KEYED.clone();
-    d.update(&hop.signer.0).update(&hop_signed(fields, pos, hop.cost, next, hop.link)).update(&hop.sig.0);
+    d.update(&hop.signer.0).update(&hop_message(ann, hop, pos, next)).update(&hop.sig.0);
     d.finalize()
 }
 
@@ -661,11 +695,6 @@ fn verified_id(a: &Announce) -> Hash32 {
         .update(a.name.as_bytes())
         .update(&a.sig.0);
     d.finalize()
-}
-
-/// The same signed fields (two copies of one seqno).
-fn same_fields(a: &Announce, b: &Announce) -> bool {
-    (a.origin, a.seq, a.flags, a.scope, a.uplink) == (b.origin, b.seq, b.flags, b.scope, b.uplink) && a.name == b.name
 }
 
 /// The fields of our next announcement, for the caller to sign.
@@ -772,6 +801,13 @@ pub struct Stats {
     pub signatures_cached: u64,
     /// ... and chains refused as lies (their senders are distrusted).
     pub chains_refused: u64,
+    /// Refreshes attested by the chain we held from their sender
+    /// ([`Announce::same`]), those we didn't hold one for (taken
+    /// unattested, the chain asked for again), and refreshes we sent
+    /// without their chain.
+    pub chains_reused: u64,
+    pub chains_unheld: u64,
+    pub chains_elided: u64,
     /// Routes withdrawn at once on a loss, and fresh-seqno requests sent.
     pub retractions_sent: u64,
     pub seqreqs_sent: u64,
@@ -842,8 +878,27 @@ struct Nb {
     ctl_q: Vec<Announce>,
     /// Whether it takes signed route attestations (`ROUTE_ATTEST`).
     attests: Attests,
-    /// Signature checks its attested announcements may still cost us.
+    /// Signature checks its attested announcements may still cost us (and
+    /// chains it asks us to sign again).
     verify_budget: Bucket,
+    /// Which of our hop connections to it this is: what it holds of the
+    /// chains we sent ([`Sent`]) went with the last one.
+    session: u64,
+}
+
+/// The attested announcement we last sent a neighbour for an origin, which
+/// it holds ([`Announce::same`]): refreshes go without the chain while
+/// nothing in it would change.
+#[derive(Clone, Debug)]
+struct Sent {
+    session: u64,
+    epoch: u64,
+    /// The chain we extended (`None`: our own announcement) ...
+    base: Option<Arc<Hop>>,
+    /// ... the cost we advertised, and the link our hop signed (`None`: we
+    /// signed no hop of our own, it won't pass it on).
+    cost: u32,
+    link: Option<u32>,
 }
 
 /// A neighbour's `ROUTE_ATTEST` capability, as its hop hello said.
@@ -877,6 +932,7 @@ impl Nb {
             ctl_q: Vec::new(),
             attests: Attests::No,
             verify_budget,
+            session: 0,
         }
     }
 
@@ -931,15 +987,17 @@ struct Via {
 struct Origin {
     newest: u64,
     /// The newest announcement itself (passed on with our cost added),
-    /// without its chain ...
+    /// without its chain.
     latest: Announce,
-    /// ... and, while that one lacks the origin's signature ([`NO_SIG`]),
-    /// the newest that has it (a retraction needs one).
-    signed: Option<Announce>,
     via: Vec<(SignPk, Via)>,
-    /// The attestation chain each attested route came with, by neighbour
-    /// (what we extend when we advertise it).
-    chains: Vec<(SignPk, Arc<Hop>)>,
+    /// The attestation chain each attested route came with, by neighbour,
+    /// and its epoch (what we extend when we advertise it).
+    chains: Vec<(SignPk, Arc<Hop>, u64)>,
+    /// What each neighbour holds of the chains we sent it ([`Sent`]).
+    sent: Vec<(SignPk, Sent)>,
+    /// The epoch (+ 1) in which we last asked a neighbour for a chain it
+    /// sent a refresh of without our holding it.
+    chain_asked: u64,
     /// Newest sequence number we have passed on (or decided not to), and
     /// when we last did.
     forwarded: u64,
@@ -971,27 +1029,37 @@ impl Origin {
 
     /// The chain the route through `n` came with.
     fn chain_of(&self, n: &SignPk) -> Option<&Arc<Hop>> {
-        self.chains.iter().find(|(k, _)| k == n).map(|(_, c)| c)
+        self.chains.iter().find(|(k, ..)| k == n).map(|(_, c, _)| c)
     }
 
-    fn set_chain(&mut self, n: SignPk, chain: Option<Arc<Hop>>) {
-        self.chains.retain(|(k, _)| *k != n);
-        if let Some(c) = chain {
-            self.chains.push((n, c));
+    fn set_chain(&mut self, n: SignPk, chain: Option<(Arc<Hop>, u64)>) {
+        self.chains.retain(|(k, ..)| *k != n);
+        if let Some((c, epoch)) = chain {
+            self.chains.push((n, c, epoch));
         }
     }
 
     /// Forget the chains of routes that are gone.
     fn prune_chains(&mut self) {
         let via = &self.via;
-        self.chains.retain(|(k, _)| via.iter().any(|(n, _)| n == k));
+        self.chains.retain(|(k, ..)| via.iter().any(|(n, _)| n == k));
     }
+}
 
-    /// The newest announcement with the origin's signature (for a
-    /// retraction, which is never attested).
-    fn signed(&self) -> Option<&Announce> {
-        if self.latest.sig != NO_SIG { Some(&self.latest) } else { self.signed.as_ref() }
-    }
+/// The chain we hold from `from` that attests `a`, a refresh it sent without
+/// one ([`Announce::same`]): of `a`'s epoch, as long as `a`'s hops, ending
+/// with `from`'s own hop or naming `from`, and claiming no less than that
+/// allows (the sender may advertise more than its hop signed, never less).
+fn held_chain(chains: &[(SignPk, Arc<Hop>, u64)], from: &SignPk, a: &Announce) -> Option<Arc<Hop>> {
+    let (_, c, epoch) = chains.iter().find(|(k, ..)| k == from)?;
+    let h = a.hops as usize;
+    let n = c.len();
+    let fits = if n == h + 1 {
+        c.signer == *from && a.cost >= c.cost
+    } else {
+        n == h && h > 0 && u64::from(a.cost) >= u64::from(c.cost) + u64::from(c.link)
+    };
+    (*epoch == attest_epoch(&a.origin, a.seq) && fits).then(|| c.clone())
 }
 
 struct Reasm {
@@ -1093,6 +1161,10 @@ pub struct Router {
     /// Neighbours with announcements waiting for their control budget.
     ctl_waiting: Vec<SignPk>,
     own: Option<Announce>,
+    /// What each neighbour holds of our own announcement's chain ([`Sent`]).
+    own_sent: Vec<(SignPk, Sent)>,
+    /// Hop connections counted, for [`Nb::session`].
+    sessions: u64,
     seq: u64,
     originated: u64,
     next_announce: Time,
@@ -1169,6 +1241,8 @@ impl Router {
             affinity: Map::default(),
             ctl_waiting: Vec::new(),
             own: None,
+            own_sent: Vec::new(),
+            sessions: 0,
             seq: 0,
             originated: 0,
             next_announce: 0,
@@ -1352,6 +1426,9 @@ impl Router {
         let n = self.nbs.entry(peer).or_insert_with(|| Nb::new(cfg, now));
         n.up = true;
         n.last_used = now;
+        // a new connection: it holds none of the chains we sent before
+        self.sessions += 1;
+        n.session = self.sessions;
         let direct = n.direct;
         self.next_sweep = self.next_sweep.min(now + INTERNET_IDLE);
         if direct {
@@ -1369,8 +1446,7 @@ impl Router {
                 self.next_announce = self.next_announce.min(now);
                 self.force_full = true;
             } else if let Some(a) = self.own_for(&peer) {
-                self.stats.announcements_sent += 1;
-                self.out.push(Out::Announce { to: peer, ann: a });
+                self.push_announce(peer, a);
             }
             if self.cfg.greet != Greet::Own && self.cfg.relay && !self.greet_q.contains(&peer) {
                 self.greet_q.push_back(peer);
@@ -1417,8 +1493,7 @@ impl Router {
             && n.direct
             && let Some(a) = self.own_for(&peer)
         {
-            self.stats.announcements_sent += 1;
-            self.out.push(Out::Announce { to: peer, ann: a });
+            self.push_announce(peer, a);
         }
     }
 
@@ -1441,22 +1516,22 @@ impl Router {
     /// newest seqno, as every caller checks): attested if `to` takes
     /// attestations and our route came with a chain we can extend (with our
     /// own hop for the caller to sign if `to` may pass it on; else the chain
-    /// alone, which still bounds our claim); otherwise unattested, which
-    /// needs the origin's own signature. `None`: neither can be sent.
+    /// alone, which still bounds our claim); otherwise unattested (also when
+    /// the chain would no longer fit in a datagram every hop carries).
     fn advert(&self, o: &Origin, n: &SignPk, via: &Via, to: &SignPk) -> Option<Announce> {
-        let mut a = Announce { hops: via.hops, cost: via.cost, ..o.latest.clone() };
+        let a = Announce { hops: via.hops, cost: via.cost, ..o.latest.clone() };
         let attesting = self.nbs.get(to).filter(|t| t.attests == Attests::Yes);
         if let Some(t) = attesting
             && via.attested
             && let Some(c) = o.chain_of(n).filter(|c| c.len() == via.hops as usize)
         {
-            a.chain = Some(c.clone());
-            if via.hops.saturating_add(1) < o.latest.scope.min(self.cfg.max_hops) {
-                a.sign_link = Some(t.hop_cost());
+            let own = via.hops.saturating_add(1) < o.latest.scope.min(self.cfg.max_hops);
+            let attested = Announce { chain: Some(c.clone()), sign_link: own.then(|| t.hop_cost()), ..a.clone() };
+            if super::wire::wire_len(&attested) < super::wire::MIN_QUIC_MTU {
+                return Some(attested);
             }
-            return Some(a);
         }
-        (a.sig != NO_SIG).then_some(a)
+        Some(a)
     }
 
     /// Tell a new direct neighbour our current routes ([`Config::greet`])
@@ -1617,11 +1692,10 @@ impl Router {
         let every = self.cfg.announce_every;
         let jitter = self.rand() % (every / 4 + 1);
         self.next_announce = now + every - every / 8 + jitter;
-        self.own = Some(Announce { chain: None, sign_link: None, ..ann });
+        self.own = Some(Announce { chain: None, sign_link: None, same: false, ..ann });
         for pk in self.direct_up().collect::<Vec<_>>() {
             let Some(a) = self.own_for(&pk) else { continue };
-            self.stats.announcements_sent += 1;
-            self.out.push(Out::Announce { to: pk, ann: a });
+            self.push_announce(pk, a);
         }
     }
 
@@ -1678,10 +1752,16 @@ impl Router {
             return;
         }
         a.sign_link = None;
-        let chain = a.chain.take().filter(|_| self.cfg.attest && a.cost != INFINITY);
+        let attest = self.cfg.attest && a.cost != INFINITY;
+        let same = std::mem::take(&mut a.same) && attest;
+        let sent = a.chain.take().filter(|_| attest);
+        // a refresh without its chain: attested by the one we hold from its
+        // sender, checked when it came (else taken unattested, and the
+        // chain asked for again, below)
+        let held = if same { self.origins.get(&a.origin).and_then(|o| held_chain(&o.chains, &from, &a)) } else { None };
         // the link cost its sender measured to us, if it signed for us
-        let mut link = 0;
-        if let Some(c) = &chain {
+        let mut link = held.as_ref().map_or(0, |c| if c.len() > a.hops as usize { c.link } else { 0 });
+        if let Some(c) = &sent {
             match self.check_chain(from, &a, c, &mut verify, now) {
                 Verdict::Attested(l) => link = l,
                 Verdict::Lie => {
@@ -1696,17 +1776,24 @@ impl Router {
                 Verdict::Loop => return,
             }
         }
-        // the origin's own signature: what an unattested announcement rests
-        // on, and what an attested one carries for us to pass on unattested
-        if (chain.is_none() || a.sig != NO_SIG) && !self.check_origin(&a, &mut verify) {
+        // the origin's own signature: what binds the seqno (hops sign only
+        // its epoch), attested or not
+        if !self.check_origin(&a, &mut verify) {
             self.stats.announcements_forged += 1;
-            if chain.is_some() {
+            if sent.is_some() {
                 // it vouched for the chain it sent along
                 self.stats.chains_refused += 1;
                 self.distrust(from, now);
             }
             return;
         }
+        let unheld = same && held.is_none();
+        if held.is_some() {
+            self.stats.chains_reused += 1;
+        } else if unheld {
+            self.stats.chains_unheld += 1;
+        }
+        let chain = sent.or(held);
         if a.cost == INFINITY {
             self.on_retraction(from, a.origin, a.seq, now);
             return;
@@ -1744,9 +1831,10 @@ impl Router {
         let o = self.origins.entry(a.origin).or_insert_with(|| Origin {
             newest: 0,
             latest: a.clone(),
-            signed: None,
             via: Vec::new(),
             chains: Vec::new(),
+            sent: Vec::new(),
+            chain_asked: 0,
             forwarded: 0,
             flooded: None,
             pending: None,
@@ -1760,17 +1848,8 @@ impl Router {
         o.seen = now;
         if seq > o.newest {
             o.newest = seq;
-            if a.sig != NO_SIG {
-                o.signed = None;
-            } else if o.latest.sig != NO_SIG {
-                o.signed = Some(o.latest.clone());
-            }
             o.latest = a;
             o.heard.clear();
-        } else if seq == o.newest && o.latest.sig == NO_SIG && a.sig != NO_SIG && same_fields(&o.latest, &a) {
-            // the origin's signature, which an earlier copy didn't carry
-            o.latest.sig = a.sig;
-            o.signed = None;
         }
         if seq == o.newest && !o.heard.iter().any(|(k, _)| *k == from) {
             o.heard.push((from, adv));
@@ -1789,7 +1868,14 @@ impl Router {
             }
             None => o.via.push((from, via)),
         }
-        o.set_chain(from, chain);
+        let epoch = attest_epoch(&origin, seq);
+        o.set_chain(from, chain.map(|c| (c, epoch)));
+        // a refresh whose chain we lack: asked for once an epoch (its sender
+        // answers a request for a seqno it sent with its chain again)
+        let ask = unheld && seq == o.newest && o.chain_asked != epoch + 1;
+        if ask {
+            o.chain_asked = epoch + 1;
+        }
         if o.feasible(&via) {
             o.retracted = false;
         }
@@ -1807,13 +1893,14 @@ impl Router {
         }
         // after: it may have become one
         self.touch(origin);
+        if ask {
+            self.stats.seqreqs_sent += 1;
+            self.out.push(Out::SeqReq { to: from, req: SeqReq { origin, seq, hops: 1 } });
+        }
     }
 
     /// The origin's signature on `a`, checked once per signed identity.
     fn check_origin(&mut self, a: &Announce, verify: &mut impl FnMut(Check<'_>) -> bool) -> bool {
-        if a.sig == NO_SIG {
-            return false;
-        }
         let verified = verified_id(a);
         if self.verified.contains(&verified) {
             self.stats.signatures_cached += 1;
@@ -1862,10 +1949,12 @@ impl Router {
         // with its sender's own hop (position h, naming us), or without it
         // (we may not pass it on; the last hop names the sender)
         let own = n == h + 1;
-        if !own && !(n == h && h > 0) {
+        if !(own || (n == h && h > 0)) {
             return Verdict::Lie;
         }
-        if hops[0].signer != a.origin || hops[0].cost != 0 || (own && (hops[h].signer != from || hops[h].cost != a.cost))
+        if hops[0].signer != a.origin
+            || hops[0].cost != 0
+            || (own && (hops[h].signer != from || hops[h].cost != a.cost))
         {
             return Verdict::Lie;
         }
@@ -1897,14 +1986,13 @@ impl Router {
                 return Verdict::Lie;
             }
         }
-        let fields = fields_digest(a);
         for j in 0..n {
             let next = match hops.get(j + 1) {
                 Some(x) => x.signer,
                 None if own => self.me,
                 None => from,
             };
-            let id = hop_id(&fields, j as u8, hops[j], &next);
+            let id = hop_id(a, j as u8, hops[j], &next);
             if self.verified.contains(&id) {
                 self.stats.signatures_cached += 1;
                 continue;
@@ -1973,13 +2061,12 @@ impl Router {
         }
         let targets: Vec<SignPk> = self.direct_up().filter(|k| Some(*k) != except && *k != origin).collect();
         let Some(o) = self.origins.get_mut(&origin) else { return };
-        if o.fd.is_some()
-            && !o.retracted
-            && let Some(signed) = o.signed()
-        {
-            // (never attested: it only takes away our own route)
-            let mut a = signed.clone();
+        if o.fd.is_some() && !o.retracted {
+            // (never attested: it only takes away our own route, and what
+            // its receivers held of our chains goes with it)
+            let mut a = o.latest.clone();
             o.retracted = true;
+            o.sent.clear();
             a.cost = INFINITY;
             for t in &targets {
                 self.stats.retractions_sent += 1;
@@ -2003,6 +2090,17 @@ impl Router {
             return;
         }
         if req.origin == self.me {
+            // one we sent it already, asked for once more: its chain (our
+            // hop) didn't arrive (`Announce::same`), so ours again to it
+            if req.hops == 1 && self.own.as_ref().is_some_and(|a| req.seq <= a.seq) {
+                if self.nbs.get_mut(&from).is_some_and(|n| n.verify_budget.take(1.0, now)) {
+                    self.own_sent.retain(|(k, _)| *k != from);
+                }
+                if let Some(a) = self.own_for(&from) {
+                    self.push_announce(from, a);
+                }
+                return;
+            }
             if self.last_forced.is_none_or(|t| now.saturating_sub(t) >= FORCED_GAP) {
                 self.last_forced = Some(now);
                 self.next_announce = now; // answer with a fresh one ...
@@ -2011,7 +2109,8 @@ impl Router {
             return;
         }
         let best = self.best_route(&req.origin, now);
-        let advert = best.and_then(|(n, via)| self.origins.get(&req.origin).and_then(|o| self.advert(o, &n, &via, &from)));
+        let advert =
+            best.and_then(|(n, via)| self.origins.get(&req.origin).and_then(|o| self.advert(o, &n, &via, &from)));
         let Some(o) = self.origins.get_mut(&req.origin) else { return };
         if o.newest >= req.seq
             && let Some((_, via)) = best
@@ -2026,8 +2125,12 @@ impl Router {
                 _ => Some((o.newest, via.cost)),
             };
             o.retracted = false;
-            self.stats.announcements_sent += 1;
-            self.out.push(Out::Announce { to: from, ann: a });
+            // with its chain, if it asked for one it lacks (within its
+            // signature budget: each costs us a signature)
+            if self.nbs.get_mut(&from).is_some_and(|n| n.verify_budget.take(1.0, now)) {
+                o.sent.retain(|(k, _)| *k != from);
+            }
+            self.push_announce(from, a);
             self.touch(req.origin); // its feasibility distance may have changed
             return;
         }
@@ -2099,6 +2202,70 @@ impl Router {
         }
     }
 
+    /// Push an announcement for `to`: an attested one it holds the chain of
+    /// goes without it ([`Router::elided`]); what it holds is noted.
+    fn push_announce(&mut self, to: SignPk, a: Announce) {
+        let a = self.elided(&to, &a).unwrap_or(a);
+        self.note_sent(&to, &a);
+        self.stats.announcements_sent += 1;
+        self.out.push(Out::Announce { to, ann: a });
+    }
+
+    /// `a` without its chain ([`Announce::same`]), if `to` holds the chain
+    /// we last sent it for the origin and ours wouldn't change: the same
+    /// connection and epoch, the same chain under our hop, our hop's link
+    /// no more than 1/[`RESIGN_FRACTION`] below what we signed, and our
+    /// cost not below what we signed by more (it goes as signed then: a
+    /// receiver takes no less).
+    fn elided(&self, to: &SignPk, a: &Announce) -> Option<Announce> {
+        if !self.cfg.chain_reuse || a.same || !a.attested() {
+            return None;
+        }
+        let nb = self.nbs.get(to)?;
+        let sent = if a.origin == self.me { &self.own_sent } else { &self.origins.get(&a.origin)?.sent };
+        let (_, s) = sent.iter().find(|(k, _)| k == to)?;
+        let base = match (&s.base, &a.chain) {
+            (None, None) => true,
+            (Some(x), Some(y)) => Arc::ptr_eq(x, y),
+            _ => false,
+        };
+        let link = match (s.link, a.sign_link) {
+            (None, None) => true,
+            (Some(signed), Some(l)) => l >= signed - signed / RESIGN_FRACTION,
+            _ => false,
+        };
+        let cost = a.cost.saturating_add(a.cost / RESIGN_FRACTION) >= s.cost;
+        (s.session == nb.session && s.epoch == attest_epoch(&a.origin, a.seq) && base && link && cost)
+            .then(|| Announce { cost: a.cost.max(s.cost), chain: None, sign_link: None, same: true, ..a.clone() })
+    }
+
+    /// Note what `to` will hold once it has `a`: an attested announcement's
+    /// chain (until it changes), or, after an unattested one, nothing.
+    fn note_sent(&mut self, to: &SignPk, a: &Announce) {
+        if a.same {
+            self.stats.chains_elided += 1;
+            return;
+        }
+        let Some(session) = self.nbs.get(to).map(|n| n.session) else { return };
+        let me = self.me;
+        let sent = if a.origin == me {
+            &mut self.own_sent
+        } else {
+            let Some(o) = self.origins.get_mut(&a.origin) else { return };
+            &mut o.sent
+        };
+        sent.retain(|(k, _)| k != to);
+        if a.attested() && a.cost != INFINITY {
+            let epoch = attest_epoch(&a.origin, a.seq);
+            sent.push((*to, Sent { session, epoch, base: a.chain.clone(), cost: a.cost, link: a.sign_link }));
+        }
+        // (neighbours gone, or reconnected since: dropped now and then)
+        if sent.len() > 32 {
+            let nbs = &self.nbs;
+            sent.retain(|(k, s)| nbs.get(k).is_some_and(|n| n.session == s.session));
+        }
+    }
+
     /// Send a relayed announcement to neighbour `to`: within its control
     /// budget ([`Defences::budget`]), or queued for it. Waiting
     /// announcements go fewest hops first (they reach the most, and near
@@ -2106,15 +2273,13 @@ impl Router {
     /// replaced; a full queue drops the farthest.
     fn send_announce(&mut self, to: SignPk, a: Announce, now: Time) {
         if !self.cfg.defences.budget || a.cost == INFINITY {
-            self.stats.announcements_sent += 1;
-            self.out.push(Out::Announce { to, ann: a });
+            self.push_announce(to, a);
             return;
         }
+        let size = super::wire::wire_len(self.elided(&to, &a).as_ref().unwrap_or(&a)) as f64;
         let Some(n) = self.nbs.get_mut(&to) else { return };
-        let size = super::wire::wire_len(&a) as f64;
         if n.ctl_q.is_empty() && n.ctl.take(size, now) {
-            self.stats.announcements_sent += 1;
-            self.out.push(Out::Announce { to, ann: a });
+            self.push_announce(to, a);
             return;
         }
         self.stats.announcements_deferred += 1;
@@ -2167,7 +2332,7 @@ impl Router {
                     self.stats.announcements_shed += 1;
                     continue;
                 };
-                let size = super::wire::wire_len(&fresh) as f64;
+                let size = super::wire::wire_len(self.elided(&to, &fresh).as_ref().unwrap_or(&fresh)) as f64;
                 if !self.nbs.get_mut(&to).is_some_and(|n| n.ctl.take(size, now)) {
                     break;
                 }
@@ -2179,8 +2344,7 @@ impl Router {
                         _ => Some((fresh.seq, fresh.cost)),
                     };
                 }
-                self.stats.announcements_sent += 1;
-                self.out.push(Out::Announce { to, ann: fresh });
+                self.push_announce(to, fresh);
             }
             if let Some(n) = self.nbs.get_mut(&to)
                 && !q.is_empty()
@@ -2216,9 +2380,8 @@ impl Router {
     /// relay far from our spaces ([`Defences::affinity`]), and behind every
     /// usable attested route if it has no chain ([`UNATTESTED_RANK`]).
     fn base_rank(&self, o: &Origin, n: &SignPk, v: &Via, now: Time) -> u64 {
-        let unattested = self.cfg.attest
-            && !v.attested
-            && o.via.iter().any(|(k, w)| w.attested && self.usable(o, k, w, now));
+        let unattested =
+            self.cfg.attest && !v.attested && o.via.iter().any(|(k, w)| w.attested && self.usable(o, k, w, now));
         self.affine(n, v.cost) + if unattested { UNATTESTED_RANK } else { 0 }
     }
 

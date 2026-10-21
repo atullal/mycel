@@ -113,10 +113,20 @@ pub enum Role {
 }
 
 impl Role {
+    /// It rewrites attested announcements it sends, signing its own hop
+    /// over the lie (so its core sends every chain whole,
+    /// `Config::chain_reuse` off).
+    pub fn signs_lies(self) -> bool {
+        matches!(self, Role::ChainLiar | Role::AttestedLiar)
+    }
+
     /// It drops what it is given to relay (packets, and with the GLOBAL
     /// core bundles too).
     pub fn drops(self) -> bool {
-        matches!(self, Role::BlackHole | Role::Liar | Role::ChainLiar | Role::AttestedLiar | Role::Dropper | Role::GreyHole)
+        matches!(
+            self,
+            Role::BlackHole | Role::Liar | Role::ChainLiar | Role::AttestedLiar | Role::Dropper | Role::GreyHole
+        )
     }
 
     /// It drops traffic of message `msg` that it relays (`None`: traffic

@@ -44,6 +44,8 @@ pub(crate) struct Net {
     seen: BTreeSet<(usize, SignPk, u32)>,
     pub frame_loops: u64,
     pub sent: Vec<u64>,
+    /// Announcement bytes each device sent, as the wire carries them.
+    pub ann_bytes: Vec<u64>,
     /// Plausible liars, as tier 2's: they relay announcements claiming to
     /// be one hop from every origin, as cheaply as an honest relay could
     /// say it, and swallow the packets that this attracts.
@@ -74,6 +76,7 @@ impl Net {
             seen: BTreeSet::new(),
             frame_loops: 0,
             sent: vec![0; n],
+            ann_bytes: vec![0; n],
             liars: BTreeSet::new(),
             keys: None,
             attesting: BTreeSet::new(),
@@ -154,9 +157,11 @@ impl Net {
                     }
                     if self.liars.contains(&i) && ann.origin != me && ann.cost != INFINITY {
                         // (unattested: no chain backs this)
-                        (ann.hops, ann.cost, ann.chain, ann.sign_link) = (1, 1 + HOP_PENALTY, None, None);
+                        (ann.hops, ann.cost, ann.chain, ann.sign_link, ann.same) =
+                            (1, 1 + HOP_PENALTY, None, None, false);
                     }
                     self.sent[i] += 1;
+                    self.ann_bytes[i] += crate::mesh::wire::wire_len(&ann) as u64;
                     if let Some(&j) = self.index.get(&to) {
                         self.post(i, j, Msg::Ann(ann));
                     }
@@ -262,6 +267,7 @@ impl Net {
                         sig: Sig([0; 64]),
                         chain: None,
                         sign_link: None,
+                        same: false,
                     };
                     r.originate(a, now);
                 }
@@ -432,8 +438,9 @@ fn forged_stale_and_flooding_announcements_are_rejected() {
         uplink: 0,
         name: Arc::from(""),
         sig: Sig([0; 64]),
-                        chain: None,
-                        sign_link: None,
+        chain: None,
+        sign_link: None,
+        same: false,
     };
     let mut r = Router::new(key(1), Config::default());
     let n = key(2);
@@ -664,8 +671,9 @@ fn a_neighbour_relaying_impossible_routes_is_not_routed_through() {
         uplink: 0,
         name: Arc::from(""),
         sig: Sig([0; 64]),
-                        chain: None,
-                        sign_link: None,
+        chain: None,
+        sign_link: None,
+        same: false,
     };
     let (honest, liar, o, p, q) = (key(2), key(3), key(9), key(10), key(11));
     let mut r = Router::new(key(1), Config::default());
@@ -728,8 +736,9 @@ fn unacknowledged_packets_move_a_destination_off_its_next_hop() {
         uplink: 0,
         name: Arc::from(""),
         sig: Sig([0; 64]),
-                        chain: None,
-                        sign_link: None,
+        chain: None,
+        sign_link: None,
+        same: false,
     };
     let (liar, honest, d) = (key(2), key(3), key(9));
     // the rule itself (the defences that refine it are tested below)
@@ -786,8 +795,9 @@ fn a_silent_path_moves_the_offered_route() {
         uplink: 0,
         name: Arc::from(""),
         sig: Sig([0; 64]),
-                        chain: None,
-                        sign_link: None,
+        chain: None,
+        sign_link: None,
+        same: false,
     };
     let (liar, honest, d, stranger) = (key(2), key(3), key(9), key(7));
     let mut r = Router::new(key(1), Config { routes: 1, defences: Defences::NONE, ..Config::default() });
@@ -1062,8 +1072,9 @@ fn an_announcement_storm_stops_at_the_first_relays() {
             uplink: o.uplink,
             name: Arc::from(""),
             sig: Sig([0; 64]),
-                        chain: None,
-                        sign_link: None,
+            chain: None,
+            sign_link: None,
+            same: false,
         };
         r.originate(a, now);
         net.effects(0);
@@ -1346,7 +1357,20 @@ fn security_verified_cache_stays_bounded_and_can_be_disabled() {
 // ───────────────────────────── defences ─────────────────────────────
 
 fn ann(origin: SignPk, seq: u64, hops: u8, cost: u32) -> Announce {
-    Announce { hops, cost, origin, seq, flags: 0, scope: 8, uplink: 0, name: Arc::from(""), sig: Sig([0; 64]), chain: None, sign_link: None }
+    Announce {
+        hops,
+        cost,
+        origin,
+        seq,
+        flags: 0,
+        scope: 8,
+        uplink: 0,
+        name: Arc::from(""),
+        sig: Sig([0; 64]),
+        chain: None,
+        sign_link: None,
+        same: false,
+    }
 }
 
 /// A source that doesn't relay (so nothing it advertises narrows which

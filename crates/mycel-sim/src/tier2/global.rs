@@ -28,9 +28,8 @@
 //!   digest of its signer and what it signs ([`stub_sig`]), checked as the
 //!   node checks Ed25519 (`mesh/wire.rs`), so a device can sign only its
 //!   own hops and an altered chain fails as it would for real. Each copy's
-//!   size is what the wire would carry (`wire::wire_len`), and an attested
-//!   copy whose receiver won't pass it on drops the origin's signature as
-//!   the wire does.
+//!   size is what the wire would carry (`wire::wire_len`): a refresh its
+//!   receiver holds the chain of goes without it, as on the wire.
 //! - **Loops**: a packet (source, id) arriving at the same device twice is
 //!   counted as a loop.
 //! - **Store-and-forward** (optional, `with_dtn`): GLOBAL's carrier
@@ -277,28 +276,15 @@ pub fn stub_sig(signer: &SignPk, msg: &[u8]) -> Sig {
 pub fn stub_verify(c: Check<'_>) -> bool {
     match c {
         Check::Origin(_) => true,
-        Check::Hop { ann, hop, pos, next } => {
-            let m = mc::hop_signed(&mc::fields_digest(ann), pos, hop.cost, &next, hop.link);
-            hop.sig == stub_sig(&hop.signer, &m)
-        }
+        Check::Hop { ann, hop, pos, next } => hop.sig == stub_sig(&hop.signer, &mc::hop_message(ann, hop, pos, &next)),
     }
 }
 
 /// `ann` with our own hop signed for `to` (stubbed), if the router asked.
 fn sign_for(me: &SignPk, ann: Announce, to: &SignPk) -> Announce {
     let Some(link) = ann.sign_link else { return ann };
-    let m = mc::hop_signed(&mc::fields_digest(&ann), ann.hops, ann.cost, to, link);
-    let sig = stub_sig(me, &m);
+    let sig = stub_sig(me, &mc::own_hop_message(&ann, to, link));
     ann.signed_by(*me, sig)
-}
-
-/// What an attested copy carries on the wire: no origin signature unless it
-/// ends with its sender's own hop (`wire::encode_attested`).
-fn as_on_the_wire(mut ann: Announce) -> Announce {
-    if ann.chain.is_some() && ann.chain_len() != ann.hops as usize + 1 {
-        ann.sig = mc::NO_SIG;
-    }
-    ann
 }
 
 /// The hop upstream of `me` in `ann`'s chain, and whether `me` signed its
@@ -541,12 +527,12 @@ impl Global {
                         match self.role {
                             Role::BlackHole => {
                                 // "everyone is right here" (no chain says so)
-                                (ann.cost, ann.chain) = (0, None);
+                                (ann.cost, ann.chain, ann.same) = (0, None, false);
                             }
                             Role::Liar => {
                                 // "everyone is one hop from me", as cheaply as
                                 // an honest relay could say it: no chain can
-                                (ann.hops, ann.cost, ann.chain) = (1, ATTESTED_HOP_FLOOR, None);
+                                (ann.hops, ann.cost, ann.chain, ann.same) = (1, ATTESTED_HOP_FLOOR, None, false);
                             }
                             Role::ChainLiar if ann.chain.is_some() => ann = chain_lie(&self.pk, ann, &to),
                             Role::ChainLiar => {
@@ -557,7 +543,7 @@ impl Global {
                             _ => {}
                         }
                     }
-                    self.send_to(cx, node(&to), Frame::Ann(as_on_the_wire(ann)), None);
+                    self.send_to(cx, node(&to), Frame::Ann(ann), None);
                 }
                 Out::SeqReq { to, req } => {
                     self.send_to(cx, node(&to), Frame::Req(req), None);
@@ -879,8 +865,10 @@ impl Router for Global {
             Frame::Bundle(b, copies) => {
                 let id = b.id;
                 let msg = bundle_msg(&id);
-                if matches!(self.role, Role::Liar | Role::ChainLiar | Role::AttestedLiar | Role::Dropper | Role::GreyHole)
-                    && self.role.swallows(Some(msg))
+                if matches!(
+                    self.role,
+                    Role::Liar | Role::ChainLiar | Role::AttestedLiar | Role::Dropper | Role::GreyHole
+                ) && self.role.swallows(Some(msg))
                     && b.dst != self.pk
                 {
                     // takes custody, keeps nothing
@@ -982,6 +970,7 @@ impl Router for Global {
                         sig: Sig([0; 64]),
                         chain: None,
                         sign_link: None,
+                        same: false,
                     };
                     self.core.originate(a, now);
                     self.busy(cx);
@@ -1143,6 +1132,7 @@ mod tests {
             sig: Sig([0; 64]),
             chain: None,
             sign_link: None,
+            same: false,
         }
     }
 

@@ -8,8 +8,9 @@
 //! valid signature.
 //!
 //! Attested announcements (`ROUTE_ATTEST`) arrive raw or structured, with
-//! chains of any shape and hop values; the router checks their structure
-//! and bounds itself, and each signature as the input decides.
+//! chains of any shape and hop values or as refreshes without their chain;
+//! the router checks their structure and bounds itself (a refresh against
+//! the chain it holds), and each signature as the input decides.
 //!
 //! Properties: nothing panics (overflow checks are on), the router never
 //! addresses itself, what it emits re-encodes (attested announcements, once
@@ -52,6 +53,8 @@ enum Step {
         cost: u32,
         /// The sender's own hop (its link to us), if it signs one.
         own: Option<u32>,
+        /// Sent as a refresh without its chain (`Announce::same`) instead.
+        same: bool,
         seq: i32,
         scope: u8,
         verify: bool,
@@ -136,14 +139,18 @@ fn check(me: SignPk, r: &Router, outs: &mut Vec<Out>, arrived: Option<(u8, u8)>)
             Out::Announce { to, ann } => {
                 assert_ne!(to, me, "announcement to ourselves");
                 assert!(ann.name.len() <= wire::MAX_NAME);
-                if ann.chain.is_some() || ann.sign_link.is_some() {
+                if ann.attested() {
                     assert!(r.attests(&to), "attested to a neighbour that doesn't take it");
+                    assert!(!(ann.same && (ann.chain.is_some() || ann.sign_link.is_some())));
                     let signed = ann.signed_by(me, Sig([9; 64]));
                     let (grams, rest) = wire::encode_attested(vec![signed.clone()], usize::MAX);
                     assert!(rest.is_empty(), "the router extended a chain it can't send: {signed:?}");
                     let back = wire::decode_attested(&grams[0], &me);
                     assert_eq!(back.len(), 1);
-                    assert_eq!((back[0].chain.clone(), back[0].hops, back[0].cost), (signed.chain, signed.hops, signed.cost));
+                    assert_eq!(
+                        (back[0].chain.clone(), back[0].hops, back[0].cost, back[0].same),
+                        (signed.chain, signed.hops, signed.cost, signed.same)
+                    );
                 } else {
                     assert_eq!(wire::decode_announce(&wire::encode_announce(&ann)), Some(ann));
                 }
@@ -191,7 +198,7 @@ fuzz_target!(|input: Input| {
             Step::SetInternet(on) => r.set_internet(on),
             Step::SetUplink(u) => r.set_uplink(u),
             Step::SetAttests(p, on) => r.set_attests(pk(p), on, now),
-            Step::Attested { from, origin, relays, origin_link, cost, own, seq, scope, verify } => {
+            Step::Attested { from, origin, relays, origin_link, cost, own, same, seq, scope, verify } => {
                 let (from, origin) = (pk(from), pk(origin));
                 let mut chain = Arc::new(Hop { signer: origin, cost: 0, link: origin_link, sig: Sig([1; 64]), prev: None });
                 for (k, c, l) in relays.iter().take(16) {
@@ -212,8 +219,9 @@ fuzz_target!(|input: Input| {
                     uplink: 0,
                     name: Arc::from(""),
                     sig: Sig([4; 64]),
-                    chain: Some(chain),
+                    chain: (!same).then_some(chain),
                     sign_link: None,
+                    same,
                 };
                 // as the decoder would give it, where it would
                 let (g, rest) = wire::encode_attested(vec![a.clone()], usize::MAX);
@@ -270,7 +278,7 @@ fuzz_target!(|input: Input| {
                     name: Arc::from(wire::truncate(&name, wire::MAX_NAME)),
                     sig: Sig([origin; 64]),
                     chain: None,
-                    sign_link: None,
+                    sign_link: None, same: false,
                 };
                 // only what the decoder lets through
                 let a = wire::decode_announce(&wire::encode_announce(&a)).expect("valid announcement");
