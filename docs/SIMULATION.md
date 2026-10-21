@@ -108,7 +108,7 @@ as the key and (entity, k) as the counter (`world::streams`). Radio
 jitter is keyed per directed link and frame (the k-th frame on a→b), each
 router's `Cx::rng` per router, each routing core's own generator seed per
 device, a walker's waypoints per device, each message's ends per message,
-churn per minute, adversary placement per scenario. There is no global
+churn per minute, adversary placement per scenario (distinct devices, fixed 28). There is no global
 draw count, so two candidates that both send the k-th frame on a→b see
 the same jitter for it: common random numbers (CRN, Law, *Simulation
 Modeling and Analysis*, ch. 11), the variance reduction behind every
@@ -357,11 +357,11 @@ where the nearest-rank "p99" these rows used to print is the maximum.
 | `routing-convergence` | 2 | full | ✅ | global core: 99% routed in 1.1 s, 0 loops, re-converged in 0.1 s, stretch 1.02× (before 1.01×) · the last of the 300 pairs not within the 40 s watched (before: 100% in 1.9 s; the objective is 99%; one pair, 8 hops apart, whose relayed hop counts reach the 10-hop limit: open 18) · main: 99% in never · CI size, the gate's 10 seeds: 99% in 0.6–0.7 s, 0 loops on every seed | 18 s |
 | `flood-scaling` | 2 | full | ✅ | largest N (2,000): global core 8.5% of BLE in steady state (before 8.4%), 100% of pairs routed (flood reduction on: 98%, before 100%), main 136.1% | 550 s |
 | `partial-route` | 2 | full | ✅ | gap 100 m: global core + DTN 100%; stand-in custody 100% p50 98.4 s (before 97.6 s); sender-holds 100% p50 98.8 s (before 98.5 s) · gap 300 m: global core + DTN 100%; stand-in custody 0%; sender-holds 0% | 0 s |
-| `disaster-dtn` | 2 | full, judged on 12 worlds from seed 1 | ✅ | **global core + DTN: mean 83.6% delivered** (target ≥ 80%; per world 70–92%; before 88.1%, 78–100%: each message's ends and each walker's waypoints now come from their own streams, so all 12 worlds are new ones; DISASTER13_PLACEHOLDER) · seed 1: 83%, p95 7310 s, optimality p50/p95 1.58/4.60×, 20.1 replicas and 27.8 hand-offs per message (budget 32; mean of the 12 worlds 20.5) · latency p50 against epidemic's, median of the 12 worlds' ratios, 1.45× (before 1.36×; target 3×) · PRoPHET 52%, spray-and-wait (L=8) 22%, epidemic 100%, on the same world (before 67%, 28%, 100%) · CI size (0.1, 48 messages, mean of 20 worlds): the gate's 10 seeds 79.3–90.1%, median 86.2% (before 81.0–87.5%, 86.1%); CALDIS_PLACEHOLDER | 187 s |
+| `disaster-dtn` | 2 | full, judged on 12 worlds from seed 1 | ✅ | **global core + DTN: mean 83.6% delivered** (target ≥ 80%; per world 70–92%; before 88.1%, 78–100%: each message's ends and each walker's waypoints now come from their own streams, so all 12 worlds are new ones; DISASTER13_PLACEHOLDER) · seed 1: 83%, p95 7310 s, optimality p50/p95 1.58/4.60×, 20.1 replicas and 27.8 hand-offs per message (budget 32; mean of the 12 worlds 20.5) · latency p50 against epidemic's, median of the 12 worlds' ratios, 1.45× (before 1.36×; target 3×) · PRoPHET 52%, spray-and-wait (L=8) 22%, epidemic 100%, on the same world (before 67%, 28%, 100%) · CI size (0.1, 48 messages, mean of 20 worlds): the gate's 10 seeds 79.3–90.1%, median 86.2% (before 81.0–87.5%, 86.1%); the 30 calibration seeds (base 2000) 79.9–90.5%, median 85.4%, 29 of 30 (before fixed 27: 81.1–91.0%, median 85.2%) | 187 s |
 | `mailbox` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 9900 s, optimality p50/p95 1.00/1.00× | 0 s |
 | `global-scale` | 2 | 2,002 devices (0.02) | ✅ | global core + DTN: 100% delivered, p95 0.720 s, optimality p50 3.52×, p95 11.7× (before 0.690 s, 3.54×, 10.0×: every message's pair now from its own stream, so the 400 messages are new ones) · first contact p95 0.808 s (≤ 3 s; before 0.741 s), optimality p95 14.5× (before 12.9×) · warm p50 0.108 s, p95 0.216 s, optimality p95 3.39× (≤ 5×; before 2.87×; 4.45× before fixed 19; 32.2× before fixed 18) · control 704 B/s per device (was 8,470): routing 470, carrier 233 (was 8,004, fixed 17) | 62 s |
 | `churn` | 2 | 1,001 devices (scale 0.1) | ✅ | global core + DTN: 100% delivered, p95 59.0 s, optimality p50/p95 5.80/11.6×, CVaR₉₅ 12.9× (before 61.1 s, 5.89/12.6×, 16.0×: who leaves and who sends now come from per-minute and per-message streams); control 710 B/s per device (before 700) · stand-in 97% (before 91%), main 5% (before 3%) | 33 s |
-| `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.092 s, optimality p50/p95 1.92/5.39×, CVaR₉₅ 6.93× (before 0.091 s, 1.91/6.02×, 7.84×) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (today's one-hop liar, judged ≥ 90%; open 15): 92.7%, liar-free-reachable delivery 92.7% of a 100% ceiling (before 93.3%) · attackers are now placed from their own stream, so these are other devices: the storm's announcements dropped by per-neighbour limits 903,045 (before 261,195), replays dropped as stale 1,076,704 (before 141,475), devices that stopped routing through a lying neighbour 533 (before 341) · CI size: the gate's 10 seeds, lying plausibly 88.3–100%, median 99.2% (before 91.7–100%, 97.5%); CALADV_PLACEHOLDER | 567 s |
+| `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.092 s, optimality p50/p95 1.92/5.39×, CVaR₉₅ 6.93× (before 0.091 s, 1.91/6.02×, 7.84×) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (today's one-hop liar, judged ≥ 90%; open 15): 92.7%, liar-free-reachable delivery 92.7% of a 100% ceiling (before 93.3%) · attackers are now placed from their own stream, so these are other devices: the storm's announcements dropped by per-neighbour limits 903,045 (before 261,195), replays dropped as stale 1,076,704 (before 141,475), devices that stopped routing through a lying neighbour 533 (before 341) · CI size: the gate's 10 seeds, lying plausibly 88.3–100%, median 99.2% (before 91.7–100%, 97.5%); the 30 calibration seeds (base 2000), lying plausibly 90.0–100%, median 98.3%, 30 of 30 (before fixed 27: 88.3–100%, median 96.7%; with fixed 27 alone the storm check missed on one, finding 28) | 567 s |
 | `liar-ceiling` | 2 | full, seeds 1–20 | ⏳ | ceiling 100% on every seed · each announcement format against its worst strategy: today 78.0% (chain-extending liar, min 66%), signed per-hop chain 78.0% (+0.0), chain + each hop's measured cost 99.4% (+21.3 ± 2.7 points) · by strategy: one-hop liar 85.9%, chain-extending liar 78.0%, honest dropper 99.4%, honest grey hole 99.7% (open 15) · before (v2/integration, same day): 79.0% (min 68%), 79.0%, 98.9% (+20.0 ± 2.3); by strategy 85.5%, 79.0%, 98.9%, 99.5%: the liars are other devices now (their own stream) | 833 s |
 | `trace-replay` | 2 | full | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.8% of feasible (3,990 of 4,000 sent), p50 4.8 s, p95 1370 s, optimality p50 1.22×, p95 8.35× [6.43–11.6], CVaR₉₅ 26.5×, 4 of 399 over 30× (Wilson upper bound 2.5%), overhead 3.28 · before (same trace, the workload from the old stream): 99.0% (3,984), p95 1312 s, 8.22× [6.28–11.1], CVaR₉₅ 19.1×, 4 of 396 over 30×, overhead 3.31: the 4,000 messages' times, ends and sizes now come from a Philox workload stream, so they are other messages; CVaR₉₅ is the mean of the 20 worst ratios and moves with them · ten full-size calibration seeds pooled before fixed 27: p95 8.30× [7.73–9.20], CVaR₉₅ 39.8× · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 57 s |
 | `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 51%, 68%, 82%, 91%, 95% (before 16, 33, 52, 70, 83, 91, 94%: the 640 broadcasts' sources now come from a Philox workload stream; the same at every limit; the shape checks are paired, "reach rises" a non-inferiority test, weakest step 6→7 +4.6 ± 1.3 points, before +3.1 ± 1.5: finding 24) | 0.7 s |
@@ -990,7 +990,31 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    paired shape checks and the pinned seeds. The gate passes: 106.7 s
    wall, 418 s of CPU and 1.4 GB peak (before, the same day: 109.0 s,
    412 s, 2.0 GB; machine load 4–12 both times); with fixed 28 as well,
-   108.7 s, 425 s and 1.4 GB. CALIBRATION_PLACEHOLDER
+   108.7 s, 425 s and 1.4 GB.
+
+   On the 30 calibration seeds (base 2000, scale 0.1), where the
+   thresholds come from: `disaster-dtn` 79.9–90.5%, median 85.4%, 29 of
+   30 (before 81.1–91.0%, median 85.2%, 30 of 30) and `adversarial`'s
+   plausible liars 90.0–100%, median 98.3%, 30 of 30 (before 88.3–100%,
+   median 96.7%). A miss rate near 1 in 30 per seed fails the gate's 8
+   of 10 with odds of about 0.4% (binomial), so the thresholds stand. The
+   storm check there found finding 28.
+
+28. **Adversary roles could land on one device** (`adversarial`,
+   `liar-ceiling`). The black holes (or liars), the storm, the replayer
+   and the Sybil gateway were drawn with replacement, before fixed 27 and
+   after it, so two black holes could be one device, a storm or replayer
+   drawn onto a black hole took its place, and a storm drawn as the
+   replayer too became a replayer: no storm at all. Calibration seed
+   16420980624331089132 drew exactly that and failed "storm announcements
+   rate-limited" with 0 limited. The chance per seed is 24% at CI size (7
+   roles among 80 devices) and 41% at full size (18 among 300), and 8 of
+   the 30 calibration seeds lost or merged a role. `Substream::distinct`
+   now draws a repeat again, and a regression test checks the 30
+   calibration seeds at both sizes. What moved: the gate's plausible
+   liars, median 99.2% → 98.3% (same range and miss), the calibration
+   seeds' storm check 29 → 30 of 30; full-size `adversarial` on seed 1
+   drew no repeat and is unchanged. LIARFIX_PLACEHOLDER
 
 23. **Routing defences without a wire change, measured one by one**
    (`docs/ROUTING.md` §6, item 15). Eight were built in the core. Each
