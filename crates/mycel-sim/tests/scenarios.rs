@@ -104,6 +104,13 @@ fn disaster_dtn() {
     check("disaster-dtn");
 }
 
+/// Devices leaving and joining: where packets went round loops along the
+/// default route (docs/SIMULATION.md §4, fixed 27).
+#[test]
+fn churn() {
+    check("churn");
+}
+
 /// Seeds that once failed (`seeds::PINNED`): every objective, every time.
 #[test]
 fn pinned_regressions() {
@@ -137,12 +144,6 @@ fn flood_scaling() {
 #[ignore = "heavier"]
 fn global_scale() {
     check_one("global-scale", 0.01);
-}
-
-#[test]
-#[ignore = "heavier"]
-fn churn() {
-    check_one("churn", 0.05);
 }
 
 // ───────────── tier 1 (real nodes, real time) ─────────────

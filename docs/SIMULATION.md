@@ -117,8 +117,8 @@ Objectives come in two kinds (`Slo::invariant`):
 
 Thresholds are calibrated on base 2000's seeds (30 at CI size), never on
 the gate's (base 1000). CI's "Simulation" job (`.github/workflows/ci.yml`)
-runs `mycel-sim ci --seed 1000 --runs 10`: the nine tier-2 scenarios of
-`seeds::CI_SUITE` at CI size, ten seeds each, in parallel, then the pinned
+runs `mycel-sim ci --seed 1000 --runs 10`: the ten tier-2 scenarios of
+`seeds::CI_SUITE` at CI size (`churn` at 0.05 joined them with fixed 27), ten seeds each, in parallel, then the pinned
 regression seeds (`seeds::PINNED`), every objective; every failing seed is
 printed with the command that replays it, and the verdicts go to the job
 summary. `--min-pass` above `--runs` is refused rather than failing every
@@ -147,7 +147,13 @@ other seven 17 s together), and `cargo test --release -p mycel-sim`
 156 s for the scenario tests (tier 1's CI three included), 245 s with an
 incremental build. On CI's 4-vCPU
 runner we estimate (not measured) about 3–6 minutes for the gate plus
-the release build; the job's limit is 45 minutes.
+the release build; the job's limit is 45 minutes. Fixed 27 and 29 added
+to it, measured on the same Mac (4 threads, other jobs running):
+`adversarial` now runs an adaptive-liar run too, 201 s of runs over the
+10 seeds (57 s wall with `partial-route` and `routing-convergence`), and
+`churn` at 0.05 adds 590 s of runs (it runs main and the stand-in beside
+the core). The gate's total wasn't re-measured end to end: an estimate
+of 3–4 minutes wall on the Mac, and on the runner proportionally more.
 
 ## 2. Models and sources
 
@@ -224,7 +230,7 @@ where the nearest-rank "p99" these rows used to print is the maximum.
 | `global-scale` | 2 | 2,002 devices (0.02) | ✅ | global core + DTN: 100% delivered, p95 0.690 s, optimality p50 3.76×, p95 10.0× · first contact p95 0.741 s (≤ 3 s), optimality p95 12.9× · warm p50 0.117 s, p95 0.211 s, optimality p95 2.76× (2.88× on the shared streams; 4.45× before fixed 19; 32.2× before fixed 18) · control 708 B/s per device (was 8,470): routing 470, carrier 238 (was 8,004, fixed 17) · CI size (1,499 devices, shared streams): warm optimality p95 2.65× (was 5.14×, failing) | 58 s |
 | `churn` | 2 | 1,001 devices (scale 0.1) | ✅ | global core + DTN: 100% delivered, p95 61.1 s, optimality p50/p95 5.99/12.6×, CVaR₉₅ 16.0× (p50/p95 5.87/12.5× on the shared streams); control 700 B/s per device: routing 2,659 → 471, carrier 4,540 → 256 (full size before the carrier fixes: 100%, p95 65.2 s) | 33 s |
 | `adversarial` | 2 | full | ✅ | global core + DTN: 100% delivered, p95 0.091 s, optimality p50/p95 1.91/6.02×, CVaR₉₅ 7.84× (was 82%, p95 1.28 s, 36.6/170× p50/p95, failing: fixed 20) · clean 100%, attacked 100%, Sybil gateway 100% · black holes lying plausibly (today's one-hop liar, judged ≥ 90%; a weak attacker: open 15): 91%, liar-free-reachable delivery 91% of a 100% ceiling (94% on the shared streams; 76% before fixed 21); 85.4% mean over seeds 1–20, and 78.4% for the chain-extending lie any liar can tell today (open 15) · CI size (0.1), 30 calibration seeds: lying plausibly 88.3–100%, median 96.7% | 265 s |
-| `liar-ceiling` | 2 | full, seeds 1–20 | ⏳ | ceiling 100% on every seed · each announcement format against its worst strategy: today 78.4% (chain-extending liar, min 69%), signed per-hop chain 78.4% (+0.0), chain + each hop's measured cost 98.9% (+20.6 ± 2.4 points) · by strategy: one-hop liar 85.4%, chain-extending liar 78.4%, honest dropper 98.9%, honest grey hole 99.5% (open 15) · CI size (seeds 1–20): 97.0% (one-hop liar), chain alone +0.3 ± 0.7, hop costs +2.7 ± 0.9 | 507 s |
+| `liar-ceiling` | 2 | full, seeds 1–20 | ⏳ | since fixed 28 (seeds 1–10): one-hop liar 99.6%, chain-extending liar 80.2%, today's worst 80.2%, chain + hop costs 99.4% (+19.2 ± 3.7) · before it: ceiling 100% on every seed · each announcement format against its worst strategy: today 78.4% (chain-extending liar, min 69%), signed per-hop chain 78.4% (+0.0), chain + each hop's measured cost 98.9% (+20.6 ± 2.4 points) · by strategy: one-hop liar 85.4%, chain-extending liar 78.4%, honest dropper 98.9%, honest grey hole 99.5% (open 15) · CI size (seeds 1–20): 97.0% (one-hop liar), chain alone +0.3 ± 0.7, hop costs +2.7 ± 0.9 | 507 s |
 | `trace-replay` | 2 | full | ✅ | synthetic trace (40 devices, 17,562 contacts over 72 h): global core + DTN 99.0% of feasible (3,981 of 4,000 sent), p50 4.7 s, p95 1311 s, optimality p50 1.22×, p95 8.30× [6.24–13.8], CVaR₉₅ 23.1×, 3 of 396 over 30× (Wilson upper bound 2.2%), overhead 3.34 (was 8.38/18.0× p95/p99: fixed 21; pipelining-aware oracle, fixed 12) · ten full-size calibration seeds pooled (3,982 messages): p95 8.30× [7.73–9.20], CVaR₉₅ 39.8× (the p99 jump 36.8× → 46.9× on the shared streams: finding 26) · real Infocom 2006: 50.8% (passes); Infocom 2005: 27.5% (target 30%; §5; not rerun) | 49 s |
 | `flood-hop-limit` | 2 | full | ✅ | reach by hop limit 1..7: 16%, 33%, 52%, 70%, 83%, 91%, 94% (640 broadcasts, the same at every limit; the shape checks are paired, "reach rises" a non-inferiority test, weakest step 6→7 +3.1 ± 1.5 points: finding 24) | 0.5 s |
 
@@ -839,6 +845,126 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    defences 87.0% → 83.8% (full size), as honest alternatives wait for a
    fresh seqno. Test: `a_seqno_answer_sets_the_feasibility_distance`.
 
+27. **Packets went round loops along the default route** (was open 17).
+   A hop that had just lost its last route to a destination forwarded
+   the packets still arriving for it along its default route toward a
+   gateway, while the neighbour that sent them still routed the
+   destination through it: Babel's overlapping-prefix pitfall (RFC 8966
+   §2.8), outside what the feasibility condition covers. Traced with
+   `MYCEL_LOOP_TRACE` (each hop's mesh next hop at the time) on the only
+   loops left on today's streams, full-size `adversarial`'s
+   plausible liars, seed 6: a frame went 37 → 275 (no mesh route, toward
+   its gateway) → 199 → 19 → 151 (no mesh route) → 199 → 19, twice
+   through 199 and 19. The fix is Babel's hold time (§3.5.4): after a
+   device retracts a route, for 5 s (`RETRACT_HOLD`, knob `hold`), unless
+   a feasible route returns, packets for that destination take neither
+   the default route nor (for others' packets) the internet; they are
+   dropped (`dropped_unreachable`). Babel holds until every neighbour has
+   acknowledged the retraction; there are no acknowledgements on the
+   wire, so the hold is a time a few round trips long. Custody hand-offs
+   aren't held (a bundle waits, it doesn't loop). Seed 6 with the hold
+   alone: 0 loops, delivery unchanged (91%); with fixed 28's refresh
+   hold-down but no hold time: 2 loops. Tests: the core builds the loop
+   (`a_broken_route_doesnt_send_packets_round_the_default_route`: 4
+   frames revisit a device without the hold, 0 with it) and checks the
+   hold (`a_retracted_route_is_not_replaced_by_the_default_route_at_once`).
+   The churn loops open 17 recorded (seed 3 at 1,000 devices: 54 with no
+   defences, 90 with the defaults) were on the streams before fixed 23's
+   split and no longer reproduce: seeds 1–30 at 1,000 devices count 0 on
+   the build before this fix, so they were not traced. The tier-2 gate
+   now holds every GLOBAL run of a scenario to zero loops (an invariant
+   on every seed), not just the run `compare` reports: `adversarial`'s
+   clean, liar, adaptive-liar and Sybil runs, `liar-ceiling`'s every seed
+   and strategy, `partial-route`'s routes, and `churn`, now in the CI
+   suite at 0.05 (500 devices). On the gate's 10 seeds: 0 loops in every
+   run of `adversarial`, `churn`, `partial-route` and
+   `routing-convergence`.
+28. **A one-hop liar's neighbourhood asked for seqnos millions of times a
+   run** (was open 16). Its claims about far origins expire on the near
+   scope's schedule and come back only at the far scope's; each lapse
+   with nothing feasible left sent a retraction and a seqno request to
+   every neighbour, and each request travelled on toward the origin.
+   Three changes in the core:
+   - **A refresh hold-down** (`Defences::refresh`, on by default): a
+     neighbour through which our cheapest route to 4 or more origins
+     expired within 2 minutes (it stopped refreshing them while its hop
+     stayed up, and never retracted them) has its routes rank behind
+     every other route for 10 minutes. Once the next seqno makes the
+     honest routes feasible, they carry the traffic, and the liar's
+     lapses retract nothing. Honest relays refresh a route within its
+     scope's period or retract it, and only the route we used counts (a
+     neighbour that heard the newest seqno from us doesn't send it back,
+     so its unused routes lapse honestly). In every run below no honest
+     neighbour was held down; liars' neighbours held them 4,776 times
+     (seeds 1–10, full size).
+   - **Seqno requests after a loss go to 2 neighbours**, those that
+     offered a route to the origin, cheapest first (to all only if none
+     did; `Config::seqreq_fanout`, knob `fanout=0` for the old
+     behaviour). On seed 6 that alone took requests from 1.15 million to
+     79,000 with delivery unchanged.
+   - **Requests taken from one neighbour are limited to 10 a second**
+     (burst 40). Each request an origin answers floods a fresh
+     announcement to its full scope, so one device asking for every
+     origin could make the whole mesh flood twice a second.
+
+   Full-size `adversarial` (300 phones, 15 one-hop liars), seeds 1–10,
+   default defences, the build before against this one: delivery 86.9% →
+   99.6% (+12.7 ± 2.9 points, 10 of 10 seeds better), seqno requests 2.0
+   million → 80,000 per run (−96%), retractions 1.83 million → 0.88
+   million, control 26.8 → 21.3 kB/s per device (clean: 18.1 both). The
+   fan-out: 87.0% → 99.97% (+12.9 ± 3.4, 10/10), 26.7 → 21.2 kB/s.
+   Clean runs are identical (no seqno requests there). In `liar-ceiling`
+   (seeds 1–10, full size) the one-hop liar's runs ask 57,000–98,000
+   times (were 1.3–2.3 million over seeds 1–20) and its routing control
+   is 18.1 kB/s per device against 16.4 with chain-extending liars and
+   16.7 with honest droppers: about 1.5 kB/s more (was about 6). The
+   remaining excess is the first wave: routes advertised from the lie
+   set the feasibility distance, so each still needs one retraction and
+   one fresh seqno before the honest routes are feasible.
+   `routing-convergence` at full size: 99% routed in 1.1 s (seed 1) and
+   1.0 s (seed 2), re-converged in 0.1 s, 0 loops; at CI size on the
+   gate's 10 seeds 0.6–0.7 s. Tests:
+   `a_neighbour_whose_routes_keep_expiring_ranks_last`,
+   `a_loss_asks_the_neighbours_nearest_the_origin_for_a_seqno`,
+   `seqno_requests_from_one_neighbour_are_rate_limited`, and
+   `churn_never_loops_with_every_defence` now runs with and without the
+   refresh hold-down (with it, its liars are ranked last before
+   suspicion and aggregation see much: 6,764 of 7,200 delivered against
+   5,660).
+29. **Adaptive liars and proxy blame.** `Role::AdaptiveLiar` relays
+   honestly until a quarter of the messages have been sent, then lies
+   like the one-hop liar and drops everything: it is trusted first (its
+   routes are incumbents, acknowledgements it carried vouch for it), so
+   the corroboration hold-down doesn't hold its drop in cost (a route
+   that was already the cheapest getting cheaper is never held).
+   `adversarial` runs it on the same devices and judges it at ≥ 90%. On
+   the gate's 10 seeds at CI size it delivered 98.3–100% (median 100%);
+   at full size, seeds 1–10, 99.0% (seeds 1–6 on the build before:
+   97.2%; +1.6 ± 0.6 points, 6 of 6 better). It is milder than the liar
+   that lies from the start (86.9% before fixed 28) because the honest
+   routes it competed with stay known.
+
+   Proxy blame: aggregation blames a next hop for every destination when
+   several go silent through it, and can't tell the hop from a liar past
+   it. Each suspicion now remembers what the hop advertised for the
+   destination (the path the silence blames, ODSBR's idea of blaming
+   paths rather than nodes, with the advertisement standing in for the
+   path). Once the hop advertises the destination at a higher cost that
+   other neighbours' routes corroborate (no longer a shortcut), that
+   silence stops counting toward aggregation and the shun is lifted if
+   the rest no longer holds; the per-destination suspicion stands, so a
+   liar can lift the shun only by giving up its lie for each suspected
+   destination (test:
+   `an_honest_relay_in_front_of_a_liar_is_no_longer_shunned_once_it_moves`).
+   A role-aware counter now splits shuns: in the half-size fan-out
+   (seeds 1–10) honest relays were shunned 22 times against 79 for
+   liars before this change and 21 after, so it rarely fires there:
+   those honest relays mostly kept advertising the same routes while
+   shunned. In `liar-ceiling` (full size, seeds 1–10) 1 honest and 1
+   lying hop were shunned in all. Requiring corroboration across
+   disjoint paths before a shun would need paths the source can't see
+   without a wire change (ODSBR's probes, routing plan item 14).
+
 ### Open findings
 
 1. **Bluetooth control traffic: what is left after fixed 14, 15 and 17.**
@@ -1060,39 +1186,21 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    Over seeds 1–10 the GLOBAL core alone delivers 83.8% at full size
    (fixed 24 lowered it from 87.0%); its default defences take that to
    86.9% (ROUTING.md).
-16. **Today's liar makes its neighbourhood ask for seqnos millions of
-   times a run.** The mechanism is open 15's: routes it claims at 1 hop
-   expire on the near scope's schedule and come back only at the far
-   scope's, and each loss with nothing feasible left sends a retraction
-   and a seqno request to every neighbour (`after_loss`, rate-limited per
-   origin and device by `SEQREQ_GAP`). In `liar-ceiling` that is 1.3–2.3
-   million seqno requests per 210 s run of 300 phones (about 30 per device
-   per second), and routing control of 21.9 kB/s per device against
-   15.9 kB/s with chain-extending liars and 16.3 kB/s with honest droppers (mean
-   of 20 seeds): about 6 kB/s more per device, 15% of a Bluetooth radio.
-   A cheap way for one device to load its neighbourhood's control
-   plane; a hold-down on routes that keep expiring, or a limit on seqno
-   requests per neighbour rather than per origin, would bound it. The
-   behaviour is the real `mycel_net::mesh::core`'s, which the simulator
-   wraps, so the fix belongs to the routing work, not the simulator.
-   Repro: `mycel-sim liar-ceiling --scale 0.5` (12 s with the first
-   version's three strategies; 105k–123k seqno requests per run of 150
-   phones).
 
-17. **Packets can cycle among honest devices in `churn`.** The
-   frame-loop counter (a device seeing the same packet twice) is 0 in
-   `routing-convergence`, in the core's link-flap tests (including the
-   one with every defence at work), and, since fixed 24, in full-size
-   `adversarial` without defences. Two cases remain. `churn` at 1,000
-   devices, seed 3, counts 54 with no defences (as on `main`) and 90
-   with the default set. Full-size `adversarial`'s fan-out with the
-   default set counts 1 (seed 6). Not root-caused, and not the
-   seqno-answer bug: fixing it left churn at 54. The suspect is where a
-   feasible-route choice meets something outside Babel's feasibility
-   condition. For example, a hop without a route forwards along its
-   default route toward a gateway, while the next one still routes
-   toward the destination. Repro: `MYCEL_CORE=defences=none cargo run
-   --release -p mycel-sim --example ablation -- churn 3 0.1`.
+   **Since fixed 28** the one-hop liar is no longer a contender for the
+   worst strategy: its lapsing claims get it ranked last. `liar-ceiling`
+   at full size, seeds 1–10 (`MYCEL_SIM_LIAR_SEEDS=10`, 564 s): one-hop
+   liar 99.6% (min 99%), chain-extending liar 80.2% (min 68%), honest
+   dropper 99.4%, honest grey hole 99.6%; each format against its worst
+   strategy: today and with a signed chain alone 80.2% (the
+   chain-extending liar; +0.0), with each hop's measured cost 99.4%
+   (+19.2 ± 3.7 points, 10 of 10 seeds). The numbers above for the
+   one-hop liar (85.4%, the seqno storm) are the build before. What is
+   left of open 15 is the chain-extending lie, and the case for binding
+   each hop's measured cost into the chain stands as it was.
+16. *(fixed 28: a one-hop liar's seqno-request storm.)*
+17. *(fixed 27: frame loops along the default route; the gate now holds
+   every GLOBAL run to zero loops.)*
 
 ## 5. Benchmarks against external baselines
 

@@ -143,13 +143,26 @@ something changes.
    alternative, is retracted at once. We send our neighbours the latest
    signed announcement with cost ∞. They drop that route and, if it was
    their last, retract in turn. A dead route stops being used in about one
-   RTT per hop, instead of after a 3.5-period timeout.
+   RTT per hop, instead of after a 3.5-period timeout. For 5 s after a
+   retraction (unless a feasible route returns), packets for that origin
+   take neither the default route toward a gateway nor, for others'
+   packets, the internet: they are dropped. A neighbour that hasn't heard
+   the retraction yet may still route the origin through us, and a packet
+   we sent toward a gateway would come back along its stale route, a
+   loop. This is Babel's hold time (RFC 8966 §2.8, §3.5.4), which holds
+   until every neighbour has acknowledged the retraction; with no
+   acknowledgements on the wire, a time a few round trips long
+   (`RETRACT_HOLD`; `docs/SIMULATION.md` §4, fixed 27).
 6. **Seqno requests.** With routes left but none feasible (starvation), or
-   right after a retraction, we ask for a fresh seqno. The request travels
+   right after a retraction, we ask for a fresh seqno. The request goes
+   to the two neighbours that offered a route to the origin, cheapest
+   first (they are nearer it, and infeasible only because of what we
+   advertised; to every neighbour only if none did), and travels on
    toward the origin. A device that already has a newer feasible
    announcement answers with it; the origin answers by announcing at once
-   (rate-limited). Recovery takes about an RTT, not up to an announcement
-   period.
+   (rate-limited). Requests taken from one neighbour are limited to 10 a
+   second (burst 40): each one an origin answers floods its full scope.
+   Recovery takes about an RTT, not up to an announcement period.
 7. **Fisheye scope.** Every period an origin announces with scope 2 hops.
    Every 8th period it uses the full scope (10 hops). Nearby routes refresh
    every 16 s; far ones every 128 s, with timeouts scaled to match. Each
@@ -325,7 +338,9 @@ something changes.
     which feasible route we use, and so which one we advertise (the
     hold-down and affinity), and when we advertise it (the budget). Eight
     were built and measured one at a time against none and all (below):
-    three are on by default, one is opt-in, four were dropped.
+    three are on by default, one is opt-in, four were dropped. A ninth,
+    the refresh hold-down, came later (on by default, measured below the
+    table).
     - **On: cross-destination aggregation** (`AGGREGATE_MIN`,
       `VOUCHED_PER_HOP`, `SHUN_SEQREQS`). A next hop suspected (item 13)
       for at least 3 distinct destinations at once is avoided for every
@@ -345,8 +360,18 @@ something changes.
       whether the hop drops or someone past it does: an honest relay in
       front of a liar that attracts 3 of our destinations through it is
       avoided for everything for 2 minutes. That is already true of item
-      13 for one destination; aggregation widens it. In the runs below no
-      clean run shunned anyone.
+      13 for one destination; aggregation widens it. So each suspicion
+      remembers the cost the hop advertised for the destination (the path
+      the silence blames: ODSBR blames paths, not nodes, and here the
+      advertisement stands in for the path). Once the hop advertises that
+      destination at a higher cost that other neighbours' routes
+      corroborate, the silence stops counting toward aggregation, and the
+      shun is lifted if the rest no longer holds; the suspicion for that
+      destination stands, so a liar can lift the shun only by giving up
+      its lie for each suspected destination. Measured, it rarely fires:
+      in the half-size fan-out (seeds 1–10) honest relays were shunned 22
+      times against 79 for liars before it and 21 after. In the runs
+      below no clean run shunned anyone.
     - **On: corroboration hold-down** (`CORROBORATE_FACTOR`, `HOLD_DOWN`).
       A neighbour's claim is a *sudden shortcut* when it costs less than
       half of every other usable route: when it first appears, or when it
@@ -401,6 +426,21 @@ something changes.
       preference that grows with distance in the membership graph, which
       would need other members' membership lists. Off by default: it buys
       delivery under plausible liars with longer routes everywhere else.
+    - **On: refresh hold-down** (`Defences::refresh`, `STALE_MIN`,
+      `STALE_HOLD`). A neighbour through which our cheapest route to 4 or
+      more origins expired within 2 minutes (it stopped refreshing them
+      while its hop stayed up, and never retracted them) has its routes
+      rank behind every other route for 10 minutes, renewed while it
+      keeps happening. Honest relays refresh a route within its scope's
+      period or retract it. A liar claiming to be one hop from far origins
+      can refresh those claims only when the far scope's announcements
+      reach it, so they expire on the near scope's schedule, again and
+      again, and each lapse with nothing feasible left cost a retraction
+      and a seqno request to every neighbour. Only the route we used
+      counts: a neighbour that heard the newest seqno from us doesn't send
+      it back, so its unused routes lapse honestly. The route to the
+      neighbour itself is never held. Like the others it only ranks
+      feasible routes.
     - **Dropped.** A *randomised suspicion threshold* (the silence a
       suspicion needs drawn from ½–1½× of it, so a gray hole can't sit
       under it); *churn-conditioned suspicion* (no strike against a hop
@@ -536,21 +576,43 @@ something changes.
       route after a cheaper one appears), and runs with it on showed frame
       loops.
 
-    The simulator's liars lie from their first announcement. A liar that
-    waits, then drops its cost, is covered by the core's tests
-    (`a_sudden_uncorroborated_shortcut_…`), not yet by a tier-2 role.
+    **The refresh hold-down and the seqno-request changes** (items 5, 6,
+    `docs/SIMULATION.md` §4, fixed 28), full-size `adversarial` (300
+    phones, 15 one-hop liars), seeds 1–10, default defences, the build
+    before against the build after: delivery 86.9% → 99.6% (+12.7 ± 2.9
+    points, 10 of 10 seeds better), the fan-out 87.0% → 99.97% (10/10);
+    seqno requests 2.0 million → 80,000 per run, retractions 1.83 million
+    → 0.88 million, control 26.8 → 21.3 kB/s per device (clean 18.1 both;
+    clean runs identical). No honest neighbour was held down in any run;
+    liars' neighbours held them 4,776 times. In `liar-ceiling` (seeds
+    1–10, full size) the one-hop liar now delivers 99.6% and the
+    chain-extending liar 80.2%, which is today's worst strategy alone.
+    `routing-convergence` at full size: 99% routed in 1.1 s (seed 1) and
+    1.0 s (seed 2), re-converged in 0.1 s, 0 loops.
+
+    The simulator's liars mostly lie from their first announcement. A
+    liar that waits, then drops its cost, is covered by the core's tests
+    (`a_sudden_uncorroborated_shortcut_…`), and in tier 2 by
+    `Role::AdaptiveLiar`: honest until a quarter of the messages have been
+    sent, then a one-hop liar. Trusted first (incumbent routes,
+    acknowledgements that vouch for it), its drop in cost isn't held
+    (a route that was already the cheapest getting cheaper never is).
+    `adversarial` judges it at ≥ 90%: 98.3–100% on the gate's 10 seeds
+    at CI size; 99.0% at full size, seeds 1–10.
 
     **Loops.** The core's link-flap test runs with every defence at work:
     plausible liars, feedback from what arrived, slow hops, and 60 link
-    cuts and repairs. It asserts that suspicion, shunning, the hold-down
-    and the budget each engaged, and that no frame or route loops among
-    honest devices (`churn_never_loops_with_every_defence`). In tier 2,
-    the seqno-answer fix above removed the frame loops of the liar runs.
-    What remains: `churn` seed 3 counts 54 without the defences (as on
-    `main`) and 90 with the default set. With the default set, one
-    full-size fan-out seed counts 1. Both are open (`docs/SIMULATION.md`
-    §4, open 16): not root-caused, and not the seqno-answer bug (fixing it
-    left churn at 54). The invariant is not yet met in tier 2.
+    cuts and repairs, once without the refresh hold-down and once with
+    it. It asserts that suspicion, shunning, the hold-down, the budget
+    and the refresh hold-down each engaged, and that no frame or route
+    loops among honest devices (`churn_never_loops_with_every_defence`).
+    In tier 2, the seqno-answer fix above removed the frame loops of the
+    liar runs, and Babel's hold time (item 5) the ones left: a hop that
+    had just lost its last route sent packets along its default route
+    toward a gateway, back to a neighbour still routing through it
+    (traced on full-size `adversarial`, seed 6; `docs/SIMULATION.md` §4,
+    fixed 27). The tier-2 gate now holds every GLOBAL run of a scenario
+    to zero frame loops on every seed, `churn` included.
 
 ## 7. Beyond one mesh
 

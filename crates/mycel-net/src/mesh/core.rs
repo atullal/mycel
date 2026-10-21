@@ -156,7 +156,7 @@ const STALE_MIN: usize = 4;
 /// claimed nearer than the refreshes that come prove (a one-hop lie about a
 /// far origin) expires on the near scope's schedule again and again, and
 /// each expiry with nothing feasible left costs a retraction and a seqno
-/// request to every neighbour (`docs/SIMULATION.md` §4, open 16).
+/// request to every neighbour (`docs/SIMULATION.md` §4, fixed 28).
 const STALE_HOLD: Time = 10 * 60_000;
 /// What a held neighbour's routes rank behind: more than any route's cost
 /// with every other defence's penalty.
@@ -229,7 +229,7 @@ const SEQREQ_HOPS: u8 = 8;
 /// After a loss, a seqno request goes to at most this many neighbours: those
 /// that offered a route to the origin, cheapest first (all of them only if
 /// none did). Each copy travels on toward the origin, so every neighbour
-/// asked costs up to [`SEQREQ_HOPS`] requests ([`Config::seqreq_fanout`]).
+/// asked costs up to 8 requests ([`Config::seqreq_fanout`]).
 pub const SEQREQ_FANOUT: usize = 2;
 /// Seqno requests taken from one neighbour: at most this many a second
 /// (burst 4×); the rest are dropped. Each one answered by an origin floods

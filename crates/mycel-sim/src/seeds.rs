@@ -53,6 +53,9 @@ pub const CI_SUITE: &[(&str, f64)] = &[
     ("adversarial", 0.1),
     ("routing-convergence", 0.1),
     ("disaster-dtn", 0.1),
+    // devices leaving and joining: where the default route used to send
+    // packets round loops (docs/SIMULATION.md §4, fixed 27)
+    ("churn", 0.05),
 ];
 
 /// The nightly soak's: the gate's, the heavier ones, and the liar ceiling

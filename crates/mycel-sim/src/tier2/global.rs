@@ -160,7 +160,7 @@ pub struct Shared {
     /// With `MYCEL_LOOP_TRACE` set: each data frame's path, (src, id) →
     /// hops (device, came from, its mesh next hop toward the destination
     /// then, ms), printed when the frame revisits a device.
-    pub paths: Option<std::cell::RefCell<Map<(SignPk, u32), Vec<Hop>>>>,
+    pub paths: Option<std::cell::RefCell<Paths>>,
     /// Devices that drop what they relay (for the counters below).
     pub bad: Set<NodeId>,
     /// Times an honest device began to shun a neighbour for every
@@ -170,6 +170,9 @@ pub struct Shared {
     /// (`Router::is_stale_hop`).
     pub stale: Cell<[u64; 2]>,
 }
+
+/// Traced frames' paths: (src, id) → hops.
+pub type Paths = Map<(SignPk, u32), Vec<Hop>>;
 
 /// One hop of a traced frame: the device, the neighbour it came from, the
 /// device's mesh next hop toward the destination at that moment (`None`:

@@ -629,8 +629,16 @@ fn compare(
 /// The GLOBAL core never sends a packet round a loop (an invariant: every
 /// seed). Other models don't count loops.
 fn no_loops(r: &mut ScenarioResult, x: &Run) {
-    if let Some(loops) = x.extra.get("loops").and_then(|v| v.as_u64()) {
-        r.at_most("packets that came back to a device they had passed (loops)", loops as f64, 0.0, "").invariant();
+    no_loops_in(r, "", &[x]);
+}
+
+/// [`no_loops`] over several runs of a scenario (`what` names them: each
+/// objective's name is its own across replications).
+fn no_loops_in(r: &mut ScenarioResult, what: &str, xs: &[&Run]) {
+    let counts: Vec<u64> = xs.iter().filter_map(|x| x.extra.get("loops").and_then(|v| v.as_u64())).collect();
+    if !counts.is_empty() {
+        let name = format!("packets that came back to a device they had passed (loops){what}");
+        r.at_most(&name, counts.iter().sum::<u64>() as f64, 0.0, "").invariant();
     }
 }
 
@@ -1249,6 +1257,7 @@ fn partial_route(o: Opts) -> ScenarioResult {
             .map(|m| run(*m, &w, &plan, o.seed, until, None))
             .collect();
         let (holds, stand, cand) = (runs.pop().unwrap(), runs.pop().unwrap(), runs.pop().unwrap());
+        no_loops_in(&mut r, &format!(", gap {gap} m"), &[&cand]);
         r.at_least(&format!("gap {gap} m: delivery"), 100.0 * cand.m.delivery_ratio, 99.0, "%");
         r.at_most(&format!("gap {gap} m: optimality p95"), inf_if_none(&cand.m, cand.m.optimality.p95), 2.0, "×");
         r.headline(format!(
@@ -1651,11 +1660,21 @@ fn adversarial(o: Opts) -> ScenarioResult {
         Plan { poison: Some(sybil), roles: [(sybil, Role::BlackHole)].into_iter().collect(), ..plan.clone() };
     // the same devices as black holes that lie plausibly and drop bundles too
     let liar_plan = Plan { roles: bad.iter().map(|b| (*b, Role::Liar)).collect(), ..plan.clone() };
-    let ((clean, liars), ((cand, _), syb)) = rayon::join(
+    // the same devices, honest until a quarter of the messages have been
+    // sent, then liars: trusted first (incumbent routes, vouched for by
+    // acknowledgements they carried), then lying
+    let turn = plan.sends.get(plan.sends.len() / 4).map(|s| s.0);
+    let adaptive_plan = Plan { roles: bad.iter().map(|b| (*b, Role::AdaptiveLiar)).collect(), turn, ..plan.clone() };
+    let (((clean, liars), adaptive), ((cand, _), syb)) = rayon::join(
         || {
             rayon::join(
-                || run(Model::of(o.candidate), &w, &plan, o.seed, until, None),
-                || run(Model::of(o.candidate), &w, &liar_plan, o.seed, until, None),
+                || {
+                    rayon::join(
+                        || run(Model::of(o.candidate), &w, &plan, o.seed, until, None),
+                        || run(Model::of(o.candidate), &w, &liar_plan, o.seed, until, None),
+                    )
+                },
+                || run(Model::of(o.candidate), &w, &adaptive_plan, o.seed, until, None),
             )
         },
         || {
@@ -1689,6 +1708,14 @@ fn adversarial(o: Opts) -> ScenarioResult {
         90.0,
         "%",
     );
+    r.at_least(
+        "delivery with the same devices honest first, then lying plausibly and dropping (of feasible)",
+        100.0 * adaptive.m.delivery_ratio,
+        90.0,
+        "%",
+    );
+    // the attacked run is checked by `compare`; every other run too
+    no_loops_in(&mut r, ", clean, liar, adaptive-liar and Sybil runs", &[&clean, &liars, &adaptive, &syb]);
     r.check(
         "black holes' impossible routes refused",
         o.candidate != Candidate::Global || distrusted > 0,
@@ -1702,13 +1729,14 @@ fn adversarial(o: Opts) -> ScenarioResult {
         r.at_most("honest routes through a black hole at the end", through as f64, 0.0, "").invariant();
     }
     r.headline(format!(
-        "{}: clean {:.0}%, attacked {:.0}%, Sybil gateway {:.0}%, black holes lying plausibly {:.0}% (LFR {:.0}%)",
+        "{}: clean {:.0}%, attacked {:.0}%, Sybil gateway {:.0}%, black holes lying plausibly {:.0}% (LFR {:.0}%), honest first then lying {:.0}%",
         cand.m.model,
         100.0 * clean.m.delivery_ratio,
         100.0 * cand.m.delivery_ratio,
         100.0 * syb.m.delivery_ratio,
         100.0 * liars.m.delivery_ratio,
-        100.0 * liars.lfr.as_ref().map_or(f64::NAN, |c| c.lfr())
+        100.0 * liars.lfr.as_ref().map_or(f64::NAN, |c| c.lfr()),
+        100.0 * adaptive.m.delivery_ratio,
     ));
     let mut lfr_rows = Vec::new();
     for (label, x) in [("black holes, storm, replayer", &cand), ("black holes lying plausibly", &liars)] {
@@ -1729,6 +1757,11 @@ fn adversarial(o: Opts) -> ScenarioResult {
     r.note(format!(
         "Sybil gateway (every lookup also returns a free route via it, and it swallows what it gets): {}",
         row(&syb.m)
+    ));
+    r.note(format!(
+        "Adaptive liars (the same devices relay honestly until a quarter of the messages have been sent, then lie as above and drop; docs/SIMULATION.md §4): {}; counters {}",
+        row(&adaptive.m),
+        adaptive.extra
     ));
     r.note("Forged announcements (bad signatures) are covered by the core's and wire.rs's own tests (the simulator skips signature checks). Black holes here re-announce every route at zero cost and drop all transit packets: a cost no honest relay can send, so their neighbours stop routing through them (`mesh/core.rs`, distrust). In the real node several routes are open QUIC paths at once; in this simulation a packet takes the core's single best next hop, so the numbers are a worst case for black holes.");
     if o.candidate == Candidate::Main {
@@ -1970,13 +2003,15 @@ fn liar_ceiling(o: Opts) -> ScenarioResult {
         .sum();
     r.at_most("delivered although every path crosses a liar", leaked as f64, 0.0, "messages")
         .invariant_if(o.candidate == Candidate::Global);
+    let all: Vec<&Run> = seeds.iter().flat_map(|s| s.runs.iter()).collect();
+    no_loops_in(&mut r, ", every seed and strategy", &all);
     r.at_least(
         "liar-free-reachable delivery against the worst unattested strategy, mean over seeds",
         m(&lfr_d[fixed[0]]),
         90.0,
         "%",
     );
-    r.note("Liar-free-reachable (LFR): the honest pair still has a path, on the time-expanded contact graph, once every bad device is removed. LFR delivery = delivered / LFR-reachable is what the defence saved of what could be saved; the ceiling (LFR-reachable / feasible) is the most any routing can deliver while they drop everything. One-hop liar: claims to be one hop from every origin at the 2.1 ms floor (today's `Role::Liar`). Chain-extending liar: the cheapest chain it was sent, plus one hop and the 2.1 ms floor; the most a signed per-hop chain lets a liar say, and open to an unattested liar too. Honest dropper and grey hole: announce the truth (all a liar can do once each hop's measured cost is signed into the chain as well); the dropper drops everything, the grey hole half the messages. Each format is judged by the strategy it leaves open with the worst mean over the seeds, fixed before formats are compared; the per-seed worst (a bad device that knew which strategy hurts most in its world) is reported as an upper bound on each gain. Not modelled: what attestations give the defence (blaming the last signer of a chain that loses traffic), or a liar that adapts within a run. Paired gaps: mean of the per-seed differences in raw delivery ± two standard errors. At most `MYCEL_SIM_MAX_PAR` runs (default 4) are in flight at once, about 1 GB each at full size.");
+    r.note("Liar-free-reachable (LFR): the honest pair still has a path, on the time-expanded contact graph, once every bad device is removed. LFR delivery = delivered / LFR-reachable is what the defence saved of what could be saved; the ceiling (LFR-reachable / feasible) is the most any routing can deliver while they drop everything. One-hop liar: claims to be one hop from every origin at the 2.1 ms floor (today's `Role::Liar`). Chain-extending liar: the cheapest chain it was sent, plus one hop and the 2.1 ms floor; the most a signed per-hop chain lets a liar say, and open to an unattested liar too. Honest dropper and grey hole: announce the truth (all a liar can do once each hop's measured cost is signed into the chain as well); the dropper drops everything, the grey hole half the messages. Each format is judged by the strategy it leaves open with the worst mean over the seeds, fixed before formats are compared; the per-seed worst (a bad device that knew which strategy hurts most in its world) is reported as an upper bound on each gain. Not modelled: what attestations give the defence (blaming the last signer of a chain that loses traffic). A liar that adapts within a run (honest first) is `adversarial`'s adaptive-liar run. Paired gaps: mean of the per-seed differences in raw delivery ± two standard errors. At most `MYCEL_SIM_MAX_PAR` runs (default 4) are in flight at once, about 1 GB each at full size.");
     r.metrics = serde_json::Value::Array(rows);
     if o.candidate != Candidate::Global {
         r.expect_fail("liars and attestation are modelled for the GLOBAL routing core only");
@@ -2488,7 +2523,7 @@ mod tests {
         // today's liar claims to be one hop from everyone; 0 holds that
         // near-scope route only between the far origin's announcements, the
         // only ones the liar can refresh it from (docs/SIMULATION.md §4,
-        // open 16)
+        // fixed 28)
         let liar = hops_via(Role::Liar, 0, 1, 4);
         assert!(liar.iter().all(|h| h.is_none() || *h == Some(2)), "{liar:?}");
         assert!(liar.contains(&Some(2)) && liar.contains(&None), "{liar:?}");
