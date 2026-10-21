@@ -673,12 +673,8 @@ impl Driver {
         }
         for (to, v) in anns {
             let Some(c) = self.conn(&to) else { continue };
-            if let [a] = &v[..] {
-                let _ = c.send_datagram(wire::encode_announce(a));
-                continue;
-            }
             let max = c.max_datagram_size().unwrap_or(MIN_QUIC_MTU);
-            for d in wire::encode_announces(&v, max) {
+            for d in wire::encode_announcements(&v, max) {
                 let _ = c.send_datagram(d);
             }
         }
@@ -1278,7 +1274,8 @@ impl Driver {
         let now = self.now();
         let got = c.lock().accept(from, b, o.copies, now, verify_bundle);
         let ok = !matches!(got, dtn::Accepted::Refused(_));
-        crate::resources::write_all(&mut tx, &[ok as u8]).await?;
+        let verdict: [u8; BUNDLE_VERDICT_LEN] = [ok as u8];
+        crate::resources::write_all(&mut tx, &verdict).await?;
         tx.finish()?;
         if let dtn::Accepted::ForMe(b) = got {
             let sig = self.keys.sign(RECEIPT_CTX, &[&b.id.0]);
@@ -1869,18 +1866,74 @@ pub(crate) fn decode_summary(body: &[u8]) -> Result<dtn::Summary> {
     })
 }
 
+/// [`WireSummary`] borrowed from a [`dtn::Summary`], for encoding: the
+/// same fields in the same order, so the same bytes.
+#[derive(Serialize)]
+struct WireSummaryRef<'a> {
+    full: bool,
+    ids: &'a [Hash32],
+    receipts: WireReceipts<'a>,
+    preds: &'a [(SignPk, f32)],
+    free: u64,
+    evictable: &'a [(u64, u64)],
+    wants: &'a [SignPk],
+}
+
+/// Receipts as [`WireSummary`] has them: `(id, dst, sig)` tuples.
+struct WireReceipts<'a>(&'a [dtn::Receipt]);
+
+impl Serialize for WireReceipts<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_seq(self.0.iter().map(|r| (r.id, r.dst, r.sig)))
+    }
+}
+
+impl<'a> WireSummaryRef<'a> {
+    fn of(s: &'a dtn::Summary) -> Self {
+        WireSummaryRef {
+            full: s.full,
+            ids: &s.ids,
+            receipts: WireReceipts(&s.receipts),
+            preds: &s.preds,
+            free: s.free,
+            evictable: &s.evictable,
+            wants: &s.wants,
+        }
+    }
+}
+
 /// Our summary for a neighbour, without its kind byte.
 pub(crate) fn encode_summary(s: dtn::Summary) -> Result<Vec<u8>> {
-    let wire = WireSummary {
-        full: s.full,
-        ids: s.ids,
-        receipts: s.receipts.into_iter().map(|r| (r.id, r.dst, r.sig)).collect(),
-        preds: s.preds,
-        free: s.free,
-        evictable: s.evictable,
-        wants: s.wants,
-    };
-    crate::wire::encode_bounded(&wire, MAX_SUMMARY - 1)
+    crate::wire::encode_bounded(&WireSummaryRef::of(&s), MAX_SUMMARY - 1)
+}
+
+// What the store-and-forward exchanges put on their streams, measured with
+// the encoders above but without allocating: the tier-2 simulator
+// (`mycel-sim`) charges these, so a format change shows up in its byte
+// counts.
+
+/// The bytes before a [`write_frame`] frame's body (its length, `u32`).
+pub const STREAM_FRAME_PREFIX: usize = 4;
+/// The carrier's one-byte verdict after a bundle's payload ("took it").
+pub const BUNDLE_VERDICT_LEN: usize = 1;
+
+/// A summary's uni-stream: its kind byte and the summary; `None` if it is
+/// too large to send (the node then sends none).
+pub fn summary_stream_len(s: &dtn::Summary) -> Option<usize> {
+    crate::wire::encoded_size(&WireSummaryRef::of(s), MAX_SUMMARY - 1).ok().map(|n| 1 + n)
+}
+
+/// An offer's first frame on its bi-stream, length prefix included, on a
+/// hop of wire `version`; `None` if that hop can't take the bundle (see
+/// [`encode_offer`]).
+pub fn offer_stream_len(version: WireVersion, o: &dtn::Offer) -> Option<usize> {
+    encode_offer(version, o).ok().flatten().map(|m| STREAM_FRAME_PREFIX + m.len())
+}
+
+/// The answer's frame back on the offer's stream, length prefix included.
+pub fn answer_stream_len(a: dtn::Answer) -> usize {
+    let body = crate::wire::encoded_size(&WireAnswer::from(a), 64).expect("an answer is a few bytes");
+    STREAM_FRAME_PREFIX + body
 }
 
 /// Our offer `o` on a hop of wire `version` (its first frame's body, kind
@@ -2072,7 +2125,8 @@ async fn send_bundle(
 /// A length-prefixed frame on a stream that goes on after it.
 async fn write_frame(tx: &mut iroh::endpoint::SendStream, body: &[u8]) -> Result<()> {
     anyhow::ensure!(body.len() <= crate::wire::MAX_FRAME, "frame too large");
-    crate::resources::write_all(tx, &(body.len() as u32).to_be_bytes()).await?;
+    let prefix: [u8; STREAM_FRAME_PREFIX] = (body.len() as u32).to_be_bytes();
+    crate::resources::write_all(tx, &prefix).await?;
     crate::resources::write_all(tx, body).await?;
     Ok(())
 }

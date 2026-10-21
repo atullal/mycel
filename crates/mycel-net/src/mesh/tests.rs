@@ -392,3 +392,59 @@ fn hop_queue_management_drops_only_for_a_standing_queue() {
     assert!(!slow.drop_now(ms(10), t0));
     assert!((1..=300).all(|i| !slow.drop_now(ms(160), t0 + ms(10 * i))));
 }
+
+/// The store-and-forward stream lengths the tier-2 simulator charges
+/// (`mycel-sim`) are the encoders' own, on random summaries, offers and
+/// answers; the borrowed summary encoding still decodes.
+#[test]
+fn stream_lengths_match_the_encoders() {
+    use super::dtn::{Answer, BundleFormat, Offer, Receipt, Summary};
+    use super::{
+        BUNDLE_VERDICT_LEN, STREAM_FRAME_PREFIX, WireAnswer, answer_stream_len, decode_summary, encode_offer,
+        encode_summary, offer_stream_len, summary_stream_len,
+    };
+    use mycel_crypto::{Hash32, Sig, SignPk};
+    let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+    let mut below = |n: u64| {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x % n.max(1)
+    };
+    for _ in 0..300 {
+        let s = Summary {
+            full: below(2) == 1,
+            ids: (0..below(600)).map(|i| Hash32([i as u8; 32])).collect(),
+            receipts: (0..below(300))
+                .map(|i| Receipt { id: Hash32([i as u8; 32]), dst: SignPk([1; 32]), sig: Sig([2; 64]) })
+                .collect(),
+            preds: (0..below(80)).map(|i| (SignPk([i as u8; 32]), i as f32 / 80.0)).collect(),
+            free: below(1 << 40),
+            evictable: (0..below(40)).map(|i| (i * 1_000_003, i << 20)).collect(),
+            wants: (0..below(20)).map(|i| SignPk([i as u8; 32])).collect(),
+        };
+        let body = encode_summary(s.clone()).unwrap();
+        assert_eq!(summary_stream_len(&s), Some(1 + body.len()));
+        assert_eq!(decode_summary(&body).unwrap(), s);
+        let o = Offer {
+            format: if below(2) == 1 { BundleFormat::V1 } else { BundleFormat::v2(below(70_000) as u16) },
+            id: Hash32([3; 32]),
+            src: SignPk([4; 32]),
+            dst: SignPk([5; 32]),
+            size: below(1 << 30),
+            created: 1_700_000_000_000 + below(1 << 40),
+            lifetime: below(1 << 34),
+            copies: below(256) as u8,
+            sig: Sig([6; 64]),
+        };
+        for v in [WIRE_V1, WIRE_V2] {
+            let want = encode_offer(v, &o).unwrap().map(|m| STREAM_FRAME_PREFIX + m.len());
+            assert_eq!(offer_stream_len(v, &o), want);
+        }
+        for a in [Answer::Take { from: below(1 << 40) }, Answer::Duplicate, Answer::Refuse("store full")] {
+            let body = crate::wire::encode_bounded(&WireAnswer::from(a), 64).unwrap();
+            assert_eq!(answer_stream_len(a), STREAM_FRAME_PREFIX + body.len());
+        }
+    }
+    assert_eq!(BUNDLE_VERDICT_LEN, 1);
+}

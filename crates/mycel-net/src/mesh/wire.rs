@@ -111,9 +111,16 @@ pub fn verify_announce(a: &Announce) -> bool {
 }
 
 const OGM_FIXED: usize = 1 + 1 + 4 + 32 + 8 + 1 + 1 + 4 + 1;
+/// A sequence-number request's encoded length.
+pub const SEQREQ_LEN: usize = 1 + 32 + 8 + 1;
+
+/// [`encode_announce`]'s length for `a`, without encoding it.
+pub fn announce_len(a: &Announce) -> usize {
+    OGM_FIXED + a.name.len() + 64
+}
 
 pub fn encode_announce(a: &Announce) -> Bytes {
-    let mut b = BytesMut::with_capacity(OGM_FIXED + a.name.len() + 64);
+    let mut b = BytesMut::with_capacity(announce_len(a));
     b.put_u8(T_OGM);
     b.put_u8(a.hops);
     b.put_u32(a.cost);
@@ -149,7 +156,7 @@ pub fn decode_announce(b: &[u8]) -> Option<Announce> {
 }
 
 /// The encoded length of the announcement starting at `b[0]`, if whole.
-fn announce_len(b: &[u8]) -> Option<usize> {
+fn announce_len_at(b: &[u8]) -> Option<usize> {
     let n = *b.get(OGM_FIXED - 1)? as usize;
     let len = OGM_FIXED + n + 64;
     (b.first() == Some(&T_OGM) && n <= MAX_NAME && b.len() >= len).then_some(len)
@@ -163,15 +170,14 @@ fn announce_len(b: &[u8]) -> Option<usize> {
 pub fn encode_announces(anns: &[Announce], max: usize) -> Vec<Bytes> {
     let mut out = Vec::new();
     let mut cur = BytesMut::new();
-    for a in anns {
-        let e = encode_announce(a);
-        if !cur.is_empty() && cur.len() + e.len() > max {
+    for (a, first) in anns.iter().zip(batch_starts(anns, max)) {
+        if first && !cur.is_empty() {
             out.push(std::mem::take(&mut cur).freeze());
         }
         if cur.is_empty() {
             cur.put_u8(T_OGMS);
         }
-        cur.put_slice(&e);
+        cur.put_slice(&encode_announce(a));
     }
     if !cur.is_empty() {
         out.push(cur.freeze());
@@ -179,12 +185,59 @@ pub fn encode_announces(anns: &[Announce], max: usize) -> Vec<Bytes> {
     out
 }
 
+/// For each of `anns`, whether it starts a new datagram in
+/// [`encode_announces`]: the packing both it and [`announces_lens`] use.
+fn batch_starts(anns: &[Announce], max: usize) -> impl Iterator<Item = bool> + '_ {
+    let mut cur = 0;
+    anns.iter().map(move |a| {
+        let e = announce_len(a);
+        let first = cur == 0 || cur + e > max;
+        if first {
+            cur = 1; // the T_OGMS byte
+        }
+        cur += e;
+        first
+    })
+}
+
+/// The lengths of the datagrams [`encode_announces`] packs `anns` into,
+/// without encoding them.
+pub fn announces_lens(anns: &[Announce], max: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for (a, first) in anns.iter().zip(batch_starts(anns, max)) {
+        match out.last_mut() {
+            Some(cur) if !first => *cur += announce_len(a),
+            _ => out.push(1 + announce_len(a)),
+        }
+    }
+    out
+}
+
+/// The datagrams carrying `anns` to one neighbour, as the node sends what
+/// one routing step produced for it: one announcement alone as itself
+/// ([`T_OGM`]), several packed into [`T_OGMS`] datagrams of at most `max`
+/// bytes ([`encode_announces`]).
+pub fn encode_announcements(anns: &[Announce], max: usize) -> Vec<Bytes> {
+    match anns {
+        [a] => vec![encode_announce(a)],
+        _ => encode_announces(anns, max),
+    }
+}
+
+/// The lengths of [`encode_announcements`]' datagrams, without encoding.
+pub fn announcements_lens(anns: &[Announce], max: usize) -> Vec<usize> {
+    match anns {
+        [a] => vec![announce_len(a)],
+        _ => announces_lens(anns, max),
+    }
+}
+
 /// The announcements in a `T_OGMS` datagram (none if any is malformed).
 pub fn decode_announces(b: &[u8]) -> Vec<Announce> {
     let mut out = Vec::new();
     let Some((&T_OGMS, mut rest)) = b.split_first() else { return out };
     while !rest.is_empty() {
-        let Some(len) = announce_len(rest) else { return Vec::new() };
+        let Some(len) = announce_len_at(rest) else { return Vec::new() };
         let Some(a) = decode_announce(&rest[..len]) else { return Vec::new() };
         out.push(a);
         rest = &rest[len..];
@@ -193,7 +246,7 @@ pub fn decode_announces(b: &[u8]) -> Vec<Announce> {
 }
 
 pub fn encode_seqreq(r: &SeqReq) -> Bytes {
-    let mut b = BytesMut::with_capacity(1 + 32 + 8 + 1);
+    let mut b = BytesMut::with_capacity(SEQREQ_LEN);
     b.put_u8(T_SEQREQ);
     b.put_slice(&r.origin.0);
     b.put_u64(r.seq);
@@ -202,7 +255,7 @@ pub fn encode_seqreq(r: &SeqReq) -> Bytes {
 }
 
 pub fn decode_seqreq(b: &[u8]) -> Option<SeqReq> {
-    if b.len() != 42 || b[0] != T_SEQREQ {
+    if b.len() != SEQREQ_LEN || b[0] != T_SEQREQ {
         return None;
     }
     Some(SeqReq {
@@ -224,18 +277,36 @@ fn header(f: &Frame, offset: u16, b: &mut BytesMut) {
     b.put_u16(f.total);
 }
 
+/// The payload bytes each of a frame's datagrams carries when they are at
+/// most `max` bytes, or `None` if it can't (or shouldn't) be split to fit:
+/// how [`encode_frame`] and [`frame_lens`] cut it.
+fn frame_room(f: &Frame, max: usize) -> Option<usize> {
+    let room = max.checked_sub(DATA_HDR)?;
+    if f.payload.len() > room && (f.total as usize > MIN_QUIC_MTU || room < 64) {
+        return None;
+    }
+    Some(room)
+}
+
+/// The lengths of [`encode_frame`]'s datagrams, without encoding them.
+pub fn frame_lens(f: &Frame, max: usize) -> Option<Vec<usize>> {
+    let room = frame_room(f, max)?;
+    let len = f.payload.len();
+    if len <= room {
+        return Some(vec![DATA_HDR + len]);
+    }
+    Some((0..len.div_ceil(room)).map(|i| DATA_HDR + room.min(len - i * room)).collect())
+}
+
 /// Encoded datagrams of at most `max` bytes each, or `None` if the frame
 /// can't (or shouldn't) be split to fit.
 pub fn encode_frame(f: &Frame, max: usize) -> Option<Vec<Bytes>> {
-    let room = max.checked_sub(DATA_HDR)?;
+    let room = frame_room(f, max)?;
     if f.payload.len() <= room {
         let mut b = BytesMut::with_capacity(DATA_HDR + f.payload.len());
         header(f, f.offset, &mut b);
         b.put_slice(&f.payload);
         return Some(vec![b.freeze()]);
-    }
-    if f.total as usize > MIN_QUIC_MTU || room < 64 {
-        return None;
     }
     Some(
         f.payload
@@ -321,6 +392,68 @@ mod tests {
         let g = &grams[0];
         assert!(decode_announces(&g[..g.len() - 1]).is_empty());
         assert!(encode_announces(&[], 1100).is_empty());
+    }
+
+    /// A small deterministic generator for the length tests (xorshift64*).
+    struct Gen(u64);
+
+    impl Gen {
+        fn below(&mut self, n: usize) -> usize {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            (self.0.wrapping_mul(0x2545_f491_4f6c_dd1d) >> 32) as usize % n.max(1)
+        }
+    }
+
+    /// The length functions the tier-2 simulator charges (`mycel-sim`)
+    /// agree with the encoders, byte for byte, on random input.
+    #[test]
+    fn lengths_match_the_encoders() {
+        let mut g = Gen(0x9e37_79b9_7f4a_7c15);
+        let pk = |g: &mut Gen| SignPk([g.below(256) as u8; 32]);
+        for _ in 0..2_000 {
+            let anns: Vec<Announce> = (0..1 + g.below(40))
+                .map(|_| Announce {
+                    hops: g.below(16) as u8,
+                    cost: g.below(1 << 20) as u32,
+                    origin: pk(&mut g),
+                    seq: g.below(1 << 40) as u64,
+                    flags: g.below(4) as u8,
+                    scope: g.below(16) as u8,
+                    uplink: g.below(1 << 20) as u32,
+                    name: Arc::from("n".repeat(g.below(MAX_NAME + 1)).as_str()),
+                    sig: Sig([7; 64]),
+                })
+                .collect();
+            let max = 60 + g.below(1_500);
+            let lens = |v: Vec<Bytes>| v.iter().map(|d| d.len()).collect::<Vec<_>>();
+            assert_eq!(announces_lens(&anns, max), lens(encode_announces(&anns, max)));
+            assert_eq!(announcements_lens(&anns, max), lens(encode_announcements(&anns, max)));
+            assert_eq!(announce_len(&anns[0]), encode_announce(&anns[0]).len());
+            let len = g.below(MIN_QUIC_MTU + 400);
+            let f = Frame {
+                ttl: 8,
+                reached: false,
+                control: g.below(2) == 1,
+                ext: 0,
+                dst: pk(&mut g),
+                src: pk(&mut g),
+                waypoint: pk(&mut g),
+                id: g.below(1 << 30) as u32,
+                offset: 0,
+                total: len as u16,
+                payload: Bytes::from(vec![1; len]),
+            };
+            let max = DATA_HDR + g.below(1_500);
+            assert_eq!(frame_lens(&f, max), encode_frame(&f, max).map(lens), "{len} bytes in {max}");
+        }
+        let r = SeqReq { origin: pk(&mut g), seq: 1, hops: 2 };
+        assert_eq!(encode_seqreq(&r).len(), SEQREQ_LEN);
+        // one announcement goes alone, without the batch's type byte
+        let one = &[sign_announce(&DeviceKeys::generate(), Origination { seq: 1, flags: 0, scope: 8, uplink: 0 }, "a")];
+        assert_eq!(encode_announcements(one, 1200)[0][0], T_OGM);
+        assert_eq!(announcements_lens(one, 1200), vec![OGM_FIXED + 1 + 64]);
     }
 
     #[test]
