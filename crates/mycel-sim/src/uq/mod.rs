@@ -215,6 +215,11 @@ pub struct Study {
     pub sobol: Vec<sobol::Index>,
     /// The worst sampled point.
     pub worst_sampled: Option<Point>,
+    /// If the worst sampled point failed: its mean on the fresh
+    /// confirmation seeds, and whether that passes (a failure on the
+    /// study's own seeds can be their noise).
+    #[serde(default)]
+    pub worst_sampled_recheck: Option<(f64, bool)>,
     /// The worst point the search found on the emulator, confirmed.
     pub worst_searched: Option<Worst>,
     /// Every sampled point and the confirmed worst case pass.
@@ -337,6 +342,12 @@ pub fn study(e: &dyn Experiment, plan: &Plan) -> anyhow::Result<Study> {
         })
         .cloned()
         .or_else(|| points.iter().find(|p| !p.mean.is_finite()).cloned());
+    let worst_sampled_recheck = worst_sampled.as_ref().filter(|w| !w.pass).map(|w| {
+        let v = run_all(e, &plan.confirm_seeds.iter().map(|s| (w.x.clone(), *s)).collect::<Vec<_>>());
+        runs += v.len();
+        let m = mean(&v);
+        (m, plan.passes(m))
+    });
     let worst_searched = match &gp {
         Some(g) => {
             let sign = if plan.higher_is_better { 1.0 } else { -1.0 };
@@ -379,6 +390,7 @@ pub fn study(e: &dyn Experiment, plan: &Plan) -> anyhow::Result<Study> {
         emulator,
         sobol,
         worst_sampled,
+        worst_sampled_recheck,
         worst_searched,
         robust,
         runs,
@@ -483,7 +495,16 @@ impl Study {
             if self.nominal.pass { "pass" } else { "fail" }
         ));
         if let Some(w) = &self.worst_sampled {
-            s.push_str(&format!("Worst sampled point: {} at {}.\n\n", fmt(w.mean), xs(&w.x)));
+            s.push_str(&format!("Worst sampled point: {} at {}", fmt(w.mean), xs(&w.x)));
+            match self.worst_sampled_recheck {
+                Some((m, pass)) => s.push_str(&format!(
+                    "; on {} fresh seeds {} ({}).\n\n",
+                    self.plan.confirm_seeds.len(),
+                    fmt(m),
+                    if pass { "pass: its failure was the study's seeds" } else { "fail again" }
+                )),
+                None => s.push_str(".\n\n"),
+            }
         }
         if let Some(w) = &self.worst_searched {
             s.push_str(&format!(
@@ -652,6 +673,7 @@ mod tests {
         assert!(!s.robust && s.robust_pass.0 > s.robust_pass.1 / 2, "{}", s.robust_pass_label());
         assert!(s.markdown().contains("not robust"));
         assert!(s.clear_fails > 0, "the corner fails by more than noise");
+        assert_eq!(s.worst_sampled_recheck.map(|r| r.1), Some(false), "and again on fresh seeds");
     }
 
     /// When seed noise is most of the spread, the study says so, names no
