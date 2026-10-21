@@ -96,7 +96,8 @@ pub enum Input {
     Info(Pid, GattInfo),
     InfoFailed(Pid),
     /// An L2CAP channel opened: dialed by us over `pid`, or (`pid: None`)
-    /// accepted by our peripheral.
+    /// accepted by our peripheral. `chan` is new: platforms never reuse a
+    /// channel id.
     ChannelOpened {
         chan: ChanId,
         pid: Option<Pid>,

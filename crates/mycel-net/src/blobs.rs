@@ -1026,6 +1026,31 @@ impl Node {
         res.map(|()| path).map_err(|e| e.context("couldn't download the file from anyone in the conversation"))
     }
 }
+
+/// For the `blob_ranges` fuzz target: a `.ranges` file read back from
+/// disk, then the arithmetic a resumed download does with it. Panics if what
+/// loads isn't a valid set of ranges within the blob, or stops being one.
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_ranges(bytes: &[u8], total: Option<u64>, inserts: &[(u64, u64)]) -> bool {
+    let Some(mut done) = parse_ranges(bytes, total) else { return false };
+    let f: RangesFile = postcard::from_bytes(bytes).expect("parsed above");
+    let total = f.total;
+    let check = |done: &Ranges| {
+        let missing = done.missing(total);
+        let gaps: u64 = missing.iter().map(|(a, b)| b - a).sum();
+        assert_eq!(done.covered() + gaps, total, "{done:?} and the gaps {missing:?} cover the blob");
+        assert!(done.prefix() <= total);
+    };
+    check(&done);
+    for &(a, b) in inserts {
+        done.insert(a.min(total), b.min(total));
+        check(&done);
+    }
+    let saved = postcard::to_allocvec(&RangesFile { total, done: done.clone() }).expect("encodes");
+    assert_eq!(parse_ranges(&saved, Some(total)), Some(done), "what we save loads back");
+    true
+}
+
 #[cfg(test)]
 mod security_tests {
     use super::*;

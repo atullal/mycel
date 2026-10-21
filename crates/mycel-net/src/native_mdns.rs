@@ -229,7 +229,7 @@ fn wire_name(mut wire: &[u8]) -> Option<String> {
     }
     (!name.is_empty() && name.len() <= 255).then_some(name)
 }
-fn parse_srv(rdata: &[u8]) -> Option<Target> {
+pub(crate) fn parse_srv(rdata: &[u8]) -> Option<Target> {
     let port = u16::from_be_bytes(rdata.get(4..6)?.try_into().ok()?);
     Some((wire_name(rdata.get(6..)?)?, port))
 }
@@ -339,7 +339,7 @@ unsafe extern "C" fn registered(
         c.send(Event::RegisterFailed(err == NAME_CONFLICT));
     }
 }
-fn parse_txt(mut txt: &[u8]) -> Option<UserData> {
+pub(crate) fn parse_txt(mut txt: &[u8]) -> Option<UserData> {
     while let Some((&len, rest)) = txt.split_first() {
         let len = len as usize;
         if rest.len() < len {

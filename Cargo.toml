@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/host/src-tauri", "bench/mycel-bench"]
+# The fuzz targets are a workspace of their own, built with nightly by
+# cargo-fuzz (docs/TESTING.md): stable builds never see them.
+exclude = ["fuzz"]
 
 [workspace.package]
 edition = "2024"
@@ -27,6 +30,9 @@ redundant_lifetimes = "warn"
 unit_bindings = "warn"
 unused_extern_crates = "warn"
 unused_lifetimes = "warn"
+# `cfg(fuzzing)` is set by cargo-fuzz. It gates the `fuzzing` modules: the
+# entry points the targets in fuzz/ need into crate-private decoders.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 
 [workspace.lints.clippy]
 # Debugging leftovers and unfinished code.
