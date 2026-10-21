@@ -88,6 +88,23 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// The defaults, with the frontier caps for a side that knows `known`
+    /// authors: never below the default 65,536 authors (a fresh device knows
+    /// almost none, while a long-lived peer lists every author that ever
+    /// wrote, including removed members and old device keys), scaled up for
+    /// a side that knows more, and four runs per author on average (an
+    /// honest author has one; an equivocation flood lists at most
+    /// [`MAX_RUNS_INLINE`] and a commitment to the rest). At the floor a
+    /// session buffers at most about 19 MB of the peer's frontier (an
+    /// estimate from the encoded sizes: 65,536 entries and 262,144 runs).
+    pub fn for_known(known: usize) -> Self {
+        let d = Config::default();
+        let authors = d.max_frontier_authors.max(known.saturating_mul(2).saturating_add(1024));
+        Config { max_frontier_authors: authors, max_frontier_runs: authors.saturating_mul(4), ..d }
+    }
+}
+
 /// Why a session ended without syncing (from the server's `Status`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
@@ -530,6 +547,13 @@ impl<S: SyncSet> Session<S> {
             self.outbox.push_back(Msg::Abort { reason });
             self.outcome = Some(Outcome::Aborted { reason, by_peer: false });
         }
+    }
+
+    /// The driver's byte budget grew during the session (its set grew, or
+    /// time refilled it): raise this session's send budget to `budget`
+    /// (never lowers it).
+    pub fn raise_send_budget(&mut self, budget: u64) {
+        self.cfg.send_budget = self.cfg.send_budget.max(budget);
     }
 
     /// The next frame to send, if any.

@@ -89,6 +89,10 @@ pub const POOL_IDLE: Duration = Duration::from_secs(60);
 /// away only fails once the peer has had [`resources::REPLY_TIMEOUT`] to
 /// answer, and a passer-by who could carry it may be gone by then.
 const BUNDLE_AFTER: Duration = Duration::from_secs(10);
+/// How long [`Node::sync_with`] keeps retrying a peer that answers `Busy`.
+pub const EXPLICIT_BUSY_WAIT: Duration = Duration::from_secs(300);
+/// Background retries after `Busy` (see `sync_once`).
+const BUSY_RETRIES: u32 = 3;
 /// Periodic anti-entropy: the first interval, and the cap it backs off to
 /// while periodic sessions find nothing.
 const PERIODIC_SYNC: Duration = Duration::from_secs(15);
@@ -178,8 +182,9 @@ pub struct NodeOptions {
     /// that much per event.
     pub max_ephemeral: usize,
     /// Speak Sync v2 (default). Off: behave as a build without it (only
-    /// v1 sessions, refuse `SyncV2` streams, sync every member), for mixed
-    /// groups in tests and v1 baselines.
+    /// v1 sessions, drop `SyncV2` streams as an unknown kind, as builds
+    /// before it do, sync every member), for mixed groups in tests and v1
+    /// baselines.
     pub sync_v2: bool,
 }
 
@@ -1220,14 +1225,15 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Tri
             }
         };
         // `Busy`: the peer is syncing this space with us already, or over
-        // its limits. Not a failure: no backoff, no bundle; try again soon
-        // if a change is waiting.
+        // its limits. Not a failure: no backoff, no bundle. A crossing
+        // session carries our set only as of its start, so try again a few
+        // times even without a new change (cheap: an idle check or what came
+        // after, once the crossing session has ended).
         if let Err(e) = &res
             && let Some(busy) = e.downcast_ref::<sync_v2::PeerBusy>()
         {
-            let retry = Duration::from_millis(u64::from(busy.0).clamp(200, 5000));
-            let again = inner.inflight.lock().get(&(peer, space)).copied().unwrap_or(false);
-            if again && busy_retries < 3 {
+            let retry = busy.retry_after();
+            if busy_retries < BUSY_RETRIES {
                 busy_retries += 1;
                 if let Some(a) = inner.inflight.lock().get_mut(&(peer, space)) {
                     *a = false;
@@ -1742,13 +1748,32 @@ impl Node {
     ///
     /// `trust_peer` lets a freshly-invited device sync with its inviter before
     /// it has learned (via that very sync) that the inviter is a member.
+    ///
+    /// A peer that is syncing this space with us already (it opened to us at
+    /// the same moment) or is over its session limits answers `Busy`: not a
+    /// failure. This waits and runs its own session then (cheap once the
+    /// crossing one has ended), for up to [`EXPLICIT_BUSY_WAIT`].
     pub async fn sync_with(&self, peer: SignPk, space: SpaceId, trust_peer: bool) -> Result<SyncStats> {
-        let res = sync_session(&self.inner, peer, space, trust_peer).await;
-        match &res {
-            Ok(_) => self.inner.mark_ok(peer),
-            Err(_) => self.inner.mark_fail(peer),
+        let deadline = Instant::now() + EXPLICIT_BUSY_WAIT;
+        loop {
+            let res = sync_session(&self.inner, peer, space, trust_peer).await;
+            if let Err(e) = &res
+                && let Some(busy) = e.downcast_ref::<sync_v2::PeerBusy>()
+            {
+                let retry = busy.retry_after();
+                if Instant::now() + retry < deadline {
+                    tokio::time::sleep(retry).await;
+                    continue;
+                }
+                // (no backoff: the peer is up)
+                return res;
+            }
+            match &res {
+                Ok(_) => self.inner.mark_ok(peer),
+                Err(_) => self.inner.mark_fail(peer),
+            }
+            return res;
         }
-        res
     }
 
     /// Sync `space` with every member now and wait (best effort).

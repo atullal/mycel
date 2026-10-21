@@ -21,7 +21,10 @@
 //! to the stream; the session aborts with `Budget` and resumes later,
 //! keeping what arrived); phase-2 sessions per peer (6 per hour, reserved
 //! when a session starts and refunded if it didn't need phase 2); and the
-//! peer's frontier a session buffers (authors and runs, scaled to ours).
+//! peer's frontier a session buffers (at least 65,536 authors, more if we
+//! know more). The byte budget follows our set as it grows, during a
+//! session too. A `Busy` answer is never a failure: [`crate::Node::sync_with`]
+//! waits and runs its own session after the crossing one.
 //!
 //! **Liveness.** A session has no total deadline (a catch-up over
 //! Bluetooth takes minutes) and no per-frame reply deadline either: the
@@ -87,6 +90,18 @@ const SESSION_BURST: f64 = 32.0;
 const SESSIONS_PER_SEC: f64 = 4.0;
 const BYTES_PER_SEC: f64 = 1024.0 * 1024.0 / 60.0;
 const PHASE2_PER_HOUR: usize = 6;
+/// The largest `Open` (an invite) or opening `Status` (a `Removed` proof)
+/// accepted: both carry the whole membership history, so they get v1's
+/// frame limit (64 MiB: about 1,900 removals in a 300-reader group, at
+/// about 115 B of rotation lockbox per reader per removal), not a session
+/// frame's 1.1 MiB (about 33 such removals). Like v1's `Hello`, an
+/// `Open` from a device we share no space with is charged to the stranger
+/// frame budget. Every later frame is a session frame
+/// ([`reconcile::MAX_FRAME`]).
+const OPENING_FRAME: usize = crate::wire::MAX_FRAME;
+/// Frontier chunks a client may have sent after an eager `Open` (at most a
+/// full frontier at the largest cap), skipped after `NeedInvite`.
+const MAX_SKIPPED_FRONTIER: usize = 1024;
 /// Consecutive `Ops` frames are ingested together (one membership
 /// resolution) up to this many bytes.
 const OPS_BUFFER: usize = 8 * 1024 * 1024;
@@ -114,8 +129,10 @@ pub struct V2Totals {
     /// Sessions run as client and as server.
     pub client_sessions: u64,
     pub server_sessions: u64,
-    /// Client attempts that fell back to v1 (the peer refused `SyncV2`).
+    /// Client attempts that fell back to v1 (the peer refused `SyncV2`),
+    /// and peers remembered as v1-only (v2 not tried for [`V1_REMEMBERED`]).
     pub fallbacks: u64,
+    pub remembered_v1: u64,
     /// Sessions that ended in one round trip (`InSync`/`Unchanged`).
     pub idle: u64,
     /// Sessions that needed phase 2.
@@ -213,7 +230,7 @@ impl V2 {
 
     fn mark_v1_only(&self, peer: SignPk) {
         self.v1_only.lock().insert(peer, Instant::now());
-        self.totals.lock().fallbacks += 1;
+        self.totals.lock().remembered_v1 += 1;
     }
 
     /// Peers that opened a session to us in `space` in the last 30 minutes
@@ -358,6 +375,13 @@ impl Drop for ActiveGuard<'_> {
 #[derive(Debug)]
 pub(crate) struct PeerBusy(pub u32);
 
+impl PeerBusy {
+    /// When to try again (the peer's hint, within [200 ms, 5 s]).
+    pub(crate) fn retry_after(&self) -> Duration {
+        Duration::from_millis(u64::from(self.0).clamp(200, 5000))
+    }
+}
+
 impl fmt::Display for PeerBusy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "peer busy (retry in {} ms)", self.0)
@@ -373,18 +397,11 @@ fn byte_cap(r: &Replica) -> f64 {
 }
 
 fn config(inner: &Inner, peer: SignPk, space: SpaceId, r: &Replica, allow_phase2: bool) -> Config {
-    // The peer's frontier, buffered whole: scaled to the authors we know of
-    // (the peer may know some more, not orders of magnitude more: authors
-    // must be named by an admin, rule A2), runs to a few per author.
+    // The peer's frontier, buffered whole: at least 65,536 authors (a fresh
+    // device knows almost none, a long-lived peer lists every author that
+    // ever wrote), more if we know more (see `Config::for_known`).
     let known = r.index().entries().len().max(r.members().len());
-    let authors = (2 * known + 1024).min(Config::default().max_frontier_authors);
-    Config {
-        send_budget: inner.v2.byte_budget(peer, space, byte_cap(r)),
-        allow_phase2,
-        max_frontier_authors: authors,
-        max_frontier_runs: 8 * authors,
-        ..Config::default()
-    }
+    Config { send_budget: inner.v2.byte_budget(peer, space, byte_cap(r)), allow_phase2, ..Config::for_known(known) }
 }
 
 /// Did the peer refuse the stream kind (a build without Sync v2)? Only on
@@ -411,7 +428,14 @@ fn refused(err: &anyhow::Error, conn: &Connection) -> Option<bool> {
         None
     };
     let found = err.chain().find_map(|e| {
-        code(e).or_else(|| e.downcast_ref::<std::io::Error>().and_then(|io| io.get_ref()).and_then(|e| code(e)))
+        code(e).or_else(|| {
+            let io = e.downcast_ref::<std::io::Error>()?;
+            // A read that hit the end of the stream (tokio's `read_exact`:
+            // "early eof"): the peer finished its side, code 0.
+            io.get_ref()
+                .and_then(|inner| code(inner))
+                .or_else(|| (io.kind() == std::io::ErrorKind::UnexpectedEof).then(|| VarInt::from_u32(0)))
+        })
     })?;
     if found == VarInt::from_u32(STREAM_REFUSED) {
         Some(true)
@@ -467,6 +491,7 @@ pub(crate) async fn sync(
     let res = crate::on_conn!(inner, &peer, |conn| exchange(inner, &conn, peer, space, eager));
     match res {
         Ok(Exchange::Refused { explicit }) => {
+            inner.v2.totals.lock().fallbacks += 1;
             if explicit || inner.v2.note_refusal(peer) {
                 inner.v2.mark_v1_only(peer);
             }
@@ -540,7 +565,9 @@ async fn exchange_on(
             }
         }
         let wait = resources::reply_timeout(sent);
-        let msg = match recv_bounded::<V2Msg>(rx, wait, reconcile::MAX_FRAME, &inner.reply_frames(&peer)).await {
+        // The answer to `Open` may carry a `Removed` proof: the whole
+        // membership history, as large as v1 allows (see `OPENING_FRAME`).
+        let msg = match recv_bounded::<V2Msg>(rx, wait, OPENING_FRAME, &inner.reply_frames(&peer)).await {
             Ok((m, _permit)) => m,
             Err(e) => match refused(&e, conn) {
                 Some(explicit) => return Ok(Exchange::Refused { explicit }),
@@ -598,8 +625,11 @@ pub(crate) async fn serve(
     mut rx: RecvStream,
 ) -> Result<()> {
     if !inner.sync_v2 {
-        refuse_stream(&mut tx, &mut rx);
-        return Ok(());
+        // Exactly what a build before Sync v2 does: an error on the unknown
+        // stream kind, dropping both halves (the opener sees the stream end,
+        // code 0), not the explicit refusal of later builds.
+        drop((tx, rx));
+        bail!("unknown stream kind {}", StreamKind::SyncV2 as u8);
     }
     let res = serve_on(inner, conn, peer, &mut tx, &mut rx).await;
     if res.is_err() {
@@ -619,17 +649,40 @@ async fn serve_on(
     tx: &mut SendStream,
     rx: &mut RecvStream,
 ) -> Result<()> {
-    let max = reconcile::MAX_FRAME;
+    // `Open` may carry an invite: the whole membership history (see
+    // `OPENING_FRAME`).
+    let max = OPENING_FRAME;
     let (mut msg, mut _permit) = recv_bounded::<V2Msg>(rx, resources::FIRST_FRAME, max, &inner.frames(&peer)).await?;
+    let mut asked_invite = false;
     loop {
         let Msg::Open(mut open) = msg else { bail!("expected Open") };
         let space = open.space;
         if !inner.spaces.lock().contains_key(&space) {
             match open.invite.take() {
-                None => {
+                None if !asked_invite => {
+                    asked_invite = true;
                     let n = send_len(tx, &V2Msg::Status(Verdict::NeedInvite)).await?;
-                    (msg, _permit) = recv_bounded(rx, resources::reply_timeout(n), max, &inner.frames(&peer)).await?;
+                    let wait = resources::reply_timeout(n);
+                    // A client that sent its frontier eagerly sent the rest
+                    // of it after `Open` before reading our answer: skip it
+                    // (bounded) until the `Open` that carries the invite.
+                    let mut skipped = 0;
+                    loop {
+                        (msg, _permit) = recv_bounded(rx, wait, max, &inner.frames(&peer)).await?;
+                        if !matches!(msg, Msg::Frontier(_)) {
+                            break;
+                        }
+                        skipped += 1;
+                        if skipped > MAX_SKIPPED_FRONTIER {
+                            bail!("too many frontier chunks before the invite");
+                        }
+                    }
                     continue;
+                }
+                None => {
+                    send_len(tx, &V2Msg::Status(Verdict::Denied)).await?;
+                    tx.finish()?;
+                    return Ok(());
                 }
                 Some(ops) => {
                     if !accept_invite(inner, peer, space, ops) {
@@ -792,10 +845,20 @@ async fn drive(
     };
     let writer = async {
         loop {
-            let frame = inner.with_space(&space, |r| shared.lock().poll_send(r)).unwrap_or_else(|_| {
-                shared.lock().abort(AbortReason::Gone);
-                None
-            });
+            let frame = inner
+                .with_space(&space, |r| {
+                    let mut s = shared.lock();
+                    // The budget follows our set: it may have grown since the
+                    // session opened (a write, or what this very session
+                    // brought while both sides stream), and a budget fixed
+                    // at the start aborted catch-ups halfway.
+                    s.raise_send_budget(inner.v2.byte_budget(peer, space, byte_cap(r)));
+                    s.poll_send(r)
+                })
+                .unwrap_or_else(|_| {
+                    shared.lock().abort(AbortReason::Gone);
+                    None
+                });
             match frame {
                 Some(m) => {
                     let data = matches!(m, Msg::Ops(_) | Msg::Chunk(_));

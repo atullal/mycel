@@ -168,6 +168,37 @@ fn more_than_256_authors_are_chunked() {
     assert_equal(&a, &c);
 }
 
+/// Review regression: the driver scaled the frontier cap to the authors a
+/// side knows (2 × known + 1024), so a fresh device (knowing none) aborted
+/// every session with a long-lived peer listing more authors than that, in
+/// both roles, and never caught up.
+#[test]
+fn a_fresh_peer_catches_up_with_a_peer_listing_more_authors_than_it_knows() {
+    let mut old = ModelSet::new(space());
+    for i in 0..1_500u32 {
+        let mut k = [0u8; 32];
+        k[..4].copy_from_slice(&i.to_le_bytes());
+        old.append(SignPk(k), 1, 10);
+    }
+    let fresh_cfg = Config::for_known(0);
+    assert!(fresh_cfg.max_frontier_authors >= Config::default().max_frontier_authors);
+    for fresh_is_client in [true, false] {
+        let mut fresh = ModelSet::new(space());
+        // (the model runs one config for both sides: the fresh side's)
+        let run = if fresh_is_client {
+            run_pair(&mut fresh, &mut old, (None, None), fresh_cfg.clone(), false, |_, _, _| {})
+        } else {
+            run_pair(&mut old, &mut fresh, (None, None), fresh_cfg.clone(), true, |_, _, _| {})
+        };
+        assert_eq!(converged(&run), 1, "fresh side as client: {fresh_is_client}");
+        assert_equal(&old, &fresh);
+    }
+    // A side that knows more than the floor accepts proportionally more.
+    let big = Config::for_known(100_000);
+    assert_eq!(big.max_frontier_authors, 201_024);
+    assert_eq!(big.max_frontier_runs, 4 * 201_024);
+}
+
 #[test]
 fn gaps_fill_from_either_side() {
     let full = history(1, 30, 20);
@@ -782,6 +813,50 @@ fn the_send_budget_aborts_the_session_and_progress_is_kept() {
     let got = client.env_ids().len();
     assert!(got > 50 && got < 600, "{got}");
     assert!(run.server_stats.sent_data_bytes < 140_000);
+}
+
+/// Review regression: the budget was fixed when the session opened, so a
+/// side whose set grew during the session (both streaming at once) aborted
+/// its catch-up halfway. The driver raises it as its byte bucket grows.
+#[test]
+fn a_raised_send_budget_lets_the_session_finish() {
+    let mut server = history(2, 300, 1000);
+    let mut client = ModelSet::new(space());
+    let cfg = Config { send_budget: 100_000, chunk_bytes: 16 * 1024, ..Config::default() };
+    let run = run_pair(&mut client, &mut server, (None, None), cfg.clone(), false, |_, _, _| {});
+    assert!(matches!(run.server, Outcome::Aborted { reason: AbortReason::Budget, .. }));
+    // The same budget, raised before the first data frame.
+    let mut client = ModelSet::new(space());
+    let mut c = Session::open(&client, cfg.clone(), [1; 16], None, false, None);
+    let Some(Msg::Open(open)) = c.poll_send(&client) else { panic!() };
+    let mut s = Session::accept(&server, cfg, open, None);
+    s.raise_send_budget(10_000_000);
+    s.raise_send_budget(1); // never lowers it
+    let mut to_server: Vec<Msg<_, _>> = Vec::new();
+    for _ in 0..1000 {
+        let mut to_client = Vec::new();
+        while let Some(m) = s.poll_send(&server) {
+            to_client.push(m);
+        }
+        for m in to_client {
+            let got = c.on_msg(&client, m).unwrap();
+            let (new, refused) = client.apply(got);
+            c.ingested(new, &refused);
+        }
+        while let Some(m) = c.poll_send(&client) {
+            to_server.push(m);
+        }
+        for m in to_server.drain(..) {
+            let got = s.on_msg(&server, m).unwrap();
+            let (new, refused) = server.apply(got);
+            s.ingested(new, &refused);
+        }
+        if c.is_done() && s.is_done() {
+            break;
+        }
+    }
+    assert!(matches!(s.outcome(), Some(Outcome::Converged { .. })), "{:?}", s.outcome());
+    assert_equal(&client, &server);
 }
 
 #[test]
