@@ -238,7 +238,7 @@ pub(crate) async fn recv_ephemeral<R: AsyncRead + Unpin>(
     Ok((msg, permit))
 }
 
-async fn recv_frame<T: DeserializeOwned, R: AsyncRead + Unpin>(
+pub(crate) async fn recv_frame<T: DeserializeOwned, R: AsyncRead + Unpin>(
     r: &mut R,
     wait: Duration,
     idle: Duration,

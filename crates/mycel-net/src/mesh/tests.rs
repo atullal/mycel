@@ -217,7 +217,7 @@ async fn hops_negotiate_versions_and_capabilities() {
 /// still cross it).
 #[tokio::test(flavor = "multi_thread")]
 async fn bundles_cross_hops_by_their_format() {
-    use super::dtn::{Bundle, BundleFormat};
+    use super::dtn::{Bundle, BundleFormat, Offer};
     use super::{Sent, bundle_id_of, bundle_signed, encode_offer, send_bundle, wall_ms};
     let net = MemNet::new(1, PathKind::Bluetooth);
     let a = versioned(Protocol::default(), &net).await;
@@ -249,9 +249,9 @@ async fn bundles_cross_hops_by_their_format() {
     let v2 = signed(BundleFormat::v2(super::dtn::KIND_SPACE_SYNC), b"version 2");
     // never offered (not merely refused: a v1 carrier would find the
     // signature bad, after the offer had cost the hop its bytes)
-    assert!(encode_offer(WIRE_V1, &v2, 1).unwrap().is_none());
-    assert!(encode_offer(WIRE_V2, &v2, 1).unwrap().is_some());
-    assert!(encode_offer(WIRE_V1, &signed(BundleFormat::V1, b"v1"), 1).unwrap().is_some());
+    assert!(encode_offer(WIRE_V1, &Offer::of(&v2, 1)).unwrap().is_none());
+    assert!(encode_offer(WIRE_V2, &Offer::of(&v2, 1)).unwrap().is_some());
+    assert!(encode_offer(WIRE_V1, &Offer::of(&signed(BundleFormat::V1, b"v1"), 1)).unwrap().is_some());
     assert!(matches!(send_bundle(&to_old, WIRE_V1, &v2, 1, &frames).await.unwrap(), Sent::Refused(false)));
     assert_eq!(old.mesh.dtn_stats().refused, 0, "the version 1 carrier was never offered it");
     let v1 = signed(BundleFormat::V1, b"version 1");
@@ -270,6 +270,43 @@ async fn bundles_cross_hops_by_their_format() {
     assert!(
         a.mesh.send_bundle_as(far, BundleFormat::v2(0x7777), v1.payload.clone(), Duration::from_secs(60)).is_some()
     );
+}
+
+/// An offer's first frame carries its bundle's format: a version 2 hop
+/// gets any format back as sent (one this build can't check included, for
+/// the receiver to refuse), a version 1 hop only version 1 bundles, and an
+/// offer kind from a later version decodes to nothing (left unanswered).
+#[test]
+fn offers_carry_their_bundle_format() {
+    use super::dtn::{BundleFormat, Offer};
+    use super::{decode_offer, encode_offer};
+    let offer = |format| Offer {
+        format,
+        id: mycel_crypto::Hash32([1; 32]),
+        src: mycel_crypto::SignPk([2; 32]),
+        dst: mycel_crypto::SignPk([3; 32]),
+        size: 1234,
+        created: 5,
+        lifetime: 6,
+        copies: 7,
+        sig: mycel_crypto::Sig([8; 64]),
+    };
+    for format in
+        [BundleFormat::V1, BundleFormat::v2(1), BundleFormat::v2(0x7777), BundleFormat { version: 9, kind: 1 }]
+    {
+        let o = offer(format);
+        let v2 = encode_offer(WIRE_V2, &o).unwrap().expect("a version 2 hop takes every format");
+        assert_eq!(decode_offer(&v2).unwrap(), Some(o.clone()));
+        let v1 = encode_offer(WIRE_V1, &o).unwrap();
+        assert_eq!(v1.is_some(), format == BundleFormat::V1);
+        if let Some(v1) = v1 {
+            assert_eq!(decode_offer(&v1).unwrap(), Some(o));
+        }
+    }
+    let mut later = encode_offer(WIRE_V2, &offer(BundleFormat::V1)).unwrap().unwrap();
+    later[0] = 0x7f;
+    assert_eq!(decode_offer(&later).unwrap(), None);
+    assert_eq!(decode_offer(&[]).unwrap(), None);
 }
 
 /// The same through the planner, as a node sends: a version 2 bundle goes

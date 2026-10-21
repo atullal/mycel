@@ -30,6 +30,11 @@ enum Kind {
     Table,
 }
 
+/// Operation actions as Automerge 0.12 encodes them (storage/change).
+const DELETE: u64 = 3;
+const INCREMENT: u64 = 5;
+const MARK: u64 = 7;
+
 impl Kind {
     fn made_by(action: u64) -> Option<Kind> {
         match action {
@@ -257,6 +262,14 @@ impl Index {
                 }
                 _ => return Err(fail()),
             }
+            // Deletes and increments name an existing element; marks are
+            // always new elements. Upstream writes nothing else, and applies
+            // anything else out of order (found by fuzzing: its op order
+            // check fails, and release builds keep a corrupt document).
+            match (row.action, row.insert) {
+                (DELETE | INCREMENT, true) | (MARK, false) => return Err(fail()),
+                _ => {}
+            }
             for p in preds {
                 resolve(*p, &runs, i).ok_or_else(fail)?;
             }
@@ -388,6 +401,47 @@ mod tests {
             assert!(index.admit(&c.get_last_local_change().unwrap()).is_some());
             assert!(index.admit(&bad).is_none(), "b is outside c's declared history");
         }
+    }
+
+    /// Found by fuzzing (`fuzz/fuzz_targets/sync_doc.rs`): a member's change
+    /// with an inserted delete (or increment), or a mark that isn't an
+    /// insertion, passed the index; Automerge then applied it out of order
+    /// (its debug check of the op order failed; release builds went on with
+    /// a corrupt document). Automerge never writes such operations.
+    #[test]
+    fn inserted_deletes_and_uninserted_marks_are_refused() {
+        use automerge::legacy::OpType;
+        use automerge::marks::{ExpandMark, Mark};
+        let mut d = AutoCommit::new().with_actor(actor(1));
+        let text = d.put_object(ROOT, "text", ObjType::Text).unwrap();
+        d.splice_text(&text, 0, 0, "abc").unwrap();
+        d.commit();
+        let base = d.get_changes(&[]);
+        d.splice_text(&text, 1, 1, "").unwrap();
+        d.mark(&text, Mark::new("bold".into(), true, 0, 2), ExpandMark::None).unwrap();
+        d.commit();
+        let honest = d.get_last_local_change().unwrap();
+        let ops = honest.decode().operations;
+        let at = |want: fn(&OpType) -> bool| ops.iter().position(|o| want(&o.action)).unwrap();
+        let delete = at(|a| matches!(a, OpType::Delete));
+        let mark = at(|a| matches!(a, OpType::MarkEnd(_)));
+        let mut index = Index::default();
+        admit_all(&mut index, &base);
+        assert!(index.admit(&honest).is_some());
+        let crafted = |edit: &dyn Fn(&mut automerge::legacy::Change)| {
+            let mut c = honest.decode();
+            edit(&mut c);
+            Change::from(c)
+        };
+        let inserted_delete = crafted(&|c| c.operations[delete].insert = true);
+        assert!(index.admit(&inserted_delete).is_none(), "an inserted delete");
+        let inserted_increment = crafted(&|c| {
+            c.operations[delete].insert = true;
+            c.operations[delete].action = OpType::Increment(1);
+        });
+        assert!(index.admit(&inserted_increment).is_none(), "an inserted increment");
+        let uninserted_mark = crafted(&|c| c.operations[mark].insert = false);
+        assert!(index.admit(&uninserted_mark).is_none(), "a mark that isn't an insertion");
     }
 
     #[test]

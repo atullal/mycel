@@ -17,7 +17,7 @@ use crate::codec::FRAME_MS;
 
 const FRAME: Duration = Duration::from_millis(FRAME_MS as u64);
 /// More than this many frames missing in a row is a resync, not loss.
-const MAX_GAP: u32 = 25;
+const MAX_GAP: u64 = 25;
 /// Never hold more than this (5 s) of audio.
 const MAX_PACKETS: usize = 250;
 /// After an underrun, conceal this many frames before going silent.
@@ -59,8 +59,11 @@ pub struct JitterStats {
 pub struct JitterBuffer {
     min: Duration,
     max: Duration,
-    packets: BTreeMap<u32, Bytes>,
-    next: u32,
+    /// By sequence number, widened: a peer's numbers near `u32::MAX` must
+    /// not overflow the arithmetic below (ours start at 0 and would take
+    /// 2.7 years to wrap).
+    packets: BTreeMap<u64, Bytes>,
+    next: u64,
     playing: bool,
     started: bool,
     concealing: u32,
@@ -114,7 +117,7 @@ impl JitterBuffer {
         match (self.packets.first_key_value(), self.packets.last_key_value()) {
             (Some((&first, _)), Some((&last, _))) => {
                 let from = if self.playing { self.next.min(first) } else { first };
-                last + 1 - from
+                u32::try_from(last + 1 - from).unwrap_or(u32::MAX)
             }
             _ => 0,
         }
@@ -124,7 +127,7 @@ impl JitterBuffer {
         JitterStats {
             jitter_ms: (self.jitter * 1000.0) as f32,
             target_ms: self.target_delay().as_millis() as u32,
-            depth_ms: self.depth() * FRAME_MS,
+            depth_ms: self.depth().saturating_mul(FRAME_MS),
             ..self.stats
         }
     }
@@ -139,6 +142,7 @@ impl JitterBuffer {
         }
         self.last = Some((now, seq));
 
+        let seq = u64::from(seq);
         if self.started && seq < self.next {
             self.stats.late += 1;
             return;
@@ -352,5 +356,29 @@ mod tests {
         let st = jb.stats();
         assert!(st.trimmed > 0);
         assert!(st.depth_ms <= st.target_ms + 60, "depth {} target {}", st.depth_ms, st.target_ms);
+    }
+
+    /// Found by fuzzing (`fuzz/fuzz_targets/call_media.rs`): a peer picks its
+    /// own sequence numbers, and ones near `u32::MAX` overflowed the depth
+    /// and next-frame arithmetic (a panic in debug builds, a wrapped depth in
+    /// release ones). They now play like any others.
+    #[test]
+    fn sequence_numbers_near_the_top_of_the_range_play() {
+        let mut jb = JitterBuffer::for_calls();
+        let top = u32::MAX - 9;
+        let arrivals: Vec<(u32, u64)> = (top..=u32::MAX).map(|s| (s, u64::from(s - top) * 20)).collect();
+        let out = simulate(&mut jb, &arrivals, 0, 20);
+        assert_eq!(played(&out), (top..=u32::MAX).collect::<Vec<_>>());
+
+        // the extremes of the range at once: depth saturates, nothing panics
+        let mut jb = JitterBuffer::for_calls();
+        let now = Instant::now();
+        jb.push(0, p(0), now);
+        jb.push(u32::MAX, p(u32::MAX), now);
+        assert_eq!(jb.depth(), u32::MAX);
+        assert_eq!(jb.stats().depth_ms, u32::MAX);
+        for _ in 0..10 {
+            let _ = jb.pop();
+        }
     }
 }

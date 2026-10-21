@@ -520,6 +520,105 @@ fn a_refusal_marks_the_neighbour_full_until_its_next_summary() {
     assert_eq!(c.plan(2_000, |_| Toward::Nowhere, &nb).len(), 2);
 }
 
+/// Found while writing the `dtn` fuzz target: summaries carry `f32`
+/// predictabilities, and `f64::clamp` keeps a NaN. A neighbour reporting
+/// NaN then outranked every real predictability wherever candidates are
+/// ranked with `total_cmp` (the spread of a doubted route's copies). What a
+/// neighbour reports is a probability, or nothing.
+#[test]
+fn a_reported_nan_predictability_counts_as_zero() {
+    let mut c = Carrier::new(key(1), DtnConfig::default());
+    let (liar, x) = (key(2), key(9));
+    let s = Summary {
+        full: true,
+        preds: vec![(x, f32::NAN), (INTERNET, f32::INFINITY), (key(10), -1.0)],
+        ..Summary::default()
+    };
+    c.on_summary(liar, s, 0, |_| true);
+    let table = &c.nb_pred[&liar];
+    assert!(table.iter().all(|(_, p)| (0.0..=1.0).contains(p)), "{table:?}");
+    assert_eq!(table.iter().find(|(k, _)| *k == x).map(|(_, p)| *p), Some(0.0));
+    assert_eq!(table.iter().find(|(k, _)| *k == INTERNET).map(|(_, p)| *p), Some(1.0));
+    assert!(c.p(&x, 0).is_finite());
+}
+
+/// One hostile neighbour can't grow what we remember without bound: partial
+/// summaries full of new destinations and bundle ids, and offers of bundles
+/// nobody holds, while the link stays up (found in review: 1,000 summaries
+/// of 64 new keys left 64,000 entries for the neighbour and 64,001 of our
+/// own). Its latest summary always counts in full, and the likeliest of our
+/// own predictabilities survive the trim.
+#[test]
+fn a_neighbour_cannot_grow_what_we_remember_without_bound() {
+    let mut c = Carrier::new(key(1), DtnConfig::default());
+    let (liar, friend) = (key(2), key(3));
+    c.encounter(liar, 0);
+    c.encounter(friend, 0);
+    let mut n = 1_000u32;
+    let mut fresh = |count: usize| -> Vec<SignPk> {
+        (0..count)
+            .map(|_| {
+                n += 1;
+                key(n)
+            })
+            .collect()
+    };
+    let id = |i: u32, j: u32| {
+        let mut h = [0u8; 32];
+        h[..4].copy_from_slice(&i.to_be_bytes());
+        h[4..8].copy_from_slice(&j.to_be_bytes());
+        Hash32(h)
+    };
+    let mut last = Vec::new();
+    for i in 0..1_000u32 {
+        let now = Time::from(i);
+        last = fresh(SUMMARY_PREDS + SUMMARY_WANTS);
+        let s = Summary {
+            full: false,
+            ids: (0..SUMMARY_IDS as u32).map(|j| id(i, j)).collect(),
+            preds: last.iter().map(|k| (*k, 1.0)).collect(),
+            ..Summary::default()
+        };
+        c.on_summary(liar, s, now, |_| true);
+        let b = bundle(liar, key(4), 1, 3_600_000);
+        let o = Offer { id: id(i, u32::MAX), ..Offer::of(&b, 1) };
+        let _ = c.offered(liar, &o, now, |_| false);
+        let (pred, nb_pred, nb_has) = c.table_sizes();
+        assert!(pred <= PRED_MAX + PRED_MAX / 4, "{pred} predictabilities after {i} summaries");
+        assert!(nb_pred <= NB_PREDS_MAX, "{nb_pred} remembered for one neighbour");
+        assert!(nb_has <= NB_HAS_MAX, "{nb_has} ids remembered for one neighbour");
+        c.check_bounds().unwrap();
+    }
+    let now = 1_000;
+    c.tick(now);
+    let table = &c.nb_pred[&liar];
+    assert_eq!(table.len(), NB_PREDS_MAX);
+    assert!(last.iter().all(|k| table.binary_search_by(|(x, _)| x.cmp(k)).is_ok()), "the latest summary counts");
+    assert!(c.table_sizes().0 <= PRED_MAX + PRED_MAX / 4);
+    assert!(c.unheld_ids_of(&liar) <= NB_HAS_MAX);
+    // the neighbours we met ourselves outrank anything learnt through them
+    assert!(c.p(&liar, now) > 0.69 && c.p(&friend, now) > 0.69);
+}
+
+/// Trimming our predictabilities forgets the least likely first, and the
+/// same ones on every device.
+#[test]
+fn trimming_predictabilities_forgets_the_least_likely() {
+    let mut c = Carrier::new(key(1), DtnConfig::default());
+    let total = PRED_MAX + PRED_MAX / 4;
+    for i in 0..total as u32 {
+        c.set_p(key(10 + i), f64::from(i + 1) / total as f64, 0);
+    }
+    assert_eq!(c.table_sizes().0, total);
+    c.set_p(key(5), 1.0, 0);
+    assert_eq!(c.table_sizes().0, PRED_MAX);
+    assert_eq!(c.p(&key(5), 0), 1.0);
+    // the cut fell below everything kept
+    let lowest_kept = (total + 1 - PRED_MAX) as u32;
+    assert_eq!(c.p(&key(10 + lowest_kept - 1), 0), 0.0);
+    assert!(c.p(&key(10 + lowest_kept), 0) > 0.0);
+}
+
 /// A transfer cut short keeps its bytes with the receiver; the next offer
 /// of that bundle, from anyone, resumes where it stopped. Kept bytes are
 /// bounded and expire.

@@ -50,7 +50,11 @@ impl Beacon {
     pub fn decode(b: &[u8]) -> Option<Beacon> {
         let rest = b.strip_prefix(MAGIC.as_slice())?;
         let key = SignPk(rest.get(..32)?.try_into().ok()?);
-        let len = *rest.get(32)? as usize;
+        // (a forged beacon must not carry a name longer than ours can)
+        let len = usize::from(*rest.get(32)?);
+        if len > MAX_NAME {
+            return None;
+        }
         let name = std::str::from_utf8(rest.get(33..33 + len)?).ok()?.to_string();
         Some(Beacon { key, name })
     }
@@ -110,6 +114,19 @@ mod tests {
         let long = Beacon { key: SignPk([1; 32]), name: "é".repeat(40) };
         let back = Beacon::decode(&long.encode()).unwrap();
         assert!(back.name.len() <= MAX_NAME && long.name.starts_with(&back.name), "cut on a char boundary");
+    }
+
+    /// Found by fuzzing (`fuzz/fuzz_targets/link_wire.rs`): a beacon's name
+    /// length is a byte, and decoding took up to 255 bytes of name, where
+    /// the format (and every beacon we send) has at most [`MAX_NAME`].
+    #[test]
+    fn a_beacon_with_an_overlong_name_is_refused() {
+        let beacon = |len: usize| [MAGIC.as_slice(), &[3; 32], &[len as u8], &b"x".repeat(len)].concat();
+        let at_limit = Beacon::decode(&beacon(MAX_NAME)).unwrap();
+        assert_eq!(at_limit.name.len(), MAX_NAME);
+        assert_eq!(Beacon::decode(&at_limit.encode()), Some(at_limit));
+        assert_eq!(Beacon::decode(&beacon(MAX_NAME + 1)), None);
+        assert_eq!(Beacon::decode(&beacon(255)), None);
     }
 
     #[test]

@@ -663,7 +663,7 @@ impl Nb {
     }
 
     fn hop_cost(&self) -> u32 {
-        (if self.cost == 0 { DEFAULT_COST } else { self.cost }) + HOP_PENALTY
+        (if self.cost == 0 { DEFAULT_COST } else { self.cost }).saturating_add(HOP_PENALTY)
     }
 
     /// The control budget for a hop of this cost: its cost is the time to
@@ -1232,8 +1232,11 @@ impl Router {
     /// Measured hop cost in 0.1 ms units (smoothed here).
     pub fn set_cost(&mut self, peer: SignPk, units: u32) {
         if let Some(n) = self.nbs.get_mut(&peer) {
-            let units = units.max(1);
-            n.cost = if n.cost == 0 { units } else { (n.cost * 7 + units) / 8 };
+            // (at most the driver's cap, `mesh::hop_cost`, which leaves room
+            // to add penalties; and in u64: a slow hop's cost times 7 can
+            // exceed u32)
+            let units = units.clamp(1, u32::MAX / 2);
+            n.cost = if n.cost == 0 { units } else { ((u64::from(n.cost) * 7 + u64::from(units)) / 8) as u32 };
             // the control budget follows the hop's capacity
             n.ctl.rate = Nb::control_bucket(n.cost).rate;
         }

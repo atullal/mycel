@@ -136,6 +136,20 @@ const SUMMARY_RECEIPTS: usize = 256;
 const SUMMARY_PREDS: usize = 64;
 const SUMMARY_EVICTABLE: usize = 32;
 const SUMMARY_WANTS: usize = 16;
+/// What we remember of one neighbour's predictabilities: as much as one
+/// summary carries. Summaries between full ones add to it, so without a cap
+/// a neighbour sending new keys would grow it without end.
+const NB_PREDS_MAX: usize = SUMMARY_PREDS + SUMMARY_WANTS;
+/// Bundle ids we remember a neighbour holding, beyond those we hold
+/// ourselves (the only ones [`Carrier::plan`] asks about): eight full
+/// summaries' worth.
+const NB_HAS_MAX: usize = 8 * SUMMARY_IDS;
+/// Our own delivery predictabilities, at most (each an estimated 50
+/// bytes). Neighbours' summaries add transitive ones for destinations we
+/// have never met, as many as they like; past this, the least likely are
+/// forgotten first, as ageing would forget them anyway. Trimmed back to it
+/// once it is a quarter over, so the cost per insertion stays constant.
+const PRED_MAX: usize = 4096;
 /// What changed goes to a neighbour at most this often (ms)...
 pub const SUMMARY_GAP: Time = 2_000;
 /// ...and everything we hold this often, for it to drop what we no longer do.
@@ -683,6 +697,33 @@ impl Carrier {
 
     fn set_p(&mut self, x: SignPk, p: f64, now: Time) {
         self.pred.insert(x, (p.clamp(0.0, 1.0), now));
+        if self.pred.len() > PRED_MAX + PRED_MAX / 4 {
+            self.trim_pred(now);
+        }
+    }
+
+    /// Forget all but the [`PRED_MAX`] likeliest destinations (aged to `now`).
+    fn trim_pred(&mut self, now: Time) {
+        let mut all: Vec<(f64, SignPk)> = self.pred.keys().map(|k| (self.p(k, now), *k)).collect();
+        let cut = all.len().saturating_sub(PRED_MAX);
+        if cut == 0 {
+            return;
+        }
+        // (ties by key, so every device forgets the same ones)
+        all.select_nth_unstable_by(cut - 1, |a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        for (_, k) in &all[..cut] {
+            self.pred.remove(k);
+        }
+    }
+
+    /// `nb` told us it holds `id`. Remembered while what it told us is
+    /// within [`NB_HAS_MAX`], or if we hold `id` too.
+    fn note_has(&mut self, nb: SignPk, id: Hash32) {
+        let held = self.held.contains_key(&id);
+        let has = self.nb_has.entry(nb).or_default();
+        if has.len() < NB_HAS_MAX || held {
+            has.insert(id);
+        }
     }
 
     /// We are in range of `peer`: P(peer) = P + (1 − P)·P_enc.
@@ -720,7 +761,7 @@ impl Carrier {
     /// `from` offers a bundle; `verify` checks the source's signature over
     /// the offer. Taking it means room for it now; the payload follows.
     pub fn offered(&mut self, from: SignPk, o: &Offer, now: Time, verify: impl FnOnce(&Offer) -> bool) -> Answer {
-        self.nb_has.entry(from).or_default().insert(o.id);
+        self.note_has(from, o.id);
         self.nb_heard.insert(from, now);
         if self.receipts.contains_key(&o.id) {
             return Answer::Duplicate;
@@ -804,7 +845,7 @@ impl Carrier {
         now: Time,
         verify: impl FnOnce(&Bundle) -> bool,
     ) -> Accepted {
-        self.nb_has.entry(from).or_default().insert(b.id);
+        self.note_has(from, b.id);
         self.nb_heard.insert(from, now);
         if self.receipts.contains_key(&b.id) {
             return Accepted::Duplicate;
@@ -1121,7 +1162,9 @@ impl Carrier {
         } else {
             // what it took since, or a full list that is only part of what
             // it holds: add to what we knew
-            self.nb_has.entry(from).or_default().extend(ids);
+            for id in ids {
+                self.note_has(from, id);
+            }
         }
         if s.wants.is_empty() {
             self.nb_wants.remove(&from);
@@ -1146,7 +1189,9 @@ impl Carrier {
         let full = s.full;
         let mut table: NbPreds = Vec::with_capacity(s.preds.len().min(SUMMARY_PREDS + SUMMARY_WANTS));
         for (x, px) in s.preds.into_iter().take(SUMMARY_PREDS + SUMMARY_WANTS) {
-            let px = (px as f64).clamp(0.0, 1.0);
+            // (`clamp` keeps a NaN: one would outrank every real
+            // predictability where candidates are ranked by `total_cmp`)
+            let px = if px.is_nan() { 0.0 } else { (px as f64).clamp(0.0, 1.0) };
             table.push((x, px as f32));
             if x == self.me {
                 continue;
@@ -1157,16 +1202,20 @@ impl Carrier {
                 self.set_p(x, via, now);
             }
         }
-        // between full summaries, what it sends updates what we knew
-        if !full && let Some(old) = self.nb_pred.get(&from) {
-            let mut merged = old.clone();
-            merged.extend(table);
-            table = merged;
-        }
         // sorted for lookups; of repeated keys the last counts
         table.reverse();
         table.sort_by_key(|x| x.0);
         table.dedup_by_key(|(k, _)| *k);
+        // between full summaries, what it sends updates what we knew: the
+        // rest of the room goes to the likeliest of what it told us before
+        if !full && let Some(old) = self.nb_pred.get(&from) {
+            let mut older: Vec<(SignPk, f32)> =
+                old.iter().filter(|(k, _)| table.binary_search_by(|(x, _)| x.cmp(k)).is_err()).copied().collect();
+            older.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            older.truncate(NB_PREDS_MAX.saturating_sub(table.len()));
+            table.extend(older);
+            table.sort_by_key(|x| x.0);
+        }
         self.nb_pred.insert(from, table);
     }
 
@@ -1361,7 +1410,7 @@ impl Carrier {
         if !ok {
             return;
         }
-        self.nb_has.entry(to).or_default().insert(id);
+        self.note_has(to, id);
         self.nb_heard.insert(to, now);
         let gone = match self.held.get_mut(&id) {
             Some(h) if h.b.dst == to => true, // delivered
@@ -1430,6 +1479,38 @@ impl Carrier {
     /// Neighbours whose summaries we remember.
     pub fn remembered(&self) -> usize {
         self.nb_pred.len().max(self.nb_has.len())
+    }
+
+    /// How much we remember from neighbours, for bounds checks: our own
+    /// predictabilities, and the most predictabilities and bundle ids
+    /// remembered for any one neighbour.
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn table_sizes(&self) -> (usize, usize, usize) {
+        let most = |n: Option<usize>| n.unwrap_or(0);
+        (
+            self.pred.len(),
+            most(self.nb_pred.values().map(Vec::len).max()),
+            most(self.nb_has.values().map(|s| s.len()).max()),
+        )
+    }
+
+    /// Whether what we remember is within the caps: [`PRED_MAX`] (plus the
+    /// quarter it may grow before a trim), [`NB_PREDS_MAX`] per neighbour,
+    /// and [`NB_HAS_MAX`] unheld bundle ids per neighbour.
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn check_bounds(&self) -> Result<(), String> {
+        let (pred, nb_pred, _) = self.table_sizes();
+        let unheld = self.nb_has.keys().map(|k| self.unheld_ids_of(k)).max().unwrap_or(0);
+        if pred > PRED_MAX + PRED_MAX / 4 || nb_pred > NB_PREDS_MAX || unheld > NB_HAS_MAX {
+            return Err(format!("{pred} predictabilities, {nb_pred} for one neighbour, {unheld} unheld ids"));
+        }
+        Ok(())
+    }
+
+    /// Bundle ids we remember neighbour `nb` holding that we don't hold.
+    #[cfg(any(test, fuzzing))]
+    pub(crate) fn unheld_ids_of(&self, nb: &SignPk) -> usize {
+        self.nb_has.get(nb).map_or(0, |s| s.iter().filter(|id| !self.held.contains_key(id)).count())
     }
 }
 

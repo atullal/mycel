@@ -238,14 +238,25 @@ mod tests {
     }
 
     fn repeated_ops(rows: u64, predecessors: u64, key: &str) -> Vec<u8> {
+        ops_naming(rows, predecessors, key, 0)
+    }
+
+    /// `rows` map operations on `key`, each with `predecessors` predecessors
+    /// whose counter is `counter` (delta-encoded: the first is `counter`, the
+    /// rest the same).
+    fn ops_naming(rows: u64, predecessors: u64, key: &str, counter: i64) -> Vec<u8> {
         let unsigned = |n| {
             let mut v = Vec::new();
             leb128::write::unsigned(&mut v, n).unwrap();
             v
         };
-        let run = |n, value: &[u8]| {
+        let signed = |n| {
             let mut v = Vec::new();
             leb128::write::signed(&mut v, n).unwrap();
+            v
+        };
+        let run = |n, value: &[u8]| {
+            let mut v = signed(n);
             v.extend_from_slice(value);
             v
         };
@@ -261,7 +272,12 @@ mod tests {
         if predecessors != 0 {
             let count = rows.checked_mul(predecessors).unwrap() as i64;
             columns.push((0x71, run(count, &unsigned(0))));
-            columns.push((0x73, run(count, &unsigned(0))));
+            let deltas = match counter {
+                0 => run(count, &signed(0)),
+                _ if count == 1 => run(1, &signed(counter)),
+                _ => [run(1, &signed(counter)), run(count - 1, &signed(0))].concat(),
+            };
+            columns.push((0x73, deltas));
         }
         let mut body = unsigned(0); // dependencies
         body.extend(unsigned(32));
@@ -311,6 +327,19 @@ mod tests {
         let bomb = repeated_ops(1, i64::MAX as u64, "k");
         assert!(bomb.len() < 160);
         assert!(matches!(parse(&bomb), Err(SyncError::TooLarge)));
+    }
+
+    /// End to end (`change_resources::tests::operation_ids_beyond_u32_are_refused`
+    /// checks the column alone): a change naming a predecessor counter
+    /// beyond `u32` is refused by the preflight, before Automerge's loader,
+    /// which converts such ids with `unwrap` (found by fuzzing).
+    #[test]
+    fn a_change_naming_an_id_beyond_u32_is_refused_before_automerge_parses() {
+        let fits = ops_naming(1, 1, "k", i64::from(u32::MAX));
+        assert!(preflight(&fits, &READ).is_ok());
+        let beyond = ops_naming(1, 1, "k", i64::from(u32::MAX) + 1);
+        assert!(matches!(preflight(&beyond, &READ), Err(SyncError::Encoding)));
+        assert!(matches!(parse(&beyond), Err(SyncError::Encoding)));
     }
 
     #[test]

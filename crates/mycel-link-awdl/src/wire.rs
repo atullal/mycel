@@ -90,7 +90,8 @@ pub fn parse_advert(pk: Option<&[u8]>, name: Option<&[u8]>) -> Option<Advert> {
     hex::decode_to_slice(pk, &mut key).ok()?;
     let name = name
         .and_then(|n| std::str::from_utf8(n).ok())
-        .map(|n| truncate_utf8(n.trim(), MAX_NAME).to_string())
+        // (trimmed again after the cut, which can end on whitespace)
+        .map(|n| truncate_utf8(n.trim(), MAX_NAME).trim_end().to_string())
         .filter(|n| !n.is_empty());
     Some(Advert { key: SignPk(key), name })
 }
@@ -168,6 +169,21 @@ mod tests {
         assert_eq!(parse_advert(Some(b"abcd"), None), None);
         assert_eq!(parse_advert(Some(&[b'z'; 64]), None), None);
         assert!(parse_advert(Some(&[b'A'; 64]), Some(&[0xff, 0xfe])).unwrap().name.is_none());
+    }
+
+    /// Found by fuzzing (`fuzz/fuzz_targets/link_wire.rs`): a long name was
+    /// trimmed before being cut to [`MAX_NAME`], so a cut landing in
+    /// whitespace kept it, and the same advert parsed to different names
+    /// depending on whether it had been re-encoded.
+    #[test]
+    fn a_name_cut_in_whitespace_is_trimmed() {
+        let name = format!("{}{}tail", "A".repeat(MAX_NAME - 3), " ".repeat(10));
+        let pk = hex::encode(key(2).0);
+        let a = parse_advert(Some(pk.as_bytes()), Some(name.as_bytes())).unwrap();
+        assert_eq!(a.name.as_deref(), Some("A".repeat(MAX_NAME - 3).as_str()));
+        let e = txt_entries(&a.key, a.name.as_deref().unwrap());
+        let get = |k: &str| e.iter().find(|(n, _)| *n == k).map(|(_, v)| v.as_slice());
+        assert_eq!(parse_advert(get(TXT_KEY), get(TXT_NAME)), Some(a), "parsing is idempotent");
     }
 
     #[test]

@@ -1181,16 +1181,7 @@ impl Driver {
             // a kind from a newer neighbour: nothing it needs answered
             _ => return Ok(()),
         };
-        let w: WireSummary = postcard::from_bytes(body)?;
-        let s = dtn::Summary {
-            full: w.full,
-            ids: w.ids,
-            receipts: w.receipts.into_iter().map(|(id, dst, sig)| dtn::Receipt { id, dst, sig }).collect(),
-            preds: w.preds,
-            free: w.free,
-            evictable: w.evictable,
-            wants: w.wants,
-        };
+        let s = decode_summary(body)?;
         let now = self.now();
         if let Some(c) = &self.carrier {
             c.lock().on_summary(from, s, now, verify_receipt);
@@ -1210,30 +1201,19 @@ impl Driver {
         let Some(c) = &self.carrier else { return Ok(()) };
         let frames = self.frames.peer(&from);
         let (head, _head_permit) = read_frame(&mut rx, MAX_OFFER, crate::resources::FIRST_FRAME, &frames).await?;
-        let Some((format, w)) = decode_offer(&head)? else { return Ok(()) };
-        if !format.checkable() {
+        let Some(o) = decode_offer(&head)? else { return Ok(()) };
+        if !o.format.checkable() {
             // a header we can't check is one we won't carry (a payload kind
             // we don't know is fine: carriers never read payloads)
             write_frame(&mut tx, &crate::wire::encode_bounded(&WireAnswer::Refuse(false), 64)?).await?;
             tx.finish()?;
             return Err(crate::version::VersionError::Unsupported {
                 what: "bundle",
-                version: format.version.into(),
+                version: o.format.version.into(),
                 newest: dtn::BUNDLE_VERSION.into(),
             }
             .into());
         }
-        let o = dtn::Offer {
-            format,
-            id: w.id,
-            src: w.src,
-            dst: w.dst,
-            size: w.size,
-            created: w.created,
-            lifetime: w.lifetime,
-            copies: w.copies,
-            sig: w.sig,
-        };
         let answer = {
             let mut c = c.lock();
             c.set_clock(self.now(), wall_ms());
@@ -1324,16 +1304,7 @@ impl Driver {
         // summaries: everything to a new neighbour, then what changes
         let due = c.lock().summaries(now, &neighbours);
         for (k, s) in due {
-            let wire = WireSummary {
-                full: s.full,
-                ids: s.ids,
-                receipts: s.receipts.into_iter().map(|r| (r.id, r.dst, r.sig)).collect(),
-                preds: s.preds,
-                free: s.free,
-                evictable: s.evictable,
-                wants: s.wants,
-            };
-            let Ok(body) = crate::wire::encode_bounded(&wire, MAX_SUMMARY - 1) else { continue };
+            let Ok(body) = encode_summary(s) else { continue };
             let Some(conn) = self.conn(&k) else { continue };
             let mut msg = vec![K_SUMMARY];
             msg.extend_from_slice(&body);
@@ -1884,6 +1855,100 @@ struct WireSummary {
     wants: Vec<SignPk>,
 }
 
+/// A neighbour's summary stream, after its kind byte.
+pub(crate) fn decode_summary(body: &[u8]) -> Result<dtn::Summary> {
+    let w: WireSummary = postcard::from_bytes(body)?;
+    Ok(dtn::Summary {
+        full: w.full,
+        ids: w.ids,
+        receipts: w.receipts.into_iter().map(|(id, dst, sig)| dtn::Receipt { id, dst, sig }).collect(),
+        preds: w.preds,
+        free: w.free,
+        evictable: w.evictable,
+        wants: w.wants,
+    })
+}
+
+/// Our summary for a neighbour, without its kind byte.
+pub(crate) fn encode_summary(s: dtn::Summary) -> Result<Vec<u8>> {
+    let wire = WireSummary {
+        full: s.full,
+        ids: s.ids,
+        receipts: s.receipts.into_iter().map(|r| (r.id, r.dst, r.sig)).collect(),
+        preds: s.preds,
+        free: s.free,
+        evictable: s.evictable,
+        wants: s.wants,
+    };
+    crate::wire::encode_bounded(&wire, MAX_SUMMARY - 1)
+}
+
+/// Our offer `o` on a hop of wire `version` (its first frame's body, kind
+/// byte included); `None` if that hop can't take the bundle (a version 1
+/// hop only takes version 1 bundles: it would take any other as a version
+/// 1 bundle and find the signature bad).
+pub(crate) fn encode_offer(version: WireVersion, o: &dtn::Offer) -> Result<Option<Vec<u8>>> {
+    let offer = WireOffer {
+        id: o.id,
+        src: o.src,
+        dst: o.dst,
+        size: o.size,
+        created: o.created,
+        lifetime: o.lifetime,
+        sig: o.sig,
+        copies: o.copies,
+    };
+    Ok(Some(if version >= WIRE_V2 {
+        let format = WireFormat { version: o.format.version, kind: o.format.kind };
+        let mut msg = vec![K_OFFER_V2];
+        msg.extend_from_slice(&crate::wire::encode_bounded(&(format, offer), MAX_OFFER - 1)?);
+        msg
+    } else if o.format == dtn::BundleFormat::V1 {
+        let mut msg = vec![K_OFFER];
+        msg.extend_from_slice(&crate::wire::encode_bounded(&offer, MAX_OFFER - 1)?);
+        msg
+    } else {
+        return Ok(None);
+    }))
+}
+
+/// A neighbour's bundle offer (its first frame, kind byte included), in
+/// the format it names (a version 1 offer is of a version 1 bundle);
+/// `None` for an offer kind this build doesn't know (left unanswered).
+/// The format may be one this build can't check: the caller refuses it.
+pub(crate) fn decode_offer(head: &[u8]) -> Result<Option<dtn::Offer>> {
+    let (format, w) = match head.split_first() {
+        Some((&K_OFFER, body)) => (dtn::BundleFormat::V1, postcard::from_bytes::<WireOffer>(body)?),
+        Some((&K_OFFER_V2, body)) => {
+            let (f, w): (WireFormat, WireOffer) = postcard::from_bytes(body)?;
+            (dtn::BundleFormat { version: f.version, kind: f.kind }, w)
+        }
+        _ => return Ok(None),
+    };
+    Ok(Some(dtn::Offer {
+        format,
+        id: w.id,
+        src: w.src,
+        dst: w.dst,
+        size: w.size,
+        created: w.created,
+        lifetime: w.lifetime,
+        copies: w.copies,
+        sig: w.sig,
+    }))
+}
+
+/// A neighbour's answer to our offer: `Ok(Some(from))` to send the payload
+/// from byte `from`, `Ok(None)` if it has the bundle, `Err(full)` if refused
+/// (`true` for lack of room).
+pub(crate) fn decode_answer(body: &[u8]) -> Result<std::result::Result<Option<u64>, bool>> {
+    Ok(match postcard::from_bytes::<WireAnswer>(body)? {
+        WireAnswer::Take(at) => Ok(Some(at)),
+        WireAnswer::Duplicate => Ok(None),
+        WireAnswer::Refuse(full) => Err(full),
+    })
+}
+
 /// A bundle's id: the same data for the same destination is the same bundle
 /// (a version 1 bundle: what [`Mesh::send_bundle`] sends).
 pub fn bundle_id(src: &SignPk, dst: &SignPk, payload: &[u8]) -> Hash32 {
@@ -1980,7 +2045,7 @@ async fn send_bundle(
     copies: u8,
     frames: &crate::resources::PeerFrames,
 ) -> Result<Sent> {
-    let Some(msg) = encode_offer(version, b, copies)? else {
+    let Some(msg) = encode_offer(version, &dtn::Offer::of(b, copies))? else {
         // (it would take it as a version 1 bundle and find the signature bad)
         return Ok(Sent::Refused(false));
     };
@@ -1990,10 +2055,11 @@ async fn send_bundle(
     write_frame(&mut tx, &msg).await?;
     let (answer, _answer_permit) =
         read_frame(&mut rx, 64, crate::resources::reply_timeout(4 + msg.len()), frames).await?;
-    let at = match postcard::from_bytes::<WireAnswer>(&answer)? {
-        WireAnswer::Duplicate => return Ok(Sent::Took),
-        WireAnswer::Refuse(full) => return Ok(Sent::Refused(full)),
-        WireAnswer::Take(at) => (at as usize).min(b.payload.len()),
+    let at = match decode_answer(&answer)? {
+        Ok(None) => return Ok(Sent::Took),
+        Err(full) => return Ok(Sent::Refused(full)),
+        // (a 32-bit device must not truncate an offset beyond the payload)
+        Ok(Some(at)) => usize::try_from(at).unwrap_or(usize::MAX).min(b.payload.len()),
     };
     crate::resources::write_all(&mut tx, &b.payload[at..]).await?;
     tx.finish()?;
@@ -2001,47 +2067,6 @@ async fn send_bundle(
     let wait = crate::resources::reply_timeout(b.payload.len() - at);
     let ack = crate::resources::within(wait, "no receipt", rx.read_to_end(1)).await?;
     Ok(if ack.first() == Some(&1) { Sent::Took } else { Sent::Refused(false) })
-}
-
-/// The offer of bundle `b` on a hop of wire `version` (its first frame's
-/// body); `None` if that hop can't take `b` (a version 1 hop only takes
-/// version 1 bundles).
-fn encode_offer(version: WireVersion, b: &dtn::Bundle, copies: u8) -> Result<Option<Vec<u8>>> {
-    let offer = WireOffer {
-        id: b.id,
-        src: b.src,
-        dst: b.dst,
-        size: b.payload.len() as u64,
-        created: b.created,
-        lifetime: b.lifetime,
-        sig: b.sig,
-        copies,
-    };
-    Ok(Some(if version >= WIRE_V2 {
-        let format = WireFormat { version: b.format.version, kind: b.format.kind };
-        let mut msg = vec![K_OFFER_V2];
-        msg.extend_from_slice(&crate::wire::encode_bounded(&(format, offer), MAX_OFFER - 1)?);
-        msg
-    } else if b.format == dtn::BundleFormat::V1 {
-        let mut msg = vec![K_OFFER];
-        msg.extend_from_slice(&crate::wire::encode_bounded(&offer, MAX_OFFER - 1)?);
-        msg
-    } else {
-        return Ok(None);
-    }))
-}
-
-/// An offer's first frame: the bundle's format and the offer; `None` for
-/// an offer kind this build doesn't know (left unanswered).
-fn decode_offer(head: &[u8]) -> Result<Option<(dtn::BundleFormat, WireOffer)>> {
-    Ok(match head.split_first() {
-        Some((&K_OFFER, body)) => Some((dtn::BundleFormat::V1, postcard::from_bytes(body)?)),
-        Some((&K_OFFER_V2, body)) => {
-            let (format, w): (WireFormat, WireOffer) = postcard::from_bytes(body)?;
-            Some((dtn::BundleFormat { version: format.version, kind: format.kind }, w))
-        }
-        _ => None,
-    })
 }
 
 /// A length-prefixed frame on a stream that goes on after it.

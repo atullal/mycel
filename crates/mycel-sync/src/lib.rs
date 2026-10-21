@@ -23,6 +23,9 @@ mod bounded_change;
 mod change_ops;
 mod change_resources;
 mod doc_index;
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod reconcile;
 
 pub type EnvelopeId = Hash32;

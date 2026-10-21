@@ -31,8 +31,10 @@ pub struct ReceiverStats {
 
 #[derive(Debug)]
 pub struct Reorder {
-    /// The sequence number the decoder needs next.
-    next: Option<u32>,
+    /// The sequence number the decoder needs next, widened so that it never
+    /// wraps: after a peer's frame `u32::MAX` (ours would take 4.5 years at
+    /// 30 fps to get there) everything else is late, not frame 0 again.
+    next: Option<u64>,
     /// Waiting for a keyframe (at the start, or after a loss).
     need_key: bool,
     held: BTreeMap<u32, EncodedFrame>,
@@ -63,7 +65,7 @@ impl Default for Reorder {
 impl Reorder {
     /// The frame the decoder needs next (what a keyframe request names).
     pub fn missing(&self) -> u32 {
-        self.next.unwrap_or(0)
+        self.next.map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX))
     }
 
     /// Waiting for a keyframe right now.
@@ -73,7 +75,7 @@ impl Reorder {
 
     /// A frame arrived. Returns what the decoder can take now, in order.
     pub fn push(&mut self, f: EncodedFrame, now: Instant) -> Vec<EncodedFrame> {
-        if self.next.is_some_and(|n| f.seq < n) || self.held.contains_key(&f.seq) {
+        if self.next.is_some_and(|n| u64::from(f.seq) < n) || self.held.contains_key(&f.seq) {
             return vec![]; // late or duplicate
         }
         if f.keyframe && self.newest_key.is_none_or(|k| f.seq > k) {
@@ -91,7 +93,7 @@ impl Reorder {
 
     /// The sender gave up on frame `seq` (its stream was reset).
     pub fn lost(&mut self, seq: u32, now: Instant) -> Vec<EncodedFrame> {
-        if self.next.is_some_and(|n| seq < n) || self.newest_key.is_some_and(|k| seq < k) {
+        if self.next.is_some_and(|n| u64::from(seq) < n) || self.newest_key.is_some_and(|k| seq < k) {
             return vec![];
         }
         self.gone.insert(seq);
@@ -135,7 +137,7 @@ impl Reorder {
         }
         self.gone.retain(|s| *s > k);
         self.need_key = false;
-        self.next = Some(k);
+        self.next = Some(u64::from(k));
     }
 
     fn drain(&mut self, now: Instant) -> Vec<EncodedFrame> {
@@ -147,22 +149,22 @@ impl Reorder {
                 self.jump_to(k);
             }
             while let Some(n) = self.next {
-                let Some(f) = self.held.remove(&n) else { break };
+                let Some(f) = u32::try_from(n).ok().and_then(|n| self.held.remove(&n)) else { break };
                 if f.keyframe {
                     self.stats.keyframes += 1;
                 }
                 self.stats.delivered += 1;
                 out.push(f);
-                self.next = Some(n.wrapping_add(1));
+                self.next = Some(n + 1);
             }
             if self.held.is_empty() {
                 break;
             }
-            let next = self.next.unwrap_or(0);
+            let next = u32::try_from(self.next.unwrap_or(0)).ok();
             match self.held.iter().find(|(_, f)| f.keyframe).map(|(s, _)| *s) {
                 // a newer keyframe is already here: no need to wait for the gap
                 Some(k) => self.jump_to(k),
-                None if self.gone.contains(&next) => self.give_up(),
+                None if next.is_some_and(|n| self.gone.contains(&n)) => self.give_up(),
                 None => break,
             }
             if self.need_key {
@@ -258,5 +260,25 @@ mod tests {
         assert_eq!(seqs(&r.push(f(3, true), t)), [3]);
         assert!(r.lost(2, t).is_empty());
         assert!(!r.needs_keyframe());
+    }
+
+    /// Found by fuzzing (`fuzz/fuzz_targets/video_media.rs`): a peer picks
+    /// its own sequence numbers, and after frame `u32::MAX` the next one
+    /// expected wrapped to 0, so an older held keyframe was then handed to
+    /// the decoder after newer frames. Delivery is now strictly in order:
+    /// past the top of the range, everything is late.
+    #[test]
+    fn delivery_never_goes_backwards_past_the_top_of_the_range() {
+        let mut r = Reorder::default();
+        let t = Instant::now();
+        assert!(r.push(f(u32::MAX - 5, false), t).is_empty(), "held: 1 missing");
+        assert_eq!(seqs(&r.push(f(u32::MAX - 7, true), t)), [u32::MAX - 7]);
+        assert_eq!(seqs(&r.push(f(u32::MAX, true), t)), [u32::MAX], "a newer keyframe skips the gap");
+        assert_eq!(r.missing(), u32::MAX);
+        assert!(r.push(f(u32::MAX - 3, true), t).is_empty(), "older than what was delivered");
+        assert!(r.push(f(0, true), t).is_empty(), "no wrapping around to the start");
+        assert!(r.lost(1, t).is_empty());
+        assert!(r.tick(t + GAP_WAIT * 2).0.is_empty());
+        assert_eq!(r.stats.delivered, 2);
     }
 }

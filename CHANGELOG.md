@@ -46,6 +46,15 @@ The first public version. It contains:
 - **Hardening:** resource limits on everything a peer sends, and fixes for
   the findings of internal adversarial reviews, each with a regression test
   ([TRUST.md](docs/TRUST.md) §8d and §9b).
+- **Fuzzing:** libFuzzer targets for every decoder of untrusted bytes, run
+  on pull requests and nightly ([TESTING.md](docs/TESTING.md), "Fuzzing").
+  The bugs they found are fixed. Among them, document changes are now
+  refused that are shaped as Automerge never writes them (inserted deletes
+  and increments, marks that aren't insertions, element keys with an actor
+  and counter 0) or that name operation ids beyond 32 bits
+  ([TRUST.md](docs/TRUST.md) §7, rules 8 and 9). Builds from before this
+  admit some such crafted changes where newer ones refuse them, so a space
+  mixing the two can disagree about a malicious member's edits.
 - **SDK and CLI:** `@mycel/sdk` (TypeScript client, Tauri/HTTP/mock
   transports, React hooks) and the `mycel` CLI (`serve`, `keeper`, `id`,
   `call`).

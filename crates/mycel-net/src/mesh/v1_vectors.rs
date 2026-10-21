@@ -23,7 +23,7 @@ use mycel_sync::{Envelope, Header, StreamId};
 use mycel_trust::{Action, EpochId, Op, SignedOp};
 
 use super::core::{Frame, Origination, SeqReq};
-use super::dtn::{Bundle, BundleFormat};
+use super::dtn::{Bundle, BundleFormat, Offer};
 use super::{
     K_SUMMARY, RECEIPT_CTX, WireAnswer, WireSummary, bundle_id_of, bundle_sig_ok, bundle_signed, decode_offer,
     encode_offer,
@@ -401,14 +401,14 @@ fn version_1_bundles() {
         payload: Bytes::from_static(payload),
         sig,
     };
-    assert_eq!(encode_offer(WIRE_V1, &bundle, 4).unwrap(), Some(golden(K_OFFER_VEC)));
-    let (format, w) = decode_offer(&golden(K_OFFER_VEC)).unwrap().unwrap();
-    assert_eq!(format, BundleFormat::V1);
+    assert_eq!(encode_offer(WIRE_V1, &Offer::of(&bundle, 4)).unwrap(), Some(golden(K_OFFER_VEC)));
+    let o = decode_offer(&golden(K_OFFER_VEC)).unwrap().unwrap();
+    assert_eq!(o.format, BundleFormat::V1);
     assert_eq!(
-        (w.id, w.src, w.dst, w.size, w.created, w.lifetime, w.copies),
+        (o.id, o.src, o.dst, o.size, o.created, o.lifetime, o.copies),
         (id, a.sign_pk(), b.sign_pk(), 9, created, lifetime, 4)
     );
-    assert!(bundle_sig_ok(format, &w.src, &w.id, w.created, w.lifetime, &w.sig));
+    assert!(bundle_sig_ok(o.format, &o.src, &o.id, o.created, o.lifetime, &o.sig));
 
     assert_eq!(b.sign(RECEIPT_CTX, &[&id.0]).0.to_vec(), golden(RECEIPT_SIG));
     let summary = WireSummary {
