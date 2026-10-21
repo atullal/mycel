@@ -19,6 +19,8 @@ pub struct Outcome {
     pub loops: u64,
     pub composed_devices: usize,
     pub attackers: usize,
+    /// The routing core's counters (announcements, control by kind...).
+    pub extra: serde_json::Value,
 }
 
 /// Compose and run once.
@@ -26,7 +28,7 @@ pub fn outcome(s: &Spec, k: &Knobs, size: Size, swarm: &Swarm, seed: u64) -> any
     let Composed { world, plan, until, sample, gcfg, devices, attackers } = compose(s, k, size, swarm, seed)?;
     let r = run_t2(Model::Global(gcfg), &world, &plan, seed, until, sample);
     let loops = r.extra.get("loops").and_then(|v| v.as_u64()).unwrap_or(0);
-    Ok(Outcome { m: r.m, loops, composed_devices: devices, attackers })
+    Ok(Outcome { m: r.m, loops, composed_devices: devices, attackers, extra: r.extra })
 }
 
 /// A metric's value from a run.
@@ -43,6 +45,11 @@ pub fn metric_of(metric: Metric, m: &T2Metrics) -> f64 {
 
 /// One seed, judged against the scenario's objectives.
 pub fn result(s: &Spec, size: Size, label: &str, seed: u64) -> ScenarioResult {
+    result_with(s, size, label, seed, &Swarm::default())
+}
+
+/// [`result`] with some swarm toggles switched off.
+pub fn result_with(s: &Spec, size: Size, label: &str, seed: u64, swarm: &Swarm) -> ScenarioResult {
     let mut r = ScenarioResult::new(&s.name, &s.title, 2, seed, size.people as f64 / s.size.people as f64);
     let mut fid = s.fidelity();
     let status = s.status();
@@ -61,7 +68,7 @@ pub fn result(s: &Spec, size: Size, label: &str, seed: u64) -> ScenarioResult {
     }
     let t = std::time::Instant::now();
     let k = Knobs::nominal(s);
-    let o = match outcome(s, &k, size, &Swarm::default(), seed) {
+    let o = match outcome(s, &k, size, swarm, seed) {
         Ok(o) => o,
         Err(e) => {
             r.check("composes", false, format!("{e:#}"));
@@ -115,22 +122,35 @@ pub fn result(s: &Spec, size: Size, label: &str, seed: u64) -> ScenarioResult {
         o.composed_devices,
         size.duration / crate::tier2::MIN
     ));
+    if !swarm.off.is_empty() {
+        r.note(format!("Swarm toggles off: {}.", swarm.off.join(", ")));
+    }
     r.note(format!("Proves (once its models are in): {}", s.proves));
     r.note(format!("Key physics: {}", s.key_physics.join("; ")));
     fid.region = "nominal point (no uncertainty region)".into();
     r.fidelity = Some(fid);
     r.optimality.clone_from(&m.optimality_ratios);
-    r.metrics = json!({"metrics": m, "loops": o.loops, "attackers": o.attackers});
+    r.metrics = json!({"metrics": m, "loops": o.loops, "attackers": o.attackers, "extra": o.extra});
+    if let Some(c) = o.extra.get("control_b_s_per_device") {
+        r.note(format!("Control B/s per device by kind: {c}"));
+    }
     r
 }
 
 /// Every seed, judged as CI judges (invariants on every seed, quality on
 /// at least `min_pass`).
-pub fn replicate(s: &Spec, size: Size, label: &str, seeds: &[u64], min_pass: usize) -> (Vec<ScenarioResult>, Verdict) {
+pub fn replicate(
+    s: &Spec,
+    size: Size,
+    label: &str,
+    seeds: &[u64],
+    min_pass: usize,
+    swarm: &Swarm,
+) -> (Vec<ScenarioResult>, Verdict) {
     let rs: Vec<ScenarioResult> = seeds
         .par_iter()
         .map(|seed| {
-            let mut r = result(s, size, label, *seed);
+            let mut r = result_with(s, size, label, *seed, swarm);
             r.finish();
             r
         })
@@ -219,7 +239,7 @@ mod tests {
             .collect();
         for (name, status, r) in &out {
             let f = r.fidelity.as_ref().expect("labelled");
-            assert_eq!(f.is_bound(), *status == Status::Bound, "{name}");
+            assert_eq!(f.is_bound(), *status != Status::Verdict, "{name}");
             if *status == Status::Blocked {
                 assert!(r.headline[0].starts_with("blocked"), "{name}");
                 continue;

@@ -27,7 +27,7 @@ use crate::uq::sample::norm_quantile;
 /// entity gets the same draw whatever else changes.
 pub fn keyed(seed: u64, purpose: u64, entity: u64, k: u64) -> f64 {
     let h =
-        mix64(seed ^ mix64(purpose.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ mix64(entity ^ mix64(k ^ 0x6b65_7965_64))));
+        mix64(seed ^ mix64(purpose.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ mix64(entity ^ mix64(k ^ 0x6b65_7965_6400))));
     (h >> 11) as f64 / (1u64 << 53) as f64
 }
 
@@ -59,7 +59,7 @@ pub struct Knobs {
     pub adoption: f64,
     pub inet_share: f64,
     pub nat_hard: f64,
-    pub max_neighbours: Option<usize>,
+    pub max_neighbours: usize,
     pub walk_speed: f64,
     pub pause_s: f64,
     pub msg_rate: f64,
@@ -80,7 +80,7 @@ impl Knobs {
             adoption: n("adoption"),
             inet_share: n("inet_share"),
             nat_hard: n("nat_hard"),
-            max_neighbours: s.radio.max_neighbours,
+            max_neighbours: n("max_neighbours") as usize,
             walk_speed: n("walk_speed"),
             pause_s: n("pause_s"),
             msg_rate: 1.0,
@@ -100,7 +100,7 @@ impl Knobs {
             "adoption" => self.adoption = v,
             "inet_share" => self.inet_share = v,
             "nat_hard" => self.nat_hard = v,
-            "max_neighbours" => self.max_neighbours = Some(v.round().max(1.0) as usize),
+            "max_neighbours" => self.max_neighbours = v.round().max(1.0) as usize,
             "walk_speed" => self.walk_speed = v,
             "pause_s" => self.pause_s = v,
             "msg_rate" => self.msg_rate = v,
@@ -198,7 +198,7 @@ pub fn compose(s: &Spec, k: &Knobs, size: Size, swarm: &Swarm, seed: u64) -> any
     let m = k.range_mult;
     anyhow::ensure!(m > 0.0 && m.is_finite(), "range multiplier {m}");
     let mut w = World { areas: Vec::new(), specs: Vec::new() };
-    let mut plan = Plan { max_neighbours: k.max_neighbours, ..Plan::default() };
+    let mut plan = Plan { max_neighbours: Some(k.max_neighbours), ..Plan::default() };
     // the trace layout: a trace's devices and contacts (no geometry)
     if r.layout == Layout::Trace {
         return compose_trace(s, k, size, swarm, seed);
@@ -251,7 +251,7 @@ pub fn compose(s: &Spec, k: &Knobs, size: Size, swarm: &Swarm, seed: u64) -> any
             has_inet[*i] = true;
         }
     }
-    for i in 0..n {
+    for (i, inet_here) in has_inet.iter().copied().enumerate() {
         let u = |p: u64| keyed(seed, p, i as u64, 0);
         let (area, xy) = match r.layout {
             Layout::Field => (0, (u(P_X) * width, u(P_Y) * height)),
@@ -273,7 +273,7 @@ pub fn compose(s: &Spec, k: &Knobs, size: Size, swarm: &Swarm, seed: u64) -> any
         } else {
             Techs::of(&[Tech::Ble, Tech::WifiDirect])
         };
-        let inet = has_inet[i].then(|| inet_for(s.internet.access, u(P_ACCESS), u(P_NAT), k.nat_hard));
+        let inet = inet_here.then(|| inet_for(s.internet.access, u(P_ACCESS), u(P_NAT), k.nat_hard));
         let moving = match s.mobility.model {
             MobilityModel::Static => false,
             MobilityModel::Waypoint | MobilityModel::Mules => u(P_MOVE) < k.mule_share,
@@ -528,7 +528,7 @@ fn compose_trace(s: &Spec, k: &Knobs, size: Size, swarm: &Swarm, seed: u64) -> a
             .collect(),
     };
     let ble = Techs::of(&[Tech::Ble]);
-    let mut plan = Plan { max_neighbours: k.max_neighbours, ..Plan::default() };
+    let mut plan = Plan { max_neighbours: Some(k.max_neighbours), ..Plan::default() };
     for (st, e, a, b) in &trace.contacts {
         if *st >= size.duration {
             continue;
@@ -584,7 +584,8 @@ mod tests {
         for d in a.plan.roles.keys() {
             assert!(b.plan.roles.contains_key(d), "attacker {d} stays one at a larger share");
         }
-        assert_eq!(a.plan.sends.len(), b.plan.sends.len(), "the same workload");
+        // the same message count; a few more or fewer skipped as the honest set shrinks
+        assert!(a.plan.sends.len().abs_diff(b.plan.sends.len()) <= a.plan.sends.len() / 50 + 1);
         k.adoption *= 1.5;
         let c = compose(&s, &k, size, &Swarm::default(), 5).unwrap();
         assert!(c.devices > a.devices);

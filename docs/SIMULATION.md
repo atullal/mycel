@@ -1215,3 +1215,164 @@ the routing core and carrier and the template for others: translate the core's
 effects (`Out`) into `Cx` calls (`send_radio`, `send_inet`, `set_timer`,
 `reach_put`/`reach_get`, `delivered`, `receipt`) and its inputs from the
 `Router` callbacks.
+
+## 7. Scenario catalogue and fidelity
+
+Two pieces from the simulation-fidelity roadmap (WP15 and WP19): a
+declarative catalogue of real-world scenarios, and a framework that says
+what every simulated number can be trusted for and how robust a verdict is
+over what is not known. Neither changes the engine, the routing core or
+the hand-written scenarios of §3, so the CI gate's numbers are unchanged
+(checked: below).
+
+```
+cargo run --release -p mycel-sim -- catalogue                       # the 36 scenarios, status, fidelity, needs
+cargo run --release -p mycel-sim -- catalogue earthquake --runs 10  # CI size, 10 seeds, judged as the gate judges
+cargo run --release -p mycel-sim -- catalogue all --seed 1          # every runnable one, one seed
+cargo run --release -p mycel-sim -- catalogue festival --off fisheye,dtn   # swarm toggles off (WP20)
+cargo run --release -p mycel-sim -- catalogue my-town.toml          # a scenario file of your own
+cargo run --release -p mycel-sim -- robust earthquake --points 32 --runs 3 --morris-r 8
+```
+
+### 7.1 Fidelity levels
+
+Every result carries a fidelity level: the lowest among the models it
+uses (`src/fidelity.rs`). The levels are the design's (§3 of the
+roadmap): **L0** abstract (a disc, instant links, literature constants:
+good for logic bugs, invariants and comparing designs on one world),
+**L1** literature-grounded (cited parameters, not checked on our devices:
+the direction of an effect), **L2** calibrated on our own measurements
+with a discrepancy term, **L3** validated on held-out measurements, **L4**
+a recorded real day replayed. Nothing is above L1 today, and the radio is
+a disc, so **every tier-2 number in this document is L0**, and so is every
+tier-1 number (EmuNet's media are discs too). `report.md` now has
+Fidelity, Region and Robust-pass columns on every row; the hand-written
+scenarios get their tier's default (`Fidelity::tier_default`).
+
+`fidelity::MODELS` lists 55 models the catalogue can ask for: 20 the
+simulator has (with their level and source) and 35 it lacks (with the work
+package that brings each and the direction its absence biases results:
+optimistic, pessimistic or either way). A catalogue scenario names the
+models its key physics **needs**. If a needed model is missing:
+
+- a non-essential need is a note;
+- an essential need runs on the component's stand-in (the disc for an
+  interference model, instant links for BLE discovery), and the result is
+  a **bound**, never a verdict: on an optimistic bound a missed objective
+  is a finding (reality is worse) and a pass is inconclusive;
+- an essential need with no meaningful stand-in (storage-full devices on
+  unlimited storage, a censor without a censorship model) **blocks** the
+  scenario: it is listed with what it waits for, and not run.
+
+When a work package lands a model (WP7–WP12 are in progress on other
+branches), its entry gets a level, the scenarios that need it become
+verdicts, and their numbers start to mean more. That is the point of
+stating needs as data.
+
+### 7.2 The catalogue
+
+`crates/mycel-sim/scenarios/NN-name.toml`, the 36 situations of the
+roadmap's table, compiled into the binary (`catalogue::FILES`; a test
+fails if a file is not listed, malformed, or misnumbered). Each composes:
+a region and layout (field, clusters, line, several cities, or a contact
+trace), people at full and CI size and the share running Mycel
+(adoption), a device mix (iPhones with AWDL, others with Wi-Fi Direct,
+BLE-only phones), mobility (static, random waypoint, or static clusters
+with walking mules), the radio's neighbour cap, internet (share or exact
+gateways, access mix, hard-NAT share, outages of everything or cellular
+only, devices abroad), OS behaviour (battery deaths, churn, restart
+storms, devices away for hours), adversaries by role and share, a
+workload (rate, size, destinations near, far, any or abroad, calls),
+objectives, the statistics plan, the uncertain parameters of its
+robustness study, the swarm toggles WP20 may vary, and its needs. Full
+sizes are the design's; CI sizes shrink the area with the population to
+keep density, and are what `catalogue` runs unless `--full`.
+
+Randomness in the composition is keyed per entity (`keyed(seed, purpose,
+entity, k)`): device i's place, radios, internet and attacker rank do not
+move when adoption, the attacker share or the internet share do, so the
+points of a robustness study differ in the parameter, not in a reshuffled
+world (WP1's common-random-numbers rule, applied here to the world; the
+engine's own streams are WP1's). Tested: raising the attacker share keeps
+every earlier attacker, raising adoption keeps every earlier device's
+place and radios.
+
+The **range multiplier** (an uncertain parameter) is applied to the
+geometry: for a disc, scaling every range by m is exactly scaling every
+distance by 1/m (places, area, walking speed), so the engine and its
+oracle are untouched. It is exact only for a uniform multiplier on a
+disc; WP7's link budget replaces it. Its prior, ×0.63–×1.58 log-uniform,
+is a ±6 dB link-budget error at path-loss exponent 3 (computed), a span
+that covers per-handset RSSI offsets (estimate).
+
+Three new world components, all **L0 stand-ins** and exogenous (drawn
+from the seed, not from traffic): battery deaths (each device dies at a
+log-normal time around a median, σ 0.5 by default; WP9's energy model
+replaces it), devices away for hours, and restart storms. They only add
+scheduled events, so their CPU cost is the cost of the devices that
+remain (measured below).
+
+Every catalogue scenario gets a radio-neighbour cap of 8 unless it says
+otherwise (Android allows about 7 BLE connections, iOS 6–15 reported).
+Without it the first timing run of `office` (150 phones in a 60 × 40 m
+room, everyone in range of everyone over Wi-Fi Direct and AWDL) took
+422 s for 20 simulated minutes and its devices sent **64.8 kB/s of
+control each**, more than a BLE radio carries: an uncapped clique's
+announcement traffic grows with its size. With the cap: 2 s, 1.05 kB/s.
+The node itself dials at most `max_neighbours` = 6 hop connections and
+accepts others' (about 12 in all in a crowd: `mesh/mod.rs`), and real
+radios cap connections too, so the uncapped run measured the simulator,
+not Mycel. It is a drift between the tier-2 world and the node worth
+knowing: a hand-written tier-2 scenario that does not set
+`Plan::max_neighbours` (only `global-scale` and `churn` do) gives every device
+every neighbour in range, which overstates control traffic in dense
+places (catalogue finding 1, §7.5).
+
+### 7.3 Robustness and sensitivity (`src/uq/`)
+
+A verdict counts only if it holds over a **joint uncertainty region** of
+what cannot be measured yet, not at one nominal point and not at three
+independent corners (pessimistic corners stacked together make a world
+nobody believes in, and corners miss interior and interaction worst
+cases). `mycel-sim robust NAME` runs, for the scenario's objective
+(`[uq] metric`: delivery, latency p95 or control):
+
+1. the nominal point, replicated over `--runs` seeds;
+2. `--points` scrambled Sobol points of the region (Joe–Kuo direction
+   numbers, Owen scrambling in Burley's hash form; tested: the first 2^m
+   points keep the (0, m, 2)-net property after scrambling, and a 4,096-
+   point estimate of a 5-D integral is within 0.5%), mapped through the
+   parameters' priors and a Gaussian copula for parameters known to move
+   together, each point replicated on the **same** seeds. The
+   **robust-pass fraction** is the share of points that pass, with a
+   Wilson interval; points come from the prior, so it is the
+   prior-weighted pass probability;
+3. **Morris screening**, `--morris-r` trajectories of k + 1 points on a
+   4-level grid (μ* with a bootstrap interval, and σ for interactions);
+4. a **Gaussian-process emulator** (Matérn 5/2, one length scale per
+   parameter, a noise term, hyperparameters by maximum marginal
+   likelihood) on the space-filling runs, checked by closed-form
+   leave-one-out (RMSE, Q², coverage of the 95% interval) and on the
+   Morris runs as a held-out set;
+5. **Sobol first-order and total indices** on the emulator (Saltelli's
+   first-order and Jansen's total estimator, 4,096 base rows, 200
+   bootstrap resamples). Tested on the Ishigami function: every index
+   within 0.03 of the analytic values directly, and within 0.06 through
+   an emulator fitted on 256 points (Q² > 0.95). The intervals cover the
+   Monte Carlo error on the emulator, not the emulator's own error, which
+   is reported beside them;
+6. a **worst-case search** on the emulator (sep-CMA-ES from the worst
+   sampled points and the centre), and the point found **confirmed with
+   `--confirm` fresh seeds**. A verdict is called robust only if the
+   nominal point, every sampled point and the confirmed worst case pass;
+   the report says the worst case was found by search, not proven.
+
+The parameters a verdict hinges on (total index ≥ 0.1) are the ones that
+jump WP14's measurement queue. `uq::params::builtin` has 14 named
+parameters, each with a range, a prior and a source or "(estimate)":
+`range_mult`, `adoption`, `inet_share`, `nat_hard`, `max_neighbours`,
+`walk_speed`, `pause_s`, `msg_rate`, `adversary_share`,
+`battery_median_h`, `ios_share`, `ble_only_share`, `churn_per_min`,
+`mule_share`. None is calibrated on Mycel's own devices yet (WP14), so
+robustness here is robustness over today's ignorance, not a calibrated
+error bar.

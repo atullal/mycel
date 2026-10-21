@@ -262,7 +262,10 @@ impl Default for MobilitySpec {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RadioSpec {
-    /// BLE connections a device keeps (real radios cap them).
+    /// Radio neighbours a device keeps connections to. Default 8: Android
+    /// allows ~7 BLE connections (BTA_GATTC_CONN_MAX), iOS 6–15 reported;
+    /// without a cap a dense room becomes a clique whose control traffic
+    /// grows with its size (docs/SIMULATION.md §7, catalogue findings).
     #[serde(default)]
     pub max_neighbours: Option<usize>,
 }

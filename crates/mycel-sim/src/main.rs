@@ -66,6 +66,16 @@ struct Args {
     /// Robust: fresh seeds confirming the worst case found.
     #[arg(long, default_value_t = 10)]
     confirm: usize,
+    /// Catalogue: swarm toggles to switch off, comma-separated (fisheye,
+    /// flood-reduction, dtn, churn, outages, adversaries, battery).
+    #[arg(long, value_delimiter = ',')]
+    off: Vec<String>,
+    /// Catalogue and robust: people present instead of the CI (or full) size.
+    #[arg(long)]
+    people: Option<usize>,
+    /// Catalogue and robust: simulated minutes instead of the scenario's.
+    #[arg(long)]
+    minutes: Option<f64>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -277,9 +287,22 @@ fn catalogue_specs(a: &Args) -> anyhow::Result<Vec<mycel_sim::catalogue::Spec>> 
     Ok(out)
 }
 
+/// The run size: CI (or `--full`), with `--people` / `--minutes` on top.
+fn size_of(a: &Args, s: &mycel_sim::catalogue::Spec) -> mycel_sim::catalogue::compose::Size {
+    use mycel_sim::catalogue::compose::Size;
+    let mut size = if a.full { Size::full(s) } else { Size::ci(s) };
+    if let Some(p) = a.people {
+        size.people = p.clamp(1, s.size.people);
+    }
+    if let Some(m) = a.minutes {
+        size.duration = (m * mycel_sim::tier2::MIN as f64) as mycel_sim::tier2::Time;
+    }
+    size
+}
+
 /// `catalogue`: list, or run the named scenarios on `--runs` seeds.
 fn catalogue(a: &Args) -> anyhow::Result<()> {
-    use mycel_sim::catalogue::{self, Status, compose::Size, run};
+    use mycel_sim::catalogue::{self, Status, run};
     if a.dirs.is_empty() {
         println!("| # | Scenario | Status | Fidelity | Size (people × adoption) | Needs |\n|---|---|---|---|---|---|");
         for s in catalogue::all() {
@@ -305,14 +328,24 @@ fn catalogue(a: &Args) -> anyhow::Result<()> {
         return Ok(());
     }
     let specs = catalogue_specs(a)?;
+    for t in &a.off {
+        anyhow::ensure!(catalogue::SWARM_TOGGLES.contains(&t.as_str()), "unknown toggle {t:?}");
+    }
+    let swarm = catalogue::compose::Swarm { off: a.off.clone() };
     let seeds = mycel_sim::stats::run_seeds(a.seed, a.runs.max(1));
     let mut results = Vec::new();
     let mut verdicts = Vec::new();
     let mut failed = Vec::new();
     let mut md = format!("# Mycel scenario catalogue: {} seeds from base {}\n\n", seeds.len(), a.seed);
     for s in &specs {
-        let size = if a.full { Size::full(s) } else { Size::ci(s) };
-        let label = if a.full { "full size" } else { "CI size" };
+        let size = size_of(a, s);
+        let label = if a.people.is_some() || a.minutes.is_some() {
+            "scaled down"
+        } else if a.full {
+            "full size"
+        } else {
+            "CI size"
+        };
         let m = a.min_pass.unwrap_or_else(|| mycel_sim::seeds::min_pass(seeds.len()).min(s.stats.min_pass));
         let t = Instant::now();
         let status = s.status();
@@ -327,7 +360,7 @@ fn catalogue(a: &Args) -> anyhow::Result<()> {
             results.push(r);
             continue;
         }
-        let (rs, v) = run::replicate(s, size, label, &seeds, m.min(seeds.len()));
+        let (rs, v) = run::replicate(s, size, label, &seeds, m.min(seeds.len()), &swarm);
         let fid = s.fidelity();
         eprintln!(
             "▶ {} {} ({:?}, {}): {} in {:.0} s — {}",
@@ -359,7 +392,7 @@ fn catalogue(a: &Args) -> anyhow::Result<()> {
 
 /// `robust NAME`: the verdict's robustness over its uncertainty region.
 fn robust(a: &Args) -> anyhow::Result<()> {
-    use mycel_sim::catalogue::{compose::Size, run::Study};
+    use mycel_sim::catalogue::run::Study;
     use mycel_sim::uq::{Plan, study};
     let specs = catalogue_specs(a)?;
     anyhow::ensure!(!specs.is_empty(), "name a catalogue scenario");
@@ -367,7 +400,7 @@ fn robust(a: &Args) -> anyhow::Result<()> {
     let mut md = String::from("# Mycel robustness studies\n\n");
     let mut all = Vec::new();
     for s in specs {
-        let size = if a.full { Size::full(&s) } else { Size::ci(&s) };
+        let size = size_of(a, &s);
         let st = Study::new(s, size)?;
         let (threshold, higher_is_better) = st.threshold();
         let plan = Plan {
