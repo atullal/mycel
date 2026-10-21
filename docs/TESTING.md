@@ -323,21 +323,34 @@ Each harness's world is as adversarial as the real one, or more:
   complete, fail or hang. Info reads and channel opens complete or fail.
   The link can drop and the stack can close a channel.
 
+Not modelled yet:
+- Router: gateways and internet hops, and the inputs the defences take
+  (`feedback`, `set_affinity`). The defences only rank feasible routes,
+  but their own paths are unexplored.
+- Carrier: partial transfers and resume, eviction, expiry.
+- BLE: address rotation, restriction to known devices, and the harsh
+  cancel seen between two Macs (`BleModel::harsh_cancel`, off in the
+  published bound).
+
 Properties and the bounds checked exhaustively (release build, 3 threads,
-the 18-core Mac; *budget* is how many of each fault and clock jump a path
-may contain):
+on the 18-core Mac while other builds ran). The bound says how many of
+each fault and clock jump a path may contain. `mycel-check 300` ran all
+five checks in about 2.5 minutes of wall time. CI runs it with a 300 s
+budget per check, and a bound not exhausted within its budget fails the
+job.
 
 | Check | Properties (every reachable state) | Bound | States (unique) | Time |
 |---|---|---|---|---|
-| `router/line` | no loop over any usable route; Babel's feasibility condition; every advertised (seqno, cost) no better than its advertiser's feasibility distance | 3 devices in a line, warm; 2 clock jumps, 1 link change, 1 cost change, 1 loss | 8,472,637 (3,406,391) | 61 s |
-| `router/triangle` | the same | 3 devices in a triangle, warm; 1 clock jump, 1 link change, 1 cost change, 1 loss | TRI_STATES | TRI_TIME |
-| `router/planted` | the same, with `model_plant_infeasible` (every route treated as feasible) | as the triangle, 2 jumps | **violated**: a two-device loop, found after PLANT_STATES unique states | PLANT_TIME |
+| `router/line` | no loop over any usable route; Babel's feasibility condition; every advertised (seqno, cost) no better than its advertiser's feasibility distance | 3 devices in a line, warm; 2 clock jumps, 1 link change, 1 cost change, 1 loss | 8,472,637 (3,406,391) | 59–61 s |
+| `router/triangle` | the same | 3 devices in a triangle, warm; 1 clock jump, 1 link change, 1 loss | 2,179,489 (722,701) | 21 s |
+| `router/planted` | the same, with `model_plant_infeasible` (every route treated as feasible) | 3 devices in a triangle, warm; the line's budget | **violated** (`loop-free`), found after 1,643 unique states | 0.1 s |
 | `carrier/line` | *custody*: until delivered, some carrier holds the bundle; *receipts clear every copy*: from every state, once faults stop and the links return, the bundle ends delivered and held by nobody (80 rounds of 2.1 s) | 3 devices in a line, from every state of the fault-free run; 1 clock jump, 1 link change, 1 lost stream | 3,160,689 (695,730) | 22 s |
 | `ble/pair` | Found and Lost alternate; the platform routes exactly what the core's table says, over an open channel end; *relinks*: from every state, once faults stop, both ends route over the two ends of one channel and no other channel is open (120 s of ticks) | 2 devices; 1 clock jump (1.5, 5 or 10 s), 1 failed or hung operation, 1 link drop or channel close | 14,213,194 (2,959,095) | 27 s |
 
-Larger bounds were explored without being exhausted (60–90 s each, nothing
-violated). Router: a triangle with 3 jumps, 2 link changes and a
-duplicate, 5.1 million states. Carrier: 3 jumps and a lost stream, 2.3
+Larger bounds were explored without being exhausted (60–300 s each,
+nothing violated). Router: the triangle with a cost change added, 10.4
+million unique states in 300 s; with 3 jumps, 2 link changes and a
+duplicate, 5.1 million states in 60 s. Carrier: 3 jumps and a lost stream, 2.3
 million unique states. BLE: 2 jumps, 5.5 million unique states.
 Stateright proves properties only up to the bound: bugs that need many
 devices or long histories are the simulator's job.

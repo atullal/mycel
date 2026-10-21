@@ -169,8 +169,12 @@ printed as a `(seed, mask)` line for `swarm::PINNED`, which every run
 replays first. CI runs 24 fixed configurations (`--seed 1 --runs 24`).
 The nightly soak runs 200 fresh ones. Measured: `swarm --seed 1 --runs 24`
 took 16 s wall and 57 s of CPU (4 threads), 0.28 GB peak memory. All 24
-held, and nothing is pinned yet. In-code fault injection (`buggify!`) and
-bounded model checking of the router, the carrier and the BLE state machine
+held, and nothing is pinned yet. WP20 (model checking, `buggify!`, the swarm runner) added no model to
+tier 2 and changed none. The ten-seed gate (`ci --seed 1000 --runs 10`)
+run on this branch and on the commit before it (`4a321e4`) gave identical
+`results.json` files apart from wall-clock times: every tier-2 number
+stands, including `gateway-choice`'s one quality miss. In-code fault
+injection (`buggify!`) and bounded model checking of the router, the carrier and the BLE state machine
 are described in [TESTING.md](TESTING.md), "Model checking, fault injection
 and swarm testing".
 

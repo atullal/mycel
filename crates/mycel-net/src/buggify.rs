@@ -125,9 +125,10 @@ mod tests {
     fn compiled_out_of_default_builds() {
         const { assert!(!buggify!("test: never")) };
         // No site's purpose string is in this binary, which links every
-        // module of the crate (the needle is built at run time, so this
-        // test's own source doesn't put it there).
-        let needle = ["mycel-buggify", "-site:"].concat();
+        // module of the crate. The needle is built at run time from its
+        // reverse, so this test doesn't put it there itself (two halves can
+        // end up side by side in the binary).
+        let needle: String = ":etis-yfiggub-lecym".chars().rev().collect();
         let exe = std::fs::read(std::env::current_exe().expect("own path")).expect("own binary");
         assert!(
             !exe.windows(needle.len()).any(|w| w == needle.as_bytes()),

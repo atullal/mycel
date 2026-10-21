@@ -35,6 +35,7 @@ fn main() {
     check("router/triangle", &|| {
         let mut m = RouterModel::new(3, &[(0, 1), (1, 2), (0, 2)]);
         m.budget.steps = 1;
+        m.budget.costs = 0;
         run("router/triangle", &m.bound(), m, 3, budget)
     });
     check("router/planted", &|| {
