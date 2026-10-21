@@ -163,7 +163,15 @@ pub struct Global {
     conns: Map<NodeId, Time>,
     buffer_at: Time,
     buffer_now: u64,
+    /// [`Role::AttestedLiar`]: per origin, the cheapest announcement it was
+    /// sent of the newest seqno (seq, hops, cost), as received.
+    chains: Map<SignPk, (u64, u8, u32)>,
 }
+
+/// The least a hop adds to a route's cost (the core's plausibility floor,
+/// `MIN_HOP_COST`: a measured cost of at least 1 plus [`mc::HOP_PENALTY`],
+/// 2.1 ms): what a liar claims for its own link.
+const ATTESTED_HOP_FLOOR: u32 = 1 + mc::HOP_PENALTY;
 
 /// A bundle's id for message `msg` (the same message is the same bundle).
 fn bundle_id(msg: MsgId, src: NodeId) -> Hash32 {
@@ -220,6 +228,7 @@ impl Global {
             conns: Map::default(),
             buffer_at: 0,
             buffer_now: 0,
+            chains: Map::default(),
         }
     }
 
@@ -366,7 +375,17 @@ impl Global {
                                 // "everyone is one hop from me", as cheaply as
                                 // an honest relay could say it
                                 ann.hops = 1;
-                                ann.cost = 1 + mc::HOP_PENALTY;
+                                ann.cost = ATTESTED_HOP_FLOOR;
+                            }
+                            Role::AttestedLiar => {
+                                // the cheapest chain it was sent, extended by
+                                // one hop at the least an honest hop adds
+                                if let Some(&(seq, hops, cost)) = self.chains.get(&ann.origin)
+                                    && seq == ann.seq
+                                {
+                                    ann.hops = hops.saturating_add(1);
+                                    ann.cost = ann.cost.min(cost.saturating_add(ATTESTED_HOP_FLOOR));
+                                }
                             }
                             _ => {}
                         }
@@ -377,7 +396,7 @@ impl Global {
                     self.send_to(cx, node(&to), Frame::Req(req), None);
                 }
                 Out::Frame { to, frame, relayed } => {
-                    if relayed && matches!(self.role, Role::BlackHole | Role::Liar) {
+                    if relayed && self.role.drops() {
                         continue; // swallowed
                     }
                     let msg = packet_msg(&frame.payload);
@@ -645,6 +664,14 @@ impl Router for Global {
                 if self.role == Role::Replayer && self.old.len() < 200 {
                     self.old.push(a.clone());
                 }
+                if self.role == Role::AttestedLiar && a.cost != mc::INFINITY && a.origin != self.pk {
+                    // every chain it is sent is one it could extend: keep the
+                    // cheapest of the newest seqno
+                    let e = self.chains.entry(a.origin).or_insert((a.seq, a.hops, a.cost));
+                    if a.seq > e.0 || (a.seq == e.0 && (a.cost, a.hops) < (e.2, e.1)) {
+                        *e = (a.seq, a.hops, a.cost);
+                    }
+                }
                 self.core.on_announce(fpk, a, now, WALL_MS + now, |_| true)
             }
             Frame::Req(r) => self.core.on_seqreq(fpk, r, now),
@@ -678,7 +705,7 @@ impl Router for Global {
             Frame::Bundle(b, copies) => {
                 let id = b.id;
                 let msg = bundle_msg(&id);
-                if self.role == Role::Liar && b.dst != self.pk {
+                if matches!(self.role, Role::Liar | Role::AttestedLiar | Role::Dropper) && b.dst != self.pk {
                     // takes custody, keeps nothing
                     self.send_to(cx, from, Frame::BundleAck { id, copies, ok: true, stored: true }, None);
                     return;

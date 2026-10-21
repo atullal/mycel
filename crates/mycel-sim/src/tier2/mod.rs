@@ -4,6 +4,7 @@
 pub mod dtn;
 pub mod engine;
 pub mod global;
+pub mod lfr;
 pub mod mycel;
 pub mod oracle;
 pub mod world;

@@ -77,10 +77,33 @@ pub enum Role {
     /// gets, packets and store-and-forward bundles alike (tier-2 GLOBAL core
     /// only).
     Liar,
+    /// A liar held to what signed per-hop route attestations would let it
+    /// say (the planned wire change, docs/ROUTING.md §6 item 13): it can't
+    /// invent a short chain, only extend one it received, by one hop and
+    /// the least cost an honest hop adds (2.1 ms); so it advertises the
+    /// cheapest route it heard plus one hop and 2.1 ms, understating only
+    /// its own link. It drops everything all the same (tier-2 GLOBAL core
+    /// only). The gap between [`Role::Liar`] and this is what the wire
+    /// change can buy.
+    AttestedLiar,
+    /// Announces honestly and drops everything (packets and bundles): all
+    /// that is left of a liar once announcements can't lie at all (route
+    /// attestations that also carry each upstream's measured cost to the
+    /// next hop, so not even its own link can be understated). The real
+    /// world's "believable liar": a relay that truly is close, and drops.
+    Dropper,
     /// Announces every 10 ms.
     Storm,
     /// Re-sends announcements it heard long ago.
     Replayer,
+}
+
+impl Role {
+    /// It drops what it is given to relay (packets, and with the GLOBAL
+    /// core bundles too).
+    pub fn drops(self) -> bool {
+        matches!(self, Role::BlackHole | Role::Liar | Role::AttestedLiar | Role::Dropper)
+    }
 }
 
 #[derive(Clone, Debug)]
