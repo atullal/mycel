@@ -2501,11 +2501,36 @@ impl Runtime {
         })
     }
 
-    /// Sync every conversation with every member now (pull-to-refresh).
+    /// Sync every conversation with every member now, all at once
+    /// (pull-to-refresh, a phone's background catch-up): a member who is
+    /// asleep costs one connect timeout in all, not one per conversation
+    /// ([`Node::sync_everything`]).
     pub async fn sync_now(&self) {
+        self.node.sync_everything().await;
+    }
+
+    /// The app on a phone went to the background (`true`) or came back
+    /// (`false`). While it's away, radios that would link with any device
+    /// in range (Bluetooth) link only with [`Runtime::known_peers`], so a
+    /// locked phone never hands its node key to a stranger that advertises
+    /// Mycel (docs/TRUST.md §8b).
+    pub fn set_background(&self, background: bool) {
+        let known = background.then(|| self.known_peers());
+        self.node.restrict_links(known.as_deref());
+    }
+
+    /// Devices this profile deals with: contacts and everyone in its
+    /// conversations (members and keepers), never itself.
+    pub fn known_peers(&self) -> Vec<SignPk> {
+        let me = self.keys.sign_pk();
+        let mut known: BTreeSet<SignPk> = self.contacts.lock().keys().copied().collect();
         for s in self.node.space_ids() {
-            self.node.sync_all(s).await;
+            if let Ok(members) = self.node.with_space(&s, |r| r.members()) {
+                known.extend(members.into_iter().map(|(k, _)| k.sign_pk));
+            }
         }
+        known.remove(&me);
+        known.into_iter().collect()
     }
 }
 
@@ -3933,5 +3958,37 @@ mod tests {
         }
         let rate = sample_rate(&mut s, at(7_000), 100_000_000);
         assert_eq!(rate, 50_000_000);
+    }
+
+    /// Who a phone in the background still links with over Bluetooth:
+    /// contacts and conversation members, never a stranger or itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn known_peers_are_contacts_and_conversation_members() {
+        use super::*;
+        let dir = |tag: &str| std::env::temp_dir().join(format!("mycel-known-{tag}-{}", mycel_crypto::random_u64()));
+        let (da, db, dc, ds) = (dir("a"), dir("b"), dir("c"), dir("s"));
+        let alice = Runtime::open(&da, NetworkMode::Local, Some("Alice".into())).await.unwrap();
+        let bob = Runtime::open(&db, NetworkMode::Local, Some("Bob".into())).await.unwrap();
+        let carol = Runtime::open(&dc, NetworkMode::Local, Some("Carol".into())).await.unwrap();
+        let stranger = Runtime::open(&ds, NetworkMode::Local, Some("Stranger".into())).await.unwrap();
+        assert!(alice.known_peers().is_empty());
+        let b = alice.add_contact(bob.profile().contact_code).unwrap();
+        let c = alice.add_contact(carol.profile().contact_code).unwrap();
+        alice.create_conversation(None, vec![b.id.clone(), c.id.clone()]).unwrap();
+        // Carol stays a member after she is no longer a contact.
+        alice.remove_contact(c.id).unwrap();
+        let known = alice.known_peers();
+        assert_eq!(known.len(), 2, "{known:?}");
+        assert!(known.contains(&bob.keys.sign_pk()) && known.contains(&carol.keys.sign_pk()));
+        assert!(!known.contains(&alice.keys.sign_pk()) && !known.contains(&stranger.keys.sign_pk()));
+        // No Bluetooth link in tests, so this only must not fail.
+        alice.set_background(true);
+        alice.set_background(false);
+        for rt in [alice, bob, carol, stranger] {
+            rt.shutdown().await.unwrap();
+        }
+        for d in [da, db, dc, ds] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }
