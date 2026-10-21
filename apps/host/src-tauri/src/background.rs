@@ -15,9 +15,12 @@
 //!   periodic WorkManager job (`CatchUpWorker`) catches up if the phone
 //!   stopped it anyway (`android.rs`).
 //!
-//! A catch-up syncs every conversation now, then stays awake a little longer
-//! so peers that hold messages for us (keepers, store-and-forward relays)
-//! can deliver them, then flushes to disk. It never outlives its budget.
+//! A catch-up syncs every conversation with every member at once (keepers
+//! and reachable peers first; a member who is asleep costs one connect
+//! timeout in all, see `Runtime::sync_now`), then stays awake a little
+//! longer so peers that hold messages for us (keepers, store-and-forward
+//! relays) can deliver them, then flushes to disk. It never outlives its
+//! budget.
 
 // Only phones lend background time, but the logic is built and tested
 // everywhere.
@@ -159,10 +162,20 @@ fn now_ms() -> u64 {
 /// [`begin_catch_up`]. `false` if there is no runtime to catch up with,
 /// another catch-up is running, or it was cancelled or cut short.
 pub(crate) fn catch_up_now(ticket: u64, budget: Duration) -> bool {
-    catch_up_with(ticket, budget, LINGER)
+    catch_up_with(ticket, budget, LINGER, sync_everything)
 }
 
-fn catch_up_with(ticket: u64, budget: Duration, linger: Duration) -> bool {
+/// The sync round of a catch-up: every conversation with every member.
+async fn sync_everything(runtime: crate::Rt) {
+    runtime.sync_now().await
+}
+
+fn catch_up_with<F: Future<Output = ()>>(
+    ticket: u64,
+    budget: Duration,
+    linger: Duration,
+    sync: impl FnOnce(crate::Rt) -> F,
+) -> bool {
     // The flag stays registered while the catch-up runs, so a cancel
     // reaches it; released on the way out (a panic leaves it until it
     // falls off).
@@ -181,7 +194,7 @@ fn catch_up_with(ticket: u64, budget: Duration, linger: Duration) -> bool {
         };
         let runtime = core.runtime.clone();
         let started = Instant::now();
-        let outcome = tauri::async_runtime::block_on(catch_up(runtime.sync_now(), budget, linger, &cancel));
+        let outcome = tauri::async_runtime::block_on(catch_up(sync(runtime.clone()), budget, linger, &cancel));
         if let Err(error) = runtime.flush() {
             eprintln!("mycel-host: background persistence failed: {error}");
         }
@@ -203,7 +216,13 @@ fn catch_up_with(ticket: u64, budget: Duration, linger: Duration) -> bool {
 /// [`catch_up_now`] with a short linger (the host's own tests).
 #[cfg(test)]
 pub(crate) fn catch_up_for_test(ticket: u64, budget: Duration, linger: Duration) -> bool {
-    catch_up_with(ticket, budget, linger)
+    catch_up_with(ticket, budget, linger, sync_everything)
+}
+
+/// A catch-up whose sync round never finishes (a peer that stalls).
+#[cfg(test)]
+pub(crate) fn stalled_catch_up_for_test(ticket: u64, budget: Duration) -> bool {
+    catch_up_with(ticket, budget, Duration::ZERO, |_| std::future::pending::<()>())
 }
 
 #[cfg(test)]
@@ -412,7 +431,7 @@ mod tests {
         let ticket = begin_catch_up();
         cancel_catch_up(ticket);
         let start = Instant::now();
-        assert!(!catch_up_with(ticket, Duration::from_secs(300), LINGER));
+        assert!(!catch_up_with(ticket, Duration::from_secs(300), LINGER, sync_everything));
         assert!(start.elapsed() < Duration::from_secs(1));
         assert_eq!(LAST_CATCH_UP.load(Ordering::Acquire), last, "a cancelled catch-up isn't a check");
         assert!(tickets().open.iter().all(|(id, _)| *id != ticket), "its ticket is released");

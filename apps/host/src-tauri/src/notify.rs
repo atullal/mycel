@@ -168,6 +168,14 @@ pub struct Notifier {
     asked: AtomicBool,
 }
 
+/// Whether a runtime opened now starts with nobody looking: a start with
+/// no window (Android's service), or an app the OS launched straight into
+/// the background (iOS). Until a window says otherwise, every alert shows,
+/// the incoming-call one included.
+pub(crate) fn starts_away(watched: bool, launched_in_background: bool) -> bool {
+    !watched || launched_in_background
+}
+
 impl Notifier {
     fn with_routes(routes: Routes, path: Option<PathBuf>) -> Notifier {
         Notifier {
@@ -209,6 +217,11 @@ impl Notifier {
 
     pub fn set_away(&self, away: bool) {
         self.away.store(away, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_away_for_test(&self) -> bool {
+        self.away.load(Ordering::Relaxed)
     }
 
     /// Hand a shell event to the worker. Never blocks.
@@ -507,6 +520,21 @@ mod tests {
         notifier.set_away(true);
         assert!(!notifier.suppressed(&message) && !notifier.suppressed(&call));
         assert!(!notifier.viewing("thread"));
+    }
+
+    /// Regression: an iOS background launch (a catch-up, a Bluetooth event)
+    /// opened with a window, so the notifier started "in front" and never
+    /// heard otherwise: a call arriving then rang nowhere.
+    #[test]
+    fn a_background_launch_starts_away_so_a_call_rings() {
+        assert!(starts_away(false, false), "no window");
+        assert!(starts_away(true, true), "a window, but launched into the background");
+        assert!(!starts_away(true, false), "opened by the user");
+        let notifier = notifier();
+        notifier.set_away(starts_away(true, true));
+        assert!(!notifier.suppressed(&alert(AlertKind::IncomingCall, "thread", "call:c")));
+        notifier.set_away(starts_away(true, false));
+        assert!(notifier.suppressed(&alert(AlertKind::IncomingCall, "thread", "call:c")), "rung in the app");
     }
 
     #[test]

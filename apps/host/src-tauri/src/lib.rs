@@ -644,8 +644,14 @@ fn open_core(data_dir: &Path, app: Option<AppHandle>) -> Result<Option<&'static 
         let _ = slot.set(app);
     }
     let notifier = notify::Notifier::start(slot.clone(), data_dir);
-    // Nobody is looking until a window says so.
-    notifier.set_away(!watched);
+    // Nobody is looking until a window says so, nor when iOS launched the
+    // app straight into the background (a catch-up, a Bluetooth event): an
+    // incoming call must ring as a notification then.
+    let away = notify::starts_away(watched, watched && launched_in_background());
+    notifier.set_away(away);
+    if away && cfg!(mobile) {
+        runtime.set_background(true);
+    }
     forward_events(slot.clone(), runtime.clone(), notifier.clone());
     eprintln!(
         "mycel-host: data dir {}, network {:?}{}",
@@ -654,6 +660,36 @@ fn open_core(data_dir: &Path, app: Option<AppHandle>) -> Result<Option<&'static 
         if watched { "" } else { ", started in the background" }
     );
     Ok(Some(CORE.get_or_init(|| Core { runtime, notifier, app: slot })))
+}
+
+/// iOS launched the app straight into the background (`BGTaskScheduler`, or
+/// a relaunch for a Bluetooth event): it has a window, but nobody is
+/// looking, and no `Suspended` event will say so.
+#[cfg(target_os = "ios")]
+fn launched_in_background() -> bool {
+    use objc2::MainThreadMarker;
+    use objc2_ui_kit::{UIApplication, UIApplicationState};
+    // Setup runs on the main thread, during launch.
+    let Some(mtm) = MainThreadMarker::new() else { return false };
+    UIApplication::sharedApplication(mtm).applicationState() == UIApplicationState::Background
+}
+
+#[cfg(not(target_os = "ios"))]
+fn launched_in_background() -> bool {
+    false
+}
+
+/// On a phone, whether `event` sends the app to the background (`true`) or
+/// brings it back (`false`): radios link only with known devices while
+/// it's away ([`Runtime::set_background`]). Focus alone doesn't count (a
+/// pulled-down notification centre would drop links to strangers).
+#[cfg(mobile)]
+fn background_change(event: &WindowEvent) -> Option<bool> {
+    match event {
+        WindowEvent::Suspended | WindowEvent::Destroyed => Some(true),
+        WindowEvent::Resumed => Some(false),
+        _ => None,
+    }
 }
 
 /// `MYCEL_DATA_DIR`, if set: the data folder instead of the app's own.
@@ -830,6 +866,14 @@ pub fn run() {
         {
             notifier.set_away(away);
         }
+        #[cfg(mobile)]
+        if let RunEvent::WindowEvent { label, event, .. } = &event
+            && label == "main"
+            && let Some(background) = background_change(event)
+            && let Some(runtime) = app.try_state::<Rt>()
+        {
+            runtime.set_background(background);
+        }
         #[cfg(target_os = "ios")]
         if let RunEvent::WindowEvent { event: WindowEvent::Suspended, .. } = &event {
             finish_in_background(app);
@@ -855,6 +899,16 @@ mod tests {
     pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
         static SERIAL: Mutex<()> = Mutex::new(());
         SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if check() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for: {what}");
     }
 
     fn temp_dir(tag: &str) -> PathBuf {
@@ -896,26 +950,50 @@ mod tests {
         assert!(CORE.get().is_none());
         assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0, "the folder stays empty");
 
-        // A profile made in the app (here directly), then closed.
+        // A profile made in the app (here directly): Bob, who shares a
+        // conversation with Alice. Then his phone sleeps (closed).
         let dir = temp_dir("profile");
-        let made = tauri::async_runtime::block_on(Runtime::open_with(RuntimeOptions {
-            data_dir: dir.clone(),
-            mode: NetworkMode::Local,
-            name: Some("alice".into()),
-            default_name: None,
-            keeper: false,
-            port: 0,
-        }))
-        .unwrap();
+        let alice_dir = temp_dir("alice");
+        let open = |dir: &Path, name: &str| {
+            tauri::async_runtime::block_on(Runtime::open_with(RuntimeOptions {
+                data_dir: dir.to_path_buf(),
+                mode: NetworkMode::Local,
+                name: Some(name.into()),
+                default_name: None,
+                keeper: false,
+                port: 0,
+            }))
+            .unwrap()
+        };
+        let made = open(&dir, "bob");
+        let alice = open(&alice_dir, "alice");
+        let bob_contact = alice.add_contact(made.profile().contact_code).unwrap();
+        made.add_contact(alice.profile().contact_code).unwrap();
+        alice.node().add_peer_addr(made.node().addr());
+        made.node().add_peer_addr(alice.node().addr());
+        let conversation = alice.create_conversation(None, vec![bob_contact.id]).unwrap().id;
+        eventually("Bob has the conversation", || made.conversation(conversation.clone()).is_ok());
         let id = made.profile().id;
         tauri::async_runtime::block_on(made.shutdown()).unwrap();
         drop(made);
+        // Alice writes while Bob's phone is asleep.
+        tauri::async_runtime::block_on(alice.send_message(
+            conversation.clone(),
+            "while you slept".into(),
+            None,
+            vec![],
+        ))
+        .unwrap();
+        let bodies = |rt: &Rt| -> Vec<String> {
+            rt.messages(conversation.clone(), None, None).unwrap().into_iter().map(|m| m.body).collect()
+        };
 
         // Opened with no window, as that profile.
         let core = open_core(&dir, None).unwrap().expect("an existing profile opens");
         assert_eq!(core.runtime.profile().id, id);
         assert_eq!(core.runtime.data_dir(), dir.as_path());
         assert!(core.app.get().is_none(), "no window yet");
+        assert!(core.notifier.is_away_for_test(), "nobody is looking");
 
         // Later opens (the window's, a second background start) adopt it
         // rather than opening the profile twice. A different folder gets
@@ -925,14 +1003,48 @@ mod tests {
         assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
         assert!(std::ptr::eq(super::core().unwrap(), core));
 
-        // A catch-up against the real runtime: sync (nothing to sync with,
-        // so at once), linger, flush; only a completed one is recorded.
+        // A catch-up against the real runtime delivers what Alice wrote:
+        // sync, linger, flush; only a completed one is recorded. (Alice has
+        // Bob's old address only, so nothing reaches him before it.)
+        core.runtime.node().add_peer_addr(alice.node().addr());
+        assert!(!bodies(&core.runtime).contains(&"while you slept".to_string()));
         let ticket = background::begin_catch_up();
         let start = std::time::Instant::now();
         assert!(background::catch_up_for_test(ticket, Duration::from_secs(15), Duration::from_millis(200)));
         assert!(start.elapsed() < Duration::from_secs(10));
-        assert!(background::last_catch_up_for_test().is_some());
+        assert!(bodies(&core.runtime).contains(&"while you slept".to_string()), "the catch-up delivered it");
+        let recorded = background::last_catch_up_for_test();
+        assert!(recorded.is_some());
 
+        // A message Alice pushes while the catch-up lingers arrives too.
+        alice.node().add_peer_addr(core.runtime.node().addr());
+        let pusher = {
+            let (alice, conversation) = (alice.clone(), conversation.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                tauri::async_runtime::block_on(alice.send_message(
+                    conversation,
+                    "during the linger".into(),
+                    None,
+                    vec![],
+                ))
+                .unwrap();
+            })
+        };
+        let ticket = background::begin_catch_up();
+        assert!(background::catch_up_for_test(ticket, Duration::from_secs(15), Duration::from_secs(4)));
+        pusher.join().unwrap();
+        assert!(bodies(&core.runtime).contains(&"during the linger".to_string()), "pushed during the linger");
+
+        // A sync the budget cuts short (a peer that stalls) isn't a check.
+        std::thread::sleep(Duration::from_millis(5));
+        let recorded = background::last_catch_up_for_test();
+        let ticket = background::begin_catch_up();
+        assert!(!background::stalled_catch_up_for_test(ticket, Duration::from_secs(4)));
+        assert_eq!(background::last_catch_up_for_test(), recorded, "an incomplete catch-up isn't recorded");
+
+        tauri::async_runtime::block_on(alice.shutdown()).unwrap();
+        let _ = std::fs::remove_dir_all(&alice_dir);
         tauri::async_runtime::block_on(core.runtime.shutdown()).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&empty);
