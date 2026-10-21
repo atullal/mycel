@@ -291,7 +291,7 @@ checks on every pull request and the Audit workflow runs them daily against
 new advisories. Vulnerabilities always fail; so do unmaintained and unsound
 crates, unless `deny.toml` accepts one by ID with the reason Mycel isn't
 exposed and a review date (`.cargo/audit.toml` mirrors the list for
-`cargo audit --deny unsound --deny unmaintained`). As of 2026-10-20 it
+`cargo audit --deny unsound --deny unmaintained`). As of 2026-10-21 it
 accepts, all on Linux or at build time only:
 
 - RUSTSEC-2024-0429, unsound `glib::VariantStrIter` in glib 0.18, which
@@ -305,6 +305,11 @@ accepts, all on Linux or at build time only:
 
 `zip` was moved to 9.0.5 for RUSTSEC-2026-0367/0368/0369 (extraction
 flaws; Mycel only writes archives, when it zips a shared folder).
+`rustls-webpki` was moved to 0.103.16 and `webpki-roots` and
+`webpki-root-certs` to 1.0.10 for RUSTSEC-2026-0382/0381/0383 (emSign
+intermediates whose private keys are public could anchor a TLS chain; these
+crates sit on the relay and HTTPS client paths through Iroh, reqwest and
+Tauri). Lockfile only, no vendored code changed.
 
 ## 9b. Hardening
 
