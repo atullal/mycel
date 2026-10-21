@@ -1,0 +1,50 @@
+# 20. Mass churn: an app update restarts everyone within an hour.
+number = 20
+name = "update-storm"
+title = "Mass churn: app update storm"
+proves = "Re-convergence; wire versioning"
+key_physics = ["everyone restarts within 1 h", "version skew v1/v2"]
+
+[size]
+people = 100000
+ci_people = 2000
+adoption = 0.1
+duration_min = 120
+ci_duration_min = 90
+
+[region]
+layout = "field"
+width_m = 3000
+height_m = 3000
+env = "outdoor"
+
+[mobility]
+model = "waypoint"
+share = 0.3
+
+[internet]
+share = 0.85
+access = "mixed"
+
+[os.restart_storm]
+at_min = 10
+within_min = 60
+downtime_s = 60
+
+[workload]
+per_device_hour = 3
+
+[objectives]
+delivery_min = 0.95
+latency_p95_max_s = 120
+
+[uq]
+parameters = ["range_mult", "adoption", "inet_share"]
+
+[swarm]
+toggles = ["churn", "dtn"]
+
+[[needs]]
+model = "mixed-versions"
+essential = true
+why = "during the storm v1 and v2 builds coexist; the restart storm alone stands in"

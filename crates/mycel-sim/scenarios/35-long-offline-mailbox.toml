@@ -1,0 +1,43 @@
+# 35. Long offline mailbox: some devices away for a long time.
+number = 35
+name = "long-offline-mailbox"
+title = "Long offline mailbox (weeks)"
+proves = "Lifetimes, mailbox drain"
+key_physics = ["offline 2–3 weeks"]
+
+[size]
+people = 1000
+ci_people = 400
+adoption = 0.5
+duration_min = 30240
+ci_duration_min = 720
+
+[region]
+layout = "field"
+width_m = 1000
+height_m = 1000
+env = "outdoor"
+
+[internet]
+share = 0.9
+access = "mixed"
+
+[os.away]
+share = 0.2
+at_min = 5
+hours = 8
+
+[workload]
+per_device_hour = 0.5
+drain_min = 60
+
+[objectives]
+delivery_min = 0.9
+latency_p95_max_s = 36000
+
+[uq]
+parameters = ["range_mult", "inet_share", "msg_rate"]
+
+[[needs]]
+model = "storage-full"
+why = "weeks of mail fill stores"

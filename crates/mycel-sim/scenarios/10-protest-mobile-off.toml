@@ -1,0 +1,54 @@
+# 10. Protest when only mobile data is shut down: home Wi-Fi at the edges.
+number = 10
+name = "protest-mobile-off"
+title = "Protest, mobile data only shut down"
+proves = "Gateway use at the edges"
+key_physics = ["home Wi-Fi gateways at the edges", "censorship profile"]
+
+[size]
+people = 50000
+ci_people = 3000
+adoption = 0.05
+duration_min = 180
+ci_duration_min = 60
+
+[region]
+layout = "field"
+width_m = 150
+height_m = 150
+env = "crowd"
+latlon = [41.01, 28.98]
+
+[mobility]
+model = "waypoint"
+share = 0.3
+speed_mps = 0.5
+pause_s = 300
+
+[internet]
+share = 0.6
+access = "mixed"
+abroad = 4
+[[internet.outages]]
+at_min = 10
+scope = "cellular"
+
+[workload]
+per_device_hour = 4
+dest = "abroad"
+
+[objectives]
+delivery_min = 0.9
+latency_p95_max_s = 60
+
+[uq]
+parameters = ["range_mult", "adoption", "inet_share", "max_neighbours"]
+
+[[needs]]
+model = "body-loss"
+essential = true
+why = "the crowd blocks paths to the gateways at the edges"
+
+[[needs]]
+model = "sinr-aggregate"
+why = "dense interference"

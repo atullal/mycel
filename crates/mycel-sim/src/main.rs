@@ -8,6 +8,13 @@
 //! CI judges it (`mycel_sim::seeds`), printing every failing seed; `ci`
 //! also replays the pinned regression seeds, and `gate.md` holds the
 //! verdicts alone.
+//!
+//! The declarative catalogue (`crates/mycel-sim/scenarios/*.toml`):
+//! `mycel-sim catalogue` lists it with each scenario's status and
+//! fidelity; `mycel-sim catalogue NAME... [--runs K] [--full]` runs
+//! scenarios (`all` for every runnable one; a path for a file of your
+//! own); `mycel-sim robust NAME [--points N] [--runs K] [--morris-r R]`
+//! studies a verdict over its uncertainty region (docs/SIMULATION.md §7).
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -24,7 +31,8 @@ struct Args {
     /// `list`, `merge`, `fit-latency`, or `export-trace` (write MYCEL_TRACE,
     /// or the synthetic trace, as the benchmarks' contacts CSV).
     what: String,
-    /// For `merge`: directories holding a `results.json` each.
+    /// For `merge`: directories holding a `results.json` each. For
+    /// `catalogue` and `robust`: scenario names (or `.toml` paths).
     dirs: Vec<PathBuf>,
     #[arg(long, default_value_t = 1)]
     seed: u64,
@@ -46,6 +54,18 @@ struct Args {
     /// (default 80%, rounded up).
     #[arg(long)]
     min_pass: Option<usize>,
+    /// Catalogue: run at full size instead of the scenario's CI size.
+    #[arg(long)]
+    full: bool,
+    /// Robust: space-filling points over the uncertainty region.
+    #[arg(long, default_value_t = 32)]
+    points: usize,
+    /// Robust: Morris trajectories (0: no screening).
+    #[arg(long, default_value_t = 8)]
+    morris_r: usize,
+    /// Robust: fresh seeds confirming the worst case found.
+    #[arg(long, default_value_t = 10)]
+    confirm: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -85,6 +105,12 @@ fn main() -> anyhow::Result<()> {
         std::fs::write(a.out.join("results.json"), serde_json::to_string_pretty(&results)?)?;
         eprintln!("merged {} scenarios into {}", results.len(), a.out.join("report.md").display());
         return Ok(());
+    }
+    if a.what == "catalogue" {
+        return catalogue(&a);
+    }
+    if a.what == "robust" {
+        return robust(&a);
     }
     if a.what == "list" {
         for s in &all {
@@ -231,5 +257,157 @@ fn replications(a: &Args, picked: &[(&scenarios::Scenario, f64)], candidate: Can
         failed.push("pinned regression seeds");
     }
     anyhow::ensure!(failed.is_empty(), "{} scenario(s) failed the gate: {}", failed.len(), failed.join(", "));
+    Ok(())
+}
+
+/// The catalogue's scenarios named on the command line (`all`: every one).
+fn catalogue_specs(a: &Args) -> anyhow::Result<Vec<mycel_sim::catalogue::Spec>> {
+    use mycel_sim::catalogue;
+    let mut out = Vec::new();
+    for d in &a.dirs {
+        let name = d.to_string_lossy();
+        if name == "all" {
+            out.extend(catalogue::all());
+        } else if name.ends_with(".toml") {
+            out.push(catalogue::load(d)?);
+        } else {
+            out.push(catalogue::find(&name).ok_or_else(|| anyhow::anyhow!("no catalogue scenario {name:?}"))?);
+        }
+    }
+    Ok(out)
+}
+
+/// `catalogue`: list, or run the named scenarios on `--runs` seeds.
+fn catalogue(a: &Args) -> anyhow::Result<()> {
+    use mycel_sim::catalogue::{self, Status, compose::Size, run};
+    if a.dirs.is_empty() {
+        println!("| # | Scenario | Status | Fidelity | Size (people × adoption) | Needs |\n|---|---|---|---|---|---|");
+        for s in catalogue::all() {
+            let f = s.fidelity();
+            let needs: Vec<String> = f
+                .missing
+                .iter()
+                .map(|m| format!("{}{} ({})", m.wanted, if m.essential { "*" } else { "" }, m.wp))
+                .collect();
+            println!(
+                "| {} | `{}` {} | {:?} | {} | {} × {} (CI {}) | {} |",
+                s.number,
+                s.name,
+                s.title,
+                s.status(),
+                f.short(),
+                s.size.people,
+                s.size.adoption,
+                s.size.ci_people,
+                needs.join(", ")
+            );
+        }
+        return Ok(());
+    }
+    let specs = catalogue_specs(a)?;
+    let seeds = mycel_sim::stats::run_seeds(a.seed, a.runs.max(1));
+    let mut results = Vec::new();
+    let mut verdicts = Vec::new();
+    let mut failed = Vec::new();
+    let mut md = format!("# Mycel scenario catalogue: {} seeds from base {}\n\n", seeds.len(), a.seed);
+    for s in &specs {
+        let size = if a.full { Size::full(s) } else { Size::ci(s) };
+        let label = if a.full { "full size" } else { "CI size" };
+        let m = a.min_pass.unwrap_or_else(|| mycel_sim::seeds::min_pass(seeds.len()).min(s.stats.min_pass));
+        let t = Instant::now();
+        let status = s.status();
+        if status == Status::Blocked {
+            let r = {
+                let mut r = run::result(s, size, label, seeds[0]);
+                r.finish();
+                r
+            };
+            eprintln!("▶ {} {}: {}", s.number, s.name, r.headline.join("; "));
+            md.push_str(&format!("### `{}`: blocked\n\n{}\n\n", s.name, r.headline.join("; ")));
+            results.push(r);
+            continue;
+        }
+        let (rs, v) = run::replicate(s, size, label, &seeds, m.min(seeds.len()));
+        let fid = s.fidelity();
+        eprintln!(
+            "▶ {} {} ({:?}, {}): {} in {:.0} s — {}",
+            s.number,
+            s.name,
+            status,
+            fid.short(),
+            if v.pass { "pass" } else { "FAIL" },
+            t.elapsed().as_secs_f64(),
+            rs[0].headline.join("; ")
+        );
+        md.push_str(&format!("{}*Status: {:?}; fidelity {}.*\n\n", v.markdown(), status, fid.short()));
+        // invariants always count; quality only where the result is a verdict
+        if !v.invariant_failures.is_empty() || (status == Status::Verdict && !v.pass) {
+            failed.push(s.name.clone());
+        }
+        results.extend(rs);
+        verdicts.push(v);
+    }
+    std::fs::create_dir_all(&a.out)?;
+    md.push_str(&markdown(&results));
+    std::fs::write(a.out.join("report.md"), md)?;
+    std::fs::write(a.out.join("results.json"), serde_json::to_string_pretty(&results)?)?;
+    std::fs::write(a.out.join("verdicts.json"), serde_json::to_string_pretty(&verdicts)?)?;
+    eprintln!("wrote {}", a.out.join("report.md").display());
+    anyhow::ensure!(failed.is_empty(), "{} scenario(s) failed: {}", failed.len(), failed.join(", "));
+    Ok(())
+}
+
+/// `robust NAME`: the verdict's robustness over its uncertainty region.
+fn robust(a: &Args) -> anyhow::Result<()> {
+    use mycel_sim::catalogue::{compose::Size, run::Study};
+    use mycel_sim::uq::{Plan, study};
+    let specs = catalogue_specs(a)?;
+    anyhow::ensure!(!specs.is_empty(), "name a catalogue scenario");
+    std::fs::create_dir_all(&a.out)?;
+    let mut md = String::from("# Mycel robustness studies\n\n");
+    let mut all = Vec::new();
+    for s in specs {
+        let size = if a.full { Size::full(&s) } else { Size::ci(&s) };
+        let st = Study::new(s, size)?;
+        let (threshold, higher_is_better) = st.threshold();
+        let plan = Plan {
+            points: a.points,
+            seeds: mycel_sim::stats::run_seeds(a.seed, a.runs.max(1)),
+            morris_r: a.morris_r,
+            threshold,
+            higher_is_better,
+            confirm_seeds: mycel_sim::stats::run_seeds(a.seed ^ 0x636f_6e66, a.confirm.max(1)),
+            sobol_n: 4096,
+            boots: 200,
+            seed: a.seed,
+        };
+        eprintln!(
+            "▶ robust {} at {} people: {} points × {} seeds, Morris r = {}",
+            st.spec.name,
+            size.people,
+            plan.points,
+            plan.seeds.len(),
+            plan.morris_r
+        );
+        let r = study(&st, &plan)?;
+        eprintln!(
+            "  {} in {:.0} s: {}; hinges on {}",
+            if r.robust { "robust" } else { "not robust" },
+            r.wall_s,
+            r.robust_pass_label(),
+            r.hinges_on().join(", ")
+        );
+        md.push_str(&format!(
+            "{}\nFidelity {} at {} people ({} min); the region's robustness is over today's ignorance, not a calibrated error bar.\n\n",
+            r.markdown(),
+            st.spec.fidelity().short(),
+            size.people,
+            size.duration / mycel_sim::tier2::MIN
+        ));
+        all.push(r);
+    }
+    std::fs::write(a.out.join("robustness.md"), &md)?;
+    std::fs::write(a.out.join("robustness.json"), serde_json::to_string_pretty(&all)?)?;
+    eprintln!("wrote {}", a.out.join("robustness.md").display());
     Ok(())
 }

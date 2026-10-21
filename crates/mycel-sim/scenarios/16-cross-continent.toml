@@ -1,0 +1,47 @@
+# 16. Cross-continent: phones in US and EU cities reaching each other.
+number = 16
+name = "cross-continent"
+title = "Cross-continent (US ↔ EU)"
+proves = "The us-eu scenario with realistic NAT and DHT"
+key_physics = ["WonderNetwork latency", "NAT and IPv6 profiles (libp2p and iroh brackets, then M8)", "DHT"]
+
+[size]
+people = 20000
+ci_people = 2000
+adoption = 0.1
+duration_min = 30
+ci_duration_min = 15
+
+[region]
+layout = "cities"
+cities = ["New York", "Chicago", "London", "Berlin"]
+width_m = 2000
+height_m = 2000
+env = "outdoor"
+
+[internet]
+access = "mixed"
+
+[workload]
+per_device_hour = 6
+dest = "far"
+
+[objectives]
+delivery_min = 0.99
+latency_p95_max_s = 5
+
+[uq]
+parameters = ["range_mult", "adoption", "nat_hard"]
+
+[[needs]]
+model = "dht-latency"
+essential = true
+why = "first contact across continents pays a DHT lookup: 1–20 s measured, 150 ms in the stand-in"
+
+[[needs]]
+model = "ipv6"
+why = "IPv6-capable pairs connect directly where IPv4 needs relays"
+
+[[needs]]
+model = "relay-outage"
+why = "relays fail and saturate"

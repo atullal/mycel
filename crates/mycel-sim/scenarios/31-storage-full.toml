@@ -1,0 +1,36 @@
+# 31. Storage-full devices.
+number = 31
+name = "storage-full"
+title = "Storage-full devices"
+proves = "Graceful refusal"
+key_physics = ["5% of devices at 0 bytes free"]
+
+[size]
+people = 20000
+ci_people = 2000
+adoption = 0.1
+duration_min = 60
+ci_duration_min = 30
+
+[region]
+layout = "field"
+width_m = 2000
+height_m = 2000
+env = "outdoor"
+
+[internet]
+share = 0.5
+access = "mixed"
+
+[workload]
+per_device_hour = 3
+
+[objectives]
+delivery_min = 0.9
+latency_p95_max_s = 600
+
+[[needs]]
+model = "storage-full"
+essential = true
+stand_in = false
+why = "the scenario is full storage: unlimited storage exercises nothing"

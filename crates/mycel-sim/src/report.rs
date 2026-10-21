@@ -4,6 +4,8 @@ use std::fmt::Write as _;
 
 use serde::{Deserialize, Serialize};
 
+use crate::fidelity::Fidelity;
+
 /// One objective: what was required and what happened.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Slo {
@@ -68,6 +70,12 @@ pub struct ScenarioResult {
     /// p99 only means something over thousands. Not written out.
     #[serde(skip)]
     pub optimality: Vec<f64>,
+    /// What the result can be trusted for: its fidelity level, the models
+    /// it ran without, the uncertainty region it covers
+    /// ([`crate::fidelity`]). [`ScenarioResult::finish`] fills in the
+    /// tier's default for scenarios that don't set one.
+    #[serde(default)]
+    pub fidelity: Option<Fidelity>,
 }
 
 impl ScenarioResult {
@@ -86,6 +94,7 @@ impl ScenarioResult {
             metrics: serde_json::Value::Null,
             wall_s: 0.0,
             optimality: Vec::new(),
+            fidelity: None,
         }
     }
 
@@ -146,6 +155,9 @@ impl ScenarioResult {
     /// scenario whatever is expected of it (a candidate that doesn't model
     /// one mustn't emit it as an invariant).
     pub fn finish(&mut self) {
+        if self.fidelity.is_none() {
+            self.fidelity = Some(Fidelity::tier_default(self.tier));
+        }
         if self.slos.iter().any(|s| s.invariant && !s.pass) {
             self.status = Status::Fail;
             return;
@@ -193,11 +205,22 @@ fn status_label(s: &Status) -> &'static str {
 pub fn markdown(results: &[ScenarioResult]) -> String {
     let mut s = String::new();
     let _ = writeln!(s, "# Mycel simulation results\n");
-    let _ = writeln!(s, "| Scenario | Tier | Status | Headline |\n|---|---|---|---|");
+    let _ = writeln!(
+        s,
+        "Fidelity: the lowest level among the models a result uses (L0 abstract … L4 field-replayed; docs/SIMULATION.md §7). A **bound** ran without a model its result depends on and is never a verdict.\n"
+    );
+    let _ = writeln!(
+        s,
+        "| Scenario | Tier | Status | Fidelity | Region | Robust pass | Headline |\n|---|---|---|---|---|---|---|"
+    );
     for r in results {
+        let (fid, region, robust) = match &r.fidelity {
+            Some(f) => (f.short(), f.region.clone(), f.robust_pass.clone().unwrap_or_else(|| "not studied".into())),
+            None => ("unlabelled".into(), String::new(), String::new()),
+        };
         let _ = writeln!(
             s,
-            "| `{}` {} | {} | {} | {} |",
+            "| `{}` {} | {} | {} | {fid} | {region} | {robust} | {} |",
             r.name,
             r.title,
             r.tier,
@@ -218,6 +241,21 @@ pub fn markdown(results: &[ScenarioResult]) -> String {
         );
         if let Some(why) = &r.expected_fail {
             let _ = writeln!(s, "> Expected to fail until: {why}\n");
+        }
+        if let Some(f) = &r.fidelity {
+            let models: Vec<String> = f.models.iter().map(|(_, m, l)| format!("{m} {l:?}")).collect();
+            let _ = writeln!(s, "Fidelity {}; models: {}.\n", f.short(), models.join(", "));
+            for m in &f.missing {
+                let _ = writeln!(
+                    s,
+                    "- without `{}` ({}, {}{}): {}\n",
+                    m.wanted,
+                    m.wp,
+                    if m.essential { "essential, " } else { "" },
+                    m.bias.label(),
+                    m.stand_in.as_deref().map_or("no stand-in".to_string(), |x| format!("stand-in `{x}`"))
+                );
+            }
         }
         let _ = writeln!(s, "| Objective | Target | Actual | |\n|---|---|---|---|");
         for o in &r.slos {

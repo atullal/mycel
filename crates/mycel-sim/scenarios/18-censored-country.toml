@@ -1,0 +1,40 @@
+# 18. Censored country: QUIC blocked by SNI, relays blocked, DHT throttled.
+number = 18
+name = "censored-country"
+title = "Censored country (GFW-like)"
+proves = "Fallbacks; time to reconnect"
+key_physics = ["QUIC SNI blocks (180 s)", "relays blocked", "DHT throttled"]
+
+[size]
+people = 100000
+ci_people = 2000
+adoption = 0.1
+duration_min = 60
+ci_duration_min = 30
+
+[region]
+layout = "cities"
+cities = ["Beijing", "Shanghai", "Tokyo"]
+width_m = 2000
+height_m = 2000
+env = "outdoor"
+
+[internet]
+access = "mixed"
+
+[workload]
+per_device_hour = 3
+dest = "far"
+
+[objectives]
+delivery_min = 0.9
+latency_p95_max_s = 300
+
+[uq]
+parameters = ["range_mult", "adoption"]
+
+[[needs]]
+model = "censorship-sni"
+essential = true
+stand_in = false
+why = "the scenario is the censor: without SNI blocking and relay blocking it is cross-continent again"

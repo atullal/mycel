@@ -1,0 +1,38 @@
+# 15. Long-haul flight: a cabin cluster for hours, catch-up on landing.
+number = 15
+name = "long-haul-flight"
+title = "Long-haul flight"
+proves = "Mesh in the cabin, catch-up on landing"
+key_physics = ["cabin cluster for 10 h", "optional GEO Wi-Fi 550–750 ms"]
+
+[size]
+people = 200
+ci_people = 200
+adoption = 0.3
+duration_min = 600
+ci_duration_min = 60
+
+[region]
+layout = "field"
+width_m = 60
+height_m = 6
+env = "indoor"
+
+[workload]
+per_device_hour = 4
+dest = "near"
+
+[objectives]
+delivery_min = 0.99
+latency_p95_max_s = 10
+
+[uq]
+parameters = ["range_mult", "adoption", "ble_only_share"]
+
+[[needs]]
+model = "geo-satellite"
+why = "in-flight GEO Wi-Fi at 550–750 ms, when bought"
+
+[[needs]]
+model = "body-loss"
+why = "seats and bodies in a metal tube"

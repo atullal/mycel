@@ -1,0 +1,39 @@
+# 34. Android OEM mix: killer profiles by market share.
+number = 34
+name = "android-oem-mix"
+title = "Android OEM mix"
+proves = "Real Android reachability"
+key_physics = ["killer profiles by market share"]
+
+[size]
+people = 50000
+ci_people = 2000
+adoption = 0.1
+duration_min = 60
+ci_duration_min = 30
+
+[region]
+layout = "field"
+width_m = 2000
+height_m = 2000
+env = "outdoor"
+
+[devices]
+ios_share = 0.15
+
+[internet]
+share = 0.8
+access = "mixed"
+
+[workload]
+per_device_hour = 3
+
+[objectives]
+delivery_min = 0.95
+latency_p95_max_s = 60
+
+[[needs]]
+model = "android-doze"
+essential = true
+stand_in = false
+why = "the scenario is OEM killers and Doze: always-on phones exercise nothing"

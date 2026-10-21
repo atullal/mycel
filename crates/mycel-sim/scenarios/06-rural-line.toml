@@ -1,0 +1,38 @@
+# 6. A line of houses along a road, one with internet: Wi-Fi Direct hops.
+number = 6
+name = "rural-line"
+title = "Rural line of houses"
+proves = "The tier-1 rural-line scenario with link setup"
+key_physics = ["Wi-Fi Direct group formation delays"]
+
+[size]
+people = 30
+ci_people = 30
+adoption = 1.0
+duration_min = 30
+ci_duration_min = 15
+
+[region]
+layout = "line"
+width_m = 1500
+height_m = 10
+env = "outdoor"
+
+[internet]
+gateways = 1
+access = "home"
+
+[workload]
+per_device_hour = 20
+
+[objectives]
+delivery_min = 0.99
+latency_p95_max_s = 5
+
+[uq]
+parameters = ["range_mult", "ble_only_share"]
+
+[[needs]]
+model = "wifi-direct-formation"
+essential = true
+why = "every new Wi-Fi Direct hop pays 4–17 s of discovery and 1.5–2.5 s of group formation"

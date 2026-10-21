@@ -1,0 +1,37 @@
+# 24. Eclipse a VIP's records in the DHT.
+number = 24
+name = "eclipse-vip"
+title = "Eclipse a VIP's records"
+proves = "Reachability under eclipse"
+key_physics = ["DhtEclipse", "pkarr relay fallback"]
+
+[size]
+people = 100000
+ci_people = 2000
+adoption = 0.1
+duration_min = 30
+ci_duration_min = 15
+
+[region]
+layout = "cities"
+cities = ["London", "Paris", "Madrid"]
+width_m = 2000
+height_m = 2000
+env = "outdoor"
+
+[internet]
+access = "mixed"
+
+[workload]
+per_device_hour = 3
+dest = "far"
+
+[objectives]
+delivery_min = 0.95
+latency_p95_max_s = 30
+
+[[needs]]
+model = "dht-eclipse"
+essential = true
+stand_in = false
+why = "the scenario is the eclipse; the directory poisoner attacks a different lookup"

@@ -1,0 +1,58 @@
+# 26. Refugee camp: low adoption, old phones, solar charging, few gateways.
+number = 26
+name = "refugee-camp"
+title = "Refugee camp"
+proves = "Equity of delivery"
+key_physics = ["low adoption", "shared phones", "solar charging"]
+
+[size]
+people = 100000
+ci_people = 2000
+adoption = 0.1
+duration_min = 360
+ci_duration_min = 180
+
+[region]
+layout = "clusters"
+width_m = 2000
+height_m = 2000
+env = "outdoor"
+clusters = 20
+cluster_radius_m = 80
+latlon = [3.73, 34.85]
+
+[devices]
+ble_only_share = 0.3
+
+[mobility]
+model = "mules"
+share = 0.1
+speed_mps = 1.2
+pause_s = 900
+
+[internet]
+gateways = 3
+access = "satellite"
+
+[os]
+battery_median_h = 20
+
+[workload]
+per_device_hour = 1
+dest = "far"
+drain_min = 30
+
+[objectives]
+delivery_min = 0.7
+latency_p95_max_s = 14400
+
+[uq]
+parameters = ["range_mult", "adoption", "mule_share", "ble_only_share", "inet_share"]
+
+[[needs]]
+model = "social"
+why = "phones are shared, so identities and devices differ"
+
+[[needs]]
+model = "energy"
+why = "solar charging makes uptime diurnal"

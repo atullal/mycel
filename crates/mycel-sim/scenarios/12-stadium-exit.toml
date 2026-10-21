@@ -1,0 +1,49 @@
+# 12. Stadium exit: everyone leaves at once, contacts are brief.
+number = 12
+name = "stadium-exit"
+title = "Stadium exit"
+proves = "Discovery and setup latency vs contact time"
+key_physics = ["crowd flow 2–3 people/m²", "brief contacts", "aggregate interference"]
+
+[size]
+people = 40000
+ci_people = 3000
+adoption = 0.05
+duration_min = 30
+ci_duration_min = 20
+
+[region]
+layout = "field"
+width_m = 200
+height_m = 200
+env = "crowd"
+
+[mobility]
+model = "waypoint"
+share = 1.0
+speed_mps = 1.0
+pause_s = 30
+
+[internet]
+share = 0.5
+access = "cellular"
+
+[workload]
+per_device_hour = 6
+
+[objectives]
+delivery_min = 0.9
+latency_p95_max_s = 60
+
+[uq]
+parameters = ["range_mult", "adoption", "walk_speed", "pause_s"]
+
+[[needs]]
+model = "crowd-flow"
+essential = true
+why = "a stadium empties as a directed flow, not random walks"
+
+[[needs]]
+model = "ble-discovery"
+essential = true
+why = "contacts last seconds: discovery and setup decide whether a hop happens"

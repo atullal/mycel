@@ -1,0 +1,36 @@
+# 30. Clock-skewed population.
+number = 30
+name = "clock-skew"
+title = "Clock-skewed population"
+proves = "Seqno window, lifetimes"
+key_physics = ["offsets from MyShake data plus hour-level outliers"]
+
+[size]
+people = 20000
+ci_people = 2000
+adoption = 0.1
+duration_min = 60
+ci_duration_min = 30
+
+[region]
+layout = "field"
+width_m = 2000
+height_m = 2000
+env = "outdoor"
+
+[internet]
+share = 0.8
+access = "mixed"
+
+[workload]
+per_device_hour = 3
+
+[objectives]
+delivery_min = 0.95
+latency_p95_max_s = 60
+
+[[needs]]
+model = "clock-skew"
+essential = true
+stand_in = false
+why = "the scenario is skewed clocks: one shared clock exercises nothing"

@@ -1,0 +1,51 @@
+# 14. Subway line: cars without cellular, Wi-Fi at stations.
+number = 14
+name = "subway"
+title = "Subway line"
+proves = "DTN at stations; handover gaps"
+key_physics = ["tunnels without cellular", "car clusters", "station Wi-Fi"]
+
+[size]
+people = 20000
+ci_people = 2000
+adoption = 0.1
+duration_min = 60
+ci_duration_min = 60
+
+[region]
+layout = "clusters"
+width_m = 2000
+height_m = 50
+env = "indoor"
+clusters = 10
+cluster_radius_m = 10
+
+[mobility]
+model = "mules"
+share = 0.05
+speed_mps = 1.0
+pause_s = 300
+
+[internet]
+gateways = 2
+access = "home"
+
+[workload]
+per_device_hour = 2
+drain_min = 15
+
+[objectives]
+delivery_min = 0.8
+latency_p95_max_s = 1800
+
+[uq]
+parameters = ["range_mult", "adoption", "mule_share", "inet_share"]
+
+[[needs]]
+model = "transit"
+essential = true
+why = "cars move together and meet station Wi-Fi in turn; static clusters stand in"
+
+[[needs]]
+model = "handover"
+why = "phones lose and regain cellular between stations"

@@ -1,0 +1,52 @@
+# 8. Flood or hurricane: people in shelters, a few moving between them.
+number = 8
+name = "flood-evacuation"
+title = "Flood or hurricane evacuation"
+proves = "DTN across shelters"
+key_physics = ["map-constrained flows", "shelters as clusters"]
+
+[size]
+people = 200000
+ci_people = 2000
+adoption = 0.1
+duration_min = 1440
+ci_duration_min = 240
+
+[region]
+layout = "clusters"
+width_m = 5000
+height_m = 5000
+env = "indoor"
+clusters = 10
+cluster_radius_m = 60
+latlon = [29.95, -90.07]
+
+[mobility]
+model = "mules"
+share = 0.05
+speed_mps = 1.0
+pause_s = 900
+
+[internet]
+gateways = 2
+access = "satellite"
+
+[os]
+battery_median_h = 12
+
+[workload]
+per_device_hour = 0.5
+dest = "far"
+drain_min = 30
+
+[objectives]
+delivery_min = 0.7
+latency_p95_max_s = 14400
+
+[uq]
+parameters = ["range_mult", "mule_share", "pause_s", "battery_median_h"]
+
+[[needs]]
+model = "map-flows"
+essential = true
+why = "movement between shelters follows roads and evacuation routes"

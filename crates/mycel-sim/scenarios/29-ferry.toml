@@ -1,0 +1,45 @@
+# 29. Ferry or ship: isolated for hours behind one satellite gateway.
+number = 29
+name = "ferry"
+title = "Ferry or ship"
+proves = "Mailbox and catch-up"
+key_physics = ["isolated for hours", "satellite gateway"]
+
+[size]
+people = 500
+ci_people = 500
+adoption = 0.3
+duration_min = 360
+ci_duration_min = 60
+
+[region]
+layout = "field"
+width_m = 100
+height_m = 20
+env = "indoor"
+
+[mobility]
+model = "waypoint"
+share = 0.3
+speed_mps = 1.0
+pause_s = 600
+
+[internet]
+gateways = 1
+access = "satellite"
+abroad = 4
+
+[workload]
+per_device_hour = 2
+dest = "abroad"
+
+[objectives]
+delivery_min = 0.95
+latency_p95_max_s = 600
+
+[uq]
+parameters = ["range_mult", "adoption", "walk_speed"]
+
+[[needs]]
+model = "geo-satellite"
+why = "maritime VSAT latency"

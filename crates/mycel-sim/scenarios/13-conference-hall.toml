@@ -1,0 +1,52 @@
+# 13. Conference hall: dense indoor, AWDL and BLE, venue Wi-Fi.
+number = 13
+name = "conference-hall"
+title = "Conference hall"
+proves = "The tier-1 conference scenario at scale"
+key_physics = ["dense indoor", "AWDL + BLE", "Wi-Fi Aware"]
+
+[size]
+people = 1000
+ci_people = 1000
+adoption = 0.2
+duration_min = 60
+ci_duration_min = 20
+
+[region]
+layout = "field"
+width_m = 60
+height_m = 40
+env = "indoor"
+
+[mobility]
+model = "waypoint"
+share = 0.2
+speed_mps = 1.0
+pause_s = 600
+
+[internet]
+share = 0.5
+access = "home"
+
+[workload]
+per_device_hour = 6
+
+[objectives]
+delivery_min = 0.99
+latency_p95_max_s = 2
+
+[uq]
+parameters = ["range_mult", "adoption", "max_neighbours", "ios_share"]
+
+[[needs]]
+model = "sinr-aggregate"
+essential = true
+why = "200 radios in a hall interfere"
+
+[[needs]]
+model = "awdl-windows"
+why = "AWDL availability windows add latency spikes"
+
+[[needs]]
+model = "wifi-contention"
+why = "venue Wi-Fi is contended"

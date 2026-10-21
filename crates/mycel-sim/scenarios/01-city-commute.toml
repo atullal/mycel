@@ -1,0 +1,67 @@
+# 1. City commute day: phones in pockets on streets, in transit and at home.
+number = 1
+name = "city-commute"
+title = "City commute day (24 h)"
+proves = "Day-long delivery and energy with phones in pockets"
+key_physics = ["SLAW + SUMO transit", "LTE/5G handovers", "diurnal OS states", "Doze"]
+
+[size]
+people = 100000
+ci_people = 2000
+adoption = 0.1
+duration_min = 1440
+ci_duration_min = 60
+
+[region]
+layout = "field"
+width_m = 5000
+height_m = 5000
+env = "outdoor"
+latlon = [52.52, 13.40]
+
+[mobility]
+model = "waypoint"
+share = 0.5
+speed_mps = 1.2
+pause_s = 300
+
+[internet]
+share = 0.85
+access = "mixed"
+
+[workload]
+per_device_hour = 2
+dest = "any"
+
+[objectives]
+delivery_min = 0.95
+latency_p95_max_s = 60
+
+[uq]
+parameters = ["range_mult", "adoption", "inet_share", "walk_speed"]
+
+[swarm]
+toggles = ["fisheye", "flood-reduction", "dtn"]
+
+[[needs]]
+model = "transit"
+essential = true
+why = "commuters move in vehicles and trains, in groups, on fixed lines"
+
+[[needs]]
+model = "ios-lifecycle"
+essential = true
+why = "an iPhone in a pocket is suspended most of the day"
+
+[[needs]]
+model = "android-doze"
+essential = true
+why = "an idle Android phone dozes and its app may be killed"
+
+[[needs]]
+model = "handover"
+why = "LTE handovers interrupt internet paths for tens of ms"
+
+[[needs]]
+model = "energy"
+why = "the day's traffic drains batteries"

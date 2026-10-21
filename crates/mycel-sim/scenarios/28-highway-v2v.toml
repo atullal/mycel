@@ -1,0 +1,56 @@
+# 28. Highway: phones in cars at 30 m/s, contacts of seconds.
+number = 28
+name = "highway-v2v"
+title = "Highway V2V"
+proves = "Discovery-limited contacts"
+key_physics = ["30 m/s", "contacts of seconds", "high Doppler"]
+
+[size]
+people = 20000
+ci_people = 2000
+adoption = 0.1
+duration_min = 30
+ci_duration_min = 15
+
+[region]
+layout = "line"
+width_m = 20000
+height_m = 20
+env = "outdoor"
+
+[mobility]
+model = "waypoint"
+share = 1.0
+speed_mps = 30
+pause_s = 30
+
+[internet]
+share = 0.8
+access = "cellular"
+
+[workload]
+per_device_hour = 6
+dest = "near"
+
+[objectives]
+delivery_min = 0.9
+latency_p95_max_s = 10
+
+[uq]
+parameters = ["range_mult", "adoption", "walk_speed"]
+[uq.bounds]
+walk_speed = [20.0, 35.0]
+
+[[needs]]
+model = "ble-discovery"
+essential = true
+why = "at 30 m/s a 60 m BLE range is 4 s of contact, shorter than background discovery"
+
+[[needs]]
+model = "wifi-direct-formation"
+essential = true
+why = "group formation takes longer than the contact"
+
+[[needs]]
+model = "tdl-fading"
+why = "Doppler at highway speed"

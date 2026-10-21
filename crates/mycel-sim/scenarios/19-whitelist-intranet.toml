@@ -1,0 +1,37 @@
+# 19. Whitelist national intranet: only domestic paths, a few gateways out.
+number = 19
+name = "whitelist-intranet"
+title = "Whitelist national intranet"
+proves = "Domestic mesh plus a few external gateways"
+key_physics = ["only domestic paths"]
+
+[size]
+people = 100000
+ci_people = 2000
+adoption = 0.1
+duration_min = 60
+ci_duration_min = 30
+
+[region]
+layout = "cities"
+cities = ["Istanbul", "Cairo", "Berlin"]
+width_m = 2000
+height_m = 2000
+env = "outdoor"
+
+[internet]
+access = "mixed"
+
+[workload]
+per_device_hour = 3
+dest = "far"
+
+[objectives]
+delivery_min = 0.8
+latency_p95_max_s = 600
+
+[[needs]]
+model = "whitelist"
+essential = true
+stand_in = false
+why = "the scenario is the whitelist: without it every path is open"

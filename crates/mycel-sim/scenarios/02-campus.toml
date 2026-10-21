@@ -1,0 +1,48 @@
+# 2. University campus: replay real proximity, the validation scenario.
+number = 2
+name = "campus"
+title = "University campus (Copenhagen trace)"
+proves = "Validation against real contact data (L2 to L4)"
+key_physics = ["real RSSI proximity", "indoor PHY"]
+
+[size]
+people = 700
+ci_people = 60
+adoption = 1.0
+duration_min = 4320
+ci_duration_min = 360
+
+[region]
+layout = "trace"
+trace = "synthetic"
+width_m = 1000
+height_m = 1000
+env = "indoor"
+latlon = [55.79, 12.52]
+
+[internet]
+share = 0.1
+access = "home"
+
+[workload]
+per_device_hour = 1
+drain_min = 60
+
+[objectives]
+delivery_min = 0.8
+latency_p95_max_s = 7200
+
+[uq]
+parameters = ["inet_share", "msg_rate"]
+
+[swarm]
+toggles = ["dtn"]
+
+[[needs]]
+model = "copenhagen-trace"
+essential = true
+why = "the point is replaying the Copenhagen Networks Study's real BLE proximity (set MYCEL_TRACE and trace = \"env\"); the synthetic Pareto trace stands in"
+
+[[needs]]
+model = "wall-loss"
+why = "indoor links across walls"

@@ -1,0 +1,47 @@
+# 3. Office building: enterprise network that blocks UDP, LAN and BLE inside.
+number = 3
+name = "office"
+title = "Office building"
+proves = "Relay-only internet; LAN + BLE"
+key_physics = ["walls", "Wi-Fi AP Bianchi contention", "UDP-blocked enterprise network"]
+
+[size]
+people = 300
+ci_people = 300
+adoption = 0.5
+duration_min = 60
+ci_duration_min = 20
+
+[region]
+layout = "field"
+width_m = 60
+height_m = 40
+env = "indoor"
+
+[internet]
+share = 1.0
+access = "home"
+
+[workload]
+per_device_hour = 4
+
+[objectives]
+delivery_min = 0.99
+latency_p95_max_s = 2
+
+[uq]
+parameters = ["range_mult", "adoption", "max_neighbours"]
+
+[[needs]]
+model = "udp-blocked"
+essential = true
+why = "enterprise firewalls block UDP: QUIC-only devices are relay-only"
+
+[[needs]]
+model = "wall-loss"
+essential = true
+why = "walls and floors cut BLE links"
+
+[[needs]]
+model = "wifi-contention"
+why = "a busy AP shares airtime"

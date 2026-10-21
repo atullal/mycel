@@ -1,0 +1,68 @@
+# 23. Adversary sweep: every role the simulator has, at several shares.
+number = 23
+name = "adversary-sweep"
+title = "Adversary sweep"
+proves = "Defence envelopes"
+key_physics = ["all adversary roles × fractions × placements"]
+
+[size]
+people = 3000
+ci_people = 1500
+adoption = 0.1
+duration_min = 10
+ci_duration_min = 6
+
+[region]
+layout = "field"
+width_m = 520
+height_m = 520
+env = "outdoor"
+
+[internet]
+share = 0.05
+access = "cellular"
+
+[[adversaries]]
+role = "liar"
+share = 0.02
+
+[[adversaries]]
+role = "greyhole"
+share = 0.01
+
+[[adversaries]]
+role = "dropper"
+share = 0.01
+
+[[adversaries]]
+role = "storm"
+share = 0.005
+
+[[adversaries]]
+role = "replayer"
+share = 0.005
+
+[workload]
+per_device_hour = 60
+start_min = 0.5
+drain_min = 1.5
+
+[objectives]
+delivery_min = 0.85
+latency_p95_max_s = 30
+
+[uq]
+parameters = ["adversary_share", "range_mult", "adoption"]
+[uq.bounds]
+adversary_share = [0.0, 0.15]
+
+[swarm]
+toggles = ["fisheye", "flood-reduction", "dtn", "adversaries"]
+
+[[needs]]
+model = "wormhole"
+why = "colluding pairs are a role the sweep lacks"
+
+[[needs]]
+model = "radio-sybil"
+why = "one radio, many identities"

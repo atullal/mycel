@@ -15,6 +15,8 @@
 //! service-level objectives; `cargo run -p mycel-sim -- all` runs them and
 //! writes a report. See docs/SIMULATION.md.
 
+pub mod catalogue;
+pub mod fidelity;
 pub mod latency;
 pub mod models;
 pub mod report;
@@ -24,3 +26,4 @@ pub mod stats;
 pub mod tier1;
 pub mod tier2;
 pub mod traces;
+pub mod uq;

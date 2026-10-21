@@ -1,0 +1,67 @@
+# 11. Multi-day festival: a dense crowd, cells saturate, batteries matter.
+number = 11
+name = "festival"
+title = "Festival (multi-day)"
+proves = "Load fairness; BLE in extreme density"
+key_physics = ["crowd density", "aggregate interference", "cell capacity collapse", "Paléo-like movement", "battery"]
+
+[size]
+people = 100000
+ci_people = 3000
+adoption = 0.05
+duration_min = 360
+ci_duration_min = 60
+
+[region]
+layout = "field"
+width_m = 400
+height_m = 400
+env = "crowd"
+latlon = [46.38, 6.24]
+
+[mobility]
+model = "waypoint"
+share = 0.6
+speed_mps = 0.8
+pause_s = 600
+
+[internet]
+share = 0.7
+access = "cellular"
+
+[os]
+battery_median_h = 14
+
+[workload]
+per_device_hour = 3
+
+[objectives]
+delivery_min = 0.95
+latency_p95_max_s = 30
+control_max_bps = 4000
+
+[uq]
+parameters = ["range_mult", "adoption", "max_neighbours", "walk_speed", "inet_share", "msg_rate"]
+[uq.bounds]
+walk_speed = [0.3, 1.4]
+
+[swarm]
+toggles = ["fisheye", "flood-reduction", "dtn"]
+
+[[needs]]
+model = "sinr-aggregate"
+essential = true
+why = "aggregate interference from thousands of BLE radios"
+
+[[needs]]
+model = "cell-capacity"
+essential = true
+why = "cells collapse under festival load, so gateways are scarcer than their count"
+
+[[needs]]
+model = "crowd-flow"
+why = "movement between stages, in waves"
+
+[[needs]]
+model = "energy"
+why = "multi-day battery"

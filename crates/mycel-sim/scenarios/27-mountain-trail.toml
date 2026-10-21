@@ -1,0 +1,49 @@
+# 27. Mountain trail: very sparse, hikers carry messages.
+number = 27
+name = "mountain-trail"
+title = "Mountain trail"
+proves = "Long-delay DTN"
+key_physics = ["very sparse", "hiker mules"]
+
+[size]
+people = 200
+ci_people = 200
+adoption = 0.5
+duration_min = 720
+ci_duration_min = 240
+
+[region]
+layout = "line"
+width_m = 20000
+height_m = 20
+env = "outdoor"
+
+[mobility]
+model = "waypoint"
+share = 0.5
+speed_mps = 1.0
+pause_s = 1800
+
+[internet]
+gateways = 1
+access = "cellular"
+
+[workload]
+per_device_hour = 0.5
+drain_min = 60
+
+[objectives]
+delivery_min = 0.5
+latency_p95_max_s = 14400
+
+[uq]
+parameters = ["range_mult", "adoption", "walk_speed", "pause_s"]
+
+[[needs]]
+model = "shadowing"
+essential = true
+why = "ridges and trees cut links along the trail"
+
+[[needs]]
+model = "slaw"
+why = "hikers walk the trail, not random waypoints"

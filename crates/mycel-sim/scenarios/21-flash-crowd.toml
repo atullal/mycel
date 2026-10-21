@@ -1,0 +1,40 @@
+# 21. Flash crowd onboarding: everyone starts cold at once.
+number = 21
+name = "flash-crowd"
+title = "Flash crowd onboarding"
+proves = "DHT load; first-contact latency"
+key_physics = ["cold start", "DHT publish burst"]
+
+[size]
+people = 100000
+ci_people = 2000
+adoption = 0.1
+duration_min = 30
+ci_duration_min = 15
+
+[region]
+layout = "field"
+width_m = 3000
+height_m = 3000
+env = "outdoor"
+
+[internet]
+share = 0.85
+access = "mixed"
+
+[workload]
+per_device_hour = 6
+start_min = 0.5
+dest = "far"
+
+[objectives]
+delivery_min = 0.95
+latency_p95_max_s = 30
+
+[uq]
+parameters = ["range_mult", "adoption", "nat_hard"]
+
+[[needs]]
+model = "dht-latency"
+essential = true
+why = "10k devices publishing at once load the DHT; the stand-in answers every lookup in 150 ms"

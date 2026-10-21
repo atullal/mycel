@@ -1,0 +1,38 @@
+# 17. Sparse-internet continent: low adoption, slow access, far relays.
+number = 17
+name = "sparse-internet"
+title = "Sparse-internet continent (Lagos ↔ Mumbai)"
+proves = "Gateway scarcity"
+key_physics = ["35–55% internet adoption", "2G/3G access", "relay distance"]
+
+[size]
+people = 50000
+ci_people = 2000
+adoption = 0.1
+duration_min = 60
+ci_duration_min = 30
+
+[region]
+layout = "cities"
+cities = ["Lagos", "Mumbai"]
+width_m = 2000
+height_m = 2000
+env = "outdoor"
+
+[internet]
+access = "satellite"
+
+[workload]
+per_device_hour = 3
+dest = "far"
+
+[objectives]
+delivery_min = 0.9
+latency_p95_max_s = 30
+
+[uq]
+parameters = ["range_mult", "adoption", "nat_hard"]
+
+[[needs]]
+model = "dht-latency"
+why = "slow access makes lookups slower still"

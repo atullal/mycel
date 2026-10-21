@@ -1,0 +1,42 @@
+# 4. Apartment block: home broadband, walls between flats, evening use.
+number = 4
+name = "apartment-block"
+title = "Apartment block"
+proves = "The tier-1 apartment-80211s scenario at higher fidelity, at block scale"
+key_physics = ["802.11s", "walls", "evening diurnal use"]
+
+[size]
+people = 200
+ci_people = 200
+adoption = 0.5
+duration_min = 120
+ci_duration_min = 20
+
+[region]
+layout = "field"
+width_m = 40
+height_m = 30
+env = "indoor"
+
+[internet]
+share = 0.8
+access = "home"
+
+[workload]
+per_device_hour = 4
+
+[objectives]
+delivery_min = 0.99
+latency_p95_max_s = 2
+
+[uq]
+parameters = ["range_mult", "adoption", "inet_share"]
+
+[[needs]]
+model = "wall-loss"
+essential = true
+why = "flats are separated by walls and floors (the block is flattened to one plane)"
+
+[[needs]]
+model = "social"
+why = "evening use is diurnal and bursty"

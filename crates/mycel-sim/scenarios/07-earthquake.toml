@@ -1,0 +1,65 @@
+# 7. Earthquake: towers down, power out, people in camps, responders walking.
+number = 7
+name = "earthquake"
+title = "Earthquake (cell towers down, power out)"
+proves = "Delivery before batteries die; mule value"
+key_physics = ["Aschenbruck disaster mobility", "battery depletion", "responders as mules"]
+
+[size]
+people = 50000
+ci_people = 1500
+adoption = 0.1
+duration_min = 720
+ci_duration_min = 180
+
+[region]
+layout = "clusters"
+width_m = 3000
+height_m = 3000
+env = "outdoor"
+clusters = 8
+cluster_radius_m = 50
+latlon = [18.54, -72.34]
+
+[mobility]
+model = "mules"
+share = 0.08
+speed_mps = 1.4
+pause_s = 300
+
+[internet]
+gateways = 1
+access = "satellite"
+
+[os]
+battery_median_h = 10
+battery_sigma = 0.5
+
+[workload]
+per_device_hour = 1
+dest = "far"
+drain_min = 30
+
+[objectives]
+delivery_min = 0.8
+latency_p95_max_s = 10800
+
+[uq]
+parameters = ["range_mult", "adoption", "mule_share", "walk_speed", "pause_s", "battery_median_h"]
+
+[swarm]
+toggles = ["dtn", "battery"]
+
+[[needs]]
+model = "map-flows"
+essential = true
+why = "rescuers and survivors move between camps on roads (Aschenbruck et al.'s disaster area model), not random waypoints"
+
+[[needs]]
+model = "ble-discovery"
+essential = true
+why = "a mule passing a camp has seconds of contact, and discovery takes up to 5 s in the background"
+
+[[needs]]
+model = "energy"
+why = "batteries drain with use; the stand-in draws deaths independent of traffic"

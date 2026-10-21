@@ -1,0 +1,49 @@
+# 32. Low-battery cascade: phones drop out as the mesh runs.
+number = 32
+name = "low-battery-cascade"
+title = "Low-battery cascade"
+proves = "Mesh as phones drop out"
+key_physics = ["batteries at 20–40%", "power saving"]
+
+[size]
+people = 50000
+ci_people = 2000
+adoption = 0.1
+duration_min = 360
+ci_duration_min = 180
+
+[region]
+layout = "field"
+width_m = 1500
+height_m = 1500
+env = "outdoor"
+
+[mobility]
+model = "waypoint"
+share = 0.3
+
+[internet]
+share = 0.3
+access = "cellular"
+
+[os]
+battery_median_h = 3
+battery_sigma = 0.4
+
+[workload]
+per_device_hour = 1
+drain_min = 30
+
+[objectives]
+delivery_min = 0.8
+latency_p95_max_s = 3600
+
+[uq]
+parameters = ["range_mult", "adoption", "battery_median_h", "inet_share"]
+[uq.bounds]
+battery_median_h = [1.0, 6.0]
+
+[[needs]]
+model = "energy"
+essential = true
+why = "relays drain fastest: deaths follow traffic, which the stand-in ignores"
