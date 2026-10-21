@@ -105,7 +105,13 @@ Ops whose parents are unknown are **pending** and are not evaluated until the pa
 
 **Pending caps.** Pending ops are held in memory before anyone can tell whether they are authorized, so the pool is bounded: at most `MAX_PENDING` (4,096) in total and `MAX_PENDING_PER_AUTHOR` (256) per author. The per-author cap stops one member (or one stolen key) from filling the shared pool and starving everyone else's out-of-order ops; ops whose parents are all known bypass the pool entirely, so a full pool never blocks a ready admin op such as a revocation. An op refused by a full pool is not lost: it is offered again by the next sync. To keep honest syncs inside these caps, peers send ops in resolution order (`op_ids()`/`all_ops()`: topological, then pending ops by id), so a receiver normally admits every op directly; a new member receives a single admin's 10,000-op history in one exchange.
 
-**Cost.** Resolution keeps a running state while history is linear (each op's past contains every valid op before it), so a long run of one admin's ops resolves in linear time; only ops concurrent with others replay their own past.
+**Cost.** Peers resolve incrementally (`crates/mycel-trust/src/resolve.rs`) and get exactly the result of the steps above. The from-scratch implementation of those steps is kept as `oracle::resolve_full`, and differential tests require identical results (order, validity, heads, winners, state, `state_at`, ancestry) after every insert of random concurrent histories (§9).
+
+- **Ancestry** comes from a chain cover index (`reach.rs`), the approach Synapse uses for Matrix auth chains, instead of an n × n ancestor bitset. A linear op costs O(1); a merge stores one sparse vector of the other chains it reaches. Side branches that get merged stop costing anything once merged, and ops nobody builds on (the losers of a revocation storm) never take a chain position. Memory is O(n · k) in the worst case for `k` chains that stay open and partly reached, not O(n²).
+- **Fast path.** An op that descends from the current valid heads and conflicts with nothing is checked against the running state of each round and applied in place: O(op), plus, for a reader `Add`, one recipient insert per epoch the member lacks (§6).
+- **Concurrency** re-resolves only a **region**: the ops that arrived after the newest cut the new op can be resolved against. A cut is the valid heads after an earlier update; it qualifies when the new op descends from it and nothing before it can change (no older op outside it that is valid or could win is concurrent with the new op, and seniority does not move for anyone with older revocations). This is the conflicted-subgraph idea of Matrix state resolution v2.1. Cuts thin out geometrically (O(log n) kept), so an op whose parents arrived `lag` ops ago re-resolves fewer than about `2 · lag`. Everything is re-resolved (a full recompute) when a new op moves the seniority of a member with older revocations, when one update ranks a member and also carries their revocation of someone whose older conflicting op is still in play, and when a new op's parents are older than every cut kept. The last costs O(n) and any key ever named can trigger it with one cheap invalid op (§10).
+- **Rounds** of the winners loop (step 6) are all kept, because the loop is path dependent, but they share storage: each op's flags are stored as runs over the rounds and rounds whose valid ops agree share one state. A removed member's k concurrent `Leave`s make k + 1 rounds (each wins one round, then fails); later inserts still cost what they did before.
+- **Measured** (one insert at a time, Apple M5 Pro, `cargo bench -p mycel-trust --features oracle --bench resolve --profile replay`): insert cost stays flat from 1,000 to 100,000 ops, 27–28 µs for one admin's linear history and 38–45 µs in a revocation storm, of which 24–33 µs is the signature check; memory is linear, about 1.1–1.5 KiB per op. Before, every insert ran the from-scratch resolution: 80 ms at 10,000 linear ops and 9.1 s at 100,000 (with a 1.2 GB bitset), and 588 s in a 10,000-op storm. Details, and the adversarial cases of §10, in [BENCHMARKS.md §7](BENCHMARKS.md#7-membership-resolution-mycel-trust).
 
 ## 6. Epochs and encryption keys
 
@@ -331,7 +337,7 @@ operator, so its trust is fixed here before any code:
 | Spec section | Code | What the tests cover |
 |---|---|---|
 | §2 primitives | `crates/mycel-crypto` | Domain separation, framing, kex binding, lockbox info binding, AEAD tamper; the streaming attachment AEAD (§7b): chunk boundaries, tamper, truncation, extension, reorder, duplication, chunk-size change, legacy detection, incremental digest |
-| §3–§6 graph, resolution, epochs | `crates/mycel-trust` (`resolve.rs` = §5) | Forged admin ops, pending ops, removal and rotation, concurrent revocation, mutual removal (seniority), delivery-order convergence, rotation recipient checks, bad key commitment, last admin, self-healing rotation, leave, epoch-ID reuse, ops from never-added keys; fan-outs of invalid ops, wide valid frontiers, pending-pool limits and ready admin ops |
+| §3–§6 graph, resolution, epochs | `crates/mycel-trust` (`resolve.rs` = §5, incremental; `oracle.rs` = §5 from scratch; `reach.rs` = ancestry) | Forged admin ops, pending ops, removal and rotation, concurrent revocation, mutual removal (seniority), delivery-order convergence, rotation recipient checks, bad key commitment, last admin, self-healing rotation, leave, epoch-ID reuse, ops from never-added keys; fan-outs of invalid ops, wide valid frontiers, pending-pool limits and ready admin ops. **Differential tests** (`diff_tests.rs`, proptest): random concurrent histories from four replicas (concurrent adds, removals and role changes, revocation storms, mutual revocation cycles, equivocation, reused epochs, stale recipients, out-of-order and duplicate delivery, batches, a member's `Add` and their revocation delivered in one update, revocation spam by removed members) must resolve exactly as `resolve_full` after every insert, with and without the fast path; hand-built regressions for histories the generator rarely reaches (a seniority move inside one update, seniority moves before a cut, round-0 states, re-added readers, lagging ops, dead chains, concurrent `Leave`s); the ancestry index is checked against brute force |
 | §7 envelopes | `crates/mycel-sync` | Replication, reader writes rejected, keeper can't read, outsider and tampered envelopes, forged actor, backdated writes after removal, 3-way convergence, demotion, feed causal order, restore from storage, equivocation; decompression and expansion bombs, malformed and deferred changes, declared-history checks (actor, counters, object references), delivery-order and restore consistency |
 | §8–§8d transport, mesh, limits | `crates/mycel-net`, `crates/mycel-node` | End to end over real Iroh QUIC with five nodes (admin, writer, reader, keeper, outsider); forged, renamed and replayed mesh announcements; signed-field cache mutation; stream and frame budgets, stalled and progressing I/O, duplicate requests, invitation validation order, ephemeral limits; attachment consent and disk reservations across restarts |
 
@@ -417,10 +423,46 @@ What this layer does **not** do:
   the user profile's permissions). Downloaded attachments are plaintext in
   the app's files folder. There is no database encryption, app lock or
   app-switcher redaction.
-- **Scale.** Resolution is linear for linear history but O(n²) for heavily
-  concurrent membership ops, and envelope validity is recomputed on each
-  membership change. Rotation sends one lockbox per reader: fine up to a
-  few hundred members. Sync exchanges full ID inventories.
+- **Scale.** Membership resolution is incremental (§5): flat per-insert
+  cost to 100,000 ops, linear or in revocation storms. What remains
+  superlinear, partly under an attacker's control (any key ever named in
+  the space can author ops, valid or not):
+  - A new op whose parents lie far back re-resolves everything that
+    arrived after the newest cut it can use: up to about twice its lag, or
+    the whole history when its parents are older than every cut kept
+    (roughly, older than half the history). An honest device back from a
+    long time offline pays this once; a removed member can send such ops
+    at will, e.g. ops on their own `Add` from before their removal:
+    measured 5 ms per op at 10,000 ops and 99 ms at 100,000, against
+    25 µs for an op on the heads, so a few such ops per second keep one
+    core busy in a 100,000-op space. Re-resolving only the ops concurrent
+    with the new one, instead of every op since the cut, would remove
+    this; it is not done.
+  - A removed member's k pairwise-concurrent `Leave`s add k rounds to the
+    winners loop (§5 step 6). Later inserts are unaffected (measured
+    33 µs after 1,000 such `Leave`s at 10,000 ops), but inserting the
+    `Leave`s costs about k³: the i-th re-resolves up to i ops in each of
+    i rounds. Measured 0.3 s for 200 and 57 s for 1,000 (worst single
+    insert 0.2 s). Dropping revocation candidates whose author is not a
+    member in their causal state ignoring concurrency would end this, but
+    it changes which ops are valid in rare histories (a member added on a
+    branch that only becomes valid in a later round), so it needs a
+    protocol decision.
+  - The ancestry index grows with chains that stay open and partly
+    reached, O(n · k) in the worst case, and whoever appends ops can make
+    `k` grow with their op count: merges that each name a non-tip op of
+    many side chains keep those chains open. Measured with crafted ops:
+    0.3, 1.3 and 5.1 million vector entries (8 bytes each) at 19,000,
+    38,000 and 76,000 ops, 4× per doubling (an estimate by that trend:
+    about 500 million entries, 4 GB, at 760,000 ops). Bounding the
+    vectors is not done.
+  - Inserting an op into the topological order shifts the ops after it,
+    and a reader `Add` writes the member into every epoch they lack, since
+    the state lists each epoch's recipients.
+
+  Envelope validity is recomputed on each membership change. Rotation
+  sends one lockbox per reader: fine up to a few hundred members. Sync
+  exchanges full ID inventories.
 - **Rebuild costs.** A batch carrying a lower-ID fork of an already-applied
   change costs one linear rebuild of that document, and the displaced
   change's descendants are dropped, as for revocations. Honest edits built

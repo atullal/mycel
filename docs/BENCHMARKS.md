@@ -6,7 +6,8 @@ binary Spray-and-Wait, MaxProp and Direct Delivery. Both replay the same
 real Bluetooth contact traces and the same message workloads.
 
 Everything here ran on one Mac (18 cores, 24 GB). Simulations of Mycel's own
-routing at scale are in [SIMULATION.md](SIMULATION.md).
+routing at scale are in [SIMULATION.md](SIMULATION.md). §7 measures
+something else: the cost of resolving a space's membership graph.
 
 ## Headline
 
@@ -655,3 +656,112 @@ To reproduce one cell:
   --messages bench/traces/out/helsinki-chat-msgs.csv --ttl-min 1440 \
   --knobs spray=focus,gradient=both --latencies /tmp/lat.csv
 ```
+
+## 7. Membership resolution (`mycel-trust`)
+
+Every peer resolves a space's membership graph (TRUST.md §5) whenever an op
+arrives. The resolver used to rebuild everything on each insert: an n × n
+ancestor bitset and a replay of each concurrent op's past, inside a loop
+rerun whenever a revocation winner failed. It is now incremental, with the
+old resolver kept as the differential-test oracle (`oracle::resolve_full`).
+`crates/mycel-trust/benches/resolve.rs` builds two histories live, one
+`insert` at a time:
+
+- **linear**: one admin's run of rotations, each on the previous op.
+- **storm**: 12 admins; every round, four of them remove each other in a
+  cycle on the same heads while a fifth rotates, then a survivor adds back
+  whoever was removed. 29% of all ops are winning revocations, and as many
+  are invalid (lost or concurrently revoked) and stay as dead ends.
+
+"Before" is one `resolve_full` of the same ops: what every insert cost
+before. "Resolver heap" is what the graph holds beyond the ops themselves
+(resolution bookkeeping and the membership state); before, the graph kept
+the bitset, so the oracle's peak is the comparable figure. Apple M5 Pro,
+18 cores, `--profile replay`, measured 2026-10-21 with other builds
+running (load average 6–9), so single numbers are ±15%. The incremental
+columns are from the final code; the "before" columns at 100,000 linear
+ops and 10,000 storm ops were measured the same day on the same,
+unchanged oracle and not re-run (they take minutes and over a gigabyte).
+
+| History | Ops | Insert, mean | of which signature check | Worst insert, last 10% | Resolver heap | Before: per insert | Before: heap |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| linear | 1,000 | 28 µs | 24 µs | 46 µs | 1.1 MiB | 1.1 ms | 1.8 MiB |
+| linear | 10,000 | 27 µs | 24 µs | 45 µs | 13.9 MiB | 80 ms | 21.8 MiB |
+| linear | 100,000 | 28 µs | 27 µs | 91 µs | 119 MiB | 9.1 s | 1,283 MiB |
+| storm | 1,004 | 38 µs | 31 µs | 51 µs | 1.3 MiB | 515 ms | 2.6 MiB |
+| storm | 10,000 | 39 µs | 31 µs | 82 µs | 14.2 MiB | 588 s | 28.5 MiB |
+| storm | 100,000 | 45 µs | 33 µs | 306 µs | 129 MiB | not run | not run |
+
+- **Insert cost is flat in history size.** Resolution itself is about
+  1–4 µs per op for the linear history and 7–12 µs in the storm (insert
+  minus the separately timed signature check); the rest is the Ed25519
+  check `insert` does first. The 100,000-op storm builds in 5.7 s.
+- **Before, it grew with history**: about n² for linear history
+  (80 ms → 9.1 s per insert from 10,000 to 100,000 ops) and about n³ in
+  the storm (515 ms → 588 s from 1,000 to 10,000). The 100,000-op storm
+  was not run: by that trend, one insert would take days.
+- **Memory is linear.** Resolver heap is 1.1–1.5 KiB per op in both
+  histories: per-op metadata, undo logs, per-op round flags, and the
+  membership state with each epoch's recipients (about 400,000 entries at
+  100,000 linear ops). The bitset alone was n²/8 bytes: 1.2 GB at 100,000
+  ops.
+- **A new member's first sync** (`insert_many` of the whole history into a
+  fresh graph, one full resolution): 29–34 µs/op linear and 38–42 µs/op storm,
+  so 3.4 s and 4.2 s at 100,000 ops, again mostly signature checks.
+
+Three things kept the storm from scaling in the first incremental version,
+each found by profiling this benchmark (the differential tests guarded
+the changes):
+
+- **Dead ends held chain positions.** An op took its chain position on
+  arrival, so when the first op of a round to arrive was a loser nobody
+  built on, the main chain ended there, and every later op's reach vector
+  kept one more partly reached chain per round: 6.8 million vector entries
+  at 20,000 ops, 1.6 GB of heap and 328 µs per insert at 100,000. Ops now
+  join a chain only when they get their first child: 28,568 entries at
+  100,000 ops.
+- **Re-adding a reader rescanned every epoch.** A member added back is a
+  recipient of every epoch in the adder's past; the resolver checked all of
+  them. It now starts after the prefix of epochs the member already holds.
+- **Full resolutions were quadratic in revocations per member.** Steps 3
+  and 4 scanned every revocation of an op's author, and the region walk
+  copied its undo logs at merges: 125 µs/op for a 100,000-op first sync.
+  Winners are now indexed per target in topological order, with each scan
+  stopping at a winner whose earlier (or later) winners all lie in its
+  past (or future), and the logs are shared lists.
+
+Reproduce (the oracle columns: `--oracle-max`, `--oracle-storm-max`; the
+storm oracle at 10,000 ops takes about ten minutes):
+
+```sh
+cargo bench -p mycel-trust --features oracle --bench resolve --profile replay -- \
+  1000 10000 100000 --oracle-max 100000 --oracle-storm-max 10000
+```
+
+**Adversarial and lagging histories** (`benches/adversarial.rs`, same
+machine and day). Each starts from one admin's linear history in which
+member 1 was added and then removed (TRUST.md §10):
+
+| Case | 10,000 ops | 100,000 ops |
+|---|---:|---:|
+| Op on the heads (baseline) | 25 µs | 25 µs |
+| Removed member's op on their own pre-removal `Add` (invalid; older than every cut, so a full recompute) | 5.3 ms median | 99 ms median |
+| Honest admin op on the second op of the history (valid; also a full recompute) | 6.0 ms | 97 ms |
+| Inserting k concurrent `Leave`s by the removed member | 57 s for k = 1,000 (worst 0.20 s) | 0.3 s for k = 200 (worst 4.5 ms) |
+| Honest insert after those `Leave`s | 33 µs median, 48 µs max | 28 µs median, 93 µs max |
+| Heap added by those `Leave`s (k + 1 rounds) | 0.3 MiB | under 0.1 MiB |
+
+The first review of the incremental resolver measured the `Leave` case
+before rounds shared their storage: after 1,000 `Leave`s at 10,000 ops,
+every honest insert took 1.7 ms median (57× the baseline), and the
+rounds held 10.2 million undo-log entries (253 MB peak RSS). The
+full-recompute rows are a known gap (TRUST.md §10).
+
+```sh
+cargo bench -p mycel-trust --features oracle --bench adversarial --profile replay -- 10000 1000
+```
+
+Correctness is checked separately: `cargo test -p mycel-trust` runs
+random concurrent histories through both resolvers (TRUST.md §9).
+`PROPTEST_CASES=6000` (18,000 histories, each checked after every insert)
+passed on the final version.

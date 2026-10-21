@@ -4,7 +4,11 @@
 //! the same deterministic algorithm, so peers holding the same ops agree on
 //! membership, roles and encryption epochs.
 
+#[cfg(any(test, feature = "oracle"))]
 mod bitset;
+#[cfg(any(test, feature = "oracle"))]
+pub mod oracle;
+mod reach;
 mod resolve;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -302,6 +306,7 @@ impl MemberState {
         self.epochs.iter().rev().find(|e| e.recipients == readers).map(|e| e.id)
     }
 
+    #[cfg(any(test, feature = "oracle"))]
     pub(crate) fn admin_count(&self) -> usize {
         self.members.values().filter(|m| m.role.is_admin()).count()
     }
@@ -383,7 +388,7 @@ impl SpaceGraph {
         named.extend(names(&genesis));
         let mut ops = HashMap::new();
         ops.insert(space, genesis);
-        let res = resolve::resolve(&ops);
+        let res = Resolution::new(&ops, space);
         Ok(SpaceGraph {
             space,
             ops,
@@ -433,9 +438,10 @@ impl SpaceGraph {
             return Ok(Inserted::Duplicate);
         }
         let ready = self.stage(op)?;
-        let promoted = self.promote_pending();
+        let mut promoted = self.promote_pending();
         if ready || promoted.contains(&id) {
-            self.reresolve();
+            promoted.insert(id);
+            self.reresolve(promoted);
             Ok(Inserted::New)
         } else {
             Ok(Inserted::Pending)
@@ -464,10 +470,11 @@ impl SpaceGraph {
             }
         }
         promoted.extend(self.promote_pending());
+        let added: Vec<OpId> = promoted.iter().copied().collect();
         if !promoted.is_empty() {
-            self.reresolve();
+            self.reresolve(promoted);
         }
-        (promoted.into_iter().collect(), rejected)
+        (added, rejected)
     }
 
     /// Returns true when inserted directly into the resolvable graph.
@@ -505,8 +512,10 @@ impl SpaceGraph {
         self.named.contains(pk)
     }
 
-    fn reresolve(&mut self) {
-        self.res = resolve::resolve(&self.ops);
+    /// Fold ops that just became resolvable into the resolution.
+    fn reresolve(&mut self, new: HashSet<OpId>) {
+        let new: Vec<OpId> = new.into_iter().collect();
+        self.res.add(&self.ops, &new);
         self.state_cache.lock().unwrap().clear();
     }
 
@@ -588,7 +597,7 @@ impl SpaceGraph {
     /// Winning revocations targeting `pk`: (op id, cutoff).
     pub fn revocations_of(&self, pk: &SignPk) -> Vec<(OpId, Option<Hash32>)> {
         self.res
-            .winners
+            .winners_against(pk)
             .iter()
             .filter_map(|id| {
                 let op = &self.ops[id].op;
@@ -762,5 +771,7 @@ impl SpaceGraph {
     }
 }
 
+#[cfg(test)]
+mod diff_tests;
 #[cfg(test)]
 mod tests;
