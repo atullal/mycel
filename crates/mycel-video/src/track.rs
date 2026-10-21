@@ -649,7 +649,15 @@ fn encode_loop(sh: Arc<Shared>, out: mpsc::UnboundedSender<EncodedFrame>) {
         let force = fresh || asked;
         let mut frame = match enc.encode(&pic.buf, pic.capture_us as i64, force) {
             Ok(Some(f)) => f,
-            Ok(None) => continue,
+            Ok(None) => {
+                // (an encoder that went quiet may have switched mode)
+                let d = enc.describe();
+                let mut s = sh.send.lock();
+                if s.encoder != d {
+                    s.encoder = d;
+                }
+                continue;
+            }
             Err(e) => {
                 eprintln!("[video] {e:#}");
                 encoder = None;
