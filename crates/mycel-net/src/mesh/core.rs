@@ -2090,9 +2090,11 @@ impl Router {
             return;
         }
         if req.origin == self.me {
-            // one we sent it already, asked for once more: its chain (our
+            // the one we sent it last, asked for once more: its chain (our
             // hop) didn't arrive (`Announce::same`), so ours again to it
-            if req.hops == 1 && self.own.as_ref().is_some_and(|a| req.seq <= a.seq) {
+            // alone (a request for a seqno it lacks, `seq` + 1, carries on
+            // below and reaches everyone)
+            if req.hops == 1 && self.own.as_ref().is_some_and(|a| req.seq == a.seq) {
                 if self.nbs.get_mut(&from).is_some_and(|n| n.verify_budget.take(1.0, now)) {
                     self.own_sent.retain(|(k, _)| *k != from);
                 }
