@@ -739,6 +739,12 @@ async fn serve_on(
             }
         };
         inner.v2.note_inbound(space, peer);
+        // A member just opened a session to us over a live connection: it is
+        // reachable now (as v1's server marks it once it has answered). The
+        // session's own end comes a flight after the client's, and an app
+        // acting on the client's return (an ephemeral message to everyone
+        // online) mustn't find the peer offline in between.
+        inner.mark_ok(peer);
         drop(_permit);
         let done = drive(inner, peer, space, session, None, tx, rx, false, phase2).await?;
         drop(active);
