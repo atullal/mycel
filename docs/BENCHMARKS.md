@@ -854,22 +854,34 @@ gossip and session frames (stream) and all UDP they sent, for the whole
 group per message. Payload copies count envelopes received by push (the
 author's own excluded, so the floor is members − 1). Sessions are all
 sessions started in the window. Measured 2026-10-21 after the tree fixes
-below, one run:
+below (10 and 50 members at 2624b901; 200 members at 851f38af, the same
+dissemination logic, see the note below the table):
 
 | Members | Stream B per message (group) | Per member | UDP B per message (group) | Payload copies | Sessions per message | Time to everyone |
 |---|---|---|---|---|---|---|
-| 10 | 8,734 | 873 | 143,303 | 9.0 | 1.2 | 52 ms |
-| 50 | 45,072 | 901 | 779,525 | 49.0 | 2.8 | 52 ms |
+| 10 | 8,951 | 895 | 176,008 | 9.0 | 1.4 | 53 ms |
+| 50 | 44,623 | 892 | 614,133 | 49.0 | 2.8 | 52 ms |
 | 200 | 169,786 | 849 | 1,912,092 | 199.0 | 8.4 | 84 ms |
 
-After the warm-up the eager edges were exactly a spanning tree (49 of 187
-edges eager at 50 members, 199 of 669 at 200) and no announcement timed
-out at 10 or 50 members (at 200, 64 timed out, all in the warm-up, where
-28 sends also failed while 200 nodes in one debug process set up their
-connections). The sessions in the window are not repairs: they are not
-broken down by cause, but with no timeouts they are the author's sessions
-to members whose hello it hasn't seen (the strict coverage rule for own
-writes) and the periodic anti-entropy that the window catches.
+At 10 and 50 members the eager edges were exactly a spanning tree after
+the warm-up (49 of 187 edges eager at 50 members), no announcement timed
+out and no pull was needed in the whole run. The sessions in the window
+are not repairs: they are not broken down by cause, but with no timeouts
+and no pulls they are the author's sessions to members whose hello it
+hasn't seen (the strict coverage rule for own writes) and the periodic
+anti-entropy that the window catches.
+
+**200 members depend on the machine's load** (200 nodes in one debug
+process, sharing the 18 cores with other agents' builds). The run in the
+table had a spanning tree (199 of 669 edges eager) and its 64 timeouts
+and 28 failed sends all in the warm-up. Two later runs at 2624b901, with
+the load average at about 20–23: 204.2 payload copies, 25 sessions and
+473 ms (93 failed sends, 97 timeouts); and 240.6 copies, 78 sessions and
+12.3 s on average, one message taking 50 s (86 failed sends, 163
+timeouts). Failed sends mark a neighbour down and redraw edges, which
+the tree repairs with announcements and pulls; whether that holds up on
+real lossy links is for the simulator's `churn` scenario, not this
+bench.
 
 Before the fixes (same bench, 2026-10-21, earlier the same day): 88.2 and
 372.0 payload copies (1.8 and 1.9 per member), 4.4 and 17.2 sessions per
