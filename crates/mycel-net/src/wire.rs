@@ -56,8 +56,7 @@ pub enum StreamKind {
     Ephemeral = 3,
     /// Bi-stream: one blob request (see `blobs.rs`).
     Blob = 4,
-    /// Bi-stream, wire version 2 and later: the dialer's
-    /// [`Hello`](crate::version::Hello), then
+    /// Bi-stream, wire version 2 and later: the dialer's [`Hello`], then
     /// the listener's, once per connection.
     Hello = 5,
 }
