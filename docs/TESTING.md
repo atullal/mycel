@@ -131,7 +131,7 @@ committed.
 | `mycel-link-iface` | Interface classification (medium from type and name, software interfaces skipped, ordinary NICs left to IP), environment overrides, beacons; a sync over a real interface with IP off, one path per interface |
 | `mycel-kit-chat` | Author-only edits/deletes, reactions, receipts/unread, admin-only meta, garbage tolerance, thread merging (a late alias can't backdate messages; a message written at an alias's first-seen time sorts after that alias's older messages), alerts |
 | `mycel-rules(-abi)` | Deterministic WASM engine: fuel/memory limits, banned features, ABI violations, chat rules, wire compatibility with the chat kit, the fuel cost model pinned |
-| `mycel-sim` | Every scenario at CI size, and the simulator's own models (`cargo test -p mycel-sim`) |
+| `mycel-sim` | Every scenario at CI size, the simulator's own models, and its determinism meta-tests: same seed same run hash, one exogenous world for every model, one extra frame changes nothing outside its causal cone, an exported world replays bit for bit (`cargo test -p mycel-sim`; SIMULATION.md §1) |
 | `mycel-host` | Log file privacy, notification privacy, deduplication, tap routing and permission handling |
 | Web (`npm test`) | SDK paging, search, presence and conversation identity; Messaging layout and swipe gestures; host notices and notification actions |
 

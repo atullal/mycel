@@ -76,7 +76,7 @@ pub struct ScenarioResult {
 
 /// The invariant `finish` adds when runs registered their worlds.
 pub const SAME_WORLD: &str =
-    "every model saw the same exogenous world (BLAKE3 of positions, links, outages, workload, adversaries)";
+    "every model saw the same exogenous world (digest of positions, links, outages, workload, adversaries)";
 
 impl ScenarioResult {
     pub fn new(name: &str, title: &str, tier: u8, seed: u64, scale: f64) -> Self {

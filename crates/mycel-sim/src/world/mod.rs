@@ -14,7 +14,7 @@
 //!   wakes). Their draws come from counter-based [`streams`] keyed per
 //!   entity and event, so candidates share them (common random numbers).
 //!
-//! Every run carries two BLAKE3 digests: the **exogenous hash** (equal for
+//! Every run carries two [`Digest`]s: the **exogenous hash** (equal for
 //! every candidate on one seed, checked as an invariant wherever a scenario
 //! runs several models on one world) and the **run hash**, over every
 //! event a router sees (equal for the same seed and candidate, and for a

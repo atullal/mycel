@@ -312,7 +312,7 @@ impl Contacts {
 
 /// The exogenous world: everything no protocol decision can change.
 /// Routers see it only through [`Cx`], read-only, so nothing they do can
-/// move a device, a link or an outage. Its BLAKE3 digest
+/// move a device, a link or an outage. Its digest
 /// ([`Sim::exo_hash`]) is the same for every candidate on one seed.
 pub struct Exo {
     /// The run's seed (its exogenous streams and the endogenous ones).
@@ -794,7 +794,7 @@ impl<F> WorldCore<F> {
         self.queue.push(Reverse((at, (u64::from(class) << 56) | self.seq, slot)));
     }
 
-    /// The run hash so far: BLAKE3 over every event a router saw.
+    /// The run hash so far: the digest of every event a router saw.
     pub fn run_hash(&self) -> [u8; 32] {
         self.digest.finish()
     }
@@ -936,7 +936,7 @@ impl<R: Router> Sim<R> {
         self.exo.notes.push((tag, data));
     }
 
-    /// The exogenous hash so far: BLAKE3 over the world's starting state,
+    /// The exogenous hash so far: the digest of the world's starting state,
     /// the workload's intents, the notes, and every exogenous change.
     pub fn exo_hash(&self) -> [u8; 32] {
         self.exo.digest.finish()

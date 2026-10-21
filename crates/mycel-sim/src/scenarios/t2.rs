@@ -310,10 +310,10 @@ pub struct Run {
     /// With devices that drop traffic: what they must cost, against what
     /// they did (liar-free-reachable delivery, [`crate::tier2::lfr`]).
     pub lfr: Option<crate::tier2::lfr::Ceiling>,
-    /// BLAKE3 of the exogenous world (hex): the same for every model run
+    /// The digest of the exogenous world (hex): the same for every model run
     /// on one world and seed.
     pub exo_hash: String,
-    /// BLAKE3 of every event the routers saw (hex): the same for the same
+    /// The digest of every event the routers saw (hex): the same for the same
     /// seed and model, and for a replay of the exported world.
     pub run_hash: String,
     /// The exported world, with [`Plan::keep_world`].

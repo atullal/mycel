@@ -17,6 +17,9 @@ cargo run --release -p mycel-sim -- us-eu,mailbox --scale 0.1 --seed 7
 cargo run --release -p mycel-sim -- t2 --candidate main    # hold the earlier mesh design to the same objectives
 cargo run --release -p mycel-sim -- ci --seed 1000 --runs 10  # CI's gate: 10 seeds per scenario (§1)
 cargo run --release -p mycel-sim -- liar-ceiling           # plausible liars, four strategies, seeds 1–20 (§4, open 15)
+cargo run --release -p mycel-sim -- export-world us-eu --out target/w  # the exogenous world of each run, as JSON (§1)
+cargo run --release -p mycel-sim -- replay --world target/w/worlds/<file>.json  # replay one, bit for bit
+cargo run --release -p mycel-sim -- crn --seed 3000 --runs 10  # what common random numbers buy (§1)
 cargo test --release -p mycel-sim                          # CI sizes; `-- --ignored` for the rest
 ```
 
@@ -76,16 +79,115 @@ and reports the slowest instead.
 **Seeds and verdicts** (`src/seeds.rs`, `src/stats.rs`). A seed is a
 replication, never a tuning target. Replication seeds come from a base and
 a run index (`run_seed(base, i)`, SplitMix64's mixer over both: ns-3's
-fixed seed with an advancing run number), and each seed's randomness is
-split into streams that never share a sequence: the world
-(`Rng::new(seed ^ tag)`, as before), walking devices (fixed 22), the
-workload where the world already draws from the bare seed
-(`Stream::Workload`), the engine's radio jitter (`Stream::Protocol`), and
-each routing core's generator (`Stream::Routers`, one sub-stream per
-device). Before, the engine drew its jitter from `Rng::new(seed)`, the
-very sequence a mesh's positions came from, and the routers' seeds were
-`seed × constant ^ device`: xorshift states a few bits apart. (So every
-tier-2 number changed once; §3 is rerun on the split streams.)
+fixed seed with an advancing run number). Within a seed, the world's
+layout comes from the scenario's own generator (`Rng::new(seed ^ tag)`),
+and everything else from counter-based streams keyed per purpose, entity
+and event (next paragraph). Before fixed 23 the engine drew its jitter
+from `Rng::new(seed)`, the very sequence a mesh's positions came from;
+before fixed 27 jitter and every router's draws shared one sequence.
+
+**World and streams** (`src/world/`, `tier2/engine.rs`; fixed 27). A
+tier-2 run's state is split three ways. The **exogenous world** (`Exo`)
+is what no protocol decision may move: areas, devices and radios,
+positions and walks, who is switched on, internet up or down, which
+pairs are in range (under the disc model below), the workload's intents
+(who sends what to whom, when), and adversary placement. Routers see it
+only through `Cx`, which holds it read-only, so the separation is checked
+by the compiler. The **endogenous models** (`Endo`) depend on traffic:
+today the radio queues and per-frame jitter; later link setup,
+interference, energy and OS wakes. The **protocol state** (`WorldCore`)
+is the event queue, messages, counters and the directory. At one instant
+the world changes first, then the workload's sends, then what protocols
+scheduled, so the order of the world's events never depends on how many
+events routers pushed before them.
+
+Every random draw is a stateless function of (seed, purpose, entity, k):
+Philox4×32-10 (Salmon et al., [SC 2011](https://www.thesalmons.org/john/random123/papers/random123sc11.pdf),
+checked against Random123's known-answer vectors) with (seed, purpose)
+as the key and (entity, k) as the counter (`world::streams`). Radio
+jitter is keyed per directed link and frame (the k-th frame on a→b), each
+router's `Cx::rng` per router, each routing core's own generator seed per
+device, a walker's waypoints per device, each message's ends per message,
+churn per minute, adversary placement per scenario. There is no global
+draw count, so two candidates that both send the k-th frame on a→b see
+the same jitter for it: common random numbers (CRN, Law, *Simulation
+Modeling and Analysis*, ch. 11), the variance reduction behind every
+paired comparison here. The world's layout (positions, radios, internet
+access) still comes from each scenario's generator, drawn before the run.
+
+Each run carries two digests (`world::Digest`: two crossed 64-bit
+chains through SplitMix64's finaliser, finished with BLAKE3; built to
+detect divergence between deterministic runs, not to resist an
+adversary). The **exogenous hash** covers the
+world's starting state, the intents, the adversaries and every change to
+the world as it was applied; every scenario registers it for each model
+it runs, and `ScenarioResult::finish` makes "every model saw the same
+exogenous world" an invariant (zero tolerance, every seed). The **run
+hash** covers every event a router sees (time, kind, device, peer, frame
+size, message), and is equal for the same seed and model. Meta-tests
+(`world/meta_tests.rs`): the same seed gives the same run hash; nine
+models on one seed give one exogenous hash and nine run hashes; moving a
+liar changes the exogenous hash; one extra frame on link 0→1 of an
+80-device BLE line changes no device's events before one BLE hop latency
+per hop could carry it there (the causal cone), and devices beyond the
+cone are unchanged throughout (with the old single generator, the extra
+frame's jitter draw moved every later draw of every device); and an
+exported world replays bit for bit.
+
+`mycel-sim export-world <scenario,...> --seed N --scale X --out DIR`
+writes the exogenous world of every tier-2 run a scenario makes (one
+JSON file per run, `world::trace::WorldTrace`: starting state, sends,
+adversaries, and every position, link, power and internet change in the
+order applied), and `mycel-sim replay --world FILE [--candidate C]` runs
+the source model (and C) on it, with links taken from the file rather
+than from geometry. Replay checks, as invariants, that it rebuilds the
+exogenous hash and, where the source run used default model settings,
+that it reproduces the run hash. This is the format field logs are meant
+to be converted to (fidelity L4 below). Positions are written in Rust's
+shortest round-trip notation and parsed exactly: serde_json's default
+float parser can miss by an ulp, and one ulp of a position changes an
+internet delay and so the run (the round-trip test caught this).
+
+CPU cost of the streams and digests, measured single-threaded against
+v2/integration (4a321e48) on the 18-core Mac while other jobs ran (load
+4–12): instructions retired +12.3% on `churn --scale 0.05` (512 → 575
+billion) and +12.7% on `global-scale --scale 0.02` (673 → 758 billion).
+Wall time, alternating runs: churn 37–38 s → 40–43 s (+8–11%),
+global-scale 73–91 s → 101–105 s (the spread is the machine's load);
+peak memory within 6%. A first version fed every record to BLAKE3 and
+kept the per-link frame counts in a hashed map and cost 2.2× the CPU
+(measured; BLAKE3 alone ~100 ns a record). What remains per event is a
+Philox block per radio frame (Philox4×32-10 is ~10 rounds of two
+multiplies; both 64-bit words of a block are used for router draws), the
+two digest chains and the run hash's frame word. The disc radio is the
+only radio model, so there is no lighter profile to fall back to yet.
+
+What CRN buys, measured with `mycel-sim crn` (variance of A − B over
+seeds, A = the GLOBAL core + DTN, B = a reference model, three ways: on
+the same seed; on the same world with B's endogenous streams salted; on
+independent seeds): CRN_PLACEHOLDER
+
+**Fidelity levels.** Each result is only as strong as the weakest model
+it uses:
+
+| Level | Meaning | What it supports |
+|---|---|---|
+| L0 Abstract | Literature constants, a disc, instant links | Logic bugs, invariants, relative comparisons |
+| L1 Literature-grounded | Models with cited parameters, not checked on our devices | The direction of an effect, sensitivity |
+| L2 Calibrated | Parameters fitted to our own measurements, with a discrepancy term | Absolute numbers in the measured conditions |
+| L3 Validated | Predictions checked against held-out measurements within stated tolerances | Absolute numbers in similar conditions |
+| L4 Field-replayed | A recorded real day replayed and compared with the phones' own logs | The strongest evidence short of deployment |
+
+Every tier-2 result in this document is **L0**: radio is a range disc
+with links up the instant two devices are in range and lossless hops
+(`Tech::loss` feeds only tier 1), no device sleeps, and the internet has
+fixed per-pair delays. Individual parameters are L1 (sourced in
+`models.rs` and §2); the WonderNetwork latency fit and the CRAWDAD
+replays (§5) anchor single models to measurements without making the
+results L2. Nothing is calibrated or validated on phones yet
+([TESTING.md](TESTING.md#real-hardware)). The disc is the only radio
+model today, so it is also the cheap profile later physics models will
+be compared against and kept beside.
 
 Objectives come in two kinds (`Slo::invariant`):
 
@@ -802,6 +904,54 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    8×, 120×, 12% and 6% at CI size, where the worst of 30 seeds was
    6.43×, 86.0×, 8.01% and 4.49% (the gate's 10: 5.28×, 23.0×, 5.03%,
    3.61%).
+
+27. **One draw shifted every later draw, and nothing showed that every
+   model saw the same world** (§1, "World and streams"). After fixed 23
+   the engine still drew every frame's jitter and every router's
+   `Cx::rng` from one sequence, so a router that drew one number more,
+   or sent one frame more, moved the jitter of every later frame of
+   every device; walkers drew in device order from one stream, and in
+   `churn`, `disaster-dtn`, `global-scale` and `adversarial` the
+   workload, churn and adversary placement came from the stream that had
+   just drawn the world, so one more device or attacker moved every
+   message. Now each draw is keyed by (seed, purpose, entity, event),
+   the exogenous world sits behind a read-only borrow, and the
+   exogenous hash is an invariant in every scenario that runs several
+   models on one world (the gate: 10 of 10 seeds in all eight that do;
+   `flood-hop-limit` and `routing-convergence` build their own runs and
+   don't register yet). The CRN isolation test fails on the old engine
+   by construction (its extra frame's draw moved everyone's) and passes
+   now.
+
+   Every tier-2 number moved once. The gate (base 1000, 10 seeds) before
+   (v2/integration, 4a321e48) and after, median (min–max) over the
+   seeds, where it changed:
+
+   | Scenario | Objective | Before | After | Why |
+   |---|---|---|---|---|
+   | `us-eu` | latency p95 | 0.771 s (0.759–0.789) | 0.763 s (0.749–0.789) | jitter now per link and frame |
+   | `us-eu` | optimality p95 | 2.30× (2.22–2.39) | 2.30× (2.23–2.40) | same |
+   | `us-eu` | round trip p95 | 1.20 s (1.17–1.22) | 1.18 s (1.16–1.22) | same |
+   | `gateway-choice` | 1 KB optimality p50 | 1.70× (1.53–2.03), 9 of 10 | 1.73× (1.45–1.96), 10 of 10 | jitter; the seed at 2.03× is at 1.96× (a few ms on a ~10 ms path) |
+   | `mailbox` | delivered within, after it reappears | 0.143 s (0.125–0.184) | 0.135 s (0.128–0.189) | jitter |
+   | `trace-replay` | delivery | 99.0% (94.7–100) | 98.8% (92.2–100) | the workload's stream key changed (SplitMix64 `Stream::Workload` → Philox), so the 200 messages per seed are new ones |
+   | `trace-replay` | optimality p95 | 3.65× (2.79–5.60) | 2.97× (2.35–5.06) | same (new messages; thresholds 8×) |
+   | `trace-replay` | CVaR₉₅ | 10.3× (5.34–22.4) | 8.55× (4.06–25.0) | same (120×) |
+   | `trace-replay` | over 10×, upper bound | 3.36% (1.90–5.08) | 3.20% (1.91–5.95) | same (12%) |
+   | `trace-replay` | over 30×, upper bound | 2.35% (1.88–4.36) | 2.02% (1.88–4.32) | same (6%) |
+   | `adversarial` | plausible liars | 97.5% (91.7–100), 10 of 10 | 99.2% (88.3–100), 9 of 10 | liars, storm, replayer and Sybil placed from their own stream, honest pairs from per-attempt workload streams: new attackers in the same towns. The miss (seed 16427468972947960519, 88.3%) equals the lowest of the 30 calibration seeds before |
+   | `routing-convergence` | 99% routed at cold start | 0.7 s (0.6–0.7) | 0.6 s (0.6–0.7) | router start phases from per-router streams |
+   | `routing-convergence` | route length vs shortest | 1.00 (1.00–1.00) | 1.00 (1.00–1.01) | same |
+   | `disaster-dtn` | delivery, mean of 20 worlds | 86.1% (81.0–87.5), 10 of 10 | 86.2% (79.3–90.1), 9 of 10 | each message's ends from its own stream, each walker's waypoints from its own: new worlds. The miss (same seed, 79.3% against 80%) is within the slack |
+   | `disaster-dtn` | replicas per message | 7.44 (6.93–7.79) | 7.39 (6.95–7.69) | same |
+   | `disaster-dtn` | latency p50 vs epidemic's | 0.995× (0.933–1.00) | 0.999× (0.955–1.00) | same |
+
+   Unchanged on every seed: every invariant (no loops, no honest route
+   through a black hole, converged, liars' impossible routes refused),
+   every delivery of 100%, `partial-route`, `flood-hop-limit`'s four
+   paired shape checks and the pinned seeds. The gate passes: 106.7 s
+   wall, 418 s of CPU and 1.4 GB peak (before, the same day: 109.0 s,
+   412 s, 2.0 GB; machine load 4–12 both times). CALIBRATION_PLACEHOLDER
 
 23. **Routing defences without a wire change, measured one by one**
    (`docs/ROUTING.md` §6, item 15). Eight were built in the core. Each

@@ -66,9 +66,9 @@ pub struct WorldTrace {
     pub start_events: usize,
     /// Every exogenous change, in the order the engine applied it.
     pub events: Vec<(Time, WorldEvent)>,
-    /// BLAKE3 over all of the above as the engine saw it (hex).
+    /// The exogenous hash ([`super::Digest`]) of all of the above as the engine saw it (hex).
     pub exo_hash: String,
-    /// BLAKE3 over every event the source run's routers saw (hex).
+    /// The run hash ([`super::Digest`]) of every event the source run's routers saw (hex).
     pub run_hash: String,
 }
 

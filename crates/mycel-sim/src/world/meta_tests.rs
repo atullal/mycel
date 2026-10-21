@@ -261,3 +261,20 @@ fn one_extra_frame_moves_only_what_it_can_have_caused() {
     }
     assert!(clean >= 10 && changed >= 2, "clean {clean}, changed {changed}: the test must have both");
 }
+
+#[test]
+fn model_names_and_positions_round_trip() {
+    for m in
+        [Model::Global(GCfg::default()), Model::Global(GCfg::before()), Model::Main, Model::Spray(8), Model::Flood(7)]
+    {
+        assert_eq!(Model::from_name(&m.name()), Some(m));
+    }
+    assert_eq!(Model::from_name("no such model"), None);
+    // positions survive JSON exactly, where a plain f64 could miss by an ulp
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct P(#[serde(with = "crate::world::trace::exact")] (f64, f64));
+    for xy in [(0.1 + 0.2, 1.0 / 3.0), (1e-300, -2.5e17), (123.456_789_012_345_67, f64::MIN_POSITIVE)] {
+        let back: P = serde_json::from_str(&serde_json::to_string(&P(xy)).expect("json")).expect("parse");
+        assert_eq!((back.0.0.to_bits(), back.0.1.to_bits()), (xy.0.to_bits(), xy.1.to_bits()));
+    }
+}
