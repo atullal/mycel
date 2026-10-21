@@ -181,10 +181,23 @@ to be reachable as often as it can, and how honestly the app says so:
 
 - **App refresh and processing.** `main.mm` registers two `BGTaskScheduler`
   tasks before launch finishes (`dev.mycel.refresh`, 25 s;
-  `dev.mycel.processing`, up to 120 s) and asks for them each time the app
-  goes to the background. Each catch-up syncs every conversation, waits up
-  to 10 s for deliveries from keepers and carriers, and saves
-  (`src-tauri/src/background.rs`); iOS's expiration handler stops it early.
+  `dev.mycel.processing`, up to 120 s). Each launch asks for the next one of
+  its own kind, and leaving the app asks only for kinds not queued already
+  (asking again replaces a queued request and its earliest date, which
+  would keep the processing task an hour away for an app left often). Each
+  catch-up syncs every conversation with every member at once (keepers and
+  reachable peers first, peers in failure backoff skipped), then lingers up
+  to 10 s for deliveries from keepers and carriers, stopping 3 s before its
+  budget ends, and saves (`src-tauri/src/background.rs`); iOS's
+  expiration handler stops it early. A member who is asleep costs one 6 s
+  connect timeout for the whole catch-up, not one per conversation: one
+  sleeping member in six conversations measured 6.0 s (36.0 s before; the
+  `mycel-net` test `a_sleeping_member_costs_one_connect_timeout_not_one_per_conversation`,
+  loopback). A member that connects and then stalls holds up only its own
+  syncs (unless it shares more conversations than the node's 16 sync
+  slots, which it can then fill until its replies time out); whatever the
+  budget cuts short waits for the next catch-up, and such a catch-up isn't
+  shown as the last check.
   iOS decides when they run: typically a few times a day for an app used
   regularly, more while charging; never after the user swipes Mycel away
   in the app switcher, until it's opened again.
@@ -192,7 +205,13 @@ to be reachable as often as it can, and how honestly the app says so:
   keeps scanning (always filtered by Mycel's service, as iOS requires in
   the background) and dialing devices that advertise Mycel (computers, and
   phones with Mycel open), and CoreBluetooth events wake Mycel briefly;
-  while awake, its LAN and peer-to-peer Wi-Fi paths run too. The central
+  while awake, its LAN and peer-to-peer Wi-Fi paths run too. While Mycel is
+  in the background (also when iOS launched it straight there) it **links
+  only with known devices**: contacts and members of its conversations. An
+  unknown advertiser's key is read and the iPhone hangs up without sending
+  its own; channels to strangers close when the app leaves the
+  foreground. So a locked iPhone doesn't relay for strangers over
+  Bluetooth, and never hands its key to one that merely advertises Mycel. The central
   opts into **state restoration**: iOS relaunches Mycel in the background
   for a Bluetooth event after ending it for memory (not after a swipe
   away). **Not `bluetooth-peripheral`:** with it, a locked iPhone would keep
@@ -201,14 +220,19 @@ to be reachable as often as it can, and how honestly the app says so:
   two iPhones that both have Mycel in the background don't find each other
   over Bluetooth; one of them has to be open. What the Bluetooth link
   reveals, and the fix that would allow background advertising, are in
-  [TRUST.md](TRUST.md#8b-mesh-relays-what-they-can-and-cant-do) (§8b, known limits). The
-  characteristic never carries the display name.
+  [TRUST.md](TRUST.md#8b-mesh-relays-what-they-can-and-cant-do) (§8b, known limits). Neither
+  the characteristic nor the channel's hello carries the display name
+  (nearby devices read it from the signed contact card, encrypted), so a
+  device seen only over Bluetooth shows in *Nearby* by its short ID until
+  it's added or found on the LAN.
 - **The grace period.** Leaving the app still asks for iOS's usual
   background time so sends finish.
 - **What the app says.** The *In the background* card says "Slow mode: new
   messages may wait until you open Mycel", why (no push server), what does
   wake it, that swiping it away stops the checks, and when the last
   background check ran. Notifications are local, one fixed sentence each.
+  A launch straight into the background starts as "nobody looking", so an
+  incoming call during a catch-up shows its notification.
 - **The optional wake relay** for timely delivery is a design only, off by
   default if it is ever built: [WAKE_RELAY.md](WAKE_RELAY.md), with its
   trust in [TRUST.md](TRUST.md#8e-optional-wake-relay-designed-not-built).
@@ -249,17 +273,26 @@ to be reachable as often as it can, and how honestly the app says so:
   (`background.rs`, paused tokio time); per-launch cancel tickets (a cancel
   before the catch-up begins ends it at once; one launch's cancel never
   stops another's); one catch-up at a time (also after a panic); the
-  windowless lifecycle against a real runtime (`lib.rs`: no profile is
-  created without a window, an existing one opens, later opens adopt the
-  same core, a catch-up syncs and is recorded); the Kotlin status JSON
-  mapping; that neither iOS Info.plist declares `bluetooth-peripheral`; the
-  GATT payload carrying no name; the UI copy
+  windowless lifecycle against two real runtimes on loopback (`lib.rs`: no
+  profile is created without a window, an existing one opens, later opens
+  adopt the same core; a message Alice wrote while Bob's profile was closed
+  reaches Bob's replica through a windowless catch-up, so does one she
+  pushes during the linger, and a catch-up whose sync the budget cuts short
+  isn't recorded); a background launch starting "away" so a call rings;
+  the sync of every conversation at once (`mycel-net` `tests/pool.rs`); the
+  Kotlin status JSON mapping; that neither iOS Info.plist declares
+  `bluetooth-peripheral`; the GATT payload and the hello carrying no name;
+  the restricted Bluetooth mode (`mycel-link-ble` `core.rs` and the fake
+  radio: a stranger is never linked, live links to strangers close, known
+  devices link, lifting it links strangers again); `Runtime::known_peers`;
+  the UI copy
   (`apps/host/tests/backgroundStatus.test.ts`); and `Runtime::profile_exists`.
 - **JVM unit tests (Android, `gen/android/app/src/test`, `./gradlew
   :app:testArm64DebugUnitTest`):** the service's and the worker's
   decisions (`BackgroundPolicy.kt`), including the regression where a late
-  catch-up stopped the service the app had just made foreground, and a
-  worker stopped while the runtime opens.
+  catch-up stopped the service the app had just made foreground, a
+  foreground start with no runtime (no profile, or a store that won't
+  open) that never stopped, and a worker stopped while the runtime opens.
 - **Builds and emulator checks:** [TESTING.md](TESTING.md#phones-and-the-other-platforms).
 - **Not tested on real phones:** none of this has run on a physical Android
   phone or iPhone. BGTaskScheduler never runs in the Simulator, and

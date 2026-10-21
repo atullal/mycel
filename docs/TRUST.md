@@ -210,7 +210,7 @@ A relay forwards QUIC packets of a connection between two other devices.
 **Limits (known):**
 - No onion routing or padding: relays see endpoints, sizes and timing. Hiding who-talks-to-whom would need onion-style layered encryption and cover traffic, at a large bandwidth cost on Bluetooth.
 - Sybil devices nearby can each be a neighbour (each is rate-limited separately); the radio's range is the practical bound.
-- **Bluetooth shows the device key to anyone in range.** The link has no pairing. The readable GATT characteristic carries the L2CAP PSM and the device's long-term key (never the display name), and the first frame on an L2CAP channel (the hello) carries the key and the display name, unencrypted, to whichever device opened or accepted it. So a nearby attacker scanning for Mycel's service can recognise a device by its key (passive), and one advertising the service can also get its name (active). How long a device is exposed: computers whenever Mycel runs; iPhones and iPads while Mycel is open and, in the background, only to devices that advertise Mycel (iOS keeps scanning and dialing with the `bluetooth-central` background mode; `bluetooth-peripheral` is deliberately not declared, so a locked iPhone neither advertises nor serves the characteristic). Android has no Bluetooth link yet. The fix, rotating tokens in place of the key and identity only inside an encrypted handshake, is not built.
+- **Bluetooth shows the device key to anyone in range.** The link has no pairing and the L2CAP channel isn't encrypted. The readable GATT characteristic carries the L2CAP PSM and the device's long-term key, and the first frame on a channel (the hello) carries the key again, to whichever device opened or accepted it. Neither carries the display name any more (the hello's name field is always empty; older builds still send one): a nearby device learns the name from the signed contact card, fetched inside the encrypted QUIC session, which a stranger can still do once it has a channel. So a nearby attacker scanning for Mycel's service can recognise a device by its key (passive), and one advertising the service can get the key from a channel and the name from the card (active). How long a device is exposed: computers whenever Mycel runs; iPhones and iPads while Mycel is open. In the background an iPhone keeps scanning and dialing (the `bluetooth-central` background mode) but **links only with known devices**: contacts and members of its conversations (`Runtime::set_background`, `mycel-link-ble`'s restricted mode). It still connects to an unknown advertiser long enough to read its GATT key (that read reveals nothing about the iPhone but its rotating Bluetooth address), then hangs up and doesn't dial it again; a channel a stranger opens to it is closed at the stranger's hello. `bluetooth-peripheral` is deliberately not declared, so a locked iPhone neither advertises nor serves the characteristic. Residual: an attacker who knows the key of one of the victim's contacts (read passively from that contact's Mac, say) can advertise that key and receive the iPhone's key in its hello before QUIC's handshake fails; that tracks a targeted victim, not every passer-by. Android has no Bluetooth link yet. The fix for all of it, rotating tokens in place of the key and identity only inside an encrypted handshake, is not built.
 
 ## 8c. Gateways, records and carriers (global routing, store-and-forward)
 
@@ -291,9 +291,10 @@ operator, so its trust is fixed here before any code:
   no key that decrypts any, and envelopes are checked by the trust layer as
   always.
 - **Content-blind.** A wake is a capability ID plus a fixed-size HPKE blob
-  (RFC 9180 base mode, X25519 / HKDF-SHA256 / ChaCha20-Poly1305) sealed to
-  that capability's own wake key, separate from the device's Mycel keys
-  and from every other capability's. The blob holds only a timestamp and a
+  (RFC 9180 PSK mode, X25519 / HKDF-SHA256 / ChaCha20-Poly1305) sealed to
+  that capability's own wake key with that capability's own 32-byte random
+  PSK, both separate from the device's Mycel keys and from every other
+  capability's. The blob holds only a timestamp and a
   fetch hint the extension doesn't trust; the content comes over Mycel's
   own paths.
 - **Identity-blind.** The relay sees a push token and random registration
@@ -305,12 +306,16 @@ operator, so its trust is fixed here before any code:
   channel; two capabilities share nothing but the relay's URL, so contacts
   can't link theirs to others'; the device can revoke any; the relay
   rate-limits each.
-- **Wakes are attributed by capability, never by their contents.** Base
-  mode authenticates no sender, so a wake proves only "from whoever holds
-  this capability", which the device gave to exactly one contact. Abuse is
-  counted and revoked per capability ID: a malicious contact can burn only
-  its own, never forge one that passes for another contact's. The relay
-  can't forge wakes (it never sees a wake key), only drop or replay them.
+- **Wakes are attributed by capability, never by their contents.** HPKE's
+  PSK mode lets the device check that the sender held the capability's
+  PSK, so a wake proves only "from whoever holds this capability", which
+  the device gave to exactly one contact. The assumption, stated: the PSK
+  stays secret between the device and that contact (it travels only end to
+  end and lives only in their keychains); the wake public key needs no
+  secrecy. Abuse is counted and revoked per capability ID: a malicious
+  contact can burn only its own, never forge one that passes for another
+  contact's. The relay can't forge wakes (it never sees a PSK), only drop
+  or replay them.
 - **What it learns:** a push token (which Apple can tie to an Apple ID),
   how many capabilities a registration has, and when each fires. Timing is
   the residual leak, shared with Apple; random delay, coalescing and cover

@@ -64,9 +64,10 @@ is already running.
 ```text
  sender S (a contact of D)          wake relay R                 APNs           D's phone
  ─────────────────────────          ────────────                 ────           ─────────
- holds cap_S = (id_S, pk_S)
+ holds cap_S = (id_S, pk_S, psk_S)
  send message over Mycel ──────────────────────────────────────────────────────▶ (asleep)
- wake = id_S ‖ HPKE(pk_S, hint) ─▶ look up id_S → token_D
+ wake = id_S ‖ HPKE(pk_S, psk_S, ─▶ look up id_S → token_D
+               hint)
    (through a one-hop proxy        rate-limit id_S
     or OHTTP, never directly)      jitter, coalesce
                                    push {mutable-content,
@@ -110,10 +111,12 @@ token (APNs rotates them) uses the same `reg_key`.
 D asks R for capability IDs: `Mint { reg_id, n, sig }` → `[id_1 … id_n]`,
 each 128 random bits, stored by R as `id_i → reg_id`. D keeps a pool, and
 for each contact (or conversation) takes one ID, generates a fresh X25519
-*wake key pair* `(wake_sk_i, wake_pk_i)` for it, records `id_i → (wake_sk_i,
-contact, expiry)`, and hands the contact, inside the trust layer,
-`cap_i = (relay URL, id_i, wake_pk_i, expiry)`. The capability travels only
-end to end; R never learns who holds which `id`, and never sees a wake key.
+*wake key pair* `(wake_sk_i, wake_pk_i)` and a fresh 32-byte random
+*wake PSK* `psk_i` for it, records `id_i → (wake_sk_i, psk_i, contact,
+expiry)`, and hands the contact, inside the trust layer,
+`cap_i = (relay URL, id_i, wake_pk_i, psk_i, expiry)`. The capability
+travels only end to end; R never learns who holds which `id`, and never
+sees a wake key or a PSK.
 Two capabilities share nothing but the relay URL (which every user of that
 relay shares), so contacts comparing theirs learn nothing.
 
@@ -127,16 +130,27 @@ After S sends D a message that D hasn't acknowledged within a short grace
 period (so a device that is awake and connected is never pushed), S sends:
 
 ```text
-Wake { id_S, blob }    blob = HPKE.Seal(wake_pk_S, info = "mycel/v0/wake", aad = id_S, pt = pad(hint, 64))
+Wake { id_S, blob }    blob = HPKE.SealPSK(wake_pk_S, info = "mycel/v0/wake", aad = id_S,
+                                       psk = psk_S, psk_id = id_S, pt = pad(hint, 64))
 ```
 
-- HPKE is RFC 9180 base mode with DHKEM(X25519, HKDF-SHA256), HKDF-SHA256
-  and ChaCha20-Poly1305: standard, widely reviewed, no custom cryptography.
-- Base mode authenticates no sender: anyone holding `cap_S` (S, or anyone
-  S leaked it to) can seal a valid blob for `id_S`, and nobody without it
-  can. That is the property the design relies on: a wake proves only "from
-  whoever holds `cap_S`", and D, which gave `cap_S` to exactly one contact,
-  knows who that is. So the blob doesn't name its sender; `id_S` does.
+- HPKE is RFC 9180 **PSK mode** (`mode_psk`, §5.1.2) with DHKEM(X25519,
+  HKDF-SHA256), HKDF-SHA256 and ChaCha20-Poly1305: standard, widely
+  reviewed, no custom cryptography.
+- Why PSK mode: a wake must prove it came from the holder of `cap_S`. Base
+  mode can't say that, because it treats the recipient key as public and
+  authenticates no sender, so whoever learned `wake_pk_S` could seal a
+  blob that opens. PSK mode is the standard way for the recipient to
+  check that the sender possessed a given pre-shared key: a blob opens
+  only for someone holding `psk_S` (32 random bytes, the full entropy RFC
+  9180 §9.5 asks of a PSK). The assumption the design relies on, stated
+  plainly: **`psk_S` stays secret between D and S** (it travels only
+  inside the end-to-end encrypted trust layer and is stored only in D's
+  and S's keychains). `wake_pk_S` needs no secrecy. A wake then proves only
+  "from whoever holds `cap_S`", and D, which gave `cap_S` to exactly one
+  contact, knows who that is. So the blob doesn't name its sender; `id_S`
+  does. (PSK mode doesn't distinguish D from S, which is moot: D is the
+  recipient.)
 - `hint` is the smallest thing that lets the NSE fetch quickly: a send
   timestamp (for replay detection) and an optional index into the
   conversation's known keepers. No node ID, and nothing the NSE trusts:
@@ -175,8 +189,9 @@ generic; the NSE replaces it.
 For each entry the NSE looks up `id_S` in its capability table (from the
 Keychain, in an access group shared with the extension;
 `AfterFirstUnlockThisDeviceOnly`), skipping unknown, revoked or expired
-IDs; opens the blob with `wake_sk_S` and `aad = id_S` (a blob moved to
-another ID fails to open); drops timestamps it has seen (replays); then
+IDs; opens the blob with `wake_sk_S`, `psk_S`, `psk_id = id_S` and
+`aad = id_S` (a blob moved to another ID, or sealed without `psk_S`, fails
+to open); drops timestamps it has seen (replays); then
 runs a cut-down Mycel fetch: connect to S, the contact `id_S` was given to
 (or its carriers and the conversation's keepers), over Iroh, pull the pending envelopes into a
 staging inbox in the app group container, decrypt only enough to pick the
@@ -188,7 +203,8 @@ time, it shows "You may have new messages".
 
 Forged wakes can come from whoever holds `cap_S`: S, anyone S leaked it
 to, or R if it obtained the capability. R alone can't forge one (it never
-sees `wake_pk_S`), but it can replay or drop real ones. Each forgery or
+sees `psk_S`; HPKE's PSK mode, not the secrecy of `wake_pk_S`, is what
+stops it), but it can replay or drop real ones. Each forgery or
 replay costs one fetch and one generic alert, counts against `id_S` only,
 and the timestamp lets the NSE drop replays it has seen.
 
@@ -213,7 +229,7 @@ and the timestamp lets the NSE drop replays it has seen.
 | Wake relay R | a push token and `reg_pk`; how many capabilities a registration has; when each capability fires (timing, counts); the proxy's address | D's or S's identity, IP addresses (with the proxy), message content, sizes or recipients beyond "this token" |
 | Apple (APNs) | the token, which it ties to the device and Apple ID; push timing and counts; R's address | the blob's plaintext; anything about S |
 | The one-hop proxy / OHTTP relay | S's address; that S talks to R | `id_S` and the blob (encrypted to R / opaque) |
-| A contact S | its own `id_S` and `wake_pk_S` | D's other capabilities (or that two capabilities belong to one device); D's token |
+| A contact S | its own `id_S`, `wake_pk_S` and `psk_S` | D's other capabilities (or that two capabilities belong to one device); D's token |
 | An eavesdropper on S's or D's network | that S talks to the proxy; that D gets APNs pushes | anything inside TLS or the blob |
 
 **Timing is the real leak.** R and Apple see when D is woken, which follows
