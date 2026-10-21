@@ -44,6 +44,12 @@ The first public version. It contains:
 - **SDK and CLI:** `@mycel/sdk` (TypeScript client, Tauri/HTTP/mock
   transports, React hooks) and the `mycel` CLI (`serve`, `keeper`, `id`,
   `call`).
+- **Phones in the background:** Android restarts its `connectedDevice`
+  foreground service after a reboot, an update or being killed, with a
+  WorkManager catch-up as a backstop, and explains before asking to be let
+  off battery optimisation; iPhone and iPad catch up through
+  `BGTaskScheduler` and keep Bluetooth links in the background with state
+  restoration ("slow mode", said so in the app).
 - **Simulator and benchmarks:** `mycel-sim`, with real nodes over emulated
   radios and up to 10,000+ virtual devices in virtual time, and replays
   against The ONE's routers on real contact traces.
@@ -54,8 +60,9 @@ The first public version. It contains:
 - Peer-to-peer Wi-Fi, and Bluetooth and Wi-Fi Direct on Linux, are tested
   on emulated links, not between real devices. Windows and Linux apps have
   run on CI machines only, Android on the emulator only.
-- A suspended iPhone or iPad doesn't receive messages until Mycel is opened
-  again.
+- A suspended iPhone or iPad runs in slow mode (background refresh and
+  Bluetooth catch-ups): new messages may wait until Mycel is opened. The
+  optional wake relay is a design only (docs/WAKE_RELAY.md).
 - Every device must run the same build.
 
 More in [ARCHITECTURE.md](docs/ARCHITECTURE.md) §7 and

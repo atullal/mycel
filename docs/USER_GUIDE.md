@@ -50,7 +50,10 @@ Without the network permissions, devices can't see or reach each other.
   work), Bluetooth, and on first use the microphone, camera and photos.
   Notifications are asked for while the app is open.
 - **Android:** notifications (Android 13 and later), and the microphone and
-  camera on the first call.
+  camera on the first call. **Profile > In the background** explains why
+  Mycel asks to run unrestricted in the background, and offers Android's
+  prompt; allow it to stay connected (see
+  [Keeping Mycel running on Android](#keeping-mycel-running-on-android)).
 - **Windows:** Windows Firewall asks the first time Mycel listens; allow
   private networks for discovery on the LAN. Video calls need the camera
   allowed for desktop apps (**Settings > Privacy & security > Camera**).
@@ -259,10 +262,51 @@ details > **Keepers** > **Add a keeper**. Only the conversation's admin can
 add keepers. Now A can send while B is offline and quit; B gets the
 messages from the keeper later.
 
-A suspended iPhone or iPad doesn't receive messages until Mycel is opened
-again: waking it would need Apple's push service, which needs a server.
-Calls continue in the background. Android keeps Mycel running in the
-background, with a quiet "Mycel is connected" notification.
+### iPhone and iPad: slow mode
+
+iOS pauses Mycel soon after you leave it, and Mycel has no push server, so
+nothing can wake it the moment a message is sent. It catches up when iOS
+lends it time (a few times a day if you use it often, more while
+charging), over Bluetooth when a device running Mycel is nearby, and when
+you open it. **New messages may wait until you open Mycel.** Swiping Mycel
+away in the app switcher stops the background checks until you open it
+again, so leave it in the switcher. Calls continue in the background.
+**Profile > In the background** says when the last background check ran.
+
+### Keeping Mycel running on Android
+
+Android keeps Mycel running in the background, with a quiet "Mycel is
+connected" notification, and starts it again after the phone restarts or
+Mycel is updated (once you've opened it at least once). Phones still stop
+it to save battery, in two ways:
+
+1. **Android's battery optimisation.** Open **Profile > In the background**
+   and tap **Allow background use**, then **Allow**. Or: **Settings > Apps >
+   Mycel > Battery > Unrestricted** (the names vary a little by phone). If
+   the card says background use is *restricted*, that's the same setting.
+   An app you don't open for several days lands in Android's most
+   restricted group, where it may not run at all: open Mycel now and then.
+2. **The manufacturer's own battery manager**, on top of Android's. Menu
+   names change between versions; [dontkillmyapp.com](https://dontkillmyapp.com)
+   keeps an up-to-date list per brand.
+   - **Samsung:** **Settings > Battery > Background usage limits**: take Mycel
+     out of *Sleeping apps* and *Deep sleeping apps*, add it to *Never
+     sleeping apps*, and turn off *Put unused apps to sleep*. Recheck after
+     a system update.
+   - **Xiaomi, Redmi, POCO:** **Settings > Apps > Mycel**: turn on
+     *Autostart*, set *Battery saver* to *No restrictions*; lock Mycel in
+     the recent apps screen (drag its card down or tap the padlock).
+   - **Huawei, Honor:** **Settings > Battery > App launch**: set Mycel to
+     *Manage manually* and turn on all three switches.
+   - **OnePlus, OPPO, realme:** **Settings > Apps > Mycel > Battery**: allow
+     background activity and auto-launch, turn off battery optimisation;
+     lock Mycel in the recent apps screen. OnePlus has been seen reverting
+     the setting: check it now and then.
+   - **Google Pixel and phones close to stock Android:** step 1 is enough.
+
+Swiping Mycel away from the recent apps keeps it running on stock
+Android; on some brands it stops it until you open it again, unless it's
+locked there.
 
 ## 10. Where data and logs live
 
@@ -352,7 +396,8 @@ or script it with `mycel call <command> '<json>'`
   newer one.
 
 **Messages stuck on the clock mark or *sent*.** The other side is offline
-or unreachable. In the Network panel it should show as *Connected* or *On
+or unreachable. If it's a phone, it may be asleep: an iPhone in slow mode,
+or an Android phone whose battery settings stop Mycel (§9). In the Network panel it should show as *Connected* or *On
 your network*. Messages are delivered automatically when it comes back.
 
 **"Mycel is damaged and can't be opened"** (macOS). Gatekeeper's quarantine

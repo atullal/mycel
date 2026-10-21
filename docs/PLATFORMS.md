@@ -24,8 +24,8 @@ Installing, permissions, logs and troubleshooting: [USER_GUIDE.md](USER_GUIDE.md
 | Voice calls | echo cancelled | echo cancelled | echo cancelled⁵ | no echo cancellation⁶ | no echo cancellation⁶ |
 | Sending video | yes | yes, camera untested on a device³ | yes⁸ | yes⁸ | yes, with GStreamer's H.264 encoders⁸ |
 | Opening a received file | default app | share sheet | "Open with" | default app | default app |
-| Keeps running in the background | yes | during calls⁷ | yes⁷ | yes | yes |
-| Notifications (new messages, incoming calls)⁹ | yes | yes, while running | yes | yes | yes |
+| Keeps running in the background | yes | slow mode⁷ | yes⁷ | yes | yes |
+| Notifications (new messages, incoming calls)⁹ | yes | yes, while running⁷ | yes | yes | yes |
 
 **How each was tested:**
 - **macOS:** the full Rust test suite; the app on real Macs, on the LAN and
@@ -62,16 +62,13 @@ Installing, permissions, logs and troubleshooting: [USER_GUIDE.md](USER_GUIDE.md
    interfaces on one Mac).
 5. AAudio's voice-communication input preset (`crates/mycel-call/src/android.rs`).
 6. Plain devices through `cpal`: use headphones, or the far end hears itself.
-7. **Android:** a foreground service (`MycelService`, a quiet "Mycel is
+7. See [Background delivery without a server](#background-delivery-without-a-server).
+   **Android:** a foreground service (`MycelService`, a quiet "Mycel is
    connected" notification) keeps the runtime running with the app in the
-   background or swiped away from recents; opening it again gets a new
-   window on the same runtime. Tested on the emulator. **iPhone and iPad:**
-   iOS suspends apps. Calls carry on in the background (background audio),
-   and going to the background asks iOS for its usual grace period so sends
-   finish. After that, messages arrive when Mycel is opened again, or
-   through a keeper or store-and-forward on other devices. Waking a
-   suspended iPhone needs Apple's push service, which needs a server; Mycel
-   has none.
+   background or swiped away from recents, and starts again after a reboot
+   or an update. **iPhone and iPad:** slow mode. iOS suspends apps; Mycel
+   catches up when iOS lends it time and over Bluetooth, and new messages
+   may wait until it's opened. Calls carry on in the background.
 8. Android, Windows and Linux have no VideoToolbox, so the web view captures
    the camera (`getUserMedia`) and encodes H.264 with WebCodecs, in hardware
    where the platform has it, and the runtime sends those frames like a
@@ -109,6 +106,124 @@ hides. iOS slides the page under the keyboard instead of shrinking it, so the
 app sizes itself to the visible part and moves there. Both are tested: Android
 by hand on the emulator, iPhone with a UI test on the Simulator's on-screen
 keyboard (below).
+
+## Background delivery without a server
+
+Mycel has no push server, so nothing can wake a phone the moment a message
+is sent. Messages wait on the sender (and on keepers and store-and-forward
+carriers) until the recipient's device is reachable. What each phone does
+to be reachable as often as it can, and how honestly the app says so:
+
+### Android: stay connected
+
+- **`MycelService`** is a foreground service of type `connectedDevice`
+  ("interaction with external devices over Bluetooth, NFC, IR, USB, or
+  network"): it keeps the runtime's connections to nearby devices and the
+  internet open. Not `dataSync`, which Android 15 caps at 6 hours a day and
+  forbids starting after a reboot. Its prerequisite is a Wi-Fi or network
+  permission in the manifest (`CHANGE_WIFI_MULTICAST_STATE`,
+  `CHANGE_NETWORK_STATE`; no prompt). Google Play would ask for a
+  justification of the type; `specialUse` is the fallback if it's refused.
+- **No window needed.** Tauri opens the runtime when the first activity is
+  created, so the service now opens the same runtime itself when there is
+  no activity (`MycelRuntime.kt`, `src-tauri/src/android.rs`), for an
+  existing profile only, and a window opened later adopts it. That makes
+  three restarts possible:
+  - after a reboot or an update (`BootReceiver`: `BOOT_COMPLETED` and
+    `MY_PACKAGE_REPLACED`, both allowed to start a foreground service on
+    Android 12+; Android doesn't deliver them to an app that was never
+    opened or was force-stopped);
+  - after Android kills the process (`START_STICKY`). Android 12+ refuses to
+    make a restarted service foreground unless Mycel may ignore battery
+    optimisation; then it catches up once (45 s) and stops;
+  - a periodic backstop (`CatchUpWorker`, WorkManager, every 3 hours when
+    the system allows): restart the service if allowed, else one 60 s
+    catch-up. Android 16 holds jobs to runtime quotas per standby bucket,
+    so this stays short and occasional, never the delivery path.
+- **Battery optimisation.** The Profile panel's *In the background* card
+  says whether Mycel may run unrestricted and, only while it may not,
+  explains why it asks (no push server; costs some battery; reversible)
+  before offering the system prompt
+  (`ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS`, which Play allows for apps
+  that can't use push). It also flags a user restriction in Settings or the
+  "restricted" standby bucket, and gives a tip for vendors whose battery
+  managers stop apps regardless (Samsung, Xiaomi, Huawei/Honor,
+  OnePlus/OPPO/realme). The full guide is in [USER_GUIDE.md](USER_GUIDE.md#keeping-mycel-running-on-android).
+- **Notifications** carry one fixed sentence per kind ("New message"), never
+  names or text, also when they come from a background start. There is no
+  opt-in for previews.
+
+### iPhone and iPad: slow mode
+
+- **App refresh and processing.** `main.mm` registers two `BGTaskScheduler`
+  tasks before launch finishes (`dev.mycel.refresh`, 25 s;
+  `dev.mycel.processing`, up to 120 s) and asks for them each time the app
+  goes to the background. Each catch-up syncs every conversation, waits up
+  to 10 s for deliveries from keepers and carriers, and saves
+  (`src-tauri/src/background.rs`); iOS's expiration handler stops it early.
+  iOS decides when they run: typically a few times a day for an app used
+  regularly, more while charging; never after the user swipes Mycel away
+  in the app switcher, until it's opened again.
+- **Bluetooth in the background.** The `bluetooth-central` and
+  `bluetooth-peripheral` background modes keep scanning (always filtered by
+  Mycel's service, as iOS requires in the background) and advertising, and
+  CoreBluetooth events wake Mycel briefly; while awake, its LAN and
+  peer-to-peer Wi-Fi paths run too. Both managers opt into **state
+  restoration**: iOS relaunches Mycel in the background for a Bluetooth event
+  after ending it for memory (not after a swipe away). A backgrounded
+  iPhone advertises only in Apple's "overflow area", which other Apple
+  devices scanning for Mycel can see and a Linux peer can't.
+- **The grace period.** Leaving the app still asks for iOS's usual
+  background time so sends finish.
+- **What the app says.** The *In the background* card says "Slow mode: new
+  messages may wait until you open Mycel", why (no push server), what does
+  wake it, that swiping it away stops the checks, and when the last
+  background check ran. Notifications are local, one fixed sentence each.
+- **The optional wake relay** for timely delivery is a design only, off by
+  default if it is ever built: [WAKE_RELAY.md](WAKE_RELAY.md), with its
+  trust in [TRUST.md](TRUST.md#8e-optional-wake-relay-designed-not-built).
+
+### What the platforms allow (researched 2026-10)
+
+- **iOS has no server-free timely wake.** `BGAppRefreshTask` and
+  `BGProcessingTask` run when iOS chooses. iOS 26's
+  `BGContinuedProcessingTask` is for work the user starts, with visible
+  progress, not sync. PushKit VoIP pushes must report a real CallKit call
+  or iOS terminates the app. Local Push Connectivity needs an entitlement
+  and runs only on configured Wi-Fi networks, against "your server".
+  Bluetooth state restoration doesn't survive a force-quit.
+- **Wi-Fi Aware (iOS 26)** gives secure, fast peer-to-peer links to
+  *paired* devices (pairing through DeviceDiscoveryUI or AccessorySetupKit,
+  the `com.apple.developer.wifi-aware` entitlement, iPhone 12 or later).
+  Apple's documentation: apps "may connect to paired Wi-Fi Aware devices
+  whenever [they're] running, in both foreground and background states",
+  getting runtime "using any of the existing mechanisms", such as
+  BackgroundTasks. So it doesn't wake a suspended app. The EU's DMA decision
+  requires Apple to interoperate with Android's Wi-Fi Aware, but early
+  reports of iOS–Android pairing failures exist. Mycel doesn't use it yet;
+  it would be a fast local path during a catch-up or a Bluetooth wake, and
+  needs a pairing step Mycel doesn't have.
+- **iOS 27:** no primary source found for a new background or wake
+  mechanism. A secondary source describes long-running App Intents, which
+  are user-started with visible progress: not a wake.
+- **Android:** Android 14+ requires a declared type; Android 15 caps
+  `dataSync` and `mediaProcessing` and bars some types from boot receivers
+  (`connectedDevice` isn't one); Android 16 puts jobs under runtime quotas,
+  also alongside a foreground service; Android 17's confirmed change is to
+  background audio. Vendors (Samsung, Xiaomi, Huawei, OnePlus and others)
+  stop apps beyond what Android requires, which only users can undo.
+
+### How it was tested
+
+- **Unit tests (macOS):** the catch-up's budget, linger and cancellation
+  (`background.rs`, paused tokio time), one catch-up at a time (also after
+  a panic), the Kotlin status JSON mapping, the UI copy (`apps/host/tests/backgroundStatus.test.ts`),
+  and `Runtime::profile_exists`.
+- **Builds and emulator checks:** [TESTING.md](TESTING.md#phones-and-the-other-platforms).
+- **Not tested on real phones:** none of this has run on a physical Android
+  phone or iPhone. BGTaskScheduler never runs in the Simulator, and
+  Bluetooth state restoration needs a real device; vendor battery managers
+  need the vendors' phones.
 
 ## Building
 
@@ -167,8 +282,12 @@ The Xcode project is `apps/host/src-tauri/gen/apple`, generated by
 `cargo tauri ios init` and then edited: `project.yml` (frameworks the Rust
 code needs, since a static library carries no link flags) is the source for
 `mycel-host.xcodeproj`. Regenerate it with `xcodegen generate` in that folder
-(with `Externals/` empty, or the Rust library gets bundled as a resource).
-Extra Info.plist keys live in `apps/host/src-tauri/Info.ios.plist`.
+(with `Externals/` empty, or the Rust library gets bundled as a resource),
+then restore `mycel-host_iOS/Info.plist` and the scheme, which xcodegen
+rewrites. Extra Info.plist keys live in `apps/host/src-tauri/Info.ios.plist`
+(and the merged copy in `gen/apple/mycel-host_iOS/Info.plist`).
+`Sources/mycel-host/main.mm` registers the background tasks before the app
+starts.
 
 ### Android
 
@@ -190,8 +309,10 @@ The Gradle project is `apps/host/src-tauri/gen/android` (from
 `cargo tauri android init`, then edited): `MainActivity.kt` (multicast lock,
 system-bar and keyboard insets for the page, "Open with", a window for a
 reopened activity), `MycelService.kt` (the foreground service and
-notifications), `AndroidManifest.xml` (permissions) and
-`app/build.gradle.kts` (signing). Tauri's Android IPC can't carry raw bytes,
+notifications), `MycelRuntime.kt` (the runtime with no window, battery
+status), `BootReceiver.kt` and `CatchUpWorker.kt` (restarts and the
+backstop), `AndroidManifest.xml` (permissions) and `app/build.gradle.kts`
+(signing, WorkManager). Tauri's Android IPC can't carry raw bytes,
 so files and video frames cross it as base64 (`invokeBytes` in the SDK).
 
 ### Windows
