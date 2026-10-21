@@ -487,6 +487,8 @@ pub struct Replica {
     pending: HashSet<EnvelopeId>,
     /// The envelope chains held, for Sync v2 (`reconcile`).
     index: reconcile::ChainIndex,
+    /// Encoded bytes of the envelopes held (for per-peer sync budgets).
+    stored_bytes: u64,
     #[cfg(test)]
     stats: std::cell::Cell<DocStats>,
 }
@@ -557,6 +559,7 @@ impl Replica {
             doc_inputs: HashMap::new(),
             pending: HashSet::new(),
             index: reconcile::ChainIndex::default(),
+            stored_bytes: 0,
             #[cfg(test)]
             stats: Default::default(),
         }
@@ -651,6 +654,11 @@ impl Replica {
             .collect()
     }
 
+    /// Encoded bytes of every envelope held.
+    pub fn stored_bytes(&self) -> u64 {
+        self.stored_bytes
+    }
+
     pub fn envelope_ids(&self) -> Vec<EnvelopeId> {
         self.envelopes.keys().copied().collect()
     }
@@ -730,6 +738,7 @@ impl Replica {
         self.persist_envelope(&env);
         self.chains.entry(env.header.author).or_default().entry(env.header.author_seq).or_default().push(id);
         self.index.insert(id, env.header.author, env.header.author_seq, env.header.author_prev);
+        self.stored_bytes += reconcile::encoded_len(&env) as u64;
         self.envelopes.insert(id, env);
         Ok(Some(id))
     }

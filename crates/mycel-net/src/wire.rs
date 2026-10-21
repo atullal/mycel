@@ -32,6 +32,12 @@ pub enum StreamKind {
     Ephemeral = 3,
     /// Bi-stream: one blob request (see `blobs.rs`).
     Blob = 4,
+    /// Bi-stream: one Sync v2 session (`sync_v2.rs`, `mycel_sync::reconcile`).
+    /// (5 is taken by the capability hello on the `v2/wire-versioning`
+    /// branch; numbers are final when the branches merge.) A device that
+    /// doesn't know it refuses the stream, and the opener falls back to
+    /// `Sync`.
+    SyncV2 = 6,
 }
 
 impl StreamKind {
@@ -41,6 +47,7 @@ impl StreamKind {
             2 => StreamKind::Card,
             3 => StreamKind::Ephemeral,
             4 => StreamKind::Blob,
+            6 => StreamKind::SyncV2,
             _ => return None,
         })
     }
@@ -146,6 +153,17 @@ pub(crate) async fn recv_held<T: DeserializeOwned>(
     frames: &PeerFrames,
 ) -> Result<(T, FramePermit)> {
     recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, MAX_FRAME, frames).await
+}
+
+/// [`recv_held`] with a smaller frame limit (`max`): a bigger declared
+/// length is refused before anything is buffered.
+pub(crate) async fn recv_bounded<T: DeserializeOwned>(
+    r: &mut RecvStream,
+    wait: Duration,
+    max: usize,
+    frames: &PeerFrames,
+) -> Result<(T, FramePermit)> {
+    recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, max, frames).await
 }
 
 /// [`recv_held`] for messages that are always small (blob requests and

@@ -15,8 +15,12 @@
 //! messages ahead of file bytes. No handshake per sync, and the connection's
 //! extra paths (links, other interfaces) stay open and measured.
 //!
-//! Sync protocol (stream kind `Sync`), one bi-stream, strictly alternating so
-//! neither side can deadlock on flow control:
+//! Sync v2 (stream kind `SyncV2`, `sync_v2.rs` driving
+//! `mycel_sync::reconcile`): an idle check costs one round trip and a few
+//! hundred bytes, a difference costs about what differs. Devices that don't
+//! speak it refuse the stream, and the opener falls back to v1 (stream kind
+//! `Sync`), one bi-stream, strictly alternating so neither side can deadlock
+//! on flow control:
 //!
 //! ```text
 //! C → S  Hello{space, inv, invite?}
@@ -24,6 +28,15 @@
 //! C → S  DataAndWant{data, want}
 //! S → C  Data{data}
 //! ```
+//!
+//! Scheduling: after a change a device syncs the space with every member in
+//! groups of up to [`FULL_MESH`] devices, and otherwise with a bounded view
+//! (two nearby members, two chosen at random by rendezvous hash, and those
+//! that recently chose it), forwarding what it learns the same way; so a
+//! change costs O(members) sessions, not O(members²). Periodic
+//! anti-entropy backs off from 15 s to 10 min while it finds nothing, and
+//! returns to 15 s on signs of loss (a periodic session that moved items, a
+//! membership change, a local write, a newly reachable peer).
 
 mod blobs;
 pub mod emu;
@@ -33,6 +46,7 @@ pub mod mesh;
 mod native_mdns;
 mod pool;
 mod resources;
+mod sync_v2;
 pub mod wire;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -63,6 +77,7 @@ pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_fr
 pub use iroh;
 pub use link::{Link, LinkEvent, LinkStatus, PathKind, path_in_use};
 pub use mesh::{Mesh, MeshOptions, MeshRoute, MeshStats, Tap};
+pub use sync_v2::{V1_REMEMBERED, V2Totals};
 use wire::*;
 pub use wire::{ContactCard, MAX_EPHEMERAL};
 
@@ -74,7 +89,24 @@ pub const POOL_IDLE: Duration = Duration::from_secs(60);
 /// away only fails once the peer has had [`resources::REPLY_TIMEOUT`] to
 /// answer, and a passer-by who could carry it may be gone by then.
 const BUNDLE_AFTER: Duration = Duration::from_secs(10);
+/// Periodic anti-entropy: the first interval, and the cap it backs off to
+/// while periodic sessions find nothing.
 const PERIODIC_SYNC: Duration = Duration::from_secs(15);
+const PERIODIC_MAX: Duration = Duration::from_secs(600);
+/// Groups up to this size sync every member after a change; larger ones a
+/// bounded view (see the crate docs).
+pub const FULL_MESH: usize = 6;
+/// The bounded view: nearby members, random members, and at most this many
+/// members that recently chose us.
+const VIEW_NEARBY: usize = 2;
+const VIEW_RANDOM: usize = 2;
+const VIEW_INBOUND: usize = 8;
+/// The author of a change pushes it to every member in groups up to this
+/// size (one hop to everyone it can reach, O(members) sessions); larger
+/// groups use the bounded view for the author too.
+pub const AUTHOR_FULL: usize = 32;
+/// Views are re-drawn this often.
+const VIEW_EPOCH: Duration = Duration::from_secs(600);
 /// How long shutting down waits for peers to acknowledge the close.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const ONLINE_WINDOW: Duration = Duration::from_secs(45);
@@ -145,6 +177,10 @@ pub struct NodeOptions {
     /// device. What is queued for the app (up to 1024 events) can hold
     /// that much per event.
     pub max_ephemeral: usize,
+    /// Speak Sync v2 (default). Off: behave as a build without it (only
+    /// v1 sessions, refuse `SyncV2` streams, sync every member), for mixed
+    /// groups in tests and v1 baselines.
+    pub sync_v2: bool,
 }
 
 /// Another protocol served on the node's endpoint: incoming connections with
@@ -173,6 +209,7 @@ impl NodeOptions {
             extra_protocols: Vec::new(),
             mesh: None,
             max_ephemeral: MAX_EPHEMERAL,
+            sync_v2: true,
         }
     }
 }
@@ -288,6 +325,71 @@ struct Inner {
     /// the rest (`resources.rs`).
     member_frames: resources::Frames,
     stranger_frames: resources::Frames,
+    /// See [`NodeOptions::sync_v2`].
+    sync_v2: bool,
+    /// Spaces with a local write since the last periodic round (sessions
+    /// then send the frontier in `Open`, saving a round trip).
+    local_writes: Mutex<HashSet<SpaceId>>,
+    /// Spaces with a local write not yet pushed (the author pushes to more
+    /// members than a forwarder: see [`AUTHOR_FULL`]).
+    dirty_local: Mutex<HashSet<SpaceId>>,
+    v2: sync_v2::V2,
+    /// Periodic anti-entropy schedule per space.
+    periodic: Mutex<HashMap<SpaceId, Backoff>>,
+}
+
+/// Why a sync runs: only some outcomes are signs of loss for the backoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Trigger {
+    /// A local write or forwarded items (event-driven).
+    Change,
+    /// Periodic anti-entropy.
+    Periodic,
+    /// A peer became reachable.
+    Discovery,
+    /// The app asked.
+    Manual,
+}
+
+/// Idle backoff for periodic anti-entropy in one space: the interval starts
+/// at [`PERIODIC_SYNC`] and doubles each round up to [`PERIODIC_MAX`],
+/// unless a sign of loss arrived since the last round, which brings it back
+/// to the start. Rounds are jittered ±20% so devices don't synchronise.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Backoff {
+    interval: Duration,
+    next: Instant,
+    reset: bool,
+}
+
+impl Backoff {
+    /// The first round comes soon (within ~2 s): it also tells the members
+    /// of our view that we chose them, so they push to us (symmetric edges).
+    fn new(now: Instant, jitter: f64) -> Self {
+        Backoff { interval: PERIODIC_SYNC / 2, next: now + (PERIODIC_SYNC / 8).mul_f64(jitter), reset: true }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next
+    }
+
+    /// A round runs now; `jitter` in [0.8, 1.2].
+    fn round(&mut self, now: Instant, jitter: f64) {
+        self.interval = if self.reset { PERIODIC_SYNC } else { (self.interval * 2).min(PERIODIC_MAX) };
+        self.reset = false;
+        self.next = now + self.interval.mul_f64(jitter);
+    }
+
+    /// A sign of loss: the next round comes within the first interval.
+    fn signal(&mut self, now: Instant) {
+        self.reset = true;
+        self.interval = PERIODIC_SYNC;
+        self.next = self.next.min(now + PERIODIC_SYNC);
+    }
+}
+
+fn jitter() -> f64 {
+    (0.8 + (mycel_crypto::random_u64() % 4001) as f64 / 10_000.0).min(1.2)
 }
 
 /// How many QUIC connections (handshakes) a node has made.
@@ -421,7 +523,8 @@ impl Inner {
             let shared: Vec<SpaceId> =
                 self.spaces.lock().iter().filter(|(_, r)| r.is_member(&peer)).map(|(s, _)| *s).collect();
             for s in shared {
-                tokio::spawn(sync_once(self.clone(), peer, s));
+                self.loss_signal(s);
+                tokio::spawn(sync_once(self.clone(), peer, s, Trigger::Discovery));
             }
         }
     }
@@ -546,6 +649,93 @@ impl Inner {
         self.wake.notify_one();
     }
 
+    /// New items arrived in `space` (from any sync or a bundle): tell the
+    /// app and forward them (epidemic: others may not reach the author). A
+    /// membership change is also a sign of loss for the backoff.
+    fn on_new_items(&self, space: SpaceId, membership: bool) {
+        self.emit(NetEvent::SpaceChanged { space });
+        if membership {
+            self.loss_signal(space);
+        }
+        self.schedule(space);
+    }
+
+    /// Did we write to `space` locally since the last periodic round? Then
+    /// a session sends its frontier in `Open` (saving a round trip) even
+    /// without a record of the peer.
+    fn dirty_since_last(&self, _peer: &SignPk, space: &SpaceId) -> bool {
+        self.local_writes.lock().contains(space)
+    }
+
+    /// See [`Backoff::signal`].
+    fn loss_signal(&self, space: SpaceId) {
+        let now = Instant::now();
+        let mut periodic = self.periodic.lock();
+        periodic.entry(space).or_insert_with(|| Backoff::new(now, jitter())).signal(now);
+        drop(periodic);
+        self.wake.notify_one();
+    }
+
+    /// Who to sync `space` with after a change or in a periodic round
+    /// (excluding us): every member in small groups and on builds without
+    /// v2; otherwise the bounded view (see the crate docs).
+    fn targets(&self, space: &SpaceId, r: &Replica, peers: &HashMap<SignPk, PeerState>, local: bool) -> Vec<SignPk> {
+        let me = self.keys.sign_pk();
+        let members: Vec<SignPk> = r.members().into_iter().map(|(k, _)| k.sign_pk).filter(|pk| *pk != me).collect();
+        let full = if local { AUTHOR_FULL } else { FULL_MESH };
+        if !self.sync_v2 || members.len() <= full {
+            return members;
+        }
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() / VIEW_EPOCH.as_secs());
+        let score =
+            |p: &SignPk| Hash32::digest("mycel/v2/view", &[&space.0[..], &me.0, &p.0, &epoch.to_le_bytes()].concat());
+        let mut ranked: Vec<(Hash32, SignPk)> = members.iter().map(|p| (score(p), *p)).collect();
+        ranked.sort();
+        let mut out: Vec<SignPk> = ranked
+            .iter()
+            .filter(|(_, p)| peers.get(p).is_some_and(PeerState::is_directly_discovered))
+            .take(VIEW_NEARBY)
+            .map(|(_, p)| *p)
+            .collect();
+        // Random edges (by rendezvous hash over the whole member list, so
+        // physical clusters can't split the overlay).
+        let nearby = out.len();
+        for (_, p) in &ranked {
+            if out.len() >= nearby + VIEW_RANDOM {
+                break;
+            }
+            if !out.contains(p) {
+                out.push(*p);
+            }
+        }
+        for p in self.v2.inbound(space, VIEW_INBOUND) {
+            if members.contains(&p) && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        // Members on builds without v2 still re-sync epidemically with
+        // everyone; only the two members nearest each of them by
+        // rendezvous hash push to it, so they hear of changes once.
+        for v in self.v2.v1_only_peers() {
+            if out.contains(&v) || !members.contains(&v) {
+                continue;
+            }
+            let mut by: Vec<(Hash32, SignPk)> = members
+                .iter()
+                .chain(std::iter::once(&me))
+                .filter(|m| **m != v)
+                .map(|m| (Hash32::digest("mycel/v2/v1-designated", &[&space.0[..], &v.0, &m.0].concat()), *m))
+                .collect();
+            by.sort();
+            if by.iter().take(2).any(|(_, m)| *m == me) {
+                out.push(v);
+            }
+        }
+        out
+    }
+
     /// Blobs are stored per space: a member of one space can't fetch or fill
     /// another space's blobs.
     fn blob_path(&self, space: &SpaceId, hash: &Hash32) -> Option<PathBuf> {
@@ -567,9 +757,7 @@ impl Inner {
             res
         };
         if res.changed() {
-            self.emit(NetEvent::SpaceChanged { space: *space });
-            // Epidemic forwarding: others may not be reachable by the author.
-            self.schedule(*space);
+            self.on_new_items(*space, res.ops > 0);
         } else if !sent.is_empty() {
             // delivery status changed
             self.emit(NetEvent::SpaceChanged { space: *space });
@@ -692,15 +880,24 @@ async fn serve_bi(
     inner: &Arc<Inner>,
     conn: &Connection,
     peer: SignPk,
-    tx: SendStream,
+    mut tx: SendStream,
     mut rx: RecvStream,
 ) -> Result<()> {
-    let kind = stream_kind(&mut rx).await?;
+    let kind = match stream_kind(&mut rx).await {
+        Ok(kind) => kind,
+        Err(e) => {
+            // An unknown kind (a newer build's) is refused at once, so the
+            // opener can fall back instead of waiting for a timeout.
+            sync_v2::refuse_stream(&mut tx, &mut rx);
+            return Err(e);
+        }
+    };
     tx.set_priority(kind.priority()).ok();
     match kind {
         // No total deadline: over a slow link a large sync takes minutes,
         // and each wait inside is bounded while bytes keep moving.
         StreamKind::Sync => serve_sync(inner, conn, peer, tx, rx).await,
+        StreamKind::SyncV2 => sync_v2::serve(inner, conn, peer, tx, rx).await,
         StreamKind::Card => serve_card(inner, tx).await,
         StreamKind::Blob => blobs::serve(inner, peer, tx, rx).await,
         StreamKind::Ephemeral => bail!("ephemeral messages use uni-streams"),
@@ -911,6 +1108,13 @@ pub(crate) async fn open_bi(conn: &Connection, kind: StreamKind) -> Result<(Send
 }
 
 async fn sync_session(inner: &Arc<Inner>, peer: SignPk, space: SpaceId, trust_peer: bool) -> Result<SyncStats> {
+    if inner.sync_v2 && !inner.v2.is_v1_only(&peer) {
+        let eager = inner.dirty_since_last(&peer, &space);
+        if let Some(stats) = sync_v2::sync(inner, peer, space, trust_peer, eager).await? {
+            return Ok(stats);
+        }
+        // The peer doesn't speak v2 (remembered): v1 below.
+    }
     let hello =
         inner.with_space(&space, |r| (trust_peer || r.is_member(&peer)).then(|| (inventory(r), r.all_ops())))?;
     let (inv, ops) = hello.ok_or_else(|| anyhow!("peer is not a member of this space"))?;
@@ -971,7 +1175,7 @@ async fn sync_exchange(
     Ok(inner.ingest(&space, peer, data, &sent))
 }
 
-async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
+async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Trigger) {
     {
         let mut inflight = inner.inflight.lock();
         if let Some(again) = inflight.get_mut(&(peer, space)) {
@@ -995,8 +1199,13 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
             }
         };
         let ok = res.is_ok();
-        if ok {
+        if let Ok(stats) = &res {
             inner.mark_ok(peer);
+            // A periodic session that found something means pushes are
+            // being missed: back to the short interval.
+            if trigger == Trigger::Periodic && sync_v2::moved(stats) {
+                inner.loss_signal(space);
+            }
         } else {
             inner.mark_fail(peer);
             inner.offer_bundle(peer, space);
@@ -1012,39 +1221,60 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
     }
 }
 
-/// Push dirty spaces to their members; periodically sync everything.
+/// Push dirty spaces to their members (or the bounded view); run periodic
+/// anti-entropy per space on its backoff schedule.
 async fn scheduler(inner: Arc<Inner>) {
-    let mut last_full = Instant::now();
     loop {
+        let wait = {
+            let now = Instant::now();
+            let periodic = inner.periodic.lock();
+            periodic.values().map(|b| b.next.saturating_duration_since(now)).min().unwrap_or(PERIODIC_SYNC)
+        };
         tokio::select! {
             _ = inner.wake.notified() => {}
-            _ = tokio::time::sleep(PERIODIC_SYNC) => {}
+            _ = tokio::time::sleep(wait.max(DEBOUNCE)) => {}
         }
         tokio::time::sleep(DEBOUNCE).await;
-        let periodic = last_full.elapsed() >= PERIODIC_SYNC;
         let explicit: HashSet<SpaceId> = std::mem::take(&mut *inner.dirty.lock());
-        let mut dirty = explicit.clone();
-        if periodic {
-            last_full = Instant::now();
-            dirty.extend(inner.spaces.lock().keys().copied());
-        }
-        let me = inner.keys.sign_pk();
-        let targets: Vec<(SignPk, SpaceId)> = {
-            let spaces = inner.spaces.lock();
-            let peers = inner.peers.lock();
-            dirty
-                .iter()
-                .filter_map(|s| spaces.get(s).map(|r| (s, r)))
-                // No longer a member: only push explicit local changes (e.g. our
-                // own Leave op); periodic syncs would just be refused.
-                .filter(|(s, r)| explicit.contains(*s) || r.my_role().is_some())
-                .flat_map(|(s, r)| r.members().into_iter().map(move |(k, _)| (k.sign_pk, *s)).collect::<Vec<_>>())
-                .filter(|(pk, _)| *pk != me)
-                .filter(|(pk, _)| !peers.get(pk).is_some_and(|p| p.backing_off() && !p.nearby))
+        let local: HashSet<SpaceId> = std::mem::take(&mut *inner.dirty_local.lock());
+        let now = Instant::now();
+        let due: HashSet<SpaceId> = {
+            let spaces: Vec<SpaceId> = inner.spaces.lock().keys().copied().collect();
+            let mut periodic = inner.periodic.lock();
+            periodic.retain(|s, _| spaces.contains(s));
+            spaces
+                .into_iter()
+                .filter(|s| {
+                    let b = periodic.entry(*s).or_insert_with(|| Backoff::new(now, jitter()));
+                    let due = b.due(now);
+                    if due {
+                        b.round(now, jitter());
+                        inner.local_writes.lock().remove(s);
+                    }
+                    due
+                })
                 .collect()
         };
-        for (peer, space) in targets {
-            tokio::spawn(sync_once(inner.clone(), peer, space));
+        let targets: Vec<(SignPk, SpaceId, Trigger)> = {
+            let spaces = inner.spaces.lock();
+            let peers = inner.peers.lock();
+            explicit
+                .iter()
+                .map(|s| (*s, Trigger::Change))
+                .chain(due.iter().filter(|s| !explicit.contains(*s)).map(|s| (*s, Trigger::Periodic)))
+                .filter_map(|(s, t)| spaces.get(&s).map(|r| (s, t, r)))
+                // No longer a member: only push explicit local changes (e.g. our
+                // own Leave op); periodic syncs would just be refused.
+                .filter(|(s, _, r)| explicit.contains(s) || r.my_role().is_some())
+                .flat_map(|(s, t, r)| {
+                    let local = t == Trigger::Change && local.contains(&s);
+                    inner.targets(&s, r, &peers, local).into_iter().map(move |pk| (pk, s, t)).collect::<Vec<_>>()
+                })
+                .filter(|(pk, _, _)| !peers.get(pk).is_some_and(|p| p.backing_off() && !p.nearby))
+                .collect()
+        };
+        for (peer, space, trigger) in targets {
+            tokio::spawn(sync_once(inner.clone(), peer, space, trigger));
         }
     }
 }
@@ -1086,7 +1316,8 @@ fn on_lan_discovery(inner: &Arc<Inner>, source: &'static str, ev: DiscoveryEvent
                 let shared: Vec<SpaceId> =
                     inner.spaces.lock().iter().filter(|(_, r)| r.is_member(&pk)).map(|(s, _)| *s).collect();
                 for s in shared {
-                    tokio::spawn(sync_once(inner.clone(), pk, s));
+                    inner.loss_signal(s);
+                    tokio::spawn(sync_once(inner.clone(), pk, s, Trigger::Discovery));
                 }
             }
         }
@@ -1269,6 +1500,11 @@ impl Node {
             max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
             member_frames: resources::Frames::members(),
             stranger_frames: resources::Frames::strangers(),
+            sync_v2: opts.sync_v2,
+            local_writes: Mutex::default(),
+            dirty_local: Mutex::default(),
+            v2: sync_v2::V2::default(),
+            periodic: Mutex::default(),
         });
         let mut router = Router::builder(endpoint).accept(ALPN, Handler { inner: inner.clone() });
         for p in opts.extra_protocols {
@@ -1447,7 +1683,16 @@ impl Node {
     /// Local change happened: push to members soon and notify the app.
     pub fn changed(&self, space: SpaceId) {
         self.inner.emit(NetEvent::SpaceChanged { space });
+        self.inner.local_writes.lock().insert(space);
+        self.inner.dirty_local.lock().insert(space);
+        self.inner.loss_signal(space);
         self.inner.schedule(space);
+    }
+
+    /// Sync v2 counters (sessions, fallbacks, bytes): for tests and the
+    /// Network panel.
+    pub fn sync_v2_totals(&self) -> V2Totals {
+        self.inner.v2.totals()
     }
 
     /// One full bidirectional sync of `space` with `peer`, now.
@@ -1470,7 +1715,7 @@ impl Node {
             self.with_space(&space, |r| r.members().into_iter().map(|(k, _)| k.sign_pk).collect()).unwrap_or_default();
         let mut set = tokio::task::JoinSet::new();
         for pk in members.into_iter().filter(|p| *p != me) {
-            set.spawn(sync_once(self.inner.clone(), pk, space));
+            set.spawn(sync_once(self.inner.clone(), pk, space, Trigger::Manual));
         }
         while set.join_next().await.is_some() {}
     }
@@ -1588,6 +1833,35 @@ impl Node {
 mod discovery_tests {
     use super::*;
     use link::{CustomAddr, TRANSPORT_BLUETOOTH, TRANSPORT_MESH, TRANSPORT_PEER_WIFI};
+
+    #[test]
+    fn periodic_backoff_doubles_to_its_cap_and_resets_on_loss() {
+        let t0 = Instant::now();
+        let mut b = Backoff::new(t0, 1.0);
+        assert!(b.next - t0 <= Duration::from_secs(2), "the first round comes soon");
+        let mut now = b.next;
+        b.round(now, 1.0);
+        assert_eq!(b.interval, PERIODIC_SYNC);
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            now = b.next;
+            b.round(now, 1.0);
+            seen.push(b.interval.as_secs());
+        }
+        assert_eq!(seen, [30, 60, 120, 240, 480, 600, 600, 600]);
+        // A sign of loss: the next round is within the first interval, and
+        // the schedule starts over.
+        let mid = now + Duration::from_secs(100);
+        b.signal(mid);
+        assert!(b.next <= mid + PERIODIC_SYNC);
+        b.round(b.next, 1.0);
+        assert_eq!(b.interval, PERIODIC_SYNC);
+        b.round(b.next, 1.0);
+        assert_eq!(b.interval, PERIODIC_SYNC * 2);
+        for _ in 0..1000 {
+            assert!((0.8..=1.2).contains(&jitter()));
+        }
+    }
 
     #[test]
     fn direct_discovery_excludes_mesh_and_recent_exchanges() {
