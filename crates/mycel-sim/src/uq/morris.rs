@@ -10,6 +10,13 @@
 //! μ* (the mean of |EE|) ranks importance; σ (their spread) flags
 //! interactions or non-linearity. It costs r(k + 1) runs, against
 //! N(k + 2) for Sobol indices, and drops the factors not worth an emulator.
+//!
+//! A simulation is noisy: even an inert factor gets |EE| > 0 from seed
+//! noise. [`noise_floors`] estimates, per factor, the μ* that seed noise
+//! alone would give, from the spread over seeds of each elementary effect
+//! (paired on the same seeds, so common random numbers count). A factor
+//! whose μ* interval does not clear its floor is not distinguishable from
+//! noise at this many seeds.
 
 use serde::{Deserialize, Serialize};
 
@@ -66,6 +73,17 @@ pub struct Effect {
     pub mu: f64,
     /// Standard deviation of EE: interaction or non-linearity.
     pub sigma: f64,
+    /// The μ* seed noise alone would give ([`noise_floors`]; 0 if not
+    /// estimated).
+    #[serde(default)]
+    pub noise_floor: f64,
+}
+
+impl Effect {
+    /// μ*'s interval clears the noise floor.
+    pub fn above_noise(&self) -> bool {
+        self.mu_star_ci.0 > self.noise_floor
+    }
 }
 
 /// Effects from the outputs `y[t][j]` at each trajectory's points, ranked
@@ -101,11 +119,36 @@ pub fn effects(trajs: &[Trajectory], y: &[Vec<f64>], names: &[String], rng: &mut
                 .collect();
             boots.sort_by(f64::total_cmp);
             let ci = (boots[12], boots[487]);
-            Effect { factor: i, name: names[i].clone(), mu_star, mu_star_ci: ci, mu, sigma }
+            Effect { factor: i, name: names[i].clone(), mu_star, mu_star_ci: ci, mu, sigma, noise_floor: 0.0 }
         })
         .collect();
     out.sort_by(|a, b| b.mu_star.total_cmp(&a.mu_star));
     out
+}
+
+/// Per factor, the μ* that seed noise alone would give: for each
+/// elementary effect, the standard error of its mean over seeds (from the
+/// per-seed effects, `values[t][j][s]` = trajectory t, point j, seed s),
+/// times E|Z| = √(2/π) for a normal Z, averaged over the factor's effects.
+/// With fewer than two seeds there is no estimate (0).
+pub fn noise_floors(trajs: &[Trajectory], values: &[Vec<Vec<f64>>], k: usize) -> Vec<f64> {
+    let mut sum = vec![0.0; k];
+    let mut cnt = vec![0usize; k];
+    for (t, ys) in trajs.iter().zip(values) {
+        for (j, (i, step)) in t.moves.iter().enumerate() {
+            let d: Vec<f64> =
+                ys[j].iter().zip(&ys[j + 1]).map(|(a, b)| (b - a) / step).filter(|v| v.is_finite()).collect();
+            if d.len() < 2 {
+                continue;
+            }
+            let n = d.len() as f64;
+            let m = d.iter().sum::<f64>() / n;
+            let sd = (d.iter().map(|v| (v - m).powi(2)).sum::<f64>() / (n - 1.0)).sqrt();
+            sum[*i] += sd / n.sqrt() * (2.0 / std::f64::consts::PI).sqrt();
+            cnt[*i] += 1;
+        }
+    }
+    sum.iter().zip(&cnt).map(|(s, c)| if *c == 0 { 0.0 } else { s / *c as f64 }).collect()
 }
 
 #[cfg(test)]
@@ -152,5 +195,34 @@ mod tests {
         let x1 = e.iter().find(|x| x.name == "x1").unwrap();
         assert!(x1.sigma > 0.5, "interaction shows as spread: {x1:?}");
         assert!(e[0].mu_star_ci.0 <= e[0].mu_star && e[0].mu_star <= e[0].mu_star_ci.1);
+    }
+
+    /// y = 4 x0 + noise (sd 3 per seed, 4 seeds): x0 clears the noise
+    /// floor, the inert x1 does not, and the floor is near its expected
+    /// value E|mean of 4 differences| / Δ = √2·3/2 · √(2/π) / (2/3) ≈ 2.5.
+    #[test]
+    fn the_noise_floor_separates_a_real_effect_from_seed_noise() {
+        let mut rng = Rng::new(21);
+        let trajs = trajectories(2, 30, &mut rng);
+        let seeds = 4;
+        let values: Vec<Vec<Vec<f64>>> = trajs
+            .iter()
+            .map(|t| t.points.iter().map(|p| (0..seeds).map(|_| 4.0 * p[0] + 3.0 * rng.normal()).collect()).collect())
+            .collect();
+        let y: Vec<Vec<f64>> =
+            values.iter().map(|t| t.iter().map(|v| v.iter().sum::<f64>() / seeds as f64).collect()).collect();
+        let names = vec!["x0".to_string(), "x1".to_string()];
+        let mut e = effects(&trajs, &y, &names, &mut rng);
+        let floors = noise_floors(&trajs, &values, 2);
+        for x in &mut e {
+            x.noise_floor = floors[x.factor];
+        }
+        let x0 = e.iter().find(|x| x.name == "x0").unwrap();
+        let x1 = e.iter().find(|x| x.name == "x1").unwrap();
+        assert!(x0.above_noise(), "{x0:?}");
+        assert!(!x1.above_noise(), "{x1:?}");
+        for f in floors {
+            assert!((f - 2.5).abs() < 0.6, "floor {f}");
+        }
     }
 }

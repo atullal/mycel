@@ -5,6 +5,13 @@
 //! - Kernel: Matérn ν = 5/2 with one length scale per input (ARD) (eq.
 //!   4.17), plus a noise term: a seed-averaged simulation output is noisy,
 //!   and an interpolating emulator would chase that noise.
+//! - Where the noise is *known*, because every point was replicated on
+//!   several seeds, it enters as a fixed variance per point
+//!   ([`Gp::fit_noisy`]: stochastic kriging, B. Ankenman, B. L. Nelson and
+//!   J. Staum, "Stochastic kriging for simulation metamodeling", Oper.
+//!   Res. 58, 2010), with only a small extra nugget fitted on top. Fitting
+//!   the noise alone on 32 points let the emulator explain seed noise with
+//!   short length scales (`rural-starlink`, docs/SIMULATION.md §7.6).
 //! - Outputs are standardised; hyperparameters (log length scales, log
 //!   signal and noise variances) maximise the log marginal likelihood
 //!   (eq. 2.30) by Nelder–Mead from several starts ([`super::search`]).
@@ -29,6 +36,7 @@ pub struct Gp {
     ys: Vec<f64>,
     pub length: Vec<f64>,
     pub signal_var: f64,
+    /// The fitted nugget (standardised), on top of any known noise.
     pub noise_var: f64,
     y_mean: f64,
     y_sd: f64,
@@ -74,8 +82,17 @@ fn solve_upper_t(l: &[Vec<f64>], b: &[f64]) -> Vec<f64> {
     x
 }
 
-/// (L, α, log marginal likelihood) for hyperparameters on standardised y.
-fn factor(x: &[Vec<f64>], y: &[f64], length: &[f64], sf2: f64, sn2: f64) -> Option<(Vec<Vec<f64>>, Vec<f64>, f64)> {
+/// (L, α, log marginal likelihood) for hyperparameters on standardised y;
+/// `known[i]`: point i's known noise variance (standardised), added to the
+/// fitted nugget `sn2`.
+fn factor(
+    x: &[Vec<f64>],
+    y: &[f64],
+    length: &[f64],
+    sf2: f64,
+    sn2: f64,
+    known: &[f64],
+) -> Option<(Vec<Vec<f64>>, Vec<f64>, f64)> {
     let n = x.len();
     let mut k = vec![vec![0.0; n]; n];
     for i in 0..n {
@@ -84,7 +101,7 @@ fn factor(x: &[Vec<f64>], y: &[f64], length: &[f64], sf2: f64, sn2: f64) -> Opti
             k[i][j] = v;
             k[j][i] = v;
         }
-        k[i][i] += sn2 + 1e-10;
+        k[i][i] += sn2 + known[i] + 1e-10;
     }
     let l = cholesky(&k)?;
     let alpha = solve_upper_t(&l, &solve_lower(&l, y));
@@ -95,15 +112,25 @@ fn factor(x: &[Vec<f64>], y: &[f64], length: &[f64], sf2: f64, sn2: f64) -> Opti
 }
 
 impl Gp {
-    /// Fit on inputs in [0, 1]^k and outputs `y` (finite).
+    /// Fit on inputs in [0, 1]^k and outputs `y` (finite), the noise
+    /// fitted.
     pub fn fit(x: &[Vec<f64>], y: &[f64]) -> anyhow::Result<Gp> {
+        Self::fit_noisy(x, y, &vec![0.0; y.len()])
+    }
+
+    /// [`Gp::fit`] with each output's known noise variance (in the
+    /// metric's units², e.g. the variance of a mean over seeds).
+    pub fn fit_noisy(x: &[Vec<f64>], y: &[f64], noise: &[f64]) -> anyhow::Result<Gp> {
         anyhow::ensure!(x.len() == y.len() && x.len() >= 3, "a surrogate needs at least 3 points");
+        anyhow::ensure!(noise.len() == y.len(), "one noise variance per output");
         anyhow::ensure!(y.iter().all(|v| v.is_finite()), "surrogate outputs must be finite");
+        anyhow::ensure!(noise.iter().all(|v| v.is_finite() && *v >= 0.0), "noise variances must be finite and ≥ 0");
         let k = x[0].len();
         let n = y.len() as f64;
         let y_mean = y.iter().sum::<f64>() / n;
         let y_sd = (y.iter().map(|v| (v - y_mean).powi(2)).sum::<f64>() / n).sqrt().max(1e-9);
         let ys: Vec<f64> = y.iter().map(|v| (v - y_mean) / y_sd).collect();
+        let known: Vec<f64> = noise.iter().map(|v| v / (y_sd * y_sd)).collect();
         // θ = (log ℓ₁..ℓₖ, log σf², log σn²), each clamped to a sane box
         let bounds = |i: usize| -> (f64, f64) {
             if i < k {
@@ -126,7 +153,7 @@ impl Gp {
         let neg_lml = |t: &[f64]| -> f64 {
             let t = clamp(t);
             let length: Vec<f64> = t[..k].iter().map(|v| v.exp()).collect();
-            match factor(x, &ys, &length, t[k].exp(), t[k + 1].exp()) {
+            match factor(x, &ys, &length, t[k].exp(), t[k + 1].exp(), &known) {
                 Some((_, _, lml)) => -lml,
                 None => f64::INFINITY,
             }
@@ -144,8 +171,8 @@ impl Gp {
         let (t, _) = best.expect("three starts");
         let length: Vec<f64> = t[..k].iter().map(|v| v.exp()).collect();
         let (sf2, sn2) = (t[k].exp(), t[k + 1].exp());
-        let (l, alpha, lml) =
-            factor(x, &ys, &length, sf2, sn2).ok_or_else(|| anyhow::anyhow!("covariance not positive definite"))?;
+        let (l, alpha, lml) = factor(x, &ys, &length, sf2, sn2, &known)
+            .ok_or_else(|| anyhow::anyhow!("covariance not positive definite"))?;
         Ok(Gp {
             x: x.to_vec(),
             l,
@@ -229,5 +256,25 @@ mod tests {
         assert!(err < 0.15, "{err}");
         let loo = gp.loo();
         assert!(loo.coverage95 > 0.85, "{loo:?}");
+    }
+
+    /// Few points, much noise (the shape of a 32-point study on 3 seeds):
+    /// with the noise known, the emulator does not explain it with an
+    /// inert input, and stays close to the true function.
+    #[test]
+    fn known_noise_keeps_the_emulator_from_chasing_it() {
+        let mut rng = crate::stats::Rng::new(8);
+        let x = sobol(32, 2, 3);
+        let f = |p: &[f64]| 10.0 * p[0];
+        // seed noise sd 6 on a mean of 3 seeds: variance 12 per point
+        let var: f64 = 36.0 / 3.0;
+        let y: Vec<f64> = x.iter().map(|p| f(p) + var.sqrt() * rng.normal()).collect();
+        let gp = Gp::fit_noisy(&x, &y, &vec![var; y.len()]).unwrap();
+        let test = sobol(200, 2, 77);
+        let rmse = (test.iter().map(|p| (gp.mean(p) - f(p)).powi(2)).sum::<f64>() / 200.0).sqrt();
+        assert!(rmse < var.sqrt(), "the emulator ({rmse}) beats a single point's noise");
+        assert!(gp.length[1] > 1.0, "the inert input stays inert: {:?}", gp.length);
+        let flat = Gp::fit_noisy(&x, &y, &vec![0.0; y.len()]).unwrap();
+        assert!(flat.noise_var > gp.noise_var, "without the known noise, the nugget takes it");
     }
 }

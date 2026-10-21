@@ -9,7 +9,14 @@
 //!   table 2 (f)): (1/2N) Σ (f(A)ⱼ − f(A_Bⁱ)ⱼ)² / V;
 //!
 //! with A, B independent N × k uniform matrices and A_Bⁱ = A with column i
-//! from B: N(k + 2) evaluations. Intervals are percentile bootstraps over
+//! from B: N(k + 2) evaluations. Every output is first centred on the mean
+//! of f(A) and f(B): the first-order estimator is unbiased under a constant
+//! shift of f, but its variance grows with the square of the output's mean
+//! (about (mean / sd)²-fold: some 300-fold for a delivery ratio near 90
+//! with a spread of 5; regression test below). Centring
+//! the pairs of evaluations is what Sobol' and Myshetskaya (2007) found
+//! most effective (A. B. Owen, "Better estimation of small Sobol'
+//! sensitivity indices", ACM TOMACS 23, 2013, §2). Intervals are percentile bootstraps over
 //! the N rows. Inputs are independent uniforms on [0, 1]^k: Sobol indices
 //! are defined for independent inputs. Applied to the emulator, which is
 //! cheap, the intervals cover the Monte Carlo error of the indices on the
@@ -38,6 +45,10 @@ pub fn indices(f: &dyn Fn(&[f64]) -> f64, names: &[String], n: usize, boots: usi
     let b: Vec<Vec<f64>> = (0..n).map(|_| (0..k).map(|_| rng.f64()).collect()).collect();
     let fa: Vec<f64> = a.iter().map(|x| f(x)).collect();
     let fb: Vec<f64> = b.iter().map(|x| f(x)).collect();
+    // centre every output (module docs)
+    let centre = (fa.iter().sum::<f64>() + fb.iter().sum::<f64>()) / (2 * n).max(1) as f64;
+    let fa: Vec<f64> = fa.iter().map(|v| v - centre).collect();
+    let fb: Vec<f64> = fb.iter().map(|v| v - centre).collect();
     let fab: Vec<Vec<f64>> = (0..k)
         .map(|i| {
             a.iter()
@@ -45,7 +56,7 @@ pub fn indices(f: &dyn Fn(&[f64]) -> f64, names: &[String], n: usize, boots: usi
                 .map(|(ra, rb)| {
                     let mut x = ra.clone();
                     x[i] = rb[i];
-                    f(&x)
+                    f(&x) - centre
                 })
                 .collect()
         })
@@ -135,6 +146,26 @@ mod tests {
             );
         }
         assert_eq!(idx[0].name, "x1", "x1 has the largest total index");
+    }
+
+    /// Regression: a metric far from zero (a delivery ratio near 90 %)
+    /// must not widen the intervals. Before outputs were centred, the
+    /// Ishigami function plus 1000 at 4,096 rows gave S₁ = −3.8 ± 8.7
+    /// (95%) against 0.28 ± 0.045 without the offset (computed with the
+    /// same design).
+    #[test]
+    fn a_large_mean_does_not_widen_the_intervals() {
+        let shifted = |u: &[f64]| 1000.0 + ishigami(u);
+        let (mut r1, mut r2) = (Rng::new(77), Rng::new(77));
+        let plain = indices(&ishigami, &names(), 1 << 12, 100, &mut r1);
+        let far = indices(&shifted, &names(), 1 << 12, 100, &mut r2);
+        for (p, f) in plain.iter().zip(&far) {
+            assert_eq!(p.factor, f.factor);
+            assert!((p.first - f.first).abs() < 1e-6 && (p.total - f.total).abs() < 1e-6, "{p:?} vs {f:?}");
+            let width = f.first_ci.1 - f.first_ci.0;
+            assert!(width < 0.15, "S{} interval {:?}", f.factor + 1, f.first_ci);
+            assert!((f.first - ISHIGAMI_FIRST[f.factor]).abs() < 0.06, "S{} {}", f.factor + 1, f.first);
+        }
     }
 
     /// The emulator route the studies use: fit a GP on 256 space-filling
