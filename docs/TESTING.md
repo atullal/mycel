@@ -46,9 +46,11 @@ that then passes as a "Flaky test" warning; one that fails three times fails
 the run.
 
 **Timing on the macOS runner.** The hosted macOS runner is a virtual Mac
-whose jobs run throttled, the way macOS treats a process at utility QoS: the
-kernel coalesces timers, so an ordinary thread's short sleep oversleeps by
-a lot. Measured on the 18-core Mac (`thread::sleep`, 200 samples, p50–p90):
+whose jobs behave as if they ran at utility QoS. That is inferred, not
+read off the runner: under `taskpolicy -c utility` a local run fails in
+exactly the CI way, with the same numbers, and passes with the fixes below.
+At utility QoS the kernel coalesces timers, so an ordinary thread's short
+sleep oversleeps by a lot. Measured on the 18-core Mac (`thread::sleep`, 200 samples, p50–p90):
 3 ms takes 4.5 ms normally but 17–27 ms under `taskpolicy -c utility`, and
 10 ms takes 66–90 ms. That is what failed CI: the test camera made 10–13
 frames/s instead of 30, the fake Bluetooth radio moved 5.4 KiB/s instead
@@ -62,18 +64,43 @@ raw). The fixes, now tested that way too:
   matters outside CI too: an app in the background is throttled the same
   way, and its call must not fall behind.
 - Emulated radios count the time that actually passed, not the time they
-  asked to sleep (fake radio: 30.8 KiB/s throttled, 31.5 KiB/s normal).
+  asked to sleep (fake radio: 30.8 KiB/s goodput throttled, 31.5 KiB/s
+  normal; the busiest channel carries 39.1–39.8 KiB/s of its 40). The radio
+  step is a function of the clock, tested with late wake-ups and stalls, and
+  the bulk-sync test also fails if the radio ever carries more than its rate.
+- `recovers_from_lost_frames_with_keyframes` failed on the runner too; it
+  now measures the frame rate over 2 s, not 1 s (a 1 s window read a
+  throttled 25-26 frames as exactly 25.0 fps, its bar).
+
+The real-time promotion is checked on any Mac, throttled or not: a test
+re-runs itself under `taskpolicy -c utility` and requires a promoted
+thread's 3 ms sleeps to wake under 2 ms late (p90); measured, 10–14 µs
+late (p90), while an ordinary thread beside it woke 12–16 ms late (p50). A test
+also reads the stored policy back: XNU raises `computation` to half the
+period whatever is asked, so a call thread may run 10 ms per wake-up at
+real-time priority. The darwin background band (`taskpolicy -b`) is
+throttled even for real-time threads (175–195 ms sleeps, measured in
+review); if the runner
+ever moved there these fixes would stop working, so the macOS test job
+first logs how late a 3 ms sleep wakes ("Timer probe").
 - Tests that time a call (mouth-to-ear latency) run alone in their test
   binary (`cpu_alone`); the others share the CPU. Throttled, with 18 CPU
   burners alongside, mouth-to-ear is 75–95 ms 1:1 and 80–100 ms in the
   3-way call (it was 207 ms when the latency test ran beside nine others).
 
-Not explained yet: on the runner, VideoToolbox's encoder returned nothing at
-160×90 in `encode_decode_round_trip_with_scaling` (1280×720 and 424×240
-were fine, and so is 160×90 on a real Mac, hardware or software encoder).
-The runner has no hardware scaler ("IOServiceMatching failed for
-AppleM2ScalerParavirtDriver"). The test now reports each frame as made,
-dropped by rate control or timed out, to tell the next run's failure apart.
+Not explained: on the runner, VideoToolbox's low-latency encoder returned
+nothing at 160×90 in `encode_decode_round_trip_with_scaling` (1280×720 and
+424×240 were fine, and so is 160×90 on a real Mac, hardware or software
+encoder, throttled or not). The runner has no hardware scaler
+("IOServiceMatching failed for AppleM2ScalerParavirtDriver"), and 160×90 is
+the only size in that test scaled down more than 4× from its 720p source. Since it would
+mean no video on Bluetooth wherever it happens, the encoder now handles it:
+a session that stops answering is replaced by the next mode (default
+encoder, pictures scaled first by a pixel transfer session or the CPU, the
+software encoder; ARCHITECTURE.md, Video). Tests force each step (a session
+that never answers, one that only drops, CPU scaling 8× down, no mode
+left). Whether this makes the runner pass is not verified: this branch has
+not run on the runner yet.
 
 **Before merging to `main`:** the workspace tests pass twice in a row, clippy
 is clean with `-D warnings`, `cargo fmt --all --check` passes, and `npm run build` passes if TypeScript changed. Iroh, noq,
@@ -92,10 +119,10 @@ committed.
 | `mycel-net` | **Bandwidth aggregation** (`aggregate.rs`, no IP, rate-limited in-memory links): one stream over two 10 MB/s links ≈ 1.9× one link; one link cut a quarter of the way in, the transfer still completes; a fast link + 20 KB/s Bluetooth, and a fast link + a slow 300 KB/s / 60 ms one, never drop below the fast link alone. **Connection reuse** (`pool.rs`): 20 syncs + a card + a typing message = 1 dial / 1 accepted connection; a peer restarted on the same port is redialed; an idle connection is closed and redialed on use. **Multi-source download** (`multisource.rs`): three members hold a 24 MiB blob, each on its own 4 MB/s link; the fourth downloads from all three at ≈2.6× one source, one source is shut down a third of the way in, the rest comes from the other two, hash-checked and byte-exact. **Links**: two devices with no IP at all sync over in-memory links, prefer the faster one, fall back to a Bluetooth-like one; **a live QUIC connection moves to another link mid-transfer** (failover ≈5 s). Real QUIC between 5 nodes; invites + live sync with no manual calls; refusing invites; contact cards, typing, encrypted blobs; **real mDNS discovery on the test machine**; **40 MiB blob streamed to disk, interrupted (multi-source, out-of-order) download resumed from its `.part` + `.ranges`, corrupt partial copy detected and refetched from another member while the sender is offline, push policy (small → everyone, big → keepers only)**; free-space guard; stream and frame budgets, stalled and progressing I/O, duplicate requests, ephemeral limits; Windows timer resolution (`timers.rs`); the path-open queue doesn't grow (`path_queue.rs`) |
 | `mycel-net` mesh | **Multi-hop mesh** (`tests/mesh.rs`, in-memory links, one per radio "edge"; unit tests in `src/mesh/`): A–B–C where A and C have no direct link sync through B, **B is in no space and none of the plaintext crosses it** (every relayed byte is inspected); two disjoint relays A–B–C + A–D–C over 400 KB/s links carry **1.8–1.9× one relay** on one stream (4 MB, five runs) and the transfer survives B leaving mid-way; a 5-device line reaches 4 hops (≈0.1 ms per hop on a round trip); a route heals over a longer path ≈5 s after the middle device leaves; a 6-device ring sends no more announcements than predicted and nothing loops (no TTL drops); a 100 KB/s relay budget holds and a non-relaying device isn't routed through; hops over a fast link then a Bluetooth-like one; a hop whose fast link is cut mid-transfer carries on over its Bluetooth-like link; **a hop over a real network interface link** (`mycel-link-iface/tests/sync.rs`, `lo0`); forged, renamed and replayed announcements rejected; per-neighbour announcement rate limit; fragmentation and re-fragmentation; routing convergence, churn and store-and-forward in virtual time (`mesh/core/tests.rs`, `mesh/dtn/tests.rs`); gateways and the data mule (`tests/global.rs`) |
 | `mycel-call` | **Live calls.** Unit: Opus round trip keeps a 440 Hz tone, 12 kbps fits ~1.5 KB/s, PLC and FEC; frame codec and stream fallback framing under arbitrary splits; **jitter buffer**: prebuffering, reorder, loss → FEC from the next frame, late and duplicate frames dropped, target grows with jitter but never past 120 ms, underrun → conceal → rebuffer → resume, bursts trimmed; **bitrate controller** (path ceilings, loss/RTT step-down, slow recovery, FEC loss %); resampler pitch/length across rates; call id binds space + caller + nonce; **state machine**: answer and hang-up from either side, decline, ring timeout on both sides, setup timeout, busy, **both call at once → one call**. Integration (real nodes, real QUIC, test audio): audio both ways with measured latency, mute, hang-up by either side; decline / no answer / missed / busy / **forged rings from a non-member refused**; simultaneous calls merge; **no IP: a call starts on a fast in-memory link, the link is cut, the same call continues over a 20 KB/s Bluetooth-like link at 12 kbps**; datagram → stream fallback; **a call through a mesh relay** (no direct link; 0 % loss, ≈95 ms); group calls (below); video calls both ways, recovery from lost frames, adapting to a slow link; **the playout cushion follows the device's buffer** (25 ms for 10 ms bursts, covers 40 and 60 ms Bluetooth bursts, never over 100 ms, shrinks back after a hiccup); the test audio device paces itself at 10 and 40 ms periods |
-| `mycel-video` | Rate controller (a budget for every kind of path, ramp-up, back-off when frames queue, pacing, path changes), frame and control wire formats, receiver reordering and keyframe recovery; on Apple platforms, VideoToolbox encode and decode, and camera frames keeping their shape in portrait, landscape and 4:3, one answer from the encoder per frame (a frame, a drop, or a timeout, counted apart); media threads promoted to real-time scheduling wake on time (p90 under 2 ms late for 3 ms sleeps) |
+| `mycel-video` | Rate controller (a budget for every kind of path, ramp-up, back-off when frames queue, pacing, path changes), frame and control wire formats, receiver reordering and keyframe recovery; on Apple platforms, VideoToolbox encode and decode, and camera frames keeping their shape in portrait, landscape and 4:3, one answer from the encoder per frame (a frame, a drop, or a timeout, counted apart), a stalled encoder session replaced by the next mode down to CPU scaling and the software encoder, and an error when none is left; media threads promoted to real-time scheduling wake on time (p90 under 2 ms late for 3 ms sleeps), also when the test re-runs itself throttled, and the kernel's stored policy read back |
 | `mycel-node` | Full messaging API on real storage: DMs, delivery → read, replies, reactions, edits, deletes, attachments, **restart persistence**, **keeper delivery while the sender is offline**, group admin removal, **L4 rules rejecting a forged op**, **message requests + declined/blocked strangers stay out**, **contact-code address hints connect without discovery**, **hostile attachment names neutralised**; **voice call refused while the conversation is a message request, then rings, answers, carries audio, mutes and hangs up through the JSON command table**; **120 MiB attachment byte-exact between two nodes with upload/download progress**, **legacy one-shot attachments still open**, **folders sent as .zip via a `file://` URL**, `file://` decoding, **unreadable files explain why** (missing, permission denied → macOS privacy hint); one chat per person across separately created spaces, paging and search, local hide and restore across restarts, attachment consent across restarts, identity and storage fault injection; closing the store releases its file at once, so a restarted runtime opens it even while a straggling task still holds the old handle |
 | `mycel-link-awdl` | Control datagrams, TXT records, interface filtering; plus 2 ignored Bonjour loopback tests (`-- --ignored`) |
-| `mycel-link-ble` | Framing, bounded queues, connection state machine (who dials, duplicates, timeouts, backoff, address rotation), fake-radio sync between real nodes with IP off, hours of simulated faults between two devices, macOS stream code over in-process pipes; the fake radio's rate holds when its thread wakes late |
+| `mycel-link-ble` | Framing, bounded queues, connection state machine (who dials, duplicates, timeouts, backoff, address rotation), fake-radio sync between real nodes with IP off, hours of simulated faults between two devices, macOS stream code over in-process pipes; the fake radio's rate holds when its thread wakes late, and is never exceeded |
 | `mycel-link-iface` | Interface classification (medium from type and name, software interfaces skipped, ordinary NICs left to IP), environment overrides, beacons; a sync over a real interface with IP off, one path per interface |
 | `mycel-kit-chat` | Author-only edits/deletes, reactions, receipts/unread, admin-only meta, garbage tolerance, thread merging (a late alias can't backdate messages; a message written at an alias's first-seen time sorts after that alias's older messages), alerts |
 | `mycel-rules(-abi)` | Deterministic WASM engine: fuel/memory limits, banned features, ABI violations, chat rules, wire compatibility with the chat kit, the fuel cost model pinned |
@@ -164,7 +191,9 @@ every other person's tone and not its own):
   `Ring` with the real call reference. Both devices in the call answer
   `Denied` and nothing shows up.
 - Carol is removed from the group mid-call, then tries to join. Her join
-  ends `failed` and nobody hears her.
+  ends `failed` and nobody hears her: for 2 s, checked every 100 ms,
+  neither device has her joined or a level for her, and her tone stays
+  below both the noise-floor bound and 5 % of the other voice.
 - With no IP at all, three devices on fast in-memory links hold a 3-way
   call.
 - `group_call_between_runtimes` runs the same flow through the JSON command

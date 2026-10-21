@@ -97,6 +97,15 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # How late this runner wakes a sleeping process. The hosted macOS
+      # runner behaved as if its jobs ran at utility QoS (timers coalesced:
+      # a 3 ms sleep took ~15-25 ms), which the media threads' real-time
+      # scheduling makes up for (docs/TESTING.md). If the timing tests
+      # start failing, this line shows whether the runner changed.
+      - name: Timer probe
+        if: runner.os == 'macOS'
+        run: |
+          perl -MTime::HiRes=time,sleep -e 'my @l; for (1..50) { my $t = time; sleep 0.003; push @l, (time - $t - 0.003) * 1000 } @l = sort { $a <=> $b } @l; printf "3 ms sleeps woke %.2f ms late (p50), %.2f ms (p90), %.2f ms (max)\n", $l[25], $l[45], $l[49]'
       # The runtime and everything under it. The host app is tested by the
       # Apps workflow (it needs the webview libraries); the simulator and
       # benchmarks are dev tools.
