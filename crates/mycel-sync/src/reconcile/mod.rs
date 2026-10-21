@@ -40,11 +40,14 @@ use serde::de::DeserializeOwned;
 
 use crate::EnvelopeId;
 
+pub mod gossip;
 mod index;
 mod msg;
 mod replica;
 mod session;
 
+#[cfg(test)]
+mod gossip_tests;
 #[cfg(any(test, feature = "model"))]
 pub mod model;
 #[cfg(test)]
