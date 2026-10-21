@@ -3,7 +3,9 @@
 //! media for real nodes, tier 2 into per-hop delay and capacity.
 //!
 //! The numbers are application-level goodput and one-way latency, not PHY
-//! rates. Sources (see docs/SIMULATION.md for the full list):
+//! rates: payload above each link's framing of a QUIC packet, which tier 2
+//! charges separately with QUIC's own overhead ([`crate::quic`]). Sources
+//! (see docs/SIMULATION.md for the full list):
 //!
 //! - **BLE L2CAP CoC**: 1M PHY tops out near 700–800 kbit/s of payload
 //!   with data length extension and short connection intervals; phones and
