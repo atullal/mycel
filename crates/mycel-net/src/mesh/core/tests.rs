@@ -2254,3 +2254,52 @@ fn seqno_requests_from_one_neighbour_are_rate_limited() {
     r.drain(&mut outs);
     assert_eq!(seqreqs_to(&outs).len(), 10);
 }
+
+/// Proxy blame. An honest relay whose routes run through a liar downstream
+/// is suspected for those destinations and avoided for all. Once it moves
+/// its routes to them off the liar (a new, costlier route that others'
+/// routes corroborate), their silences stop counting against it for every
+/// destination: it carries the others again, while each destination it was
+/// suspected for stays suspected (2 minutes). A liar that keeps its cheap
+/// claims, or raises them a little but stays a shortcut, stays avoided.
+#[test]
+fn an_honest_relay_in_front_of_a_liar_is_no_longer_shunned_once_it_moves() {
+    let (relay, other) = (key(2), key(3));
+    let ds: Vec<SignPk> = (10..15).map(key).collect();
+    let only = Defences { aggregate: true, ..Defences::NONE };
+    let setup = || {
+        let mut r = source(&[relay, other], only);
+        for d in &ds {
+            // the relay's route is through a liar that claims to be next to d
+            r.on_announce(relay, ann(*d, WALL, 2, 142), 10, WALL, |_| true);
+            r.on_announce(other, ann(*d, WALL, 3, 600), 10, WALL, |_| true);
+        }
+        for (i, d) in ds[..3].iter().enumerate() {
+            suspect_then_ack(&mut r, *d, 100 + 5_000 * i as Time);
+        }
+        assert_eq!(r.stats().hops_shunned, 1);
+        assert_eq!(sent_to(&mut r, ds[3], 14_500), vec![other], "avoided for all");
+        r
+    };
+    let readvertise = |r: &mut Router, cost: u32, t: Time| {
+        for d in &ds[..3] {
+            r.on_announce(relay, ann(*d, WALL + t, 4, cost), t, WALL + t, |_| true);
+            r.on_announce(other, ann(*d, WALL + t, 3, 600), t, WALL + t, |_| true);
+        }
+        r.on_announce(relay, ann(ds[3], WALL + t, 2, 142), t, WALL + t, |_| true);
+        r.on_announce(other, ann(ds[3], WALL + t, 3, 600), t, WALL + t, |_| true);
+    };
+    // honest: it moved off the liar, at about what the others' routes cost
+    let mut r = setup();
+    readvertise(&mut r, 520, 20_000);
+    assert_eq!(r.stats().hops_unshunned, 1);
+    assert_eq!(sent_to(&mut r, ds[3], 20_100), vec![relay], "carries the rest again");
+    assert_eq!(sent_to(&mut r, ds[0], 20_200), vec![other], "but stays suspected where it failed");
+    // a liar keeping its claims, or raising them a little, stays shunned
+    for cost in [142, 200] {
+        let mut r = setup();
+        readvertise(&mut r, cost, 20_000);
+        assert_eq!(r.stats().hops_unshunned, 0, "{cost}");
+        assert_eq!(sent_to(&mut r, ds[3], 20_100), vec![other], "{cost}");
+    }
+}
