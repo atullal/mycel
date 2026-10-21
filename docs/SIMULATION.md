@@ -1376,3 +1376,116 @@ parameters, each with a range, a prior and a source or "(estimate)":
 `mule_share`. None is calibrated on Mycel's own devices yet (WP14), so
 robustness here is robustness over today's ignorance, not a calibrated
 error bar.
+
+### 7.4 Catalogue results at CI size
+
+`mycel-sim catalogue all --seed 1` (one run: seed 2515552253147602109,
+run 0 of base 1, before single runs took the seed as given; replay a row
+with `catalogue NAME --seed 2515552253147602109`), CI sizes, the routing
+core and carrier with their defaults, the 18-core Mac with other jobs
+running (load 9–13), one scenario at a time on one thread. **Every number
+is L0**, and every *bound* row ran without a model its result depends on
+(column "needs"). The objectives are product targets written before the
+runs, not thresholds calibrated on seeds (§1): a miss is a question to
+answer, and none of these scenarios is in the CI gate. One seed per row:
+the multi-seed verdicts (`--runs 10`) are the next step for the rows that
+matter, and were run for `long-haul-flight` (finding 3).
+
+| # | Scenario | Status (needs) | Devices | Delivered (of feasible) | p95 | Control per device | Wall | Objectives |
+|---|---|---|---:|---:|---:|---:|---:|---|
+| 1 | `city-commute` | bound (transit, iOS, Doze) | 200 | 100% of 351 | 0.33 s | **20.4 kB/s** | 384 s | met; control: finding 2 |
+| 2 | `campus` | bound (Copenhagen trace) | 60 | 100% of 292 | 0.24 s | 1.70 kB/s | 40 s | met |
+| 3 | `office` | bound, optimistic (UDP blocked, walls) | 150 | 100% of 130 | 0.20 s | 1.05 kB/s | 6 s | met (inconclusive) |
+| 4 | `apartment-block` | bound, optimistic (walls) | 100 | 100% of 86 | 0.12 s | 0.95 kB/s | 3 s | met (inconclusive) |
+| 5 | `rural-starlink` | **verdict** | 90 | 80.9% of 47 | 4,734 s | 0.40 kB/s | 8 s | **p95 missed** (≤ 3,600 s) |
+| 6 | `rural-line` | bound, optimistic (Wi-Fi Direct setup) | 30 | 100% of 36 | 0.08 s | 0.20 kB/s | 0.3 s | met (inconclusive) |
+| 7 | `earthquake` | bound (disaster mobility, BLE discovery) | 150 | 100% of 367 | 838 s | 2.11 kB/s | 52 s | met |
+| 8 | `flood-evacuation` | bound (map flows) | 200 | 89.7% of 339 | 4,734 s | 0.65 kB/s | 41 s | met |
+| 9 | `protest-shutdown` | bound, optimistic (SINR, body loss, jamming) | 150 (5 attackers) | 98.7% of 525 | **127 s** | 7.06 kB/s | 83 s | **p95 missed** (≤ 60 s): a finding |
+| 10 | `protest-mobile-off` | bound, optimistic (body loss) | 150 | 100% of 530 | 0.43 s | 7.16 kB/s | 99 s | met (inconclusive) |
+| 11 | `festival` | bound, optimistic (SINR, cell capacity) | 150 | 100% of 394 | 0.24 s | **6.43 kB/s** | 75 s | **control missed** (≤ 4 kB/s): a finding |
+| 12 | `stadium-exit` | bound (crowd flow, BLE discovery) | 150 | 100% of 195 | 3.28 s | **46.8 kB/s** | 140 s | see finding 2 |
+| 13 | `conference-hall` | bound, optimistic (SINR) | 200 | 100% of 258 | 0.23 s | 2.67 kB/s | 12 s | met (inconclusive) |
+| 14 | `subway` | bound (transit) | 200 | **74.0%** of 285 | 1,339 s | 1.42 kB/s | 16 s | **delivery missed** (≥ 80%) |
+| 15 | `long-haul-flight` | **verdict** | 60 | **97.6%** of 212 | 1.56 s | 0.71 kB/s | 2 s | **delivery missed** (≥ 99%): finding 3 |
+| 16 | `cross-continent` | bound, optimistic (DHT latency) | 200 | 100% of 154 | 0.48 s | 0.37 kB/s | 1 s | met (inconclusive) |
+| 17 | `sparse-internet` | **verdict** | 200 | 100% of 230 | 3.08 s | 1.02 kB/s | 6 s | met |
+| 18 | `censored-country` | blocked (censorship) | | | | | | |
+| 19 | `whitelist-intranet` | blocked (whitelist) | | | | | | |
+| 20 | `update-storm` | bound, optimistic (mixed versions) | 200 | 100% of 825 | 0.97 s | **17.5 kB/s** | 472 s | see finding 2 |
+| 21 | `flash-crowd` | bound, optimistic (DHT latency) | 200 | 100% of 190 | 0.29 s | 1.09 kB/s | 3 s | met (inconclusive) |
+| 22 | `night-doze` | blocked (iOS lifecycle, Doze) | | | | | | |
+| 23 | `adversary-sweep` | **verdict** | 150 (9 attackers) | 98.3% of 595 | 1.91 s | 2.18 kB/s | 1 s | met |
+| 24 | `eclipse-vip` | blocked (DHT eclipse) | | | | | | |
+| 25 | `hospital` | bound, optimistic (walls) | 150 | 100% of 173 | 0.20 s | 2.68 kB/s | 11 s | met (inconclusive) |
+| 26 | `refugee-camp` | **verdict** | 200 | 100% of 493 | 1.44 s | 1.93 kB/s | 72 s | met |
+| 27 | `mountain-trail` | bound (shadowing) | 100 | 80.2% of 106 | 8,097 s | 0.12 kB/s | 8 s | met |
+| 28 | `highway-v2v` | bound, optimistic (BLE discovery, Wi-Fi Direct setup) | 200 | 100% of 160 | 0.34 s | **19.7 kB/s** | 55 s | met (inconclusive); control: finding 2 |
+| 29 | `ferry` | **verdict** | 150 | 99.6% of 265 | 314 s | 3.57 kB/s | 36 s | met |
+| 30 | `clock-skew` | blocked (clock skew) | | | | | | |
+| 31 | `storage-full` | blocked (storage full) | | | | | | |
+
+### 7.5 What the catalogue found
+
+None of these changed routing code: the routing core and carrier belong
+to the routing tracks (v2/w2-harden is working on the seqno-request
+storm of open finding 16, which finding 2 may share a cause with). Each
+is reproducible from the command given.
+
+1. **The tier-2 world has no neighbour cap unless a scenario sets one;
+   the node has one.** The node dials at most 6 hop connections (about 12
+   in all, `mesh/mod.rs`), but a tier-2 device links to everyone in range
+   unless `Plan::max_neighbours` is set (`global-scale` and `churn` set
+   8). In a dense room that turns into a clique: 150 phones in a 60 × 40 m
+   office sent 64.8 kB/s of control each and took 422 s for 20 simulated
+   minutes; with a cap of 8, 1.05 kB/s and 2 s. The catalogue now caps at
+   8 by default (Android ~7 BLE connections, iOS 6–15 reported) and
+   varies it over 6–15 in robustness studies. The hand-written tier-2
+   scenarios are unchanged; the dense ones among them overstate control.
+2. **Walking devices multiply routing control traffic.** `city-commute`
+   at CI size (200 phones over 707 × 707 m, 85% with internet), 5
+   simulated minutes, seed 2515552253147602109, only the share of walkers
+   (1.2 m/s, random waypoint) changed:
+
+   | Walkers | Control per device | Seqno requests | Retractions | Routes up |
+   |---:|---:|---:|---:|---:|
+   | 0% | 1.22 kB/s | not recorded | not recorded | not recorded |
+   | 5% | 6.65 kB/s | 520,166 | 300,830 | 532,760 |
+   | 20% | 15.6 kB/s | 2,176,779 | 1,378,636 | 1,369,799 |
+   | 50% | 24.8 kB/s | 4,376,281 | 3,016,223 | 2,387,853 |
+
+   At 50%, 24.3 of the 24.8 kB/s is routing (the carrier 0.46 kB/s): the
+   200 devices sent 7.6 million announcements in 5 minutes (126 per device
+   per second), 61% of a 40 kB/s BLE radio spent on routing control. It is the same without internet (25.0
+   kB/s), so it is the mesh's own churn, not gateways. `stadium-exit`
+   (everyone walking in a crowd) reached **46.8 kB/s** per device, more
+   than a BLE radio carries; `highway-v2v` 19.7 kB/s and `update-storm`
+   17.5 kB/s. Delivery stayed at 100% in all of these, but on real radios
+   this control would crowd out the data and drain batteries. Part of it
+   is an L0 artefact: the disc has no hysteresis, so a device walking
+   along the edge of range flips links every 5 s mobility step; but real
+   radios flap more at the edge, not less (fading), so the core needs
+   damping on route churn driven by link churn (a hold-down, or rate
+   limits per neighbour on seqno requests and retractions). Reproduce:
+   `mycel-sim catalogue city-commute --minutes 5 --seed 2515552253147602109`
+   (the per-kind split is in the report's notes).
+3. **A static, capped cabin loses about 2% of feasible messages.**
+   `long-haul-flight` (60 phones in a 60 × 6 m cabin, no internet, nobody
+   moving, cap 8) on 10 seeds (`catalogue long-haul-flight --runs 10`):
+   delivery of feasible messages median 98.1%, min 94.3%, ≥ 99% on 1 of
+   10 seeds. With the cap lifted to 60 (everyone linked to everyone), 100%
+   on 10 of 10. On the first seed 870 packets were dropped for want of a
+   route, and 37 messages became bundles of which 32 were delivered: the
+   carrier cannot help when nobody moves. The oracle found a path for
+   every one of them on the capped links. Not yet explained: either the
+   core loses routes in a capped static graph, or the engine's cap (when
+   a device relinks, it drops links to neighbours that it did not pick
+   among its own nearest 8, though they picked it) churns links at start
+   in a way the core handles badly. Either way it is worth a look.
+4. **Misses on the targets** (one seed each): `protest-shutdown`'s p95 is
+   127 s against 60 s (an optimistic bound, so reality is worse);
+   `festival` spends 6.43 kB/s of control per device against a 4 kB/s
+   budget (10% of a BLE radio; also optimistic); `subway` delivers 74.0%
+   of feasible messages against 80% (static car clusters stand in for
+   moving trains); `rural-starlink`, a verdict at L0, has a p95 of 79
+   minutes against 60 with one satellite gateway and nine walkers.
