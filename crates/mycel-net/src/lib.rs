@@ -85,7 +85,7 @@ use mycel_sync::{EnvelopeId, FeedValidator, Replica, Store};
 use mycel_trust::{Role, SignedOp, SpaceId};
 use n0_future::StreamExt;
 use pool::{Pool, PooledConn};
-use tokio::sync::{Notify, Semaphore, broadcast, mpsc};
+use tokio::sync::{Notify, Semaphore, broadcast, mpsc, watch};
 
 pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_free_space, free_space, human_size};
 pub use iroh;
@@ -337,8 +337,8 @@ struct Inner {
     /// Spaces needing a push to all members; `None` key = everything (periodic).
     dirty: Mutex<HashSet<SpaceId>>,
     wake: Notify,
-    /// Syncs running now; `true` = something changed meanwhile, run again.
-    inflight: Mutex<HashMap<(SignPk, SpaceId), bool>>,
+    /// Syncs running now, one per (peer, space).
+    inflight: Mutex<HashMap<(SignPk, SpaceId), Inflight>>,
     sync_slots: Semaphore,
     /// Outgoing connections, one per peer, reused for every exchange.
     pool: Pool,
@@ -374,6 +374,17 @@ struct Inner {
     v2: sync_v2::V2,
     /// Periodic anti-entropy schedule per space.
     periodic: Mutex<HashMap<SpaceId, Backoff>>,
+}
+
+/// A sync of one (peer, space) that is running (see [`sync_once`]).
+#[derive(Default)]
+struct Inflight {
+    /// Something changed meanwhile, or someone asked: run once more after
+    /// a session that succeeds.
+    again: bool,
+    /// Made when someone waits for this run ([`Trigger::Manual`]), and
+    /// dropped with the entry when the run ends, which wakes them.
+    done: Option<watch::Sender<()>>,
 }
 
 /// Why a sync runs: only some outcomes are signs of loss for the backoff.
@@ -1376,15 +1387,34 @@ async fn sync_exchange(
     Ok(inner.ingest(&space, peer, data, &sent))
 }
 
+/// Sync `space` with `peer`, unless a sync of the two is running already:
+/// then that one runs once more (it may have missed this change), and a
+/// [`Trigger::Manual`] caller, who waits for a sync, waits for it to end.
 async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Trigger) {
-    {
+    // `Some` if one is running already, with what a waiting caller waits on.
+    let joined = {
         let mut inflight = inner.inflight.lock();
-        if let Some(again) = inflight.get_mut(&(peer, space)) {
-            // One is running: it may have missed this change, so it runs once more.
-            *again = true;
-            return;
+        if let Some(running) = inflight.get_mut(&(peer, space)) {
+            running.again = true;
+            // Returning at once would report a sync that hasn't happened (a
+            // background catch-up "synced" in no time and went back to
+            // sleep before the running one delivered anything).
+            Some(
+                (trigger == Trigger::Manual)
+                    .then(|| running.done.get_or_insert_with(|| watch::channel(()).0).subscribe()),
+            )
+        } else {
+            inflight.insert((peer, space), Inflight::default());
+            None
         }
-        inflight.insert((peer, space), false);
+    };
+    if let Some(wait) = joined {
+        if let Some(mut done) = wait {
+            // An error once the run (and its rerun) is over: the entry,
+            // with the sender, is gone.
+            let _ = done.changed().await;
+        }
+        return;
     }
     let _slot = inner.sync_slots.acquire().await;
     let mut busy_retries = 0;
@@ -1411,8 +1441,8 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Tri
             let retry = busy.retry_after();
             if busy_retries < BUSY_RETRIES {
                 busy_retries += 1;
-                if let Some(a) = inner.inflight.lock().get_mut(&(peer, space)) {
-                    *a = false;
+                if let Some(running) = inner.inflight.lock().get_mut(&(peer, space)) {
+                    running.again = false;
                 }
                 tokio::time::sleep(retry).await;
                 continue;
@@ -1434,7 +1464,7 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Tri
         }
         let mut inflight = inner.inflight.lock();
         match inflight.get_mut(&(peer, space)) {
-            Some(again) if *again && ok => *again = false,
+            Some(running) if running.again && ok => running.again = false,
             _ => {
                 inflight.remove(&(peer, space));
                 return;
@@ -2001,7 +2031,10 @@ impl Node {
     /// (the pool shares a failed dial with every sync waiting for it).
     /// Keepers and peers that are reachable right now go first; peers in
     /// failure backoff that aren't nearby are skipped, as the scheduler
-    /// skips them.
+    /// skips them. A sync with a member that is running already (pushed,
+    /// periodic, on discovery) is waited for, and runs once more if it
+    /// succeeds, so what the member had when this was called has arrived
+    /// when it returns.
     pub async fn sync_everything(&self) {
         let inner = &self.inner;
         let me = self.id();

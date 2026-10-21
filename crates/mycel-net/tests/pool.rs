@@ -194,3 +194,41 @@ async fn a_sleeping_member_costs_one_connect_timeout_not_one_per_conversation() 
     alice.shutdown().await.unwrap();
     bob.shutdown().await.unwrap();
 }
+
+/// Regression: a sync with a member that was running already (here the one
+/// a new address starts) made `sync_everything` return at once, before
+/// anything arrived. A phone's background catch-up then reported "synced in
+/// 0.2 s" and went back to sleep with the message still on its way
+/// (mycel-host's windowless catch-up test failed 2 runs in 60). On a
+/// single-threaded runtime the address's sync is always the one running.
+#[tokio::test(flavor = "current_thread")]
+async fn sync_everything_waits_for_a_sync_already_running() {
+    let alice = node(Arc::new(DeviceKeys::generate()), "alice", 0).await;
+    let bob = node(Arc::new(DeviceKeys::generate()), "bob", 0).await;
+    let (space, genesis) = alice.create_space().unwrap();
+    alice.with_space(&space, |r| r.add_member(bob.keys().public(), Role::Writer)).unwrap().unwrap();
+    bob.join_space(genesis).unwrap();
+    // Bob has the membership (as after an earlier sync), not Alice's address.
+    let ops = alice.with_space(&space, |r| r.all_ops()).unwrap();
+    bob.with_space(&space, |r| r.ingest_batch(ops, vec![])).unwrap();
+    assert!(bob.with_space(&space, |r| r.my_role()).unwrap().is_some());
+    let doc = Replica::new_doc_id();
+    alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "news", "while you slept"))).unwrap().unwrap();
+
+    // Bob learns Alice's address (which starts a sync with her) and catches up.
+    bob.add_peer_addr(alice.addr());
+    bob.sync_everything().await;
+    assert_eq!(
+        bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(),
+        json!({"news": "while you slept"}),
+        "sync_everything returned before the sync it joined delivered"
+    );
+
+    // `sync_all` (one space) waits the same way.
+    alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "news", "and then"))).unwrap().unwrap();
+    bob.add_peer_addr(alice.addr());
+    bob.sync_all(space).await;
+    assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(), json!({"news": "and then"}));
+    alice.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
+}

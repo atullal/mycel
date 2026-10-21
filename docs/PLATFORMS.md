@@ -192,7 +192,9 @@ to be reachable as often as it can, and how honestly the app says so:
   (asking again replaces a queued request and its earliest date, which
   would keep the processing task an hour away for an app left often). Each
   catch-up syncs every conversation with every member at once (keepers and
-  reachable peers first, peers in failure backoff skipped), then lingers up
+  reachable peers first, peers in failure backoff skipped; a sync with a
+  member that was running already is waited for, and runs once more),
+  then lingers up
   to 10 s for deliveries from keepers and carriers, stopping 3 s before its
   budget ends, and saves (`src-tauri/src/background.rs`); iOS's
   expiration handler stops it early. A member who is asleep costs one 6 s
@@ -285,7 +287,10 @@ to be reachable as often as it can, and how honestly the app says so:
   reaches Bob's replica through a windowless catch-up, so does one she
   pushes during the linger, and a catch-up whose sync the budget cuts short
   isn't recorded); a background launch starting "away" so a call rings;
-  the sync of every conversation at once (`mycel-net` `tests/pool.rs`); the
+  the sync of every conversation at once, and that it waits for a sync
+  already running (`mycel-net` `tests/pool.rs`: before, it returned at
+  once and the catch-up "synced in 0.2 s" before anything arrived, failing
+  the windowless test in 2 of 60 runs; none failed in 100 runs after); the
   Kotlin status JSON mapping; that neither iOS Info.plist declares
   `bluetooth-peripheral`; the GATT payload and the hello carrying no name;
   the restricted Bluetooth mode (`mycel-link-ble` `core.rs` and the fake
