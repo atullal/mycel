@@ -572,6 +572,25 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
      hop 7; the same on 4aab57a, before any of this work). The CI tests
      run seed 1.
 
+23. **Routing defences without a wire change, measured one by one**
+   (`docs/ROUTING.md` §6, item 15). Eight were built in the core and run
+   alone, all together and as the kept set on seeds 1–10 of `adversarial`
+   (half size, plus a fan-out workload), `churn`, `global-scale` and
+   `trace-replay` (scaled down to fit a few minutes per run; the tool was
+   a local harness over `scenarios::t2::run`, GLOBAL core only), with
+   seeds 11–20 kept apart for calibration. Kept on by default:
+   cross-destination aggregation, corroboration hold-down and a 2%
+   control budget per hop (plausible liars at full size 87.0% → 88.9%, 9
+   of 10 seeds; at half size 91.9% → 92.7% and the fan-out 92.1% → 94.3%;
+   nothing else moved beyond the seeds' scatter). Opt-in:
+   trust-graph relay preference (the largest gain, 87.0% → 92.9% at full
+   size, 10 of 10 seeds, but clean optimality p95 5.29 → 5.79 on 9 of 10).
+   Dropped: a randomised suspicion threshold, churn-conditioned
+   suspicion, hedging and smoothed costs (why: `docs/ROUTING.md`). The
+   simulator feeds the preference from a membership model
+   (`tier2::global::spaces`: two spaces of 8 per device, one local, one
+   anywhere; adversaries in none unless `MYCEL_SPACES=insiders`).
+
 ### Open findings
 
 1. **Bluetooth control traffic: what is left after fixed 14, 15 and 17.**
@@ -655,7 +674,27 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    a destination's neighbourhood sits next to a liar: every alternative
    leads to one too. The target isn't lowered; whether to lower it
    (seeds 1–3 support about 75%) or strengthen the defence is open.
-   Repro: `mycel-sim adversarial --seed 2`.
+   Repro: `mycel-sim adversarial --seed 2`. Over seeds 1–10 the GLOBAL
+   core alone delivers 87.0% at full size (per seed in the harness of
+   fixed 23); its default defences take that to 88.9%, opt-in affinity on
+   top to 92.9%.
+
+16. **Packets can cycle among honest devices in tier 2.** The frame-loop
+   counter (a device seeing the same packet twice) is 0 in
+   `routing-convergence` and in the core's link-flap tests, but not
+   everywhere: with no defences (as on `main`), `churn` at 1,000 devices
+   seed 3 counts 54, full-size `adversarial` 33 over seeds 1–10 with
+   plausible liars (seeds 3 and 4) and 134 in a fan-out workload of the
+   same liars. One traced case (liars, seed 3) went round three honest
+   devices, a packet of ours toward its destination, until its TTL ran
+   out. Not root-caused. The suspect is where a feasible-route choice
+   meets something outside Babel's feasibility condition: a hop without a
+   route forwarding along its default route toward a gateway, while the
+   next one still routes toward the destination. Seen with the local
+   harness of fixed 23 (`churn` at scale 0.1, seed 3; `adversarial`'s
+   liar run at full size, seed 3, `MYCEL_CORE=defences=none`); not yet
+   checked through `mycel-sim` itself, whose `loops` counter in
+   `results.json` is the same one.
 
 ## 5. Benchmarks against external baselines
 

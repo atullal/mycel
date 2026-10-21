@@ -311,6 +311,155 @@ something changes.
       interleaved with the old build, which spread 1.79–2.19×).
     - No wire change: it only decides which frames a device puts on its
       own hops.
+15. **Defences that need no wire change** (`Defences` in `mesh/core.rs`,
+    each behind its own constants and a `Config::tune` knob). None of them
+    changes what we advertise or which routes are feasible: they only rank
+    feasible routes (every one loop-free, Babel), decide when our own
+    evidence counts, or pace what we send. Eight were built and measured
+    one at a time against none and all (below): three are on by default,
+    one is opt-in, four were dropped.
+    - **On: cross-destination aggregation** (`AGGREGATE_MIN`,
+      `VOUCHED_PER_HOP`). A next hop suspected (item 13) for at least 3
+      distinct destinations at once, and for more of them than it carried
+      acknowledgements for lately, is avoided for every destination (but
+      itself) for 2 minutes, and fresh seqnos are asked for our
+      destinations that went through it. Only our own evidence counts, so
+      nobody can badmouth a relay to us. The bar is high on purpose: a
+      well-connected honest relay carries the most destinations, so it
+      also collects the most false suspicions (BGP route-flap damping's
+      lesson, RFC 7196). At most 8 vouching destinations per hop are kept.
+    - **On: corroboration hold-down** (`CORROBORATE_FACTOR`, `HOLD_DOWN`).
+      A route one neighbour claims at less than half the cost of the route
+      in use (older, through another neighbour), with no other neighbour's
+      route within that factor of it, ranks just behind the incumbent for
+      32 s: two periods, time for a real shortcut to be heard twice. Backed
+      by a second neighbour, or after the hold-down, it takes over; if the
+      incumbent goes, it is used at once.
+    - **On: a control budget per hop** (`CONTROL_SHARE`, `CONTROL_BURST_S`,
+      `CONTROL_BURST_MIN`, `CONTROL_QUEUE`; Reticulum's announce cap).
+      Relayed announcements to a neighbour take at most 2% of that hop's
+      capacity, estimated from its cost (the time to move 64 KiB), after a
+      burst of 30 s of it and at least 64 KiB. Past that they queue, fewest
+      hops first, one per origin, at most 1,024 per neighbour (the farthest
+      make way), and go out as they stand when sent, so a route lost
+      meanwhile is never advertised late. Retractions never wait. A BLE hop
+      (~1.7 s per 64 KiB) gets ~790 B/s. It never had to defer anything in
+      the runs below (steady-state routing stays well under 2% of a hop);
+      it is a guard for bursts on slow links, not a measured gain.
+    - **Opt-in: trust-graph relay preference** (`Defences::affinity`,
+      `Config::affinity_step`, `AFFINITY_UNKNOWN`; Whanau's and
+      SybilLimit's argument). The node tells the router who shares a space
+      with it (`Mesh::set_affinity`, from its replicas' members whenever
+      membership may have changed; nothing about it is sent). A route
+      ranks 50% costlier per step its next hop is from us in the
+      membership graph beyond a co-member, and an unlisted relay counts as
+      3 steps (2× cost). We only know our own spaces' members, so in
+      practice it is co-member or not. Off by default: it buys delivery
+      under plausible liars with longer routes everywhere else.
+    - **Dropped.** A *randomised suspicion threshold* (the silence a
+      suspicion needs drawn from ½–1½× of it, so a gray hole can't sit
+      under it); *churn-conditioned suspicion* (no strike against a hop
+      just up, a route just appeared, or a neighbour met only briefly);
+      *hedging* (after a p95 timeout, a copy of our late packet along the
+      next route, at most 5% of our packets; Dean and Barroso); *smoothed,
+      saturating costs* switched only when both smoothed and instantaneous
+      costs agree (Jonglez et al., Babel's delay metric).
+    - **No explicit loss (ETX) term.** The node's hop cost already folds
+      loss in: the RTT plus the time to move 64 KiB at the rate the
+      congestion window allows, and Cubic shrinks the window on loss (item
+      2). The tier-2 simulator gives each hop a fixed cost per radio, so
+      nothing there could measure a loss term; adding one unmeasured would
+      be a guess.
+
+    **Measured** in tier 2 (GLOBAL core only, the scenarios' own worlds
+    and workloads, seeds 1–10 each). `adversarial` at half size: 150
+    phones, 7 plausible liars (item 13), plus a *fan-out* variant in which
+    10 sources send the same number of messages to many destinations,
+    which is what aggregation needs to see. `churn` at 1,000 devices,
+    `global-scale` at 1,500, `trace-replay` on its synthetic trace at half
+    size (20 devices, 36 h). Means over the seeds; *b/w* counts seeds
+    better/worse than none. Delivery is over the pairs the oracle found
+    reachable; raw delivery is over everything sent (trace-replay's oracle
+    judges only a sample, so its raw figure is the one to read).
+    Optimality is achieved latency over the oracle's (§10).
+
+    | Defence alone | Liars: delivery (b/w) | Liars: opt p50 / p95 | Fan-out: delivery (b/w) | Clean: opt p50 / p95 | Trace: raw delivery (b/w), opt p95 | Frame loops | Verdict |
+    |---|---|---|---|---|---|---|---|
+    | none | 91.9% | 4.95 / 1000 | 92.1% | 1.83 / 5.35 | 88.2%, 5.20 | 54 (churn seed 3) | |
+    | aggregation | 92.1% (4/0) | 4.78 / 1068 | 93.1% (6/3) | 1.83 / 5.35 | 86.3%¹ (0/0), 5.29 | 54 (same) | on |
+    | hold-down | 92.7% (7/2) | 3.72 / 947 | 93.2% (7/2) | 1.83 / 5.35 | 86.2%¹ (1/4), 5.30 | 0 | on |
+    | budget | 91.9% (0/0) | identical | identical | identical | identical¹ | 54 (same) | on (guard) |
+    | affinity | 96.1% (9/1) | 2.86 / 668 | 95.9% (8/1) | 2.04 / 6.03 (1/9 seeds better) | 86.2%¹ (2/3), 5.17 | 0 | opt-in |
+    | random threshold | 92.1% (6/2) | 4.38 / 1068 (4/6) | 92.1% (6/3) | 1.83 / 5.35 | 86.2%¹ (2/2), 5.19 | 54 (same) | dropped |
+    | churn-conditioned | 91.8% (4/3) | 4.94 / 1278 (1/9) | 91.7% (1/4) | 1.83 / 5.35 | 86.4%¹ (3/2), 5.14 | 54 (same) + 17 (fan-out) | dropped |
+    | hedging | 91.7% (3/2) | 4.70 / 896 | 92.1% (4/5) | 1.83 / 5.33 | 85.7%¹ (0/5), 4.91 | 54 (same) | dropped |
+    | smoothing | 92.9% (7/2) | 7.04 / 1120 | 92.2% (5/4) | 1.85 / 6.06 (1/9) | 86.4%¹ (2/2), 5.17 | 18 (liars) + 19 (fan-out) | dropped |
+    | all eight | 96.3% (9/1) | 2.34 / 308 | 96.9% (9/0) | 2.01 / 6.08 (2/8) | 88.1% (6/4), 5.27 | 16 (fan-out) | |
+    | **default (first three)** | **92.7% (7/2)** | **3.79 / 960** | **94.3% (8/1)** | **1.83 / 5.35** | **88.3% (5/5), 5.13** | 36 (fan-out seed 2) | |
+
+    ¹ Single defences ran on seeds 1–5 outside `adversarial` (none on
+    seeds 1–5: 86.3% raw, opt p95 5.29). Black holes and the Sybil gateway
+    stay at 100% delivery in every configuration; their optimality moves
+    as the clean run's does. `churn` (100%, opt p95 11.86 → 11.91 with the
+    default set) and `global-scale` (100%, 10.17 → 10.23) barely move;
+    affinity lowers routing traffic by 5–17% (fewer route changes) and
+    adds up to 0.3 to their p95. On calibration seeds 11–20 the default set
+    took the liars from 94.7% to 95.9% (7/2), opt p95 891 → 663 (8/2).
+    At full size (300 phones, 15 liars, seeds 1–10) it takes them from
+    87.0% to 88.9% (9 of 10 seeds better), median optimality 15.4× →
+    5.2×, p95 2,378× → 1,852× (9/1); the fan-out from 88.5% to 90.1%
+    (8/2); clean, black-hole and Sybil runs stay at 100% with opt p95
+    within ±0.1.
+
+    What decided each:
+    - *Aggregation* fires only when one source loses traffic to one relay
+      for several destinations: never in the standard workload (each
+      source sends a message or two), in the fan-out one it halves the
+      median optimality (6.72 → 3.25) for +1.0% delivery. *Hold-down*
+      helps both liar workloads; its costs (black holes' opt p95 5.71 →
+      5.99, 1 seed better and 5 worse; trace p99) are within what the
+      seeds scatter. Neither costs anything in clean runs.
+    - *Affinity* is the strongest single defence, and stronger at full
+      size: with the default set, 300 phones and 15 liars go from 87.0% to
+      92.9% delivered (10 of 10 seeds), the fan-out from 88.5% to 93.3%
+      (10/0), median optimality 15.4× → 2.9×. But every clean run pays:
+      median optimality 1.96 → 2.25, p95 5.29 → 5.79 (9 of 10 seeds
+      worse). A smaller step doesn't buy a better trade: on seeds 11–20,
+      at 25% or 15% per step the liar gain vanished (+0.1%) while clean
+      p95 still rose by 0.25–0.37. Nor does the gain come from what the
+      Whanau argument predicts: with the liars in spaces like anyone
+      (`MYCEL_SPACES=insiders`), all eight together still reach 96.6%.
+      Preferring the few co-members seems to steer traffic off routes that
+      liars attract, whoever the members are. That is a product choice
+      (longer routes for everyone against fewer losses to liars), so it
+      waits, opt-in, for the attested-liar measurement (report step 2).
+    - *Random threshold*: the simulator's liars drop everything, so there
+      is no gray hole for it to catch; against them it only delays some
+      suspicions (opt p95 worse on 6 of 10 seeds). It needs a gray-hole
+      role before it can earn its place.
+    - *Churn-conditioned suspicion* excused the liars too (opt p95 worse
+      on 9 of 10 seeds) for a trace gain within noise.
+    - *Hedging* cut trace-replay's tail (opt p95 5.29 → 4.91) but lost
+      raw delivery on all 5 seeds (−0.6%): its copies spend brief contacts
+      that the bundles needed. Under liars it did nothing measurable.
+    - *Smoothing*: clean opt p95 worse on 9 of 10 seeds (sticking with a
+      route after a cheaper one appears), and runs with it on showed frame
+      loops (below).
+
+    **Loops.** `routing-convergence` (built to catch them) shows 0 loops,
+    99% routed in 1.1 s and re-converged in 0.1 s with every defence on
+    and each alone, seeds 1 and 2; the core's link-flap test runs with all
+    four on (`churn_never_loops_with_every_defence`). Tier 2's frame-loop
+    counter (a device seeing the same packet twice) is not zero, though,
+    and not because of the defences: without any (= `main`), `churn` seed
+    3 counts 54, and full-size `adversarial` 33 with plausible liars and
+    134 in the fan-out. One traced case cycled three honest devices until
+    the TTL ran out (`docs/SIMULATION.md` §4, open 16). The defences move
+    which seeds hit it rather than whether: with the default set the
+    full-size counts are 53 (liars) and 121 (fan-out); at half size it hit
+    one fan-out seed (36), as churn-conditioned suspicion and smoothing
+    did, and affinity hit calibration seeds. The table lists them so; the
+    invariant is not met in tier 2 by `main` or by this work.
 
 ## 7. Beyond one mesh
 
@@ -555,4 +704,5 @@ where it works:
 - **Overhead per device** (`mycel-sim flood-scaling`, Bluetooth-only phones with ~12 neighbours, steady state): 3.4 kB/s at 2,000 devices, 8.4% of a BLE radio, with every pair within 8 hops routed. With the old timing (2 s, full scope of 8 hops every 4th, flood reduction): 26.8 kB/s (67%), 85% routed. Fisheye alone cuts traffic 4–5× (`docs/SIMULATION.md` §5). In `global-scale` (2,002 devices in neighbourhoods of 80) routing costs 467 B/s per device, down from 3,768.
 - **Gateways** (QUIC, in-process): a Bluetooth-only device three BLE hops from its gateway syncs with one behind another gateway; the first sync took 0.58 s. A test-tone call along that route had 84 ms RTT and 0 % loss.
 - **Two gateways:** 2.0× one path's throughput. When one is lost, the longest pause on the other is 0.8–2.6 s: data in flight leaves a hole in the stream until the dead path's loss detection gives up.
+- **Defences without a wire change** (§6 item 15; tier 2, seeds 1–10): the default set (aggregation, hold-down, control budget) takes 300 phones with 15 plausible liars from 87.0% to 88.9% delivered (9 of 10 seeds better; 150 phones and 7 liars: 91.9% → 92.7%, 7/2), with clean, churn, global-scale and trace-replay unchanged within the seeds' scatter. Opt-in affinity on top reaches 92.9% (10/10) at a cost to every clean run's optimality (median 1.96 → 2.25).
 - **Store-and-forward:** spraying 4 copies, then a single copy following the gradient toward the internet, gets the first copy to the internet in 28 min (mean of 40 traces, 4 clusters in a chain). The same 4 copies with no gradient (Spray-and-Wait) don't get there within 12 h. A real data mule delivered 1 s after meeting the destination. Against The ONE's routers on real contact traces, see `docs/BENCHMARKS.md`.
