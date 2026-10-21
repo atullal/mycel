@@ -1,0 +1,40 @@
+# OSV-Scanner (and OpenSSF Scorecard's Vulnerabilities check, which runs it)
+# reads this file for Cargo.lock and package-lock.json in this directory.
+# The same advisories are accepted in deny.toml, which has the full reason
+# for each, and .cargo/audit.toml. Keep all three in step. An ID also covers
+# its aliases (RUSTSEC-2024-0429 covers GHSA-wrw7-89jp-8q8g).
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0429"
+ignoreUntil = 2027-01-31
+reason = "glib 0.18 via Tauri's GTK 3 webview on Linux; VariantStrIter is unused; no glib release Tauri can use has the fix (wry needs gtk 0.18)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0370"
+ignoreUntil = 2027-01-31
+reason = "zvariant unmaintained (merged into zbus 6); zbus 5 is still required by notify-rust and tauri-plugin-opener (Linux)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0371"
+ignoreUntil = 2027-01-31
+reason = "zbus_names unmaintained (merged into zbus 6); zbus 5 is still required by notify-rust and tauri-plugin-opener (Linux)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0372"
+ignoreUntil = 2027-01-31
+reason = "zvariant_derive unmaintained (merged into zbus 6); zbus 5 is still required by notify-rust and tauri-plugin-opener (Linux)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0370"
+ignoreUntil = 2027-01-31
+reason = "proc-macro-error unmaintained: build-time only, via glib-macros 0.18 (Tauri, Linux); not in shipped binaries"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0436"
+ignoreUntil = 2027-01-31
+reason = "paste unmaintained: build-time only, via netlink-packet-core (Iroh netwatch, Linux/Android); not in shipped binaries"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0089"
+ignoreUntil = 2027-01-31
+reason = "atomic-polyfill unmaintained: heapless 0.7 (via postcard) uses it only on AVR or with its cas feature, neither of which Mycel builds"

@@ -1,0 +1,8 @@
+# OSV-Scanner (and OpenSSF Scorecard) reads this for vendor/noq/Cargo.lock,
+# which only noq's own test suite uses (vendor/noq-proto/MYCEL_PATCH.md);
+# Mycel builds noq from the workspace's Cargo.lock.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0121"
+ignoreUntil = 2027-01-31
+reason = "gcc 0.3 unmaintained: an optional noq dependency no feature enables; not in the workspace Cargo.lock, never built"
