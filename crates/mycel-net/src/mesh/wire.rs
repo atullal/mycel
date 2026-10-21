@@ -215,7 +215,7 @@ pub fn announces_lens(anns: &[Announce], max: usize) -> Vec<usize> {
 
 /// The datagrams carrying `anns` to one neighbour, as the node sends what
 /// one routing step produced for it: one announcement alone as itself
-/// ([`T_OGM`]), several packed into [`T_OGMS`] datagrams of at most `max`
+/// (`T_OGM`), several packed into `T_OGMS` datagrams of at most `max`
 /// bytes ([`encode_announces`]).
 pub fn encode_announcements(anns: &[Announce], max: usize) -> Vec<Bytes> {
     match anns {

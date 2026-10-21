@@ -1912,7 +1912,8 @@ pub(crate) fn encode_summary(s: dtn::Summary) -> Result<Vec<u8>> {
 // (`mycel-sim`) charges these, so a format change shows up in its byte
 // counts.
 
-/// The bytes before a [`write_frame`] frame's body (its length, `u32`).
+/// The bytes before a length-prefixed frame's body on a carrier stream
+/// (its length, `u32`).
 pub const STREAM_FRAME_PREFIX: usize = 4;
 /// The carrier's one-byte verdict after a bundle's payload ("took it").
 pub const BUNDLE_VERDICT_LEN: usize = 1;
@@ -1924,8 +1925,8 @@ pub fn summary_stream_len(s: &dtn::Summary) -> Option<usize> {
 }
 
 /// An offer's first frame on its bi-stream, length prefix included, on a
-/// hop of wire `version`; `None` if that hop can't take the bundle (see
-/// [`encode_offer`]).
+/// hop of wire `version`; `None` if that hop can't take the bundle (a
+/// version 1 hop only takes version 1 bundles).
 pub fn offer_stream_len(version: WireVersion, o: &dtn::Offer) -> Option<usize> {
     encode_offer(version, o).ok().flatten().map(|m| STREAM_FRAME_PREFIX + m.len())
 }

@@ -750,7 +750,7 @@ fn wire_of(f: &Frame) -> Wire {
 impl Router for Global {
     type Frame = Frame;
 
-    /// Its QUIC packets before a link's framing ([`wire_of`]; what is
+    /// Its QUIC packets before a link's framing (`wire_of`; what is
     /// charged adds the framing of the link that carries it).
     fn size(f: &Frame) -> u32 {
         wire_of(f).bytes
