@@ -117,6 +117,7 @@ pub struct NodeSpec {
 /// A radio area (a building, a block, a camp...) at a place on Earth.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Area {
+    #[serde(with = "crate::world::trace::exact")]
     pub latlon: (f64, f64),
     pub env: Env,
 }
@@ -183,11 +184,30 @@ pub trait Router {
 }
 
 enum Ev<F> {
-    Frame { to: NodeId, from: NodeId, over: Over, f: F, link_since: Time },
-    Timer { node: NodeId, token: u64 },
-    Dir { node: NodeId, token: u64, subject: NodeId },
-    Reach { node: NodeId, token: u64, subject: NodeId },
-    Send { msg: MsgId },
+    Frame {
+        to: NodeId,
+        from: NodeId,
+        over: Over,
+        f: F,
+        link_since: Time,
+    },
+    Timer {
+        node: NodeId,
+        token: u64,
+    },
+    Dir {
+        node: NodeId,
+        token: u64,
+        subject: NodeId,
+    },
+    Reach {
+        node: NodeId,
+        token: u64,
+        subject: NodeId,
+    },
+    Send {
+        msg: MsgId,
+    },
     Mobility,
     Act(Action),
     /// A change from an exported world (replay).
@@ -353,7 +373,8 @@ impl Exo {
     }
 
     fn inet_delay_static(&self, a: NodeId, b: NodeId) -> Time {
-        let (ia, ib) = (self.nodes[a as usize].spec.inet.expect("inet"), self.nodes[b as usize].spec.inet.expect("inet"));
+        let (ia, ib) =
+            (self.nodes[a as usize].spec.inet.expect("inet"), self.nodes[b as usize].spec.inet.expect("inet"));
         let (pa, pb) = (self.latlon(a), self.latlon(b));
         let acc = ia.access.latency() + ib.access.latency();
         // one way between two points: measured (half the median RTT between the
@@ -615,7 +636,11 @@ impl<F> Cx<'_, F> {
         let air = (size as u64 * SEC) / up;
         busy[9] = start + air;
         self.account(size, control, msg);
-        self.world.push(start + air + delay, C_PROTO, Ev::Frame { to: dst, from: me, over: Over::Inet, f, link_since: 0 });
+        self.world.push(
+            start + air + delay,
+            C_PROTO,
+            Ev::Frame { to: dst, from: me, over: Over::Inet, f, link_since: 0 },
+        );
         true
     }
 
@@ -1258,7 +1283,9 @@ impl<R: Router> Sim<R> {
                 Ev::Frame { to, from, over, f, link_since } => {
                     let ok = match over {
                         // the link must still be the same one (not broken and remade)
-                        Over::Radio(_) => self.exo.nodes[to as usize].nbrs.get(&from).is_some_and(|x| x.1 <= link_since),
+                        Over::Radio(_) => {
+                            self.exo.nodes[to as usize].nbrs.get(&from).is_some_and(|x| x.1 <= link_since)
+                        }
                         Over::Inet => self.exo.nodes[to as usize].online && self.exo.nodes[to as usize].inet_up,
                     };
                     let word = frame_word::<R>(&f);
@@ -1320,7 +1347,13 @@ impl<R: Router> Sim<R> {
                         let m = &self.core.msgs[msg as usize];
                         (m.src, m.dst, m.size)
                     };
-                    self.core.digest.record(rec::SEND, at, src, u64::from(msg), u64::from(dst) | (u64::from(size) << 32));
+                    self.core.digest.record(
+                        rec::SEND,
+                        at,
+                        src,
+                        u64::from(msg),
+                        u64::from(dst) | (u64::from(size) << 32),
+                    );
                     let (r, mut cx) = self.cx(src);
                     r.on_send(&mut cx, msg, dst, size);
                 }

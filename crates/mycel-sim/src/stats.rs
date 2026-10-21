@@ -63,33 +63,9 @@ pub fn mix64(x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// The independent random streams of one seed. A scenario draws its world
-/// and workload from `Rng::new(seed ^ tag)` streams; what the protocols do
-/// (radio jitter, the routers' own randomness) comes from these, so the
-/// world's draws never line up with the protocol's. (They used to be the
-/// same sequence: `Rng::new(seed)` for a mesh's positions and for the
-/// engine's jitter and the routers' start phases.)
-///
-/// This is ns-3's substream rule ("the only way to guarantee that two
-/// streams do not overlap is to use the substream capability") applied to
-/// SplitMix64: each stream starts from [`mix64`] of (seed, stream), and two
-/// SplitMix64 sequences of length L overlap only if their starts are
-/// within L Weyl steps, a chance of about 2L / 2^64 per pair.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stream {
-    /// The engine: radio jitter, and what routers draw through `Cx::rng`.
-    Protocol = 1,
-    /// Each routing core's own generator (one sub-stream per device).
-    Routers = 2,
-    /// Who sends what when, where the scenario's world stream (or trace)
-    /// already draws from `Rng::new(seed)`.
-    Workload = 3,
-}
-
-/// The seed of stream `s` of `seed`.
-pub fn stream_seed(seed: u64, s: Stream) -> u64 {
-    mix64(seed ^ mix64((s as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15)))
-}
+// The per-purpose, per-entity random streams of one seed are in
+// `crate::world::streams` (counter-based, keyed by (seed, purpose, entity,
+// k)); `Rng` stays for building worlds up front.
 
 /// The seed of replication `run` of base seed `base` (ns-3's fixed seed
 /// with an advancing run number). Replications of one base never repeat a
@@ -323,20 +299,12 @@ mod tests {
     }
 
     #[test]
-    fn streams_and_runs_are_distinct_and_reproducible() {
-        let s = [Stream::Protocol, Stream::Routers, Stream::Workload];
-        let seeds: Vec<u64> = s.iter().map(|x| stream_seed(1, *x)).collect();
-        assert!(seeds.iter().all(|x| *x != 1));
-        assert_eq!(seeds.iter().collect::<Set<_>>().len(), 3);
-        assert_eq!(stream_seed(7, Stream::Protocol), stream_seed(7, Stream::Protocol));
+    fn runs_are_distinct_and_reproducible() {
         let runs = run_seeds(1, 100);
         assert_eq!(runs.iter().collect::<Set<_>>().len(), 100);
         assert!(runs.iter().all(|r| *r > 1_000), "unrelated to the small hand-picked seeds");
         assert_eq!(runs, run_seeds(1, 100));
         assert_ne!(run_seeds(2, 3), run_seeds(1, 3));
-        // the protocol stream no longer repeats the world's `Rng::new(seed)`
-        let (mut world, mut proto) = (Rng::new(1), Rng::new(stream_seed(1, Stream::Protocol)));
-        assert_ne!((0..4).map(|_| world.u64()).collect::<Vec<_>>(), (0..4).map(|_| proto.u64()).collect::<Vec<_>>());
     }
 
     #[test]

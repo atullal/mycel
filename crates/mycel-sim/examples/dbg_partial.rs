@@ -62,8 +62,8 @@ fn main() {
         println!(
             "t={} mule x {:.0} nbrs {:?} held {:?} delivered {:?}",
             t / SEC,
-            sim.core.spec(m).xy.0,
-            sim.core.neighbours_of(m),
+            sim.exo.spec(m).xy.0,
+            sim.exo.neighbours_of(m),
             held,
             sim.core.msgs[0].delivered.map(|x| x / SEC)
         );

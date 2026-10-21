@@ -30,6 +30,7 @@ pub const FORMAT: u32 = 1;
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Device {
     pub area: u32,
+    #[serde(with = "exact")]
     pub xy: (f64, f64),
     pub radios: Techs,
     pub inet: Option<Inet>,
@@ -74,7 +75,12 @@ pub struct WorldTrace {
 impl WorldTrace {
     pub fn load(path: &Path) -> anyhow::Result<WorldTrace> {
         let t: WorldTrace = serde_json::from_slice(&std::fs::read(path)?)?;
-        anyhow::ensure!(t.format == FORMAT, "{}: world format {} (this build reads {FORMAT})", path.display(), t.format);
+        anyhow::ensure!(
+            t.format == FORMAT,
+            "{}: world format {} (this build reads {FORMAT})",
+            path.display(),
+            t.format
+        );
         Ok(t)
     }
 
@@ -92,12 +98,27 @@ impl WorldTrace {
 
     /// A file name for it: the start of its exogenous hash and its model.
     pub fn file_name(&self) -> String {
-        let model: String = self
-            .model
-            .chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
-            .collect();
+        let model: String =
+            self.model.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' }).collect();
         format!("world-{}-{}-{model}.json", self.seed, &self.exo_hash[..12.min(self.exo_hash.len())])
+    }
+}
+
+/// A point as `"x,y"` in Rust's shortest round-trip notation, parsed back
+/// exactly (`str::parse` rounds correctly; serde_json's default float
+/// parser may miss by an ulp, and one ulp of a position changes an
+/// internet delay and so the run).
+pub mod exact {
+    use serde::{Deserialize, Deserializer, Serializer, de::Error};
+
+    pub fn serialize<S: Serializer>(p: &(f64, f64), s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format!("{:?},{:?}", p.0, p.1))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<(f64, f64), D::Error> {
+        let s = String::deserialize(d)?;
+        let (x, y) = s.split_once(',').ok_or_else(|| D::Error::custom("expected \"x,y\""))?;
+        Ok((x.parse().map_err(D::Error::custom)?, y.parse().map_err(D::Error::custom)?))
     }
 }
 

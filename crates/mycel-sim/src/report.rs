@@ -68,7 +68,15 @@ pub struct ScenarioResult {
     /// p99 only means something over thousands. Not written out.
     #[serde(skip)]
     pub optimality: Vec<f64>,
+    /// (world label, exogenous hash) of every run: runs of one world must
+    /// share it, whatever model they ran (`finish` makes that an invariant).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worlds: Vec<(String, String)>,
 }
+
+/// The invariant `finish` adds when runs registered their worlds.
+pub const SAME_WORLD: &str =
+    "every model saw the same exogenous world (BLAKE3 of positions, links, outages, workload, adversaries)";
 
 impl ScenarioResult {
     pub fn new(name: &str, title: &str, tier: u8, seed: u64, scale: f64) -> Self {
@@ -86,6 +94,7 @@ impl ScenarioResult {
             metrics: serde_json::Value::Null,
             wall_s: 0.0,
             optimality: Vec::new(),
+            worlds: Vec::new(),
         }
     }
 
@@ -133,6 +142,11 @@ impl ScenarioResult {
         })
     }
 
+    /// A run on the world `label` had exogenous hash `hash`.
+    pub fn world_hash(&mut self, label: &str, hash: &str) {
+        self.worlds.push((label.into(), hash.into()));
+    }
+
     pub fn headline(&mut self, s: impl Into<String>) {
         self.headline.push(s.into());
     }
@@ -146,6 +160,19 @@ impl ScenarioResult {
     /// scenario whatever is expected of it (a candidate that doesn't model
     /// one mustn't emit it as an invariant).
     pub fn finish(&mut self) {
+        if !self.worlds.is_empty() && !self.slos.iter().any(|s| s.name == SAME_WORLD) {
+            let mut by: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+            for (l, h) in &self.worlds {
+                by.entry(l.as_str()).or_default().push(h.as_str());
+            }
+            let bad: Vec<&str> = by.iter().filter(|(_, v)| v.iter().any(|h| *h != v[0])).map(|(l, _)| *l).collect();
+            let actual = if bad.is_empty() {
+                format!("{} runs on {} worlds", self.worlds.len(), by.len())
+            } else {
+                format!("differs on {}", bad.join(", "))
+            };
+            self.check(SAME_WORLD, bad.is_empty(), actual).invariant();
+        }
         if self.slos.iter().any(|s| s.invariant && !s.pass) {
             self.status = Status::Fail;
             return;

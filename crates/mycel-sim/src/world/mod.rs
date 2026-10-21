@@ -20,6 +20,8 @@
 //! event a router sees (equal for the same seed and candidate, and for a
 //! run replayed from an exported world).
 
+#[cfg(test)]
+mod meta_tests;
 pub mod streams;
 pub mod trace;
 
@@ -33,7 +35,11 @@ use crate::tier2::engine::{NodeId, Techs, Time};
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorldEvent {
     /// A device's position (a mobility step or a scripted move).
-    Move { n: NodeId, xy: (f64, f64) },
+    Move {
+        n: NodeId,
+        #[serde(with = "trace::exact")]
+        xy: (f64, f64),
+    },
     /// A radio link came up or went down (`a`'s side is told first).
     Link { a: NodeId, b: NodeId, techs: Techs, up: bool },
     /// A device switched on or off.

@@ -15,6 +15,7 @@
 //! service-level objectives; `cargo run -p mycel-sim -- all` runs them and
 //! writes a report. See docs/SIMULATION.md.
 
+pub mod crn;
 pub mod latency;
 pub mod models;
 pub mod report;

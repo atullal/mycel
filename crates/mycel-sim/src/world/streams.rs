@@ -23,9 +23,23 @@
 //! (ns-3 manual, "Random Variables"), keyed per entity so they cannot
 //! shift.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use serde::{Deserialize, Serialize};
 
 use crate::stats::mix64;
+
+/// Shifts every endogenous key (0: none). Only `mycel-sim crn` sets it, to
+/// run candidates on the same exogenous world with independent protocol
+/// draws; it is process-wide, so it is set between batches of runs, never
+/// during one.
+static ENDOGENOUS_SALT: AtomicU64 = AtomicU64::new(0);
+
+/// Give the endogenous streams of every run started from now on salt `s`
+/// (0 restores them). For the CRN measurement only.
+pub fn set_endogenous_salt(s: u64) {
+    ENDOGENOUS_SALT.store(s, Ordering::SeqCst);
+}
 
 /// Philox4×32's multipliers and Weyl key increments (Salmon et al. 2011,
 /// Table 2; Random123 `philox.h`).
@@ -118,6 +132,8 @@ pub struct Key([u32; 2]);
 
 impl Key {
     pub fn new(seed: u64, p: Purpose) -> Key {
+        let salt = if p.is_exogenous() { 0 } else { ENDOGENOUS_SALT.load(Ordering::Relaxed) };
+        let seed = if salt == 0 { seed } else { seed ^ mix64(salt ^ 0x5a17) };
         // distinct seeds give distinct keys for one purpose (mix64 is a
         // bijection); across purposes a collision has odds of 2^-64 a pair
         let k = mix64(seed ^ mix64((p as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x6d79_6365_6c5f_7277));

@@ -20,7 +20,7 @@ use serde_json::json;
 use super::{Candidate, Opts, Scenario};
 use crate::models::{Access, Env, Nat, Tech};
 use crate::report::{ScenarioResult, fmt};
-use crate::stats::{Rng, Stream, Tail, stream_seed};
+use crate::stats::{Rng, Tail};
 use crate::tier2::dtn::{Dtn, Kind};
 use crate::tier2::engine::{Mobility, NodeSpec};
 use crate::tier2::global::{Global, Shared, key, node};
@@ -28,6 +28,8 @@ use crate::tier2::mycel::{Cfg, Mycel, Role};
 use crate::tier2::oracle::Oracle;
 use crate::tier2::world::{self, ble_only, cellular, phone};
 use crate::tier2::{Action, Area, HOUR, Inet, MIN, MS, NodeId, Router, SEC, Sim, T2Metrics, Techs, Time, metrics};
+use crate::world::trace::WorldTrace;
+use crate::world::{Purpose, Streams, hex};
 
 pub fn scenarios() -> Vec<Scenario> {
     vec![
@@ -123,6 +125,11 @@ pub struct Plan {
     pub bundle_lifetime_ms: Option<u64>,
     /// Buffer and TTL for the baseline routers.
     pub baseline: Option<crate::tier2::dtn::Opts>,
+    /// Replay this exported world instead of building one from the specs
+    /// (`sends`, `roles`, `poison` and `max_neighbours` come from it too).
+    pub replay: Option<std::sync::Arc<WorldTrace>>,
+    /// Keep the run's exported world in [`Run::world`].
+    pub keep_world: bool,
 }
 
 impl Plan {
@@ -145,6 +152,31 @@ impl Plan {
 
     fn role(&self, i: NodeId) -> Role {
         self.roles.get(&i).copied().unwrap_or_default()
+    }
+
+    /// The adversary placement, sorted: part of the exogenous world.
+    fn sorted_roles(&self) -> Vec<(NodeId, Role)> {
+        let mut v: Vec<(NodeId, Role)> = self.roles.iter().map(|(i, r)| (*i, *r)).collect();
+        v.sort_unstable_by_key(|x| x.0);
+        v
+    }
+
+    /// Every model at its default settings (no scenario overrides).
+    fn default_config(&self) -> bool {
+        self.dtn.is_none() && self.bundle_lifetime_ms.is_none() && self.baseline.is_none()
+    }
+
+    /// The plan an exported world carries: its sends and adversaries, and
+    /// the world itself to replay.
+    pub fn replaying(t: &std::sync::Arc<WorldTrace>) -> Plan {
+        Plan {
+            sends: t.sends.clone(),
+            max_neighbours: t.max_neighbours,
+            poison: t.dir_poison,
+            roles: t.roles.iter().copied().collect(),
+            replay: Some(t.clone()),
+            ..Plan::default()
+        }
     }
 
     /// What sets this plan's run apart from others on the same world and
@@ -223,12 +255,23 @@ pub enum Model {
 }
 
 impl Model {
-    fn of(c: Candidate) -> Model {
+    pub fn of(c: Candidate) -> Model {
         match c {
             Candidate::Global => Model::Global(GCfg::default()),
             Candidate::Main => Model::Main,
             Candidate::StandIn => Model::StandIn,
         }
+    }
+
+    /// The model a [`Model::name`] names, among the ones the CLI and the
+    /// scenarios run with default settings.
+    pub fn from_name(name: &str) -> Option<Model> {
+        let mut known =
+            vec![Model::Global(GCfg::default()), Model::Global(GCfg::routing()), Model::Global(GCfg::before())];
+        known.extend([Model::Main, Model::StandIn, Model::SenderHolds, Model::Epidemic, Model::Prophet]);
+        known.extend((1..=32).map(Model::Spray));
+        known.extend((1..=16).map(Model::Flood));
+        known.into_iter().find(|m| m.name() == name)
     }
 
     pub fn name(&self) -> String {
@@ -267,7 +310,18 @@ pub struct Run {
     /// With devices that drop traffic: what they must cost, against what
     /// they did (liar-free-reachable delivery, [`crate::tier2::lfr`]).
     pub lfr: Option<crate::tier2::lfr::Ceiling>,
+    /// BLAKE3 of the exogenous world (hex): the same for every model run
+    /// on one world and seed.
+    pub exo_hash: String,
+    /// BLAKE3 of every event the routers saw (hex): the same for the same
+    /// seed and model, and for a replay of the exported world.
+    pub run_hash: String,
+    /// The exported world, with [`Plan::keep_world`].
+    pub world: Option<WorldTrace>,
 }
+
+/// The tag of the adversary roles in the exogenous hash.
+const NOTE_ROLES: u8 = 0x20;
 
 #[allow(clippy::too_many_arguments)]
 fn go<R: Router>(
@@ -281,12 +335,33 @@ fn go<R: Router>(
     extra: impl Fn(&Sim<R>) -> serde_json::Value,
 ) -> Run {
     let t = Instant::now();
-    let mut sim = Sim::new(w.areas.clone(), w.specs.clone(), seed, make);
+    let mut sim = match &plan.replay {
+        Some(tr) => Sim::replay(tr, make),
+        None => Sim::new(w.areas.clone(), w.specs.clone(), seed, make),
+    };
     plan.apply(&mut sim);
+    let roles = plan.sorted_roles();
+    sim.note_world(NOTE_ROLES, serde_json::to_vec(&roles).expect("roles"));
+    let export = crate::world::trace::export_dir();
+    if export.is_some() || plan.keep_world {
+        sim.keep_world_log();
+    }
     sim.start();
     sim.run(until);
     sim.finish();
     let wall = t.elapsed().as_secs_f64();
+    let world = (export.is_some() || plan.keep_world).then(|| {
+        let mut tr =
+            sim.world_trace(format!("{name}{}, seed {seed}", plan.label()), name.into(), plan.default_config(), until);
+        tr.roles = roles;
+        tr
+    });
+    if let (Some(dir), Some(tr)) = (export, &world) {
+        let path = dir.join(tr.file_name());
+        if let Err(e) = tr.save(&path) {
+            eprintln!("export-world: {}: {e}", path.display());
+        }
+    }
     let oracle = Oracle::new(&sim);
     oracle.annotate(&mut sim, sample);
     dump_messages(&sim, name, &plan.label(), seed);
@@ -309,7 +384,16 @@ fn go<R: Router>(
             )),
         )
     };
-    Run { m, extra: extra(&sim), warm, first, lfr }
+    Run {
+        m,
+        extra: extra(&sim),
+        warm,
+        first,
+        lfr,
+        exo_hash: hex(&sim.exo_hash()),
+        run_hash: hex(&sim.run_hash()),
+        world: world.filter(|_| plan.keep_world),
+    }
 }
 
 /// With `MYCEL_SIM_DUMP=<dir>`, every message of a run (sent, delivered,
@@ -372,8 +456,8 @@ fn global_cfg(g: GCfg, seed: u64, i: NodeId) -> Config {
         max_hops: g.max_hops,
         flood_reduction: g.flood_reduction,
         // one well-mixed sub-stream per device (xorshift from seeds a few
-        // bits apart starts out correlated)
-        seed: crate::stats::mix64(stream_seed(seed, Stream::Routers) ^ (i as u64 + 1)).max(1),
+        // bits apart starts out correlated): its first draw of RouterCore
+        seed: Streams::new(seed).u64(Purpose::RouterCore, u64::from(i), 0).max(1),
         // signatures are stubbed (always valid): the cache only costs memory
         verified_max: 64,
         ..Config::default()
@@ -529,6 +613,71 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
     }
 }
 
+/// Replay an exported world (`mycel-sim replay --world FILE`): the model it
+/// was exported from, and `also` if that is another, on the same world and
+/// endogenous streams. Invariants: the replay rebuilds the trace's
+/// exogenous hash, every model sees that world, and (where the source run
+/// used default settings) the source model's replay gives its run hash.
+pub fn replay_world(t: std::sync::Arc<WorldTrace>, also: Option<Candidate>) -> ScenarioResult {
+    let mut r =
+        ScenarioResult::new("world-replay", &format!("Replay of an exported world: {}", t.source), 2, t.seed, 1.0);
+    let Some(model) = Model::from_name(&t.model) else {
+        r.check("the trace's model is one this build knows", false, t.model.clone());
+        return r;
+    };
+    let w = World {
+        areas: t.areas.clone(),
+        specs: t
+            .devices
+            .iter()
+            .map(|d| NodeSpec {
+                area: d.area,
+                xy: d.xy,
+                radios: d.radios,
+                inet: d.inet,
+                mobility: Mobility::Static,
+                online: d.online,
+            })
+            .collect(),
+    };
+    let plan = Plan::replaying(&t);
+    let mut models = vec![model];
+    if let Some(c) = also.map(Model::of)
+        && c != model
+    {
+        models.push(c);
+    }
+    let runs: Vec<Run> = models.par_iter().map(|m| run(*m, &w, &plan, t.seed, t.until, None)).collect();
+    for x in &runs {
+        r.world_hash("trace", &x.exo_hash);
+        r.note(row(&x.m));
+        r.note(format!("{}: exogenous hash {}, run hash {}", x.m.model, x.exo_hash, x.run_hash));
+    }
+    r.check(
+        "the replay rebuilds the exported world (exogenous hash)",
+        runs[0].exo_hash == t.exo_hash,
+        runs[0].exo_hash.clone(),
+    )
+    .invariant();
+    if t.default_config {
+        r.check(
+            "the source model's replay is the source run (run hash)",
+            runs[0].run_hash == t.run_hash,
+            runs[0].run_hash.clone(),
+        )
+        .invariant();
+    } else {
+        r.note("The source run overrode model settings (carrier or baselines) that a world trace doesn't carry, so its run hash isn't checked here; the round-trip test covers it with the source settings.");
+    }
+    for x in &runs {
+        headline(&mut r, &x.m);
+    }
+    r.metrics = serde_json::Value::Array(
+        runs.iter().map(|x| json!({"metrics": x.m, "exo_hash": x.exo_hash, "run_hash": x.run_hash})).collect(),
+    );
+    r
+}
+
 fn row(m: &T2Metrics) -> String {
     format!(
         "**{}**: delivered {}/{} feasible ({:.0}%); latency p50 {} s, p95 {} s; optimality {}; \
@@ -590,6 +739,9 @@ fn compare(
         std::iter::once(cand_model).chain(refs.iter().copied().filter(|m| *m != cand_model)).collect();
     let mut others: Vec<Run> = models.par_iter().map(|m| run(*m, w, plan, o.seed, until, sample)).collect();
     let cand = others.remove(0);
+    for x in std::iter::once(&cand).chain(&others) {
+        r.world_hash("world", &x.exo_hash);
+    }
     no_loops(r, &cand);
     headline(r, &cand.m);
     r.optimality.clone_from(&cand.m.optimality_ratios);
@@ -600,8 +752,13 @@ fn compare(
     for x in &others {
         r.note(row(&x.m));
     }
-    let mut all: Vec<serde_json::Value> = vec![json!({"metrics": cand.m, "extra": cand.extra})];
-    all.extend(others.iter().map(|x| json!({"metrics": x.m, "extra": x.extra})));
+    let mut all: Vec<serde_json::Value> =
+        vec![json!({"metrics": cand.m, "extra": cand.extra, "exo_hash": cand.exo_hash, "run_hash": cand.run_hash})];
+    all.extend(
+        others
+            .iter()
+            .map(|x| json!({"metrics": x.m, "extra": x.extra, "exo_hash": x.exo_hash, "run_hash": x.run_hash})),
+    );
     r.metrics = serde_json::Value::Array(all);
     (cand, others)
 }
@@ -1229,6 +1386,9 @@ fn partial_route(o: Opts) -> ScenarioResult {
             .map(|m| run(*m, &w, &plan, o.seed, until, None))
             .collect();
         let (holds, stand, cand) = (runs.pop().unwrap(), runs.pop().unwrap(), runs.pop().unwrap());
+        for x in [&cand, &stand, &holds] {
+            r.world_hash(&format!("gap {gap} m"), &x.exo_hash);
+        }
         r.at_least(&format!("gap {gap} m: delivery"), 100.0 * cand.m.delivery_ratio, 99.0, "%");
         r.at_most(&format!("gap {gap} m: optimality p95"), inf_if_none(&cand.m, cand.m.optimality.p95), 2.0, "×");
         r.headline(format!(
@@ -1298,8 +1458,11 @@ fn disaster_world(o: &Opts) -> (World, Vec<(NodeId, NodeId)>) {
     let mut pairs = Vec::new();
     // at least 48 messages sent even in a small world (with 12, one message
     // was 8 points of delivery, and seeds "failed" at 6 of 8, 75%); fewer
-    // are feasible, so the verdict is a mean over worlds
+    // are feasible, so the verdict is a mean over worlds. Message k's ends
+    // come from its own workload stream: more messages move no earlier one.
+    let streams = Streams::new(o.seed);
     for k in 0..o.n(60, 48) {
+        let mut rng = streams.stream(Purpose::Workload, k as u64);
         let sc = k % camps.len();
         let src = members[sc][rng.below(per)];
         let dst = if k % 3 == 0 {
@@ -1320,10 +1483,12 @@ struct DisasterWorld {
     delivery: f64,
     copies: f64,
     latency_vs_epidemic: f64,
+    /// The exogenous hashes of the two runs (the same world).
+    hashes: [String; 2],
 }
 
 impl DisasterWorld {
-    fn of(c: &T2Metrics, epidemic: &T2Metrics) -> DisasterWorld {
+    fn of(c: &T2Metrics, epidemic: &T2Metrics, hashes: [String; 2]) -> DisasterWorld {
         let ratio = if epidemic.delivered == 0 {
             f64::INFINITY
         } else {
@@ -1333,6 +1498,7 @@ impl DisasterWorld {
             delivery: 100.0 * c.delivery_ratio,
             copies: inf_if_none(c, c.copies_per_msg),
             latency_vs_epidemic: ratio,
+            hashes,
         }
     }
 }
@@ -1366,10 +1532,10 @@ fn disaster_dtn(o: Opts) -> ScenarioResult {
         let (w, pairs) = disaster_world(&ok);
         let plan = plan_for(&pairs);
         let (c, e) = rayon::join(
-            || run(Model::of(o.candidate), &w, &plan, ok.seed, until, None).m,
-            || run(Model::Epidemic, &w, &plan, ok.seed, until, None).m,
+            || run(Model::of(o.candidate), &w, &plan, ok.seed, until, None),
+            || run(Model::Epidemic, &w, &plan, ok.seed, until, None),
         );
-        DisasterWorld::of(&c, &e)
+        DisasterWorld::of(&c.m, &e.m, [c.exo_hash, e.exo_hash])
     };
     let seeds = if o.scale >= 1.0 { DISASTER_SEEDS } else { DISASTER_SEEDS_CI };
     let ((cand, others), more) = rayon::join(
@@ -1387,8 +1553,13 @@ fn disaster_dtn(o: Opts) -> ScenarioResult {
         || (1..seeds).into_par_iter().map(more_seeds).collect::<Vec<DisasterWorld>>(),
     );
     let epi = others.iter().find(|x| x.m.model == "epidemic").map(|x| x.m.clone()).unwrap_or_default();
-    let mut worlds = vec![DisasterWorld::of(&cand.m, &epi)];
+    let mut worlds = vec![DisasterWorld::of(&cand.m, &epi, [cand.exo_hash.clone(), cand.exo_hash.clone()])];
     worlds.extend(more);
+    for (k, x) in worlds.iter().enumerate().skip(1) {
+        for h in &x.hashes {
+            r.world_hash(&format!("world {k}"), h);
+        }
+    }
     let per_seed: Vec<f64> = worlds.iter().map(|x| x.delivery).collect();
     let mean = per_seed.iter().sum::<f64>() / per_seed.len() as f64;
     let (lo, hi) = per_seed.iter().fold((f64::INFINITY, 0.0f64), |(l, h), x| (l.min(*x), h.max(*x)));
@@ -1482,8 +1653,10 @@ fn global_scale(o: Opts) -> ScenarioResult {
     let msgs = o.n(2000, 200);
     let warm = 2 * MIN;
     let mut plan = Plan { max_neighbours: Some(8), ..Plan::default() };
+    let streams = Streams::new(o.seed);
     for k in 0..msgs {
-        let (a, b) = (rng.below(n) as NodeId, rng.below(n) as NodeId);
+        let mut wl = streams.stream(Purpose::Workload, k as u64);
+        let (a, b) = (wl.below(n) as NodeId, wl.below(n) as NodeId);
         if a != b {
             let t = warm + (k as Time * 5 * MIN) / msgs as Time;
             plan.sends.push((t, a, b, 1000, false));
@@ -1544,20 +1717,25 @@ fn churn(o: Opts) -> ScenarioResult {
     let (warm, dur) = (2 * MIN, 10 * MIN);
     let mut plan = Plan { max_neighbours: Some(8), ..Plan::default() };
     let mut away: Vec<NodeId> = Vec::new();
+    // who leaves and comes back: each minute's own churn stream; the
+    // messages: each its own workload stream
+    let streams = Streams::new(o.seed);
     for minute in 0..(dur / MIN) {
         let t = warm + minute * MIN;
+        let mut ch = streams.stream(Purpose::Churn, minute);
         for a in away.drain(..) {
-            plan.acts.push((t + rng.below(60) as Time * SEC, Action::Online(a, true)));
+            plan.acts.push((t + ch.below(60) as Time * SEC, Action::Online(a, true)));
         }
         for _ in 0..(n as f64 * 0.15) as usize {
-            let d = rng.below(n) as NodeId;
+            let d = ch.below(n) as NodeId;
             away.push(d);
-            plan.acts.push((t + rng.below(60) as Time * SEC, Action::Online(d, false)));
+            plan.acts.push((t + ch.below(60) as Time * SEC, Action::Online(d, false)));
         }
     }
     let msgs = o.n(1000, 150);
     for k in 0..msgs {
-        let (a, b) = (rng.below(n) as NodeId, rng.below(n) as NodeId);
+        let mut wl = streams.stream(Purpose::Workload, k as u64);
+        let (a, b) = (wl.below(n) as NodeId, wl.below(n) as NodeId);
         if a != b {
             plan.sends.push((warm + (k as Time * dur) / msgs as Time, a, b, 1000, false));
         }
@@ -1593,21 +1771,26 @@ fn adversaries(o: &Opts) -> Adversaries {
     for s in w.specs.iter_mut().take(n / 20) {
         s.inet = Some(cellular(&mut rng));
     }
-    let bad: Vec<NodeId> = (0..(n / 20).max(2)).map(|_| rng.below(n) as NodeId).collect();
-    let storm = rng.below(n) as NodeId;
-    let replay = rng.below(n) as NodeId;
+    // adversary placement and the honest workload: streams of their own,
+    // apart from the world's (which still decides who has internet)
+    let streams = Streams::new(o.seed);
+    let mut adv = streams.stream(Purpose::Adversary, 0);
+    let bad: Vec<NodeId> = (0..(n / 20).max(2)).map(|_| adv.below(n) as NodeId).collect();
+    let storm = adv.below(n) as NodeId;
+    let replay = adv.below(n) as NodeId;
+    let sybil = adv.below(n) as NodeId;
     let roles: crate::stats::Set<NodeId> = bad.iter().copied().chain([storm, replay]).collect();
     let mut plan = Plan::default();
     let mut k = 0;
     while plan.sends.len() < o.n(300, 60) && k < 10_000 {
+        let mut wl = streams.stream(Purpose::Workload, k);
         k += 1;
-        let (a, b) = (rng.below(n) as NodeId, rng.below(n) as NodeId);
+        let (a, b) = (wl.below(n) as NodeId, wl.below(n) as NodeId);
         if a != b && !roles.contains(&a) && !roles.contains(&b) {
             plan.sends.push((30 * SEC + plan.sends.len() as Time * 300 * MS, a, b, 1000, false));
         }
     }
     let until = 30 * SEC + plan.sends.len() as Time * 300 * MS + 90 * SEC;
-    let sybil = rng.below(n) as NodeId;
     Adversaries { w, bad, storm, replay, sybil, plan, until }
 }
 
@@ -2047,7 +2230,7 @@ fn trace_replay(o: Opts) -> ScenarioResult {
     // The ONE's default workload: a message every 25–35 s between random
     // devices, 500 kB–1 MB, TTL 300 min; buffers of 5 MB, FIFO drop. (Its
     // own stream: the synthetic trace draws from `Rng::new(seed)`.)
-    let mut rng = Rng::new(stream_seed(o.seed, Stream::Workload));
+    let mut rng = Streams::new(o.seed).stream(Purpose::Workload, 0);
     let mut plan = Plan { acts, ..Plan::default() };
     let mut t = 25 * SEC;
     let ttl = 300 * MIN;
@@ -2072,6 +2255,9 @@ fn trace_replay(o: Opts) -> ScenarioResult {
     let models = [Model::Global(GCfg::default()), Model::Epidemic, Model::Prophet, Model::Spray(6), Model::Flood(7)];
     let mut rows = Vec::new();
     let runs: Vec<Run> = models.par_iter().map(|m| run(*m, &w, &plan, o.seed, until, Some(400))).collect();
+    for x in &runs {
+        r.world_hash("trace", &x.exo_hash);
+    }
     for (m, x) in models.into_iter().zip(runs) {
         // The ONE's relayed counts every transfer, the final one to the
         // destination included, so its (relayed − delivered)/delivered is
@@ -2174,7 +2360,7 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
     // different messages: at CI size, seed 3, reach "fell" from 99% to 95%
     // at hop 7 on 20 messages from other devices.)
     let msgs = o.n(HOP_LIMIT_BROADCASTS, HOP_LIMIT_BROADCASTS);
-    let mut rng = Rng::new(stream_seed(o.seed, Stream::Workload));
+    let mut rng = Streams::new(o.seed).stream(Purpose::Workload, 0);
     let sources: Vec<NodeId> = (0..msgs).map(|_| rng.below(n) as NodeId).collect();
     let mut rows = Vec::new();
     let mut reach_by_h = Vec::new();
