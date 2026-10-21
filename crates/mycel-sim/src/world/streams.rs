@@ -158,7 +158,7 @@ impl Key {
 
     /// The stream of `entity`, from its draw 0.
     pub fn stream(self, entity: u64) -> Substream {
-        Substream { key: self, entity, k: 0 }
+        Substream { key: self, entity, k: 0, spare: None }
     }
 }
 
@@ -193,25 +193,34 @@ impl Streams {
 }
 
 /// One entity's stream: draw k is a pure function of (seed, purpose,
-/// entity, k), and the stream only counts k. The same interface as
+/// entity, k) (draws 2j and 2j + 1 are the two words of Philox block j),
+/// and the stream only counts k. The same interface as
 /// [`crate::stats::Rng`], so routers and scenario code use either.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Substream {
     key: Key,
     entity: u64,
+    /// The next block's index.
     k: u64,
+    /// The second word of the last block, not yet drawn.
+    spare: Option<u64>,
 }
 
 impl Substream {
-    /// How many draws this entity has made.
+    /// How many 64-bit draws this entity has made.
     pub fn draws(&self) -> u64 {
-        self.k
+        2 * self.k - u64::from(self.spare.is_some())
     }
 
+    /// Draw 2j and 2j + 1 are the two words of block j.
     pub fn u64(&mut self) -> u64 {
-        let x = self.key.u64(self.entity, self.k);
+        if let Some(x) = self.spare.take() {
+            return x;
+        }
+        let [a, b] = self.key.block(self.entity, self.k);
         self.k += 1;
-        x
+        self.spare = Some(b);
+        a
     }
 
     /// Uniform in [0, 1).
@@ -268,7 +277,8 @@ mod tests {
         let mut a = s.stream(Purpose::Router, 3);
         let first: Vec<u64> = (0..5).map(|_| a.u64()).collect();
         // the k-th draw is the same however it is reached
-        assert_eq!(first[4], s.u64(Purpose::Router, 3, 4));
+        assert_eq!(first[4], s.key(Purpose::Router).block(3, 2)[0]);
+        assert_eq!(first[3], s.key(Purpose::Router).block(3, 1)[1]);
         assert_eq!(a.draws(), 5);
         // another entity, purpose or seed: unrelated
         assert_ne!(first[0], s.u64(Purpose::Router, 4, 0));

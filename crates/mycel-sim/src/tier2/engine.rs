@@ -488,14 +488,21 @@ impl Exo {
 /// from a counter-based stream keyed per entity and event (common random
 /// numbers across candidates, [`crate::world::streams`]).
 pub struct Endo {
-    /// When each device's radios (by tech index) and uplink are free again.
-    busy: Vec<[Time; 10]>,
     /// Radio jitter: draw k of directed link (a, b) is its k-th frame's.
     jitter: Key,
-    /// Frames sent so far on each directed link (its jitter index).
-    link_frames: Map<u64, u64>,
-    /// Each router's own stream for [`Cx::rng`].
-    routers: Vec<Substream>,
+    /// Per device, together so a send touches one place.
+    nodes: Vec<EndoNode>,
+}
+
+/// One device's endogenous state.
+struct EndoNode {
+    /// When its radios (by tech index) and uplink are free again.
+    busy: [Time; 10],
+    /// Frames sent so far on each of its outgoing links (their jitter
+    /// index), sorted by receiver: no hashing on the per-frame path.
+    frames: Vec<(NodeId, u64)>,
+    /// Its router's own stream for [`Cx::rng`].
+    rng: Substream,
 }
 
 /// What a router can see and do.
@@ -510,7 +517,8 @@ pub struct Cx<'a, F> {
 /// The protocol-facing state (the event queue, messages, counters, the
 /// directory) and the endogenous models: everything routers can change.
 pub struct WorldCore<F> {
-    queue: BinaryHeap<Reverse<(Time, u8, u64, usize)>>,
+    /// (time, class << 56 | sequence, slot)
+    queue: BinaryHeap<Reverse<(Time, u64, usize)>>,
     events: Vec<Option<Ev<F>>>,
     free: Vec<usize>,
     seq: u64,
@@ -566,7 +574,7 @@ impl<F> Cx<'_, F> {
     /// This router's own random stream (draw k of router `me`, whatever
     /// any other router draws).
     pub fn rng(&mut self) -> &mut Substream {
-        &mut self.world.endo.routers[self.me as usize]
+        &mut self.world.endo.nodes[self.me as usize].rng
     }
 
     pub fn online(&self) -> bool {
@@ -607,15 +615,21 @@ impl<F> Cx<'_, F> {
         let ti = Tech::ALL.iter().position(|x| *x == t).expect("listed");
         let now = self.now;
         let endo = &mut self.world.endo;
-        let busy = &mut endo.busy[me as usize];
-        let start = busy[ti].max(now);
+        let node = &mut endo.nodes[me as usize];
+        let start = node.busy[ti].max(now);
         let air = (size as u64 * SEC) / t.rate();
-        busy[ti] = start + air;
+        node.busy[ti] = start + air;
         // the k-th frame on this directed link draws its jitter from (a→b, k)
-        let e = streams::link(me, nb);
-        let k = endo.link_frames.entry(e).or_insert(0);
-        let jitter = (endo.jitter.f64(e, *k) * t.jitter().as_micros() as f64) as Time;
-        *k += 1;
+        let i = match node.frames.binary_search_by_key(&nb, |x| x.0) {
+            Ok(i) => i,
+            Err(i) => {
+                node.frames.insert(i, (nb, 0));
+                i
+            }
+        };
+        let k = node.frames[i].1;
+        node.frames[i].1 += 1;
+        let jitter = (endo.jitter.f64(streams::link(me, nb), k) * t.jitter().as_micros() as f64) as Time;
         let at = start + air + t.latency().as_micros() as Time + jitter;
         self.account(size, control, msg);
         self.world.push(at, C_PROTO, Ev::Frame { to: nb, from: me, over: Over::Radio(t), f, link_since: since });
@@ -631,7 +645,7 @@ impl<F> Cx<'_, F> {
         let me = self.me;
         let Some(delay) = self.exo.inet_delay(me, dst) else { return false };
         let up = self.exo.nodes[me as usize].spec.inet.expect("inet").access.uplink();
-        let busy = &mut self.world.endo.busy[me as usize];
+        let busy = &mut self.world.endo.nodes[me as usize].busy;
         let start = busy[9].max(self.now);
         let air = (size as u64 * SEC) / up;
         busy[9] = start + air;
@@ -777,7 +791,7 @@ impl<F> WorldCore<F> {
             }
         };
         self.seq += 1;
-        self.queue.push(Reverse((at, class, self.seq, slot)));
+        self.queue.push(Reverse((at, (u64::from(class) << 56) | self.seq, slot)));
     }
 
     /// The run hash so far: BLAKE3 over every event a router saw.
@@ -796,7 +810,7 @@ fn frame_word<R: Router>(f: &R::Frame) -> u64 {
 fn over_code(o: Over) -> u64 {
     match o {
         Over::Inet => 0,
-        Over::Radio(t) => 1 + Tech::ALL.iter().position(|x| *x == t).expect("listed") as u64,
+        Over::Radio(t) => 1 + t as u64,
     }
 }
 
@@ -868,10 +882,10 @@ impl<R: Router> Sim<R> {
             free: Vec::new(),
             seq: 0,
             endo: Endo {
-                busy: vec![[0; 10]; n],
                 jitter: streams.key(Purpose::RadioJitter),
-                link_frames: Map::default(),
-                routers: (0..n as u64).map(|i| streams.stream(Purpose::Router, i)).collect(),
+                nodes: (0..n as u64)
+                    .map(|i| EndoNode { busy: [0; 10], frames: Vec::new(), rng: streams.stream(Purpose::Router, i) })
+                    .collect(),
             },
             msgs: Vec::new(),
             counters: vec![NodeCounters::default(); n],
@@ -1261,7 +1275,7 @@ impl<R: Router> Sim<R> {
 
     /// Run until `until` (or the queue empties).
     pub fn run(&mut self, until: Time) {
-        while let Some(Reverse((at, _, _, slot))) = self.core.queue.peek().copied() {
+        while let Some(Reverse((at, _, slot))) = self.core.queue.peek().copied() {
             if at > until {
                 break;
             }

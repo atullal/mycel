@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 pub use streams::{Key, Purpose, Streams, Substream};
 
+use crate::stats::mix64;
 use crate::tier2::engine::{NodeId, Techs, Time};
 
 /// A change in the exogenous world, as the engine applied it.
@@ -62,48 +63,42 @@ impl WorldEvent {
     }
 }
 
-/// A running BLAKE3 digest over fixed-size records, buffered so that a
-/// million small records a second cost one large `update` per 4 KiB rather
-/// than one per record.
-#[derive(Clone)]
+/// A running digest of a sequence of records, for telling deterministic
+/// runs apart: two 64-bit chains through SplitMix64's finaliser (a
+/// bijection with full avalanche), one absorbing each record's first two
+/// words and the other its last two, crossed after every record; finished
+/// with BLAKE3 over both chains and the record count.
+/// It detects divergence (two different record sequences collide with
+/// odds of about 2^-128); it is not meant to resist an adversary, and a
+/// million records a second cost a few nanoseconds each, where feeding
+/// every record to BLAKE3 itself cost ~100 ns (measured, fixed 27).
+#[derive(Clone, Debug, Default)]
 pub struct Digest {
-    hasher: blake3::Hasher,
-    buf: Vec<u8>,
+    chains: [u64; 2],
     records: u64,
 }
 
-impl Default for Digest {
-    fn default() -> Self {
-        Digest { hasher: blake3::Hasher::new(), buf: Vec::with_capacity(4096), records: 0 }
-    }
-}
-
-impl std::fmt::Debug for Digest {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Digest({} records, {})", self.records, self.hex())
-    }
-}
-
 impl Digest {
+    /// Four words: two into each chain (the two run in parallel), then
+    /// each chain takes in the other, so every word reaches both.
+    fn absorb(&mut self, w: [u64; 4]) {
+        let c0 = mix64(mix64(self.chains[0] ^ w[0]) ^ w[1]);
+        let c1 = mix64(mix64(self.chains[1] ^ w[2] ^ 0x6a09_e667_f3bc_c908) ^ w[3]);
+        self.chains = [c0 ^ c1.rotate_left(32), c1 ^ c0.rotate_left(17)];
+    }
+
     /// One record: a kind tag, the time, a device and two words.
     pub fn record(&mut self, kind: u8, t: Time, node: NodeId, a: u64, b: u64) {
-        self.buf.push(kind);
-        self.buf.extend_from_slice(&t.to_le_bytes());
-        self.buf.extend_from_slice(&node.to_le_bytes());
-        self.buf.extend_from_slice(&a.to_le_bytes());
-        self.buf.extend_from_slice(&b.to_le_bytes());
+        self.absorb([u64::from(kind) | (u64::from(node) << 8) | (1 << 40), t, a, b]);
         self.records += 1;
-        if self.buf.len() >= 4000 {
-            self.hasher.update(&self.buf);
-            self.buf.clear();
-        }
     }
 
-    /// Arbitrary bytes, length-prefixed.
+    /// Arbitrary bytes (hashed with BLAKE3 first), with a tag.
     pub fn bytes(&mut self, tag: u8, data: &[u8]) {
-        self.buf.push(tag);
-        self.buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
-        self.buf.extend_from_slice(data);
+        let h = blake3::hash(data);
+        let w: Vec<u64> = h.as_bytes().chunks_exact(8).map(|w| u64::from_le_bytes(w.try_into().expect("8"))).collect();
+        self.absorb([u64::from(tag) | (2 << 40), data.len() as u64, 0, 0]);
+        self.absorb([w[0], w[1], w[2], w[3]]);
         self.records += 1;
     }
 
@@ -118,8 +113,10 @@ impl Digest {
 
     /// The digest so far (the digest itself keeps running).
     pub fn finish(&self) -> [u8; 32] {
-        let mut h = self.hasher.clone();
-        h.update(&self.buf);
+        let mut h = blake3::Hasher::new();
+        h.update(&self.chains[0].to_le_bytes());
+        h.update(&self.chains[1].to_le_bytes());
+        h.update(&self.records.to_le_bytes());
         *h.finalize().as_bytes()
     }
 
@@ -138,30 +135,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn digest_is_order_and_content_sensitive_and_buffering_invisible() {
-        let (mut a, mut b, mut c) = (Digest::default(), Digest::default(), Digest::default());
+    fn digest_is_order_and_content_sensitive() {
+        let (mut a, mut b) = (Digest::default(), Digest::default());
         for i in 0..1000u32 {
             a.record(1, u64::from(i), i, 2, 3);
             b.record(1, u64::from(i), i, 2, 3);
         }
         assert_eq!(a.finish(), b.finish());
-        // the same records unbuffered give the same digest
-        let mut h = blake3::Hasher::new();
-        for i in 0..1000u32 {
-            let mut r = vec![1u8];
-            r.extend_from_slice(&u64::from(i).to_le_bytes());
-            r.extend_from_slice(&i.to_le_bytes());
-            r.extend_from_slice(&2u64.to_le_bytes());
-            r.extend_from_slice(&3u64.to_le_bytes());
-            h.update(&r);
-        }
-        assert_eq!(a.finish(), *h.finalize().as_bytes());
-        c.record(1, 1, 0, 2, 3);
-        c.record(1, 0, 0, 2, 3);
-        let mut d = Digest::default();
-        d.record(1, 0, 0, 2, 3);
-        d.record(1, 1, 0, 2, 3);
-        assert_ne!(c.finish(), d.finish(), "order matters");
         assert_eq!(a.records(), 1000);
+        let mut c = a.clone();
+        c.record(1, 0, 0, 0, 0);
+        assert_ne!(c.finish(), a.finish(), "one more record");
+        // any one field of one record
+        let one = |kind, t, node, x, y| {
+            let mut d = Digest::default();
+            d.record(kind, t, node, x, y);
+            d.finish()
+        };
+        let base = one(1, 2, 3, 4, 5);
+        for other in
+            [one(9, 2, 3, 4, 5), one(1, 9, 3, 4, 5), one(1, 2, 9, 4, 5), one(1, 2, 3, 9, 5), one(1, 2, 3, 4, 9)]
+        {
+            assert_ne!(base, other);
+        }
+        // order
+        let (mut x, mut y) = (Digest::default(), Digest::default());
+        x.record(1, 1, 0, 2, 3);
+        x.record(1, 0, 0, 2, 3);
+        y.record(1, 0, 0, 2, 3);
+        y.record(1, 1, 0, 2, 3);
+        assert_ne!(x.finish(), y.finish(), "order matters");
+        // bytes and records don't alias
+        let (mut p, mut q) = (Digest::default(), Digest::default());
+        p.bytes(1, b"abc");
+        q.bytes(1, b"abd");
+        assert_ne!(p.finish(), q.finish());
     }
 }
