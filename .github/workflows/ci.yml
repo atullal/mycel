@@ -40,9 +40,10 @@ jobs:
           persist-credentials: false
       # The toolchain and components pinned in rust-toolchain.toml.
       - run: rustup toolchain install --no-self-update
-      # Both workspaces; vendor/ is excluded by vendor/rustfmt.toml.
+      # All three workspaces; vendor/ is excluded by vendor/rustfmt.toml.
       - run: cargo fmt --all --check
       - run: cargo fmt --all --check --manifest-path rules/Cargo.toml
+      - run: cargo fmt --all --check --manifest-path fuzz/Cargo.toml
 
   clippy:
     name: Clippy (${{ matrix.os }})

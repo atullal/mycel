@@ -38,6 +38,8 @@ builds, on Linux, macOS and Windows; the security regression tests with no
 retries; rustdoc with `-D warnings`; the WebAssembly rules; cargo-deny
 (advisories, licences, duplicate and unknown sources, `deny.toml`); the web
 checks; spelling; and the workflows themselves (actionlint, zizmor). The
+Fuzz workflow runs every fuzz target ([Fuzzing](#fuzzing)) briefly on pull
+requests and for ten minutes each night. The
 Apps workflow builds and launches the Linux and Windows apps. CodeQL and
 OpenSSF Scorecard run on their own schedules. On the small CI machines, one timing test
 usually misses its deadline somewhere in a run, a different one each time:
@@ -72,6 +74,127 @@ committed.
 | `mycel-sim` | Every scenario at CI size, and the simulator's own models (`cargo test -p mycel-sim`) |
 | `mycel-host` | Log file privacy, notification privacy, deduplication, tap routing and permission handling |
 | Web (`npm test`) | SDK paging, search, presence and conversation identity; Messaging layout and swipe gestures; host notices and notification actions |
+
+## Fuzzing
+
+Every decoder that reads bytes from someone else is fuzzed with libFuzzer
+(`cargo-fuzz`), with AddressSanitizer, overflow checks and debug assertions
+on. Bridgefy's mesh fell to one crafted message because clients forwarded
+before they parsed ([ePrint 2021/214](https://eprint.iacr.org/2021/214));
+here a node parses and checks everything before acting on it, and these
+targets look for inputs where the parsing itself panics, hangs or allocates
+without bound.
+
+The targets live in `fuzz/`, a Cargo workspace of their own (excluded from
+the main one, so stable builds never see it), and need a nightly toolchain.
+Crate-private decoders are reached through `fuzzing` modules in
+`mycel-net` and `mycel-sync`, compiled only under `cfg(fuzzing)` (which
+cargo-fuzz sets): they are not API.
+
+```sh
+rustup toolchain install nightly --profile minimal
+cargo install cargo-fuzz --version 0.13.2 --locked
+fuzz/run.sh 600                       # every target for 10 minutes, 2 at a time
+JOBS=1 fuzz/run.sh 60 mesh_wire       # one target for a minute
+cargo +nightly fuzz run mesh_wire fuzz/artifacts/mesh_wire/crash-…   # replay an input
+cd fuzz && cargo run --example seeds  # rewrite the seed corpora
+```
+
+`fuzz/run.sh` builds every target once, then runs each with the corpus in
+`fuzz/corpus/<target>` (started from the committed seeds in
+`fuzz/seeds/<target>`: for targets that read raw bytes, real messages
+encoded by the code a node sends them with; for every target, each input
+that once failed), a 10 s limit per input (a hang), a 2 GiB memory limit
+and a 512 MiB limit on any single allocation (no input of a few KiB should
+need that). Structure-aware targets (`arbitrary`) build their messages
+from the fuzzer's bytes, so real encodings would not help them.
+Failing inputs land in `fuzz/artifacts/<target>/`.
+
+Where a value can be encoded again, targets check the round trip
+(decode → encode gives the input back, or a value that decodes equal);
+where there is an independent implementation, they compare against it. The
+first byte of a raw input often selects the decoder.
+
+| Target | What it feeds, and the properties beyond "no panic" |
+|---|---|
+| `mesh_wire` | Mesh datagrams (`mesh/wire.rs`): announcements, batches, seqno requests, data frames and fragments, mesh addresses. Canonical re-encoding; a frame split for any hop MTU reassembles |
+| `mesh_router` | The router (`mesh/core.rs`) driven by hostile neighbours: raw datagrams dispatched as the driver does, and structured announcements, frames and seqno requests that pass the decoder (signatures decided by the input: a liar may hold a valid one), plus links, sends, lookups and time. The router never addresses itself, what it emits re-encodes, a relayed frame's TTL goes down |
+| `dtn` | Store-and-forward (`mesh/dtn.rs`): summary, offer and answer messages, then a carrier fed hostile summaries (NaN predictabilities included), offers, bundles, partial transfers and receipts. Never plans a bundle to ourselves; what we tell neighbours are probabilities |
+| `net_stream` | A peer's stream read as the node reads it (`wire.rs`): length prefix against the limit and the peer's memory budget, then postcard, for sync sessions, ephemeral messages, blob requests and answers, contact cards. No allocation beyond what arrived; canonical re-encoding |
+| `postcard_messages` | Every other postcard decoder of untrusted bytes: store-and-forward payloads, feed entries, keyrings, membership ops and envelopes (from peers and from storage), contact cards, chat payloads, the rules ABI, call and video control. Round trip; signature checks run |
+| `sync_change` | Document changes (`bounded_change.rs`, `change_ops.rs`), raw or re-framed with a valid checksum so mutations reach the column decoders. **Differential against Automerge 0.12**: whatever we accept, Automerge loads with the same hash; our op decoder reads exactly Automerge's rows |
+| `sync_doc` | Concurrent real Automerge edits (maps, lists, text, counters, marks, forks, merges) through a replica's causal index (`doc_index.rs`), optionally with one change mutated. Automerge as the oracle: an honest change is always admitted once its dependencies are, every admitted change applies, the heads agree |
+| `sync_replica` | A replica receiving what a malicious *member* can send: anything sealed with the epoch key at any position of its chain (forks included), raw envelopes and ops. **Convergence**: a replica fed in batches and one restored from storage in reverse order end in the same state |
+| `trust_graph` | Membership (`mycel-trust`): DAGs of validly signed ops by members and outsiders, any parents, roles, removals, rotations, departures. **Convergence**: inserted one at a time and in a shuffled batch, the resolution is the same |
+| `rules_wasm` | Rules bundles any admin may publish: `wasm-smith` modules with the ABI's exports loaded under small limits and run. What loads is valid under exactly the documented feature set; every call is deterministic (same verdict and fuel, twice and on a fresh engine) |
+| `rules_bundles` | The shipped chat and counter bundles on members' inputs. **Differential**: the WebAssembly chat rules reach the verdict of the same rules written natively; the counter folds as native arithmetic does |
+| `call_media` | Call audio: datagram and stream framing (any split), the Opus decoder (transpiled C) on any packet, the jitter buffer on hostile sequence numbers and timing. Decoded audio is finite and fits the buffer |
+| `video_media` | Call video: frames, control stream (any split), the webview frame layout, H.264 `avcC` records, the reorder buffer on hostile sequence numbers, keyframes and give-ups. Delivery strictly in order, from a keyframe after every loss |
+| `link_ble` | Bluetooth LE: GATT info, the L2CAP byte stream (any split), and the connection state machine fed a hostile radio. Never routes to or reports our own key |
+| `link_wire` | Peer-to-peer Wi-Fi control datagrams and TXT adverts, interface beacons and link addresses, and (Apple) Bonjour SRV and TXT records. Round trip |
+| `contact_code` | Contact codes as pasted or scanned (`mycel:` + base64url + address hints), raw and validly signed. Decodes only with a valid signature and at most eight hints |
+| `directory_record` | Reachability records (pkarr packets from the relay, the DHT or a gateway), raw and validly signed. Opens only as signed by its own key, with at most three gateways; what we seal opens the same |
+| `blob_ranges` | Node storage: the `.ranges` file of a partial download as read back from disk (damaged, or written by something else). What loads covers the blob exactly with the gaps a resume fetches, and stays so as pieces arrive |
+
+**Not fuzzed here:** the redb database file format itself (a damaged
+database fails to open; records inside it that don't decode are set aside,
+and the op and envelope decoders they go through are in `postcard_messages`);
+JSON the node writes for itself (the identity marker, saved notices); and
+the QUIC and TLS stacks (Iroh, the vendored noq, rustls) below our framing.
+
+**In CI** (`.github/workflows/fuzz.yml`): pull requests that touch Rust
+build every target and run each for 30 s; every night, and on demand, each
+runs for 10 minutes, four at a time, and the corpora are minimised and kept
+in the Actions cache for the next night. A failure uploads the failing
+inputs and logs as an artifact.
+
+**Found and fixed** (each with a regression unit test in the owning crate;
+none in the harnesses):
+
+| Target | Crate | What a crafted input did | Fix | Regression test |
+|---|---|---|---|---|
+| `sync_doc` | `mycel-sync` | A member's change with an *inserted* delete or increment, or a mark that isn't an insertion, passed the causal index; Automerge applied it out of order (its debug op-order check failed; release builds carry on with a corrupt document) | The index refuses them: Automerge never writes such operations | `doc_index::tests::inserted_deletes_and_uninserted_marks_are_refused` |
+| `sync_change` | `mycel-sync` | An operation id beyond `u32` (object, key or predecessor counter, or actor number) panicked inside Automerge's change loader, which converts with `unwrap`. The replica's `catch_unwind` caught it, but a parser must refuse, not crash | The column preflight refuses such ids before Automerge parses the change | `change_resources::tests::operation_ids_beyond_u32_are_refused` |
+| `sync_change` | `mycel-sync` | Differential: a key with an actor and counter 0 decoded here as an element, where Automerge reads the head (the index then refused it: safe, but the decoders disagreed) | Refused in the op decoder; Automerge never writes it | `change_ops::tests::element_counter_zero_with_an_actor_is_refused` |
+| `sync_doc` | `mycel-sync` | Two honest concurrent counter increments overflowed when merged: Automerge adds with plain `i64` arithmetic, so debug builds panicked (refusing a change release builds accept, which wrap identically everywhere) | Automerge is built without overflow checks in every profile, as release builds are | `tests::concurrent_counter_increments_that_overflow_converge` |
+| `mesh_router` | `mycel-net` | Smoothing a measured hop cost multiplied a `u32` by 7: above about 61 s per 64 KiB (a congested Bluetooth hop) debug builds panicked and release builds wrapped to a near-zero cost, making the slowest hop the cheapest. The per-hop penalty overflowed the same way | Smoothed in `u64`, capped where the driver caps costs; the penalty saturates | `mesh::core::tests::smoothing_a_very_slow_hop_cost_does_not_overflow` |
+| `dtn` | `mycel-net` | A neighbour's summary reporting a NaN delivery predictability kept it through `clamp`, and NaN outranks every real value where candidates are ranked by `total_cmp` | NaN counts as 0 | `mesh::dtn::tests::a_reported_nan_predictability_counts_as_zero` |
+| `blob_ranges` | `mycel-net` | A damaged `.ranges` file loaded as it was: a reversed range underflowed the bytes held (debug panic; release called the download complete), and overlapping or out-of-blob ranges overstated it | Only sorted, disjoint ranges within the blob load; anything else restarts the download | `blobs::security_tests::a_damaged_ranges_file_is_refused` |
+| `call_media` | `mycel-call` | Sequence numbers near `u32::MAX` (a peer picks its own) overflowed the jitter buffer's depth and next-frame arithmetic | Widened to `u64`; depth saturates | `jitter::tests::sequence_numbers_near_the_top_of_the_range_play` |
+| `video_media` | `mycel-video` | After frame `u32::MAX` the next expected frame wrapped to 0, so an older held keyframe reached the decoder after newer frames | Widened: past the top of the range everything is late | `receiver::tests::delivery_never_goes_backwards_past_the_top_of_the_range` |
+| `link_wire` | `mycel-link-iface` | A beacon's one-byte name length let a forged beacon carry 255 bytes of name, where the format has at most 64 | Longer names are refused | `wire::tests::a_beacon_with_an_overlong_name_is_refused` |
+| `link_wire` | `mycel-link-awdl` | A long advertised name was trimmed before being cut to length, so a cut in whitespace kept it, and the same advert parsed differently once re-encoded | Trimmed again after the cut | `wire::tests::a_name_cut_in_whitespace_is_trimmed` |
+
+Also fixed while writing the targets: a store-and-forward resume offset
+from a neighbour was cast to `usize` before being bounded (it would
+truncate on 32-bit devices). The DTN summary and offer conversions moved
+into functions the driver and the `dtn` target share, so the target feeds
+the production decoders.
+
+Harness bugs, not product bugs (fixed in the targets): `trust_graph`
+compared op counts without the pending ops; `link_ble` reused channel ids,
+which the platform layers never do (they number channels from a counter);
+`sync_change` called Automerge's `Change::decode`, which panics on an
+operation naming an actor the change doesn't list (Mycel never calls it on
+a received change: the causal index refuses such changes first), and
+named actors by id, which can't tell apart an actor a change lists twice
+(the index refuses those too); and one early `rules_wasm` harness failed
+on empty input. One `sync_replica` timeout (346 s for one input) did not
+reproduce: the input replays in 0.25 s (libFuzzer's timer is wall time,
+which keeps running while the machine is stalled or asleep).
+
+**Run so far:** about 5.6 CPU-hours (2026-10-20 and 21, Apple M5 Pro, two
+fuzzers at a time). A first round ran every target for 10 minutes or until
+its first failure (2.2 hours; wall time, measured from libFuzzer's logs).
+After the fixes, a second round (3.4 CPU-hours, measured; it found the
+last three `mycel-sync` bugs above, and every run after their fixes ended
+clean) ran the highest-risk targets longest:
+`sync_change`, `sync_replica`, `mesh_router` and `net_stream` 20 minutes,
+`sync_doc` 30; `mesh_wire`, `link_ble`, `link_wire` and `trust_graph` 10;
+the rest, which had run clean for 10 minutes in the first round, 5 more.
+Totals per target range from 10 minutes (`link_ble`, `link_wire`,
+`trust_graph`) to 36 (`sync_doc`). Short, by fuzzing standards: the nightly
+CI runs (3 CPU-hours a night) are what grows the corpora from here.
 
 ## Voice calls
 

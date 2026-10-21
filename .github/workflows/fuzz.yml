@@ -1,0 +1,115 @@
+# Fuzzing (docs/TESTING.md, "Fuzzing"): every libFuzzer target in fuzz/,
+# built with a pinned nightly, AddressSanitizer, overflow checks and debug
+# assertions. Pull requests that touch Rust run each target for a short
+# smoke; every night each runs for ten minutes, growing corpora kept in the
+# Actions cache. A crash, hang, memory blow-up or excessive allocation fails
+# the job and uploads the input that caused it.
+name: Fuzz
+
+on:
+  pull_request:
+    paths:
+      - "crates/**"
+      - "fuzz/**"
+      - "vendor/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    - cron: "41 3 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Seconds to run each target
+        required: false
+        default: "600"
+
+permissions: {}
+
+concurrency:
+  group: fuzz-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+  RUST_BACKTRACE: short
+  # cargo-fuzz needs nightly. Pinned to the one the targets were last run
+  # with locally; bump it deliberately, like rust-toolchain.toml.
+  FUZZ_TOOLCHAIN: nightly-2026-10-19
+  CARGO_FUZZ_VERSION: 0.13.2
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ github.event_name == 'pull_request' && 'smoke' || 'long' }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: System libraries
+        # D-Bus (Bluetooth), ALSA (calls)
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config
+      - name: Toolchain and cargo-fuzz
+        run: |
+          rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal --no-self-update
+          cargo "+$FUZZ_TOOLCHAIN" install cargo-fuzz --version "$CARGO_FUZZ_VERSION" --locked
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz -> target
+          key: ${{ env.FUZZ_TOOLCHAIN }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Corpora from earlier nightly runs (fuzz/seeds/ starts them).
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: Fuzz every target
+        env:
+          EVENT: ${{ github.event_name }}
+          SECONDS_INPUT: ${{ inputs.seconds }}
+        run: |
+          case "$EVENT" in
+            pull_request) seconds=30 ;;
+            workflow_dispatch) seconds=${SECONDS_INPUT:-600} ;;
+            *) seconds=600 ;;
+          esac
+          # four vCPUs: four fuzzers at once
+          JOBS=4 fuzz/run.sh "$seconds"
+      - name: Minimise the corpora
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        run: |
+          cd fuzz
+          host=$(rustc "+$FUZZ_TOOLCHAIN" -vV | sed -n 's/^host: //p')
+          for dir in corpus/*/; do
+            t=$(basename "$dir")
+            mkdir -p "min/$t"
+            "target/$host/release/$t" -merge=1 -timeout=10 "min/$t" "corpus/$t" >/dev/null 2>&1 || exit 1
+          done
+          rm -rf corpus && mv min corpus
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+      - name: Crash inputs and logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-failures-${{ github.run_id }}
+          path: |
+            fuzz/artifacts
+            fuzz/logs
+          if-no-files-found: ignore
+          retention-days: 30
