@@ -19,6 +19,11 @@ scripts/security-check.sh                     # security regressions, npm audit,
 
 - `cargo test -p mycel-sim` runs the simulator's scenarios at CI size;
   `-- --ignored` runs the full sizes (see [SIMULATION.md](SIMULATION.md)).
+  It also parses all 36 catalogue scenarios (`crates/mycel-sim/scenarios/`),
+  runs every runnable one small on one seed with the no-loop invariant, and
+  checks the robustness tools against known answers (Sobol indices of the
+  Ishigami function, Morris effects of a known function, the Sobol net
+  property, a GP's held-out error; SIMULATION.md §7).
 - Tests that measure speed or time emulated radios (video frame rates, mesh
   throughput, link failover, real-time simulator scenarios) run one at a time
   within each test binary, and can still miss their deadlines on a heavily
@@ -131,7 +136,7 @@ committed.
 | `mycel-link-iface` | Interface classification (medium from type and name, software interfaces skipped, ordinary NICs left to IP), environment overrides, beacons; a sync over a real interface with IP off, one path per interface |
 | `mycel-kit-chat` | Author-only edits/deletes, reactions, receipts/unread, admin-only meta, garbage tolerance, thread merging (a late alias can't backdate messages; a message written at an alias's first-seen time sorts after that alias's older messages), alerts |
 | `mycel-rules(-abi)` | Deterministic WASM engine: fuel/memory limits, banned features, ABI violations, chat rules, wire compatibility with the chat kit, the fuel cost model pinned |
-| `mycel-sim` | Every scenario at CI size, and the simulator's own models (`cargo test -p mycel-sim`) |
+| `mycel-sim` | Every scenario at CI size, every catalogue scenario small, and the simulator's own models and robustness tools (`cargo test -p mycel-sim`) |
 | `mycel-host` | Log file privacy, notification privacy, deduplication, tap routing and permission handling |
 | Web (`npm test`) | SDK paging, search, presence and conversation identity; Messaging layout and swipe gestures; host notices and notification actions |
 

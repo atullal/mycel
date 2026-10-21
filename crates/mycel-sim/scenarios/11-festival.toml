@@ -42,6 +42,7 @@ control_max_bps = 4000
 
 [uq]
 parameters = ["range_mult", "adoption", "max_neighbours", "walk_speed", "inet_share", "msg_rate"]
+metric = "control"
 [uq.bounds]
 walk_speed = [0.3, 1.4]
 

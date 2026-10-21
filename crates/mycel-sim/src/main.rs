@@ -332,7 +332,9 @@ fn catalogue(a: &Args) -> anyhow::Result<()> {
         anyhow::ensure!(catalogue::SWARM_TOGGLES.contains(&t.as_str()), "unknown toggle {t:?}");
     }
     let swarm = catalogue::compose::Swarm { off: a.off.clone() };
-    let seeds = mycel_sim::stats::run_seeds(a.seed, a.runs.max(1));
+    // one run: the seed as given (as for the hand-written scenarios), so a
+    // printed failing seed replays with `--seed`
+    let seeds = if a.runs <= 1 { vec![a.seed] } else { mycel_sim::stats::run_seeds(a.seed, a.runs) };
     let mut results = Vec::new();
     let mut verdicts = Vec::new();
     let mut failed = Vec::new();
@@ -358,6 +360,7 @@ fn catalogue(a: &Args) -> anyhow::Result<()> {
             eprintln!("▶ {} {}: {}", s.number, s.name, r.headline.join("; "));
             md.push_str(&format!("### `{}`: blocked\n\n{}\n\n", s.name, r.headline.join("; ")));
             results.push(r);
+            write_catalogue(a, &md, &results, &verdicts)?;
             continue;
         }
         let (rs, v) = run::replicate(s, size, label, &seeds, m.min(seeds.len()), &swarm);
@@ -372,21 +375,50 @@ fn catalogue(a: &Args) -> anyhow::Result<()> {
             t.elapsed().as_secs_f64(),
             rs[0].headline.join("; ")
         );
-        md.push_str(&format!("{}*Status: {:?}; fidelity {}.*\n\n", v.markdown(), status, fid.short()));
+        // replay lines name the catalogue command and its size
+        let mut size_args = format!("--people {} --minutes {}", size.people, size.duration / mycel_sim::tier2::MIN);
+        if !a.off.is_empty() {
+            size_args.push_str(&format!(" --off {}", a.off.join(",")));
+        }
+        let vm = v.markdown().replace(
+            &format!("-p mycel-sim -- {} --scale {}", v.name, v.scale),
+            &format!("-p mycel-sim -- catalogue {} {size_args}", v.name),
+        );
+        md.push_str(&format!("{vm}*Status: {:?}; fidelity {}.*\n\n", status, fid.short()));
+        for seed in v.failing_seeds() {
+            println!(
+                "failing seed: {} {seed}  (cargo run --release -p mycel-sim -- catalogue {} {size_args} --seed {seed})",
+                v.name, v.name
+            );
+        }
         // invariants always count; quality only where the result is a verdict
         if !v.invariant_failures.is_empty() || (status == Status::Verdict && !v.pass) {
             failed.push(s.name.clone());
         }
+        for (seed, what) in v.invariant_failures.iter().chain(&v.quality_misses) {
+            eprintln!("    ✗ {} seed {seed}: {what}", s.name);
+        }
         results.extend(rs);
         verdicts.push(v);
+        // written after every scenario, so a long run killed part way keeps what it did
+        write_catalogue(a, &md, &results, &verdicts)?;
     }
-    std::fs::create_dir_all(&a.out)?;
-    md.push_str(&markdown(&results));
-    std::fs::write(a.out.join("report.md"), md)?;
-    std::fs::write(a.out.join("results.json"), serde_json::to_string_pretty(&results)?)?;
-    std::fs::write(a.out.join("verdicts.json"), serde_json::to_string_pretty(&verdicts)?)?;
+    write_catalogue(a, &md, &results, &verdicts)?;
     eprintln!("wrote {}", a.out.join("report.md").display());
     anyhow::ensure!(failed.is_empty(), "{} scenario(s) failed: {}", failed.len(), failed.join(", "));
+    Ok(())
+}
+
+fn write_catalogue(
+    a: &Args,
+    md: &str,
+    results: &[mycel_sim::report::ScenarioResult],
+    verdicts: &[mycel_sim::seeds::Verdict],
+) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&a.out)?;
+    std::fs::write(a.out.join("report.md"), format!("{md}{}", markdown(results)))?;
+    std::fs::write(a.out.join("results.json"), serde_json::to_string_pretty(results)?)?;
+    std::fs::write(a.out.join("verdicts.json"), serde_json::to_string_pretty(verdicts)?)?;
     Ok(())
 }
 

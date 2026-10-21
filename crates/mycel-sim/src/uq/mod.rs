@@ -203,7 +203,12 @@ pub fn study(e: &dyn Experiment, plan: &Plan) -> anyhow::Result<Study> {
     };
     // 4. emulator on the space-filling runs
     let fit: Vec<&Point> = points.iter().filter(|p| p.mean.is_finite()).collect();
-    let gp = if fit.len() >= 4 {
+    // a metric that does not move over the region has nothing to emulate
+    let spread = {
+        let m = fit.iter().map(|p| p.mean).sum::<f64>() / fit.len().max(1) as f64;
+        (fit.iter().map(|p| (p.mean - m).powi(2)).sum::<f64>() / fit.len().max(1) as f64).sqrt()
+    };
+    let gp = if fit.len() >= 4 && spread > 1e-9 * (1.0 + plan.threshold.abs()) {
         let xq: Vec<Vec<f64>> = fit.iter().map(|p| p.q.clone()).collect();
         let y: Vec<f64> = fit.iter().map(|p| p.mean).collect();
         surrogate::Gp::fit(&xq, &y).ok()
@@ -294,7 +299,7 @@ impl Study {
     /// rank; Morris's ranking where there is no emulator.
     pub fn hinges_on(&self) -> Vec<String> {
         if self.sobol.is_empty() {
-            return self.morris.iter().take(2).map(|e| e.name.clone()).collect();
+            return self.morris.iter().filter(|e| e.mu_star > 0.0).take(2).map(|e| e.name.clone()).collect();
         }
         self.sobol.iter().filter(|i| i.total >= 0.1).map(|i| i.name.clone()).collect()
     }
@@ -382,6 +387,9 @@ impl Study {
                 ));
             }
             s.push('\n');
+        }
+        if self.emulator.is_none() && !self.points.is_empty() {
+            s.push_str("No emulator: the metric is the same at every finite point (or too few points are finite), so it hinges on none of these parameters over the region.\n\n");
         }
         let h = self.hinges_on();
         s.push_str(&format!(
