@@ -10,6 +10,7 @@
 //! logs). The deterministic long-run version of this is in `sim`.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -73,6 +74,8 @@ struct SlowSink {
     to: usize,
     chan: ChanId,
     q: Mutex<OutQueue>,
+    /// Bytes the radio has moved off this end so far.
+    carried: AtomicUsize,
 }
 
 impl PacketSink for SlowSink {
@@ -84,6 +87,32 @@ impl PacketSink for SlowSink {
 /// Bytes a radio of `rate` bytes/s sends in `slice`.
 fn airtime(rate: usize, slice: Duration) -> usize {
     (rate as u128 * slice.as_micros() / 1_000_000) as usize
+}
+
+/// The radio thread's clock. Airtime is what actually passed, not what the
+/// thread asked to sleep: a 5 ms sleep can take 60 ms in a throttled
+/// process (a CI runner), and a fixed per-wake budget then ran the radio at
+/// a tenth of its rate.
+struct RadioClock {
+    last: Instant,
+}
+
+impl RadioClock {
+    /// How long the radio sleeps between steps.
+    const SLICE: Duration = Duration::from_millis(5);
+    /// A long stall (a debugger) doesn't release a burst no radio could send.
+    const MAX_SLICE: Duration = Duration::from_millis(250);
+
+    fn new(now: Instant) -> RadioClock {
+        RadioClock { last: now }
+    }
+
+    /// Bytes each channel may send at `now`, for the time since the last step.
+    fn step(&mut self, now: Instant, rate: usize) -> usize {
+        let slice = now.saturating_duration_since(self.last).min(Self::MAX_SLICE);
+        self.last = now;
+        airtime(rate, slice)
+    }
 }
 
 fn pid(n: usize) -> String {
@@ -138,23 +167,14 @@ impl Air {
         if let Some(rate) = rate {
             let weak = Arc::downgrade(&air);
             std::thread::spawn(move || {
-                const SLICE: Duration = Duration::from_millis(5);
-                // Airtime is what actually passed, not what was asked for:
-                // a 5 ms sleep can take 60 ms in a throttled process (a CI
-                // runner), and a fixed per-wake budget then ran the radio at
-                // a tenth of its rate. Capped so a long stall (a debugger)
-                // doesn't release a burst no radio could send.
-                const MAX_SLICE: Duration = Duration::from_millis(250);
-                let mut last = Instant::now();
+                let mut clock = RadioClock::new(Instant::now());
                 loop {
-                    std::thread::sleep(SLICE);
+                    std::thread::sleep(RadioClock::SLICE);
                     let Some(air) = weak.upgrade() else { return };
-                    let now = Instant::now();
-                    let slice = (now - last).min(MAX_SLICE);
-                    last = now;
+                    let per_channel = clock.step(Instant::now(), rate);
                     let sinks = air.slow.lock().clone();
                     for s in sinks {
-                        let mut budget = airtime(rate, slice);
+                        let mut budget = per_channel;
                         let mut q = s.q.lock();
                         while budget > 0 {
                             let Some(chunk) = q.peek() else { break };
@@ -162,6 +182,7 @@ impl Air {
                             let data = Bytes::copy_from_slice(&chunk[..n]);
                             q.advance(n);
                             budget -= n;
+                            s.carried.fetch_add(n, Ordering::Relaxed);
                             let _ = s.tx.send(Job::Bytes { to: s.to, chan: s.chan, data });
                         }
                     }
@@ -187,6 +208,12 @@ impl Air {
             }
         });
         air
+    }
+
+    /// Bytes the radio has carried off each rate-limited channel end, in
+    /// the order they opened (empty without a rate).
+    pub fn carried(&self) -> Vec<usize> {
+        self.slow.lock().iter().map(|s| s.carried.load(Ordering::Relaxed)).collect()
     }
 
     pub fn link(self: &Arc<Self>, me: SignPk, name: &str) -> Arc<BleLink> {
@@ -352,7 +379,13 @@ impl Air {
                     if self.rate.is_some() {
                         let mut q = OutQueue::new(OUT_QUEUE_BYTES);
                         q.push(hello);
-                        let sink = Arc::new(SlowSink { tx: self.tx.clone(), to, chan: to_chan, q: Mutex::new(q) });
+                        let sink = Arc::new(SlowSink {
+                            tx: self.tx.clone(),
+                            to,
+                            chan: to_chan,
+                            q: Mutex::new(q),
+                            carried: AtomicUsize::new(0),
+                        });
                         self.slow.lock().push(sink.clone());
                         hub.add_sink(chan, sink);
                     } else {
@@ -516,12 +549,14 @@ mod tests {
             })
             .collect();
         alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "big", big.as_str()))).unwrap().unwrap();
+        let before = air.carried();
         let t = std::time::Instant::now();
         tokio::time::timeout(Duration::from_secs(60), bob.sync_with(alice.id(), space, false))
             .await
             .expect("finished")
             .unwrap();
         let el = t.elapsed();
+        let busiest = air.carried().iter().zip(before.iter().chain(std::iter::repeat(&0))).map(|(a, b)| a - b).max();
         assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap()["big"], json!(big));
         let goodput = big.len() as f64 / el.as_secs_f64();
         eprintln!(
@@ -532,6 +567,16 @@ mod tests {
             100.0 * goodput / RATE as f64
         );
         assert!(goodput > RATE as f64 * 0.3, "QUIC keeps a slow radio reasonably busy");
+        // and never faster than the radio (allowing the one capped step a
+        // stall may release); goodput alone can't show this, Automerge may
+        // compress the text
+        let busiest = busiest.unwrap_or(0);
+        eprintln!("busiest channel end carried {busiest} B, {:.1} KiB/s", busiest as f64 / el.as_secs_f64() / 1024.0);
+        assert!(busiest > 0, "the sync went over the radio");
+        assert!(
+            busiest as f64 <= RATE as f64 * (el.as_secs_f64() + RadioClock::MAX_SLICE.as_secs_f64()),
+            "the fake radio carried {busiest} B in {el:.2?}, faster than {RATE} B/s"
+        );
         alice.shutdown().await.unwrap();
         bob.shutdown().await.unwrap();
     }
@@ -544,6 +589,24 @@ mod tests {
         assert_eq!(airtime(40 * 1024, Duration::from_millis(60)), 2_457);
         assert_eq!(airtime(40 * 1024, Duration::from_secs(1)), 40 * 1024);
         assert_eq!(airtime(40 * 1024, Duration::ZERO), 0);
+
+        // The radio loop's own step, driven by a clock we control.
+        const RATE: usize = 40 * 1024;
+        let t0 = Instant::now();
+        let mut clock = RadioClock::new(t0);
+        // on time
+        assert_eq!(clock.step(t0 + Duration::from_millis(5), RATE), 204);
+        // a 5 ms sleep that took 60 ms moves 60 ms of bytes, not 5 ms
+        assert_eq!(clock.step(t0 + Duration::from_millis(65), RATE), 2_457);
+        // a 10 s stall releases at most MAX_SLICE (250 ms) of bytes
+        assert_eq!(clock.step(t0 + Duration::from_millis(10_065), RATE), RATE / 4);
+        // a clock that seems to go backwards sends nothing
+        assert_eq!(clock.step(t0, RATE), 0);
+        // over a second of late wake-ups the total is the rate, give or
+        // take the rounding of each step, never more
+        let mut clock = RadioClock::new(t0);
+        let total: usize = (1..=16).map(|i| clock.step(t0 + Duration::from_micros(62_500 * i), RATE)).sum();
+        assert!(total <= RATE && total > RATE - 16, "{total}");
     }
 
     /// Three devices that all discover each other at once end up with one
