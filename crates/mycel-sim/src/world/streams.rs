@@ -238,6 +238,21 @@ impl Substream {
         (self.u64() % n as u64) as usize
     }
 
+    /// `k` distinct indices below `n` (k ≤ n), in draw order. A repeat is
+    /// drawn again rather than kept, so a set of roles never loses one to
+    /// a collision. Quadratic in `k`: for picking a handful of devices.
+    pub fn distinct(&mut self, n: usize, k: usize) -> Vec<usize> {
+        assert!(k <= n, "{k} distinct picks below {n}");
+        let mut out = Vec::with_capacity(k);
+        while out.len() < k {
+            let x = self.below(n);
+            if !out.contains(&x) {
+                out.push(x);
+            }
+        }
+        out
+    }
+
     pub fn chance(&mut self, p: f64) -> bool {
         self.f64() < p
     }
@@ -253,6 +268,19 @@ impl Substream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distinct_picks_are_distinct_deterministic_and_cover_all() {
+        let s = Streams::new(7);
+        for e in 0..200 {
+            let a = s.stream(Purpose::Adversary, e).distinct(10, 10);
+            let mut sorted = a.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, (0..10).collect::<Vec<_>>());
+            assert_eq!(a, s.stream(Purpose::Adversary, e).distinct(10, 10));
+        }
+        assert!(s.stream(Purpose::Adversary, 0).distinct(5, 0).is_empty());
+    }
 
     #[test]
     fn philox_matches_random123_known_answers() {

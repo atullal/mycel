@@ -1779,11 +1779,13 @@ fn adversaries(o: &Opts) -> Adversaries {
     // adversary placement and the honest workload: streams of their own,
     // apart from the world's (which still decides who has internet)
     let streams = Streams::new(o.seed);
-    let mut adv = streams.stream(Purpose::Adversary, 0);
-    let bad: Vec<NodeId> = (0..(n / 20).max(2)).map(|_| adv.below(n) as NodeId).collect();
-    let storm = adv.below(n) as NodeId;
-    let replay = adv.below(n) as NodeId;
-    let sybil = adv.below(n) as NodeId;
+    // distinct devices (finding 28): drawn with replacement, a storm that
+    // was also the replayer lost its role and two black holes could be one
+    let nbad = (n / 20).max(2);
+    let picks: Vec<NodeId> =
+        streams.stream(Purpose::Adversary, 0).distinct(n, nbad + 3).into_iter().map(|d| d as NodeId).collect();
+    let bad = picks[..nbad].to_vec();
+    let (storm, replay, sybil) = (picks[nbad], picks[nbad + 1], picks[nbad + 2]);
     let roles: crate::stats::Set<NodeId> = bad.iter().copied().chain([storm, replay]).collect();
     let mut plan = Plan::default();
     let mut k = 0;
@@ -2488,6 +2490,25 @@ fn flood_hop_limit(o: Opts) -> ScenarioResult {
 mod tests {
     use super::*;
     use crate::tier2::global::{ATTESTED_HOP_FLOOR, Chain};
+
+    #[test]
+    fn adversary_roles_are_distinct_devices() {
+        // seed 16420980624331089132 drew the storm and the replayer as one
+        // device, which became a replayer: 0 storm announcements limited
+        // (finding 28); seed 13266776934264771469 drew black hole 49 twice
+        let seeds = [16420980624331089132, 13266776934264771469].into_iter().chain(crate::stats::run_seeds(2000, 30));
+        for seed in seeds {
+            for scale in [0.1, 1.0] {
+                let o = Opts { seed, scale, candidate: Candidate::Global };
+                let a = adversaries(&o);
+                let n = a.w.specs.len();
+                assert_eq!(a.bad.len(), (n / 20).max(2));
+                let all: crate::stats::Set<NodeId> =
+                    a.bad.iter().copied().chain([a.storm, a.replay, a.sybil]).collect();
+                assert_eq!(all.len(), a.bad.len() + 3, "seed {seed} scale {scale}");
+            }
+        }
+    }
 
     #[test]
     fn liar_ceiling_runs_at_most_max_par_at_once_however_many_callers() {
