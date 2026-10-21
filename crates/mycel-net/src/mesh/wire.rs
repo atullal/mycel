@@ -542,6 +542,97 @@ mod tests {
         assert!(encode_announces(&[], 1100).is_empty());
     }
 
+    /// `origin`'s announcement relayed along `relays` and sent by the last
+    /// to `to`, signed for real; the last hop signed only if `own`.
+    fn attested(origin: &DeviceKeys, relays: &[&DeviceKeys], to: SignPk, own: bool) -> Announce {
+        let o = Origination { seq: 1_700_000_000_000, flags: 1, scope: 10, uplink: 7 };
+        let mut a = sign_announce(origin, o, "n");
+        let next = |j: usize| relays.get(j).map_or(to, |k| k.sign_pk());
+        a.sign_link = Some(300);
+        a = sign_hop(origin, a, &next(0));
+        for (j, r) in relays.iter().enumerate() {
+            a.hops = j as u8 + 1;
+            a.cost += 300;
+            a.sign_link = (own || j + 1 < relays.len()).then_some(300);
+            a = sign_hop(r, a, &next(j + 1));
+        }
+        a
+    }
+
+    #[test]
+    fn attested_announcements_round_trip_and_verify() {
+        let keys: Vec<DeviceKeys> = (0..5).map(|_| DeviceKeys::generate()).collect();
+        let me = DeviceKeys::generate().sign_pk();
+        for relays in 0..4 {
+            for own in [true, false] {
+                if relays == 0 && !own {
+                    continue; // the origin always signs its hop
+                }
+                let path: Vec<&DeviceKeys> = keys[1..1 + relays].iter().collect();
+                let mut a = attested(&keys[0], &path, me, own);
+                if !own {
+                    a.sig = NO_SIG; // nobody it passes it on to needs it
+                }
+                let from = path.last().map_or(keys[0].sign_pk(), |k| k.sign_pk());
+                let (grams, rest) = encode_attested(vec![a.clone()], 1200);
+                assert!(rest.is_empty() && grams.len() == 1);
+                assert_eq!(grams[0].len(), 1 + wire_len(&a), "{relays} relays, own {own}");
+                let back = decode_attested(&grams[0], &from);
+                assert_eq!(back, vec![a.clone()]);
+                // every hop verifies, each naming the next (the last: us or
+                // the sender)
+                let hops: Vec<&Hop> = a.chain.as_ref().unwrap().iter().collect::<Vec<_>>().into_iter().rev().collect();
+                for (j, h) in hops.iter().enumerate() {
+                    let next = hops.get(j + 1).map_or(if own { me } else { from }, |x| x.signer);
+                    assert!(verify(Check::Hop { ann: &a, hop: h, pos: j as u8, next }));
+                    assert!(!verify(Check::Hop { ann: &a, hop: h, pos: j as u8, next: DeviceKeys::generate().sign_pk() }));
+                }
+                assert_eq!(verify(Check::Origin(&a)), own, "the origin's own signature, when carried");
+                // truncated anywhere, or with a byte too many: nothing
+                for cut in 1..grams[0].len() {
+                    assert!(decode_attested(&grams[0][..cut], &from).is_empty(), "cut at {cut}");
+                }
+                let mut longer = grams[0].to_vec();
+                longer.push(0);
+                assert!(decode_attested(&longer, &from).is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_attested_announcements_are_dropped() {
+        let (o, r) = (DeviceKeys::generate(), DeviceKeys::generate());
+        let me = DeviceKeys::generate().sign_pk();
+        let a = attested(&o, &[&r], me, true);
+        let g = encode_attested(vec![a.clone()], 1200).0.remove(0);
+        let flags_at = 1 + 1 + 4 + 32 + 8 + 1 + 1 + 4 + 1 + a.name.len();
+        for bad in [4u8, 0x80] {
+            let mut x = g.to_vec();
+            x[flags_at] |= bad;
+            assert!(decode_attested(&x, &r.sign_pk()).is_empty(), "unknown flag {bad}");
+        }
+        // an origin's own announcement without its hop
+        let own = attested(&o, &[], me, true);
+        let mut x = encode_attested(vec![own], 1200).0.remove(0).to_vec();
+        x[flags_at] &= !A_OWN;
+        assert!(decode_attested(&x, &o.sign_pk()).is_empty());
+        // a retraction is never attested
+        let mut x = g.to_vec();
+        x[2..6].copy_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_attested(&x, &r.sign_pk()).is_empty());
+        // more hops than any chain may have
+        let mut x = g.to_vec();
+        x[1] = MAX_CHAIN as u8;
+        assert!(decode_attested(&x, &r.sign_pk()).is_empty());
+        // not attested, or too big for the datagram: back to send unattested
+        let plain = Announce { chain: None, ..a.clone() };
+        let (grams, rest) = encode_attested(vec![plain.clone(), a.clone()], wire_len(&a));
+        assert!(grams.is_empty());
+        assert_eq!(rest, vec![plain.clone(), plain]);
+        // an absent signature never verifies
+        assert!(!verify(Check::Origin(&Announce { sig: NO_SIG, ..a })));
+    }
+
     #[test]
     fn mesh_addresses_round_trip() {
         let (a, b) = (DeviceKeys::generate().sign_pk(), DeviceKeys::generate().sign_pk());
