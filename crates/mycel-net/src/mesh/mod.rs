@@ -1092,16 +1092,7 @@ impl Driver {
         let idle = crate::resources::IDLE_TIMEOUT;
         let (bytes, _permit) = crate::resources::read_body(&mut rx, MAX_SUMMARY, true, permit, idle).await?;
         let Some((&K_SUMMARY, body)) = bytes.split_first() else { return Ok(()) };
-        let w: WireSummary = postcard::from_bytes(body)?;
-        let s = dtn::Summary {
-            full: w.full,
-            ids: w.ids,
-            receipts: w.receipts.into_iter().map(|(id, dst, sig)| dtn::Receipt { id, dst, sig }).collect(),
-            preds: w.preds,
-            free: w.free,
-            evictable: w.evictable,
-            wants: w.wants,
-        };
+        let s = decode_summary(body)?;
         let now = self.now();
         if let Some(c) = &self.carrier {
             c.lock().on_summary(from, s, now, verify_receipt);
@@ -1122,17 +1113,7 @@ impl Driver {
         let frames = self.frames.peer(&from);
         let (head, _head_permit) = read_frame(&mut rx, MAX_OFFER, crate::resources::FIRST_FRAME, &frames).await?;
         let Some((&K_OFFER, body)) = head.split_first() else { return Ok(()) };
-        let w: WireOffer = postcard::from_bytes(body)?;
-        let o = dtn::Offer {
-            id: w.id,
-            src: w.src,
-            dst: w.dst,
-            size: w.size,
-            created: w.created,
-            lifetime: w.lifetime,
-            copies: w.copies,
-            sig: w.sig,
-        };
+        let o = decode_offer(body)?;
         let answer = {
             let mut c = c.lock();
             c.set_clock(self.now(), wall_ms());
@@ -1222,16 +1203,7 @@ impl Driver {
         // summaries: everything to a new neighbour, then what changes
         let due = c.lock().summaries(now, &neighbours);
         for (k, s) in due {
-            let wire = WireSummary {
-                full: s.full,
-                ids: s.ids,
-                receipts: s.receipts.into_iter().map(|r| (r.id, r.dst, r.sig)).collect(),
-                preds: s.preds,
-                free: s.free,
-                evictable: s.evictable,
-                wants: s.wants,
-            };
-            let Ok(body) = crate::wire::encode_bounded(&wire, MAX_SUMMARY - 1) else { continue };
+            let Ok(body) = encode_summary(s) else { continue };
             let Some(conn) = self.conn(&k) else { continue };
             let mut msg = vec![K_SUMMARY];
             msg.extend_from_slice(&body);
@@ -1712,6 +1684,75 @@ struct WireSummary {
     wants: Vec<SignPk>,
 }
 
+/// A neighbour's summary stream, after its kind byte.
+pub(crate) fn decode_summary(body: &[u8]) -> Result<dtn::Summary> {
+    let w: WireSummary = postcard::from_bytes(body)?;
+    Ok(dtn::Summary {
+        full: w.full,
+        ids: w.ids,
+        receipts: w.receipts.into_iter().map(|(id, dst, sig)| dtn::Receipt { id, dst, sig }).collect(),
+        preds: w.preds,
+        free: w.free,
+        evictable: w.evictable,
+        wants: w.wants,
+    })
+}
+
+/// Our summary for a neighbour, without its kind byte.
+pub(crate) fn encode_summary(s: dtn::Summary) -> Result<Vec<u8>> {
+    let wire = WireSummary {
+        full: s.full,
+        ids: s.ids,
+        receipts: s.receipts.into_iter().map(|r| (r.id, r.dst, r.sig)).collect(),
+        preds: s.preds,
+        free: s.free,
+        evictable: s.evictable,
+        wants: s.wants,
+    };
+    crate::wire::encode_bounded(&wire, MAX_SUMMARY - 1)
+}
+
+/// A neighbour's bundle offer, after its kind byte.
+pub(crate) fn decode_offer(body: &[u8]) -> Result<dtn::Offer> {
+    let w: WireOffer = postcard::from_bytes(body)?;
+    Ok(dtn::Offer {
+        id: w.id,
+        src: w.src,
+        dst: w.dst,
+        size: w.size,
+        created: w.created,
+        lifetime: w.lifetime,
+        copies: w.copies,
+        sig: w.sig,
+    })
+}
+
+/// Our offer of a bundle, without its kind byte.
+pub(crate) fn encode_offer(o: &dtn::Offer) -> Result<Vec<u8>> {
+    let wire = WireOffer {
+        id: o.id,
+        src: o.src,
+        dst: o.dst,
+        size: o.size,
+        created: o.created,
+        lifetime: o.lifetime,
+        sig: o.sig,
+        copies: o.copies,
+    };
+    crate::wire::encode_bounded(&wire, MAX_OFFER - 1)
+}
+
+/// A neighbour's answer to our offer: `Ok(Some(from))` to send the payload
+/// from byte `from`, `Ok(None)` if it has the bundle, `Err(full)` if refused
+/// (`true` for lack of room).
+pub(crate) fn decode_answer(body: &[u8]) -> Result<std::result::Result<Option<u64>, bool>> {
+    Ok(match postcard::from_bytes::<WireAnswer>(body)? {
+        WireAnswer::Take(at) => Ok(Some(at)),
+        WireAnswer::Duplicate => Ok(None),
+        WireAnswer::Refuse(full) => Err(full),
+    })
+}
+
 /// A bundle's id: the same data for the same destination is the same bundle.
 pub fn bundle_id(src: &SignPk, dst: &SignPk, payload: &[u8]) -> Hash32 {
     let mut h = mycel_crypto::Digest::new(BUNDLE_CTX);
@@ -1752,28 +1793,19 @@ async fn send_bundle(
     copies: u8,
     frames: &crate::resources::PeerFrames,
 ) -> Result<Sent> {
-    let offer = WireOffer {
-        id: b.id,
-        src: b.src,
-        dst: b.dst,
-        size: b.payload.len() as u64,
-        created: b.created,
-        lifetime: b.lifetime,
-        sig: b.sig,
-        copies,
-    };
     let mut msg = vec![K_OFFER];
-    msg.extend_from_slice(&crate::wire::encode_bounded(&offer, MAX_OFFER - 1)?);
+    msg.extend_from_slice(&encode_offer(&dtn::Offer::of(b, copies))?);
     // (waits while the neighbour has as many streams from us as it allows)
     let (mut tx, mut rx) =
         crate::resources::within(crate::resources::REPLY_TIMEOUT, "no stream", conn.open_bi()).await?;
     write_frame(&mut tx, &msg).await?;
     let (answer, _answer_permit) =
         read_frame(&mut rx, 64, crate::resources::reply_timeout(4 + msg.len()), frames).await?;
-    let at = match postcard::from_bytes::<WireAnswer>(&answer)? {
-        WireAnswer::Duplicate => return Ok(Sent::Took),
-        WireAnswer::Refuse(full) => return Ok(Sent::Refused(full)),
-        WireAnswer::Take(at) => (at as usize).min(b.payload.len()),
+    let at = match decode_answer(&answer)? {
+        Ok(None) => return Ok(Sent::Took),
+        Err(full) => return Ok(Sent::Refused(full)),
+        // (a 32-bit device must not truncate an offset beyond the payload)
+        Ok(Some(at)) => usize::try_from(at).unwrap_or(usize::MAX).min(b.payload.len()),
     };
     crate::resources::write_all(&mut tx, &b.payload[at..]).await?;
     tx.finish()?;
