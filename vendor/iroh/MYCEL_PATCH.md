@@ -102,3 +102,8 @@ Covered by `crates/mycel-net/tests/links.rs`
 (`live_connection_moves_to_another_link`) and, for 3,
 `crates/mycel-call/tests/calls.rs` (`call_moves_from_peer_wifi_to_bluetooth`). Drop this patch once upstream
 opens custom paths itself.
+
+Packaging: the crate's own `Cargo.lock` from the published package is not
+kept. Iroh has no `[workspace]` table here, so it is a member of Mycel's
+workspace and builds from the workspace's `Cargo.lock`; the stale copy only
+made vulnerability scanners report versions Mycel never builds.

@@ -1477,9 +1477,9 @@ impl Router {
     /// inside the end-to-end encryption), and its timeout follows the
     /// measured round trip, so a slow path isn't mistaken for a dead one.
     ///
-    /// After [`SUSPECT_STRIKES`] timeouts in a row through the same next
-    /// hop, over at least [`SUSPECT_SILENCE`] plus twice the route's cost,
-    /// that hop is suspected for `dst` for [`SUSPECT_FOR`]: our packets (and
+    /// After `SUSPECT_STRIKES` timeouts in a row through the same next
+    /// hop, over at least `SUSPECT_SILENCE` plus twice the route's cost,
+    /// that hop is suspected for `dst` for `SUSPECT_FOR`: our packets (and
     /// those we relay to `dst`) take the next feasible route; with none
     /// left, still the best (dropping can't deliver, and suspicion can be
     /// wrong), while the store-and-forward carrier spreads the bundle

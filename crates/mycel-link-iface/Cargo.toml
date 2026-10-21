@@ -23,6 +23,7 @@ tokio = { version = "1.53.2", features = ["net", "rt", "sync", "time", "macros"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
+nix.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 futures-util = "0.3"

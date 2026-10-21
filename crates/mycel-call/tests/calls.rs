@@ -19,7 +19,9 @@ use mycel_net::link::{MemNet, PathKind};
 /// Alice calls Bob and Bob answers; returns the call id once both are talking.
 pub async fn connect_call(alice: &Device, bob: &Device, space: Hash32) -> String {
     let out = alice.calls.start(space).await.unwrap();
-    assert_eq!(out.state, CallPhase::Connecting, "{out:?}");
+    // (the call runs on its own task: Bob's device may already have said
+    // it's ringing by the time `start` reads the state back)
+    assert!(matches!(out.state, CallPhase::Connecting | CallPhase::Ringing), "{out:?}");
     let ring = eventually("bob's device rings", 15, || bob.incoming().filter(|r| r.id == out.id)).await;
     assert_eq!(ring.conversation, space.to_string());
     assert_eq!(ring.peer, alice.hex());
@@ -57,6 +59,7 @@ fn burst_latency(alice: &Device, bob: &Device, period: f64) -> Option<f64> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn call_carries_audio_both_ways_and_hangs_up() {
+    let _cpu = cpu_alone().await;
     let alice = device("alice", TestSource::Bursts { hz: 1000.0, on_ms: 100, period_ms: 500 }, true, &[]).await;
     let bob = device("bob", sine(440.0), true, &[]).await;
     alice.node.add_peer_addr(bob.node.addr());
@@ -125,6 +128,7 @@ async fn call_carries_audio_both_ways_and_hangs_up() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn decline_timeout_busy_and_strangers() {
+    let _cpu = cpu_shared().await;
     let alice = device("alice", sine(440.0), true, &[]).await;
     let bob = device("bob", sine(660.0), true, &[]).await;
     let carol = device("carol", sine(550.0), true, &[]).await;
@@ -187,6 +191,7 @@ async fn decline_timeout_busy_and_strangers() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn both_call_at_once_become_one_call() {
+    let _cpu = cpu_shared().await;
     let alice = device("alice", sine(440.0), true, &[]).await;
     let bob = device("bob", sine(660.0), true, &[]).await;
     alice.node.add_peer_addr(bob.node.addr());
@@ -303,6 +308,7 @@ async fn glare_one_side_slow(lower_first: bool) {
 /// (the call glare flake on Windows CI).
 #[tokio::test(flavor = "multi_thread")]
 async fn both_call_at_once_higher_key_slow_to_place_it() {
+    let _cpu = cpu_shared().await;
     glare_one_side_slow(true).await;
 }
 
@@ -311,6 +317,7 @@ async fn both_call_at_once_higher_key_slow_to_place_it() {
 /// the first one rang and was then shown as missed.
 #[tokio::test(flavor = "multi_thread")]
 async fn both_call_at_once_lower_key_slow_to_place_it() {
+    let _cpu = cpu_shared().await;
     glare_one_side_slow(false).await;
 }
 
@@ -319,6 +326,7 @@ async fn both_call_at_once_lower_key_slow_to_place_it() {
 /// lower bitrate.
 #[tokio::test(flavor = "multi_thread")]
 async fn call_moves_from_peer_wifi_to_bluetooth() {
+    let _cpu = cpu_shared().await;
     let wifi = MemNet::new(3, PathKind::PeerWifi);
     let bt = MemNet::new(3, PathKind::Bluetooth);
     // Bluetooth LE: ~20 KB/s, 20 ms each way
@@ -378,6 +386,7 @@ async fn call_moves_from_peer_wifi_to_bluetooth() {
 /// Wi-Fi path for 3-5 s while the audio already went over Bluetooth.
 #[tokio::test(flavor = "multi_thread")]
 async fn call_leg_reports_bluetooth_promptly_after_wifi_dies() {
+    let _cpu = cpu_shared().await;
     let wifi = MemNet::new(4, PathKind::PeerWifi);
     let bt = MemNet::new(4, PathKind::Bluetooth);
     bt.set_rate_limit(Some(20_000));
@@ -422,6 +431,7 @@ async fn call_leg_reports_bluetooth_promptly_after_wifi_dies() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn audio_falls_back_to_a_stream() {
+    let _cpu = cpu_shared().await;
     let alice = device("alice", sine(440.0), true, &[]).await;
     let bob = device("bob", sine(660.0), true, &[]).await;
     alice.node.add_peer_addr(bob.node.addr());
@@ -443,6 +453,7 @@ async fn audio_falls_back_to_a_stream() {
 /// forwards ciphertext.
 #[tokio::test(flavor = "multi_thread")]
 async fn call_through_a_mesh_relay() {
+    let _cpu = cpu_shared().await;
     let ab = MemNet::new(5, PathKind::PeerWifi);
     let bc = MemNet::new(6, PathKind::PeerWifi);
     let mesh = || Some(MeshOptions { announce_every: Duration::from_millis(500), ..MeshOptions::default() });
@@ -479,6 +490,7 @@ async fn call_through_a_mesh_relay() {
 /// Europe: a live call across both gateways and the internet, end to end.
 #[tokio::test(flavor = "multi_thread")]
 async fn call_across_two_gateways_and_the_internet() {
+    let _cpu = cpu_shared().await;
     use mycel_net::mesh::directory::{self, Directory, MemDirectory};
     let dir = MemDirectory::new();
     let radio = |n: u64| {

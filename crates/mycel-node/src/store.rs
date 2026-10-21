@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -67,8 +67,11 @@ type Listener = Arc<dyn Fn() + Send + Sync>;
 
 struct Shared {
     path: PathBuf,
-    /// `None` only while a failed database is being reopened.
+    /// `None` while a failed database is being reopened, and for good once
+    /// the store is closed ([`DbStore::close`] releases the file).
     db: RwLock<Option<Database>>,
+    /// Closed and the file released: never reopen it.
+    released: AtomicBool,
     pending: Mutex<Pending>,
     cv: Condvar,
     // Held from before draining the queue through transaction completion.
@@ -83,6 +86,9 @@ struct Shared {
 impl Shared {
     fn with_db<R>(&self, f: impl FnOnce(&Database) -> Result<R>) -> Result<R> {
         let db = self.db.read().unwrap();
+        if self.released.load(Ordering::SeqCst) {
+            bail!("storage is closed");
+        }
         f(db.as_ref().context("storage is unavailable")?)
     }
 
@@ -90,6 +96,9 @@ impl Shared {
     /// the database is opened again, which also repairs it.
     fn reopen(&self) -> Result<()> {
         let mut db = self.db.write().unwrap();
+        if self.released.load(Ordering::SeqCst) {
+            bail!("storage is closed");
+        }
         // Close first: the file is locked while open.
         *db = None;
         *db = Some(Database::create(&self.path).context("reopen storage")?);
@@ -171,6 +180,9 @@ fn commit_pending(shared: &Shared, extra: Vec<Write>, retry: bool) -> Result<()>
         batch.extend(extra);
         (batch, taken, pending.error.is_some())
     };
+    if batch.is_empty() && !failing {
+        return Ok(());
+    }
     let outcome = (|| {
         #[cfg(test)]
         if shared.fail_commits.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
@@ -225,6 +237,7 @@ impl DbStore {
         let shared = Arc::new(Shared {
             path,
             db: RwLock::new(Some(db)),
+            released: AtomicBool::new(false),
             pending: Mutex::new(Pending::default()),
             cv: Condvar::new(),
             commit_gate: Mutex::new(()),
@@ -346,14 +359,26 @@ impl DbStore {
         commit_pending(&self.shared, writes, false)
     }
 
+    /// Save what's buffered and release the file. Later reads and writes
+    /// through any handle to this store fail; closing again does nothing.
     pub fn close(&self) -> Result<()> {
+        if self.shared.released.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         self.shared.pending.lock().unwrap().closed = true;
         self.shared.cv.notify_all();
         if let Some(h) = self.flusher.lock().unwrap().take() {
             h.join().map_err(|_| anyhow!("storage flusher panicked"))?;
         }
         // One last attempt, even after a failure.
-        commit_pending(&self.shared, Vec::new(), true)
+        let last = commit_pending(&self.shared, Vec::new(), true);
+        // Then release the file (redb locks it while it's open), so the
+        // store can be opened again at once, by a runtime restarted in this
+        // process, even while some task still holds this handle.
+        let mut db = self.shared.db.write().unwrap();
+        self.shared.released.store(true, Ordering::SeqCst);
+        *db = None;
+        last
     }
 
     /// Absence is allowed; malformed persisted security state is an error.
@@ -577,6 +602,29 @@ mod tests {
         assert_eq!(store.kv_get("inflight").unwrap(), Some(vec![7]));
         store.close().unwrap();
         drop(store);
+        fs_cleanup(path);
+    }
+
+    /// Closing releases the file even while another handle is still alive
+    /// (a task that hasn't finished yet): a runtime restarted in the same
+    /// process opens it again at once. The old handle is closed for good.
+    #[test]
+    fn close_releases_the_file_while_handles_live_on() {
+        let (path, store) = test_store();
+        store.kv_put("name", vec![1]);
+        let straggler = store.clone();
+        store.close().unwrap();
+        drop(store);
+        let reopened = DbStore::open(&path).unwrap();
+        assert_eq!(reopened.kv_get("name").unwrap(), Some(vec![1]));
+        let err = straggler.kv_get("name").unwrap_err().to_string();
+        assert!(err.contains("closed"), "{err}");
+        straggler.kv_put("late", vec![2]);
+        straggler.close().unwrap();
+        drop(straggler);
+        assert_eq!(reopened.kv_get("late").unwrap(), None, "a closed handle writes nothing");
+        reopened.close().unwrap();
+        drop(reopened);
         fs_cleanup(path);
     }
 

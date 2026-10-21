@@ -58,6 +58,7 @@ pub struct VTDecompressionOutputCallbackRecord {
 pub const kCMVideoCodecType_H264: u32 = u32::from_be_bytes(*b"avc1");
 /// '420v': NV12, video range (what cameras and the encoder like best).
 pub const kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: u32 = u32::from_be_bytes(*b"420v");
+pub const kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: u32 = u32::from_be_bytes(*b"420f");
 pub const kCVPixelBufferLock_ReadOnly: u64 = 1;
 pub const kCMBlockBufferAssureMemoryNowFlag: u32 = 1;
 pub const kVTEncodeInfo_FrameDropped: u32 = 1 << 1;
@@ -91,6 +92,7 @@ unsafe extern "C" {
     pub fn CVPixelBufferGetBaseAddressOfPlane(pb: CVPixelBufferRef, plane: usize) -> *mut u8;
     pub fn CVPixelBufferGetBytesPerRowOfPlane(pb: CVPixelBufferRef, plane: usize) -> usize;
     pub fn CVPixelBufferGetHeightOfPlane(pb: CVPixelBufferRef, plane: usize) -> usize;
+    pub fn CVPixelBufferGetWidthOfPlane(pb: CVPixelBufferRef, plane: usize) -> usize;
     pub static kCVPixelBufferPixelFormatTypeKey: CFStringRef;
     pub static kCVPixelBufferIOSurfacePropertiesKey: CFStringRef;
 }
@@ -177,6 +179,13 @@ unsafe extern "C" {
     pub fn VTCompressionSessionCompleteFrames(session: VTSessionRef, until: CMTime) -> OSStatus;
     pub fn VTCompressionSessionPrepareToEncodeFrames(session: VTSessionRef) -> OSStatus;
     pub fn VTCompressionSessionInvalidate(session: VTSessionRef);
+    pub fn VTPixelTransferSessionCreate(allocator: *const c_void, out: *mut VTSessionRef) -> OSStatus;
+    pub fn VTPixelTransferSessionTransferImage(
+        session: VTSessionRef,
+        source: CVPixelBufferRef,
+        destination: CVPixelBufferRef,
+    ) -> OSStatus;
+    pub fn VTPixelTransferSessionInvalidate(session: VTSessionRef);
     pub fn VTDecompressionSessionCreate(
         allocator: *const c_void,
         format: CMFormatDescriptionRef,
@@ -218,5 +227,7 @@ unsafe extern "C" {
     pub static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
     pub static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
     pub static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFStringRef;
+    #[cfg(target_os = "macos")]
+    pub static kVTVideoEncoderSpecification_EncoderID: CFStringRef;
     pub static kVTDecompressionPropertyKey_RealTime: CFStringRef;
 }

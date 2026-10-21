@@ -11,7 +11,7 @@
 mod ffi;
 
 use std::collections::HashMap;
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -851,26 +851,12 @@ fn result_name(r: ffi::nw_object) -> Option<String> {
 
 /// Is the peer-to-peer Wi-Fi interface up? (It goes down with the Wi-Fi radio.)
 fn awdl_up() -> bool {
-    let mut head: *mut libc::ifaddrs = std::ptr::null_mut();
-    if unsafe { libc::getifaddrs(&mut head) } != 0 {
+    use nix::net::if_::InterfaceFlags;
+    let Ok(addrs) = nix::ifaddrs::getifaddrs() else {
         return true; // can't tell: don't claim it's off
-    }
-    let mut up = false;
-    let mut cur = head;
-    while !cur.is_null() {
-        let ifa = unsafe { &*cur };
-        if !ifa.ifa_name.is_null() {
-            let name = unsafe { CStr::from_ptr(ifa.ifa_name) }.to_bytes();
-            let flags = ifa.ifa_flags as libc::c_int;
-            if name.starts_with(b"awdl") && flags & libc::IFF_UP != 0 && flags & libc::IFF_RUNNING != 0 {
-                up = true;
-                break;
-            }
-        }
-        cur = ifa.ifa_next;
-    }
-    unsafe { libc::freeifaddrs(head) };
-    up
+    };
+    let up = InterfaceFlags::IFF_UP | InterfaceFlags::IFF_RUNNING;
+    addrs.into_iter().any(|a| a.interface_name.starts_with("awdl") && a.flags.contains(up))
 }
 
 // ─────────────────────────────── Iroh side ───────────────────────────────

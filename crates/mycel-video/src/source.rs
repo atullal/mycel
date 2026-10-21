@@ -79,8 +79,12 @@ impl VideoSource for TestPattern {
         let (w, h, fps) = (self.width, self.height, self.fps.max(1));
         let flag = stop.clone();
         std::thread::Builder::new().name("mycel-video-test".into()).spawn(move || {
-            let start = Instant::now();
             let interval = Duration::from_secs_f64(1.0 / fps as f64);
+            // A camera's frames come from its own clock; ours is a timer,
+            // which must not drift in a throttled process (see crate::realtime).
+            // Drawing a 720p picture takes a few ms.
+            crate::realtime::promote_current_thread(interval, (interval / 4).min(Duration::from_millis(8)));
+            let start = Instant::now();
             let mut n: u32 = 0;
             while !flag.load(Ordering::Relaxed) {
                 let due = start + interval * n;

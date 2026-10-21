@@ -533,7 +533,7 @@ async fn legacy_attachments_folders_and_read_errors() {
     let m = wait_for_message(&bob, &conv, "pkg").await;
     let got = bob.fetch_attachment(m.attachments[0].blob.clone()).await.unwrap();
     let mut z = zip::ZipArchive::new(std::fs::File::open(got).unwrap()).unwrap();
-    let names: Vec<String> = z.file_names().map(str::to_string).collect();
+    let names: Vec<String> = z.file_names().map(|n| n.unwrap().into_owned()).collect();
     assert!(names.contains(&"My Report.pages/Index.xml".to_string()), "{names:?}");
     assert!(names.contains(&"My Report.pages/Data/img.bin".to_string()), "{names:?}");
     let mut img = vec![];

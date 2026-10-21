@@ -38,6 +38,7 @@ tokio = { version = "1.53.2", features = ["full"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+nix.workspace = true
 
 # timeBeginPeriod (see `fine_timers`)
 [target.'cfg(windows)'.dependencies]
