@@ -1222,3 +1222,39 @@ fn a_new_entry_costs_the_same_in_a_long_feed() {
     assert_eq!(feed.changes_since(changes.cursor).from, 100_998);
     assert_eq!(feed.order[100_998], racer.id);
 }
+
+/// Finding 5 of the Sync v2 design: a batch re-checks only the pending
+/// envelopes that waited for what arrived, never the whole pending set.
+/// With 1,000 envelopes pending on missing predecessors, one arrival costs
+/// two status checks (itself and the one envelope it unblocks), and the
+/// rest arriving in any order leaves nothing pending.
+#[test]
+fn an_arrival_rechecks_only_the_envelopes_waiting_for_it() {
+    let (mut a, mut b, _) = pair(Role::Writer);
+    let feed = StreamId::new_feed();
+    let chain: Vec<Envelope> = (0..2000).map(|i| b.append(feed, format!("m{i}").into_bytes()).unwrap().1).collect();
+    // Every odd seq first: each waits for its missing predecessor.
+    let odd: Vec<Envelope> = chain.iter().skip(1).step_by(2).cloned().collect();
+    a.ingest_batch(vec![], odd);
+    assert_eq!(a.waiting.values().map(Vec::len).sum::<usize>(), 1000);
+    let before = a.stats.get().checks;
+    a.ingest_batch(vec![], vec![chain[10].clone()]);
+    assert_eq!(a.stats.get().checks - before, 2, "the arrival and the one envelope waiting for it");
+    assert_eq!(a.status(&chain[11].id()), Status::Valid);
+    // One membership batch re-evaluates everything once and rebuilds the map.
+    a.add_member(dev().public(), Role::Reader).unwrap();
+    assert_eq!(a.waiting.values().map(Vec::len).sum::<usize>(), 999);
+    // An unrelated arrival wakes nothing.
+    let before = a.stats.get().checks;
+    let own = a.append(feed, b"x".to_vec()).unwrap().1;
+    assert_eq!(a.status(&own.id()), Status::Valid);
+    assert!(a.stats.get().checks - before <= 2, "{}", a.stats.get().checks - before);
+    // The rest, newest first: nothing stays pending.
+    let mut even: Vec<Envelope> = chain.iter().step_by(2).cloned().collect();
+    even.reverse();
+    for e in even {
+        a.ingest_envelope(e).unwrap();
+    }
+    assert!(a.waiting.is_empty());
+    assert!(chain.iter().all(|e| a.status(&e.id()) == Status::Valid));
+}

@@ -486,8 +486,12 @@ pub struct Replica {
     /// with its declared history. A property of the payload, so permanent.
     doc_rejected: HashSet<EnvelopeId>,
     doc_inputs: HashMap<StreamId, DocInputs>,
-    /// Envelopes whose status is Pending (re-checked when new inputs arrive).
-    pending: HashSet<EnvelopeId>,
+    /// Pending envelopes by the stored envelope each waits for (its missing
+    /// `author_prev`, or a missing link below a revocation cutoff), so an
+    /// arriving envelope re-checks only what waits for it: a batch costs
+    /// O(new + woken), never O(pending). Envelopes pending on membership ops
+    /// are re-checked by the full refresh that every op batch runs.
+    waiting: HashMap<EnvelopeId, Vec<EnvelopeId>>,
     /// The envelope chains held, for Sync v2 (`reconcile`).
     index: reconcile::ChainIndex,
     /// Sync v2's op tips, with the op count they were computed at (ops are
@@ -503,6 +507,8 @@ pub struct Replica {
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Default)]
 struct DocStats {
+    /// Envelope statuses computed.
+    checks: usize,
     opens: usize,
     applies: usize,
     rebuilds: usize,
@@ -563,7 +569,7 @@ impl Replica {
             equivocated: HashSet::new(),
             doc_rejected: HashSet::new(),
             doc_inputs: HashMap::new(),
-            pending: HashSet::new(),
+            waiting: HashMap::new(),
             index: reconcile::ChainIndex::default(),
             op_tips: std::sync::Mutex::new(None),
             stored_bytes: 0,
@@ -829,27 +835,36 @@ impl Replica {
     }
 
     fn compute_status(&self, id: &EnvelopeId) -> Status {
+        self.compute_status_waiting(id).0
+    }
+
+    /// The status, and for a pending envelope the stored envelope it waits
+    /// for, if that is what it waits for (`None` while it waits for
+    /// membership ops).
+    fn compute_status_waiting(&self, id: &EnvelopeId) -> (Status, Option<EnvelopeId>) {
+        #[cfg(test)]
+        self.stats.set(DocStats { checks: self.stats.get().checks + 1, ..self.stats.get() });
         let Some(env) = self.envelopes.get(id) else {
-            return Status::Pending("unknown envelope");
+            return (Status::Pending("unknown envelope"), None);
         };
         let h = &env.header;
         if !self.graph.knows_all(&h.auth_heads) {
-            return Status::Pending("missing membership ops");
+            return (Status::Pending("missing membership ops"), None);
         }
         let st = self.graph.state_at(&h.auth_heads);
         if !st.role(&h.author).is_some_and(Role::can_write) {
-            return Status::Invalid("author not a writer at auth_heads");
+            return (Status::Invalid("author not a writer at auth_heads"), None);
         }
         if !st.epoch(&h.epoch).is_some_and(|e| e.recipients.contains(&h.author)) {
-            return Status::Invalid("author not a recipient of epoch");
+            return (Status::Invalid("author not a recipient of epoch"), None);
         }
         match (h.author_seq, &h.author_prev) {
             (0, None) => {}
-            (0, Some(_)) | (_, None) => return Status::Invalid("broken author chain"),
+            (0, Some(_)) | (_, None) => return (Status::Invalid("broken author chain"), None),
             (seq, Some(prev)) => match self.envelopes.get(prev) {
-                None => return Status::Pending("missing previous envelope"),
+                None => return (Status::Pending("missing previous envelope"), Some(*prev)),
                 Some(p) if p.header.author != h.author || p.header.author_seq.checked_add(1) != Some(seq) => {
-                    return Status::Invalid("broken author chain");
+                    return (Status::Invalid("broken author chain"), None);
                 }
                 Some(_) => {}
             },
@@ -860,28 +875,29 @@ impl Replica {
                 continue;
             }
             let Some(cutoff) = cutoff else {
-                return Status::Invalid("written after revocation");
+                return (Status::Invalid("written after revocation"), None);
             };
             match self.chain_contains(&cutoff, id) {
-                Some(true) => {}
-                Some(false) => return Status::Invalid("beyond revocation cutoff"),
-                None => return Status::Pending("missing cutoff envelope"),
+                Ok(true) => {}
+                Ok(false) => return (Status::Invalid("beyond revocation cutoff"), None),
+                Err(missing) => return (Status::Pending("missing cutoff envelope"), Some(missing)),
             }
         }
-        Status::Valid
+        (Status::Valid, None)
     }
 
-    /// Is `target` on the author chain ending at `tip`? `None` if the chain has gaps.
-    fn chain_contains(&self, tip: &EnvelopeId, target: &EnvelopeId) -> Option<bool> {
+    /// Is `target` on the author chain ending at `tip`? `Err(id)`: the chain
+    /// has a gap, and `id` is the first envelope missing on the way down.
+    fn chain_contains(&self, tip: &EnvelopeId, target: &EnvelopeId) -> std::result::Result<bool, EnvelopeId> {
         let mut cur = *tip;
         loop {
             if cur == *target {
-                return Some(true);
+                return Ok(true);
             }
-            let env = self.envelopes.get(&cur)?;
+            let env = self.envelopes.get(&cur).ok_or(cur)?;
             match env.header.author_prev {
                 Some(prev) => cur = prev,
-                None => return Some(false),
+                None => return Ok(false),
             }
         }
     }
@@ -893,8 +909,16 @@ impl Replica {
     /// and documents that lost a change they had applied (or a fork candidate).
     fn full_refresh(&mut self) {
         let ids: Vec<EnvelopeId> = self.envelopes.keys().copied().collect();
-        self.status = ids.iter().map(|id| (*id, self.compute_status(id))).collect();
-        self.pending = self.status.iter().filter(|(_, s)| matches!(s, Status::Pending(_))).map(|(id, _)| *id).collect();
+        self.waiting.clear();
+        let mut status = HashMap::with_capacity(ids.len());
+        for id in ids {
+            let (st, wait) = self.compute_status_waiting(&id);
+            if let Some(w) = wait {
+                self.waiting.entry(w).or_default().push(id);
+            }
+            status.insert(id, st);
+        }
+        self.status = status;
         let mut by_stream: HashMap<StreamId, BTreeSet<EnvelopeId>> = HashMap::new();
         for (id, st) in &self.status {
             if *st == Status::Valid {
@@ -959,43 +983,37 @@ impl Replica {
         })
     }
 
-    /// New envelopes arrived: evaluate them and anything pending that they may unblock.
+    /// New envelopes arrived: evaluate them and the pending envelopes that
+    /// waited for one of them. Validity needs only that the previous (and
+    /// cutoff) envelopes are stored, not that they are valid, so one pass
+    /// suffices: nothing that becomes valid here unblocks anything else.
     fn incremental(&mut self, new: &[EnvelopeId]) {
-        // New envelopes have no status yet, so they are never in `pending`.
+        // New envelopes have no status yet, so none of them waits.
         let mut todo: Vec<EnvelopeId> = new.to_vec();
-        todo.extend(self.pending.iter().copied());
+        for id in new {
+            if let Some(woken) = self.waiting.remove(id) {
+                todo.extend(woken);
+            }
+        }
         let mut docs: BTreeMap<StreamId, Vec<EnvelopeId>> = BTreeMap::new();
-        loop {
-            let mut progressed = false;
-            let mut still = Vec::new();
-            for id in todo {
-                let st = self.compute_status(&id);
-                let was_valid = self.status.get(&id) == Some(&Status::Valid);
-                if st == Status::Valid && !was_valid {
-                    let stream = self.envelopes[&id].header.stream;
-                    self.valid_by_stream.entry(stream).or_default().insert(id);
-                    self.status.insert(id, st);
-                    self.pending.remove(&id);
-                    if stream.kind == StreamKind::Doc {
-                        docs.entry(stream).or_default().push(id);
-                    } else {
-                        self.materialize(&id);
-                    }
-                    progressed = true;
+        for id in todo {
+            let (st, wait) = self.compute_status_waiting(&id);
+            let was_valid = self.status.get(&id) == Some(&Status::Valid);
+            if st == Status::Valid && !was_valid {
+                let stream = self.envelopes[&id].header.stream;
+                self.valid_by_stream.entry(stream).or_default().insert(id);
+                self.status.insert(id, st);
+                if stream.kind == StreamKind::Doc {
+                    docs.entry(stream).or_default().push(id);
                 } else {
-                    if matches!(st, Status::Pending(_)) {
-                        self.pending.insert(id);
-                        still.push(id);
-                    } else {
-                        self.pending.remove(&id);
-                    }
-                    self.status.insert(id, st);
+                    self.materialize(&id);
                 }
+            } else {
+                if let Some(w) = wait {
+                    self.waiting.entry(w).or_default().push(id);
+                }
+                self.status.insert(id, st);
             }
-            if !progressed || still.is_empty() {
-                break;
-            }
-            todo = still;
         }
         // Each touched document is refreshed once for the whole batch.
         for (stream, ids) in docs {
