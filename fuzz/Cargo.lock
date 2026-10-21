@@ -2323,7 +2323,9 @@ version = "0.0.0"
 dependencies = [
  "arbitrary",
  "automerge",
+ "blake3",
  "bytes",
+ "getrandom 0.4.3",
  "leb128",
  "libfuzzer-sys",
  "mycel-call",

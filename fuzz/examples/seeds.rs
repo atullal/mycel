@@ -4,14 +4,29 @@
 //! target dispatches on. Structured targets (`arbitrary` inputs) need no
 //! seeds: their corpora grow from the first run.
 //!
-//!   cd fuzz && cargo run --example seeds   # rewrites fuzz/seeds/
+//!   fuzz/seeds.sh   # writes fuzz/seeds/
 //!
-//! Everything is deterministic except epoch keys and AEAD nonces, which are
-//! random by design; rerunning rewrites those seeds with different bytes.
+//! **Deterministic**: rerunning writes the same bytes, so only a change in an
+//! encoding shows up in git. Keys come from fixed seeds, and everything the
+//! code draws from the OS's randomness (space ids, epoch keys, lockboxes,
+//! AEAD nonces) comes from a fixed stream instead: `seeds.sh` builds this
+//! with getrandom's `custom` backend, defined below (only here: nothing
+//! else in the build changes, and a fuzz target never links this). The one
+//! seed that carries the time, a reachability record (its expiry and the
+//! pkarr timestamp), is written only if missing.
+//!
+//! **Non-destructive**: it writes only the seeds it makes. It never deletes
+//! anything, and never touches a `regression-*` input (one that once failed,
+//! kept so every run tries it again); files it no longer makes are listed,
+//! for a person to delete.
 
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(getrandom_backend = "custom")]
+use std::sync::Mutex;
 
 use automerge::transaction::Transactable;
 use automerge::{AutoCommit, ObjType, ROOT};
@@ -21,20 +36,86 @@ use mycel_net::link::CustomAddr;
 use mycel_net::mesh::core::{Frame, Origination, SeqReq};
 use mycel_net::mesh::{directory, wire as mesh};
 use mycel_net::wire::{BlobReq, BlobResp, ContactCard, Data, DtnPayload, EphMsg, Inventory, SyncMsg};
-use mycel_sync::{FeedEntry, Replica, StreamId, StreamKind};
+use mycel_sync::{Envelope, EnvelopeId, FeedEntry, Replica, StreamId, StreamKind};
 use mycel_trust::Role;
 use serde::Serialize;
 
-struct Seeds<'a> {
-    root: &'a Path,
+/// The randomness every crate here draws through getrandom 0.4 (Mycel's
+/// keys, nonces and op ids, HPKE, Automerge): a BLAKE3 output stream from a
+/// fixed key, in the order this single-threaded program asks for it. For
+/// seed files only: nothing that runs a node is built with it.
+#[cfg(getrandom_backend = "custom")]
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn __getrandom_v03_custom(dest: *mut u8, len: usize) -> Result<(), getrandom::Error> {
+    static STREAM: Mutex<Option<blake3::OutputReader>> = Mutex::new(None);
+    let mut stream = STREAM.lock().unwrap_or_else(|e| e.into_inner());
+    let reader = stream.get_or_insert_with(|| blake3::Hasher::new_derive_key("mycel fuzz seeds v1").finalize_xof());
+    // SAFETY: getrandom passes a writable buffer of `len` bytes (perhaps
+    // uninitialised: zeroed before it is read as a slice).
+    let buf = unsafe {
+        std::ptr::write_bytes(dest, 0, len);
+        std::slice::from_raw_parts_mut(dest, len)
+    };
+    reader.fill(buf);
+    Ok(())
 }
 
-impl Seeds<'_> {
+/// What was written, left alone, and found in the seed directories.
+struct Seeds {
+    root: PathBuf,
+    made: RefCell<BTreeSet<PathBuf>>,
+    written: Cell<usize>,
+}
+
+impl Seeds {
+    /// Write seed `name` for `target` unless it already holds these bytes.
     fn put(&self, target: &str, name: &str, selector: Option<u8>, body: &[u8]) {
+        self.write(target, name, selector, body, true);
+    }
+
+    /// Write seed `name` only if it is missing (a seed that carries the time).
+    fn put_once(&self, target: &str, name: &str, selector: Option<u8>, body: &[u8]) {
+        self.write(target, name, selector, body, false);
+    }
+
+    fn write(&self, target: &str, name: &str, selector: Option<u8>, body: &[u8], replace: bool) {
+        assert!(!name.starts_with("regression-"), "regression inputs are never written here: {name}");
         let dir = self.root.join(target);
         fs::create_dir_all(&dir).expect("a seed directory");
+        let path = dir.join(name);
+        assert!(self.made.borrow_mut().insert(path.clone()), "two seeds named {target}/{name}");
         let bytes: Vec<u8> = selector.into_iter().chain(body.iter().copied()).collect();
-        fs::write(dir.join(name), bytes).expect("a seed file");
+        let old = fs::read(&path).ok();
+        if old.as_deref() == Some(&bytes[..]) || (old.is_some() && !replace) {
+            return;
+        }
+        fs::write(&path, bytes).expect("a seed file");
+        self.written.set(self.written.get() + 1);
+    }
+
+    /// Report, and list what is in the directories but wasn't made now.
+    fn finish(&self) {
+        let made = self.made.borrow();
+        let (mut regressions, mut stale) = (0, Vec::new());
+        for dir in fs::read_dir(&self.root).expect("seeds") {
+            for file in fs::read_dir(dir.expect("a seed directory").path()).expect("a seed directory") {
+                let path = file.expect("a seed file").path();
+                if path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("regression-")) {
+                    regressions += 1;
+                } else if !made.contains(&path) {
+                    stale.push(path);
+                }
+            }
+        }
+        println!(
+            "{} seeds, {} written, the rest unchanged; {regressions} regression inputs kept",
+            made.len(),
+            self.written.get()
+        );
+        for path in stale {
+            let path = path.strip_prefix(&self.root).unwrap_or(&path);
+            println!("not made by this generator (left in place): fuzz/seeds/{}", path.display());
+        }
     }
 }
 
@@ -49,9 +130,15 @@ fn framed<T: Serialize>(v: &T) -> Vec<u8> {
 }
 
 fn main() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("seeds");
-    let _ = fs::remove_dir_all(&root);
-    let s = Seeds { root: &root };
+    if !cfg!(all(fuzzing, getrandom_backend = "custom")) {
+        eprintln!("seeds: built without fixed randomness, so every run would write different bytes: use fuzz/seeds.sh");
+        std::process::exit(2);
+    }
+    let s = Seeds {
+        root: Path::new(env!("CARGO_MANIFEST_DIR")).join("seeds"),
+        made: RefCell::default(),
+        written: Cell::default(),
+    };
 
     // A space as a node makes one: founder A adds writer B; B edits a
     // document and posts to a feed.
@@ -73,7 +160,9 @@ fn main() {
     let edit = edit.expect("an edit seals an envelope");
     let feed = StreamId::named(StreamKind::Feed, "chat");
     let chat = mycel_kit_chat::ChatOp::Text { body: "hello".into(), reply_to: None, attachments: vec![] };
-    let (_, post) = b.append(feed, chat.encode()).expect("a post");
+    // As `Replica::append` seals a post, at a fixed time instead of now.
+    let entry = FeedEntry { deps: vec![], ts_ms: TS_MS, body: chat.encode() };
+    let post = seal(&b, feed, &pc(&entry), 1, Some(edit.id()));
     let space = a.space_id();
     let envelopes = vec![edit.clone(), post.clone()];
     let inv =
@@ -97,7 +186,7 @@ fn main() {
     let dtn = DtnPayload { space, data: Data { ops: ops.clone(), envelopes: envelopes.clone() } };
     s.put("postcard_messages", "dtn-payload", Some(0), &pc(&dtn));
     s.put("postcard_messages", "sync-data", Some(1), &pc(&data));
-    let entry = FeedEntry { deps: vec![edit.id()], ts_ms: 1_760_000_000_000, body: chat.encode() };
+    let entry = FeedEntry { deps: vec![edit.id()], ts_ms: TS_MS, body: chat.encode() };
     s.put("postcard_messages", "feed-entry", Some(2), &pc(&entry));
     s.put("postcard_messages", "op-genesis", Some(3), &pc(&genesis));
     s.put("postcard_messages", "op-add", Some(3), &pc(ops.last().expect("an add")));
@@ -134,7 +223,7 @@ fn main() {
 
     // sync_change: a whole change (mode 0) and its body (mode 1, which the
     // target re-frames), from a real multi-object edit.
-    let mut d = AutoCommit::new();
+    let mut d = AutoCommit::new().with_actor(automerge::ActorId::from(&[7u8; 16][..]));
     d.put(ROOT, "n", 1).expect("put");
     let text = d.put_object(ROOT, "text", ObjType::Text).expect("text");
     d.splice_text(&text, 0, 0, "hello world").expect("splice");
@@ -179,6 +268,11 @@ fn main() {
     for (i, p) in parts.iter().enumerate() {
         s.put("mesh_wire", &format!("data-fragment-{i}"), None, p);
     }
+    // Flag bits this version doesn't assign (relays carry them unchanged).
+    let payload = Bytes::from_static(b"marked by a later version");
+    let marked = Frame { ext: 0x84, reached: true, total: payload.len() as u16, payload, ..frame };
+    let marked = mesh::encode_frame(&marked, usize::MAX).expect("one datagram");
+    s.put("mesh_wire", "data-extension-flags", None, &marked[0]);
 
     // link_wire: the selector is the decoder (see the target).
     let awdl = mycel_link_awdl::wire::Control::Hello(founder.sign_pk()).encode();
@@ -211,11 +305,24 @@ fn main() {
 
     // directory_record: a sealed reachability record.
     let record = directory::seal(&founder, &[(writer.sign_pk(), 1_000)]).expect("a record");
-    s.put("directory_record", "record", Some(0), &record);
+    s.put_once("directory_record", "record", Some(0), &record);
 
-    let count: usize =
-        fs::read_dir(&root).expect("seeds").map(|d| fs::read_dir(d.unwrap().path()).unwrap().count()).sum();
-    println!("wrote {count} seeds to {}", root.display());
+    s.finish();
+}
+
+/// The wall time in seeds that carry one (2025-10-09).
+const TS_MS: u64 = 1_760_000_000_000;
+
+/// Seal `plaintext` as `r`'s device would at chain position `seq`, after
+/// `prev` (mycel-sync's fuzzing helper: `seeds.sh` builds with `fuzzing`).
+#[cfg(fuzzing)]
+fn seal(r: &Replica, stream: StreamId, plaintext: &[u8], seq: u64, prev: Option<EnvelopeId>) -> Envelope {
+    mycel_sync::fuzzing::seal(r, stream, plaintext, seq, prev, mycel_crypto::random()).expect("sealed")
+}
+
+#[cfg(not(fuzzing))]
+fn seal(_: &Replica, _: StreamId, _: &[u8], _: u64, _: Option<EnvelopeId>) -> Envelope {
+    unreachable!("main stops first")
 }
 
 /// The mesh and interface targets build a [`CustomAddr`] from a first byte

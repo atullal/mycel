@@ -3,8 +3,9 @@
 //!
 //! Properties: no decoder panics; every accepted datagram re-encodes to the
 //! same bytes (announcements, batches, seqno requests) or to a frame that
-//! decodes to the same fields; a decoded frame split into fragments for any
-//! hop MTU reassembles into the same payload.
+//! decodes to the same fields, unassigned flag bits included; a decoded
+//! frame split into fragments for any hop MTU reassembles into the same
+//! payload, and every fragment keeps the flags.
 #![no_main]
 
 use bytes::Bytes;
@@ -14,7 +15,7 @@ use mycel_net::mesh::core::Frame;
 use mycel_net::mesh::wire;
 
 fn fields(f: &Frame) -> impl PartialEq + std::fmt::Debug {
-    (f.ttl, f.reached, f.control, f.dst, f.src, f.waypoint, f.id, f.offset, f.total, f.payload.clone())
+    (f.ttl, f.reached, f.control, f.ext, f.dst, f.src, f.waypoint, f.id, f.offset, f.total, f.payload.clone())
 }
 
 fuzz_target!(|data: &[u8]| {
@@ -47,6 +48,7 @@ fuzz_target!(|data: &[u8]| {
                 assert!(p.len() <= mtu.max(wire::DATA_HDR + f.payload.len().min(mtu)));
                 let d = wire::decode_frame(p).expect("each fragment decodes");
                 assert_eq!((d.id, d.total, d.dst, d.src), (f.id, f.total, f.dst, f.src));
+                assert_eq!((d.reached, d.control, d.ext), (f.reached, f.control, f.ext), "a fragment lost a flag");
                 assert_eq!(d.offset as usize, f.offset as usize + payload.len());
                 payload.extend_from_slice(&d.payload);
             }

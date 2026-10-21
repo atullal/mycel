@@ -41,9 +41,16 @@ wasm-smith = { version = "0.261", features = ["wasmparser"] }
 wasmparser = "0.261"
 wat = { version = "1.228.0", default-features = false }
 
-# For `examples/seeds.rs`, which writes the seed corpora (not a fuzz target).
+# For `examples/seeds.rs`, which writes the seed corpora (not a fuzz target;
+# `seeds.sh` runs it): its fixed randomness is a getrandom `custom` backend.
 [dev-dependencies]
+blake3 = "1.8.7"
+getrandom = "0.4.3"
 leb128 = "0.2.7"
+
+# `seeds.sh` sets `getrandom_backend` (and `fuzzing`, as cargo-fuzz does).
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)', 'cfg(getrandom_backend, values("custom"))'] }
 
 # The same patched crates the main workspace builds against (see the root
 # Cargo.toml for why each is patched). A patch only applies from the root of
