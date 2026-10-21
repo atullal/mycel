@@ -520,7 +520,7 @@ pub fn decode_frame(b: Bytes) -> Option<Frame> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh::core::{ATTEST_EPOCH, attest_epoch};
+    use crate::mesh::core::{FAR_ATTEST_EPOCH, epoch_of};
 
     #[test]
     fn announcements_round_trip_and_verify() {
@@ -619,10 +619,10 @@ mod tests {
                 assert!(verify(Check::Origin(&a)), "the origin's own signature, always carried");
                 // the same within the epoch: its refreshes' copies verify too
                 let later = Announce { seq: a.seq + 16_000, ..a.clone() };
-                let stale = Announce { seq: a.seq + ATTEST_EPOCH, ..a.clone() };
+                let stale = Announce { seq: a.seq + FAR_ATTEST_EPOCH, ..a.clone() };
                 for (j, h) in hops.iter().enumerate() {
                     let next = hops.get(j + 1).map_or(if own { me } else { from }, |x| x.signer);
-                    let same_epoch = attest_epoch(&a.origin, later.seq) == attest_epoch(&a.origin, a.seq);
+                    let same_epoch = epoch_of(&later) == epoch_of(&a);
                     assert_eq!(verify(Check::Hop { ann: &later, hop: h, pos: j as u8, next }), same_epoch);
                     assert!(!verify(Check::Hop { ann: &stale, hop: h, pos: j as u8, next }), "an epoch later");
                 }

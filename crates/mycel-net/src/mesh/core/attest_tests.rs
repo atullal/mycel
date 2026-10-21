@@ -49,10 +49,13 @@ fn router(me: &DeviceKeys, nbs: &[SignPk], cost: u32) -> Router {
     r
 }
 
-/// The first seqno from [`WALL`] on that starts one of `origin`'s epochs.
-fn epoch_start(origin: &SignPk) -> u64 {
-    let e = attest_epoch(origin, WALL);
-    (WALL..).find(|s| attest_epoch(origin, *s) > e).expect("an epoch starts within one")
+/// The first seqno from [`WALL`] on that starts one of `origin`'s epochs
+/// for announcements of `scope`.
+fn epoch_start(origin: &SignPk, scope: u8) -> u64 {
+    let e = attest_epoch(origin, WALL, scope);
+    let len = if scope <= NEAR_SCOPE { ATTEST_EPOCH } else { FAR_ATTEST_EPOCH };
+    let next = (WALL..WALL + len + 1).step_by(1_000).find(|s| attest_epoch(origin, *s, scope) > e).expect("within one");
+    (next - 1_000..=next).find(|s| attest_epoch(origin, *s, scope) > e).expect("within a second")
 }
 
 fn via(r: &Router, origin: &SignPk, n: &SignPk) -> Option<Via> {
@@ -131,7 +134,8 @@ fn forged_replayed_truncated_and_readdressed_chains_are_refused() {
     let honest = relayed(&o, &[&a1, &b], me.sign_pk(), &[300, 400, 500], WALL, 8);
     let refused = |ann: Announce| {
         let mut r = router(&me, &[b.sign_pk()], 100);
-        r.on_announce(b.sign_pk(), ann, 0, WALL, wire::verify);
+        let wall = ann.seq;
+        r.on_announce(b.sign_pk(), ann, 0, wall, wire::verify);
         let s = r.stats();
         (s.chains_refused, s.neighbours_distrusted, s.announcements_attested)
     };
@@ -159,12 +163,12 @@ fn forged_replayed_truncated_and_readdressed_chains_are_refused() {
     // replayed onto the origin's next announcement: within the epoch every
     // hop signed, it attests that one too (a route B had this epoch, never
     // a cheaper link than A measured); an epoch later, nothing
-    let s0 = epoch_start(&o.sign_pk());
+    let s0 = epoch_start(&o.sign_pk(), 8);
     let first = relayed(&o, &[&a1, &b], me.sign_pk(), &[300, 400, 500], s0, 8);
     let next = sign_announce(&o, Origination { seq: s0 + 16_000, flags: 0, scope: 8, uplink: 0 }, "o");
     let replay = Announce { chain: first.chain.clone(), hops: first.hops, cost: first.cost, ..next };
     assert_eq!(refused(replay), (0, 0, 1));
-    let later = sign_announce(&o, Origination { seq: s0 + ATTEST_EPOCH, flags: 0, scope: 8, uplink: 0 }, "o");
+    let later = sign_announce(&o, Origination { seq: s0 + FAR_ATTEST_EPOCH, flags: 0, scope: 8, uplink: 0 }, "o");
     let replay = Announce { chain: first.chain.clone(), hops: first.hops, cost: first.cost, ..later };
     assert_eq!(refused(replay), (1, 1, 0), "an epoch later");
     // the origin's fields changed (a far scope claimed for a near one)
@@ -449,7 +453,7 @@ fn refresh(o: &DeviceKeys, full: &Announce, seq: u64) -> Announce {
 #[test]
 fn a_refresh_within_the_epoch_is_attested_by_the_chain_its_sender_sent() {
     let (o, u, l, x, me) = (dk(1), dk(2), dk(3), dk(5), dk(4));
-    let s0 = epoch_start(&o.sign_pk());
+    let s0 = epoch_start(&o.sign_pk(), 8);
     let mut r = router(&me, &[l.sign_pk(), x.sign_pk()], 100);
     let full = relayed(&o, &[&u, &l], me.sign_pk(), &[300, 400, 500], s0, 8);
     r.on_announce(l.sign_pk(), full.clone(), 0, s0, wire::verify);
@@ -491,11 +495,11 @@ fn a_refresh_within_the_epoch_is_attested_by_the_chain_its_sender_sent() {
 #[test]
 fn a_refresh_an_epoch_later_needs_its_chain_again() {
     let (o, l, me) = (dk(1), dk(3), dk(4));
-    let s0 = epoch_start(&o.sign_pk());
+    let s0 = epoch_start(&o.sign_pk(), 8);
     let mut r = router(&me, &[l.sign_pk()], 100);
     let full = relayed(&o, &[&l], me.sign_pk(), &[300, 400], s0, 8);
     r.on_announce(l.sign_pk(), full.clone(), 0, s0, wire::verify);
-    let later = s0 + ATTEST_EPOCH;
+    let later = s0 + FAR_ATTEST_EPOCH;
     r.on_announce(l.sign_pk(), refresh(&o, &full, later), 1_000, later, wire::verify);
     assert!(via(&r, &o.sign_pk(), &l.sign_pk()).is_some_and(|v| !v.attested && v.seq == later));
     assert_eq!(r.stats().chains_unheld, 1);
@@ -506,9 +510,9 @@ fn a_refresh_an_epoch_later_needs_its_chain_again() {
 }
 
 #[test]
-fn a_relay_sends_its_chain_again_only_when_it_changes() {
+fn a_relay_sends_its_chain_again_only_when_its_claim_needs_it() {
     let (o, u, me, y) = (dk(1), dk(2), dk(4), dk(6));
-    let s0 = epoch_start(&o.sign_pk());
+    let s0 = epoch_start(&o.sign_pk(), 8);
     let mut r = router(&me, &[u.sign_pk(), y.sign_pk()], 100);
     r.drain(&mut Vec::new());
     let full = |seq: u64, link: u32| relayed(&o, &[&u], me.sign_pk(), &[300, link], seq, 8);
@@ -528,13 +532,16 @@ fn a_relay_sends_its_chain_again_only_when_it_changes() {
     let b = step(&mut r, refresh(&o, &f, s0 + 1_000), s0 + 1_000);
     assert!(b.same && b.chain.is_none() && b.sign_link.is_none() && b.cost == a.cost);
     assert_eq!(wire::wire_len(&b), wire::wire_len(&Announce { same: false, ..b.clone() }));
-    // the chain under ours changed (U measured its link anew): again
+    // the chain under ours changed and our cost rose (U measured its link
+    // anew): the chain Y holds still bounds what we claim
     let c = step(&mut r, full(s0 + 2_000, 450), s0 + 2_000);
-    assert!(!c.same && c.chain_len() == 2 && c.cost == a.cost + 50);
-    // the same again, then a refresh whose cost fell well under what our
-    // hop signed: re-signed
-    let d = step(&mut r, refresh(&o, &full(s0, 450), s0 + 3_000), s0 + 3_000);
-    assert!(d.same);
+    assert!(c.same && c.cost == a.cost + 50);
+    // a refresh whose cost fell well under what our hop signed: re-signed
+    let d = step(&mut r, full(s0 + 3_000, 300), s0 + 3_000);
+    assert!(!d.same && d.chain_len() == 2 && d.cost == a.cost - 100);
+    // ... a little under: the same, as signed
+    let d = step(&mut r, full(s0 + 3_500, 290), s0 + 3_500);
+    assert!(d.same && d.cost == a.cost - 100, "{d:?}");
     // Y's connection again: it holds nothing of ours, so its greeting
     // carries the chain (and the next refresh goes without it again)
     let t = clock.get();
@@ -550,10 +557,10 @@ fn a_relay_sends_its_chain_again_only_when_it_changes() {
         })
         .collect();
     assert!(greeting.len() == 1 && !greeting[0].same && greeting[0].chain_len() == 2, "{greeting:?}");
-    let e = step(&mut r, refresh(&o, &full(s0, 450), s0 + 4_000), s0 + 4_000);
+    let e = step(&mut r, refresh(&o, &full(s0, 290), s0 + 4_000), s0 + 4_000);
     assert!(e.same);
     // Y asks for the chain of a refresh it got: re-sent, to Y alone
-    let f2 = step(&mut r, refresh(&o, &full(s0, 450), s0 + 5_000), s0 + 5_000);
+    let f2 = step(&mut r, refresh(&o, &full(s0, 290), s0 + 5_000), s0 + 5_000);
     assert!(f2.same);
     r.on_seqreq(y.sign_pk(), SeqReq { origin: o.sign_pk(), seq: s0 + 5_000, hops: 1 }, clock.get() + 400);
     let mut out = Vec::new();
@@ -562,17 +569,17 @@ fn a_relay_sends_its_chain_again_only_when_it_changes() {
         out.iter().filter_map(|x| if let Out::Announce { ann, .. } = x { Some(ann) } else { None }).collect();
     assert!(answers.len() == 1 && !answers[0].same && answers[0].chain_len() == 2);
     // an epoch later: everything again
-    let g = step(&mut r, full(s0 + ATTEST_EPOCH, 450), s0 + ATTEST_EPOCH);
+    let g = step(&mut r, full(s0 + FAR_ATTEST_EPOCH, 290), s0 + FAR_ATTEST_EPOCH);
     assert!(!g.same);
     let s = r.stats();
-    assert_eq!(s.chains_elided, 4);
+    assert_eq!(s.chains_elided, 5);
 }
 
 #[test]
 fn an_origin_sends_its_own_hop_once_an_epoch_and_again_when_asked() {
     let (me, y, z) = (dk(4), dk(6), dk(7));
     let mut r = router(&me, &[y.sign_pk(), z.sign_pk()], 100);
-    let s0 = epoch_start(&me.sign_pk());
+    let s0 = epoch_start(&me.sign_pk(), 2);
     let own = |r: &mut Router, seq: u64, now: Time| {
         r.originate(sign_announce(&me, Origination { seq, flags: 0, scope: 2, uplink: 0 }, ""), now);
         sent_to(r, y.sign_pk(), me.sign_pk(), now)
@@ -631,7 +638,9 @@ fn refreshes_keep_a_signed_mesh_attested_and_cost_fewer_bytes() {
     let (elided, reused, unheld, checked, bytes) = run(true, true);
     let (elided_off, _, _, checked_off, bytes_off) = run(true, false);
     let (.., plain) = run(false, false);
-    assert!(elided > 0 && reused == elided && unheld == 0, "{elided} {reused} {unheld}");
+    // (every refresh sent without its chain was attested by the one held,
+    // but for a few still in flight when the run ends)
+    assert!(elided > 0 && reused <= elided && elided - reused <= 10 && unheld == 0, "{elided} {reused} {unheld}");
     assert_eq!(elided_off, 0);
     // hops sign an epoch: copies of a chain repeat within it, so the cache
     // spares as many checks either way; what reuse saves is bytes

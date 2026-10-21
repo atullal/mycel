@@ -246,11 +246,17 @@ const HELLO_WAIT: Time = 1_000;
 /// chain when the receiver holds it already ([`Announce::same`]). It is
 /// also how stale a chain a relay can replay: a route it had up to this
 /// long ago, never a cheaper link than its upstream measured. Four of
-/// Babel's 16 s periods.
+/// Babel's 16 s periods, for announcements of the near scope ...
 pub const ATTEST_EPOCH: u64 = 64_000;
-/// A relay re-signs its hop for a neighbour within an epoch only when the
-/// chain below it changed, or its cost or its link fell by more than
-/// 1/this (it may advertise up to that much over its cost meanwhile:
+/// ... and for the full scope, which an origin announces only every
+/// [`FAR_EVERY`] periods (128 s): as long as a far route lives without a
+/// refresh anyway (3.5 of those), so that most of its refreshes, whose
+/// long chains are most of the bytes, travel without them too.
+pub const FAR_ATTEST_EPOCH: u64 = 448_000;
+/// Set in a full-scope announcement's epoch: the two kinds never match.
+const FAR_EPOCH: u64 = 1 << 63;
+/// A relay re-signs its hop for a neighbour within an epoch only when its
+/// hops change, or its cost or its link fell by more than 1/this (it may advertise up to that much over its cost meanwhile:
 /// measured costs jitter, and each change would cost a chain).
 const RESIGN_FRACTION: u32 = 8;
 /// Changed origins remembered before `tick` redoes all of them instead.
@@ -602,12 +608,25 @@ pub enum Check<'a> {
     Hop { ann: &'a Announce, hop: &'a Hop, pos: u8, next: SignPk },
 }
 
-/// The attestation epoch of `origin`'s seqno `seq` ([`ATTEST_EPOCH`]), each
-/// origin's epochs offset by its key so that not every chain in a mesh is
-/// re-signed at once.
-pub fn attest_epoch(origin: &SignPk, seq: u64) -> u64 {
-    let offset = u64::from_be_bytes(origin.0[..8].try_into().unwrap_or_default()) % ATTEST_EPOCH;
-    seq.saturating_add(offset) / ATTEST_EPOCH
+/// The attestation epoch of `origin`'s seqno `seq` in an announcement of
+/// `scope` hops ([`ATTEST_EPOCH`] up to [`NEAR_SCOPE`], else
+/// [`FAR_ATTEST_EPOCH`] with the top bit set), each origin's epochs offset
+/// by its key so that not every chain in a mesh is re-signed at once.
+pub fn attest_epoch(origin: &SignPk, seq: u64, scope: u8) -> u64 {
+    let (len, kind) = if scope <= NEAR_SCOPE { (ATTEST_EPOCH, 0) } else { (FAR_ATTEST_EPOCH, FAR_EPOCH) };
+    let offset = u64::from_be_bytes(origin.0[..8].try_into().unwrap_or_default()) % len;
+    (seq.saturating_add(offset) / len) | kind
+}
+
+/// [`attest_epoch`] of an announcement.
+pub fn epoch_of(a: &Announce) -> u64 {
+    attest_epoch(&a.origin, a.seq, a.scope)
+}
+
+/// Epochs of the same kind (near or full scope): what a neighbour holds of
+/// each kind is kept apart, as an origin's announcements alternate.
+fn same_kind(a: u64, b: u64) -> bool {
+    (a ^ b) & FAR_EPOCH == 0
 }
 
 /// What hop `pos` of an attestation signs (after its context string,
@@ -626,12 +645,12 @@ pub fn hop_signed(origin: &SignPk, epoch: u64, pos: u8, cost: u32, next: &SignPk
 
 /// What `hop`, at position `pos` of `ann`'s chain and naming `next`, signed.
 pub fn hop_message(ann: &Announce, hop: &Hop, pos: u8, next: &SignPk) -> [u8; 81] {
-    hop_signed(&ann.origin, attest_epoch(&ann.origin, ann.seq), pos, hop.cost, next, hop.link)
+    hop_signed(&ann.origin, epoch_of(ann), pos, hop.cost, next, hop.link)
 }
 
 /// What our own hop on `a` signs for `to` ([`Announce::sign_link`]).
 pub fn own_hop_message(a: &Announce, to: &SignPk, link: u32) -> [u8; 81] {
-    hop_signed(&a.origin, attest_epoch(&a.origin, a.seq), a.hops, a.cost, to, link)
+    hop_signed(&a.origin, epoch_of(a), a.hops, a.cost, to, link)
 }
 
 /// The signature cache's key for a checked hop: what it signed and the
@@ -886,17 +905,19 @@ struct Nb {
     session: u64,
 }
 
-/// The attested announcement we last sent a neighbour for an origin, which
-/// it holds ([`Announce::same`]): refreshes go without the chain while
-/// nothing in it would change.
+/// The attested announcement we last sent a neighbour for an origin, of
+/// each kind (near and full scope), which it holds ([`Announce::same`]):
+/// refreshes go without the chain while nothing in it would change.
 #[derive(Clone, Debug)]
 struct Sent {
     session: u64,
     epoch: u64,
-    /// The chain we extended (`None`: our own announcement) ...
-    base: Option<Arc<Hop>>,
-    /// ... the cost we advertised, and the link our hop signed (`None`: we
-    /// signed no hop of our own, it won't pass it on).
+    /// The hops we advertised (the chain's length, with our own hop or
+    /// without), the cost, and the link our hop signed (`None`: we signed
+    /// no hop of our own, it won't pass it on). Not which chain we
+    /// extended: whichever it was attests our claim for the epoch, and
+    /// copies of one seqno reach a relay in a different order each time.
+    hops: u8,
     cost: u32,
     link: Option<u32>,
 }
@@ -991,7 +1012,8 @@ struct Origin {
     latest: Announce,
     via: Vec<(SignPk, Via)>,
     /// The attestation chain each attested route came with, by neighbour,
-    /// and its epoch (what we extend when we advertise it).
+    /// and its epoch, one of each kind (near and full scope: an origin's
+    /// announcements alternate); what we extend when we advertise it.
     chains: Vec<(SignPk, Arc<Hop>, u64)>,
     /// What each neighbour holds of the chains we sent it ([`Sent`]).
     sent: Vec<(SignPk, Sent)>,
@@ -1027,15 +1049,22 @@ impl Origin {
         }
     }
 
-    /// The chain the route through `n` came with.
+    /// The chain the route through `n` came with (of the newest
+    /// announcement's kind, near or full scope).
     fn chain_of(&self, n: &SignPk) -> Option<&Arc<Hop>> {
-        self.chains.iter().find(|(k, ..)| k == n).map(|(_, c, _)| c)
+        let e = epoch_of(&self.latest);
+        self.chains.iter().find(|(k, _, x)| k == n && same_kind(*x, e)).map(|(_, c, _)| c)
     }
 
+    /// The chain of an announcement from `n` (`None`: it came unattested,
+    /// and what we held from `n` of either kind goes).
     fn set_chain(&mut self, n: SignPk, chain: Option<(Arc<Hop>, u64)>) {
-        self.chains.retain(|(k, ..)| *k != n);
-        if let Some((c, epoch)) = chain {
-            self.chains.push((n, c, epoch));
+        match chain {
+            Some((c, epoch)) => {
+                self.chains.retain(|(k, _, x)| !(*k == n && same_kind(*x, epoch)));
+                self.chains.push((n, c, epoch));
+            }
+            None => self.chains.retain(|(k, ..)| *k != n),
         }
     }
 
@@ -1047,11 +1076,12 @@ impl Origin {
 }
 
 /// The chain we hold from `from` that attests `a`, a refresh it sent without
-/// one ([`Announce::same`]): of `a`'s epoch, as long as `a`'s hops, ending
+/// one ([`Announce::same`]): of `a`'s epoch (and kind), as long as `a`'s hops, ending
 /// with `from`'s own hop or naming `from`, and claiming no less than that
 /// allows (the sender may advertise more than its hop signed, never less).
 fn held_chain(chains: &[(SignPk, Arc<Hop>, u64)], from: &SignPk, a: &Announce) -> Option<Arc<Hop>> {
-    let (_, c, epoch) = chains.iter().find(|(k, ..)| k == from)?;
+    let e = epoch_of(a);
+    let (_, c, _) = chains.iter().find(|(k, _, x)| k == from && *x == e)?;
     let h = a.hops as usize;
     let n = c.len();
     let fits = if n == h + 1 {
@@ -1059,7 +1089,7 @@ fn held_chain(chains: &[(SignPk, Arc<Hop>, u64)], from: &SignPk, a: &Announce) -
     } else {
         n == h && h > 0 && u64::from(a.cost) >= u64::from(c.cost) + u64::from(c.link)
     };
-    (*epoch == attest_epoch(&a.origin, a.seq) && fits).then(|| c.clone())
+    fits.then(|| c.clone())
 }
 
 struct Reasm {
@@ -1810,7 +1840,7 @@ impl Router {
         let cost = a.cost.saturating_add(hop_cost.max(link));
         let relay = self.cfg.relay;
         let forward_scope = a.scope.min(self.cfg.max_hops);
-        let (seq, adv) = (a.seq, a.cost);
+        let (seq, adv, epoch) = (a.seq, a.cost, epoch_of(&a));
         let origin = a.origin;
         // [`Defences::corroborate`]: a claim much cheaper than every other
         // route is a sudden shortcut when it appears, and when it falls to
@@ -1868,7 +1898,6 @@ impl Router {
             }
             None => o.via.push((from, via)),
         }
-        let epoch = attest_epoch(&origin, seq);
         o.set_chain(from, chain.map(|c| (c, epoch)));
         // a refresh whose chain we lack: asked for once an epoch (its sender
         // answers a request for a seqno it sent with its chain again)
@@ -2213,32 +2242,35 @@ impl Router {
         self.out.push(Out::Announce { to, ann: a });
     }
 
-    /// `a` without its chain ([`Announce::same`]), if `to` holds the chain
-    /// we last sent it for the origin and ours wouldn't change: the same
-    /// connection and epoch, the same chain under our hop, our hop's link
-    /// no more than 1/[`RESIGN_FRACTION`] below what we signed, and our
-    /// cost not below what we signed by more (it goes as signed then: a
-    /// receiver takes no less).
+    /// `a` without its chain ([`Announce::same`]), if `to` holds a chain we
+    /// sent it for the origin that still attests our claim: the same
+    /// connection, epoch and hops, our hop's link no more than
+    /// 1/[`RESIGN_FRACTION`] below what we signed, and our cost not below
+    /// what we signed by more (it goes as signed then: a receiver takes no
+    /// less). The chain under our hop may have changed meanwhile (another
+    /// neighbour's copy came first): the one it holds still shows a route
+    /// we had this epoch, at no less than we claim.
     fn elided(&self, to: &SignPk, a: &Announce) -> Option<Announce> {
         if !self.cfg.chain_reuse || a.same || !a.attested() {
             return None;
         }
         let nb = self.nbs.get(to)?;
         let sent = if a.origin == self.me { &self.own_sent } else { &self.origins.get(&a.origin)?.sent };
-        let (_, s) = sent.iter().find(|(k, _)| k == to)?;
-        let base = match (&s.base, &a.chain) {
-            (None, None) => true,
-            (Some(x), Some(y)) => Arc::ptr_eq(x, y),
-            _ => false,
-        };
+        let epoch = epoch_of(a);
+        let (_, s) = sent.iter().find(|(k, s)| k == to && s.epoch == epoch)?;
         let link = match (s.link, a.sign_link) {
             (None, None) => true,
             (Some(signed), Some(l)) => l >= signed - signed / RESIGN_FRACTION,
             _ => false,
         };
         let cost = a.cost.saturating_add(a.cost / RESIGN_FRACTION) >= s.cost;
-        (s.session == nb.session && s.epoch == attest_epoch(&a.origin, a.seq) && base && link && cost)
-            .then(|| Announce { cost: a.cost.max(s.cost), chain: None, sign_link: None, same: true, ..a.clone() })
+        (s.session == nb.session && s.hops == a.hops && link && cost).then(|| Announce {
+            cost: a.cost.max(s.cost),
+            chain: None,
+            sign_link: None,
+            same: true,
+            ..a.clone()
+        })
     }
 
     /// Note what `to` will hold once it has `a`: an attested announcement's
@@ -2256,13 +2288,17 @@ impl Router {
             let Some(o) = self.origins.get_mut(&a.origin) else { return };
             &mut o.sent
         };
-        sent.retain(|(k, _)| k != to);
         if a.attested() && a.cost != INFINITY {
-            let epoch = attest_epoch(&a.origin, a.seq);
-            sent.push((*to, Sent { session, epoch, base: a.chain.clone(), cost: a.cost, link: a.sign_link }));
+            // (one of each kind, near and full scope: they alternate)
+            let epoch = epoch_of(a);
+            sent.retain(|(k, s)| !(k == to && same_kind(s.epoch, epoch)));
+            sent.push((*to, Sent { session, epoch, hops: a.hops, cost: a.cost, link: a.sign_link }));
+        } else {
+            // it drops what it held of ours on an unattested one
+            sent.retain(|(k, _)| k != to);
         }
         // (neighbours gone, or reconnected since: dropped now and then)
-        if sent.len() > 32 {
+        if sent.len() > 64 {
             let nbs = &self.nbs;
             sent.retain(|(k, s)| nbs.get(k).is_some_and(|n| n.session == s.session));
         }
