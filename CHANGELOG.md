@@ -49,9 +49,12 @@ The first public version. It contains:
   WorkManager catch-up as a backstop, and explains before asking to be let
   off battery optimisation; iPhone and iPad catch up through
   `BGTaskScheduler` and keep reaching nearby Bluetooth devices that
-  advertise Mycel in the background, with state restoration ("slow mode",
-  said so in the app). A locked iPhone doesn't advertise, and the Bluetooth
-  characteristic no longer carries the display name.
+  advertise Mycel in the background, known devices only, with state
+  restoration ("slow mode", said so in the app). A catch-up syncs every
+  conversation at once, so a sleeping member costs one connect timeout,
+  not one per conversation. A locked iPhone doesn't advertise, and neither
+  the Bluetooth characteristic nor the channel's hello carries the display
+  name any more.
 - **Simulator and benchmarks:** `mycel-sim`, with real nodes over emulated
   radios and up to 10,000+ virtual devices in virtual time, and replays
   against The ONE's routers on real contact traces.
@@ -65,8 +68,9 @@ The first public version. It contains:
 - A suspended iPhone or iPad runs in slow mode (background refresh and
   Bluetooth catch-ups): new messages may wait until Mycel is opened. The
   optional wake relay is a design only (docs/WAKE_RELAY.md).
-- Bluetooth shows a device's key (and, on a channel, its name) to anyone in
-  range who scans for or advertises Mycel; see TRUST.md §8b.
+- Bluetooth shows a device's key to anyone in range who scans for Mycel,
+  and to devices it opens a channel with (in the background, an iPhone only
+  links with known devices); see TRUST.md §8b.
 - Every device must run the same build.
 
 More in [ARCHITECTURE.md](docs/ARCHITECTURE.md) §7 and
