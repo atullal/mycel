@@ -1785,19 +1785,21 @@ fn held_routes(r: &Router, now: Time) -> usize {
 /// liars that attract routes and swallow packets, feedback from what
 /// arrived (timeouts suspect hops, acknowledgements through others get
 /// them shunned), sudden shortcuts held down as liars' links come back,
-/// announcements paced on Bluetooth hops, and membership tables that
-/// reorder routes. Each defence's own counter must move, so the coverage
+/// announcements paced on Bluetooth hops, membership tables that reorder
+/// routes, and liars whose lapsing claims rank them last. Each defence's own counter must move, so the coverage
 /// can't quietly go away.
 #[test]
 fn churn_never_loops_with_every_defence() {
+    // without the refresh hold-down first: with it the liars' lapsing
+    // claims rank them last before suspicion and aggregation see much
+    churn_with(Defences { refresh: false, ..Defences::ALL });
+    churn_with(Defences::ALL);
+}
+
+fn churn_with(defences: Defences) {
     const N: usize = 30;
     let edges = geometric(N, 100.0, 30.0, 11);
-    let mut net = Net::new(N, |i| Config {
-        announce_every: 500,
-        seed: i as u64 + 1,
-        defences: Defences::ALL,
-        ..Config::default()
-    });
+    let mut net = Net::new(N, |i| Config { announce_every: 500, seed: i as u64 + 1, defences, ..Config::default() });
     let mut x: u64 = 7;
     let mut rnd = move |m: usize| {
         x ^= x << 13;
@@ -1847,6 +1849,7 @@ fn churn_never_loops_with_every_defence() {
         .map(|s| honest.iter().copied().filter(|d| net.hops(*s, *d).is_some_and(|h| h >= 3)).take(5).collect())
         .collect();
     assert!(sources.len() >= 3 && contacts.iter().all(|c| c.len() >= 4), "{sources:?}");
+
     let (mut route_loops, mut held, mut msg) = (0, 0, 0u64);
     let mut waiting: Vec<(usize, usize, Bytes, Time)> = vec![];
     let mut down: Vec<(usize, usize)> = vec![];
@@ -1888,20 +1891,28 @@ fn churn_never_loops_with_every_defence() {
         held += net.nodes.iter().map(|r| held_routes(r, net.now)).sum::<usize>();
     }
     let total = |f: fn(&Stats) -> u64| net.nodes.iter().map(|r| f(&r.stats())).sum::<u64>();
-    let (suspected, shunned, deferred) =
-        (total(|s| s.hops_suspected), total(|s| s.hops_shunned), total(|s| s.announcements_deferred));
+    let (suspected, shunned, deferred, stale) = (
+        total(|s| s.hops_suspected),
+        total(|s| s.hops_shunned),
+        total(|s| s.announcements_deferred),
+        total(|s| s.hops_stale),
+    );
     eprintln!(
-        "churn, every defence: {} of {msg} delivered, {} frame loops, {route_loops} route loops, \
-         {suspected} suspected, {shunned} shunned, {held} held down, {deferred} deferred",
+        "churn, {defences:?}: {} of {msg} delivered, {} frame loops, {route_loops} route loops, \
+         {suspected} suspected, {shunned} shunned, {held} held down, {deferred} deferred, {stale} stale",
         net.delivered.len(),
         net.frame_loops
     );
     assert_eq!(net.frame_loops, 0);
     assert_eq!(route_loops, 0);
     assert!(net.delivered.len() as u64 > msg / 2);
-    assert!(suspected > 0 && shunned > 0, "suspicion and aggregation at work");
     assert!(held > 0, "hold-down at work");
     assert!(deferred > 0, "control budget at work");
+    if defences.refresh {
+        assert!(stale > 0, "refresh hold-down at work");
+    } else {
+        assert!(suspected > 0 && shunned > 0, "suspicion and aggregation at work");
+    }
 }
 
 /// The defences on by default (affinity costs route length everywhere, so
@@ -1947,4 +1958,209 @@ fn smoothing_a_very_slow_hop_cost_does_not_overflow() {
     assert!(r.nbs[&n].hop_cost() > r.nbs[&n].cost, "the hop penalty still adds");
     r.nbs.get_mut(&n).unwrap().cost = u32::MAX;
     assert_eq!(r.nbs[&n].hop_cost(), u32::MAX, "and saturates");
+}
+
+/// A frame for `dst` relayed to `r` by `from` at `t`: where it went.
+fn relayed_to(r: &mut Router, from: SignPk, dst: SignPk, src: SignPk, id: u32, t: Time) -> Vec<SignPk> {
+    let f = Frame {
+        ttl: 20,
+        reached: true,
+        control: false,
+        ext: 0,
+        dst,
+        src,
+        waypoint: src,
+        id,
+        offset: 0,
+        total: 1,
+        payload: Bytes::from_static(b"x"),
+    };
+    r.on_frame(from, f, t);
+    outcome(r).2
+}
+
+/// Babel's hold time (RFC 8966 §2.8, §3.5.4). A relay that loses its last
+/// route to `d` retracts it, but a neighbour that hasn't heard yet still
+/// routes `d` through it; following the default route toward a gateway
+/// from there can bring the packet back to that neighbour, round a loop.
+/// So for a while after the retraction, packets for `d` don't take the
+/// default route: they are dropped, until a feasible route comes back or
+/// the hold runs out. Custody hand-offs aren't held (a bundle waits, it
+/// doesn't loop).
+#[test]
+fn a_retracted_route_is_not_replaced_by_the_default_route_at_once() {
+    // a (upstream) — me — x — d ; me — c — g (a gateway)
+    let (a, c, x, d, g, s) = (key(2), key(3), key(4), key(9), key(10), key(11));
+    let mut r = Router::new(key(1), Config { defences: Defences::NONE, ..Config::default() });
+    for n in [a, c, x] {
+        r.set_direct(n, true, 0);
+        r.hop_up(n, 0);
+        r.set_cost(n, 100);
+    }
+    let ok = |_: &Announce| true;
+    r.on_announce(c, Announce { flags: F_GATEWAY, ..ann(g, WALL, 1, 120) }, 10, WALL, ok);
+    r.on_announce(x, ann(d, WALL, 1, 120), 10, WALL, ok);
+    r.tick(100);
+    assert_eq!(r.origins[&d].fd.map(|(_, c)| c), Some(240), "advertised to a and c: they may route through us");
+    outcome(&mut r);
+    assert_eq!(relayed_to(&mut r, a, d, s, 1, 200), vec![x]);
+    // x loses d and says so: we retract it, and a hasn't heard yet
+    r.on_announce(x, Announce { cost: INFINITY, ..ann(d, WALL, 1, 0) }, 1_000, WALL, ok);
+    r.tick(1_001);
+    let mut outs = Vec::new();
+    r.drain(&mut outs);
+    assert!(outs.iter().any(|o| matches!(o, Out::Announce { to, ann } if *to == a && ann.cost == INFINITY)));
+    assert_eq!(r.toward(&d, 1_002), Toward::Hop(c), "custody isn't held");
+    outcome(&mut r);
+    assert_eq!(relayed_to(&mut r, a, d, s, 2, 1_010), Vec::<SignPk>::new(), "not toward the gateway");
+    assert_eq!(r.stats().dropped_unreachable, 1);
+    // our own packets neither
+    assert!(r.send(d, key(1), Bytes::from_static(b"y"), false, 1_020));
+    assert!(outcome(&mut r).2.is_empty());
+    // once the retraction has had time to reach everyone, the default route
+    let later = 1_000 + RETRACT_HOLD;
+    r.tick(later);
+    outcome(&mut r);
+    assert_eq!(relayed_to(&mut r, a, d, s, 3, later), vec![c]);
+    // and a route that comes back ends the hold at once
+    r.on_announce(x, ann(d, WALL + 2_000, 1, 120), later + 10, WALL + later, ok);
+    r.on_announce(x, Announce { cost: INFINITY, ..ann(d, WALL + 2_000, 1, 0) }, later + 20, WALL + later, ok);
+    r.tick(later + 21);
+    outcome(&mut r);
+    r.on_announce(x, ann(d, WALL + 3_000, 1, 120), later + 30, WALL + later, ok);
+    r.tick(later + 31);
+    outcome(&mut r);
+    assert_eq!(relayed_to(&mut r, a, d, s, 4, later + 40), vec![x]);
+}
+
+/// The same loop end to end: s — a — b — d, with b — c — g (a gateway)
+/// and c — a. Each side measures a hop's cost itself, and here they
+/// disagree: c finds the hop to b slow (it routes d through a), b finds it
+/// fast (its way to the gateway is through c). When b — d breaks, packets
+/// b receives before a hears the retraction used to go toward the gateway,
+/// through c, and back to a, which had passed them already.
+#[test]
+fn a_broken_route_doesnt_send_packets_round_the_default_route() {
+    for hold in [false, true] {
+        let (s, a, b, d, c, g) = (0, 1, 2, 3, 4, 5);
+        let retract_hold = if hold { RETRACT_HOLD } else { 0 }; // 0: the build before
+        let mut net = Net::new(6, |i| Config {
+            announce_every: 500,
+            seed: i as u64 + 1,
+            retract_hold,
+            // no hold-down of c's cheaper way round: the hold time alone
+            defences: Defences::NONE,
+            ..Config::default()
+        });
+        net.nodes[g].set_internet(true);
+        for (x, y) in [(s, a), (a, b), (b, d), (b, c), (c, g), (c, a)] {
+            net.link_cost(x, y, 100);
+        }
+        let kb = net.k(b);
+        for _ in 0..40 {
+            net.nodes[c].set_cost(kb, 3_000);
+        }
+        net.run(5_000);
+        assert!(net.routed(s, d));
+        let nh = |net: &Net, i: usize, x: usize| net.nodes[i].next_hop_local(&net.k(x), net.now).map(|k| net.index[&k]);
+        assert_eq!((nh(&net, c, d), nh(&net, b, g)), (Some(a), Some(c)), "the two sides disagree");
+        let (dst, me) = (net.k(d), net.k(s));
+        net.delay = 20;
+        for k in 0..400u64 {
+            if k == 100 {
+                net.cut(b, d);
+            }
+            let now = net.now;
+            net.nodes[s].send(dst, me, Bytes::from(k.to_be_bytes().to_vec()), false, now);
+            net.effects(s);
+            net.step();
+        }
+        net.run(2_000);
+        eprintln!("hold {hold}: {} frame loops", net.frame_loops);
+        if hold {
+            assert_eq!(net.frame_loops, 0);
+        } else {
+            assert!(net.frame_loops > 0, "the test shows the loop it guards against");
+        }
+    }
+}
+
+/// [`Defences::refresh`]: a liar one hop "from" far origins can refresh its
+/// claims only when the far scope's announcements reach it, so the routes
+/// it gave expire on the near scope's schedule, again and again, each time
+/// costing a retraction and a seqno request to every neighbour. After its
+/// cheapest routes to several origins expired, its routes rank behind the
+/// honest ones: the next seqno moves every origin to them, and when its
+/// claims lapse again nothing is retracted or asked. Its own route stays.
+/// A neighbour whose unused routes lapse (it heard the seqno from us) is
+/// never held.
+#[test]
+fn a_neighbour_whose_routes_keep_expiring_ranks_last() {
+    for refresh in [false, true] {
+        let (liar, honest, quiet) = (key(2), key(3), key(4));
+        let defences = Defences { refresh, ..Defences::NONE };
+        let mut r = Router::new(key(1), Config { defences, ..Config::default() });
+        for n in [liar, honest, quiet] {
+            r.set_direct(n, true, 0);
+            r.hop_up(n, 0);
+            r.set_cost(n, 100);
+        }
+        let ok = |_: &Announce| true;
+        let origins: Vec<SignPk> = (20..26).map(key).collect();
+        let far = |o, seq, hops, cost| Announce { scope: 10, ..ann(o, seq, hops, cost) };
+        let round = |r: &mut Router, t: Time| {
+            for o in &origins {
+                r.on_announce(honest, far(*o, WALL + t, 5, 3_000), t, WALL + t, ok);
+                r.on_announce(liar, far(*o, WALL + t, 1, 1 + HOP_PENALTY), t, WALL + t, ok);
+                // the quiet neighbour offers dear routes once and never again
+                if t == 0 {
+                    r.on_announce(quiet, far(*o, WALL + t, 2, 2_000), t, WALL + t, ok);
+                }
+            }
+            r.on_announce(liar, far(liar, WALL + t, 0, 0), t, WALL + t, ok);
+            r.tick(t + 100);
+        };
+        // its own announcement comes every period (its route to itself
+        // never lapses: only what it claims for others does)
+        let until = |r: &mut Router, from: Time, to: Time| {
+            for t in (from..to).step_by(16_000).chain([to]) {
+                r.on_announce(liar, ann(liar, WALL + t, 0, 0), t, WALL + t, ok);
+                r.tick(t);
+            }
+        };
+        round(&mut r, 0);
+        assert!(origins.iter().all(|o| r.next_hop_local(o, 200) == Some(liar)), "believed at first");
+        // the honest far routes last 448 s; the liar's "2 hops" 56 s
+        let expiry = 16_000 * 7 / 2;
+        until(&mut r, 200, expiry + 200);
+        let first = r.stats();
+        assert!(first.retractions_sent > 0 && first.seqreqs_sent > 0, "every lapse costs");
+        // the next far-scope round, and the next lapse
+        until(&mut r, expiry + 200, 128_000);
+        round(&mut r, 128_000);
+        let t = 128_000 + expiry + 200;
+        until(&mut r, 128_200, t);
+        let second = r.stats();
+        let moved = origins.iter().filter(|o| r.next_hop_local(o, 128_200) == Some(honest)).count();
+        eprintln!("refresh {refresh}: {first:?}\n -> {second:?}");
+        if refresh {
+            assert_eq!(second.hops_stale, 1, "the liar, not the quiet neighbour");
+            assert!(r.stale.contains_key(&liar) && !r.stale.contains_key(&quiet));
+            assert_eq!(second.retractions_sent, first.retractions_sent, "nothing more retracted");
+            assert_eq!(second.seqreqs_sent, first.seqreqs_sent, "nor asked for");
+            assert_eq!(r.route_hops(&liar, &liar), Some(1), "it stays reachable itself");
+            assert_eq!(r.next_hop_local(&liar, t), Some(liar));
+        } else {
+            assert_eq!(second.hops_stale, 0);
+            assert!(second.retractions_sent > first.retractions_sent && second.seqreqs_sent > first.seqreqs_sent);
+            assert_eq!(moved, 0);
+        }
+        // between the two lapses, with the hold-down, the honest routes carry
+        let mut r2 = r;
+        if refresh {
+            until(&mut r2, t, 256_000);
+            round(&mut r2, 256_000);
+            assert!(origins.iter().all(|o| r2.next_hop_local(o, 256_200) == Some(honest)), "ranked behind");
+        }
+    }
 }

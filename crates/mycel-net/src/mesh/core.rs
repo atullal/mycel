@@ -145,6 +145,33 @@ const CORROBORATE_FACTOR: u64 = 2;
 /// neighbour. An acknowledgement from the destination through the hop ends
 /// it early; the destination itself, next to us, is never held.
 const HOLD_DOWN: Time = 32_000;
+/// Refresh hold-down ([`Defences::refresh`]): a neighbour through which
+/// our cheapest route to this many distinct origins expired within
+/// [`SUSPECT_FOR`] (it stopped refreshing them while its hop stayed up, and
+/// never retracted them) ...
+const STALE_MIN: usize = 4;
+/// ... has its routes rank behind every route through a neighbour not so
+/// held, for this long (renewed while its routes keep expiring). Honest
+/// relays refresh a route within its scope's period or retract it; a route
+/// claimed nearer than the refreshes that come prove (a one-hop lie about a
+/// far origin) expires on the near scope's schedule again and again, and
+/// each expiry with nothing feasible left costs a retraction and a seqno
+/// request to every neighbour (`docs/SIMULATION.md` §4, open 16).
+const STALE_HOLD: Time = 10 * 60_000;
+/// What a held neighbour's routes rank behind: more than any route's cost
+/// with every other defence's penalty.
+const STALE_RANK: u64 = 1 << 40;
+/// Evidence kept per neighbour, and neighbours followed.
+const STALE_EVIDENCE: usize = 2 * STALE_MIN;
+/// Babel's hold time (RFC 8966 §2.8 and §3.5.4): after we retract a route,
+/// packets for that origin don't follow the default route (or the internet,
+/// for others' packets) for this long, unless a feasible route returns.
+/// Neighbours may still route through us until our retraction reaches them,
+/// and a packet we sent toward a gateway would come back along their stale
+/// route: a loop. Babel keeps an unreachable route until every neighbour
+/// acknowledged the retraction; without acknowledgements on the wire, a time
+/// a few round trips long (a lost hop connection is noticed within 5 s).
+pub const RETRACT_HOLD: Time = 5_000;
 /// Trust-graph preference ([`Defences::affinity`]): by default a route
 /// ranks this many percent costlier per step its next hop is from us in the
 /// membership graph of our spaces beyond a co-member (distance 1) ...
@@ -326,6 +353,10 @@ pub struct Config {
     /// ... and how much costlier, in percent, a route through a relay
     /// ranks per step it is from our spaces ([`Defences::affinity`]).
     pub affinity_step: u16,
+    /// Babel's hold time (ms): after we retract a route, packets for that
+    /// origin don't take the default route for this long (0: they do at
+    /// once, as before; [`RETRACT_HOLD`]).
+    pub retract_hold: Time,
 }
 
 /// Defences against lying relays that need no wire change
@@ -349,11 +380,16 @@ pub struct Defences {
     pub affinity: bool,
     /// Relayed announcements are paced to a share of each hop's capacity.
     pub budget: bool,
+    /// A neighbour whose routes keep expiring (it stops refreshing what it
+    /// claimed, without retracting it) has its routes rank last for a while.
+    pub refresh: bool,
 }
 
 impl Defences {
-    pub const ALL: Defences = Defences { aggregate: true, corroborate: true, affinity: true, budget: true };
-    pub const NONE: Defences = Defences { aggregate: false, corroborate: false, affinity: false, budget: false };
+    pub const ALL: Defences =
+        Defences { aggregate: true, corroborate: true, affinity: true, budget: true, refresh: true };
+    pub const NONE: Defences =
+        Defences { aggregate: false, corroborate: false, affinity: false, budget: false, refresh: false };
     /// What the simulator showed helps without costing elsewhere.
     pub const DEFAULT: Defences = Defences { affinity: false, ..Defences::ALL };
 }
@@ -386,6 +422,7 @@ impl Default for Config {
             seed: 0x6d79_6365_6c21,
             defences: Defences::default(),
             affinity_step: AFFINITY_STEP,
+            retract_hold: RETRACT_HOLD,
         }
     }
 }
@@ -395,7 +432,8 @@ impl Config {
     /// `every` (ms), `far` (periods), `hops`, `greet` (own, near, all), `fisheye`
     /// and `reduction` (on, off); the defences ([`Defences`]) all at once,
     /// `defences` (all, default, none), or one by one: `aggregate`, `corroborate`,
-    /// `affinity`, `budget` (on, off); `affinity_step` (percent).
+    /// `affinity`, `budget`, `refresh` (on, off); `affinity_step` (percent);
+    /// `hold` (ms, Babel's hold time after a retraction).
     pub fn tune(&mut self, s: &str) -> Result<(), String> {
         let on = |kv: &str, v: &str| match v {
             "on" => Ok(true),
@@ -421,6 +459,8 @@ impl Config {
                 ("affinity", v) => self.defences.affinity = on(kv, v)?,
                 ("affinity_step", v) => self.affinity_step = v.parse().map_err(|_| format!("{kv}: not a number"))?,
                 ("budget", v) => self.defences.budget = on(kv, v)?,
+                ("refresh", v) => self.defences.refresh = on(kv, v)?,
+                ("hold", n) => self.retract_hold = n.parse().map_err(|e| format!("{kv}: {e}"))?,
                 _ => return Err(format!("{kv}: unknown knob")),
             }
         }
@@ -573,6 +613,9 @@ pub struct Stats {
     /// Next hops avoided for every destination after suspicions for
     /// several ([`Defences::aggregate`]).
     pub hops_shunned: u64,
+    /// Neighbours whose routes kept expiring, held down
+    /// ([`Defences::refresh`]).
+    pub hops_stale: u64,
     /// Relayed announcements that waited for their hop's control budget
     /// ([`Defences::budget`]), and those dropped from a full queue or
     /// replaced there by a newer one.
@@ -599,6 +642,9 @@ pub struct Stats {
     pub dropped_budget: u64,
     pub dropped_ttl: u64,
     pub dropped_no_route: u64,
+    /// Frames for an origin whose route we just retracted, not sent along
+    /// the default route or the internet meanwhile (Babel's hold time).
+    pub dropped_unreachable: u64,
     pub dropped_queue: u64,
     pub dropped_too_big: u64,
     pub dropped_not_relaying: u64,
@@ -724,6 +770,9 @@ struct Origin {
     /// Last announcement heard; the entry (and its feasibility distance)
     /// outlives its routes until [`Router::gc_after`], as in Babel.
     seen: Time,
+    /// We retracted it: until then no packet for it takes the default route
+    /// ([`RETRACT_HOLD`]).
+    unreachable_until: Time,
 }
 
 impl Origin {
@@ -828,6 +877,11 @@ pub struct Router {
     /// ... and the hop each destination last acknowledged through, and
     /// when (evidence it was alive while another hop was silent).
     acked_via: Map<SignPk, (SignPk, Time)>,
+    /// Neighbours through which our cheapest route to an origin expired:
+    /// (origin, when) ([`Defences::refresh`]) ...
+    expired_via: Map<SignPk, Vec<(SignPk, Time)>>,
+    /// ... and those held down for it, until when.
+    stale: Map<SignPk, Time>,
     /// Neighbours' distance from us in our spaces' membership graph
     /// ([`Router::set_affinity`]).
     affinity: Map<SignPk, u8>,
@@ -907,6 +961,8 @@ impl Router {
             shunned: Map::default(),
             vouched: Map::default(),
             acked_via: Map::default(),
+            expired_via: Map::default(),
+            stale: Map::default(),
             affinity: Map::default(),
             ctl_waiting: Vec::new(),
             own: None,
@@ -1402,6 +1458,7 @@ impl Router {
             last_req: None,
             req_forwarded: (0, 0),
             seen: now,
+            unreachable_until: 0,
         });
         o.seen = now;
         if seq > o.newest {
@@ -1496,6 +1553,9 @@ impl Router {
         let Some(o) = self.origins.get_mut(&origin) else { return };
         if o.fd.is_some() && !o.retracted {
             o.retracted = true;
+            // Babel's hold time: neighbours may route through us until
+            // the retraction reaches them
+            o.unreachable_until = now + self.cfg.retract_hold;
             let mut a = o.latest.clone();
             a.cost = INFINITY;
             for t in &targets {
@@ -1728,7 +1788,45 @@ impl Router {
         {
             r = r.max(incumbent + 1);
         }
+        if self.is_stale(n, &o.latest.origin, now) {
+            r += STALE_RANK;
+        }
         r
+    }
+
+    /// [`Defences::refresh`]: routes through `n` keep expiring, so they rank
+    /// behind every route through a neighbour whose routes don't (never the
+    /// route to `n` itself: its own announcements are signed by it).
+    fn is_stale(&self, n: &SignPk, origin: &SignPk, now: Time) -> bool {
+        self.cfg.defences.refresh && n != origin && self.stale.get(n).is_some_and(|t| now < *t)
+    }
+
+    /// [`Defences::refresh`]: our cheapest route to `origin` expired through
+    /// `n` (its hop up, the route never retracted): one more origin whose
+    /// route it stopped refreshing. Enough of them, and its routes rank last
+    /// for [`STALE_HOLD`]. Only the cheapest route counts: a route we didn't
+    /// use can lapse for honest reasons (a neighbour that heard the newest
+    /// seqno from us doesn't send it back).
+    fn route_expired(&mut self, n: SignPk, origin: SignPk, now: Time) {
+        if !self.cfg.defences.refresh {
+            return;
+        }
+        let mut v = self.expired_via.remove(&n).unwrap_or_default();
+        v.retain(|(k, t)| *k != origin && now.saturating_sub(*t) < SUSPECT_FOR);
+        if v.len() >= STALE_EVIDENCE {
+            v.remove(0);
+        }
+        v.push((origin, now));
+        let enough = v.len() >= STALE_MIN;
+        bounded_insert(&mut self.expired_via, n, v);
+        if enough {
+            if self.stale.get(&n).is_none_or(|t| now >= *t) {
+                self.stats.hops_stale += 1;
+                self.touch_all();
+            }
+            bounded_insert(&mut self.stale, n, now + STALE_HOLD);
+            self.next_sweep = self.next_sweep.min(now + STALE_HOLD);
+        }
     }
 
     /// `cost` through next hop `n`, costlier the farther `n` is from our
@@ -2325,11 +2423,21 @@ impl Router {
         if let Some((n, _)) = unsuspected.or_else(|| self.best_route_except(target, from, now)) {
             return Next::Via(n);
         }
+        // Babel's hold time (RFC 8966 §3.5.4): we just retracted our route
+        // to it, and a neighbour that hasn't heard yet may route it back
+        // through us: not along the default route, nor (for others) over the
+        // internet to gateways that may be those neighbours' (packets, not
+        // custody: a bundle waits for its next hop, it doesn't loop)
+        let held = avoid && self.origins.get(target).is_some_and(|o| now < o.unreachable_until);
         let from_internet = from.is_some_and(|f| self.is_internet_hop(f));
         if self.internet {
             // 3. over the internet: never internet → internet for others,
             // and mesh → internet only as a gateway
             if from_internet || (from.is_some() && !self.cfg.gateway) {
+                return Next::Drop;
+            }
+            if held && from.is_some() {
+                self.stats.dropped_unreachable += 1;
                 return Next::Drop;
             }
             if self.nbs.get(target).is_some_and(|n| n.direct) {
@@ -2370,6 +2478,10 @@ impl Router {
         } else {
             // 4. no internet: the default route, to the gateway with the
             // lowest total cost
+            if held {
+                self.stats.dropped_unreachable += 1;
+                return Next::Drop;
+            }
             let first = self
                 .gateway_routes_cached(now)
                 .iter()
@@ -2598,6 +2710,38 @@ impl Router {
             let fisheye = self.cfg.fisheye;
             let far_every = self.cfg.far_every.max(1);
             let mut next = Time::MAX;
+            // [`Defences::refresh`]: the cheapest route that was usable until
+            // its age ran out (feasible, a recent seqno, its hop up), if that
+            // age is running out now
+            let mut lapsed: Vec<(SignPk, SignPk)> = Vec::new();
+            if self.cfg.defences.refresh {
+                for (k, o) in &self.origins {
+                    let age_out = |v: &Via| {
+                        let scale = if fisheye && v.hops > NEAR_SCOPE { far_every } else { 1 };
+                        now.saturating_sub(v.at) >= timeout * scale
+                    };
+                    if !o.via.iter().any(|(_, v)| age_out(v)) {
+                        continue;
+                    }
+                    let k_seq = |v: &Via| self.scale(v.hops);
+                    let cheapest = o
+                        .via
+                        .iter()
+                        .filter(|(n, v)| {
+                            o.feasible(v)
+                                && v.seq + self.cfg.announce_every * 3 * k_seq(v) >= o.newest
+                                && self.nbs.get(n).is_some_and(|n| n.up && n.direct)
+                        })
+                        .min_by_key(|(n, v)| (v.cost, n.0));
+                    if let Some((n, v)) = cheapest
+                        && age_out(v)
+                        && n != k
+                    {
+                        lapsed.push((*n, *k));
+                    }
+                }
+                lapsed.sort();
+            }
             for (k, o) in self.origins.iter_mut() {
                 let before = o.via.len();
                 o.via.retain(|(_, v)| {
@@ -2614,6 +2758,9 @@ impl Router {
                 }
             }
             self.next_expiry = next;
+            for (n, origin) in lapsed {
+                self.route_expired(n, origin, now);
+            }
             silent.sort();
             for k in silent {
                 self.touch(k);
@@ -2698,6 +2845,15 @@ impl Router {
             !v.is_empty()
         });
         self.acked_via.retain(|_, (_, at)| now.saturating_sub(*at) < SUSPECT_FOR);
+        let stale = self.stale.len();
+        self.stale.retain(|_, t| now < *t);
+        if self.stale.len() != stale {
+            self.touch_all(); // its routes rank as their cost again
+        }
+        self.expired_via.retain(|_, v| {
+            v.retain(|(_, t)| now.saturating_sub(*t) < SUSPECT_FOR);
+            !v.is_empty()
+        });
         // a long-quiet peer starts again from the minimum backoff
         self.backoff.retain(|_, (at, _)| now < *at + DIAL_BACKOFF_MAX);
         let mut next = Time::MAX;
@@ -2709,6 +2865,7 @@ impl Router {
         next = self.distrusted.values().copied().fold(next, Time::min);
         next = self.suspects.values().flatten().map(|(_, t)| *t).fold(next, Time::min);
         next = self.shunned.values().copied().fold(next, Time::min);
+        next = self.stale.values().copied().fold(next, Time::min);
         next = self.backoff.values().map(|(at, _)| at + DIAL_BACKOFF_MAX).fold(next, Time::min);
         next = self.nbs.values().filter(|n| n.internet()).map(|n| n.last_used + INTERNET_IDLE).fold(next, Time::min);
         self.next_sweep = next;
