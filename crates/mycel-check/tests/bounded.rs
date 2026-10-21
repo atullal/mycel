@@ -73,8 +73,7 @@ fn carrier_source_without_copies_is_not_told() {
 
 #[test]
 fn ble_holds_exhaustively() {
-    let mut m = BleModel::default();
-    m.budget = ble::Budget { steps: 1, fails: 1, drops: 0 };
+    let m = BleModel { budget: ble::Budget { steps: 1, fails: 1, drops: 0 }, ..BleModel::default() };
     let o = run("ble/pair (test)", &m.bound(), m, 2, BUDGET);
     assert!(o.violation.is_none() && !o.timed_out, "{o}\n{:?}", o.violation);
 }

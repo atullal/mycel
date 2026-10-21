@@ -8,7 +8,7 @@
 //! **Compiled out** without the `sim` feature: the macro is the constant
 //! `false`, the branch it guards is dead code, and no purpose string
 //! reaches the binary (`tests::compiled_out_of_default_builds` checks the
-//! test binary itself). With the feature, nothing fires until [`enable`].
+//! test binary itself). With the feature, nothing fires until `buggify::enable`.
 //! No release build turns the feature on.
 //!
 //! **When it fires.** As in FoundationDB, each site is active for a whole
@@ -123,7 +123,7 @@ mod tests {
     #[cfg(not(feature = "sim"))]
     #[test]
     fn compiled_out_of_default_builds() {
-        assert!(!buggify!("test: never"));
+        const { assert!(!buggify!("test: never")) };
         // No site's purpose string is in this binary, which links every
         // module of the crate (the needle is built at run time, so this
         // test's own source doesn't put it there).

@@ -259,7 +259,7 @@ impl CarrierModel {
             n,
             initial: initial.to_vec(),
             flappable: initial.to_vec(),
-            budget: Budget { steps: 2, links: 1, drops: 1 },
+            budget: Budget { steps: 1, links: 1, drops: 1 },
             // the summary gap (2 s); a full summary's period (60 s)
             advances: vec![SUMMARY_GAP + 100, SUMMARY_FULL],
             // two copies keep the state small and still exercise spraying

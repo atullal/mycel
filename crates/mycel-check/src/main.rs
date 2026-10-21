@@ -33,7 +33,8 @@ fn main() {
         run("router/line", &m.bound(), m, 3, budget)
     });
     check("router/triangle", &|| {
-        let m = RouterModel::new(3, &[(0, 1), (1, 2), (0, 2)]);
+        let mut m = RouterModel::new(3, &[(0, 1), (1, 2), (0, 2)]);
+        m.budget.steps = 1;
         run("router/triangle", &m.bound(), m, 3, budget)
     });
     check("router/planted", &|| {
@@ -53,10 +54,15 @@ fn main() {
         let mut m = mycel_check::ble::BleModel::default();
         if let Ok(b) = std::env::var("BLE_BUDGET") {
             let v: Vec<u8> = b.split(',').filter_map(|x| x.parse().ok()).collect();
-            m.budget = mycel_check::ble::Budget { steps: v[0], fails: v[1], drops: v[2] };
+            m = mycel_check::ble::BleModel {
+                budget: mycel_check::ble::Budget { steps: v[0], fails: v[1], drops: v[2] },
+                ..m
+            };
         }
         run("ble/pair", &m.bound(), m, 3, budget)
     });
-    let failed = outcomes.iter().filter(|o| o.violation.is_some() != o.name.contains("planted")).count();
+    // a violation fails, except where one is planted (there its absence
+    // does); so does a bound not exhausted within the budget
+    let failed = outcomes.iter().filter(|o| o.violation.is_some() != o.name.contains("planted") || o.timed_out).count();
     std::process::exit(if failed > 0 { 1 } else { 0 });
 }

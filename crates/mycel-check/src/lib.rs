@@ -5,13 +5,13 @@
 //! simulation-fidelity plan).
 //!
 //! - [`router`]: `mesh::core::Router`, Babel-style distance vector with
-//!   feasibility. Safety: no routing loop over any usable route, and the
+//!   feasibility. Invariants: no routing loop over any usable route, and the
 //!   feasibility condition with its inductive invariant.
-//! - [`carrier`]: `mesh::dtn::Carrier`, store-and-forward. Safety: a bundle
+//! - [`carrier`]: `mesh::dtn::Carrier`, store-and-forward. Invariant: a bundle
 //!   taken into custody is never lost. Liveness (checked as recovery from
 //!   every reachable state): the destination's receipt reaches the source.
 //! - [`ble`]: `mycel_link_ble::core::Core`, the BLE connection state
-//!   machine. Safety: both ends never route over different channels once
+//!   machine. Invariant: both ends never route over different channels once
 //!   settled. Liveness (recovery): a lost link is always re-established
 //!   while the peer advertises.
 //!

@@ -167,6 +167,17 @@ jobs:
       - name: Verdicts
         if: always()
         run: cat "$RUNNER_TEMP/sim/gate.md" >> "$GITHUB_STEP_SUMMARY" || true
+      # Bounded model checks (Stateright) of the routing core, the carrier
+      # and the BLE link core at their published bounds, 300 s each at most;
+      # a bound not exhausted in time fails too (docs/TESTING.md, "Model
+      # checking"). The planted-bug check must find its loop.
+      - name: Model checks
+        run: cargo run --locked --release -p mycel-check -- 300
+      # Swarm testing: 24 random subsets of world features and faults, the
+      # same every run, each checked against the invariants every
+      # configuration keeps (docs/SIMULATION.md §1, "Swarm testing").
+      - name: Swarm
+        run: cargo run --locked --release -p mycel-sim -- swarm --seed 1 --runs 24
 
   security:
     name: Security regressions

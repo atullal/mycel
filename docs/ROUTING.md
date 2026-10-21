@@ -747,7 +747,12 @@ know, and a version 2 bundle is never offered over a version 1 hop.
   get their copy through normal sync, since they are members.
 - **Receipts.** The destination signs a receipt (bundle id). Receipts
   spread among carriers like MaxProp's acks, and every carrier holding a
-  copy deletes it.
+  copy deletes it. That much is model-checked: from any state, once faults
+  stop, every copy is cleared (docs/TESTING.md, "Model checking"). A
+  source that handed on every copy is not necessarily told. If one
+  summary stream is lost while its connection lives, the receipt in it is
+  not resent until the next new contact, because summaries carry only
+  receipts learnt since the last summary.
 
 ## 8. Why not route globally over Bluetooth alone
 

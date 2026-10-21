@@ -131,6 +131,7 @@ committed.
 | `mycel-link-iface` | Interface classification (medium from type and name, software interfaces skipped, ordinary NICs left to IP), environment overrides, beacons; a sync over a real interface with IP off, one path per interface |
 | `mycel-kit-chat` | Author-only edits/deletes, reactions, receipts/unread, admin-only meta, garbage tolerance, thread merging (a late alias can't backdate messages; a message written at an alias's first-seen time sorts after that alias's older messages), alerts |
 | `mycel-rules(-abi)` | Deterministic WASM engine: fuel/memory limits, banned features, ABI violations, chat rules, wire compatibility with the chat kit, the fuel cost model pinned |
+| `mycel-check` | Bounded model checks of the router, the carrier and the BLE state machine (every state of small configurations: loop freedom, feasibility, custody, receipts clearing copies, relinking), the planted bug found, the known receipt counterexample still reachable (see "Model checking" below) |
 | `mycel-sim` | Every scenario at CI size, and the simulator's own models (`cargo test -p mycel-sim`) |
 | `mycel-host` | Log file privacy, notification privacy, deduplication, tap routing and permission handling |
 | Web (`npm test`) | SDK paging, search, presence and conversation identity; Messaging layout and swipe gestures; host notices and notification actions |
@@ -280,6 +281,108 @@ to about an hour (`sync_doc`); `mesh_wire` and `sync_change` are at about
 45. Short, by fuzzing standards, and short of the hour each the
 highest-risk targets were meant to get: the nightly CI runs (3 CPU-hours a
 night) are relied on for depth from here.
+
+## Model checking, fault injection and swarm testing
+
+Sampling (the simulator, the fuzzers) covers what it happens to reach.
+Three tools cover what it doesn't (work package WP20 of the simulation
+fidelity plan):
+
+**Bounded model checking** (`crates/mycel-check`, with
+[Stateright](https://docs.rs/stateright) 0.31). Stateright explores every
+interleaving of a small configuration and checks properties in every state
+it reaches. It runs the real state machines, not models of them: the mesh
+router (`mesh::core::Router`), the store-and-forward carrier
+(`mesh::dtn::Carrier`) and the BLE connection state machine
+(`mycel_link_ble::core::Core`). Their crates expose `Clone`, `Debug` and
+read-only views only under a `model` feature, which only `mycel-check`
+turns on. Stateright was chosen over the alternatives: Kani and other
+CBMC-based checkers prove properties of single functions, not
+interleavings of messages, and loom and shuttle explore thread schedules.
+A TLA+ spec would check a rewritten model, not the code.
+
+```sh
+cargo run --release -p mycel-check -- 300            # every check, 300 s budget each
+cargo run --release -p mycel-check -- 120 router/line # one
+cargo test -p mycel-check                             # small bounds, debug build
+```
+
+Each harness's world is as adversarial as the real one, or more:
+
+- **Router.** Datagrams may be lost, duplicated and reordered. Links go
+  down and come up, and hop costs change at one end. The clock jumps past
+  the router's own timers: rebroadcast jitter, seqno-request gap, greeting
+  gap, announcement period. The run starts from routes converged by a fair
+  run, because count-to-infinity loops start from converged routes.
+- **Carrier.** One bundle crosses three devices. Each exchange runs on its
+  own stream, so streams may be delivered in any order. Links drop, and a
+  stream can be lost while its connection lives. Next hops come from a
+  shortest-path oracle, because the router is checked separately.
+  Exploration branches off every state of the fault-free run.
+- **BLE.** The radio follows `src/sim.rs`'s model of two Macs. Connects
+  complete, fail or hang. Info reads and channel opens complete or fail.
+  The link can drop and the stack can close a channel.
+
+Properties and the bounds checked exhaustively (release build, 3 threads,
+the 18-core Mac; *budget* is how many of each fault and clock jump a path
+may contain):
+
+| Check | Properties (every reachable state) | Bound | States (unique) | Time |
+|---|---|---|---|---|
+| `router/line` | no loop over any usable route; Babel's feasibility condition; every advertised (seqno, cost) no better than its advertiser's feasibility distance | 3 devices in a line, warm; 2 clock jumps, 1 link change, 1 cost change, 1 loss | 8,472,637 (3,406,391) | 61 s |
+| `router/triangle` | the same | 3 devices in a triangle, warm; 1 clock jump, 1 link change, 1 cost change, 1 loss | TRI_STATES | TRI_TIME |
+| `router/planted` | the same, with `model_plant_infeasible` (every route treated as feasible) | as the triangle, 2 jumps | **violated**: a two-device loop, found after PLANT_STATES unique states | PLANT_TIME |
+| `carrier/line` | *custody*: until delivered, some carrier holds the bundle; *receipts clear every copy*: from every state, once faults stop and the links return, the bundle ends delivered and held by nobody (80 rounds of 2.1 s) | 3 devices in a line, from every state of the fault-free run; 1 clock jump, 1 link change, 1 lost stream | 3,160,689 (695,730) | 22 s |
+| `ble/pair` | Found and Lost alternate; the platform routes exactly what the core's table says, over an open channel end; *relinks*: from every state, once faults stop, both ends route over the two ends of one channel and no other channel is open (120 s of ticks) | 2 devices; 1 clock jump (1.5, 5 or 10 s), 1 failed or hung operation, 1 link drop or channel close | 14,213,194 (2,959,095) | 27 s |
+
+Larger bounds were explored without being exhausted (60–90 s each, nothing
+violated). Router: a triangle with 3 jumps, 2 link changes and a
+duplicate, 5.1 million states. Carrier: 3 jumps and a lost stream, 2.3
+million unique states. BLE: 2 jumps, 5.5 million unique states.
+Stateright proves properties only up to the bound: bugs that need many
+devices or long histories are the simulator's job.
+
+Model-checking findings:
+
+1. *A source that has handed on every copy is never told of the
+   receipt.* The plan stated the property as "every delivered bundle's
+   receipt eventually reaches the origin". The checker refuted it in
+   0.2 s: the destination's summary to the relay carries the receipt, that
+   one stream is lost at the receiver (a read timing out on a stalled
+   link), and the connection lives on. Summaries resend receipts only to a
+   new contact, so the relay never learns the receipt and never tells the
+   source. The design intends exactly this (docs/ROUTING.md §7.4: receipts
+   exist so carriers drop their copies), and every carrier that still
+   holds a copy does learn it. So the property was restated, and
+   `carrier_source_without_copies_is_not_told` keeps the counterexample
+   reachable. If the app ever shows "delivered" from receipts at the
+   source, this becomes a bug, and the fix is to resend receipts in full
+   summaries.
+2. Nothing else was violated at the bounds above. The planted bug was
+   found, so the checker can find a loop.
+
+**In-code fault injection** (`mycel-net/src/buggify.rs`, after
+FoundationDB's `BUGGIFY`). `buggify!("purpose")` marks a rare but legal
+path, and a simulation takes it now and then. There are six sites. In
+`pool.rs`, a dial fails spuriously and a connection is lost right after
+its handshake. In `mesh/mod.rs`, a hop's datagram queue is full, a summary
+stream fails to open, a summary stream is lost at the receiver (finding 1
+as a site), and the tick timer fires late. Without the `sim` feature each
+site is the constant `false`: `buggify::tests::compiled_out_of_default_builds`
+reads the test binary itself and finds no site string in it. With the
+feature, nothing fires until `buggify::enable(seed)`. Each site is then
+active for the run with probability 1/4 and fires on 1/4 of its
+evaluations, as in FoundationDB. Every draw is keyed by (seed, purpose,
+the site's own evaluation count) (`cargo test -p mycel-net --features sim
+--lib buggify`). Not done yet: sites in `mycel-sync` (it can't use
+`mycel-net`'s macro: the dependency points the other way) and in
+`link.rs` (its only I/O is the emulated medium, which injects faults
+already). Tier 1 doesn't enable injection yet, so no simulation run
+exercises the sites. Deterministic tier 1 (WP3) comes first.
+
+**Swarm testing** (`mycel-sim swarm`). Each run draws a random subset of
+world features and faults, and every failing run is minimised and pinned.
+See docs/SIMULATION.md §1.
 
 ## Voice calls
 

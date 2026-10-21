@@ -149,6 +149,31 @@ incremental build. On CI's 4-vCPU
 runner we estimate (not measured) about 3–6 minutes for the gate plus
 the release build; the job's limit is 45 minutes.
 
+**Swarm testing** (`mycel-sim swarm`, `tier2/swarm.rs`; Groce et al.,
+[ISSTA 2012](https://www.cs.utah.edu/~regehr/papers/swarm12.pdf)). The
+scenarios above each run one fixed configuration. The swarm runner instead
+draws, per run, a random subset of twelve world features and faults, each
+on with probability 1/2: internet gateways, Bluetooth-only devices,
+walking devices, churn, internet flaps, the store-and-forward carrier,
+fisheye off, flood reduction on, black holes, plausible liars, honest
+droppers, and a partition that splits off and rejoins a third of the
+devices. Random subsets find bugs that a run with everything on hides,
+because features suppress each other's failures (the paper's finding). Each
+run (about 60 phones, 40 messages, 7 minutes of virtual time) is checked
+against the invariants every configuration must keep: no packet loops
+back to a device it passed, no panic, nothing delivered that wasn't sent.
+Delivery is printed but not judged, since a configuration may make it
+impossible. A failing run is minimised by delta debugging over its
+features, removing one at a time until none can go (1-minimal), and
+printed as a `(seed, mask)` line for `swarm::PINNED`, which every run
+replays first. CI runs 24 fixed configurations (`--seed 1 --runs 24`).
+The nightly soak runs 200 fresh ones. Measured: `swarm --seed 1 --runs 24`
+took 16 s wall and 57 s of CPU (4 threads), 0.28 GB peak memory. All 24
+held, and nothing is pinned yet. In-code fault injection (`buggify!`) and
+bounded model checking of the router, the carrier and the BLE state machine
+are described in [TESTING.md](TESTING.md), "Model checking, fault injection
+and swarm testing".
+
 ## 2. Models and sources
 
 `crates/mycel-sim/src/models.rs` has every number and its source; summary:

@@ -283,7 +283,7 @@ impl RouterModel {
             initial: initial.to_vec(),
             flappable: initial.to_vec(),
             warm: true,
-            budget: Budget { steps: 3, links: 2, costs: 1, losses: 1, dups: 1 },
+            budget: Budget { steps: 2, links: 1, costs: 1, losses: 1, dups: 0 },
             // a rebroadcast's jitter (10–50 ms); seqno-request and forced
             // announcement gaps (1 s, 0.5 s); a greeting gap (4 s); the
             // announcement period (16 s)

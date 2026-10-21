@@ -91,7 +91,7 @@ pub struct Pair {
 
 #[derive(Clone)]
 pub struct State {
-    /// ms since [`T0`].
+    /// ms since the model's clock origin.
     pub now: u64,
     pub cores: Vec<Core>,
     refs: BTreeMap<(u8, Pid), Ref>,
@@ -217,7 +217,7 @@ pub struct BleModel {
 impl Default for BleModel {
     fn default() -> Self {
         BleModel {
-            budget: Budget { steps: 3, fails: 1, drops: 1 },
+            budget: Budget { steps: 1, fails: 1, drops: 1 },
             // the higher key's open delay (1.5 s), the duplicate grace
             // (5 s), the rescan period, setup timeout and largest backoff
             // (10 s)

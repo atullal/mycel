@@ -58,6 +58,14 @@ jobs:
           echo "base seed $BASE"
           cargo run --locked --release -p mycel-sim -- soak --seed "$BASE" --runs 20 --out "$RUNNER_TEMP/soak" \
             | tee "$RUNNER_TEMP/failing-seeds.txt"
+      # Swarm testing on fresh configurations: 200 random feature subsets
+      # from the same base; a failure prints its minimised subset to pin
+      # in crates/mycel-sim/src/tier2/swarm.rs (PINNED).
+      - name: Swarm
+        if: always()
+        env:
+          BASE: ${{ inputs.base || github.run_id }}
+        run: cargo run --locked --release -p mycel-sim -- swarm --seed "$BASE" --runs 200
       - name: Failing seeds
         if: always()
         run: |
