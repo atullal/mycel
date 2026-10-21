@@ -75,6 +75,54 @@ pub fn node(pk: &SignPk) -> NodeId {
     u32::from_be_bytes(pk.0[..4].try_into().expect("4 bytes")) - 1
 }
 
+/// Devices per space in [`spaces`].
+const SPACE: usize = 8;
+
+/// Who shares a space with whom, for relay affinity
+/// (`Router::set_affinity`: what the node pushes from its spaces'
+/// membership): each device's co-members. Every device is in two spaces of
+/// 8 (`SPACE`): one with devices near it (people near each other tend to
+/// share spaces: family, class, office) and one with devices anywhere. The
+/// core only uses it with `Defences::affinity` on (opt-in).
+/// Adversaries (`roles`) are in none: no member vouches for them
+/// (`MYCEL_SPACES=insiders` puts them in spaces like anyone, attack edges
+/// everywhere; `none` leaves everyone without spaces).
+pub fn spaces(specs: &[super::engine::NodeSpec], roles: &Map<NodeId, Role>, seed: u64) -> Vec<Vec<NodeId>> {
+    let mode = std::env::var("MYCEL_SPACES").unwrap_or_default();
+    let mut members: Vec<Vec<NodeId>> = vec![Vec::new(); specs.len()];
+    if mode == "none" {
+        return members;
+    }
+    let ids: Vec<NodeId> = (0..specs.len() as NodeId)
+        .filter(|i| mode == "insiders" || roles.get(i).is_none_or(|r| *r == Role::Honest))
+        .collect();
+    // near: by area, then 50 m cells
+    let mut near = ids.clone();
+    let cell = |i: &NodeId| {
+        let s = &specs[*i as usize];
+        (s.area, (s.xy.0 / 50.0).floor() as i64, (s.xy.1 / 50.0).floor() as i64, *i)
+    };
+    near.sort_by_key(cell);
+    // anywhere: a seeded shuffle
+    let mut rng = crate::stats::Rng::new(seed ^ 0x5bace5);
+    let mut far = ids;
+    for i in (1..far.len()).rev() {
+        far.swap(i, rng.below(i + 1));
+    }
+    for order in [near, far] {
+        for group in order.chunks(SPACE) {
+            for a in group {
+                members[*a as usize].extend(group.iter().filter(|b| *b != a));
+            }
+        }
+    }
+    for m in &mut members {
+        m.sort_unstable();
+        m.dedup();
+    }
+    members
+}
+
 #[derive(Clone, Debug)]
 pub enum Frame {
     Ann(Announce),

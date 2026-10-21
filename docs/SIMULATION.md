@@ -803,6 +803,42 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    6.43×, 86.0×, 8.01% and 4.49% (the gate's 10: 5.28×, 23.0×, 5.03%,
    3.61%).
 
+23. **Routing defences without a wire change, measured one by one**
+   (`docs/ROUTING.md` §6, item 15). Eight were built in the core. Each
+   was run alone, all eight together, and the kept set, on seeds 1–10 of
+   `adversarial` (half and full size, plus a fan-out workload), `churn`,
+   `global-scale`, `trace-replay` and `routing-convergence`. The harness
+   is `crates/mycel-sim/examples/ablation.rs` (GLOBAL core only, scaled
+   copies of the scenarios). Every run is in
+   `bench/results/routing-defences/per_seed.csv`. Seeds 11–20 were kept
+   apart for calibration. Kept on by default: cross-destination
+   aggregation, the corroboration hold-down and a 2% control budget per
+   hop. After the review fixes they take plausible liars at full size
+   from 83.8% to 86.9% (10 of 10 seeds), and at half size from 90.6% to
+   91.9% (8/1). Nothing else moved beyond the seeds' scatter. Opt-in:
+   trust-graph relay preference. It gives the largest gain (half size
+   95.7%, 9/1), but clean optimality p95 goes 5.35 → 6.08 on 9 of 10
+   seeds. Dropped: a randomised suspicion threshold, churn-conditioned
+   suspicion, hedging and smoothed costs (why: `docs/ROUTING.md`). The
+   simulator feeds the preference from a membership model
+   (`tier2::global::spaces`: two spaces of 8 per device, one local, one
+   anywhere; adversaries in none unless `MYCEL_SPACES=insiders`). The
+   review found, and fixed, a control budget that never limited a
+   greeting (it is sent before the hop is measured), shunning that sent
+   a seqno-request burst growing with history, a hold-down that a liar
+   could pass by waiting, and destinations going offline shunning an
+   honest relay. Each has a regression test in `mesh::core::tests`.
+
+24. **A seqno request's answer didn't set the feasibility distance.**
+   This is Babel's invariant (RFC 8966 §3.7.3) and the bug predates the
+   GLOBAL defences. A device could accept a costlier route that loops
+   through the neighbour it had just told the cheap one. It caused the
+   frame loops of full-size `adversarial` with plausible liars: with no
+   defences, 33 (seeds 3 and 4) and 134 in the fan-out before the fix,
+   0 over seeds 1–10 after it. Cost: delivery under liars with no
+   defences 87.0% → 83.8% (full size), as honest alternatives wait for a
+   fresh seqno. Test: `a_seqno_answer_sets_the_feasibility_distance`.
+
 ### Open findings
 
 1. **Bluetooth control traffic: what is left after fixed 14, 15 and 17.**
@@ -1021,6 +1057,9 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    0.1` 20 s, 0.26 GB. Per seed the numbers are identical to the runs
    before the cap (and to the first version's three strategies);
    `mycel-sim adversarial --seed 2`.
+   Over seeds 1–10 the GLOBAL core alone delivers 83.8% at full size
+   (fixed 24 lowered it from 87.0%); its default defences take that to
+   86.9% (ROUTING.md).
 16. **Today's liar makes its neighbourhood ask for seqnos millions of
    times a run.** The mechanism is open 15's: routes it claims at 1 hop
    expire on the near scope's schedule and come back only at the far
@@ -1039,6 +1078,21 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
    Repro: `mycel-sim liar-ceiling --scale 0.5` (12 s with the first
    version's three strategies; 105k–123k seqno requests per run of 150
    phones).
+
+17. **Packets can cycle among honest devices in `churn`.** The
+   frame-loop counter (a device seeing the same packet twice) is 0 in
+   `routing-convergence`, in the core's link-flap tests (including the
+   one with every defence at work), and, since fixed 24, in full-size
+   `adversarial` without defences. Two cases remain. `churn` at 1,000
+   devices, seed 3, counts 54 with no defences (as on `main`) and 90
+   with the default set. Full-size `adversarial`'s fan-out with the
+   default set counts 1 (seed 6). Not root-caused, and not the
+   seqno-answer bug: fixing it left churn at 54. The suspect is where a
+   feasible-route choice meets something outside Babel's feasibility
+   condition. For example, a hop without a route forwards along its
+   default route toward a gateway, while the next one still routes
+   toward the destination. Repro: `MYCEL_CORE=defences=none cargo run
+   --release -p mycel-sim --example ablation -- churn 3 0.1`.
 
 ## 5. Benchmarks against external baselines
 

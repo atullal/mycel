@@ -314,6 +314,8 @@ To run it: `head -c 1073741824 /dev/urandom > /tmp/big.bin; python3 scripts/net-
 | A dead route stops being used | `convergence_dead_route_stops_being_used` | 25 ms (retraction) |
 | A ring heals around a cut | `convergence_heals_around_a_ring_without_loops` | 0.6 s, 0 loops |
 | 60 link flaps, 30-device mesh, traffic | `churn_never_loops` | 0 frame loops, 0 route loops |
+| Every routing defence at work (§6 item 15 of `docs/ROUTING.md`): 3 plausible liars, feedback from what arrived, slow hops, 60 link cuts and repairs | `churn_never_loops_with_every_defence` | 0 frame loops, 0 route loops among honest devices; 5,660 of 7,200 delivered; 18 suspicions, 2 shuns, 885 deferred announcements, hold-down engaged (each asserted non-zero) |
+| A liar that waits before its cost drops; the destination in range; a seqno answer's feasibility distance; a greeting to an unmeasured hop; shunning's seqno requests | `a_sudden_uncorroborated_shortcut_…`, `a_seqno_answer_sets_the_feasibility_distance`, `a_greeting_to_an_unmeasured_hop_is_paced`, `shunning_asks_around_within_a_bound` | held from the drop; never held; set; 400 announcements, then 2% of the link; 32 requests, recent destinations only |
 | Gateway by total cost (far fast uplink beats near slow one) | `gateway_choice_by_total_cost` | ok |
 | BLE-only US (3 hops from its gateway) ↔ BLE-only EU, live sync | `tests/global.rs` | first sync 0.58 s; relays and gateways hold no space |
 | Test-tone call along that route | `mycel-call` `call_across_two_gateways_and_the_internet` | RTT 84 ms, ~137 ms mouth-to-ear, 0 % loss |

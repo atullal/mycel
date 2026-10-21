@@ -447,6 +447,25 @@ impl Inner {
         }
     }
 
+    /// Tell the mesh who shares a space with us: relays it prefers
+    /// (`Router::set_affinity`). Members of a space we are in are one step
+    /// away; we don't know other devices' spaces, so everyone else counts as
+    /// unknown. Nothing about it leaves this device. Nothing is built
+    /// unless the mesh uses it ([`MeshOptions::defences`]).
+    fn refresh_affinity(&self) {
+        let Some(mesh) = self.mesh.as_ref().filter(|m| m.uses_affinity()) else { return };
+        let me = self.keys.sign_pk();
+        let near: HashSet<SignPk> = self
+            .spaces
+            .lock()
+            .values()
+            .filter(|r| r.my_role().is_some())
+            .flat_map(|r| r.members().into_iter().map(|(k, _)| k.sign_pk))
+            .filter(|k| *k != me)
+            .collect();
+        mesh.set_affinity(near.into_iter().map(|k| (k, 1)));
+    }
+
     fn prepare(&self, r: &mut Replica) {
         if self.feed_validator.is_some() {
             r.set_feed_validator(self.feed_validator.clone());
@@ -1433,6 +1452,8 @@ async fn scheduler(inner: Arc<Inner>) {
             _ = tokio::time::sleep(wait.max(DEBOUNCE)) => {}
         }
         tokio::time::sleep(DEBOUNCE).await;
+        // membership may have changed (ours or another member's ops)
+        inner.refresh_affinity();
         let explicit: HashSet<SpaceId> = std::mem::take(&mut *inner.dirty.lock());
         let local: HashSet<SpaceId> = std::mem::take(&mut *inner.dirty_local.lock());
         let now = Instant::now();
@@ -1876,6 +1897,7 @@ impl Node {
         self.inner.prepare(&mut r);
         let id = r.space_id();
         self.inner.spaces.lock().insert(id, r);
+        self.inner.refresh_affinity();
         Ok((id, genesis))
     }
 
@@ -1884,6 +1906,7 @@ impl Node {
         self.inner.prepare(&mut r);
         let id = r.space_id();
         self.inner.spaces.lock().entry(id).or_insert(r);
+        self.inner.refresh_affinity();
         Ok(id)
     }
 
@@ -1892,6 +1915,7 @@ impl Node {
         self.inner.prepare(&mut r);
         let id = r.space_id();
         self.inner.spaces.lock().insert(id, r);
+        self.inner.refresh_affinity();
         id
     }
 

@@ -198,6 +198,9 @@ pub struct MeshOptions {
     /// advertised to neighbours (a node sets it from its own
     /// `NodeOptions::protocol`).
     pub protocol: Protocol,
+    /// Routing defences that need no wire change ([`core::Defences`]; the
+    /// trust-graph relay preference is off by default).
+    pub defences: core::Defences,
 }
 
 impl Default for MeshOptions {
@@ -218,6 +221,7 @@ impl Default for MeshOptions {
             store_and_forward: Some(dtn::DtnConfig::default()),
             max_neighbours: 6,
             protocol: Protocol::default(),
+            defences: c.defences,
         }
     }
 }
@@ -234,6 +238,7 @@ impl MeshOptions {
             gateway: self.gateway,
             gateway_rate: self.gateway_rate,
             gateways: self.gateways,
+            defences: self.defences,
             seed: mycel_crypto::random_u64(),
             ..Config::default()
         }
@@ -1692,6 +1697,29 @@ impl Mesh {
     /// measuring it (tests; a metered or satellite uplink).
     pub fn set_uplink(&self, units: Option<u32>) {
         *self.d.uplink.lock() = units;
+    }
+
+    /// How far devices are from us in our spaces' membership graph (1: a
+    /// member of a space we are in): routes through relays farther away, or
+    /// not listed, rank costlier (`Router::set_affinity`). Nothing about it
+    /// is sent.
+    pub fn set_affinity(&self, table: impl IntoIterator<Item = (SignPk, u8)>) {
+        self.d.with_router(|r, now| {
+            if r.set_affinity(table) {
+                r.tick(now); // the routes we offer may change
+            }
+        });
+    }
+
+    /// Whether routes are ranked by [`Mesh::set_affinity`]'s table
+    /// ([`MeshOptions::defences`]); if not, there is no need to build it.
+    pub fn uses_affinity(&self) -> bool {
+        self.d.router.lock().config().defences.affinity
+    }
+
+    /// `peer`'s distance as [`Mesh::set_affinity`] last set it.
+    pub fn affinity(&self, peer: &SignPk) -> Option<u8> {
+        self.d.router.lock().affinity(peer)
     }
 
     /// Tests: see every payload this device relays for others.

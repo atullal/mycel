@@ -405,6 +405,7 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
             let shared = Rc::new(Shared::default());
             let sh = shared.clone();
             let droppers: Vec<NodeId> = plan.roles.iter().filter(|(_, r)| r.drops()).map(|(i, _)| *i).collect();
+            let spaces = crate::tier2::global::spaces(&w.specs, &plan.roles, seed);
             go(
                 w,
                 plan,
@@ -419,6 +420,7 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                         r.bundle_lifetime_ms = plan.bundle_lifetime_ms.unwrap_or(24 * 3600 * 1000);
                     }
                     r.role = plan.role(i);
+                    r.core.set_affinity(spaces[i as usize].iter().map(|j| (key(*j), 1)));
                     r
                 },
                 move |sim| {
@@ -433,6 +435,8 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                         t.announcements_implausible += s.announcements_implausible;
                         t.neighbours_distrusted += s.neighbours_distrusted;
                         t.hops_suspected += s.hops_suspected;
+                        t.hops_shunned += s.hops_shunned;
+                        t.announcements_deferred += s.announcements_deferred;
                         t.retractions_sent += s.retractions_sent;
                         t.seqreqs_sent += s.seqreqs_sent;
                         t.infeasible += s.infeasible;
@@ -472,6 +476,7 @@ pub fn run(model: Model, w: &World, plan: &Plan, seed: u64, until: Time, sample:
                            "announcements_received": t.announcements_received, "announcements_limited": t.announcements_limited,
                            "announcements_stale": t.announcements_stale, "announcements_suppressed": t.announcements_suppressed,
                            "announcements_implausible": t.announcements_implausible, "neighbours_distrusted": t.neighbours_distrusted, "hops_suspected": t.hops_suspected,
+                           "hops_shunned": t.hops_shunned, "announcements_deferred": t.announcements_deferred,
                            "retractions_sent": t.retractions_sent, "seqreqs_sent": t.seqreqs_sent, "infeasible": t.infeasible,
                            "dropped_no_route": t.dropped_no_route, "dropped_pending": t.dropped_pending, "dropped_ttl": t.dropped_ttl,
                            "dials": t.dials, "resolves": t.resolves, "gateway_out": t.gateway_out,
