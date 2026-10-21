@@ -11,6 +11,7 @@
 		04DC1C534DE8D56CC5AA2DC6 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3781B1EEFDD85EE7ADFA2A94 /* Metal.framework */; };
 		1C5BC3DFC3598C613F68CFB1 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 456310891DC9817B03F81E18 /* main.mm */; };
 		22942AA51F1A7C6E2D9D79F5 /* CoreAudio.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EDCC05E921083F3A6DECDDE0 /* CoreAudio.framework */; };
+		23E0D226AB96F972F1CAB901 /* BackgroundTasks.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C0F65386E45AADA3606048F4 /* BackgroundTasks.framework */; };
 		26A61013D64DCDC6F8850CF8 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C302A7387C1635AFA6B0089F /* QuartzCore.framework */; };
 		26C3B8E35679824BE64FBFF1 /* AudioToolbox.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 490F4E0794B72DF85E5C0D13 /* AudioToolbox.framework */; };
 		29426F89DE0158041CC30213 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5A349B4824C84E56ABB96DEF /* UIKit.framework */; };
@@ -37,6 +38,7 @@
 		140E1446C2A0F30FBAB5FEAF /* VideoToolbox.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = VideoToolbox.framework; path = System/Library/Frameworks/VideoToolbox.framework; sourceTree = SDKROOT; };
 		2204F13D38537B628284E8EB /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
 		25619DBB3DECB15CF1D8AE39 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		284602B5C8581F6DA03F6232 /* background.rs */ = {isa = PBXFileReference; path = background.rs; sourceTree = "<group>"; };
 		295924B2D0781FC5A55540A7 /* CoreVideo.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreVideo.framework; path = System/Library/Frameworks/CoreVideo.framework; sourceTree = SDKROOT; };
 		3555E2C7BAB07835BBE13FBF /* notify.rs */ = {isa = PBXFileReference; path = notify.rs; sourceTree = "<group>"; };
 		3781B1EEFDD85EE7ADFA2A94 /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
@@ -57,9 +59,11 @@
 		AB39F84949BAF13ABCFBBBC1 /* CoreMedia.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreMedia.framework; path = System/Library/Frameworks/CoreMedia.framework; sourceTree = SDKROOT; };
 		B81AFB5AF7FDD0E5767D6800 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		BCB5A42EA6A0A31A5D1F76FA /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		C0F65386E45AADA3606048F4 /* BackgroundTasks.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = BackgroundTasks.framework; path = System/Library/Frameworks/BackgroundTasks.framework; sourceTree = SDKROOT; };
 		C302A7387C1635AFA6B0089F /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		D864E3D2A0B6634BB0535B60 /* CoreBluetooth.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreBluetooth.framework; path = System/Library/Frameworks/CoreBluetooth.framework; sourceTree = SDKROOT; };
 		E3410D8570D2354B50546AE0 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
+		E5B5BE696801712711846F19 /* android.rs */ = {isa = PBXFileReference; path = android.rs; sourceTree = "<group>"; };
 		EDCC05E921083F3A6DECDDE0 /* CoreAudio.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreAudio.framework; path = System/Library/Frameworks/CoreAudio.framework; sourceTree = SDKROOT; };
 		F28713F927B873D3AFF06791 /* mycel-host_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "mycel-host_iOS.entitlements"; sourceTree = "<group>"; };
 		FDC4E509A7735B5C449D2BDE /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
@@ -82,6 +86,7 @@
 				22942AA51F1A7C6E2D9D79F5 /* CoreAudio.framework in Frameworks */,
 				B64EC3162C52762530942CA3 /* Network.framework in Frameworks */,
 				41450B1FED51FA1AE16ED509 /* CoreBluetooth.framework in Frameworks */,
+				23E0D226AB96F972F1CAB901 /* BackgroundTasks.framework in Frameworks */,
 				7158F7D9A0E3175227D5F9C2 /* CoreMedia.framework in Frameworks */,
 				8B3907D2367E80EF0C53B047 /* CoreVideo.framework in Frameworks */,
 				942E1DC59B2DFA7565233AB2 /* VideoToolbox.framework in Frameworks */,
@@ -104,6 +109,8 @@
 		04EA44AF9A9810F0F41FD792 /* src */ = {
 			isa = PBXGroup;
 			children = (
+				E5B5BE696801712711846F19 /* android.rs */,
+				284602B5C8581F6DA03F6232 /* background.rs */,
 				8F7354FFAC6516F993507ACA /* commands.rs */,
 				53A6196748E3ECE412ED67DB /* lib.rs */,
 				4C30C1CA7EE81CFD176CEB19 /* main.rs */,
@@ -144,6 +151,7 @@
 			children = (
 				490F4E0794B72DF85E5C0D13 /* AudioToolbox.framework */,
 				679763AB647C60B15B6FDD93 /* AVFoundation.framework */,
+				C0F65386E45AADA3606048F4 /* BackgroundTasks.framework */,
 				EDCC05E921083F3A6DECDDE0 /* CoreAudio.framework */,
 				D864E3D2A0B6634BB0535B60 /* CoreBluetooth.framework */,
 				FDC4E509A7735B5C449D2BDE /* CoreGraphics.framework */,

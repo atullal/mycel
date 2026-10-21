@@ -85,7 +85,7 @@ pub fn device_links(me: SignPk, name: &str) -> Vec<Arc<dyn Link>> {
         links.push(mycel_link_awdl::link(me, name));
     }
     if on.contains(&"ble") {
-        links.push(mycel_link_ble::link(me, name));
+        links.push(mycel_link_ble::link(me));
     }
     if on.contains(&"wifidirect") {
         links.push(mycel_link_iface::link_with_wifi_direct(me, name, ip));

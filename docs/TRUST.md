@@ -24,6 +24,7 @@ strings), unchanged by wire version 2; how they would change is in
 - **A removed member keeps what they already decrypted,** and can read content that partitioned peers keep encrypting under an old epoch before they learn of the removal.
 - **Metadata is visible to keepers:** membership public keys, envelope authors, sizes and timing.
 - **Availability:** keepers can withhold data. Mitigation is multiple keepers. Withholding cannot be detected.
+- **Phones that are asleep:** with no push server, a suspended iPhone receives nothing until iOS lends Mycel time or it is opened ("slow mode"). An optional wake relay is designed, not built (§8e).
 - **Forward secrecy within an epoch:** not provided. Only post-compromise security on rotation.
 - **A compromised device** can act as its member until removed.
 
@@ -210,6 +211,7 @@ A relay forwards QUIC packets of a connection between two other devices.
 **Limits (known):**
 - No onion routing or padding: relays see endpoints, sizes and timing. Hiding who-talks-to-whom would need onion-style layered encryption and cover traffic, at a large bandwidth cost on Bluetooth.
 - Sybil devices nearby can each be a neighbour (each is rate-limited separately); the radio's range is the practical bound.
+- **Bluetooth shows the device key to anyone in range.** The link has no pairing and the L2CAP channel isn't encrypted. The readable GATT characteristic carries the L2CAP PSM and the device's long-term key, and the first frame on a channel (the hello) carries the key again, to whichever device opened or accepted it. Neither carries the display name any more (the hello's name field is always empty; older builds still send one): a nearby device learns the name from the signed contact card, fetched inside the encrypted QUIC session, which a stranger can still do once it has a channel. So a nearby attacker scanning for Mycel's service can recognise a device by its key (passive), and one advertising the service can get the key from a channel and the name from the card (active). How long a device is exposed: computers whenever Mycel runs; iPhones and iPads while Mycel is open. In the background an iPhone keeps scanning and dialing (the `bluetooth-central` background mode) but **links only with known devices**: contacts and members of its conversations (`Runtime::set_background`, `mycel-link-ble`'s restricted mode). It still connects to an unknown advertiser long enough to read its GATT key (that read reveals nothing about the iPhone but its rotating Bluetooth address), then hangs up and doesn't dial it again; a channel a stranger opens to it is closed at the stranger's hello. `bluetooth-peripheral` is deliberately not declared, so a locked iPhone neither advertises nor serves the characteristic. Residual: an attacker who knows the key of one of the victim's contacts (read passively from that contact's Mac, say) can advertise that key and receive the iPhone's key in its hello before QUIC's handshake fails; that tracks a targeted victim, not every passer-by. Android has no Bluetooth link yet. The fix for all of it, rotating tokens in place of the key and identity only inside an encrypted handshake, is not built.
 
 ## 8c. Gateways, records and carriers (global routing, store-and-forward)
 
@@ -275,6 +277,54 @@ Bluetooth still completes. Code: `crates/mycel-net/src/resources.rs` and
   declined, so a flood displaces its own requests first.
 - **Attachments:** see §7b. Concurrent transfers reserve disk space from one
   shared account, so they can't each count the same free space.
+
+## 8e. Optional wake relay (designed, not built)
+
+**Not built, and off by default if it ever is.** Design:
+[WAKE_RELAY.md](WAKE_RELAY.md). It would let a contact wake a suspended
+iPhone through Apple's push service, which needs a server holding the app
+developer's APNs key. It is the only place Mycel's design would admit an
+operator, so its trust is fixed here before any code:
+
+- **Trusted for availability only.** It can drop, delay, replay or reorder
+  wakes, or stop running; the device then stays in slow mode. It is never
+  trusted for confidentiality or integrity: it relays no content and holds
+  no key that decrypts any, and envelopes are checked by the trust layer as
+  always.
+- **Content-blind.** A wake is a capability ID plus a fixed-size HPKE blob
+  (RFC 9180 PSK mode, X25519 / HKDF-SHA256 / ChaCha20-Poly1305) sealed to
+  that capability's own wake key with that capability's own 32-byte random
+  PSK, both separate from the device's Mycel keys and from every other
+  capability's. The blob holds only a timestamp and a
+  fetch hint the extension doesn't trust; the content comes over Mycel's
+  own paths.
+- **Identity-blind.** The relay sees a push token and random registration
+  and capability IDs, never Mycel identity keys. Wakes reach it through a
+  one-hop proxy or Oblivious HTTP (RFC 9458), so it doesn't see senders'
+  addresses.
+- **Unlinkable, revocable capabilities.** Each contact gets its own
+  capability (a random ID and its own wake key) over the end-to-end
+  channel; two capabilities share nothing but the relay's URL, so contacts
+  can't link theirs to others'; the device can revoke any; the relay
+  rate-limits each.
+- **Wakes are attributed by capability, never by their contents.** HPKE's
+  PSK mode lets the device check that the sender held the capability's
+  PSK, so a wake proves only "from whoever holds this capability", which
+  the device gave to exactly one contact. The assumption, stated: the PSK
+  stays secret between the device and that contact (it travels only end to
+  end and lives only in their keychains); the wake public key needs no
+  secrecy. Abuse is counted and revoked per capability ID: a malicious
+  contact can burn only its own, never forge one that passes for another
+  contact's. The relay can't forge wakes (it never sees a PSK), only drop
+  or replay them.
+- **What it learns:** a push token (which Apple can tie to an Apple ID),
+  how many capabilities a registration has, and when each fires. Timing is
+  the residual leak, shared with Apple; random delay, coalescing and cover
+  wakes reduce it but can't hide it from Apple.
+- **Who can run one:** only the holder of a build's APNs key can send pushes
+  for it, so "self-hosted" means per build. Android needs no relay: the
+  same capability can be a UnifiedPush endpoint at a distributor the user
+  chose (also only designed).
 
 ## 9. Code and tests
 
@@ -383,3 +433,7 @@ What this layer does **not** do:
   Accepted members' history and attachments have no cumulative storage
   quota, and a process killed mid-push can leave staging files behind.
 - **Forks before a cutoff** are tolerated but not shown in the UI.
+- **No timely delivery to a suspended iPhone.** Without a push server, iOS
+  wakes Mycel only on its own schedule (background refresh, Bluetooth
+  events) or when it's opened; the wake relay that would change that is a
+  design only (§8e).

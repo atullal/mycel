@@ -49,6 +49,17 @@ The first public version. It contains:
 - **SDK and CLI:** `@mycel/sdk` (TypeScript client, Tauri/HTTP/mock
   transports, React hooks) and the `mycel` CLI (`serve`, `keeper`, `id`,
   `call`).
+- **Phones in the background:** Android restarts its `connectedDevice`
+  foreground service after a reboot, an update or being killed, with a
+  WorkManager catch-up as a backstop, and explains before asking to be let
+  off battery optimisation; iPhone and iPad catch up through
+  `BGTaskScheduler` and keep reaching nearby Bluetooth devices that
+  advertise Mycel in the background, known devices only, with state
+  restoration ("slow mode", said so in the app). A catch-up syncs every
+  conversation at once, so a sleeping member costs one connect timeout,
+  not one per conversation. A locked iPhone doesn't advertise, and neither
+  the Bluetooth characteristic nor the channel's hello carries the display
+  name any more.
 - **Simulator and benchmarks:** `mycel-sim`, with real nodes over emulated
   radios and up to 10,000+ virtual devices in virtual time, and replays
   against The ONE's routers on real contact traces.
@@ -59,8 +70,12 @@ The first public version. It contains:
 - Peer-to-peer Wi-Fi, and Bluetooth and Wi-Fi Direct on Linux, are tested
   on emulated links, not between real devices. Windows and Linux apps have
   run on CI machines only, Android on the emulator only.
-- A suspended iPhone or iPad doesn't receive messages until Mycel is opened
-  again.
+- A suspended iPhone or iPad runs in slow mode (background refresh and
+  Bluetooth catch-ups): new messages may wait until Mycel is opened. The
+  optional wake relay is a design only (docs/WAKE_RELAY.md).
+- Bluetooth shows a device's key to anyone in range who scans for Mycel,
+  and to devices it opens a channel with (in the background, an iPhone only
+  links with known devices); see TRUST.md §8b.
 - Devices in a space should run builds with the same chat rules (they are
   built in). The `dev-2026-10-09-apps` release speaks the same wire format
   (version 1) and passed a basic cross-build check, but validates some data

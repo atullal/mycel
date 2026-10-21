@@ -36,6 +36,9 @@ class MainActivity : TauriActivity() {
     // No scrim behind 3-button navigation: the page's own bar runs under it.
     enableEdgeToEdge(navigationBarStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT))
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) window.isNavigationBarContrastEnforced = false
+    // A runtime started in the background (after a reboot, say) shares an
+    // Android context with Rust libraries; Tauri's setup takes over now.
+    MycelRuntime.handOverContext()
     super.onCreate(savedInstanceState)
     // Notifications for new messages and calls (Android 13+ asks), then stay
     // connected in the background.
@@ -44,7 +47,10 @@ class MainActivity : TauriActivity() {
     ) {
       requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS)) {}
     }
-    ContextCompat.startForegroundService(this, Intent(this, MycelService::class.java))
+    ContextCompat.startForegroundService(
+      this, Intent(this, MycelService::class.java).putExtra(MycelService.EXTRA_FROM_APP, true))
+    // The backstop for phones that stop the service anyway.
+    CatchUpWorker.schedule(this)
     // Reopened after being swiped away: the app (and runtime) kept running;
     // Rust gives this activity a window (src/lib.rs).
     onActivityReady()

@@ -36,7 +36,9 @@ serde_json = "1"
 # only, which breaks Iroh's `netwatch` and `netdev` on iOS. Stay below it until
 # they stop relying on those items there.
 libc = ">=0.2.189, <0.2.190"
-tokio = { version = "1", features = ["sync"] }
+# Background catch-ups (background.rs) bound their time and watch for the OS
+# taking it back.
+tokio = { version = "1", features = ["sync", "time", "macros"] }
 
 # The device's name for a new profile, and the share sheet for attachments.
 [target.'cfg(target_os = "ios")'.dependencies]
@@ -59,6 +61,9 @@ webkit2gtk = { version = "2", features = ["v2_40"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "test-util"] }
 
 [lints]
 workspace = true

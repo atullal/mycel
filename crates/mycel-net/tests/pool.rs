@@ -148,3 +148,49 @@ async fn concurrent_exchanges_on_one_connection_all_complete() {
     alice.shutdown().await.unwrap();
     bob.shutdown().await.unwrap();
 }
+
+/// Regression: a phone's background catch-up synced conversations one after
+/// another, and every conversation with a sleeping member waited out a
+/// connect timeout before the next began; concurrent syncs to that member
+/// then queued behind one another's dials. A 25 s iOS refresh reached about
+/// three conversations. Now everything starts at once and a failed dial
+/// answers every sync waiting for it: one sleeping member in six
+/// conversations costs about one connect timeout in all, and a reachable
+/// member in the last conversation still gets the news.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sleeping_member_costs_one_connect_timeout_not_one_per_conversation() {
+    let alice = node(Arc::new(DeviceKeys::generate()), "alice", 0).await;
+    let bob = node(Arc::new(DeviceKeys::generate()), "bob", 0).await;
+    let asleep = node(Arc::new(DeviceKeys::generate()), "asleep", 0).await;
+    alice.add_peer_addr(bob.addr());
+    bob.add_peer_addr(alice.addr());
+    alice.add_peer_addr(asleep.addr());
+    let asleep_keys = asleep.keys().public();
+    asleep.shutdown().await.unwrap();
+    drop(asleep);
+
+    const SPACES: usize = 6;
+    let mut spaces = Vec::new();
+    for _ in 0..SPACES {
+        let (space, genesis) = alice.create_space().unwrap();
+        alice.with_space(&space, |r| r.add_member(asleep_keys, Role::Writer)).unwrap().unwrap();
+        spaces.push((space, genesis));
+    }
+    // Bob is only in the last one.
+    let (last, genesis) = spaces.last().cloned().unwrap();
+    alice.with_space(&last, |r| r.add_member(bob.keys().public(), Role::Writer)).unwrap().unwrap();
+    bob.join_space(genesis).unwrap();
+    bob.sync_with(alice.id(), last, true).await.unwrap();
+    let doc = Replica::new_doc_id();
+    alice.with_space(&last, |r| r.change(doc, |d| d.put(ROOT, "news", "while you slept"))).unwrap().unwrap();
+
+    let t = Instant::now();
+    alice.sync_everything().await;
+    let took = t.elapsed();
+    eprintln!("synced {SPACES} conversations with one sleeping member in {took:?}");
+    assert_eq!(bob.with_space(&last, |r| r.doc_json(&doc)).unwrap(), json!({"news": "while you slept"}));
+    // The connect timeout is 6 s; one per conversation would be 36 s.
+    assert!(took < Duration::from_secs(10), "took {took:?}");
+    alice.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
+}

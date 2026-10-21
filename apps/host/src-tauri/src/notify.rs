@@ -26,7 +26,7 @@ use tauri::{AppHandle, State};
 #[cfg(not(target_os = "android"))]
 use tauri_plugin_notification::NotificationExt;
 
-use crate::Rt;
+use crate::{AppSlot, Rt};
 
 /// All the OS ever shows: one fixed sentence per kind.
 fn content(kind: AlertKind) -> (&'static str, &'static str) {
@@ -168,6 +168,14 @@ pub struct Notifier {
     asked: AtomicBool,
 }
 
+/// Whether a runtime opened now starts with nobody looking: a start with
+/// no window (Android's service), or an app the OS launched straight into
+/// the background (iOS). Until a window says otherwise, every alert shows,
+/// the incoming-call one included.
+pub(crate) fn starts_away(watched: bool, launched_in_background: bool) -> bool {
+    !watched || launched_in_background
+}
+
 impl Notifier {
     fn with_routes(routes: Routes, path: Option<PathBuf>) -> Notifier {
         Notifier {
@@ -180,8 +188,10 @@ impl Notifier {
         }
     }
 
-    /// Start the OS bridge: its worker thread performs every OS call.
-    pub fn start(app: AppHandle, data_dir: &Path) -> Arc<Notifier> {
+    /// Start the OS bridge: its worker thread performs every OS call. With
+    /// no app in `app` yet (an Android background start), Android still
+    /// posts alerts (through `MycelService`); the plugin platforms need it.
+    pub fn start(app: AppSlot, data_dir: &Path) -> Arc<Notifier> {
         let path = data_dir.join("notification-targets.json");
         let (routes, fresh) = Routes::load(&path);
         let notifier = Arc::new(Notifier::with_routes(routes, Some(path)));
@@ -195,7 +205,7 @@ impl Notifier {
                 for job in rx {
                     let Some(notifier) = worker.upgrade() else { return };
                     // A failing OS call must not stop later alerts.
-                    let run = std::panic::AssertUnwindSafe(|| notifier.run(&app, job));
+                    let run = std::panic::AssertUnwindSafe(|| notifier.run(app.get(), job));
                     if std::panic::catch_unwind(run).is_err() {
                         eprintln!("mycel-host: a notification task failed");
                     }
@@ -207,6 +217,11 @@ impl Notifier {
 
     pub fn set_away(&self, away: bool) {
         self.away.store(away, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_away_for_test(&self) -> bool {
+        self.away.load(Ordering::Relaxed)
     }
 
     /// Hand a shell event to the worker. Never blocks.
@@ -271,7 +286,7 @@ impl Notifier {
         }
     }
 
-    fn run(&self, app: &AppHandle, job: Job) {
+    fn run(&self, app: Option<&AppHandle>, job: Job) {
         match job {
             Job::Startup { fresh } => self.clear_unroutable(app, fresh),
             Job::Show(alert) => {
@@ -292,8 +307,8 @@ impl Notifier {
     }
 
     #[cfg(target_os = "ios")]
-    fn clear_unroutable(&self, app: &AppHandle, fresh: bool) {
-        let n = app.notification();
+    fn clear_unroutable(&self, app: Option<&AppHandle>, fresh: bool) {
+        let Some(n) = app.map(|app| app.notification()) else { return };
         if fresh {
             if let Err(e) = n.remove_all_active() {
                 eprintln!("mycel-host: clearing old notifications failed: {e}");
@@ -309,14 +324,14 @@ impl Notifier {
     }
 
     #[cfg(not(target_os = "ios"))]
-    fn clear_unroutable(&self, _app: &AppHandle, _fresh: bool) {}
+    fn clear_unroutable(&self, _app: Option<&AppHandle>, _fresh: bool) {}
 
     #[cfg(target_os = "ios")]
-    fn remove(&self, app: &AppHandle, removal: Removal) {
+    fn remove(&self, app: Option<&AppHandle>, removal: Removal) {
         if removal.is_empty() {
             return;
         }
-        let n = app.notification();
+        let Some(n) = app.map(|app| app.notification()) else { return };
         let removed = if removal.all { n.remove_all_active() } else { n.remove_active(removal.ids) };
         if let Err(e) = removed {
             eprintln!("mycel-host: notification removal failed: {e}");
@@ -325,18 +340,20 @@ impl Notifier {
 
     /// Desktop notification centers can't be cleared from here.
     #[cfg(not(target_os = "ios"))]
-    fn remove(&self, _app: &AppHandle, _removal: Removal) {}
+    fn remove(&self, _app: Option<&AppHandle>, _removal: Removal) {}
 
     #[cfg(target_os = "android")]
-    fn show(&self, _app: &AppHandle, alert: &Alert) {
+    fn show(&self, _app: Option<&AppHandle>, alert: &Alert) {
         let (title, body) = content(alert.kind);
-        if let Err(e) = android_notify(title, body) {
+        if let Err(e) = crate::android::notify(title, body) {
             eprintln!("mycel-host: notification failed: {e}");
         }
     }
 
     #[cfg(not(target_os = "android"))]
-    fn show(&self, app: &AppHandle, alert: &Alert) {
+    fn show(&self, app: Option<&AppHandle>, alert: &Alert) {
+        // Desktop and iOS always have the app: their core opens with it.
+        let Some(app) = app else { return };
         let n = app.notification();
         // Permission is asked in the foreground (prepare_notifications),
         // never while an event arrives behind a locked screen.
@@ -347,7 +364,7 @@ impl Notifier {
         // A fresh opaque id even in the same thread, so tap handling can
         // tell two separate alerts apart.
         let (id, replaced) = self.route(alert);
-        self.remove(app, replaced);
+        self.remove(Some(app), replaced);
         if let Err(e) = n.builder().id(id).title(title).body(body).sound("default").show() {
             eprintln!("mycel-host: notification failed: {e}");
         }
@@ -437,36 +454,6 @@ pub async fn take_notification_action(app: AppHandle) -> Result<Option<i32>, Str
     }
 }
 
-/// `MycelService.notify(context, title, body)` (gen/android/.../MycelService.kt),
-/// through the app's class loader (a native thread's FindClass only sees
-/// system classes).
-#[cfg(target_os = "android")]
-fn android_notify(title: &str, body: &str) -> jni::errors::Result<()> {
-    use jni::objects::{JObject, JValue};
-    let ctx = ndk_context::android_context();
-    // SAFETY: tao keeps the process's JavaVM and application Context alive.
-    let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) }?;
-    let mut env = vm.attach_current_thread()?;
-    // SAFETY: a global reference to the application Context, borrowed.
-    let context = unsafe { JObject::from_raw(ctx.context().cast()) };
-    let loader = env.call_method(&context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?.l()?;
-    let name = env.new_string("dev.mycel.host.MycelService")?;
-    let class = env
-        .call_method(&loader, "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;", &[JValue::Object(&name)])?
-        .l()?;
-    let (title, body) = (env.new_string(title)?, env.new_string(body)?);
-    let res = env.call_static_method(
-        jni::objects::JClass::from(class),
-        "notify",
-        "(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)V",
-        &[JValue::Object(&context), JValue::Object(&title), JValue::Object(&body)],
-    );
-    if res.is_err() {
-        let _ = env.exception_clear();
-    }
-    res.map(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +520,21 @@ mod tests {
         notifier.set_away(true);
         assert!(!notifier.suppressed(&message) && !notifier.suppressed(&call));
         assert!(!notifier.viewing("thread"));
+    }
+
+    /// Regression: an iOS background launch (a catch-up, a Bluetooth event)
+    /// opened with a window, so the notifier started "in front" and never
+    /// heard otherwise: a call arriving then rang nowhere.
+    #[test]
+    fn a_background_launch_starts_away_so_a_call_rings() {
+        assert!(starts_away(false, false), "no window");
+        assert!(starts_away(true, true), "a window, but launched into the background");
+        assert!(!starts_away(true, false), "opened by the user");
+        let notifier = notifier();
+        notifier.set_away(starts_away(true, true));
+        assert!(!notifier.suppressed(&alert(AlertKind::IncomingCall, "thread", "call:c")));
+        notifier.set_away(starts_away(true, false));
+        assert!(notifier.suppressed(&alert(AlertKind::IncomingCall, "thread", "call:c")), "rung in the app");
     }
 
     #[test]

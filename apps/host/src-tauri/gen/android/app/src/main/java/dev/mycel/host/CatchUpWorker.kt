@@ -1,0 +1,62 @@
+package dev.mycel.host
+
+import android.content.Context
+import androidx.work.ExistingPeriodicWorkPolicy
+import androidx.work.PeriodicWorkRequestBuilder
+import androidx.work.WorkManager
+import androidx.work.Worker
+import androidx.work.WorkerParameters
+import java.util.concurrent.TimeUnit
+
+/**
+ * A backstop, not the delivery path: [MycelService] keeps Mycel connected,
+ * but some phones stop it anyway (vendor battery managers, the "restricted"
+ * standby bucket after days unopened). Every few hours this restarts the
+ * service if Android allows it, or else opens the runtime for one bounded
+ * catch-up (sync, wait for deliveries, save). WorkManager runs it when the
+ * system chooses: Android 16 holds jobs to a runtime quota per standby
+ * bucket, even alongside a foreground service, so it stays short and
+ * occasional. No network constraint: Mycel also reaches peers on a Wi-Fi
+ * with no internet, which Android doesn't count as "connected".
+ */
+class CatchUpWorker(context: Context, params: WorkerParameters) : Worker(context, params) {
+  /** This run's catch-up ([MycelRuntime.beginCatchUp]); 0 until it has one. */
+  @Volatile private var ticket = 0L
+
+  override fun doWork(): Result {
+    // Taken first, so a stop from here on cancels this run's catch-up (and
+    // only this run's: the service may be catching up too); a stop before
+    // shows in isStopped, which planCatchUp reads.
+    ticket = MycelRuntime.beginCatchUp()
+    val plan = planCatchUp(
+      stopped = { isStopped },
+      openRuntime = { MycelRuntime.startBlocking(applicationContext) },
+      // Allowed when Mycel may ignore battery optimisation: then the service
+      // keeps it connected from here on.
+      startService = { MycelService.startFromBackground(applicationContext) },
+    )
+    if (plan == CatchUpPlan.CATCH_UP) {
+      MycelRuntime.catchUp(ticket, CATCH_UP_SECONDS)
+    }
+    return Result.success()
+  }
+
+  /** WorkManager took the time back: end this run's catch-up now. */
+  override fun onStopped() {
+    ticket.takeIf { it != 0L }?.let(MycelRuntime::cancelCatchUp)
+  }
+
+  companion object {
+    private const val NAME = "mycel-catch-up"
+    /** Well inside WorkManager's 10-minute limit and the Android 16 quotas. */
+    private const val CATCH_UP_SECONDS = 60
+    private const val EVERY_HOURS = 3L
+
+    /** Keep one periodic catch-up scheduled (idempotent). */
+    fun schedule(context: Context) {
+      val request = PeriodicWorkRequestBuilder<CatchUpWorker>(EVERY_HOURS, TimeUnit.HOURS).build()
+      WorkManager.getInstance(context.applicationContext)
+        .enqueueUniquePeriodicWork(NAME, ExistingPeriodicWorkPolicy.KEEP, request)
+    }
+  }
+}

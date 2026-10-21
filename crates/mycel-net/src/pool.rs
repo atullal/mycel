@@ -6,7 +6,9 @@
 //! and holds the `Endpoint` (and its UDP socket) after the node shuts down;
 //! a node restarted in the same process can't bind its port again.
 //!
-//! - one dial at a time per peer; everyone else waits for it and shares it;
+//! - one dial at a time per peer; everyone else waits for it and shares it,
+//!   also when it fails (a peer that can't be reached costs one
+//!   [`crate::CONNECT_TIMEOUT`], not one per exchange queued behind it);
 //! - a connection that has closed is replaced on the next use;
 //! - one with no stream in use for [`crate::POOL_IDLE`] is closed;
 //! - [`Pool::shutdown`] drops everything.
@@ -72,6 +74,8 @@ struct Slot {
     /// Serialises dialing.
     dial: tokio::sync::Mutex<()>,
     entry: Mutex<Option<Arc<Entry>>>,
+    /// When the last dial failed.
+    failed_at: Mutex<Option<Instant>>,
 }
 
 pub(crate) struct Pool {
@@ -196,9 +200,16 @@ impl Pool {
         if let Some(c) = Self::live(&slot) {
             return Ok(c);
         }
+        let asked = Instant::now();
         let _dialing = slot.dial.lock().await;
         if let Some(c) = Self::live(&slot) {
             return Ok(c); // someone else just dialed it
+        }
+        // A dial that failed while we waited for it answers for us too: a
+        // catch-up syncing many conversations with one sleeping phone would
+        // otherwise wait out one connect timeout per conversation in turn.
+        if slot.failed_at.lock().is_some_and(|t| t >= asked) {
+            return Err(anyhow!("can't reach the device: a dial to it just failed"));
         }
         let id = to_endpoint_id(peer)?;
         let (first, rest) = self.alpns.split_first().expect("at least one version");
@@ -207,10 +218,17 @@ impl Pool {
             let connecting = self.endpoint.connect_with_opts(id, first, options).await?;
             anyhow::Ok(connecting.await?)
         };
-        let conn = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(anyhow!("can't reach the device: {e}")),
-            Err(_) => return Err(anyhow!("can't reach the device: connect timed out")),
+        let dialed = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+            Ok(Ok(c)) => Ok(c),
+            Ok(Err(e)) => Err(anyhow!("can't reach the device: {e}")),
+            Err(_) => Err(anyhow!("can't reach the device: connect timed out")),
+        };
+        let conn = match dialed {
+            Ok(c) => c,
+            Err(e) => {
+                *slot.failed_at.lock() = Some(Instant::now());
+                return Err(e);
+            }
         };
         self.dialed.fetch_add(1, Ordering::Relaxed);
         // (the handshake can only pick one of the ALPNs we offered)

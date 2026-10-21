@@ -7,7 +7,8 @@
 //!
 //! ```text
 //! frame  = len:u16be  type:u8  body[len-1]
-//! type 1 = hello:  "MYCL" version:u8 node_key[32] name:utf8 [0x00 ext]   (first frame, both ways)
+//! type 1 = hello:  "MYCL" version:u8 node_key[32] name:utf8 [0x00 ext]   (first frame,
+//!                  both ways; the name is always empty now, older builds sent one)
 //! type 2 = packet: one QUIC datagram
 //! type 3 = ping:   empty; sent every few seconds so a dead channel is noticed
 //!                  even when the OS doesn't report it and QUIC is idle
@@ -17,6 +18,10 @@
 //! dialing side already read it from GATT). It is *not* authenticated: QUIC's
 //! TLS handshake authenticates the node key end to end, so a device lying in
 //! its hello can at worst black-hole the Bluetooth path for that key.
+//!
+//! The channel isn't encrypted (anyone in range can listen to it), so the
+//! hello never carries the display name: a device learns a nearby node's
+//! name from its signed contact card, inside the encrypted QUIC session.
 //!
 //! Room to grow (docs/PROTOCOL.md §3.9): a name never contains a NUL byte,
 //! and readers stop the name at the first one, so a later build can append
@@ -46,7 +51,10 @@ pub const MAX_NAME: usize = 64;
 pub const MAX_GATT: usize = 512;
 
 /// What a peripheral publishes in its GATT characteristic: where its L2CAP
-/// channel listens and which node it is.
+/// channel listens and which node it is. Anyone in range can read it, with
+/// no pairing, so a device publishes [`GattInfo::published`]: never its
+/// display name (that comes from its signed contact card). The `name` field
+/// stays in the format so older builds' payloads still decode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GattInfo {
     pub psm: u16,
@@ -77,6 +85,11 @@ fn read_name(b: &[u8]) -> String {
 }
 
 impl GattInfo {
+    /// What this device serves: the PSM and node key, and no name.
+    pub fn published(psm: u16, key: SignPk) -> GattInfo {
+        GattInfo { psm, key, name: String::new() }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let name = air_name(&self.name);
         let mut v = Vec::with_capacity(35 + name.len());
@@ -116,7 +129,14 @@ fn frame(ty: u8, body_len: usize, body: impl FnOnce(&mut BytesMut)) -> Bytes {
     b.freeze()
 }
 
-pub fn encode_hello(key: &SignPk, name: &str) -> Bytes {
+/// The hello this device sends: its node key, and an empty name (the field
+/// stays so older builds decode it).
+pub fn encode_hello(key: &SignPk) -> Bytes {
+    hello_frame(key, "")
+}
+
+/// A hello carrying `name`, as older builds sent it (tests decode those).
+fn hello_frame(key: &SignPk, name: &str) -> Bytes {
     let name = air_name(name);
     frame(T_HELLO, 4 + 1 + 32 + name.len(), |b| {
         b.put_slice(MAGIC);
@@ -291,7 +311,7 @@ mod tests {
         let long = GattInfo { psm: 1, key: key(1), name: "n".repeat(MAX_NAME) };
         assert_eq!(GattInfo::decode(&long.encode()).unwrap().name, "n".repeat(MAX_NAME));
 
-        let hello = encode_hello(&key(3), "bob");
+        let hello = hello_frame(&key(3), "bob");
         let mut longer = hello[3..].to_vec(); // the hello body
         longer.extend_from_slice(&[0, 1, 2, 3]);
         let mut framed = ((1 + longer.len()) as u16).to_be_bytes().to_vec();
@@ -300,14 +320,37 @@ mod tests {
         framed.extend_from_slice(&encode_ping());
         let got = Deframer::default().push(&framed).unwrap();
         assert_eq!(got, vec![Frame::Hello { key: key(3), name: "bob".into() }, Frame::Ping]);
-        let got = Deframer::default().push(&encode_hello(&key(3), "x\0y")).unwrap();
+        let got = Deframer::default().push(&hello_frame(&key(3), "x\0y")).unwrap();
         assert_eq!(got, vec![Frame::Hello { key: key(3), name: "xy".into() }]);
+    }
+
+    /// Regression: the readable characteristic carried the profile's display
+    /// name to anyone in Bluetooth range.
+    #[test]
+    fn the_published_info_carries_no_name() {
+        let published = GattInfo::published(0x00c1, key(7));
+        let bytes = published.encode();
+        assert_eq!(bytes.len(), 35, "version, PSM and key only");
+        let decoded = GattInfo::decode(&bytes).unwrap();
+        assert_eq!((decoded.psm, decoded.key), (0x00c1, key(7)));
+        assert!(decoded.name.is_empty());
+    }
+
+    /// Regression: the hello, the first frame on an unencrypted L2CAP
+    /// channel, carried the profile's display name to whichever device
+    /// opened or accepted the channel (and to anyone listening).
+    #[test]
+    fn the_hello_carries_no_name() {
+        let hello = encode_hello(&key(7));
+        assert_eq!(hello.len(), 2 + 1 + 4 + 1 + 32, "magic, version and key only");
+        let got = Deframer::default().push(&hello).unwrap();
+        assert_eq!(got, vec![Frame::Hello { key: key(7), name: String::new() }]);
     }
 
     #[test]
     fn frames_survive_any_chunking() {
         let pkts: Vec<Vec<u8>> = (0..20).map(|i| vec![i as u8; 1 + i * 97]).collect();
-        let mut stream = encode_hello(&key(3), "bob").to_vec();
+        let mut stream = hello_frame(&key(3), "bob").to_vec();
         for p in &pkts {
             stream.extend_from_slice(&encode_packet(p).unwrap());
         }

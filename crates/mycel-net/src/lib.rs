@@ -1643,6 +1643,56 @@ impl Node {
         while set.join_next().await.is_some() {}
     }
 
+    /// Sync every space with every member now, all at once, and wait (best
+    /// effort): a phone's background catch-up and pull-to-refresh.
+    ///
+    /// Every (space, member) sync starts together and the node's sync slots
+    /// bound how many run, so a member who is asleep holds up only its own
+    /// syncs, and each unreachable peer costs one connect timeout in all
+    /// (the pool shares a failed dial with every sync waiting for it).
+    /// Keepers and peers that are reachable right now go first; peers in
+    /// failure backoff that aren't nearby are skipped, as the scheduler
+    /// skips them.
+    pub async fn sync_everything(&self) {
+        let inner = &self.inner;
+        let me = self.id();
+        let mut targets: Vec<(u8, SignPk, SpaceId)> = {
+            let spaces = inner.spaces.lock();
+            let peers = inner.peers.lock();
+            spaces
+                .iter()
+                .filter(|(_, r)| r.my_role().is_some())
+                .flat_map(|(s, r)| r.members().into_iter().map(move |(k, role)| (k.sign_pk, role, *s)))
+                .filter(|(pk, _, _)| *pk != me)
+                .filter_map(|(pk, role, s)| {
+                    let p = peers.get(&pk);
+                    if p.is_some_and(|p| p.backing_off() && !p.nearby) {
+                        return None;
+                    }
+                    let keeper = role == Role::Relay;
+                    let reachable = p.is_some_and(PeerState::online);
+                    Some((u8::from(!keeper) + u8::from(!reachable), pk, s))
+                })
+                .collect()
+        };
+        targets.sort_by_key(|(rank, _, _)| *rank);
+        let mut set = tokio::task::JoinSet::new();
+        for (_, pk, space) in targets {
+            set.spawn(sync_once(inner.clone(), pk, space));
+        }
+        while set.join_next().await.is_some() {}
+    }
+
+    /// Restrict every link to `peers` (`Some`: a phone's app went to the
+    /// background, so a radio that would otherwise link with any device in
+    /// range links only with these), or lift the restriction (`None`).
+    /// See [`Link::restrict_to`].
+    pub fn restrict_links(&self, peers: Option<&[SignPk]>) {
+        for l in &self.inner.links {
+            l.restrict_to(peers);
+        }
+    }
+
     /// Open a connection to a device for another protocol (see
     /// [`ExtraProtocol`]): dialed by key over every path the node knows
     /// (network, links, relay), with multipath failover.
