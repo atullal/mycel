@@ -22,8 +22,10 @@ scripts/security-check.sh                     # security regressions, npm audit,
   It also parses all 36 catalogue scenarios (`crates/mycel-sim/scenarios/`),
   runs every runnable one small on one seed with the no-loop invariant, and
   checks the robustness tools against known answers (Sobol indices of the
-  Ishigami function, Morris effects of a known function, the Sobol net
-  property, a GP's held-out error; SIMULATION.md §7).
+  Ishigami function, also with a large offset, Morris effects of a known
+  function and their seed-noise floors, the Sobol net property, a GP's
+  held-out error with and without known noise, a study that seed noise
+  dominates; SIMULATION.md §7).
 - Tests that measure speed or time emulated radios (video frame rates, mesh
   throughput, link failover, real-time simulator scenarios) run one at a time
   within each test binary, and can still miss their deadlines on a heavily
