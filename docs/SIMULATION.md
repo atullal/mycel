@@ -1404,7 +1404,7 @@ matter, and were run for `long-haul-flight` (finding 3).
 | 9 | `protest-shutdown` | bound, optimistic (SINR, body loss, jamming) | 150 (5 attackers) | 98.7% of 525 | **127 s** | 7.06 kB/s | 83 s | **p95 missed** (≤ 60 s): a finding |
 | 10 | `protest-mobile-off` | bound, optimistic (body loss) | 150 | 100% of 530 | 0.43 s | 7.16 kB/s | 99 s | met (inconclusive) |
 | 11 | `festival` | bound, optimistic (SINR, cell capacity) | 150 | 100% of 394 | 0.24 s | **6.43 kB/s** | 75 s | **control missed** (≤ 4 kB/s): a finding |
-| 12 | `stadium-exit` | bound (crowd flow, BLE discovery) | 150 | 100% of 195 | 3.28 s | **46.8 kB/s** | 140 s | see finding 2 |
+| 12 | `stadium-exit` | bound (crowd flow, BLE discovery) | 150 | 100% of 195 | 3.28 s | **46.8 kB/s** | 140 s | **loop invariant broken**: finding 5; control: finding 2 |
 | 13 | `conference-hall` | bound, optimistic (SINR) | 200 | 100% of 258 | 0.23 s | 2.67 kB/s | 12 s | met (inconclusive) |
 | 14 | `subway` | bound (transit) | 200 | **74.0%** of 285 | 1,339 s | 1.42 kB/s | 16 s | **delivery missed** (≥ 80%) |
 | 15 | `long-haul-flight` | **verdict** | 60 | **97.6%** of 212 | 1.56 s | 0.71 kB/s | 2 s | **delivery missed** (≥ 99%): finding 3 |
@@ -1424,6 +1424,18 @@ matter, and were run for `long-haul-flight` (finding 3).
 | 29 | `ferry` | **verdict** | 150 | 99.6% of 265 | 314 s | 3.57 kB/s | 36 s | met |
 | 30 | `clock-skew` | blocked (clock skew) | | | | | | |
 | 31 | `storage-full` | blocked (storage full) | | | | | | |
+| 32 | `low-battery-cascade` | bound, optimistic (energy) | 200 | 100% of 427 | 0.43 s | **13.5 kB/s** | 699 s | met (inconclusive); control: finding 2 |
+| 33 | `ios-heavy` | blocked (iOS lifecycle) | | | | | | |
+| 34 | `android-oem-mix` | blocked (Doze, OEM killers) | | | | | | |
+| 35 | `long-offline-mailbox` | **verdict** | 200 | 100% of 1,091 | 23,708 s | 1.14 kB/s | 217 s | met |
+| 36 | `group-chat` | blocked (group sync, WP4) | | | | | | |
+
+Rows 32 and 35 ran in a second pass with the same seed after the first
+was stopped at its time limit (28 minutes); every other row is the first
+pass. Totals: 36 scenarios, 7 verdicts, 20 bounds, 9 blocked; of the
+verdicts, 5 met their objectives and 2 missed (`rural-starlink`,
+`long-haul-flight`). `stadium-exit` also broke the loop invariant on this
+seed (finding 5).
 
 ### 7.5 What the catalogue found
 
@@ -1489,3 +1501,33 @@ is reproducible from the command given.
    of feasible messages against 80% (static car clusters stand in for
    moving trains); `rural-starlink`, a verdict at L0, has a p95 of 79
    minutes against 60 with one satellite gateway and nine walkers.
+5. **A packet came back to a relay: the mesh route and the no-internet
+   default route can form a transient loop.** `stadium-exit`, seed
+   2515552253147602109, broke the loop invariant once (one packet). Traced
+   hop by hop (a temporary print in `tier2/global.rs`, not committed):
+   device 64 had internet and a mesh route to the destination 83 through
+   38 and sent the packet there at 186.379 s; 38 passed it to 22 along its
+   own route; at 186.809 s 22 had **no internet and no mesh route to 83
+   any more** (the route it had announced to 38 had just gone, and 38 had
+   not caught up), so it took the no-internet default route
+   (`core.rs` `next_hop`, step 4) to its cheapest gateway, which was 64.
+   That BLE hop delivered 3.57 s later (queued behind control traffic,
+   finding 2); by then 64 had lost its route through 38 too, sent the
+   packet over the internet to a gateway near 83, and it was delivered.
+   Each route is loop-free toward its own target (Babel's feasibility
+   condition for routes to 83; the gateway's own announcements for the
+   default route), but **switching a packet from one to the other in
+   mid-path is covered by neither**: had the hop to 64 been fast, 64
+   would still have held its route through 38 and the packet would have
+   circled 64 → 38 → 22 → 64 until the retraction reached 38 and 64 or
+   the TTL ran out. So this is a real transient loop, not an artefact of
+   the detector's 30 s window. It needs a relay without internet that
+   loses its route while its upstream still has one, so walking crowds
+   with half the devices online are where it shows. Possible fixes, for
+   the routing track: when a relay falls back to the default route for a
+   packet that came over the mesh, make the gateway its waypoint and have
+   the gateway send it over the internet rather than back into the mesh;
+   or do what Babel does and drop it (the end-to-end retransmission and
+   the carrier recover). Not fixed here: the routing core belongs to the
+   routing tracks. Replay: `mycel-sim catalogue stadium-exit --people 3000
+   --minutes 20 --seed 2515552253147602109`.
