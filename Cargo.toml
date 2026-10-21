@@ -15,7 +15,7 @@ homepage = "https://github.com/atullal/mycel"
 # Versions shared by several first-party crates.
 [workspace.dependencies]
 # getifaddrs without hand-rolled pointer walks. 0.31.3 is already in
-# Cargo.lock (via zip and zbus), so this adds no new crate version.
+# Cargo.lock (via zip), so this adds no new crate version.
 nix = { version = "0.31.3", default-features = false, features = ["net"] }
 
 # Shared by every first-party crate (`[lints] workspace = true`); the rules
