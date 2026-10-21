@@ -24,17 +24,18 @@
        (iOS allows this while the call's audio session is active).
        fetch, processing: "slow mode" catch-ups when iOS lends time
        (BGTaskScheduler, gen/apple/Sources/mycel-host/main.mm).
-       bluetooth-central, bluetooth-peripheral: Bluetooth links to nearby
-       Mycel devices keep working (and wake Mycel briefly) in the background;
-       iOS relaunches Mycel for them after it ended it for memory
-       (mycel-link-ble's state restoration), not after a swipe away. -->
+       bluetooth-central: Mycel keeps finding and linking to nearby Mycel
+       devices that advertise (and wakes briefly for them) in the
+       background; iOS relaunches Mycel for them after it ended it for
+       memory (mycel-link-ble's state restoration), not after a swipe away.
+       Never bluetooth-peripheral: a suspended iPhone must not keep serving
+       its node key to anyone in range (docs/TRUST.md). -->
   <key>UIBackgroundModes</key>
   <array>
     <string>audio</string>
     <string>fetch</string>
     <string>processing</string>
     <string>bluetooth-central</string>
-    <string>bluetooth-peripheral</string>
   </array>
   <key>BGTaskSchedulerPermittedIdentifiers</key>
   <array>

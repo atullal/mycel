@@ -273,7 +273,7 @@ impl Driver {
                     read: Some(CharacteristicRead {
                         read: true,
                         fun: Box::new(move |_req| {
-                            let value = GattInfo { psm, key: hub.me, name: hub.name() }.encode();
+                            let value = GattInfo::published(psm, hub.me).encode();
                             async move { Ok(value) }.boxed()
                         }),
                         ..Default::default()

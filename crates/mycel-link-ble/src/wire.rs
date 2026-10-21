@@ -35,7 +35,10 @@ pub const MAX_FRAME: usize = 4096;
 pub const MAX_NAME: usize = 64;
 
 /// What a peripheral publishes in its GATT characteristic: where its L2CAP
-/// channel listens and which node it is.
+/// channel listens and which node it is. Anyone in range can read it, with
+/// no pairing, so a device publishes [`GattInfo::published`]: never its
+/// display name (that goes in the hello, over the channel). The `name` field
+/// stays in the format so older builds' payloads still decode.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GattInfo {
     pub psm: u16,
@@ -53,6 +56,11 @@ pub fn clip_name(name: &str) -> &str {
 }
 
 impl GattInfo {
+    /// What this device serves: the PSM and node key, and no name.
+    pub fn published(psm: u16, key: SignPk) -> GattInfo {
+        GattInfo { psm, key, name: String::new() }
+    }
+
     pub fn encode(&self) -> Vec<u8> {
         let name = clip_name(&self.name);
         let mut v = Vec::with_capacity(35 + name.len());
@@ -243,6 +251,18 @@ mod tests {
         let d = GattInfo::decode(&long.encode()).unwrap();
         assert_eq!(d.name, "é".repeat(32));
         assert!(long.encode().len() <= 35 + MAX_NAME);
+    }
+
+    /// Regression: the readable characteristic carried the profile's display
+    /// name to anyone in Bluetooth range.
+    #[test]
+    fn the_published_info_carries_no_name() {
+        let published = GattInfo::published(0x00c1, key(7));
+        let bytes = published.encode();
+        assert_eq!(bytes.len(), 35, "version, PSM and key only");
+        let decoded = GattInfo::decode(&bytes).unwrap();
+        assert_eq!((decoded.psm, decoded.key), (0x00c1, key(7)));
+        assert!(decoded.name.is_empty());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 //!
 //! Every device is both a BLE *peripheral* (advertises the Mycel service,
 //! publishes an L2CAP connection-oriented channel, and serves a GATT
-//! characteristic with the channel's PSM plus its node key and name) and a
+//! characteristic with the channel's PSM plus its node key, never its name) and a
 //! *central* (scans for the service, reads the characteristic, opens the
 //! channel). Both devices dial; the first channel up carries the traffic and
 //! is never hung up (see [`core`] for the rules that keep exactly one channel
@@ -53,7 +53,7 @@ pub use hub::Radio;
 
 /// The Mycel GATT service, advertised by every device.
 pub const SERVICE_UUID: &str = "8E12485D-50ED-4B8D-A6F0-276C27F29CB6";
-/// Read-only characteristic: [`wire::GattInfo`] (L2CAP PSM, node key, name).
+/// Read-only characteristic: [`wire::GattInfo`] (L2CAP PSM and node key).
 pub const INFO_CHAR_UUID: &str = "CDCCEDAE-E668-4342-8B67-80BE49E7ED5B";
 /// Bytes of outgoing frames queued per channel before new packets are dropped.
 /// ~0.3 s at typical BLE L2CAP rates: enough to keep the radio busy, small
