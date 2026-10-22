@@ -195,3 +195,9 @@ path = "fuzz_targets/video_media.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "custody"
+path = "fuzz_targets/custody.rs"
+test = false
+doc = false
