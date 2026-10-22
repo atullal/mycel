@@ -629,9 +629,6 @@ pub struct Stats {
     /// Next hops avoided for every destination after suspicions for
     /// several ([`Defences::aggregate`]).
     pub hops_shunned: u64,
-    /// ... and no longer, once the routes they were suspected for moved
-    /// off the path the silence blamed.
-    pub hops_unshunned: u64,
     /// Neighbours whose routes kept expiring, held down
     /// ([`Defences::refresh`]).
     pub hops_stale: u64,
@@ -900,12 +897,8 @@ pub struct Router {
     /// ... the destinations each carried acknowledgements for lately ...
     vouched: Map<SignPk, Vec<(SignPk, Time)>>,
     /// ... and the hop each destination last acknowledged through, and
-    /// when (evidence it was alive while another hop was silent) ...
+    /// when (evidence it was alive while another hop was silent).
     acked_via: Map<SignPk, (SignPk, Time)>,
-    /// ... and, per (destination, suspected hop), the cost the hop
-    /// advertised for the destination when it was suspected: the path the
-    /// silence blames ([`Router::moved`]).
-    blame_adv: Map<(SignPk, SignPk), u32>,
     /// Neighbours through which our cheapest route to an origin expired:
     /// (origin, when) ([`Defences::refresh`]) ...
     expired_via: Map<SignPk, Vec<(SignPk, Time)>>,
@@ -990,7 +983,6 @@ impl Router {
             shunned: Map::default(),
             vouched: Map::default(),
             acked_via: Map::default(),
-            blame_adv: Map::default(),
             expired_via: Map::default(),
             stale: Map::default(),
             affinity: Map::default(),
@@ -1515,7 +1507,6 @@ impl Router {
         if o.feasible(&via) {
             o.retracted = false;
         }
-        let reconsider = self.cfg.defences.aggregate && self.blame_adv.contains_key(&(origin, from));
         if relay && seq == o.newest && seq > o.forwarded && o.pending.is_none() && hops < forward_scope {
             if o.flooded.is_some_and(|t| now.saturating_sub(t) < ORIGIN_GAP) {
                 // an announcement storm: the route stands, the flood stops here
@@ -1530,9 +1521,6 @@ impl Router {
         }
         // after: it may have become one
         self.touch(origin);
-        if reconsider {
-            self.reconsider(from, now);
-        }
     }
 
     /// `peer` sent a route no honest relay could have: a black hole
@@ -2101,17 +2089,6 @@ impl Router {
             v.remove(0);
         }
         v.push((hop, now + SUSPECT_FOR));
-        let adv = self.origins.get(&dst).and_then(|o| o.via.iter().find(|(k, _)| *k == hop)).map(|(_, v)| v.adv);
-        if let Some(adv) = adv {
-            if self.blame_adv.len() >= FEEDBACK_MAX * SUSPECTS_PER_DST {
-                let live = &self.suspects;
-                self.blame_adv
-                    .retain(|(d, h), _| live.get(d).is_some_and(|v| v.iter().any(|(k, t)| k == h && now < *t)));
-            }
-            if self.blame_adv.len() < FEEDBACK_MAX * SUSPECTS_PER_DST {
-                self.blame_adv.insert((dst, hop), adv);
-            }
-        }
         self.stats.hops_suspected += 1;
         self.next_sweep = self.next_sweep.min(now + SUSPECT_FOR);
         self.touch(dst); // the routes offered for it change
@@ -2161,17 +2138,29 @@ impl Router {
     /// it is avoided for every destination (but itself) for
     /// [`SUSPECT_FOR`]. Only our own evidence counts (no one else's
     /// accusations), and a relay that delivers for most of what it carries
-    /// is never shunned for the rest. What it can't tell from one silence:
-    /// whether the hop or someone past it drops. An honest relay in front
-    /// of a liar is blamed too; but once it moves its route to a suspected
-    /// destination off the liar ([`Router::moved`]), that destination's
-    /// silence stops counting against it for every destination
-    /// ([`Router::reconsider`]).
+    /// is never shunned for the rest. What it can't tell: whether the hop
+    /// or someone past it drops (an honest relay in front of a liar is
+    /// blamed too, as for one destination). Nothing the hop advertises
+    /// lifts the shun early: its own advertisements are no evidence (a
+    /// liar would raise the costs it is already avoided for and escape).
+    /// Telling the two apart needs evidence the hop can't make, such as the
+    /// destination's acknowledgements for probes sent through it (ODSBR);
+    /// see `docs/ROUTING.md`.
     fn aggregate(&mut self, hop: SignPk, now: Time) {
         if self.shunned.get(&hop).is_some_and(|t| now < *t) {
             return;
         }
-        if !self.blamed(&hop, now) {
+        let acked_since = |d: &SignPk, until: Time| {
+            self.acked_via.get(d).is_some_and(|(via, at)| *via != hop && *at + SUSPECT_FOR >= until)
+        };
+        let bad: Vec<SignPk> = self
+            .suspects
+            .iter()
+            .filter(|(d, v)| v.iter().any(|(k, t)| *k == hop && now < *t && acked_since(d, *t)))
+            .map(|(d, _)| *d)
+            .collect();
+        let good = self.vouched.get(&hop).map_or(0, |v| v.iter().filter(|(d, t)| now < *t && !bad.contains(d)).count());
+        if bad.len() < AGGREGATE_MIN || bad.len() <= good {
             return;
         }
         bounded_insert(&mut self.shunned, hop, now + SUSPECT_FOR);
@@ -2201,57 +2190,6 @@ impl Router {
     /// `hop`'s routes rank last now: they kept expiring ([`Defences::refresh`]).
     pub fn is_stale_hop(&self, hop: &SignPk, now: Time) -> bool {
         self.cfg.defences.refresh && self.stale.get(hop).is_some_and(|t| now < *t)
-    }
-
-    /// Our evidence against `hop` for every destination
-    /// ([`Defences::aggregate`]): suspected now for at least
-    /// [`AGGREGATE_MIN`] destinations that acknowledged through another hop
-    /// since, and for more than it carried acknowledgements for lately, not
-    /// counting destinations it has since [`Router::moved`] off the path
-    /// the silence blamed.
-    fn blamed(&self, hop: &SignPk, now: Time) -> bool {
-        let acked_since = |d: &SignPk, until: Time| {
-            self.acked_via.get(d).is_some_and(|(via, at)| via != hop && *at + SUSPECT_FOR >= until)
-        };
-        let bad: Vec<SignPk> = self
-            .suspects
-            .iter()
-            .filter(|(d, v)| v.iter().any(|(k, t)| k == hop && now < *t && acked_since(d, *t)))
-            .filter(|(d, _)| !self.moved(d, hop, now))
-            .map(|(d, _)| *d)
-            .collect();
-        let good = self.vouched.get(hop).map_or(0, |v| v.iter().filter(|(d, t)| now < *t && !bad.contains(d)).count());
-        bad.len() >= AGGREGATE_MIN && bad.len() > good
-    }
-
-    /// Since `hop` was suspected for `dst`, it moved its route: it now
-    /// advertises `dst` at a higher cost than the path the silence blamed,
-    /// and that route is no shortcut (another neighbour's usable route costs
-    /// at most [`CORROBORATE_FACTOR`] times as much). An honest relay that
-    /// routed through a liar downstream, and has stopped, looks like this;
-    /// a liar can only look like it by giving up its lie for `dst`, and its
-    /// suspicion for `dst` stands either way (ODSBR blames the path, not
-    /// the node: here the path is what the hop advertises).
-    fn moved(&self, dst: &SignPk, hop: &SignPk, now: Time) -> bool {
-        let Some(then) = self.blame_adv.get(&(*dst, *hop)) else { return false };
-        let Some(o) = self.origins.get(dst) else { return false };
-        let Some((_, v)) = o.via.iter().find(|(k, _)| k == hop) else { return false };
-        if v.adv <= *then || !self.usable(o, hop, v, now) {
-            return false;
-        }
-        let others = o.via.iter().filter(|(k, w)| k != hop && self.usable(o, k, w, now)).map(|(_, w)| w.cost).min();
-        others.is_some_and(|c| c as u64 <= v.cost as u64 * CORROBORATE_FACTOR)
-    }
-
-    /// `hop`, avoided for every destination, advertised a new route to a
-    /// destination it is suspected for: if the evidence no longer holds
-    /// ([`Router::blamed`]), it is avoided only where it is suspected.
-    fn reconsider(&mut self, hop: SignPk, now: Time) {
-        if self.shunned.get(&hop).is_some_and(|t| now < *t) && !self.blamed(&hop, now) {
-            self.shunned.remove(&hop);
-            self.stats.hops_unshunned += 1;
-            self.touch_all();
-        }
     }
 
     /// The neighbour toward `dst` inside the mesh (no gateways, no internet).
@@ -2963,8 +2901,6 @@ impl Router {
             !v.is_empty()
         });
         self.acked_via.retain(|_, (_, at)| now.saturating_sub(*at) < SUSPECT_FOR);
-        let live = &self.suspects;
-        self.blame_adv.retain(|(d, h), _| live.get(d).is_some_and(|v| v.iter().any(|(k, t)| k == h && now < *t)));
         let stale = self.stale.len();
         self.stale.retain(|_, t| now < *t);
         if self.stale.len() != stale {

@@ -360,18 +360,22 @@ something changes.
       whether the hop drops or someone past it does: an honest relay in
       front of a liar that attracts 3 of our destinations through it is
       avoided for everything for 2 minutes. That is already true of item
-      13 for one destination; aggregation widens it. So each suspicion
-      remembers the cost the hop advertised for the destination (the path
-      the silence blames: ODSBR blames paths, not nodes, and here the
-      advertisement stands in for the path). Once the hop advertises that
-      destination at a higher cost that other neighbours' routes
-      corroborate, the silence stops counting toward aggregation, and the
-      shun is lifted if the rest no longer holds; the suspicion for that
-      destination stands, so a liar can lift the shun only by giving up
-      its lie for each suspected destination. Measured, it rarely fires:
-      in the half-size fan-out (seeds 1–10) honest relays were shunned 22
-      times against 79 for liars before it and 21 after. In the runs
-      below no clean run shunned anyone.
+      13 for one destination; aggregation widens it. In the half-size
+      fan-out (seeds 1–10) honest relays were shunned 22 times against 79
+      for liars; in the runs below no clean run shunned anyone. Nothing
+      the hop advertises lifts a shun early. A mitigation that did (lift
+      it once the hop advertised a suspected destination at a higher cost
+      that others' routes backed) was tried and reverted: the hop's own
+      advertisement is no evidence, and a liar escaped by raising one
+      destination it was already avoided for while it kept lying about
+      the rest (it went from 22 to 21 honest shuns; test
+      `a_shunned_liar_cant_lift_the_shun_by_raising_what_it_is_suspected_for`).
+      ODSBR tells a faulty link from the nodes around it with
+      authenticated probes, acknowledged by the destination, sent through
+      the suspect; here that would mean sending a few packets through a
+      shunned hop and lifting the shun on the destinations'
+      acknowledgements (which a relay can't forge). Not built: until then
+      the price is a 2-minute shun for an honest relay in front of a liar.
     - **On: corroboration hold-down** (`CORROBORATE_FACTOR`, `HOLD_DOWN`).
       A neighbour's claim is a *sudden shortcut* when it costs less than
       half of every other usable route: when it first appears, or when it

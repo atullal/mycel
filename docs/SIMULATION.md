@@ -946,24 +946,25 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
 
    Proxy blame: aggregation blames a next hop for every destination when
    several go silent through it, and can't tell the hop from a liar past
-   it. Each suspicion now remembers what the hop advertised for the
-   destination (the path the silence blames, ODSBR's idea of blaming
-   paths rather than nodes, with the advertisement standing in for the
-   path). Once the hop advertises the destination at a higher cost that
-   other neighbours' routes corroborate (no longer a shortcut), that
-   silence stops counting toward aggregation and the shun is lifted if
-   the rest no longer holds; the per-destination suspicion stands, so a
-   liar can lift the shun only by giving up its lie for each suspected
-   destination (test:
-   `an_honest_relay_in_front_of_a_liar_is_no_longer_shunned_once_it_moves`).
-   A role-aware counter now splits shuns: in the half-size fan-out
+   it. A role-aware counter now splits shuns: in the half-size fan-out
    (seeds 1–10) honest relays were shunned 22 times against 79 for
-   liars before this change and 21 after, so it rarely fires there:
-   those honest relays mostly kept advertising the same routes while
-   shunned. In `liar-ceiling` (full size, seeds 1–10) 1 honest and 1
-   lying hop were shunned in all. Requiring corroboration across
-   disjoint paths before a shun would need paths the source can't see
-   without a wire change (ODSBR's probes, routing plan item 14).
+   liars; in `liar-ceiling` (full size, seeds 1–10) 1 honest and 1 lying
+   hop were shunned in all. A mitigation was tried and reverted: lifting
+   the shun once the hop advertised a suspected destination at a higher
+   cost that other neighbours' routes backed. It changed 22 honest shuns
+   to 21, and review found the escape: a liar shunned for 3 destinations
+   raises one of them (it is avoided for that one anyway), the shun
+   lifts, and it attracts everything it still lies about; each re-shun
+   costs it one more destination. The hop's own advertisement is no
+   evidence. The shun now holds for its 2 minutes whatever the hop
+   advertises (regression test
+   `a_shunned_liar_cant_lift_the_shun_by_raising_what_it_is_suspected_for`).
+   A safe mitigation needs evidence the hop can't make: ODSBR's
+   authenticated probes, here a few packets sent through the shunned hop
+   with the shun lifted on the destinations' acknowledgements. Requiring
+   corroboration across disjoint paths before a shun would need paths the
+   source can't see without a wire change. Neither is built: proxy blame
+   stays open (open finding 18).
 
 ### Open findings
 
@@ -1201,6 +1202,15 @@ Each with the evidence and how to reproduce it (`--seed 1` unless noted).
 16. *(fixed 28: a one-hop liar's seqno-request storm.)*
 17. *(fixed 27: frame loops along the default route; the gate now holds
    every GLOBAL run to zero loops.)*
+18. **Proxy blame.** An honest relay whose routes run through a liar
+   downstream is suspected for those destinations, and after 3 of them
+   avoided for every destination for 2 minutes (22 honest shuns against
+   79 for liars in the half-size fan-out, seeds 1–10). Lifting the shun
+   on the relay's own advertisements let liars escape and was reverted
+   (§4 fixed 29). The candidate fix is ODSBR's: probe through the
+   shunned hop and lift the shun on the destinations' acknowledgements.
+   Repro: `MYCEL_SIM_SCALE=0.5 mycel-sim adversarial` (the fan-out's
+   honest-shun counter).
 
 ## 5. Benchmarks against external baselines
 
