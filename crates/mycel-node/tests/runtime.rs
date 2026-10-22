@@ -762,3 +762,58 @@ async fn group_call_between_runtimes() {
         let _ = std::fs::remove_dir_all(rt.data_dir());
     }
 }
+
+/// The bug this fixes: Alice writes to Bob while his only device is offline.
+/// Carol (in a group with Bob) is online, so Alice hands her a sealed copy:
+/// the message shows "carried by 1" instead of a clock forever, and Bob
+/// gets it from Carol after Alice has gone too (docs/OFFLINE_DELIVERY.md).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_message_to_an_offline_device_is_carried_and_delivered_later() {
+    let (da, db, dc) = (tmp("carry-a"), tmp("carry-b"), tmp("carry-c"));
+    let alice = open(&da, "Alice", 0, false).await;
+    let bob = open(&db, "Bob", 0, false).await;
+    let carol = open(&dc, "Carol", 0, false).await;
+    connect_all(&[&alice, &bob, &carol]);
+    let b = alice.add_contact(bob.profile().contact_code).unwrap();
+    let c = alice.add_contact(carol.profile().contact_code).unwrap();
+    let dm = alice.create_conversation(None, vec![b.id.clone()]).unwrap();
+    let _team = alice.create_conversation(Some("Team".into()), vec![b.id.clone(), c.id.clone()]).unwrap();
+    eventually("bob and carol have the conversations", || bob.conversations().len() == 2 && carol.conversations().len() == 1)
+        .await;
+    assert!(alice.network_status().custodian, "custody is on by default");
+
+    bob.shutdown().await.unwrap();
+    drop(bob);
+    let m = alice.send_message(dm.id.clone(), "are you there?".into(), None, vec![]).await.unwrap();
+    assert_eq!(m.delivery, Delivery::Local);
+    for _ in 0..600 {
+        let now = alice.messages(dm.id.clone(), None, None).unwrap().into_iter().find(|x| x.id == m.id).unwrap();
+        if now.delivery == Delivery::Carried {
+            assert!(now.carried_by >= 1, "{now:?}");
+            break;
+        }
+        assert_eq!(now.delivery, Delivery::Local, "nobody in the chat has it");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let now = alice.messages(dm.id.clone(), None, None).unwrap().into_iter().find(|x| x.id == m.id).unwrap();
+    assert_eq!((now.delivery, now.carried_by), (Delivery::Carried, 1), "carried by Carol");
+    alice.shutdown().await.unwrap();
+    drop(alice);
+
+    // Bob comes back; only Carol is around
+    let bob = open(&db, "Bob", 0, false).await;
+    connect_all(&[&bob, &carol]);
+    for _ in 0..600 {
+        if bob.messages(dm.id.clone(), None, None).unwrap().iter().any(|x| x.body == "are you there?") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(bob.messages(dm.id.clone(), None, None).unwrap().iter().any(|x| x.body == "are you there?"));
+    bob.shutdown().await.unwrap();
+    carol.shutdown().await.unwrap();
+    drop((bob, carol));
+    for dir in [da, db, dc] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
