@@ -174,6 +174,22 @@ impl Study {
         Ok(Study { spec, size, region })
     }
 
+    /// The fewest and most devices a run of the study can have (adoption
+    /// over its range, or at its nominal). A run's cost grows faster than
+    /// its device count (festival: 3× the devices took 15× the time and 7×
+    /// the memory, SIMULATION.md §7.7), so this is what a study's budget
+    /// hinges on.
+    pub fn device_span(&self) -> (usize, usize) {
+        let (lo, hi) = match self.region.params.iter().find(|p| p.name == "adoption") {
+            Some(p) => (p.lo, p.hi),
+            None => {
+                let a = Knobs::nominal(&self.spec).adoption;
+                (a, a)
+            }
+        };
+        (self.spec.devices_at(self.size.people, lo), self.spec.devices_at(self.size.people, hi))
+    }
+
     /// The objective the study judges: (threshold, higher is better).
     pub fn threshold(&self) -> (f64, bool) {
         match self.spec.uq.metric {
@@ -330,7 +346,10 @@ mod tests {
     #[test]
     fn a_study_can_narrow_its_region_and_says_so() {
         let mut s = find("festival").unwrap();
+        let size = Size { people: 2000, duration: crate::tier2::MIN };
+        assert_eq!(Study::new(s.clone(), size).unwrap().device_span(), (40, 2000), "adoption 0.02–1");
         assert!(s.narrow("adoption", 0.02, 0.2).is_ok());
+        assert_eq!(Study::new(s.clone(), size).unwrap().device_span(), (40, 400), "the budget follows");
         let r = s.region().unwrap();
         let p = r.params.iter().find(|p| p.name == "adoption").unwrap();
         assert_eq!((p.lo, p.hi), (0.02, 0.2));
@@ -345,6 +364,7 @@ mod tests {
     fn a_study_is_a_scorecard_row() {
         let s = find("rural-line").unwrap();
         let st = Study::new(s, Size { people: 30, duration: 5 * crate::tier2::MIN }).unwrap();
+        assert_eq!(st.device_span(), (30, 30), "adoption not varied: everyone, always");
         let (threshold, higher_is_better) = st.threshold();
         let plan = crate::uq::Plan {
             points: 4,

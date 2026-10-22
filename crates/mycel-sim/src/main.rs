@@ -456,8 +456,9 @@ fn robust(a: &Args) -> anyhow::Result<()> {
             boots: 200,
             seed: a.seed,
         };
+        let (dlo, dhi) = st.device_span();
         eprintln!(
-            "▶ robust {} at {} people: {} points × {} seeds, Morris r = {}",
+            "▶ robust {} at {} people ({dlo}–{dhi} devices): {} points × {} seeds, Morris r = {}",
             st.spec.name,
             size.people,
             plan.points,
