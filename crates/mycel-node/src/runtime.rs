@@ -256,6 +256,18 @@ impl CallHost for RuntimeCallHost {
     }
 }
 
+/// The keepers (relay members) of every space we hold: always-on devices
+/// we or our contacts chose, the first custodians for our parcels.
+fn keepers_of(node: &Node) -> Vec<SignPk> {
+    let mut out = BTreeSet::new();
+    for s in node.space_ids() {
+        if let Ok(members) = node.with_space(&s, |r| r.members()) {
+            out.extend(members.into_iter().filter(|(_, role)| *role == Role::Relay).map(|(k, _)| k.sign_pk));
+        }
+    }
+    out.into_iter().collect()
+}
+
 fn load_set<T: serde::de::DeserializeOwned + Ord>(store: &DbStore, key: &str) -> Result<BTreeSet<T>> {
     Ok(store.kv_decode::<Vec<T>>(key)?.unwrap_or_default().into_iter().collect())
 }
@@ -749,6 +761,10 @@ impl Runtime {
             }
         }
         let first_seen = load_first_seen(&store, &node.space_ids())?;
+        // Custody (docs/OFFLINE_DELIVERY.md): on unless turned off; our
+        // keepers are the custodians tried first for our parcels.
+        node.set_custodian(store.kv_decode::<bool>("custodian")?.unwrap_or(true));
+        node.set_own_devices(keepers_of(&node));
 
         let (events, _) = broadcast::channel(1024);
         let health_events = events.clone();
@@ -1034,6 +1050,7 @@ impl Runtime {
             addresses: self.node.local_addresses(),
             links: self.node.link_status(),
             peers: paths,
+            custodian: self.node.custodian(),
         }
     }
 
@@ -1304,7 +1321,7 @@ impl Runtime {
     ) -> MessageView {
         let me = self.keys.sign_pk();
         let is_mine = m.author == me;
-        let delivery = if is_mine { self.delivery(space, view, m) } else { Delivery::Delivered };
+        let (delivery, carried_by) = if is_mine { self.delivery(space, view, m) } else { (Delivery::Delivered, 0) };
         MessageView {
             id: m.id.to_string(),
             conversation: space.to_string(),
@@ -1333,13 +1350,15 @@ impl Runtime {
                 .collect(),
             is_mine,
             delivery,
+            carried_by,
         }
     }
 
-    fn delivery(&self, space: &SpaceId, view: &ChatView, m: &mycel_kit_chat::Message) -> Delivery {
+    /// My message's delivery state, and (when carried) by how many devices.
+    fn delivery(&self, space: &SpaceId, view: &ChatView, m: &mycel_kit_chat::Message) -> (Delivery, u32) {
         let me = self.keys.sign_pk();
         let Ok((members, holders)) = self.node.with_space(space, |r| (r.members(), r.holders(&m.id))) else {
-            return Delivery::Local;
+            return (Delivery::Local, 0);
         };
         let others: Vec<SignPk> = members
             .iter()
@@ -1348,13 +1367,17 @@ impl Runtime {
             .collect();
         let idx = view.index_of(&m.id).unwrap_or(usize::MAX);
         if !others.is_empty() && others.iter().all(|o| view.has_read(o, idx)) {
-            Delivery::Read
+            (Delivery::Read, 0)
         } else if !others.is_empty() && others.iter().all(|o| holders.contains(o) || view.has_read(o, idx)) {
-            Delivery::Delivered
+            (Delivery::Delivered, 0)
         } else if !holders.is_empty() {
-            Delivery::Sent
+            (Delivery::Sent, 0)
         } else {
-            Delivery::Local
+            // nobody in the conversation has it: is a sealed copy on its way?
+            match self.node.carried(&m.id) {
+                0 => (Delivery::Local, 0),
+                n => (Delivery::Carried, n.min(u32::MAX as usize) as u32),
+            }
         }
     }
 
@@ -2106,7 +2129,17 @@ impl Runtime {
                 .transpose()?;
             self.touch(space);
         }
+        self.node.set_own_devices(keepers_of(&self.node));
         Ok(())
+    }
+
+    /// Keep sealed messages for other devices whose recipients are offline
+    /// (a custodian), or stop: saved, and applied at once. Parcels already
+    /// held are still delivered.
+    pub fn set_custodian(&self, on: bool) -> Result<NetworkStatus> {
+        self.store.kv_batch_durable(vec![("custodian".to_string(), Some(postcard::to_allocvec(&on)?))])?;
+        self.node.set_custodian(on);
+        Ok(self.network_status())
     }
 
     /// Remove someone (admins), or leave (anyone, when `member` is yourself).

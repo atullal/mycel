@@ -30,6 +30,7 @@ export interface Commands {
   list_nearby: [Record<string, never>, NearbyPeer[]];
   network_status: [Record<string, never>, NetworkStatus];
   set_network_mode: [{ mode: NetworkMode }, NetworkStatus];
+  set_custodian: [{ on: boolean }, NetworkStatus];
   /** Native host only: relaunch the app. */
   restart_app: [Record<string, never>, null];
   list_notices: [Record<string, never>, Notice[]];

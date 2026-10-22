@@ -134,6 +134,11 @@ struct Mode {
 }
 
 #[derive(Deserialize)]
+struct OnOff {
+    on: bool,
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Blob {
     blob: String,
@@ -212,6 +217,7 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
         "list_notices" => ok(rt.notices()),
         "dismiss_notice" => ok(rt.dismiss_notice(args::<DismissNotice>(a)?.notice)?),
         "set_network_mode" => ok(rt.set_network_mode(args::<Mode>(a)?.mode)?),
+        "set_custodian" => ok(rt.set_custodian(args::<OnOff>(a)?.on)?),
         "list_conversations" => ok(rt.conversations()),
         "get_conversation" => ok(rt.conversation(args::<Id>(a)?.id)?),
         "create_conversation" => {

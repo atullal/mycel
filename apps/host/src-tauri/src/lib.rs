@@ -802,6 +802,7 @@ pub fn run() {
             commands::dismiss_notice,
             commands::network_status,
             commands::set_network_mode,
+            commands::set_custodian,
             commands::restart_app,
             commands::open_file,
             commands::list_conversations,

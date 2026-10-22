@@ -1,5 +1,6 @@
 import type { ReactNode, SVGProps } from "react";
 import { PRESENCE_LABEL, type Member, type MessageView, type Presence } from "@mycel/sdk";
+import { deliveryLabel } from "./delivery.ts";
 import "./presence.css";
 
 // ---------------------------------------------------------------------------
@@ -186,18 +187,23 @@ export const Icon = {
 };
 
 // ---------------------------------------------------------------------------
-// Delivery ticks: clock (local), one tick (sent), two (delivered), two filled (read)
+// Delivery ticks: clock (local), clock with a hand-off arrow (carried: sealed
+// copies held by other devices for an offline recipient), one tick (sent),
+// two (delivered), two filled (read)
 
-export function DeliveryMark({ delivery }: { delivery: MessageView["delivery"] }) {
-  const label = {
-    local: "Saved on this device",
-    sent: "Sent",
-    delivered: "Delivered to everyone",
-    read: "Read by everyone",
-  }[delivery];
+export { deliveryLabel };
+
+export function DeliveryMark({ delivery, carriedBy = 0 }: { delivery: MessageView["delivery"]; carriedBy?: number }) {
+  const label = deliveryLabel(delivery, carriedBy);
   return (
     <span className={`mx-tick mx-tick-${delivery}`} title={label} aria-label={label} role="img">
-      {delivery === "local" ? (
+      {delivery === "carried" ? (
+        <svg width="18" height="14" viewBox="0 0 18 14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+          <circle cx="7" cy="7" r="5" />
+          <path d="M7 4.3V7l1.8 1.2" />
+          <path d="M13 7h4M15.3 5.2L17 7l-1.7 1.8" />
+        </svg>
+      ) : delivery === "local" ? (
         <svg width="14" height="14" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
           <circle cx="7" cy="7" r="5" />
           <path d="M7 4.3V7l1.8 1.2" />

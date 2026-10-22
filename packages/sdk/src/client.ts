@@ -94,6 +94,8 @@ export interface Mycel {
     status(): Promise<NetworkStatus>;
     /** `set_network_mode`: takes effect after a restart. */
     setMode(mode: NetworkMode): Promise<NetworkStatus>;
+    /** `set_custodian`: keep sealed messages for offline recipients (at once). */
+    setCustodian(on: boolean): Promise<NetworkStatus>;
     /** `restart_app` (native host only; check `transport.kind === "tauri"`). */
     restart(): Promise<null>;
   };
@@ -268,6 +270,7 @@ export function createMycel(transport: Transport): Mycel {
     network: {
       status: () => call("network_status", none),
       setMode: (mode) => call("set_network_mode", { mode }),
+      setCustodian: (on) => call("set_custodian", { on }),
       restart: () => call("restart_app", none),
     },
     notices: {

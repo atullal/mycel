@@ -134,6 +134,7 @@ interface Msg {
   attachments: string[]; // blob ids
   reactions: Reaction[];
   delivery: Delivery;
+  carriedBy?: number;
 }
 
 interface Conv {
@@ -263,6 +264,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
   const handlers = new Set<(e: MycelEvent) => void>();
   const blocked = new Set<PeerId>();
   let nextMode: NetworkMode = opts.mode;
+  let custodian = true;
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let clock = 0;
 
@@ -324,6 +326,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       reactions: m.deleted ? [] : m.reactions.map((r) => ({ emoji: r.emoji, by: [...r.by] })),
       isMine: m.author === meId,
       delivery: m.delivery,
+      carriedBy: m.delivery === "carried" ? (m.carriedBy ?? 0) : 0,
     };
   }
 
@@ -398,7 +401,7 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
 
   // --- delivery simulation ---------------------------------------------------
 
-  const RANK: Record<Delivery, number> = { local: 0, sent: 1, delivered: 2, read: 3 };
+  const RANK: Record<Delivery, number> = { local: 0, carried: 1, sent: 2, delivered: 3, read: 4 };
 
   /** Move my messages in `c` forward to at least `to`. */
   function advance(c: Conv, to: Delivery, upTo?: string) {
@@ -415,7 +418,16 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
 
   function progressDelivery(c: Conv, messageId: string) {
     later(450 + Math.random() * 300, () => {
-      if (!hasOnlineDevice(c)) return;
+      if (!hasOnlineDevice(c)) {
+        // nobody in the chat is online: other devices take sealed copies
+        const m = c.messages.find((x) => x.id === messageId);
+        if (m && m.delivery === "local") {
+          m.delivery = "carried";
+          m.carriedBy = 3;
+          touch(c);
+        }
+        return;
+      }
       advance(c, "sent", messageId);
       later(700 + Math.random() * 500, () => {
         if (!allOthersOnline(c)) return;
@@ -1265,7 +1277,13 @@ export function createMockTransport(options: MockOptions = {}): MockTransport {
       onlinePeers: [...people.values()].filter((p) => p.contact && p.online).map((p) => p.id),
       nearbyPeers: [...people.values()].filter((p) => p.nearby).length,
       addresses: ["192.0.2.24:51820", "[2001:db8::24]:51820", "127.0.0.1:51820"],
+      custodian,
     }),
+    set_custodian: ({ on }): NetworkStatus => {
+      custodian = on;
+      emit({ type: "networkChanged" });
+      return handlersByCmd.network_status({} as Record<string, never>) as NetworkStatus;
+    },
     list_conversations: () =>
       [...convs.values()].filter((c) => !c.hidden).sort((a, b) => b.activity - a.activity).map(summary),
     get_conversation: ({ id }) => summary(getConv(id)),

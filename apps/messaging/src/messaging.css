@@ -778,6 +778,7 @@
   display: inline-flex;
 }
 .mx-tick-local { opacity: 0.8; }
+.mx-tick-carried { opacity: 0.9; }
 .mx-tick-read { color: var(--read); }
 
 .mx-deleted {

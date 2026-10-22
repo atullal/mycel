@@ -92,11 +92,15 @@ export interface Reaction {
 
 /**
  * - `local`: written locally, not yet seen by any other member or keeper.
+ * - `carried`: no other member or keeper has it yet, but sealed copies are
+ *   held by devices that will hand it on when the recipients come back
+ *   (custodians over the internet, carriers nearby); `carriedBy` of them
+ *   acknowledged. They can't read it.
  * - `sent`: at least one other device (member or keeper) holds it.
  * - `delivered`: every other member has it.
  * - `read`: every other member has read up to it.
  */
-export type Delivery = "local" | "sent" | "delivered" | "read";
+export type Delivery = "local" | "carried" | "sent" | "delivered" | "read";
 
 export interface MessageView {
   id: MessageId;
@@ -114,6 +118,8 @@ export interface MessageView {
   isMine: boolean;
   /** Only meaningful for my own messages. */
   delivery: Delivery;
+  /** With `delivery: "carried"`: how many devices hold a sealed copy. */
+  carriedBy?: number;
 }
 
 /** Messages around one (`messages_around`), oldest -> newest. */
@@ -206,6 +212,8 @@ export interface NetworkStatus {
   addresses: string[];
   links: LinkStatus[];
   peers: PeerPaths[];
+  /** This device keeps sealed messages for others whose recipients are offline. */
+  custodian?: boolean;
 }
 
 // ---------------------------------------------------------------------------

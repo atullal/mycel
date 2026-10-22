@@ -395,7 +395,7 @@ const MessageRow = memo(function MessageRow({
               <time dateTime={new Date(m.sentAt).toISOString()} title={new Date(m.sentAt).toLocaleString()}>
                 {formatClock(m.sentAt)}
               </time>
-              {m.isMine && !m.deleted && <DeliveryMark delivery={m.delivery} />}
+              {m.isMine && !m.deleted && <DeliveryMark delivery={m.delivery} carriedBy={m.carriedBy} />}
             </span>
           </div>
 

@@ -942,3 +942,14 @@
     display: none;
   }
 }
+
+/* Network panel: "Carry for others" (custody) */
+.p-toggle {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+.p-toggle input {
+  accent-color: var(--accent, currentColor);
+}

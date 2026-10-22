@@ -202,6 +202,39 @@ function ModeSwitch({ status }: { status: NetworkStatus }) {
   );
 }
 
+/** Keep sealed messages for other devices whose recipients are offline. */
+function CustodySwitch({ status }: { status: NetworkStatus }) {
+  const mycel = useMycel();
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  if (status.custodian === undefined) return null;
+  const toggle = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await mycel.network.setCustodian(!status.custodian);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <section className="p-card">
+      <h4>Carry for others</h4>
+      <label className="p-toggle">
+        <input type="checkbox" checked={status.custodian} disabled={busy} onChange={() => void toggle()} />
+        <span>Hold messages for people who are offline</span>
+      </label>
+      <p className="p-help">
+        Sealed copies only: this device can't read them or see who sent them, and keeps at most 32 MB for a few days.
+        Turn it off on a metered connection or a low battery.
+      </p>
+      {err && <p className="p-error">{err}</p>}
+    </section>
+  );
+}
+
 export function NetworkPanel() {
   const { status, error } = useNetwork();
   const { contacts } = useContacts();
@@ -242,6 +275,7 @@ export function NetworkPanel() {
       </dl>
 
       <ModeSwitch status={status} />
+      <CustodySwitch status={status} />
 
       <section className="p-card">
         <h4>Paths</h4>

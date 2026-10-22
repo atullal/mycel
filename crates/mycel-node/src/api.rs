@@ -116,6 +116,12 @@ pub struct Reaction {
 pub enum Delivery {
     /// Written locally, not yet seen by any other member or keeper.
     Local,
+    /// No other member or keeper has it yet, but sealed copies are held by
+    /// devices that will hand it on when the recipients come back
+    /// (custodians over the internet, store-and-forward carriers nearby):
+    /// [`MessageView::carried_by`] of them acknowledged custody. They can't
+    /// read it (docs/OFFLINE_DELIVERY.md).
+    Carried,
     /// At least one other device (member or keeper) holds it.
     Sent,
     /// Every other member has it.
@@ -142,6 +148,10 @@ pub struct MessageView {
     pub is_mine: bool,
     /// Only meaningful for my own messages.
     pub delivery: Delivery,
+    /// With [`Delivery::Carried`]: how many devices hold a sealed copy for
+    /// the recipients (0 otherwise).
+    #[serde(default)]
+    pub carried_by: u32,
 }
 
 /// Messages around one (`messages_around`), oldest → newest.
@@ -182,6 +192,10 @@ pub struct NetworkStatus {
     pub links: Vec<LinkStatus>,
     /// How each reachable peer can be reached, and which path is in use.
     pub peers: Vec<PeerPaths>,
+    /// This device keeps sealed messages for others whose recipients are
+    /// offline (a custodian; `set_custodian`).
+    #[serde(default)]
+    pub custodian: bool,
 }
 
 /// Paths to one peer.

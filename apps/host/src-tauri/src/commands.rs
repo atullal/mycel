@@ -87,6 +87,11 @@ pub async fn set_network_mode(rt: State<'_, Rt>, mode: NetworkMode) -> Res<Netwo
     rt.set_network_mode(mode).map_err(err)
 }
 
+#[tauri::command]
+pub async fn set_custodian(rt: State<'_, Rt>, on: bool) -> Res<NetworkStatus> {
+    rt.set_custodian(on).map_err(err)
+}
+
 /// Relaunch the app (the network mode is fixed while running).
 #[tauri::command]
 pub fn restart_app(app: tauri::AppHandle) {
