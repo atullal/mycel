@@ -157,6 +157,23 @@ impl State {
         }
     }
 
+    /// Whether to ask custodian `c` for our mail now (not within
+    /// [`FETCH_GAP`] of the last time); if so, noted. The record is bounded:
+    /// with [`FETCHED_MAX`] custodians asked recently, no more are asked.
+    fn note_fetch(&mut self, c: SignPk) -> bool {
+        if self.fetched.get(&c).is_some_and(|t| t.elapsed() < FETCH_GAP) {
+            return false;
+        }
+        if self.fetched.len() >= FETCHED_MAX {
+            self.fetched.retain(|_, t| t.elapsed() < FETCH_GAP);
+            if self.fetched.len() >= FETCHED_MAX {
+                return false;
+            }
+        }
+        self.fetched.insert(c, Instant::now());
+        true
+    }
+
     /// A delivery to `dst` failed: try again later, backing off.
     fn retry_later(&mut self, dst: SignPk) {
         let now = Instant::now();
@@ -215,13 +232,7 @@ impl Inner {
             } else {
                 c.directory.remove(&peer);
             }
-            let fetch = trusted && custodian && c.fetched.get(&peer).is_none_or(|t| t.elapsed() >= FETCH_GAP);
-            if fetch {
-                if c.fetched.len() >= FETCHED_MAX {
-                    c.fetched.retain(|_, t| t.elapsed() < FETCH_GAP);
-                }
-                c.fetched.insert(peer, Instant::now());
-            }
+            let fetch = trusted && custodian && c.note_fetch(peer);
             (fetch, c.vault.has_mail(&peer) && !c.delivering.contains(&peer))
         };
         let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
@@ -301,7 +312,18 @@ impl Inner {
                 continue;
             }
             self.custody.lock().stats.parcels_received += 1;
-            let Ok(o) = super::open(&self.keys, &p) else { continue };
+            let Ok(o) = super::open(&self.keys, &p) else {
+                // Addressed to us in a format we read, yet it doesn't open:
+                // junk (anyone may deposit for anyone). Receipt it, so the
+                // custodian drops it instead of pushing it again on every
+                // retry and fetch for days: without this, a junk deposit
+                // would cost us its size over and over on a metered link.
+                if p.version == super::PARCEL_V1 && p.dst == self.keys.sign_pk() {
+                    self.custody.lock().note_received(id);
+                    receipts.push(Receipt::sign(&self.keys, id));
+                }
+                continue;
+            };
             opened += 1;
             // (an unknown payload kind is refused unread, but it was
             // delivered: the receipt stops the custodians keeping it)
@@ -399,6 +421,15 @@ async fn candidates(inner: &Arc<Inner>, dst: SignPk) -> Vec<(SignPk, Tier)> {
     let volunteers = find(inner, dst).await;
     let peers = inner.peers.lock().clone();
     let online = |k: &SignPk| peers.get(k).is_some_and(crate::PeerState::online);
+    // (a co-member whose last hello said it keeps no custody would only
+    // refuse: don't spend one of the attempts on it)
+    let serves = |k: &SignPk| {
+        peers
+            .get(k)
+            .and_then(|p| p.protocol)
+            .is_none_or(|p| !p.supports(Caps::CUSTODY) || p.advertised.contains(Caps::CUSTODIAN))
+    };
+    let shares: Vec<SignPk> = shares.into_iter().filter(|k| serves(k)).collect();
     select(&dst, &me, &own, &shares, &volunteers, &online, MAX_ATTEMPTS)
 }
 
@@ -453,7 +484,13 @@ async fn deposit(inner: &Arc<Inner>, peer: SignPk, space: SpaceId) -> Result<()>
             Err(_) => inner.custody.lock().stats.deposits_failed += 1,
         }
     }
-    inner.custody.lock().outbox.settle(&id);
+    // (if the member synced live while we deposited, withdraw it again)
+    let synced = inner.custody.lock().outbox.settle(&id);
+    if let Some(d) = synced {
+        for c in d.custodians {
+            tokio::spawn(release_at(inner.clone(), c, id, d.secret));
+        }
+    }
     Ok(())
 }
 
@@ -764,17 +801,24 @@ pub(crate) async fn serve(
             let custodians = {
                 let mut c = inner.custody.lock();
                 if c.find_rate.take(peer, now) {
-                    let mut v = c.directory.closest(&target, FIND_MAX);
+                    let n = c.directory.len();
+                    let mut v = c.directory.closest(&target, n);
                     if c.vault.serving() {
                         v.push(inner.keys.sign_pk());
                         v.sort_unstable_by_key(|k| super::distance(&target, k));
-                        v.truncate(FIND_MAX);
                     }
                     v
                 } else {
                     Vec::new()
                 }
             };
+            // Never name the devices we share a space with: our directory
+            // holds every custodian we have talked to, our contacts among
+            // them, and an answer to anyone who asks must not hand out our
+            // social graph. (Strangers that dialed us, and volunteers we
+            // found, are not contacts; we and they are custodians in public.)
+            let custodians: Vec<SignPk> =
+                custodians.into_iter().filter(|k| !inner.shares_space(k)).take(FIND_MAX).collect();
             send(&mut tx, &Msg::Found { custodians }).await?;
             tx.finish()?;
         }
@@ -791,7 +835,7 @@ pub(crate) async fn run(inner: Arc<Inner>) {
     loop {
         tokio::time::sleep(TICK).await;
         let now = wall_ms();
-        let due: Vec<SignPk> = {
+        let due: Vec<(SignPk, Option<Instant>)> = {
             let mut c = inner.custody.lock();
             if !c.enabled {
                 continue;
@@ -799,14 +843,22 @@ pub(crate) async fn run(inner: Arc<Inner>) {
             c.vault.tick(now);
             c.outbox.expire(now);
             let at = Instant::now();
-            let mut due: Vec<SignPk> = c
-                .vault
+            c.vault
                 .recipients()
                 .into_iter()
                 .filter(|d| !c.delivering.contains(d))
-                .filter(|d| c.retry.get(d).is_none_or(|(t, _)| *t <= at))
-                .collect();
-            due.truncate(DELIVERIES_PER_TICK);
+                .map(|d| (d, c.retry.get(&d).map(|(t, _)| *t)))
+                .filter(|(_, t)| t.is_none_or(|t| t <= at))
+                .collect()
+        };
+        // Fair turns: recipients we share a space with first (the parcels
+        // our contacts left with us), then whoever has waited longest, so a
+        // flood of parcels for made-up recipients can't starve anyone.
+        let due: Vec<(SignPk, Option<Instant>, bool)> =
+            due.into_iter().map(|(d, t)| (d, t, inner.shares_space(&d))).collect();
+        let due = super::delivery_order(due, DELIVERIES_PER_TICK);
+        let due: Vec<SignPk> = {
+            let mut c = inner.custody.lock();
             for d in &due {
                 // (a first try is due now; after it, the schedule backs off)
                 if !c.retry.contains_key(d) {
@@ -833,19 +885,15 @@ pub(crate) async fn run(inner: Arc<Inner>) {
 }
 
 /// Ask the custodians closest to our own key (where senders put our mail
-/// when they know nobody better) whether they have anything for us.
+/// when they know nobody better) whether they have anything for us: all
+/// that a lookup names ([`FIND_MAX`]), not only the closest
+/// [`DEFAULT_COPIES`]: a sender tries volunteers down that list, past the
+/// offline ones, so its copies often land further down. (A fetch from a
+/// custodian holding nothing for us is one round trip.)
 async fn fetch_mine(inner: Arc<Inner>) {
     let me = inner.keys.sign_pk();
-    let copies = inner.custody.lock().copies;
-    for c in find(&inner, me).await.into_iter().take(copies) {
-        let go = {
-            let mut st = inner.custody.lock();
-            let go = st.fetched.get(&c).is_none_or(|t| t.elapsed() >= FETCH_GAP);
-            if go {
-                st.fetched.insert(c, Instant::now());
-            }
-            go
-        };
+    for c in find(&inner, me).await.into_iter().take(FIND_MAX) {
+        let go = inner.custody.lock().note_fetch(c);
         if go {
             tokio::spawn(fetch_from(inner.clone(), c));
         }

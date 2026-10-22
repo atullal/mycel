@@ -544,18 +544,53 @@ struct Share {
     bytes: u64,
     /// (until, id), soonest-expiring first.
     ids: BTreeSet<(u64, Hash32)>,
+    /// The depositor shared a space with us (at its latest deposit).
+    known: bool,
 }
 
 impl Share {
-    fn add(&mut self, until: u64, id: Hash32, size: u64) {
+    fn add(&mut self, until: u64, id: Hash32, size: u64, known: bool) {
         self.bytes += size;
         self.ids.insert((until, id));
+        self.known = known;
     }
 
     fn remove(&mut self, until: u64, id: &Hash32, size: u64) {
         self.bytes = self.bytes.saturating_sub(size);
         self.ids.remove(&(until, *id));
     }
+}
+
+/// What we hold for one recipient: in total, and per depositor (so a full
+/// mailbox makes room from whoever holds the most of it).
+#[derive(Default)]
+struct Mailbox {
+    bytes: u64,
+    /// (until, id), soonest-expiring first.
+    ids: BTreeSet<(u64, Hash32)>,
+    by_depositor: HashMap<SignPk, Share>,
+}
+
+/// Parcels one deposit may evict at most (bounds what a deposit costs; a
+/// newcomer that would need more is refused).
+const MAX_EVICTIONS: usize = 64;
+
+/// Whose parcel goes to make room for a newcomer `key` (`known`: it shares
+/// a space with us) that would then hold `mine` bytes of the pool: among
+/// `pool` (depositor, known, bytes held in the pool), strangers before
+/// known devices and the biggest first. A stranger only ever evicts a
+/// stranger holding more than it would (a flood evicts itself, never a
+/// small depositor, never a co-member); a known device evicts any
+/// stranger, then a known device holding more than it would.
+fn victim(pool: impl Iterator<Item = (SignPk, bool, u64)>, key: &SignPk, known: bool, mine: u64) -> Option<SignPk> {
+    pool.filter(|(k, _, bytes)| k != key && *bytes > 0)
+        .filter(|(_, k_known, bytes)| match (known, *k_known) {
+            (false, true) => false,
+            (true, false) => true,
+            _ => *bytes > mine,
+        })
+        .max_by_key(|(k, k_known, bytes)| (!k_known, *bytes, *k))
+        .map(|(k, _, _)| k)
 }
 
 /// What a custodian has done, for tests and the network panel.
@@ -585,7 +620,7 @@ pub struct Vault {
     used: u64,
     by_depositor: HashMap<SignPk, Share>,
     by_origin: HashMap<Origin, u64>,
-    by_dst: HashMap<SignPk, Share>,
+    by_dst: HashMap<SignPk, Mailbox>,
     gone: HashSet<Hash32>,
     gone_order: VecDeque<Hash32>,
     depositor_rate: Limiter<SignPk>,
@@ -691,47 +726,69 @@ impl Vault {
         {
             return self.refuse(Refusal::DepositorShare);
         }
-        if self.by_origin.get(&d.origin).copied().unwrap_or(0) + size > self.origin_share(&d.origin) {
+        // (an address's share is against fresh keys, which are free; a
+        // device that shares a space with us isn't one)
+        if !d.known && self.by_origin.get(&d.origin).copied().unwrap_or(0) + size > self.origin_share(&d.origin) {
             return self.refuse(Refusal::OriginShare);
         }
-        if self.by_dst.get(&p.dst).map_or(0, |s| s.bytes) + size > self.cfg.per_recipient {
+        let mut evictions = 0;
+        if !self.room_for_recipient(&p.dst, d, size, &mut evictions) {
             return self.refuse(Refusal::RecipientShare);
         }
-        if !self.make_room(&d.key, size) {
+        if !self.make_room(d, size, &mut evictions) {
             return self.refuse(Refusal::Full);
         }
         let until = p.expires().min(now.saturating_add(self.cfg.max_lifetime));
         self.used += size;
-        self.by_depositor.entry(d.key).or_default().add(until, id, size);
+        self.by_depositor.entry(d.key).or_default().add(until, id, size, d.known);
         *self.by_origin.entry(d.origin).or_default() += size;
-        self.by_dst.entry(p.dst).or_default().add(until, id, size);
+        let m = self.by_dst.entry(p.dst).or_default();
+        m.bytes += size;
+        m.ids.insert((until, id));
+        m.by_depositor.entry(d.key).or_default().add(until, id, size, d.known);
         self.expiry.insert((until, id));
         self.held.insert(id, Held { parcel: p, depositor: d.key, origin: d.origin, until });
         self.stats.stored += 1;
         Deposit::Stored
     }
 
-    /// Room for `size` more bytes from `key`: while the store (or the
-    /// parcel count) is over, the soonest-expiring parcel of whoever holds
-    /// the most goes, as long as that is someone holding more than `key`
-    /// would (fair share: a flood evicts itself, never a small depositor).
-    fn make_room(&mut self, key: &SignPk, size: u64) -> bool {
-        let mine = self.by_depositor.get(key).map_or(0, |s| s.bytes) + size;
-        while self.used + size > self.cfg.capacity || self.held.len() >= self.cfg.max_parcels {
-            let Some((big, bytes)) = self
-                .by_depositor
-                .iter()
-                .filter(|(_, s)| !s.ids.is_empty())
-                .map(|(k, s)| (*k, s.bytes))
-                .max_by_key(|x| x.1)
-            else {
-                return false;
-            };
-            if bytes <= mine || big == *key {
+    /// Room for `size` more bytes for recipient `dst` from `d`: while its
+    /// mailbox is over its share, a parcel of [`victim`]'s for `dst` goes
+    /// (so nobody can lock a recipient's mailbox against others, nor fill
+    /// it with junk that keeps co-members' parcels out).
+    fn room_for_recipient(&mut self, dst: &SignPk, d: &Depositor, size: u64, evictions: &mut usize) -> bool {
+        loop {
+            let Some(m) = self.by_dst.get(dst) else { return size <= self.cfg.per_recipient };
+            if m.bytes + size <= self.cfg.per_recipient {
+                return true;
+            }
+            let mine = m.by_depositor.get(&d.key).map_or(0, |s| s.bytes) + size;
+            let pool = m.by_depositor.iter().map(|(k, s)| (*k, s.known, s.bytes));
+            let Some(v) = victim(pool, &d.key, d.known, mine) else { return false };
+            let Some(&(_, id)) = m.by_depositor.get(&v).and_then(|s| s.ids.first()) else { return false };
+            if *evictions >= MAX_EVICTIONS {
                 return false;
             }
-            let Some(&(_, victim)) = self.by_depositor.get(&big).and_then(|s| s.ids.first()) else { return false };
-            self.drop_held(&victim);
+            *evictions += 1;
+            self.drop_held(&id);
+            self.stats.evicted += 1;
+        }
+    }
+
+    /// Room for `size` more bytes from `d`: while the store (or the parcel
+    /// count) is over, the soonest-expiring parcel of [`victim`] goes (fair
+    /// share: a flood evicts itself, never a small depositor).
+    fn make_room(&mut self, d: &Depositor, size: u64, evictions: &mut usize) -> bool {
+        while self.used + size > self.cfg.capacity || self.held.len() >= self.cfg.max_parcels {
+            let mine = self.by_depositor.get(&d.key).map_or(0, |s| s.bytes) + size;
+            let pool = self.by_depositor.iter().map(|(k, s)| (*k, s.known, s.bytes));
+            let Some(v) = victim(pool, &d.key, d.known, mine) else { return false };
+            let Some(&(_, id)) = self.by_depositor.get(&v).and_then(|s| s.ids.first()) else { return false };
+            if *evictions >= MAX_EVICTIONS {
+                return false;
+            }
+            *evictions += 1;
+            self.drop_held(&id);
             self.stats.evicted += 1;
         }
         true
@@ -754,9 +811,16 @@ impl Vault {
                 self.by_origin.remove(&h.origin);
             }
         }
-        if let Some(s) = self.by_dst.get_mut(&h.parcel.dst) {
-            s.remove(h.until, id, size);
-            if s.ids.is_empty() {
+        if let Some(m) = self.by_dst.get_mut(&h.parcel.dst) {
+            m.bytes = m.bytes.saturating_sub(size);
+            m.ids.remove(&(h.until, *id));
+            if let Some(s) = m.by_depositor.get_mut(&h.depositor) {
+                s.remove(h.until, id, size);
+                if s.ids.is_empty() {
+                    m.by_depositor.remove(&h.depositor);
+                }
+            }
+            if m.ids.is_empty() {
                 self.by_dst.remove(&h.parcel.dst);
             }
         }
@@ -862,7 +926,14 @@ impl Vault {
             return Err(format!("used {} != {}", self.used, sum));
         }
         let dep: u64 = self.by_depositor.values().map(|s| s.bytes).sum();
-        let dst: u64 = self.by_dst.values().map(|s| s.bytes).sum();
+        let dst: u64 = self.by_dst.values().map(|m| m.bytes).sum();
+        for m in self.by_dst.values() {
+            let per: u64 = m.by_depositor.values().map(|s| s.bytes).sum();
+            let n: usize = m.by_depositor.values().map(|s| s.ids.len()).sum();
+            if per != m.bytes || n != m.ids.len() {
+                return Err("a mailbox's books out of step".into());
+            }
+        }
         let org: u64 = self.by_origin.values().sum();
         if dep != sum || dst != sum || org != sum || self.expiry.len() != self.held.len() {
             return Err("shares out of step".into());
@@ -872,6 +943,15 @@ impl Vault {
         }
         Ok(())
     }
+}
+
+/// The recipients a custodian pushes to next, at most `n`, from those due
+/// (recipient, when it was last due (`None`: never tried), whether it
+/// shares a space with us): co-members first, then never tried, then the
+/// longest waiting. A queue, not a map's order: everyone gets a turn.
+pub fn delivery_order<T: Ord + Copy>(mut due: Vec<(SignPk, Option<T>, bool)>, n: usize) -> Vec<SignPk> {
+    due.sort_unstable_by_key(|(k, t, known)| (!known, *t, *k));
+    due.into_iter().take(n).map(|(k, _, _)| k).collect()
 }
 
 // ───────────────────────────── selection ─────────────────────────────
@@ -1044,6 +1124,9 @@ pub struct Outbox {
     parcels: HashMap<Hash32, Deposited>,
     order: VecDeque<Hash32>,
     by_item: HashMap<Hash32, Vec<Hash32>>,
+    /// Parcels still being deposited when their member synced live: to
+    /// release once depositing is over.
+    synced: HashSet<Hash32>,
 }
 
 impl Outbox {
@@ -1087,18 +1170,23 @@ impl Outbox {
     }
 
     /// Depositing `id` is over: kept if someone took it, else forgotten (so
-    /// what it carried goes in the next parcel).
-    pub fn settle(&mut self, id: &Hash32) {
+    /// what it carried goes in the next parcel). If its member synced live
+    /// meanwhile, it is returned (to release at the custodians that took it).
+    pub fn settle(&mut self, id: &Hash32) -> Option<Deposited> {
         let keep = match self.parcels.get_mut(id) {
             Some(d) => {
                 d.pending = false;
                 !d.custodians.is_empty()
             }
-            None => return,
+            None => return None,
         };
+        if self.synced.remove(id) {
+            return self.remove(id).filter(|d| !d.custodians.is_empty());
+        }
         if !keep {
             self.remove(id);
         }
+        None
     }
 
     pub fn remove(&mut self, id: &Hash32) -> Option<Deposited> {
@@ -1112,6 +1200,7 @@ impl Outbox {
             }
         }
         self.order.retain(|x| x != id);
+        self.synced.remove(id);
         Some(d)
     }
 
@@ -1135,14 +1224,19 @@ impl Outbox {
     }
 
     /// `dst` synced `space` with us live: the parcels for it are no longer
-    /// needed. Returns them (to release at their custodians).
+    /// needed. Returns them (to release at their custodians); those still
+    /// being deposited are released when that is over ([`Outbox::settle`]).
     pub fn delivered(&mut self, dst: &SignPk, space: &Hash32) -> Vec<(Hash32, Deposited)> {
-        let ids: Vec<Hash32> = self
-            .parcels
-            .iter()
-            .filter(|(_, d)| d.dst == *dst && d.space == *space && !d.pending)
-            .map(|(id, _)| *id)
-            .collect();
+        let mut ids = Vec::new();
+        for (id, d) in &self.parcels {
+            if d.dst == *dst && d.space == *space {
+                if d.pending {
+                    self.synced.insert(*id);
+                } else {
+                    ids.push(*id);
+                }
+            }
+        }
         ids.into_iter().filter_map(|id| self.remove(&id).map(|d| (id, d))).collect()
     }
 

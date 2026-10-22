@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mycel_crypto::{DeviceKeys, SignPk};
+use mycel_crypto::DeviceKeys;
 use mycel_net::custody::{self, Deposit, Refusal, VaultConfig};
 use mycel_net::{CustodyOptions, NetMode, Node, NodeOptions};
 use mycel_sync::automerge::{ROOT, transaction::Transactable};
@@ -205,5 +205,55 @@ async fn a_spammer_is_cut_off_by_the_custodians_budgets() {
     for n in [spammer, c, honest] {
         n.shutdown().await.unwrap();
     }
-    let _: Option<SignPk> = None;
+}
+
+/// Junk deposited for B (anyone may deposit for anyone) is fetched once:
+/// B can't open it, receipts it, and the custodian drops it, instead of
+/// pushing it to B again on every retry and fetch for days.
+#[tokio::test(flavor = "multi_thread")]
+async fn junk_for_a_recipient_is_dropped_after_one_delivery() {
+    let b = node("b", Arc::new(DeviceKeys::generate()), opts(6)).await;
+    let c = node("c", Arc::new(DeviceKeys::generate()), opts(6)).await;
+    let junk = node("junk", Arc::new(DeviceKeys::generate()), opts(6)).await;
+    introduce(&[&b, &c, &junk]);
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let parcel = custody::Parcel {
+        version: custody::PARCEL_V1,
+        dst: b.id(),
+        created: now - now % 60_000,
+        lifetime: 24 * 3_600_000,
+        release: custody::release_hash(&[9; 32]),
+        sealed: vec![0x5a; 64 << 10],
+    };
+    assert_eq!(junk.deposit_parcel(c.id(), parcel).await.unwrap(), Deposit::Stored);
+    b.fetch_custody(c.id()).await;
+    eventually("C dropped the junk on B's receipt", 20, || c.custody_stats().held_parcels == 0).await;
+    let bs = b.custody_stats();
+    assert_eq!((bs.parcels_received, bs.parcels_opened), (1, 0), "{bs:?}");
+    // asking again costs nothing
+    b.fetch_custody(c.id()).await;
+    assert_eq!(b.custody_stats().parcels_received, 1);
+    for n in [b, c, junk] {
+        n.shutdown().await.unwrap();
+    }
+}
+
+/// A `Find` answer never names the answerer's contacts (devices it shares a
+/// space with): its directory holds them, but handing them to whoever asks
+/// would give away its social graph.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lookup_does_not_reveal_the_answerers_contacts() {
+    let a = node("a", Arc::new(DeviceKeys::generate()), opts(6)).await;
+    let v = node("v", Arc::new(DeviceKeys::generate()), opts(6)).await;
+    let s = node("stranger", Arc::new(DeviceKeys::generate()), opts(6)).await;
+    introduce(&[&a, &v, &s]);
+    let _ = space_of(&v, &[&a]).await;
+    eventually("V knows A as a custodian", 10, || v.custody_stats().directory >= 1).await;
+    s.add_custodian_hint(v.id());
+    let found = s.find_custodians(a.id()).await;
+    assert!(found.contains(&v.id()), "the answerer names itself: {found:?}");
+    assert!(!found.contains(&a.id()), "but not its contact: {found:?}");
+    for n in [a, v, s] {
+        n.shutdown().await.unwrap();
+    }
 }

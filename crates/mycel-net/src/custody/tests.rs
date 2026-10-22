@@ -335,6 +335,15 @@ fn the_outbox_tracks_custody_coverage_and_release() {
     o.add(p1, d(vec![e1]));
     o.expire(NOW + 1000);
     assert!(o.is_empty());
+    // a live sync while a parcel is still being deposited: released when
+    // depositing is over, if anyone took it
+    o.add(p1, d(vec![e1]));
+    o.add(p2, d(vec![e2]));
+    assert!(o.ack(&p1, pk(7)));
+    assert!(o.delivered(&dst, &space).is_empty());
+    assert_eq!(o.settle(&p1).map(|d| d.custodians), Some(vec![pk(7)]));
+    assert!(o.settle(&p2).is_none());
+    assert!(o.is_empty());
 }
 
 #[test]
@@ -369,4 +378,107 @@ fn wire_messages_round_trip() {
         let back: Msg = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(format!("{m:?}"), format!("{back:?}"));
     }
+}
+
+/// A recipient's share can't be locked by strangers: a stranger's newcomer
+/// evicts a stranger holding more for that recipient, a co-member's evicts
+/// any stranger's, and nobody evicts a co-member's parcels for a stranger.
+#[test]
+fn a_full_mailbox_makes_room_fairly() {
+    let (junk, small, friend, b, c) = (keys(), keys(), keys(), keys(), keys());
+    let me = c.sign_pk();
+    let cfg = VaultConfig {
+        per_recipient: 100 << 10,
+        per_depositor: 1 << 20,
+        per_origin: 1 << 20,
+        stamp_bits: 0,
+        depositor_burst: 1000,
+        origin_burst: 1000,
+        ..Default::default()
+    };
+    let mut v = Vault::new(cfg);
+    let dj = Depositor { key: junk.sign_pk(), origin: Origin::Ip([1; 16]), known: false };
+    let mut i = 0u8;
+    while v.deposit(&dj, parcel_for(&junk, &b, vec![i; 20_000]).0, 0, &me, NOW) == Deposit::Stored {
+        i += 1;
+    }
+    let junk_held = v.listing(&b.sign_pk(), 64).len();
+    assert!(junk_held >= 4, "{junk_held}");
+    // another stranger with less gets in, at the junk's expense
+    let ds = Depositor { key: small.sign_pk(), origin: Origin::Ip([2; 16]), known: false };
+    assert_eq!(v.deposit(&ds, parcel_for(&small, &b, vec![1; 2_000]).0, 0, &me, NOW), Deposit::Stored);
+    // a co-member gets in too, and its parcels then stay
+    let df = known(friend.sign_pk());
+    for k in 0..4u8 {
+        assert_eq!(v.deposit(&df, parcel_for(&friend, &b, vec![k; 20_000]).0, 0, &me, NOW), Deposit::Stored);
+    }
+    let held = |v: &Vault, who: &DeviceKeys| {
+        v.listing(&b.sign_pk(), 64).iter().filter(|(id, _)| v.held[id].depositor == who.sign_pk()).count()
+    };
+    assert_eq!(held(&v, &friend), 4);
+    for k in 0..8u8 {
+        let _ = v.deposit(&dj, parcel_for(&junk, &b, vec![100 + k; 20_000]).0, 0, &me, NOW);
+    }
+    assert_eq!(held(&v, &friend), 4, "a stranger never evicts a co-member's parcels");
+    assert_eq!(held(&v, &small), 1, "nor a smaller stranger's");
+    v.check().unwrap();
+}
+
+/// The per-address share is against fresh keys; a co-member isn't one.
+#[test]
+fn a_shared_address_does_not_lock_out_co_members() {
+    let (spam, friend, b, c) = (keys(), keys(), keys(), keys());
+    let me = c.sign_pk();
+    let cfg = VaultConfig { per_relay: 60 << 10, stamp_bits: 0, ..Default::default() };
+    let mut v = Vault::new(cfg);
+    let d = Depositor { key: spam.sign_pk(), origin: Origin::Relay, known: false };
+    while v.deposit(&d, parcel_for(&spam, &b, vec![1; 20_000]).0, 0, &me, NOW) == Deposit::Stored {}
+    let other = keys();
+    let d2 = Depositor { key: other.sign_pk(), origin: Origin::Relay, known: false };
+    assert_eq!(
+        v.deposit(&d2, parcel_for(&other, &b, vec![2; 20_000]).0, 0, &me, NOW),
+        Deposit::Refused(Refusal::OriginShare)
+    );
+    let f = Depositor { key: friend.sign_pk(), origin: Origin::Relay, known: true };
+    assert_eq!(v.deposit(&f, parcel_for(&friend, &b, vec![3; 20_000]).0, 0, &me, NOW), Deposit::Stored);
+    v.check().unwrap();
+}
+
+/// One deposit evicts a bounded number of parcels, however small they are.
+#[test]
+fn a_deposit_evicts_a_bounded_number_of_parcels() {
+    let (tiny, big, b, c) = (keys(), keys(), keys(), keys());
+    let me = c.sign_pk();
+    let cfg = VaultConfig {
+        capacity: 200 << 10,
+        per_depositor: 1 << 20,
+        per_depositor_count: 10_000,
+        per_recipient: 1 << 20,
+        per_origin: 1 << 20,
+        stamp_bits: 0,
+        depositor_burst: 100_000,
+        origin_burst: 100_000,
+        ..Default::default()
+    };
+    let mut v = Vault::new(cfg);
+    let dt = Depositor { key: tiny.sign_pk(), origin: Origin::Ip([1; 16]), known: false };
+    let mut i = 0u32;
+    while v.deposit(&dt, parcel_for(&tiny, &b, i.to_le_bytes().to_vec()).0, 0, &me, NOW) == Deposit::Stored {
+        i += 1;
+    }
+    let n = v.used().1;
+    assert!(n > 200, "{n} parcels");
+    let db = Depositor { key: big.sign_pk(), origin: Origin::Ip([2; 16]), known: false };
+    assert_eq!(v.deposit(&db, parcel_for(&big, &b, vec![0; 150_000]).0, 0, &me, NOW), Deposit::Refused(Refusal::Full));
+    assert!(v.stats().evicted <= MAX_EVICTIONS as u64);
+    v.check().unwrap();
+}
+
+/// A custodian's pushes take turns: co-members first, then never tried,
+/// then the longest waiting, whatever order the store keeps them in.
+#[test]
+fn deliveries_take_turns() {
+    let due =
+        vec![(pk(1), Some(30u64), false), (pk(2), Some(10), false), (pk(3), None, false), (pk(4), Some(50), true)];
+    assert_eq!(delivery_order(due, 3), vec![pk(4), pk(3), pk(2)]);
 }
