@@ -247,15 +247,17 @@ pub struct Global {
     conns: Map<NodeId, Time>,
     buffer_at: Time,
     buffer_now: u64,
-    /// [`Role::AttestedLiar`]: per origin, the cheapest announcement it was
-    /// sent of the newest seqno (seq, hops, cost), as received.
+    /// [`Role::AttestedLiar`] (and the adaptive one, from the start): per
+    /// origin, the cheapest announcement it was sent of the newest seqno
+    /// (seq, hops, cost), as received.
     chains: Map<SignPk, Chain>,
     /// For tests: with `Some`, the last announcement heard from each
     /// neighbour, per origin: (neighbour, origin) → (seq, hops, cost).
     pub heard: Option<Map<(NodeId, SignPk), Chain>>,
     /// Neighbours shunned / held down at the last look ([`Shared::shuns`]).
     blamed: Map<NodeId, (bool, bool)>,
-    /// [`Role::AdaptiveLiar`]: when it turns (engine time).
+    /// [`Role::AdaptiveLiar`] and [`Role::AdaptiveAttestedLiar`]: when it
+    /// turns (engine time).
     pub turn_at: Time,
 }
 
@@ -694,11 +696,13 @@ impl Global {
     }
 
     /// What this device does at engine time `now`: its role, except that
-    /// an adaptive liar is honest until it turns, and a one-hop liar after.
+    /// an adaptive liar is honest until it turns, and a one-hop (or
+    /// chain-extending) liar after.
     fn acting(&self, now: Time) -> Role {
         match self.role {
-            Role::AdaptiveLiar if now < self.turn_at => Role::Honest,
+            Role::AdaptiveLiar | Role::AdaptiveAttestedLiar if now < self.turn_at => Role::Honest,
             Role::AdaptiveLiar => Role::Liar,
+            Role::AdaptiveAttestedLiar => Role::AttestedLiar,
             r => r,
         }
     }
@@ -822,7 +826,10 @@ impl Router for Global {
                 if self.role == Role::Replayer && self.old.len() < 200 {
                     self.old.push(a.clone());
                 }
-                if self.role == Role::AttestedLiar && a.cost != mc::INFINITY && a.origin != self.pk {
+                if matches!(self.role, Role::AttestedLiar | Role::AdaptiveAttestedLiar)
+                    && a.cost != mc::INFINITY
+                    && a.origin != self.pk
+                {
                     keep_chain(&mut self.chains, &a);
                 }
                 if let Some(h) = self.heard.as_mut() {

@@ -105,6 +105,11 @@ pub enum Role {
     /// claims to be one hop from everyone and drops everything (tier-2
     /// GLOBAL core only).
     AdaptiveLiar,
+    /// Honest until the plan's turn, as [`Role::AdaptiveLiar`], then a
+    /// [`Role::AttestedLiar`] (the worse lie at full size: the refresh
+    /// hold-down ranks a one-hop liar's lapsing claims last, a chain it
+    /// extends lapses no sooner than the chain; tier-2 GLOBAL core only).
+    AdaptiveAttestedLiar,
     /// Announces every 10 ms.
     Storm,
     /// Re-sends announcements it heard long ago.
@@ -117,7 +122,13 @@ impl Role {
     pub fn drops(self) -> bool {
         matches!(
             self,
-            Role::BlackHole | Role::Liar | Role::AttestedLiar | Role::Dropper | Role::GreyHole | Role::AdaptiveLiar
+            Role::BlackHole
+                | Role::Liar
+                | Role::AttestedLiar
+                | Role::Dropper
+                | Role::GreyHole
+                | Role::AdaptiveLiar
+                | Role::AdaptiveAttestedLiar
         )
     }
 

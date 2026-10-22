@@ -2017,6 +2017,8 @@ fn a_retracted_route_is_not_replaced_by_the_default_route_at_once() {
     // our own packets neither
     assert!(r.send(d, key(1), Bytes::from_static(b"y"), false, 1_020));
     assert!(outcome(&mut r).2.is_empty());
+    // each drop counted once, apart from those with no route
+    assert_eq!((r.stats().dropped_unreachable, r.stats().dropped_no_route), (2, 0));
     // once the retraction has had time to reach everyone, the default route
     let later = 1_000 + RETRACT_HOLD;
     r.tick(later);
@@ -2165,6 +2167,54 @@ fn a_neighbour_whose_routes_keep_expiring_ranks_last() {
     }
 }
 
+/// [`Defences::refresh`]: an honest relay whose routes run through a
+/// one-hop liar downstream loses them on the liar's schedule and retracts
+/// them, but our copies lapse only its forwarding jitter after its own: a
+/// retraction queued longer than that (a busy Bluetooth hop) arrives after
+/// our copy lapsed. Within [`REFRESH_GRACE`] the lapse doesn't count, and
+/// the relay isn't held down; a retraction later than that, or none, and
+/// it is (its routes rank last for 10 minutes).
+#[test]
+fn a_relay_whose_retractions_come_late_is_not_held_down() {
+    for (late, held) in
+        [(Some(1_000), false), (Some(REFRESH_GRACE - 100), false), (Some(REFRESH_GRACE + 1_000), true), (None, true)]
+    {
+        let (relay, honest) = (key(2), key(3));
+        let defences = Defences { refresh: true, ..Defences::NONE };
+        let mut r = Router::new(key(1), Config { defences, ..Config::default() });
+        for n in [relay, honest] {
+            r.set_direct(n, true, 0);
+            r.hop_up(n, 0);
+            r.set_cost(n, 100);
+        }
+        let ok = |_: &Announce| true;
+        let origins: Vec<SignPk> = (20..26).map(key).collect();
+        let far = |o, hops, cost| Announce { scope: 10, ..ann(o, WALL, hops, cost) };
+        for o in &origins {
+            r.on_announce(honest, far(*o, 5, 3_000), 0, WALL, ok);
+            // the relay believes the liar: "2 hops", a near-scope route
+            r.on_announce(relay, far(*o, 1, 1 + HOP_PENALTY + 100), 0, WALL, ok);
+        }
+        r.tick(100);
+        assert!(origins.iter().all(|o| r.next_hop_local(o, 100) == Some(relay)));
+        // our copies lapse (56 s); the relay's retractions come `late` after
+        let lapse = 16_000 * 7 / 2 + 100;
+        r.tick(lapse);
+        assert!(origins.iter().all(|o| r.next_hop_local(o, lapse) != Some(relay)), "lapsed");
+        assert_eq!(r.expired_via.get(&relay).map_or(0, Vec::len), origins.len(), "the cheapest routes lapsed");
+        assert!(!r.is_stale_hop(&relay, lapse), "not judged before the grace");
+        if let Some(late) = late {
+            for o in &origins {
+                r.on_announce(relay, Announce { cost: INFINITY, ..far(*o, 1, 0) }, lapse + late, WALL + lapse, ok);
+            }
+        }
+        let t = lapse + REFRESH_GRACE + 2_000;
+        r.tick(t);
+        assert_eq!(r.is_stale_hop(&relay, t), held, "{late:?}");
+        assert_eq!(r.stats().hops_stale, held as u64, "{late:?}");
+    }
+}
+
 /// The seqno requests in `outs`, by neighbour asked.
 fn seqreqs_to(outs: &[Out]) -> Vec<SignPk> {
     let mut v: Vec<SignPk> =
@@ -2218,6 +2268,57 @@ fn a_loss_asks_the_neighbours_nearest_the_origin_for_a_seqno() {
     let mut c = Config::default();
     c.tune("fanout=0").unwrap();
     assert_eq!(c.seqreq_fanout, 0);
+}
+
+/// The fan-out's two slots go to neighbours as routes are chosen: one whose
+/// routes keep expiring (held down), suspected for the origin, or shunned
+/// is asked after every other that offered a route, however cheap its
+/// claim. Regression: the slots went by raw advertised cost, so a liar
+/// (cheapest by its lie) took one, and two of them left no honest
+/// neighbour asked.
+#[test]
+fn the_seqno_fan_out_asks_held_down_and_suspected_neighbours_last() {
+    let o = key(9);
+    let nbs: Vec<SignPk> = (2..8).map(key).collect();
+    let defences = Defences { refresh: true, aggregate: true, ..Defences::NONE };
+    let asked = |blame: &dyn Fn(&mut Router)| {
+        let mut r = Router::new(key(1), Config { defences, ..Config::default() });
+        for n in &nbs {
+            r.set_direct(*n, true, 0);
+            r.hop_up(*n, 0);
+            r.set_cost(*n, 100);
+        }
+        let ok = |_: &Announce| true;
+        r.on_announce(nbs[0], ann(o, WALL, 1, 100), 10, WALL, ok);
+        r.tick(100);
+        // the cheapest infeasible claims through nbs[1] and nbs[2]
+        for (i, n) in nbs[1..5].iter().enumerate() {
+            r.on_announce(*n, ann(o, WALL, 3, 2_000 + 100 * i as u32), 200, WALL, ok);
+        }
+        blame(&mut r);
+        let mut outs = Vec::new();
+        r.drain(&mut outs);
+        outs.clear();
+        r.on_announce(nbs[0], Announce { cost: INFINITY, ..ann(o, WALL, 1, 0) }, 300, WALL, ok);
+        r.drain(&mut outs);
+        seqreqs_to(&outs)
+    };
+    assert_eq!(asked(&|_| {}), vec![nbs[1], nbs[2]], "by cost when nobody is blamed");
+    let (a, b) = (nbs[1], nbs[2]);
+    let held = move |r: &mut Router| {
+        r.stale.insert(a, 600_000);
+        r.stale.insert(b, 600_000);
+    };
+    assert_eq!(asked(&held), vec![nbs[3], nbs[4]], "held down");
+    let suspected = move |r: &mut Router| {
+        r.suspects.insert(o, vec![(a, 120_000), (b, 120_000)]);
+    };
+    assert_eq!(asked(&suspected), vec![nbs[3], nbs[4]], "suspected for the origin");
+    let shunned = move |r: &mut Router| {
+        r.shunned.insert(a, 120_000);
+        r.shunned.insert(b, 120_000);
+    };
+    assert_eq!(asked(&shunned), vec![nbs[3], nbs[4]], "shunned");
 }
 
 /// One neighbour asking for fresh seqnos of every origin it can name would

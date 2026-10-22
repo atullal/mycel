@@ -123,7 +123,8 @@ pub struct Plan {
     pub bundle_lifetime_ms: Option<u64>,
     /// Buffer and TTL for the baseline routers.
     pub baseline: Option<crate::tier2::dtn::Opts>,
-    /// When [`Role::AdaptiveLiar`]s turn (default: at once).
+    /// When [`Role::AdaptiveLiar`]s and [`Role::AdaptiveAttestedLiar`]s turn
+    /// (default: at once).
     pub turn: Option<Time>,
 }
 
@@ -638,6 +639,17 @@ fn no_loops_in(r: &mut ScenarioResult, what: &str, xs: &[&Run]) {
     let counts: Vec<u64> = xs.iter().filter_map(|x| x.extra.get("loops").and_then(|v| v.as_u64())).collect();
     if !counts.is_empty() {
         let name = format!("packets that came back to a device they had passed (loops){what}");
+        r.at_most(&name, counts.iter().sum::<u64>() as f64, 0.0, "").invariant();
+    }
+}
+
+/// No honest neighbour is held down by the refresh defence (an invariant
+/// where it is checked: an honest relay retracts a route it lost, or it
+/// lapses at both ends together; docs/ROUTING.md). `what` names the runs.
+fn no_honest_hold_downs(r: &mut ScenarioResult, what: &str, xs: &[&Run]) {
+    let counts: Vec<u64> = xs.iter().filter_map(|x| x.extra.get("stale_honest").and_then(|v| v.as_u64())).collect();
+    if !counts.is_empty() {
+        let name = format!("honest neighbours held down for lapsing routes{what}");
         r.at_most(&name, counts.iter().sum::<u64>() as f64, 0.0, "").invariant();
     }
 }
@@ -1594,6 +1606,7 @@ fn churn(o: Opts) -> ScenarioResult {
     let until = warm + dur + 10 * MIN;
     let (cand, _) = compare(&mut r, &o, &w, &plan, until, Some(300), &[Model::Main, Model::StandIn]);
     hold(&mut r, &cand.m, 0.90, 120.0, 20.0);
+    no_honest_hold_downs(&mut r, "", &[&cand]);
     expect(&mut r, &o, false);
     r.note("Each minute 15% of devices switch off and the previous minute's 15% come back (30% toggle). A message is feasible if the oracle finds any path given who was online when; senders retransmit end to end for 10 minutes.");
     r
@@ -1640,6 +1653,10 @@ fn adversaries(o: &Opts) -> Adversaries {
     Adversaries { w, bad, storm, replay, sybil, plan, until }
 }
 
+/// What `adversarial` holds the adaptive chain-extending liar to
+/// (delivery, % of feasible): set below what it measured (TBD).
+const ADAPTIVE_CHAIN_MIN: f64 = 0.0;
+
 fn adversarial(o: Opts) -> ScenarioResult {
     let mut r = ScenarioResult::new(
         "adversarial",
@@ -1665,7 +1682,11 @@ fn adversarial(o: Opts) -> ScenarioResult {
     // acknowledgements they carried), then lying
     let turn = plan.sends.get(plan.sends.len() / 4).map(|s| s.0);
     let adaptive_plan = Plan { roles: bad.iter().map(|b| (*b, Role::AdaptiveLiar)).collect(), turn, ..plan.clone() };
-    let (((clean, liars), adaptive), ((cand, _), syb)) = rayon::join(
+    // ... and turning into the chain-extending liar, the worse lie since
+    // the refresh hold-down (docs/SIMULATION.md §4, fixed 28 and 29)
+    let adaptive_chain_plan =
+        Plan { roles: bad.iter().map(|b| (*b, Role::AdaptiveAttestedLiar)).collect(), turn, ..plan.clone() };
+    let (((clean, liars), (adaptive, adaptive_chain)), ((cand, _), syb)) = rayon::join(
         || {
             rayon::join(
                 || {
@@ -1674,7 +1695,12 @@ fn adversarial(o: Opts) -> ScenarioResult {
                         || run(Model::of(o.candidate), &w, &liar_plan, o.seed, until, None),
                     )
                 },
-                || run(Model::of(o.candidate), &w, &adaptive_plan, o.seed, until, None),
+                || {
+                    rayon::join(
+                        || run(Model::of(o.candidate), &w, &adaptive_plan, o.seed, until, None),
+                        || run(Model::of(o.candidate), &w, &adaptive_chain_plan, o.seed, until, None),
+                    )
+                },
             )
         },
         || {
@@ -1714,8 +1740,16 @@ fn adversarial(o: Opts) -> ScenarioResult {
         90.0,
         "%",
     );
+    r.at_least(
+        "delivery with the same devices honest first, then extending the cheapest chain they were sent and dropping (of feasible)",
+        100.0 * adaptive_chain.m.delivery_ratio,
+        ADAPTIVE_CHAIN_MIN,
+        "%",
+    );
     // the attacked run is checked by `compare`; every other run too
-    no_loops_in(&mut r, ", clean, liar, adaptive-liar and Sybil runs", &[&clean, &liars, &adaptive, &syb]);
+    let every = [&clean, &liars, &adaptive, &adaptive_chain, &syb];
+    no_loops_in(&mut r, ", clean, liar, adaptive-liar and Sybil runs", &every);
+    no_honest_hold_downs(&mut r, ", every run", &[&[&cand], &every[..]].concat());
     r.check(
         "black holes' impossible routes refused",
         o.candidate != Candidate::Global || distrusted > 0,
@@ -1729,7 +1763,7 @@ fn adversarial(o: Opts) -> ScenarioResult {
         r.at_most("honest routes through a black hole at the end", through as f64, 0.0, "").invariant();
     }
     r.headline(format!(
-        "{}: clean {:.0}%, attacked {:.0}%, Sybil gateway {:.0}%, black holes lying plausibly {:.0}% (LFR {:.0}%), honest first then lying {:.0}%",
+        "{}: clean {:.0}%, attacked {:.0}%, Sybil gateway {:.0}%, black holes lying plausibly {:.0}% (LFR {:.0}%), honest first then lying {:.0}% (extending chains {:.0}%)",
         cand.m.model,
         100.0 * clean.m.delivery_ratio,
         100.0 * cand.m.delivery_ratio,
@@ -1737,6 +1771,7 @@ fn adversarial(o: Opts) -> ScenarioResult {
         100.0 * liars.m.delivery_ratio,
         100.0 * liars.lfr.as_ref().map_or(f64::NAN, |c| c.lfr()),
         100.0 * adaptive.m.delivery_ratio,
+        100.0 * adaptive_chain.m.delivery_ratio,
     ));
     let mut lfr_rows = Vec::new();
     for (label, x) in [("black holes, storm, replayer", &cand), ("black holes lying plausibly", &liars)] {
@@ -2468,6 +2503,17 @@ mod tests {
     /// 90 s: the last announcement of `origin` device 0 heard from 1, and
     /// the one 1 heard from 2 (seq, hops, cost).
     fn heard_via(role: Role, origin: NodeId) -> Vec<(Option<Chain>, Option<Chain>)> {
+        heard_via_turning(role, origin, 0, 90)
+    }
+
+    /// [`heard_via`], with an adaptive liar at 1 turning at `turn_at`,
+    /// sampled until `until_s`.
+    fn heard_via_turning(
+        role: Role,
+        origin: NodeId,
+        turn_at: Time,
+        until_s: Time,
+    ) -> Vec<(Option<Chain>, Option<Chain>)> {
         let w = line5();
         let shared = Rc::new(Shared::default());
         let g = GCfg::default();
@@ -2476,6 +2522,7 @@ mod tests {
             r.heard = Some(Map::default());
             if i == 1 {
                 r.role = role;
+                r.turn_at = turn_at;
             }
             r
         });
@@ -2483,7 +2530,7 @@ mod tests {
         let heard = |sim: &Sim<Global>, at: usize, from: NodeId| {
             sim.routers[at].heard.as_ref().and_then(|h| h.get(&(from, key(origin))).copied())
         };
-        (30..=90)
+        (30..=until_s)
             .map(|t| {
                 sim.run(t * SEC);
                 (heard(&sim, 0, 1), heard(&sim, 1, 2))
@@ -2563,5 +2610,52 @@ mod tests {
         let liar: Vec<Chain> =
             heard_via(Role::Liar, 4).iter().filter_map(|x| x.0).filter(|l| l.2 != INFINITY).collect();
         assert!(!liar.is_empty() && liar.iter().all(|l| (l.1, l.2) == (1, ATTESTED_HOP_FLOOR)), "{liar:?}");
+    }
+
+    /// An adaptive liar announces what the honest device would until it
+    /// turns, then the lie of the liar it turns into: one hop at the floor,
+    /// or the chain it was sent extended by one hop at the floor.
+    #[test]
+    fn an_adaptive_liar_is_honest_until_it_turns() {
+        use mycel_net::mesh::core::INFINITY;
+        let turn = 60;
+        let honest = heard_via(Role::Honest, 4);
+        let link = honest.iter().find_map(|x| match *x {
+            (Some(a), Some(b)) if a.0 == b.0 && a.2 != INFINITY && b.2 != INFINITY => Some(a.2 - b.2),
+            _ => None,
+        });
+        let link = link.expect("an honest sample");
+        for (role, lie) in [(Role::AdaptiveLiar, "one hop"), (Role::AdaptiveAttestedLiar, "chain")] {
+            let v = heard_via_turning(role, 4, turn * SEC, 300);
+            // samples are taken each second from 30 s: what 0 heard from 1,
+            // and what 1 heard from 2, of the same seqno and not retracted
+            let pairs = |from: u64, to: u64| -> Vec<(Chain, Chain)> {
+                v.iter()
+                    .zip(30u64..)
+                    .filter(|(_, t)| (from..to).contains(t))
+                    .filter_map(|(x, _)| match *x {
+                        (Some(a), Some(b)) if a.0 == b.0 && a.2 != INFINITY && b.2 != INFINITY => Some((a, b)),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            let before = pairs(30, turn);
+            assert!(!before.is_empty(), "{lie}");
+            for (a, b) in &before {
+                assert_eq!((a.1, a.2), (b.1 + 1, b.2 + link), "{lie}: honest before the turn");
+            }
+            // the origin's next seqnos (every 2 minutes or so here): only
+            // the lie
+            let last = before.iter().map(|(a, _)| a.0).max();
+            let after: Vec<_> = pairs(turn, 301).into_iter().filter(|(a, _)| Some(a.0) > last).collect();
+            assert!(!after.is_empty(), "{lie}");
+            for (a, b) in &after {
+                let want = match role {
+                    Role::AdaptiveLiar => (1, ATTESTED_HOP_FLOOR),
+                    _ => (b.1 + 1, b.2 + ATTESTED_HOP_FLOOR),
+                };
+                assert_eq!((a.1, a.2), want, "{lie}: lying after the turn");
+            }
+        }
     }
 }

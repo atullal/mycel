@@ -163,6 +163,13 @@ const STALE_HOLD: Time = 10 * 60_000;
 const STALE_RANK: u64 = 1 << 40;
 /// Evidence kept per neighbour, and neighbours followed.
 const STALE_EVIDENCE: usize = 2 * STALE_MIN;
+/// A lapse counts toward [`STALE_MIN`] only once this long has passed
+/// without the neighbour retracting the route. An honest relay whose own
+/// route lapsed retracts it, but our copy of its route lapses only its
+/// forwarding jitter (10–50 ms) after its own: a retraction queued longer
+/// than that (behind a busy Bluetooth hop) arrives after our copy lapsed,
+/// and it must not be held down for it.
+const REFRESH_GRACE: Time = 5_000;
 /// Babel's hold time (RFC 8966 §2.8 and §3.5.4): after we retract a route,
 /// packets for that origin don't follow the default route (or the internet,
 /// for others' packets) for this long, unless a feasible route returns.
@@ -661,7 +668,8 @@ pub struct Stats {
     pub dropped_ttl: u64,
     pub dropped_no_route: u64,
     /// Frames for an origin whose route we just retracted, not sent along
-    /// the default route or the internet meanwhile (Babel's hold time).
+    /// the default route or the internet meanwhile (Babel's hold time; not
+    /// counted in `dropped_no_route`).
     pub dropped_unreachable: u64,
     pub dropped_queue: u64,
     pub dropped_too_big: u64,
@@ -834,6 +842,9 @@ enum Next {
     Drop,
     /// The peer to dial failed recently (backing off).
     Unreachable,
+    /// Dropped for Babel's hold time ([`Config::retract_hold`]): counted
+    /// apart from the other drops.
+    Held,
 }
 
 /// Where data for a destination can go *now* (custody transfer).
@@ -1550,6 +1561,10 @@ impl Router {
 
     /// `from` no longer routes to `origin` (as of `seq`).
     fn on_retraction(&mut self, from: SignPk, origin: SignPk, seq: u64, now: Time) {
+        // a lapse it explains in time doesn't count against it
+        if let Some(v) = self.expired_via.get_mut(&from) {
+            v.retain(|(k, t)| !(*k == origin && now.saturating_sub(*t) <= REFRESH_GRACE));
+        }
         let Some(o) = self.origins.get_mut(&origin) else { return };
         let before = o.via.len();
         o.via.retain(|(n, v)| !(*n == from && v.seq <= seq));
@@ -1572,7 +1587,7 @@ impl Router {
             return;
         }
         let targets: Vec<SignPk> = self.direct_up().filter(|k| Some(*k) != except && *k != origin).collect();
-        let asked = self.seqreq_targets(origin, &targets);
+        let asked = self.seqreq_targets(origin, &targets, now);
         let Some(o) = self.origins.get_mut(&origin) else { return };
         if o.fd.is_some() && !o.retracted {
             o.retracted = true;
@@ -1599,16 +1614,23 @@ impl Router {
     /// Of `targets`, whom to ask for a fresh seqno of `origin`
     /// ([`Config::seqreq_fanout`]): the neighbours that offered a route to it
     /// (they are nearer it, and infeasible only because of what we
-    /// advertised), cheapest first; all of `targets` if none did.
-    fn seqreq_targets(&self, origin: SignPk, targets: &[SignPk]) -> Vec<SignPk> {
+    /// advertised), best first as routes are chosen: by [`Router::rank`]
+    /// (a neighbour held down ranks last), and a suspected or shunned one
+    /// behind every other (a liar's cheap claim mustn't take a slot an
+    /// honest neighbour would answer); all of `targets` if none offered.
+    fn seqreq_targets(&self, origin: SignPk, targets: &[SignPk], now: Time) -> Vec<SignPk> {
         let fanout = self.cfg.seqreq_fanout;
         let Some(o) = self.origins.get(&origin).filter(|_| fanout > 0) else { return targets.to_vec() };
-        let mut offered: Vec<(u32, SignPk)> =
-            o.via.iter().filter(|(n, _)| targets.contains(n)).map(|(n, v)| (v.cost, *n)).collect();
+        let mut offered: Vec<((bool, u64, [u8; 32]), SignPk)> = o
+            .via
+            .iter()
+            .filter(|(n, _)| targets.contains(n))
+            .map(|(n, v)| ((self.suspected(&origin, n, now), self.rank(o, n, v, now), n.0), *n))
+            .collect();
         if offered.is_empty() {
             return targets.to_vec();
         }
-        offered.sort_by_key(|(c, n)| (*c, n.0));
+        offered.sort_by_key(|(k, _)| *k);
         offered.into_iter().take(fanout).map(|(_, n)| n).collect()
     }
 
@@ -1844,10 +1866,11 @@ impl Router {
 
     /// [`Defences::refresh`]: our cheapest route to `origin` expired through
     /// `n` (its hop up, the route never retracted): one more origin whose
-    /// route it stopped refreshing. Enough of them, and its routes rank last
-    /// for [`STALE_HOLD`]. Only the cheapest route counts: a route we didn't
-    /// use can lapse for honest reasons (a neighbour that heard the newest
-    /// seqno from us doesn't send it back).
+    /// route it stopped refreshing, unless it retracts it within
+    /// [`REFRESH_GRACE`]. Enough of them, and its routes rank last for
+    /// [`STALE_HOLD`] ([`Router::judge_lapses`]). Only the cheapest route
+    /// counts: a route we didn't use can lapse for honest reasons (a
+    /// neighbour that heard the newest seqno from us doesn't send it back).
     fn route_expired(&mut self, n: SignPk, origin: SignPk, now: Time) {
         if !self.cfg.defences.refresh {
             return;
@@ -1858,15 +1881,33 @@ impl Router {
             v.remove(0);
         }
         v.push((origin, now));
-        let enough = v.len() >= STALE_MIN;
         bounded_insert(&mut self.expired_via, n, v);
-        if enough {
-            if self.stale.get(&n).is_none_or(|t| now >= *t) {
-                self.stats.hops_stale += 1;
-                self.touch_all();
+        self.next_sweep = self.next_sweep.min(now + REFRESH_GRACE);
+    }
+
+    /// [`Defences::refresh`]: a neighbour with lapses to at least
+    /// [`STALE_MIN`] origins that it didn't retract within
+    /// [`REFRESH_GRACE`] is held down until [`STALE_HOLD`] after the latest
+    /// (renewed while its routes keep lapsing).
+    fn judge_lapses(&mut self, now: Time) {
+        let mut held = Vec::new();
+        for (n, v) in &self.expired_via {
+            let matured = v.iter().filter(|(_, t)| now >= t + REFRESH_GRACE);
+            let (count, latest) = matured.fold((0, 0), |(c, l), (_, t)| (c + 1, l.max(*t)));
+            if count >= STALE_MIN {
+                held.push((*n, latest + STALE_HOLD));
             }
-            bounded_insert(&mut self.stale, n, now + STALE_HOLD);
-            self.next_sweep = self.next_sweep.min(now + STALE_HOLD);
+        }
+        for (n, until) in held {
+            match self.stale.get(&n) {
+                Some(t) if *t >= until => continue,
+                Some(t) if now < *t => {}
+                _ => {
+                    self.stats.hops_stale += 1;
+                    self.touch_all();
+                }
+            }
+            bounded_insert(&mut self.stale, n, until);
         }
     }
 
@@ -2462,6 +2503,7 @@ impl Router {
             }
             Next::Wait(key) => self.park(key, f, from, now),
             Next::Drop | Next::Unreachable => self.stats.dropped_no_route += 1,
+            Next::Held => self.stats.dropped_unreachable += 1,
         }
     }
 
@@ -2493,8 +2535,7 @@ impl Router {
                 return Next::Drop;
             }
             if held && from.is_some() {
-                self.stats.dropped_unreachable += 1;
-                return Next::Drop;
+                return Next::Held;
             }
             if self.nbs.get(target).is_some_and(|n| n.direct) {
                 return Next::Drop; // in range but no hop connection yet
@@ -2535,8 +2576,7 @@ impl Router {
             // 4. no internet: the default route, to the gateway with the
             // lowest total cost
             if held {
-                self.stats.dropped_unreachable += 1;
-                return Next::Drop;
+                return Next::Held;
             }
             let first = self
                 .gateway_routes_cached(now)
@@ -2599,7 +2639,7 @@ impl Router {
         match self.next_hop(dst, None, false, now) {
             Next::Via(n) => Toward::Hop(n),
             Next::Wait(_) => Toward::Soon,
-            Next::Drop => Toward::Nowhere,
+            Next::Drop | Next::Held => Toward::Nowhere,
             Next::Unreachable => Toward::Unreachable,
         }
     }
@@ -2906,6 +2946,7 @@ impl Router {
         if self.stale.len() != stale {
             self.touch_all(); // its routes rank as their cost again
         }
+        self.judge_lapses(now);
         self.expired_via.retain(|_, v| {
             v.retain(|(_, t)| now.saturating_sub(*t) < SUSPECT_FOR);
             !v.is_empty()
@@ -2922,6 +2963,8 @@ impl Router {
         next = self.suspects.values().flatten().map(|(_, t)| *t).fold(next, Time::min);
         next = self.shunned.values().copied().fold(next, Time::min);
         next = self.stale.values().copied().fold(next, Time::min);
+        let unjudged = self.expired_via.values().flatten().map(|(_, t)| t + REFRESH_GRACE).filter(|t| *t > now);
+        next = unjudged.fold(next, Time::min);
         next = self.backoff.values().map(|(at, _)| at + DIAL_BACKOFF_MAX).fold(next, Time::min);
         next = self.nbs.values().filter(|n| n.internet()).map(|n| n.last_used + INTERNET_IDLE).fold(next, Time::min);
         self.next_sweep = next;
