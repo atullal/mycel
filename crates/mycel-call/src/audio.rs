@@ -391,15 +391,15 @@ fn cpal_streams(mut ports: AudioPorts) -> Result<(cpal::Stream, cpal::Stream)> {
     }
     let in_ch = in_cfg.channels() as usize;
     let out_ch = out_cfg.channels() as usize;
-    let mut up = Resampler::new(in_cfg.sample_rate().0, SAMPLE_RATE);
-    let mut down = Resampler::new(SAMPLE_RATE, out_cfg.sample_rate().0);
-    let out_ratio = out_cfg.sample_rate().0 as f64 / SAMPLE_RATE as f64;
+    let mut up = Resampler::new(in_cfg.sample_rate(), SAMPLE_RATE);
+    let mut down = Resampler::new(SAMPLE_RATE, out_cfg.sample_rate());
+    let out_ratio = out_cfg.sample_rate() as f64 / SAMPLE_RATE as f64;
 
     let mut mono = Vec::new();
     let mut resampled = Vec::new();
     let on_err = |e| eprintln!("[mycel] audio stream error: {e}");
     let in_stream = input.build_input_stream(
-        &in_cfg.config(),
+        in_cfg.config(),
         move |data: &[f32], _| {
             mono.clear();
             resampled.clear();
@@ -413,7 +413,7 @@ fn cpal_streams(mut ports: AudioPorts) -> Result<(cpal::Stream, cpal::Stream)> {
     let mut pending: Vec<f32> = Vec::new();
     let mut from_call = Vec::new();
     let out_stream = output.build_output_stream(
-        &out_cfg.config(),
+        out_cfg.config(),
         move |data: &mut [f32], _| {
             let frames = data.len() / out_ch;
             // pull enough 48 kHz audio for this many device frames
