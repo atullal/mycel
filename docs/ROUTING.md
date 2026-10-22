@@ -264,20 +264,57 @@ something changes.
     and drops everything to and from it is routed around in 6.6 s, and two
     hops at 20 kB/s with 30 ms of latency and queue drops suspect nothing.
 
-    **Next protocol version: signed route attestations.** Feedback finds a
-    liar only by losing traffic to it first, and only at sources. The
-    planned fix is to sign what relays add: each hop signs (origin, seqno,
-    the hops and cost it advertises, the neighbour it sends to), so a
-    relay can't claim to be nearer than the signed chain it received
-    (SEAD and Ariadne's idea, with our Ed25519 keys). It changes the
-    announcement format and costs a signature per hop, so it waits for the
-    next protocol version; `docs/TRUST.md` §8b. The capability bit is
-    registered (`ROUTE_ATTEST`, `docs/PROTOCOL.md` §4): attested
-    announcements will go only to neighbours whose hop hello has it. That
-    alone would let a lying relay opt out by not advertising the bit, so
-    its downgrade policy (`docs/PROTOCOL.md` §6) is part of the design:
-    once a device has attesting neighbours, routes through hops that don't
-    attest rank below attested ones and serve only as a fallback.
+    **Signed route attestations with bilateral link-cost binding**
+    (`ROUTE_ATTEST`, `mesh/core.rs` `Hop`, `docs/PROTOCOL.md` §3.5).
+    Feedback finds a liar only by losing traffic to it first, and only at
+    sources. So between devices whose hop hellos both have the capability
+    (on by default), each hop of an announcement signs (Ed25519, context
+    `mycel/v2/mesh-attest-hop`) the origin, the announcement's epoch, its
+    position, the cost it advertises, the neighbour it sends to, and its
+    own measured cost to that neighbour. A receiver checks the whole chain
+    from the origin's hop (the origin signs for its real neighbours, so a
+    liar can't mint keys for a short chain) and refuses, distrusting its
+    sender as in item 12, any chain in which a hop advertises less than the
+    hop before it plus the link *that* hop measured, a link under the
+    floor, a device twice, a bad signature, or a hop naming someone other
+    than the next. So a relay can claim neither a shorter chain (SEAD and
+    Ariadne's idea) nor a cheaper link than its upstream measured (the
+    binding the wave-1 measurement showed pays: a chain without it bought
+    nothing against a liar that picks its lie); on its own link to us we
+    take the costlier end. What is left to a liar is the truth and
+    dropping what it attracts, which feedback handles.
+    - *Downgrade policy* (`docs/PROTOCOL.md` §6): a route that came
+      without a verified chain (from a version 1 device, or a liar that
+      stops attesting) ranks behind every usable attested route to the
+      same destination, isn't offered as a QUIC path beside one, and
+      serves only when none is left. Mixed meshes route everyone.
+    - *Bytes.* Hops sign an epoch of the origin's clock, not its seqno
+      (64 s for the near scope, 448 s for the full scope, which refreshes
+      every 128 s; the origin's own signature binds the seqno). Within an
+      epoch a relay sends a neighbour the origin's refreshes without the
+      chain (`A_SAME`, as many bytes as a version 1 announcement) while the
+      chain that neighbour holds from it still bounds its claim: same hops,
+      cost and link not more than 1/8 lower, same hop connection. A
+      receiver that lacks it takes the refresh unattested and asks for the
+      chain once per epoch (a one-hop seqno request, answered to it
+      alone). The price is the replay window: a relay can claim a route it
+      had up to an epoch ago, never a cheaper link than was measured.
+      FLOOD_RESULT
+    - *CPU.* Each hop not seen before costs a signature check; the cache
+      of checked hops (keyed by everything signed and the signature) keeps
+      today's collapse of relayed copies, and copies within an epoch hit
+      it. Checks are budgeted per neighbour (`VERIFY_RATE`, 400/s, burst
+      4×; over it, announcements are dropped, not judged), and a chain
+      request is answered within the same budget. CRYPTO_RESULT
+    - *Considered and not used:* aggregate signatures would shrink chains
+      to one signature, but BLS needs pairings (about 1 ms per check on a
+      phone) and keys of a second kind, and Ed25519 half-aggregation
+      (Chalkias et al., 2021) has no vetted, standardised implementation;
+      Merkle batching of a relay's hops per round costs more per entry
+      (log₂ of the batch × 32 bytes) than a 64-byte signature. Ed25519 batch
+      verification would roughly halve the CPU of long chains, which the
+      cache already keeps low.
+    - LIAR_RESULT
 14. **Short queues under the hops, so control traffic gets through.**
     Announcements, seqno requests, keep-alives and the end-to-end
     connections' acknowledgements share each hop with the bulk data, and
