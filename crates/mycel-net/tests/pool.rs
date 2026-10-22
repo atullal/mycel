@@ -232,3 +232,62 @@ async fn sync_everything_waits_for_a_sync_already_running() {
     alice.shutdown().await.unwrap();
     bob.shutdown().await.unwrap();
 }
+
+/// Regression: a catch-up cut short by its time budget drops
+/// `sync_everything`, and its `JoinSet` aborts the syncs it started. An
+/// aborted sync left its entry in the node's table of running syncs, so
+/// every later sync of that (member, space) joined a run that would never
+/// end: pushes to the member silently did nothing, and once a caller waited
+/// for the running sync, the next catch-up (and pull-to-refresh) hung.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_catch_up_cut_short_leaves_no_sync_behind() {
+    let alice = node(Arc::new(DeviceKeys::generate()), "alice", 0).await;
+    let bob_keys = Arc::new(DeviceKeys::generate());
+    let bob = node(bob_keys.clone(), "bob", 0).await;
+    alice.add_peer_addr(bob.addr());
+    let (space, genesis) = alice.create_space().unwrap();
+    alice.with_space(&space, |r| r.add_member(bob_keys.public(), Role::Writer)).unwrap().unwrap();
+    // Bob goes to sleep (keeping his port, so Alice still knows where he is).
+    let port = bob.addr().ip_addrs().next().unwrap().port();
+    bob.shutdown().await.unwrap();
+    drop(bob);
+    let doc = Replica::new_doc_id();
+    alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "news", "while you slept"))).unwrap().unwrap();
+
+    // A catch-up whose budget runs out mid connect timeout (6 s).
+    let first = tokio::time::timeout(Duration::from_millis(500), alice.sync_everything()).await;
+    assert!(first.is_err(), "the first catch-up was cut short (the dial to bob still waiting)");
+
+    // Bob wakes up on the same port.
+    let mut woke = None;
+    for _ in 0..50 {
+        let mut opts = NodeOptions::new(NetMode::Local, "bob again");
+        opts.port = port;
+        if let Ok(n) = Node::spawn(bob_keys.clone(), opts).await {
+            woke = Some(n);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await; // socket still closing
+    }
+    let bob = woke.expect("bob restarted on his old port");
+    bob.join_space(genesis).unwrap();
+
+    // The next catch-up returns (within about a connect timeout) and delivers.
+    let t = Instant::now();
+    let second = tokio::time::timeout(Duration::from_secs(20), alice.sync_everything()).await;
+    eprintln!("next catch-up finished={} after {:?}", second.is_ok(), t.elapsed());
+    assert!(second.is_ok(), "the next catch-up hung on the aborted sync");
+    assert_eq!(bob.with_space(&space, |r| r.doc_json(&doc)).unwrap(), json!({"news": "while you slept"}));
+
+    // And a local write is pushed to bob again, with nobody asking.
+    alice.with_space(&space, |r| r.change(doc, |d| d.put(ROOT, "news", "and then"))).unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while bob.with_space(&space, |r| r.doc_json(&doc)).unwrap() != json!({"news": "and then"}) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("alice's write was pushed to bob");
+    alice.shutdown().await.unwrap();
+    bob.shutdown().await.unwrap();
+}

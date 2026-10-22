@@ -387,6 +387,24 @@ struct Inflight {
     done: Option<watch::Sender<()>>,
 }
 
+/// Owns a (peer, space) entry in `inflight` from the moment [`sync_once`]
+/// inserts it, and is the only thing that removes it: when the sync ends,
+/// fails, gives up or is cancelled part-way (a dropped `JoinSet`, as when a
+/// background catch-up runs out of time). Removing it drops the `done`
+/// sender, which wakes every caller waiting for this run. Without this, a
+/// cancelled sync left its entry behind and every later sync of the pair
+/// joined a run that would never end.
+struct InflightEntry<'a> {
+    inner: &'a Inner,
+    key: (SignPk, SpaceId),
+}
+
+impl Drop for InflightEntry<'_> {
+    fn drop(&mut self) {
+        self.inner.inflight.lock().remove(&self.key);
+    }
+}
+
 /// Why a sync runs: only some outcomes are signs of loss for the backoff.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Trigger {
@@ -1416,6 +1434,7 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Tri
         }
         return;
     }
+    let _entry = InflightEntry { inner: &inner, key: (peer, space) };
     let _slot = inner.sync_slots.acquire().await;
     let mut busy_retries = 0;
     loop {
@@ -1447,7 +1466,6 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Tri
                 tokio::time::sleep(retry).await;
                 continue;
             }
-            inner.inflight.lock().remove(&(peer, space));
             return;
         }
         let ok = res.is_ok();
@@ -1462,13 +1480,10 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Tri
             inner.mark_fail(peer);
             inner.offer_bundle(peer, space);
         }
-        let mut inflight = inner.inflight.lock();
-        match inflight.get_mut(&(peer, space)) {
+        // Done unless asked to run again (`_entry` removes the entry).
+        match inner.inflight.lock().get_mut(&(peer, space)) {
             Some(running) if running.again && ok => running.again = false,
-            _ => {
-                inflight.remove(&(peer, space));
-                return;
-            }
+            _ => return,
         }
     }
 }
@@ -2034,7 +2049,8 @@ impl Node {
     /// skips them. A sync with a member that is running already (pushed,
     /// periodic, on discovery) is waited for, and runs once more if it
     /// succeeds, so what the member had when this was called has arrived
-    /// when it returns.
+    /// when it returns if that sync and its rerun succeed (best effort
+    /// otherwise: a failed or refused sync isn't tried again here).
     pub async fn sync_everything(&self) {
         let inner = &self.inner;
         let me = self.id();

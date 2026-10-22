@@ -193,10 +193,11 @@ to be reachable as often as it can, and how honestly the app says so:
   would keep the processing task an hour away for an app left often). Each
   catch-up syncs every conversation with every member at once (keepers and
   reachable peers first, peers in failure backoff skipped; a sync with a
-  member that was running already is waited for, and runs once more),
-  then lingers up
-  to 10 s for deliveries from keepers and carriers, stopping 3 s before its
-  budget ends, and saves (`src-tauri/src/background.rs`); iOS's
+  member that was running already is waited for, and runs once more if
+  it succeeds; a sync the budget or iOS cuts short leaves nothing behind
+  for the next catch-up to wait on), then lingers up to 10 s for
+  deliveries from keepers and carriers, stopping 3 s before its budget
+  ends, and saves (`src-tauri/src/background.rs`); iOS's
   expiration handler stops it early. A member who is asleep costs one 6 s
   connect timeout for the whole catch-up, not one per conversation: one
   sleeping member in six conversations measured 6.0 s (36.0 s before; the
@@ -290,7 +291,11 @@ to be reachable as often as it can, and how honestly the app says so:
   the sync of every conversation at once, and that it waits for a sync
   already running (`mycel-net` `tests/pool.rs`: before, it returned at
   once and the catch-up "synced in 0.2 s" before anything arrived, failing
-  the windowless test in 2 of 60 runs; none failed in 100 runs after); the
+  the windowless test in 2 of 60 runs; none failed in 100 runs after, and
+  100 of 100 passed again after the next fix), and that a catch-up cut
+  short leaves no sync behind (an aborted sync used to keep its entry in
+  the table of running syncs, so later pushes to that member did nothing
+  and, once callers waited for running syncs, the next catch-up hung); the
   Kotlin status JSON mapping; that neither iOS Info.plist declares
   `bluetooth-peripheral`; the GATT payload and the hello carrying no name;
   the restricted Bluetooth mode (`mycel-link-ble` `core.rs` and the fake
