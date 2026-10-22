@@ -21,6 +21,7 @@ impl Runtime {
     pub fn network_status(&self) -> NetworkStatus;
     pub fn notices(&self) -> Vec<Notice>;                                  // problems to tell the user about
     pub fn set_network_mode(&self, mode: NetworkMode) -> Result<NetworkStatus>; // lan or internet, from the next start
+    pub fn set_custodian(&self, on: bool) -> Result<NetworkStatus>; // carry sealed messages for offline recipients (at once)
 
     // messaging (chat kit)
     pub fn conversations(&self) -> Vec<ConversationSummary>;               // newest activity first
@@ -80,6 +81,7 @@ impl Runtime {
 | `list_notices` | — | `Notice[]` |
 | `dismiss_notice` | `notice` | `null` |
 | `set_network_mode` | `{ mode }` (`lan` or `internet`) | `NetworkStatus`; takes effect at the next start |
+| `set_custodian` | `{ on }` | `NetworkStatus` (its `custodian` field); keep sealed messages for others whose recipients are offline, from now on, saved ([OFFLINE_DELIVERY.md](OFFLINE_DELIVERY.md)) |
 | `list_conversations` | — | `ConversationSummary[]` |
 | `get_conversation` | `{ id }` | `ConversationSummary` |
 | `create_conversation` | `{ title?, members }` | `ConversationSummary` |
@@ -130,7 +132,7 @@ Errors are rejected promises carrying a human-readable string. It includes the c
 - The SDK's React hook `useTransfer(id)` returns the latest `{ done, total }`.
 
 ## Semantics the UI can rely on
-- **Instant local writes:** `send_message` returns as soon as the message is written locally (`delivery: "local"`). It moves to `sent`, then `delivered`, then `read` as peers sync, and each step emits `conversationUpdated`.
+- **Instant local writes:** `send_message` returns as soon as the message is written locally (`delivery: "local"`). It moves to `sent`, then `delivered`, then `read` as peers sync, and each step emits `conversationUpdated`. While no other member or keeper has it, it may be `carried`: custodians or carriers acknowledged a sealed copy for the offline recipients, and `carriedBy` says how many ([OFFLINE_DELIVERY.md](OFFLINE_DELIVERY.md)).
 - **Direct conversations:** a conversation with exactly one other member and no title is `direct`. Its title is the other person's name.
 - **One chat per person:** two people can each start a direct chat before their devices meet, so one pair can own several two-person spaces. They show as one conversation: `id` is the lowest of its `aliases`, every alias is a valid id, and `threadKey` (from the two signing keys) stays the same whichever spaces exist. Messages stay in the space they were written in (`MessageView.conversation`); new messages and calls go to the lowest space both people can write in, which both devices choose alike. The timeline keeps each space's causal order and never places a message before this device first saw its space, so a space that turns up later can't backdate messages into existing history. Only original private chats merge: requests, declined invitations, anything ever named, marked a group or joined by a third person stay apart (rules: `mycel_kit_chat::thread`).
 - **Administering a direct chat** never splits it: `add_members` starts a new group with both of you and the added people (the direct chat's history is not shared with them; `conversationAdded` announces it); `rename_conversation` and removing the other person are refused; `leave_conversation` leaves every alias, or none if you're the last admin of any; `add_keeper` adds the keeper to every alias you administer. After leaving, the chat's history is one inactive conversation (its `threadKey` differs from a new chat with the same person).

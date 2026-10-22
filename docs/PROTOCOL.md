@@ -115,9 +115,10 @@ one protocol takes the other takes too).
 | `Blob` | 4 | bi | v1 | `BlobReq` → `BlobResp` + raw bytes. New request variants are only ever appended. |
 | `Hello` | 5 | bi | v2 | The dialer's `Hello{caps}`, then the listener's |
 | `SyncV2` | 6 | bi | v2, `SYNC_V2` | One Sync v2 session (`mycel_sync::reconcile::Msg`, `Open` first), opened only to a peer whose hello agreed `SYNC_V2`. A listener that fails after accepting it resets with `0x6d790002` (`SYNC_V2_FAILED`), never with `STREAM_REFUSED`; a device that refuses it all the same is synced with `Sync` and not offered `SyncV2` for 30 min |
+| `Custody` | 8 | bi | v2, `CUSTODY` | One custody exchange (`custody::Msg`, §3.12): a deposit, a fetch or delivery, a release or a lookup, opened only to a peer whose hello agreed `CUSTODY`. A device with custody off refuses it with `STREAM_REFUSED`. (Byte 7 is the Sync v2 stage 3 branch's `Gossip`.) |
 
 **Unknown kinds.** A kind the stream's connection version doesn't have
-(any byte not in the table, or `Hello` or `SyncV2` on a v1 connection, or
+(any byte not in the table, or `Hello`, `SyncV2` or `Custody` on a v1 connection, or
 `SyncV2` at a device without Sync v2) is refused at
 once: the listener stops the receive side and resets the send side with the
 QUIC application error `STREAM_REFUSED` (`0x6d790001`). The opener's next
@@ -400,6 +401,47 @@ format, so a future format 2 store must not be openable by them by
 accident: its migration will rename the tables it changes (redb table
 names), so an old build finds them missing rather than misreading them.
 
+### 3.12 Custody parcels
+
+Offline delivery through the internet ([OFFLINE_DELIVERY.md](OFFLINE_DELIVERY.md),
+`crates/mycel-net/src/custody/`), on stream kind `Custody` behind
+`CUSTODY`. A **parcel** is what a custodian stores:
+
+- `Parcel{version, dst, created, lifetime, release, sealed}`, postcard.
+  `version` 1 (`PARCEL_V1`); `created` is the sender's wall clock in ms,
+  rounded down to the minute; `release` = `BLAKE3("mycel/v1/custody-release"; secret)`.
+- **Id**: `BLAKE3("mycel/v1/custody-id"; version ‖ dst ‖ created ‖ lifetime ‖
+  release ‖ len(sealed) ‖ sealed)` (integers little-endian).
+- **Seal**: `sealed` is a postcard `Lockbox`: HPKE base mode (the lockbox
+  suite) to `dst`'s key-exchange key with info `mycel/v1/custody-seal ‖ dst ‖
+  created ‖ lifetime ‖ release`, over the postcard `Sealed{src, kind,
+  payload, sig}` zero-padded to its PADMÉ size. `sig` is `src`'s signature
+  in context `mycel/v1/custody-inner` over `dst ‖ created ‖ lifetime ‖
+  release ‖ kind ‖ BLAKE3("mycel/v1/custody-inner"; payload)`. A recipient
+  refuses non-zero padding, a length that isn't a PADMÉ size, or a bad
+  signature. `kind` is a bundle payload kind (§3.6): 1 (`KIND_SPACE_SYNC`,
+  `DtnPayload`) today; an unknown kind is refused unread and still receipted.
+- **Receipt**: `{id, sig}`, `sig` by `dst` in context `mycel/v1/custody-receipt` over the id.
+- **Proof of work** (`stamp`, a u64): `BLAKE3("mycel/v1/custody-stamp"; id ‖
+  custodian ‖ stamp)` has at least the custodian's number of leading zero
+  bits (16 by default; 0 for depositors that share a space with it).
+- A custodian refuses a parcel version it doesn't know (`Refusal::Unsupported`):
+  it can't compute the id. A later version takes a new `version` value and
+  new contexts.
+
+Messages (`custody::Msg`, postcard, 4-byte little-endian length; the first
+frame at most 300 KiB, later ones 2 MiB plus 64 KiB):
+
+| Exchange | Opener | Answer |
+|---|---|---|
+| deposit | `Deposit{parcel, stamp}` | `Deposited(Stored \| Duplicate \| Refused(reason))` |
+| fetch | `Fetch` | the delivery rounds below, the custodian listing first |
+| delivery (custodian opens) | `Listing{items: [(id, size)]}` (≤ 64) | `Take{want, receipts}` → `Parcels{parcels}` (≤ 2 MiB) → `Receipts{receipts}`, repeated until an empty `Listing` |
+| release | `Release{id, secret}` | `Released{ok}` |
+| lookup | `Find{target}` | `Found{custodians}` (≤ 8 keys, XOR-closest to `target`) |
+
+`Msg` and `Refusal` variants are only ever appended; a new one needs a capability.
+
 ---
 
 ## 4. Capability registry
@@ -410,11 +452,18 @@ names), so an old build finds them missing rather than misreading them.
 |---|---|---|---|---|
 | 0 | `SYNC_V2` | node | Negotiated set-reconciliation sync: a new stream kind whose cost tracks the difference, not the history | Implemented (stream kind `SyncV2`, `mycel_sync::reconcile`); advertised by default (`Caps::SUPPORTED`) unless `NodeOptions::sync_v2` is off |
 | 1 | `ROUTE_ATTEST` | mesh | Per-hop attestations on route announcements | Registered; future |
-| 2–47 | | | Free, assigned in order | |
+| 2 | (`GOSSIP`) | node | Taken by the Sync v2 stage 3 branch (`v2/w2-sync3`) | Not in this build |
+| 3 | `CUSTODY` | node | Speaks the custody stream (kind 8, §3.12): deposits parcels for offline members with custodians and fetches its own | Implemented; advertised by default unless `CustodyOptions::enabled` is off |
+| 4 | `CUSTODIAN` | node | Keeps parcels for others now. A role, not a shared feature: read from what the peer advertised (`PeerProtocol::advertised`) beside an agreed `CUSTODY` | Implemented; advertised while `Node::custodian()` is on (`set_custodian`) |
+| 5–47 | | | Free, assigned in order | |
 | 48–63 | reserved | | Grease: one random bit per hello, never assigned | |
 
-`Caps::SUPPORTED` (what a build advertises by default) is `SYNC_V2` in
-this build: a bit is added there in the change that implements it.
+`Caps::SUPPORTED` (what a build advertises by default) is `SYNC_V2`,
+`CUSTODY` and `CUSTODIAN` in this build: a bit is added there in the
+change that implements it. The custody bits follow the settings at the
+moment of each hello (`Inner::caps`). **Downgrade policy for `CUSTODY`:**
+it adds a service, not a security property, so a peer that doesn't
+advertise it is simply never asked.
 
 ---
 
@@ -545,6 +594,7 @@ ignored or carried unread.
 | `mesh::tests::hops_negotiate_versions_and_capabilities` | Mesh hops: v2 with shared capabilities between v2 devices, v1 with none to a v1 device |
 | `mesh::tests::bundles_cross_hops_by_their_format` | A carrier carries a v2 bundle of an unknown payload kind, refuses an unknown header version, and a v2 bundle is never offered over a v1 hop (`encode_offer` gives nothing, and the v1 carrier refuses nothing: it was never asked); v1 bundles cross both |
 | `mesh::tests::the_planner_sends_bundles_only_over_hops_that_take_their_format` | Through the planner (`Mesh::send_bundle_as`): a v2 bundle reaches only the v2 neighbour and is never offered to the v1 one; a v1 bundle then reaches both |
+| `custody::tests::*`, `tests/custody.rs`, `version_tests::stream_kinds_per_version` | Parcels open only for their recipient, header bound to the seal, a newer parcel version refused with a typed error; custody messages round-trip; `Custody` (8) exists only on v2 connections; deposits, fetches and receipts between real nodes (OFFLINE_DELIVERY.md §7); fuzzed by `fuzz/fuzz_targets/custody.rs` |
 | `mesh::v1_vectors::*` | Every version 1 encoding byte for byte against vectors printed by main `98d9b7b`: ALPNs, stream kinds, every `SyncMsg` (one carrying a signed op and an envelope), `DtnPayload`, `EphMsg`, every blob request and answer, a contact card and its signature, a signed announcement, a `T_OGMS` pair, a `T_SEQREQ`, a data-frame header and a control frame's, a bundle id and signature, a `K_OFFER` frame, offer answers, a receipt, a carrier summary; and that this build decodes them. Not pinned: the reachability record inside a control frame (pkarr-signed, with a timestamp) |
 | `scripts/v1-compat/run.sh` (by hand, not in CI) | The vectors above printed again by `98d9b7b`'s own code and compared; a node built from `98d9b7b` (or `BASE=dev-2026-10-09-apps`) and one of this build pick version 1, sync a space both ways and fetch each other's cards over loopback (`tests/v1_compat.rs`, ignored in a plain `cargo test`) |
 | `mesh::core::tests::relays_carry_unknown_frame_flags_unchanged`, `mesh::wire::tests::frames_round_trip_with_flags` | End-to-end extension flags survive relaying and fragmentation |
@@ -576,6 +626,10 @@ What versioning does not cover yet, so that no other change relies on it:
   one unreadable item doesn't stop a space's sync.
 - **`ROUTE_ATTEST` ranking** (§6): the downgrade policy above is the rule
   the attestation work must implement; nothing implements it yet.
+- **Custody parcels have no extension blocks**: a later parcel field takes
+  a new parcel version (custodians refuse versions they can't check, as
+  carriers do bundle headers), so it should come with §3.6's extension
+  block design.
 - **Cross-build interop in CI**: `scripts/v1-compat/run.sh` runs a real
   pre-release build against this one, by hand (it builds the old code from
   scratch, minutes). It covers the node protocol only: mesh hops,

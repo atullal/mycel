@@ -92,8 +92,10 @@ their future invites at the network layer) are the alternatives.
 
 1. In **Messages**, start a **New conversation**, pick the other device, and
    send.
-2. The mark next to your message goes from a clock (*saved on this device*)
-   to ticks: *sent* (another device, such as a keeper, holds a copy),
+2. The mark next to your message goes from a clock (*saved on this device*),
+   through a clock with an arrow (*carried*: the recipient is offline and
+   other devices hold a sealed copy for it, §9), to ticks: *sent* (another
+   device in the chat, such as a keeper, holds a copy),
    *delivered* (everyone in the chat has it) and *read* (everyone has opened
    the chat).
 3. Replies, reactions, edits, deletes, typing indicators and group chats
@@ -246,13 +248,27 @@ How this works: [ARCHITECTURE.md](ARCHITECTURE.md) §8–9 and
 
 ## 9. Offline delivery and keepers
 
-Messages wait on the sender until a recipient (or a keeper) gets them.
-Quit Mycel on device B, send from A (the mark stays a clock), reopen B:
-within seconds of the two finding each other the messages arrive and A's
-mark moves to *delivered*.
+When the recipient is offline, other Mycel devices that are online carry
+the message for it. Quit Mycel on device B and send from A: after a few
+seconds (once A's attempt to reach B has failed) the clock gains a small
+arrow, and holding the pointer on it says **"Waiting for the recipient —
+carried by 3 devices"**. Those devices hold a sealed copy: they can't read
+it or see who sent it. They are, in order, your own always-on devices (your
+keepers), devices that share a conversation with B, and other Mycel devices
+whose keys are closest to B's. A can quit now. When B comes back it fetches
+the message from whichever of them it reaches first, and A's mark moves to
+*delivered* the next time A and B (or a keeper) sync.
 
-So the sender must be running when the recipient comes back, unless a
-**keeper** holds the conversation. A keeper is an always-on device that
+If nobody else is online, the message waits on the sender (a plain clock)
+until B, a keeper or a carrier gets it.
+
+**Carry for others.** Your device carries sealed messages for others the
+same way, up to 32 MB, for a few days, and never more than a small share
+for any one sender or recipient. Turn it off in **Network** > **Carry for
+others** (on a metered connection or a low battery, for example).
+
+For delivery that doesn't depend on who else is online, add a
+**keeper** to the conversation. A keeper is an always-on device that
 stores encrypted copies and passes them to members. It can't read them.
 On any computer with Rust and this repository:
 

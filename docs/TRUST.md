@@ -346,6 +346,25 @@ operator, so its trust is fixed here before any code:
   same capability can be a UnifiedPush endpoint at a distributor the user
   chose (also only designed).
 
+## 8f. Custodians (offline delivery through the internet)
+
+Design record: [OFFLINE_DELIVERY.md](OFFLINE_DELIVERY.md). When a live sync
+to a member fails, the sender seals what the member lacks into a **parcel**
+and deposits it with up to 3 custodians over the internet: the sender's own
+devices (its spaces' keepers), devices that share a space with the
+recipient, then volunteers XOR-closest to the recipient's key. Code:
+`crates/mycel-net/src/custody/`.
+
+- **Sealed sender.** The parcel names only the recipient (`dst`), a minute-rounded creation time, a lifetime and a release hash. The sender's key, its signature over the header, the payload kind and the payload are HPKE-sealed to the recipient's key-exchange key (`mycel/v1/custody-seal ‖ header` as info) after PADMÉ padding. The id hashes every field.
+- **They learn:** the recipient key, a size class, timing, and the depositing device's key and address (the QUIC connection: usually the sender). A parcel at rest names no sender. They never see content, the space or its members.
+- **They can't:** read it, alter it (the header is bound to the seal and the id; the payload is AEAD-sealed and signed inside), forge one (the recipient checks the sender's signature and the space's own rules, exactly as for a sync from that sender), or fake delivery (receipts are signed by `dst` and checked against the parcel's `dst`).
+- **Only the recipient fetches.** Listings and parcels go only to the key the QUIC connection is authenticated to, so nobody can drain or enumerate another device's mail; the TLS handshake is the proof of key ownership, and it can't be replayed. Only the sender can withdraw a parcel (its secret's hash is in the header).
+- **Abuse limits** (`VaultConfig`): a 32 MiB store, 256 KiB parcels, 2 MiB and 256 parcels per depositor key (twice for a device sharing a space with the custodian), 8 MiB per IPv4 address or IPv6 /64 (16 MiB for everyone behind the internet relay), 4 MiB per recipient, 8,192 parcels, lifetimes up to 7 days, `created` at most 10 min ahead; deposit rates per key (32, then one per 2 s) and per address (128, then one per 0.5 s); a 16-bit proof of work from depositors sharing no space with the custodian, bound to the parcel and the custodian; when full, room comes only from a depositor holding more than the newcomer would. Lookups and fetches are rate-limited per peer.
+- **No amplification.** Custodians never hand parcels to other custodians; every exchange runs on a QUIC connection whose address the handshake validated; answers to deposits are a few bytes.
+- **Sybil and eclipse.** Keys near a target are cheap to grind, so volunteers alone could be captured. Own devices and co-members are tried first, there are several copies, and a captured custodian can only drop what it holds. Costly node ids and disjoint lookups (S/Kademlia) are not built.
+- **Opt-out.** `set_custodian(false)` refuses deposits at once and drops `CUSTODIAN` from later hellos; already-held parcels are still delivered.
+- **Downgrade.** `CUSTODY` adds a service, not a security property: a peer that doesn't advertise it is simply never asked, and a device that doesn't serve refuses deposits.
+
 ## 9. Code and tests
 
 | Spec section | Code | What the tests cover |
@@ -425,7 +444,9 @@ What this layer does **not** do:
 - **Not post-quantum.** Lockboxes use X25519 and are stored long-term on
   keepers, so they are exposed to harvest-now-decrypt-later attacks.
 - **Metadata.** Keepers see membership keys, authors, sizes and timing;
-  mesh relays and gateways see who talks to whom, sizes and timing (§8b–8c).
+  mesh relays and gateways see who talks to whom, sizes and timing (§8b–8c);
+  custodians see the recipient, the depositing device, a size class and
+  timing (§8f).
   Transport encryption doesn't hide IP addresses or local discovery names,
   and there is no anonymity.
 - `NeedInvite` vs `Denied` reveals whether a node holds a space whose 256-bit

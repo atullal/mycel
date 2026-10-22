@@ -74,6 +74,7 @@ What is built is in [§7](#7-what-is-built).
 | **Ephemeral message** | Sent to members who are online, never stored. | Typing |
 | **Rule** | A deterministic check: may this author make this change, given the causal state? | "messages are at most 16 KiB" |
 | **Keeper** | An always-on, untrusted member with the Relay role: stores ciphertext and passes it on. | A home server, a spare laptop |
+| **Custodian** | Any Mycel device holding a sealed parcel for a member who is offline, without being in the conversation; gives it to that member when it comes back. Learns the recipient, a size class and timing, never content or (from the parcel) the sender. | The recipient's group-mate, a volunteer |
 
 ---
 
@@ -200,6 +201,10 @@ A keeper is a headless Mycel node (`mycel keeper`): the same core, no UI.
 - **Offline delivery:** a sender can post while the recipient is offline and then go offline too; the recipient gets the messages from the keeper.
 - A space can list several keepers. Losing one loses nothing.
 
+### Custodians (offline delivery without a keeper)
+
+Most chats have no keeper. When a live sync to a member fails, the sender seals what the member lacks into a **parcel** (HPKE to the member's key, padded, the sender's key and signature inside) and deposits it with up to 3 **custodians** over the internet: its own devices (its spaces' keepers), devices sharing a space with the recipient, then volunteers XOR-closest to the recipient's key (a Kademlia-style directory of custodians each device has met; no index). The recipient asks custodians for its mail on connecting, and custodians push to it; only the key on the other end of the QUIC connection gets its parcels. Receipts drop copies. Strict per-depositor, per-address and per-recipient limits, rate limits and a proof of work from strangers keep it fair; a device can turn custody off. The app shows such a message as **carried by n devices** (`Delivery::Carried`) instead of a clock. Design record: [OFFLINE_DELIVERY.md](OFFLINE_DELIVERY.md).
+
 ---
 
 ## 5. Messaging on these primitives
@@ -211,7 +216,7 @@ A keeper is a headless Mycel node (`mycel keeper`): the same core, no UI.
 | Read receipts and delivery state | `Receipt` ops in the feed |
 | Files and media | Blobs, encrypted per attachment |
 | Typing | Ephemeral messages |
-| Offline delivery | Peers, keepers and store-and-forward carriers |
+| Offline delivery | Peers, keepers, store-and-forward carriers (radio and LAN neighbours) and custodians (over the internet) |
 | Calls | `mycel-call` and `mycel-video` legs between members |
 | Rules | Writers post; authors edit and delete their own messages (reducer); admins manage membership and the title |
 
@@ -240,7 +245,7 @@ A keeper is a headless Mycel node (`mycel keeper`): the same core, no UI.
 
 | Layer | Built |
 |---|---|
-| **L0 Network** | Iroh 1.3 QUIC dialed by key, multipath, three network modes (`internet`, `lan`, `local`). Discovery by mDNS, by Bonjour on iOS, by contact-code address hints, and by pkarr records (n0 DNS relay, Mainline DHT). Links as custom transports with live failover: peer-to-peer Wi-Fi (AWDL) on macOS and iOS, Bluetooth LE (CoreBluetooth on macOS and iOS, BlueZ on Linux), and an interface link on Unix, with opt-in Wi-Fi Direct group formation on Linux. **One pooled connection per peer** (ALPN `mycel/node/2`, or `mycel/2` with a pre-release build; versions negotiated in the handshake, capabilities in a hello: PROTOCOL.md) with every sync, card, ephemeral message and blob request as its own prioritised QUIC stream; calls on `mycel/call/2` (`mycel/call/1` with pre-release builds). **Bandwidth aggregation** over comparable paths; Bluetooth stays a backup. **Mesh** (§8): multi-hop relaying through nearby devices over any link, signed Babel-style distance-vector routes, up to 3 routes per destination as separate aggregated QUIC paths, relay budgets. **Global routing** (§9): gateways, signed reachability records in the DHT and the n0 relay, store-and-forward bundles with custody, mailboxes and receipts. Resource limits on everything a peer sends (TRUST.md §8d). |
+| **L0 Network** | Iroh 1.3 QUIC dialed by key, multipath, three network modes (`internet`, `lan`, `local`). Discovery by mDNS, by Bonjour on iOS, by contact-code address hints, and by pkarr records (n0 DNS relay, Mainline DHT). Links as custom transports with live failover: peer-to-peer Wi-Fi (AWDL) on macOS and iOS, Bluetooth LE (CoreBluetooth on macOS and iOS, BlueZ on Linux), and an interface link on Unix, with opt-in Wi-Fi Direct group formation on Linux. **One pooled connection per peer** (ALPN `mycel/node/2`, or `mycel/2` with a pre-release build; versions negotiated in the handshake, capabilities in a hello: PROTOCOL.md) with every sync, card, ephemeral message and blob request as its own prioritised QUIC stream; calls on `mycel/call/2` (`mycel/call/1` with pre-release builds). **Bandwidth aggregation** over comparable paths; Bluetooth stays a backup. **Mesh** (§8): multi-hop relaying through nearby devices over any link, signed Babel-style distance-vector routes, up to 3 routes per destination as separate aggregated QUIC paths, relay budgets. **Global routing** (§9): gateways, signed reachability records in the DHT and the n0 relay, store-and-forward bundles with custody, mailboxes and receipts. **Custodians**: sealed parcels for offline members deposited over the internet with own devices, co-members and XOR-closest volunteers, fetched only by their recipient (capability `CUSTODY`, [OFFLINE_DELIVERY.md](OFFLINE_DELIVERY.md)). Resource limits on everything a peer sends (TRUST.md §8d, §8f). |
 | **L1 Identity** | Device keys (iOS Keychain; a private `identity.key` file elsewhere), kept out of iOS and Android backups; profile locks; signed contact cards and contact codes; contacts; names from signed profiles. |
 | **L2 Trust** | Membership DAG, deterministic resolution (seniority, revocation wins, cutoffs), epochs with HPKE lockboxes, self-healing rotation, leave. |
 | **L3 Data** | Docs (Automerge), Feeds (causal, deterministic order), Blobs (encrypted, any size, streamed to disk, resumable, hash-checked; up to 16 MiB pushed to members, bigger ones pulled on demand **from every member that has them at once**), ephemeral messages, redb storage with batched writes, restore on start, delivery tracking, cursor paging and local search. |
@@ -273,7 +278,8 @@ contact traces: [SIMULATION.md](SIMULATION.md), [BENCHMARKS.md](BENCHMARKS.md).
 - **Ordering** of messages written offline is by when each device first saw them, so two devices can show concurrent messages in a different order.
 - **Notifications:** desktop notification centres can't take back an alert once shown.
 - **Requests:** a stranger's request declined to make room for others stays stored (left, not deleted).
-- **Metadata:** keepers, relays and gateways see who talks to whom, sizes and timing (TRUST.md §8b–8c).
+- **Metadata:** keepers, relays and gateways see who talks to whom, sizes and timing (TRUST.md §8b–8c); a custodian sees the recipient, the depositing device, a size class and timing (§8f).
+- **Custodians** keep parcels in memory (a restart loses them; other copies remain), and "own devices" are the keepers of one's spaces until devices can be paired ([OFFLINE_DELIVERY.md](OFFLINE_DELIVERY.md) §8).
 
 ## 8. Mesh: how it stays decentralised without a direct link
 
@@ -308,7 +314,7 @@ In a six-device ring, each device sends no more announcements than the protocol 
 
 **Short queues under the hops.** Below QUIC, each hop to a device in range is a first-in, first-out send buffer (a radio's, a Bluetooth controller's) that the hop's own congestion control fills until it overflows, and announcements, keep-alives and acknowledgements wait in it with the bulk data. So each device runs CoDel on its hops: when a hop's smoothed RTT stays more than a target (3 packets' time at the hop's rate, 20–250 ms) above its lowest for 100 ms (or the hop's RTT, if longer), it drops a data frame, then more often while that lasts, and the end-to-end connections slow down before the buffer fills. Control frames and packets of 400 bytes or less are never dropped this way, internet hops don't have it, and a queue that a second of dropping doesn't drain is taken as the hop's new base. On a saturated two-hop route at 400 kB/s a small exchange then takes ~50 ms instead of ~560 ms (ROUTING.md §6.14).
 
-**Store-and-forward.** Members of a conversation store and forward for each other through CRDT sync and keepers. Strangers carry bundles too (§9): already-encrypted envelopes, moved along live segments, toward connectivity, held in mailboxes at gateways.
+**Store-and-forward.** Members of a conversation store and forward for each other through CRDT sync and keepers. Strangers carry bundles too (§9): already-encrypted envelopes, moved along live segments, toward connectivity, held in mailboxes at gateways. Between devices that only have the internet, custodians hold sealed parcels instead (§4, "Custodians").
 
 **Measured** (in-memory links, `cargo test -p mycel-net --test mesh -- --nocapture`):
 

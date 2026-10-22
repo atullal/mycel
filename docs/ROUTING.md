@@ -749,6 +749,44 @@ know, and a version 2 bundle is never offered over a version 1 hop.
   spread among carriers like MaxProp's acks, and every carrier holding a
   copy deletes it.
 
+### 7.5 Custodians: store-and-forward over the internet
+
+Carriers (§7.2–7.4) move bundles only between mesh neighbours, and gateways
+never relay internet → internet, so between internet-only devices a message
+to an offline member waited for both to be online at once. Custodians close
+that gap (design record and measurements: [OFFLINE_DELIVERY.md](OFFLINE_DELIVERY.md)).
+
+- **When:** the same trigger as a bundle: a live sync to a member fails or
+  isn't through after 10 s. The node then seals what the member lacks into a
+  parcel (HPKE to the member, PADMÉ-padded, the sender inside the seal) and
+  deposits it with up to 3 custodians.
+- **Who:** the sender's own devices (its spaces' keepers), devices that
+  share a space with the recipient, then volunteers XOR-closest to the
+  recipient's key: each device keeps the custodians it has talked to in
+  Kademlia k-buckets (16 per bucket, old live entries kept) and answers
+  `Find{target}` with its 8 closest; a lookup asks 3, then the 3 closest of
+  what they named. The recipient looks up its own key and finds the same
+  ones, with no index.
+- **Delivery:** the recipient asks every custodian it connects to, and every
+  30 min the 3 closest to its key; a custodian pushes when the recipient
+  connects to it, and dials it (a record lookup) with backoff from 1 min to
+  1 h. Only the key on the other end of the QUIC connection gets its
+  parcels. Receipts drop copies; the sender withdraws its parcels after a
+  live sync.
+- **Not a relay:** custodians never pass parcels on, so there is no
+  internet → internet forwarding and no open proxy; a parcel reaches only its
+  recipient.
+- **Limits:** a 32 MiB store per custodian, per-depositor, per-address and
+  per-recipient shares, rate limits, a proof of work from strangers, and
+  fair-share eviction (TRUST.md §8f).
+- **With carriers:** both run; the app shows a message as carried by the
+  union of custodians that acknowledged a parcel and neighbours that took
+  our bundle.
+- **Measured** (`offline-recipient`, 12 seeds, internet-only devices in
+  four time zones): messages sent while the recipient was offline reach it
+  within 1 h 59.9% of the time instead of 32.7%, within 4 h 85.9% instead of
+  68.5%; p50 latency 1,508 s instead of 4,109 s.
+
 ## 8. Why not route globally over Bluetooth alone
 
 Flat proactive routing costs every device O(N) state and O(N) messages per
@@ -763,7 +801,7 @@ where it works:
 | Local mesh | ≤ 10 hops (≤ 2 most of the time) | signed distance vector | origins in scope |
 | Global lookup | the planet | pkarr records: DHT, n0 relay | none (looked up on demand, cached 60 s, then refreshed while in use) |
 | Distance | the planet | the internet via gateways | open internet hops (≤ 256) |
-| Time | days | custody bundles, PRoPHET, mailboxes | bounded store |
+| Time | days | custody bundles, PRoPHET, mailboxes; internet custodians (§7.5) | bounded store |
 
 ## 9. Library decisions
 
