@@ -201,6 +201,10 @@ impl Experiment for Study {
         }
     }
 
+    fn progress(&self, stage: &str, runs: usize, elapsed_s: f64) {
+        eprintln!("    {}: {stage} done, {runs} runs in {elapsed_s:.0} s", self.spec.name);
+    }
+
     fn run(&self, x: &[f64], seed: u64) -> f64 {
         let mut k = Knobs::nominal(&self.spec);
         for (p, v) in self.region.params.iter().zip(x) {

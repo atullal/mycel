@@ -62,6 +62,10 @@ pub trait Experiment: Sync {
     /// One replication: the metric at parameter values `x` (in the
     /// region's order and units) on `seed`.
     fn run(&self, x: &[f64], seed: u64) -> f64;
+    /// Called after each stage of a study with what it ran so far, so a
+    /// long study can be watched (and its cost per stage read off). The
+    /// default says nothing.
+    fn progress(&self, _stage: &str, _runs: usize, _elapsed_s: f64) {}
 }
 
 /// How much to run.
@@ -272,11 +276,13 @@ pub fn study(e: &dyn Experiment, plan: &Plan) -> anyhow::Result<Study> {
     let qn: Vec<f64> = region.params.iter().zip(&xn).map(|(p, x)| p.unit_of(*x)).collect();
     let nominal = replicate(e, plan, std::slice::from_ref(&qn), std::slice::from_ref(&xn), &plan.seeds).remove(0);
     runs += plan.seeds.len();
+    e.progress("nominal", runs, t.elapsed().as_secs_f64());
     // 2. space-filling sample of the joint region
     let qs: Vec<Vec<f64>> = sample::sobol(plan.points, k, plan.seed).iter().map(|u| region.joint(u)).collect();
     let xs: Vec<Vec<f64>> = qs.iter().map(|q| region.values(q)).collect();
     let points = replicate(e, plan, &qs, &xs, &plan.seeds);
     runs += points.len() * plan.seeds.len();
+    e.progress("space-filling points", runs, t.elapsed().as_secs_f64());
     let passing = points.iter().filter(|p| p.pass).count();
     let robust_pass = (passing, points.len(), wilson(passing, points.len(), 1.96));
     let noise = Noise::of(&points);
@@ -289,6 +295,7 @@ pub fn study(e: &dyn Experiment, plan: &Plan) -> anyhow::Result<Study> {
         let tx: Vec<Vec<f64>> = tq.iter().map(|q| region.values(q)).collect();
         let tp = replicate(e, plan, &tq, &tx, &plan.seeds);
         runs += tp.len() * plan.seeds.len();
+        e.progress("Morris trajectories", runs, t.elapsed().as_secs_f64());
         let y: Vec<Vec<f64>> = tp.chunks(k + 1).map(|c| c.iter().map(|p| p.mean).collect()).collect();
         let per_seed: Vec<Vec<Vec<f64>>> =
             tp.chunks(k + 1).map(|c| c.iter().map(|p| p.values.clone()).collect()).collect();
@@ -373,6 +380,7 @@ pub fn study(e: &dyn Experiment, plan: &Plan) -> anyhow::Result<Study> {
         }
         None => None,
     };
+    e.progress("emulator, Sobol indices and worst case", runs, t.elapsed().as_secs_f64());
     let robust = nominal.pass && passing == points.len() && worst_searched.as_ref().is_none_or(|w| w.pass);
     Ok(Study {
         name: e.name(),
@@ -674,6 +682,42 @@ mod tests {
         assert!(s.markdown().contains("not robust"));
         assert!(s.clear_fails > 0, "the corner fails by more than noise");
         assert_eq!(s.worst_sampled_recheck.map(|r| r.1), Some(false), "and again on fresh seeds");
+    }
+
+    /// The toy, reporting each stage it is told about.
+    struct Watched(Toy, std::sync::Mutex<Vec<(String, usize)>>);
+
+    impl Experiment for Watched {
+        fn name(&self) -> String {
+            self.0.name()
+        }
+        fn region(&self) -> &Region {
+            self.0.region()
+        }
+        fn metric(&self) -> String {
+            self.0.metric()
+        }
+        fn run(&self, x: &[f64], seed: u64) -> f64 {
+            self.0.run(x, seed)
+        }
+        fn progress(&self, stage: &str, runs: usize, _elapsed_s: f64) {
+            self.1.lock().unwrap().push((stage.to_string(), runs));
+        }
+    }
+
+    /// A long study says how far it has got after each stage, and the last
+    /// report counts every run, the worst case's confirmation included.
+    #[test]
+    fn a_study_reports_each_stage_as_it_goes() {
+        let e = Watched(toy(), Default::default());
+        let s = study(&e, &plan(60.0)).unwrap();
+        let seen = e.1.into_inner().unwrap();
+        let stages: Vec<&str> = seen.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            stages,
+            ["nominal", "space-filling points", "Morris trajectories", "emulator, Sobol indices and worst case"]
+        );
+        assert_eq!(seen.iter().map(|(_, r)| *r).collect::<Vec<_>>(), [3, 3 + 96, 3 + 96 + 96, s.runs]);
     }
 
     /// When seed noise is most of the spread, the study says so, names no
