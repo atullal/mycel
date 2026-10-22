@@ -132,10 +132,7 @@ fn malformed_expired_oversized_and_off_are_refused() {
     let (big, _) = parcel_for(&a, &b, vec![1; 8000]);
     assert_eq!(v.deposit(&known(a.sign_pk()), big, 0, &me, NOW), Deposit::Refused(Refusal::TooBig));
     let (p, _) = parcel_for(&a, &b, b"x".to_vec());
-    assert_eq!(
-        v.deposit(&known(a.sign_pk()), p.clone(), 0, &me, p.expires() + 1),
-        Deposit::Refused(Refusal::Expired)
-    );
+    assert_eq!(v.deposit(&known(a.sign_pk()), p.clone(), 0, &me, p.expires() + 1), Deposit::Refused(Refusal::Expired));
     assert_eq!(
         v.deposit(&known(a.sign_pk()), p.clone(), 0, &me, NOW - 3600 * 1000),
         Deposit::Refused(Refusal::Malformed),
@@ -209,7 +206,8 @@ fn a_spammer_is_cut_off_by_its_shares_and_rate() {
     }
     assert!(origin_cut);
     // a burst over the rate is refused, and refilled later
-    let mut v = Vault::new(VaultConfig { stamp_bits: 0, depositor_burst: 3, depositor_every_ms: 1000, ..Default::default() });
+    let mut v =
+        Vault::new(VaultConfig { stamp_bits: 0, depositor_burst: 3, depositor_every_ms: 1000, ..Default::default() });
     let d = known(spam.sign_pk());
     let answers: Vec<Deposit> =
         (0..5).map(|i| v.deposit(&d, parcel_for(&spam, &b, vec![i; 10]).0, 0, &me, NOW)).collect();
@@ -240,7 +238,10 @@ fn a_full_store_evicts_from_the_biggest_depositor_only() {
     while v.deposit(&dbig, parcel_for(&big, &b, vec![i; 20_000]).0, 0, &me, NOW) == Deposit::Stored {
         i += 1;
     }
-    assert_eq!(v.deposit(&dbig, parcel_for(&big, &b, vec![99; 20_000]).0, 0, &me, NOW), Deposit::Refused(Refusal::Full));
+    assert_eq!(
+        v.deposit(&dbig, parcel_for(&big, &b, vec![99; 20_000]).0, 0, &me, NOW),
+        Deposit::Refused(Refusal::Full)
+    );
     // the small depositor gets in by evicting the big one's parcels
     for k in 0..3u8 {
         assert_eq!(v.deposit(&dsmall, parcel_for(&small, &b2, vec![k; 20_000]).0, 0, &me, NOW), Deposit::Stored);

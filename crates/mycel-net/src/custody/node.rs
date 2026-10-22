@@ -273,13 +273,8 @@ impl Inner {
     pub(crate) fn carried(&self, item: &Hash32) -> usize {
         let mut by = self.custody.lock().outbox.custodians_of(item);
         if let Some(m) = &self.mesh {
-            let ids: Vec<Hash32> = self
-                .bundle_items
-                .lock()
-                .iter()
-                .filter(|(_, items)| items.contains(item))
-                .map(|(id, _)| *id)
-                .collect();
+            let ids: Vec<Hash32> =
+                self.bundle_items.lock().iter().filter(|(_, items)| items.contains(item)).map(|(id, _)| *id).collect();
             for id in ids {
                 by.extend(m.bundle_carriers(&id));
             }
@@ -369,16 +364,8 @@ fn plan(inner: &Arc<Inner>, peer: SignPk, space: SpaceId) -> Option<(Hash32, Par
     let env_ids: Vec<Hash32> = envelopes.iter().map(|e| e.id()).collect();
     let payload = postcard::to_allocvec(&DtnPayload { space, data: Data { ops, envelopes } }).ok()?;
     let now = super::node::wall_ms();
-    let (parcel, secret) = super::seal(
-        &inner.keys,
-        peer,
-        &keys.kex_pk,
-        mesh::dtn::KIND_SPACE_SYNC,
-        payload,
-        lifetime,
-        now,
-    )
-    .ok()?;
+    let (parcel, secret) =
+        super::seal(&inner.keys, peer, &keys.kex_pk, mesh::dtn::KIND_SPACE_SYNC, payload, lifetime, now).ok()?;
     let id = parcel.id();
     let mut c = inner.custody.lock();
     c.stats.parcels_sealed += 1;
@@ -427,7 +414,12 @@ async fn deposit(inner: &Arc<Inner>, peer: SignPk, space: SpaceId) -> Result<()>
     let t0 = Instant::now();
     let picked = candidates(inner, peer).await;
     if debug() {
-        eprintln!("[custody] parcel {id:?} for {} ({} B): candidates {picked:?} in {:?}", peer.short(), parcel.size(), t0.elapsed());
+        eprintln!(
+            "[custody] parcel {id:?} for {} ({} B): candidates {picked:?} in {:?}",
+            peer.short(),
+            parcel.size(),
+            t0.elapsed()
+        );
     }
     let mut queue: VecDeque<SignPk> = picked.into_iter().map(|(k, _)| k).collect();
     let parcel = Arc::new(parcel);

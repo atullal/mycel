@@ -76,8 +76,9 @@ impl StreamKind {
     /// `version`; `None` for a kind that version doesn't have (the stream
     /// is then refused, see [`crate::version::STREAM_REFUSED`]).
     pub fn on(version: WireVersion, b: u8) -> Option<Self> {
-        Self::from_byte(b)
-            .filter(|k| !matches!(k, StreamKind::Hello | StreamKind::SyncV2 | StreamKind::Custody) || version >= WIRE_V2)
+        Self::from_byte(b).filter(|k| {
+            !matches!(k, StreamKind::Hello | StreamKind::SyncV2 | StreamKind::Custody) || version >= WIRE_V2
+        })
     }
 
     pub fn from_byte(b: u8) -> Option<Self> {

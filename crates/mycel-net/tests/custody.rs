@@ -184,7 +184,9 @@ async fn a_spammer_is_cut_off_by_the_custodians_budgets() {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
     let parcel = |from: &Node, size: usize| {
         let victim = DeviceKeys::generate();
-        custody::seal(from.keys(), victim.sign_pk(), &victim.public().kex_pk, 1, vec![7; size], 3_600_000, now).unwrap().0
+        custody::seal(from.keys(), victim.sign_pk(), &victim.public().kex_pk, 1, vec![7; size], 3_600_000, now)
+            .unwrap()
+            .0
     };
     let mut answers = Vec::new();
     for _ in 0..40 {

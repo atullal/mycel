@@ -88,8 +88,8 @@ use n0_future::StreamExt;
 use pool::{Pool, PooledConn};
 use tokio::sync::{Notify, Semaphore, broadcast, mpsc};
 
-pub use custody::node::{CustodyOptions, CustodyStats};
 pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_free_space, free_space, human_size};
+pub use custody::node::{CustodyOptions, CustodyStats};
 pub use iroh;
 pub use link::{Link, LinkEvent, LinkStatus, PathKind, path_in_use};
 pub use mesh::{Mesh, MeshOptions, MeshRoute, MeshStats, Tap};

@@ -79,7 +79,8 @@ pub struct Parcel {
     pub lifetime: u64,
     /// `H(secret)`: whoever shows the secret (the sender) may withdraw it.
     pub release: Hash32,
-    /// postcard [`Lockbox`]: the HPKE-sealed, padded [`Sealed`].
+    /// postcard [`Lockbox`]: the HPKE-sealed, padded sender, payload kind,
+    /// payload and the sender's signature (opened with [`open`]).
     pub sealed: Vec<u8>,
 }
 
@@ -175,7 +176,8 @@ pub fn seal(
     let mut plain = postcard::to_allocvec(&inner)?;
     plain.resize(padme(plain.len()), 0);
     let lockbox = mycel_crypto::seal_lockbox(kex, &seal_info(&dst, created, lifetime, &release), &plain)?;
-    let parcel = Parcel { version: PARCEL_V1, dst, created, lifetime, release, sealed: postcard::to_allocvec(&lockbox)? };
+    let parcel =
+        Parcel { version: PARCEL_V1, dst, created, lifetime, release, sealed: postcard::to_allocvec(&lockbox)? };
     Ok((parcel, secret))
 }
 
@@ -323,21 +325,42 @@ pub enum Deposit {
 /// Variants are only ever appended (a new one needs a capability).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum Msg {
-    Deposit { parcel: Parcel, stamp: u64 },
+    Deposit {
+        parcel: Parcel,
+        stamp: u64,
+    },
     Deposited(Deposit),
     /// "Anything for me?": the connection proves who asks.
     Fetch,
     /// Parcels held for the device on the other end: (id, size).
-    Listing { items: Vec<(Hash32, u32)> },
+    Listing {
+        items: Vec<(Hash32, u32)>,
+    },
     /// The ones it wants, and receipts for the ones it already has.
-    Take { want: Vec<Hash32>, receipts: Vec<Receipt> },
-    Parcels { parcels: Vec<Parcel> },
-    Receipts { receipts: Vec<Receipt> },
-    Release { id: Hash32, secret: [u8; 32] },
-    Released { ok: bool },
+    Take {
+        want: Vec<Hash32>,
+        receipts: Vec<Receipt>,
+    },
+    Parcels {
+        parcels: Vec<Parcel>,
+    },
+    Receipts {
+        receipts: Vec<Receipt>,
+    },
+    Release {
+        id: Hash32,
+        secret: [u8; 32],
+    },
+    Released {
+        ok: bool,
+    },
     /// The custodians the answerer knows XOR-closest to `target`.
-    Find { target: SignPk },
-    Found { custodians: Vec<SignPk> },
+    Find {
+        target: SignPk,
+    },
+    Found {
+        custodians: Vec<SignPk>,
+    },
 }
 
 /// The largest custody frame: a deposit (one parcel) or one round of
@@ -695,8 +718,12 @@ impl Vault {
     fn make_room(&mut self, key: &SignPk, size: u64) -> bool {
         let mine = self.by_depositor.get(key).map_or(0, |s| s.bytes) + size;
         while self.used + size > self.cfg.capacity || self.held.len() >= self.cfg.max_parcels {
-            let Some((big, bytes)) =
-                self.by_depositor.iter().filter(|(_, s)| !s.ids.is_empty()).map(|(k, s)| (*k, s.bytes)).max_by_key(|x| x.1)
+            let Some((big, bytes)) = self
+                .by_depositor
+                .iter()
+                .filter(|(_, s)| !s.ids.is_empty())
+                .map(|(k, s)| (*k, s.bytes))
+                .max_by_key(|x| x.1)
             else {
                 return false;
             };
@@ -862,11 +889,7 @@ pub enum Tier {
 
 /// XOR distance (Kademlia's metric), as bytes compared big-endian.
 pub fn distance(a: &SignPk, b: &SignPk) -> [u8; 32] {
-    let mut d = [0u8; 32];
-    for i in 0..32 {
-        d[i] = a.0[i] ^ b.0[i];
-    }
-    d
+    std::array::from_fn(|i| a.0[i] ^ b.0[i])
 }
 
 fn rank(dst: &SignPk, k: &SignPk) -> Hash32 {
@@ -1105,7 +1128,9 @@ impl Outbox {
     pub fn custodians_of(&self, item: &Hash32) -> BTreeSet<SignPk> {
         self.by_item
             .get(item)
-            .map(|ids| ids.iter().filter_map(|i| self.parcels.get(i)).flat_map(|d| d.custodians.iter().copied()).collect())
+            .map(|ids| {
+                ids.iter().filter_map(|i| self.parcels.get(i)).flat_map(|d| d.custodians.iter().copied()).collect()
+            })
             .unwrap_or_default()
     }
 

@@ -328,11 +328,7 @@ pub fn run(cfg: &Cfg, seed: u64, mode: Mode) -> Outcome {
             let (a, b) = open[rng.below(open.len())];
             let t = a + ((b - a) as f64 * rng.f64()) as Time;
             // a keeper: one side's always-on device, if it has one
-            let keeper = if rng.chance(cfg.dm_keeper) {
-                people[from].always_on.or(people[to].always_on)
-            } else {
-                None
-            };
+            let keeper = if rng.chance(cfg.dm_keeper) { people[from].always_on.or(people[to].always_on) } else { None };
             msgs.push((t, from, to, keeper));
         }
     }
@@ -343,7 +339,8 @@ pub fn run(cfg: &Cfg, seed: u64, mode: Mode) -> Outcome {
     let mut out = Outcome { sent: msgs.len(), ..Default::default() };
     let _ = &out;
     let mut parcels: Vec<Vec<(usize, Hash32)>> = vec![Vec::new(); msgs.len()];
-    let mut queue: BinaryHeap<Reverse<(Time, Ev)>> = msgs.iter().enumerate().map(|(i, m)| Reverse((m.0, Ev::Send(i)))).collect();
+    let mut queue: BinaryHeap<Reverse<(Time, Ev)>> =
+        msgs.iter().enumerate().map(|(i, m)| Reverse((m.0, Ev::Send(i)))).collect();
     let mut custodians_total = 0usize;
     const T0_MS: u64 = 1_800_000_000_000;
     let retry = |rng: &mut Rng| (rng.f64() * 60.0 * SEC as f64) as Time;
@@ -357,9 +354,8 @@ pub fn run(cfg: &Cfg, seed: u64, mode: Mode) -> Outcome {
                     out.offline_at_send += 1;
                 }
                 // live: whenever both are online (sender's retries within a minute)
-                let mut best = overlap(&devices[src].spells, &devices[dst].spells, t).map(|x| {
-                    if x == t { x + 100 * crate::tier2::MS } else { x + retry(&mut rng) }
-                });
+                let mut best = overlap(&devices[src].spells, &devices[dst].spells, t)
+                    .map(|x| if x == t { x + 100 * crate::tier2::MS } else { x + retry(&mut rng) });
                 // a keeper of the chat gets it when the sender is online, the
                 // recipient when both it and the keeper are
                 if let Some(k) = keeper
@@ -414,7 +410,9 @@ pub fn run(cfg: &Cfg, seed: u64, mode: Mode) -> Outcome {
                         if !online(&devices[j].spells, at) {
                             continue; // the dial fails
                         }
-                        let v = vaults[j].get_or_insert_with(|| Vault::new(VaultConfig { serve: devices[j].serves, ..vault_cfg.clone() }));
+                        let v = vaults[j].get_or_insert_with(|| {
+                            Vault::new(VaultConfig { serve: devices[j].serves, ..vault_cfg.clone() })
+                        });
                         v.tick(T0_MS + at / 1000);
                         let d = Depositor { key: me, origin: Origin::Ip([from as u8; 16]), known: true };
                         match v.deposit(&d, parcel.clone(), 0, &k, T0_MS + at / 1000) {

@@ -778,8 +778,10 @@ async fn a_message_to_an_offline_device_is_carried_and_delivered_later() {
     let c = alice.add_contact(carol.profile().contact_code).unwrap();
     let dm = alice.create_conversation(None, vec![b.id.clone()]).unwrap();
     let _team = alice.create_conversation(Some("Team".into()), vec![b.id.clone(), c.id.clone()]).unwrap();
-    eventually("bob and carol have the conversations", || bob.conversations().len() == 2 && carol.conversations().len() == 1)
-        .await;
+    eventually("bob and carol have the conversations", || {
+        bob.conversations().len() == 2 && carol.conversations().len() == 1
+    })
+    .await;
     assert!(alice.network_status().custodian, "custody is on by default");
 
     bob.shutdown().await.unwrap();

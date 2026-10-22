@@ -21,11 +21,33 @@ const NOW: u64 = 1_800_000_000_000;
 
 #[derive(Arbitrary, Debug)]
 enum Step {
-    Deposit { from: u8, to: u8, version: u8, created: i32, lifetime: u32, len: u16, stamp: u64, origin: u8, known: bool },
-    Listing { who: u8 },
-    Take { who: u8, of: u8 },
-    Receipt { signer: u8, claimed: u8, of: u8 },
-    Release { of: u8, right: bool },
+    Deposit {
+        from: u8,
+        to: u8,
+        version: u8,
+        created: i32,
+        lifetime: u32,
+        len: u16,
+        stamp: u64,
+        origin: u8,
+        known: bool,
+    },
+    Listing {
+        who: u8,
+    },
+    Take {
+        who: u8,
+        of: u8,
+    },
+    Receipt {
+        signer: u8,
+        claimed: u8,
+        of: u8,
+    },
+    Release {
+        of: u8,
+        right: bool,
+    },
     Tick(i32),
     Serve(bool),
 }
