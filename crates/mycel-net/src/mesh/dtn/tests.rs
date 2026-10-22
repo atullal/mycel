@@ -863,3 +863,44 @@ fn a_doubted_route_gets_one_share_of_our_bundle() {
         }
     }
 }
+
+/// A summary stream can be lost while its connection lives. A carrier
+/// that missed a receipt that way gets it again in the next full summary
+/// from a neighbour that knows it still holds the bundle, and drops its
+/// copy, even though it never meets the destination again (found by the
+/// bounded model checker, crates/mycel-check; docs/TESTING.md).
+#[test]
+fn full_summaries_repeat_receipts_a_holder_missed() {
+    let (x, r, y) = (key(1), key(2), key(3));
+    let mut cx = Carrier::new(x, DtnConfig::default());
+    let mut cr = Carrier::new(r, DtnConfig::default());
+    let b = bundle(key(0), key(9), 7, 24 * 3_600_000);
+    // the relay is waiting with its last copy: it hands it only to the destination
+    assert_eq!(cr.accept(key(0), b.clone(), 1, 0, |_| true), Accepted::Stored);
+    let mut now = 1_000;
+    // first contact: both summarise everything; X learns that R holds it
+    for (k, s) in cr.summaries(now, &[x]) {
+        assert_eq!(k, x);
+        cx.on_summary(r, s, now, |_| true);
+    }
+    for (_, s) in cx.summaries(now, &[r, y]) {
+        cr.on_summary(x, s, now, |_| true);
+    }
+    // X learns the receipt; the summary that carries it to R is lost
+    cx.add_receipt(Receipt { id: b.id, dst: b.dst, sig: Sig([0; 64]) });
+    now += SUMMARY_GAP;
+    let lost = cx.summaries(now, &[r, y]);
+    assert!(lost.iter().all(|(_, s)| !s.full && s.receipts.len() == 1), "the new receipt goes to both");
+    // changes since carry nothing more
+    now += SUMMARY_GAP;
+    assert!(cx.summaries(now, &[r, y]).is_empty(), "nothing changed: nothing sent");
+    assert!(cr.holds(&b.id));
+    // the next full summary repeats it, to R only (Y never said it held the bundle)
+    now += SUMMARY_FULL;
+    let full: Map<SignPk, Summary> = cx.summaries(now, &[r, y]).into_iter().collect();
+    assert!(full[&r].full && full[&r].receipts.iter().any(|rc| rc.id == b.id), "repeated to the holder");
+    assert!(full[&y].full && full[&y].receipts.is_empty(), "not repeated to others");
+    cr.on_summary(x, full[&r].clone(), now, |_| true);
+    assert!(!cr.holds(&b.id), "the relay drops the delivered bundle");
+    assert_eq!(cr.stats().cleared_by_receipt, 1);
+}

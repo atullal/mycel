@@ -9,52 +9,43 @@
 //!   feasibility condition with its inductive invariant.
 //! - [`carrier`]: `mesh::dtn::Carrier`, store-and-forward. Invariant: a bundle
 //!   taken into custody is never lost. Liveness (checked as recovery from
-//!   every reachable state): the destination's receipt reaches the source.
+//!   every reachable state): receipts clear every copy once the destination
+//!   is reachable again, and reach every holder connected to a device that
+//!   has one when it is not.
 //! - [`ble`]: `mycel_link_ble::core::Core`, the BLE connection state
 //!   machine. Invariant: both ends never route over different channels once
 //!   settled. Liveness (recovery): a lost link is always re-established
 //!   while the peer advertises.
 //!
-//! Each model's network is more adversarial than the real one where that
-//! is cheap (datagrams may be lost, duplicated and reordered), so what holds
-//! here holds for the real schedules too, within the bound. Time is
+//! Each model's network is at least as adversarial as the real one where
+//! that is cheap (messages reorder freely; datagrams may be lost, and
+//! duplicated within each bound's duplicate budget, which is 0 in most
+//! published bounds: docs/TESTING.md), so what holds here holds for the
+//! real schedules too, within the bound. Time is
 //! abstracted to a few jumps sized to cross the cores' own timers.
 //!
 //! Every state is the cores' full internal state. The cores aren't `Hash`,
-//! so states are fingerprinted by their `Debug` text ([`Fingerprint`]),
-//! which covers every field: two states that print the same are the same.
+//! so each harness hashes and compares its states by their `Debug` text.
+//! That text covers every field, but it is not quite full width:
+//! mycel-crypto's `Debug` prints a `SignPk` as its first 4 bytes, a
+//! `Hash32` as its first 6 and a `Sig` as its first 4. Two states that
+//! differ only beyond those prefixes would be taken for one, and the second
+//! never explored. In these harnesses that cannot happen for keys and
+//! bundle ids (each device's key, and the one bundle id, differ in their
+//! first byte) or signatures (all zero). The router's set of verified
+//! announcement hashes holds real hashes, printed to 48 bits: a collision
+//! among the few thousand a check sees has probability about 2⁻²⁵ (an
+//! estimate: n²/2⁴⁹ for n = 4,096). A harness that adds keys must keep them
+//! distinct in their first 4 bytes. (Maps whose iteration order depends on
+//! their history can print one state two ways; that costs a duplicate
+//! visit, never a missed one.)
 
 pub mod ble;
 pub mod carrier;
 pub mod router;
 
 use std::fmt::Debug;
-use std::hash::{Hash, Hasher};
-
-/// A value hashed and compared by its full `Debug` text. Sound for state
-/// deduplication: equal text means equal state. (Maps whose iteration
-/// order depends on their history can print the same state two ways; that
-/// costs a duplicate visit, never a missed one.)
-#[derive(Clone)]
-pub struct Fingerprint<T>(pub T);
-
-impl<T: Debug> Fingerprint<T> {
-    pub fn text(&self) -> String {
-        format!("{:?}", self.0)
-    }
-}
-
-impl<T: Debug> Hash for Fingerprint<T> {
-    fn hash<H: Hasher>(&self, h: &mut H) {
-        self.text().hash(h);
-    }
-}
-
-impl<T: Debug> PartialEq for Fingerprint<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.text() == other.text()
-    }
-}
+use std::hash::Hash;
 
 /// What one bounded check explored, for the published bounds
 /// (docs/TESTING.md) and the CI log.

@@ -66,6 +66,10 @@ jobs:
       # webview libraries installed above, so they run here.
       - name: Host tests
         run: cargo test --locked -p mycel-host --lib
+      # The release binary is built per package: no crate in it may get the
+      # model checker's or the simulator's test-only features.
+      - name: No test-only features
+        run: scripts/ci/check-release-features.sh mycel-host
       - name: Build
         working-directory: apps/host
         run: |
@@ -149,6 +153,9 @@ jobs:
           node-version: 22
           package-manager-cache: false
       - run: npm ci
+      - name: No test-only features
+        shell: bash
+        run: scripts/ci/check-release-features.sh mycel-host
       - name: Build
         working-directory: apps/host
         shell: bash

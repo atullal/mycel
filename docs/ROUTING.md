@@ -691,14 +691,15 @@ know, and a version 2 bundle is never offered over a version 1 hop.
   link time on conference traces into refused transfers, retried every
   second: `docs/BENCHMARKS.md` §6.1.)
 - **Summaries say what changed** (`Carrier::summaries`). A new hop
-  connection gets everything: the bundles held, the latest receipts, room,
+  connection gets everything: the bundles held, the latest 256 receipts, room,
   and the most useful 64 predictabilities. After that a neighbour hears what
   changed, at most every 2 s: bundles taken since, receipts learnt since,
   room, and the predictabilities the gradient uses between full summaries.
   With the internet gradient that is P(internet), plus P(destination) for
   the destinations it holds bundles for that the internet doesn't lead to
   (its summary `wants` them). Every 60 s it gets everything held again, so
-  it learns what we dropped, with the full predictability table, so
+  it learns what we dropped (and the receipts for what it last said it
+  holds, §7.4), with the full predictability table, so
   PRoPHET's transitivity keeps carrying destination predictabilities hop
   by hop. Nothing changes, nothing is sent. A summary that may not have
   arrived (its stream failed) resets the neighbour to "tell it
@@ -747,12 +748,25 @@ know, and a version 2 bundle is never offered over a version 1 hop.
   get their copy through normal sync, since they are members.
 - **Receipts.** The destination signs a receipt (bundle id). Receipts
   spread among carriers like MaxProp's acks, and every carrier holding a
-  copy deletes it. That much is model-checked: from any state, once faults
-  stop, every copy is cleared (docs/TESTING.md, "Model checking"). A
-  source that handed on every copy is not necessarily told. If one
-  summary stream is lost while its connection lives, the receipt in it is
-  not resent until the next new contact, because summaries carry only
-  receipts learnt since the last summary.
+  copy deletes it. A delta summary carries the receipts learnt since the
+  last summary to that neighbour. A summary stream can be lost while its
+  connection lives, and its sender can't tell. So every full summary (each
+  60 s) also repeats the receipts for the bundles the neighbour last said
+  it holds, newest first, within the summary's cap of 256 receipts. A
+  carrier that missed a receipt then drops its copy within a minute, even
+  if it never meets the destination again. Without the repeat, such a
+  carrier with its last copy would keep the delivered bundle, and keep
+  offering it toward the destination, until it expired (24 h by default).
+  The repeat costs nothing when no neighbour holds a delivered bundle;
+  each repeated receipt is an estimated 128 bytes (id, destination key,
+  signature).
+  What is model-checked (docs/TESTING.md, "Model checking"), for three
+  devices and one bundle: from any reachable state, once faults stop and
+  the links come back, every copy is cleared; and if the destination
+  leaves for good, no carrier keeps a copy while a device connected to it
+  has the receipt. Some copies are cleared by a receipt, others by the
+  next hop answering `Duplicate` to an offer. A source that handed on
+  every copy is not necessarily told: nothing it holds is repeated to it.
 
 ## 8. Why not route globally over Bluetooth alone
 

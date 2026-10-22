@@ -14,11 +14,22 @@
 //! time until none can go: 1-minimal, Zeller and Hildebrandt 2002) and
 //! printed as a line for [`PINNED`], which `mycel-sim swarm` replays first.
 //! Worlds are small (about 60 devices) and short, so a CI budget buys many
-//! configurations; the regular scenarios cover scale.
+//! configurations; the regular scenarios cover scale. Each feature draws
+//! from its own random substream ([`build`]), so removing one leaves the
+//! rest of the world as it was and minimisation compares like with like.
+//!
+//! Not yet among the features, though the design (sim-fidelity WP20) lists
+//! them: OS lifecycle states (tier 2 has no OS model until WP9), NAT
+//! profiles as a feature of their own (the `internet` feature draws each
+//! device's NAT, hard 70% of the time, from `cellular`), link techs beyond
+//! BLE-only versus BLE with AWDL or Wi-Fi Direct, and `buggify!` points
+//! (they are in mycel-net's async driver, which tier 2 doesn't run; tier 1
+//! will enable them once it is deterministic, WP3). Minimisation is over
+//! the feature set only, not over the world trace (WP1's trace export).
 
 use crate::models::Env;
 use crate::scenarios::t2::{GCfg, Model, Plan, World, run};
-use crate::stats::{Map, Rng};
+use crate::stats::{Map, Rng, mix64};
 use crate::tier2::engine::{Mobility, NodeSpec};
 use crate::tier2::mycel::Role;
 use crate::tier2::world::{ble_only, cellular, phone};
@@ -88,26 +99,48 @@ impl Outcome {
     }
 }
 
-/// The world and plan of one configuration (`n` devices).
+/// The random stream of one feature (or, for `"base"`, of what every
+/// configuration shares): a substream of the run's seed keyed by name, so
+/// turning one feature on or off leaves every other draw as it was, and
+/// delta debugging compares one world with and without a feature, not two
+/// different worlds (common random numbers, docs/SIMULATION.md).
+fn stream(seed: u64, name: &str) -> Rng {
+    let h = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x0100_0000_01b3));
+    Rng::new(mix64(seed ^ h))
+}
+
+/// The world and plan of one configuration (`n` devices). Positions,
+/// devices and sends come from the base stream, each feature's choices
+/// from its own ([`stream`]).
 pub fn build(seed: u64, mask: u32, n: usize) -> (World, Plan, Time, GCfg) {
-    let mut rng = Rng::new(seed);
+    let mut rng = stream(seed, "base");
     let side = (n as f64 * 900.0).sqrt();
     let mut specs: Vec<NodeSpec> = (0..n)
         .map(|_| {
             let xy = (rng.range(0.0, side), rng.range(0.0, side));
-            if on(mask, "ble-only") && rng.chance(0.3) { ble_only(0, xy, None) } else { phone(0, xy, None, &mut rng) }
+            phone(0, xy, None, &mut rng)
         })
         .collect();
-    if on(mask, "internet") {
+    if on(mask, "ble-only") {
+        let mut r = stream(seed, "ble-only");
         for s in specs.iter_mut() {
-            if rng.chance(0.1) {
-                s.inet = Some(cellular(&mut rng));
+            if r.chance(0.3) {
+                *s = ble_only(0, s.xy, None);
+            }
+        }
+    }
+    if on(mask, "internet") {
+        let mut r = stream(seed, "internet");
+        for s in specs.iter_mut() {
+            if r.chance(0.1) {
+                s.inet = Some(cellular(&mut r));
             }
         }
     }
     if on(mask, "mobility") {
+        let mut r = stream(seed, "mobility");
         for s in specs.iter_mut() {
-            if rng.chance(0.3) {
+            if r.chance(0.3) {
                 s.mobility = Mobility::Waypoint { w: side, h: side, speed: 1.4, pause: 30 * SEC };
             }
         }
@@ -115,37 +148,50 @@ pub fn build(seed: u64, mask: u32, n: usize) -> (World, Plan, Time, GCfg) {
     let w = World { areas: vec![Area { latlon: (48.86, 2.35), env: Env::Outdoor }], specs };
     let (warm, dur) = (60 * SEC, 4 * MIN);
     let mut plan = Plan::default();
-    let mut roles: Map<NodeId, Role> = Map::default();
-    for (f, role) in [("black-holes", Role::BlackHole), ("liars", Role::Liar), ("droppers", Role::Dropper)] {
-        if on(mask, f) {
-            for _ in 0..(n / 20).max(1) {
-                roles.insert(rng.below(n) as NodeId, role);
-            }
-        }
-    }
+    // the sends first, from the base stream: the same in every configuration
     let mut k = 0;
     while plan.sends.len() < 40 && k < 10_000 {
         k += 1;
         let (a, b) = (rng.below(n) as NodeId, rng.below(n) as NodeId);
-        if a != b && !roles.contains_key(&a) && !roles.contains_key(&b) {
+        if a != b {
             plan.sends.push((warm + plan.sends.len() as Time * dur / 40, a, b, 1000, false));
+        }
+    }
+    // adversaries among the devices that neither send nor receive
+    let ends: std::collections::BTreeSet<NodeId> = plan.sends.iter().flat_map(|s| [s.1, s.2]).collect();
+    let mut roles: Map<NodeId, Role> = Map::default();
+    for (f, role) in [("black-holes", Role::BlackHole), ("liars", Role::Liar), ("droppers", Role::Dropper)] {
+        if on(mask, f) {
+            let mut r = stream(seed, f);
+            let mut placed = 0;
+            for _ in 0..1_000 {
+                if placed == (n / 20).max(1) {
+                    break;
+                }
+                let d = r.below(n) as NodeId;
+                if !ends.contains(&d) && roles.insert(d, role) != Some(role) {
+                    placed += 1;
+                }
+            }
         }
     }
     plan.roles = roles;
     if on(mask, "churn") {
+        let mut r = stream(seed, "churn");
         for minute in 0..(dur / MIN) {
             for _ in 0..(n / 10).max(1) {
-                let d = rng.below(n) as NodeId;
-                let t = warm + minute * MIN + rng.below(30) as Time * SEC;
+                let d = r.below(n) as NodeId;
+                let t = warm + minute * MIN + r.below(30) as Time * SEC;
                 plan.acts.push((t, Action::Online(d, false)));
-                plan.acts.push((t + 20 * SEC + rng.below(20) as Time * SEC, Action::Online(d, true)));
+                plan.acts.push((t + 20 * SEC + r.below(20) as Time * SEC, Action::Online(d, true)));
             }
         }
     }
     if on(mask, "internet-flaps") {
+        let mut r = stream(seed, "internet-flaps");
         for (i, s) in w.specs.iter().enumerate() {
-            if s.inet.is_some() && rng.chance(0.5) {
-                let t = warm + rng.below(dur as usize / 1000) as Time * MS * 1000;
+            if s.inet.is_some() && r.chance(0.5) {
+                let t = warm + r.below(dur as usize / 1000) as Time * MS * 1000;
                 plan.acts.push((t, Action::Inet(i as NodeId, false)));
                 plan.acts.push((t + MIN, Action::Inet(i as NodeId, true)));
             }
@@ -232,6 +278,34 @@ mod tests {
         let need = (1 << 2) | (1 << 7);
         let m = minimise(0b1111_1111_1111, |m| m & need == need);
         assert_eq!(m, need);
+    }
+
+    /// Delta debugging needs one world per seed: dropping a feature must
+    /// leave every other draw alone.
+    #[test]
+    fn toggling_a_feature_keeps_the_rest_of_the_world() {
+        let bit = |f: &str| 1u32 << FEATURES.iter().position(|x| *x == f).unwrap();
+        let all = (1u32 << FEATURES.len()) - 1;
+        for seed in [1u64, 7, 1234] {
+            let (w0, p0, _, _) = build(seed, all, 60);
+            for f in FEATURES {
+                let (w1, p1, _, _) = build(seed, all & !bit(f), 60);
+                let xy = |w: &World| w.specs.iter().map(|s| s.xy).collect::<Vec<_>>();
+                assert_eq!(xy(&w0), xy(&w1), "positions, without {f}");
+                assert_eq!(p0.sends, p1.sends, "sends, without {f}");
+                if !["black-holes", "liars", "droppers"].contains(&f) {
+                    let mut r0: Vec<_> = p0.roles.iter().map(|(k, v)| (*k, format!("{v:?}"))).collect();
+                    let mut r1: Vec<_> = p1.roles.iter().map(|(k, v)| (*k, format!("{v:?}"))).collect();
+                    r0.sort();
+                    r1.sort();
+                    assert_eq!(r0, r1, "adversaries, without {f}");
+                }
+                if f != "internet" {
+                    let inet = |w: &World| w.specs.iter().map(|s| s.inet.is_some()).collect::<Vec<_>>();
+                    assert_eq!(inet(&w0), inet(&w1), "internet devices, without {f}");
+                }
+            }
+        }
     }
 
     #[test]

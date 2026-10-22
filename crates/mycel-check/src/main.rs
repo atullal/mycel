@@ -51,6 +51,15 @@ fn main() {
         }
         run("carrier/line", &m.bound(), m, 3, budget)
     });
+    check("carrier/triangle", &|| {
+        let mut m = CarrierModel::new(3, &[(0, 1), (1, 2), (0, 2)]);
+        m.budget = mycel_check::carrier::Budget { steps: 1, links: 0, drops: 1 };
+        if let Ok(b) = std::env::var("TRIANGLE_BUDGET") {
+            let v: Vec<u8> = b.split(',').filter_map(|x| x.parse().ok()).collect();
+            m.budget = mycel_check::carrier::Budget { steps: v[0], links: v[1], drops: v[2] };
+        }
+        run("carrier/triangle", &m.bound(), m, 3, budget)
+    });
     check("ble/pair", &|| {
         let mut m = mycel_check::ble::BleModel::default();
         if let Ok(b) = std::env::var("BLE_BUDGET") {

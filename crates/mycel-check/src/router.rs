@@ -7,7 +7,8 @@
 //! driver, so the network may lose, duplicate (bounded) and reorder them
 //! freely. A hop connection going down drops what was in flight on it and
 //! tells both ends (`hop_down`, `set_direct(false)`); one coming up tells
-//! both (`set_direct(true)`, `hop_up`). Measured hop costs change by
+//! both (`set_direct(true)`, `hop_up`); each call is followed at once by
+//! `tick`, as the driver does. Measured hop costs change by
 //! `set_cost` on one end (measurements are per end). Time is one global
 //! clock that jumps by [`RouterModel::advances`]; each jump runs the
 //! driver's step: originate when due, then `tick`.
@@ -368,29 +369,32 @@ impl RouterModel {
         }
     }
 
+    /// One link event at router `x` about `y`, as the driver handles it:
+    /// the call, then `tick` at once (`Driver::set_direct`, `add_conn`,
+    /// `conn_closed` in mesh/mod.rs), then what it wants sent.
+    fn event(s: &mut State, x: u8, f: impl FnOnce(&mut Router, Time)) {
+        let now = s.now;
+        let r = &mut s.routers[x as usize];
+        f(r, now);
+        r.tick(now);
+        Self::collect(s, x);
+    }
+
     fn up(s: &mut State, a: u8, b: u8) {
         s.links.insert(Self::link(a, b));
-        let now = s.now;
         for (x, y) in [(a, b), (b, a)] {
-            let r = &mut s.routers[x as usize];
-            r.set_direct(key(y), true, now);
-            r.hop_up(key(y), now);
+            Self::event(s, x, |r, now| r.set_direct(key(y), true, now));
+            Self::event(s, x, |r, now| r.hop_up(key(y), now));
         }
-        Self::collect(s, a);
-        Self::collect(s, b);
     }
 
     fn down(s: &mut State, a: u8, b: u8) {
         s.links.remove(&Self::link(a, b));
         s.net.retain(|m| Self::link(m.from, m.to) != Self::link(a, b));
-        let now = s.now;
         for (x, y) in [(a, b), (b, a)] {
-            let r = &mut s.routers[x as usize];
-            r.hop_down(key(y), now);
-            r.set_direct(key(y), false, now);
+            Self::event(s, x, |r, now| r.hop_down(key(y), now));
+            Self::event(s, x, |r, now| r.set_direct(key(y), false, now));
         }
-        Self::collect(s, a);
-        Self::collect(s, b);
     }
 
     /// The start: links up and, if warm, converged by a fair run.

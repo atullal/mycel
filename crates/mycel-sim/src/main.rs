@@ -152,9 +152,6 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `--runs K`: each scenario on K seeds from `--seed` (the base), judged
-/// together (`mycel_sim::seeds`). Prints every failing seed with the
-/// command that replays it.
 /// `mycel-sim swarm [--seed S] [--runs K]`: the pinned failing
 /// configurations, then K random ones (swarm testing,
 /// `mycel_sim::tier2::swarm`); every failure is minimised and printed as a
@@ -191,6 +188,9 @@ fn swarm(a: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `--runs K`: each scenario on K seeds from `--seed` (the base), judged
+/// together (`mycel_sim::seeds`). Prints every failing seed with the
+/// command that replays it.
 fn replications(a: &Args, picked: &[(&scenarios::Scenario, f64)], candidate: Candidate) -> anyhow::Result<()> {
     use mycel_sim::seeds::{min_pass, replicate, verdict};
     let seeds = mycel_sim::stats::run_seeds(a.seed, a.runs);

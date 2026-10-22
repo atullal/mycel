@@ -50,8 +50,9 @@
 //! that the internet can't reach (its summary `wants` them), ours for
 //! those. A neighbour gets everything at first contact, what changed at
 //! most every [`SUMMARY_GAP`], and everything held every [`SUMMARY_FULL`]
-//! (so it learns what we dropped). Nothing changes, nothing is sent
-//! (docs/SIMULATION.md §4).
+//! (so it learns what we dropped). A full summary also repeats the receipts
+//! for what the neighbour last said it holds, in case it missed them.
+//! Nothing changes, nothing is sent (docs/SIMULATION.md §4).
 //!
 //! **Offers.** A bundle is offered before it is sent ([`Offer`] →
 //! [`Answer`]): a refusal costs a round trip, not the payload. A transfer
@@ -1101,8 +1102,11 @@ impl Carrier {
         h.finish()
     }
 
-    /// A summary for `nb` (`None`: anyone): everything held, and the latest
-    /// receipts, if `full`; else what we took and learnt since `last`.
+    /// A summary for `nb` (`None`: anyone): if `full`, everything held;
+    /// else what we took since `last`. Receipts: those learnt since the
+    /// last summary to `nb` (all we keep, up to [`SUMMARY_RECEIPTS`], with
+    /// no `last`), and in a full one also those for bundles `nb` last said
+    /// it holds.
     fn build(&self, nb: Option<&SignPk>, full: bool, last: Option<Sent>, now: Time) -> Summary {
         let ids = match last {
             Some(l) if !full => {
@@ -1111,9 +1115,9 @@ impl Carrier {
             _ => self.held.keys().rev().take(SUMMARY_IDS).copied().collect(),
         };
         // receipts it hasn't heard from us (a summary that may not have
-        // arrived resets this: `new_contact`)
+        // arrived resets this: `new_contact`)...
         let since = last.map_or(0, |l| l.receipts);
-        let receipts = self
+        let mut receipts: Vec<Receipt> = self
             .receipt_order
             .iter()
             .rev()
@@ -1122,6 +1126,27 @@ impl Carrier {
             .filter_map(|(_, id)| self.receipts.get(id))
             .copied()
             .collect();
+        // ...and, in a full summary, those for bundles it last said it
+        // holds, newest first. A summary stream can be lost while its
+        // connection lives (its sender can't tell); a carrier that missed a
+        // receipt that way would keep a delivered bundle, and spray it,
+        // until it expires if it never meets the destination again.
+        if full
+            && receipts.len() < SUMMARY_RECEIPTS
+            && let Some(has) = nb.and_then(|k| self.nb_has.get(k)).filter(|h| !h.is_empty())
+        {
+            let older = self.receipt_order.iter().rev().filter(|(n, _)| *n <= since);
+            for (_, id) in older {
+                if receipts.len() >= SUMMARY_RECEIPTS {
+                    break;
+                }
+                if has.contains(id)
+                    && let Some(r) = self.receipts.get(id)
+                {
+                    receipts.push(*r);
+                }
+            }
+        }
         let (free, evictable) = if self.cfg.carry {
             let mut v: Vec<(u64, u64)> = self
                 .held

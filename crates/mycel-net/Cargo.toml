@@ -15,12 +15,16 @@ publish = false
 [features]
 # Publish and resolve gateway records on the BitTorrent Mainline DHT.
 dht = ["dep:n0-mainline"]
-# Read-only views of the sans-IO cores' state (and one planted bug) for the
-# bounded model checker, crates/mycel-check. Never on in a release build.
+# Read-only views of the sans-IO cores' state (and one planted bug, off by
+# default) for the bounded model checker, crates/mycel-check. Cargo unifies
+# features across one build, so a `--workspace` build turns this on for
+# every crate; release artifacts are built per package, and
+# scripts/ci/check-release-features.sh fails CI and the app builds if the app
+# would resolve this or `sim`.
 model = []
 # In-code fault injection (`buggify!`, src/buggify.rs) for simulation. Off,
-# every injection point compiles to `false`; on, it still fires only after
-# `buggify::enable`. Never on in a release build.
+# every injection point compiles to `false`; on, it fires only for devices
+# a `buggify::Run` covers. Never in a release build (checked as above).
 sim = []
 
 [dependencies]

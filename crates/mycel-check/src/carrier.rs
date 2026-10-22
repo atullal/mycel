@@ -27,12 +27,27 @@
 //!   reachable state): once faults stop and the links come back, within a
 //!   bounded fair run the bundle is delivered and no carrier still holds
 //!   it, the source included (what receipts are for, docs/ROUTING.md §7.4).
+//!   The recovery restores the initial links, so a carrier that missed the
+//!   receipt meets the destination (or a carrier on the way to it) again.
 //!
 //!   The plan's first wording, "the receipt reaches the source", is
 //!   stronger than the design and does not hold: a source that has handed
 //!   every copy on is never told (found by this model: one lost summary
 //!   stream is enough, docs/TESTING.md). A source still holding a copy is
 //!   a carrier like any other and is covered.
+//! - *receipts reach holders without the destination* (recovery from every
+//!   reachable state): the destination leaves for good (its links go down
+//!   and stay down) and the other links come back; within the fair run, no
+//!   carrier still holds a copy while a device it is connected to has the
+//!   receipt. Full summaries repeat the receipts for what a neighbour last
+//!   said it holds (`Carrier::build`) for this case. At the published
+//!   bounds the property also held without that repeat, most likely (not
+//!   traced state by state) because in a three-device line the receipt
+//!   holder is always the better carrier toward the destination, so the
+//!   copy is offered to it and its `Duplicate` answer clears it. The case
+//!   the repeat fixes, a holder next to no better carrier, is pinned by
+//!   the unit test
+//!   `mesh::dtn::tests::full_summaries_repeat_receipts_a_holder_missed`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Debug};
@@ -123,6 +138,11 @@ impl State {
 
     fn holders(&self) -> Vec<u8> {
         (0..self.carriers.len() as u8).filter(|i| self.carriers[*i as usize].holds(&BUNDLE)).collect()
+    }
+
+    /// `a` and `b` are joined by links that are up.
+    fn connected(&self, a: u8, b: u8) -> bool {
+        a == b || self.toward(a, b) != Toward::Nowhere
     }
 
     pub fn custody(&self) -> bool {
@@ -370,7 +390,12 @@ impl CarrierModel {
             for t in plan {
                 let to = index(&t.to);
                 let Some(b) = s.carriers[i as usize].bundle(&t.id).cloned() else { continue };
-                if !s.links.contains(&Self::link(i, to)) || s.waiting.contains_key(&(i, to, t.id)) {
+                if s.waiting.contains_key(&(i, to, t.id)) {
+                    // still on its way there: the driver skips it without a
+                    // report (its in-flight entry stays until it expires)
+                    continue;
+                }
+                if !s.links.contains(&Self::link(i, to)) {
                     s.carriers[i as usize].transferred(t.to, t.id, t.copies, false, now);
                     continue;
                 }
@@ -438,21 +463,39 @@ impl CarrierModel {
     /// Faults stop: links come back, then the fair run; whether the bundle
     /// ends delivered and held by nobody.
     pub fn recovers(&self, s: &State) -> bool {
-        self.fair_run(s, |s| s.delivered && s.holders().is_empty())
+        self.fair_run(s, false, |s| s.delivered && s.holders().is_empty())
+    }
+
+    /// Faults stop, but the destination is gone for good (it leaves, and
+    /// every link to it stays down): whether, within the fair run, no
+    /// carrier still holds a copy while a device it is connected to has the
+    /// receipt. Before delivery nobody has one, and this holds at once.
+    pub fn receipt_reaches_holders(&self, s: &State) -> bool {
+        self.fair_run(s, true, |s| {
+            let told: Vec<u8> = (0..self.n).filter(|i| s.carriers[*i as usize].model_has_receipt(&BUNDLE)).collect();
+            s.holders().iter().all(|h| told.iter().all(|t| !s.connected(*h, *t)))
+        })
     }
 
     /// The plan's first, stronger wording: the source ends with the receipt
     /// (it does not when it handed every copy on; see the module docs).
     pub fn source_told(&self, s: &State) -> bool {
-        self.fair_run(s, |s| s.carriers[0].model_has_receipt(&BUNDLE))
+        self.fair_run(s, false, |s| s.carriers[0].model_has_receipt(&BUNDLE))
     }
 
-    /// Restore the initial links, then deliver everything and step the
+    /// Restore the initial links (but cut and leave down every link to the
+    /// destination if `without_dst`), then deliver everything and step the
     /// clock, round after round, until `done` (true) or the rounds run out.
-    fn fair_run(&self, s: &State, done: impl Fn(&State) -> bool) -> bool {
+    fn fair_run(&self, s: &State, without_dst: bool, done: impl Fn(&State) -> bool) -> bool {
         let mut s = s.clone();
+        let dst = self.dst();
         for &(a, b) in &self.initial {
-            if !s.links.contains(&(a, b)) {
+            let to_dst = a == dst || b == dst;
+            if without_dst && to_dst {
+                if s.links.contains(&(a, b)) {
+                    Self::down(&mut s, a, b);
+                }
+            } else if !s.links.contains(&(a, b)) {
                 Self::up(&mut s, a, b);
             }
         }
@@ -557,6 +600,9 @@ impl Model for CarrierModel {
         vec![
             Property::always("custody", |_, s: &State| s.custody()),
             Property::always("receipts clear every copy", |m: &CarrierModel, s: &State| m.recovers(s)),
+            Property::always("receipts reach holders without the destination", |m: &CarrierModel, s: &State| {
+                m.receipt_reaches_holders(s)
+            }),
             Property::sometimes("delivered", |_, s: &State| s.delivered),
         ]
     }

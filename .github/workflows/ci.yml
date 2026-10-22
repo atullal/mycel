@@ -76,6 +76,12 @@ jobs:
           exclude=()
           if [ "$RUNNER_OS" = Windows ]; then exclude=(--exclude mycel-sim --exclude mycel-bench); fi
           cargo clippy --locked --workspace "${exclude[@]}" --all-targets -- -D warnings
+      # Clippy above builds the whole workspace, so mycel-check's test-only
+      # features reach every crate; a release build is per package, and the
+      # app must resolve none of them (also checked before each app build).
+      - name: No test-only features in the app
+        if: runner.os == 'Linux'
+        run: scripts/ci/check-release-features.sh mycel-host
 
   test:
     name: Tests (${{ matrix.os }})
@@ -173,6 +179,17 @@ jobs:
       # checking"). The planted-bug check must find its loop.
       - name: Model checks
         run: cargo run --locked --release -p mycel-check -- 300
+      # The harnesses' own tests at small bounds, among them the one that
+      # keeps the known receipt counterexample reachable.
+      - name: Model-check tests
+        run: cargo test --locked --release -p mycel-check
+      # In-code fault injection (`buggify!`, sim feature): draws reproducible
+      # per run and device, and every site fired in a real three-device
+      # exchange that must still get through (docs/TESTING.md).
+      - name: Fault injection
+        run: |
+          cargo test --locked --release -p mycel-net --features sim --lib buggify
+          cargo test --locked --release -p mycel-net --features sim --test buggify
       # Swarm testing: 24 random subsets of world features and faults, the
       # same every run, each checked against the invariants every
       # configuration keeps (docs/SIMULATION.md §1, "Swarm testing").
