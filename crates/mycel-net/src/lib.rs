@@ -2644,7 +2644,12 @@ mod version_tests {
         assert_eq!(StreamKind::on(WIRE_V1, 1), Some(StreamKind::Sync));
         assert_eq!(StreamKind::on(WIRE_V2, 6), Some(StreamKind::SyncV2));
         assert_eq!(StreamKind::on(WIRE_V1, 6), None, "version 1 has no Sync v2");
-        assert!((7..=255).all(|b| StreamKind::on(WIRE_V2, b).is_none()) && StreamKind::on(WIRE_V2, 0).is_none());
+        assert_eq!(StreamKind::on(WIRE_V2, 8), Some(StreamKind::Custody));
+        assert_eq!(StreamKind::on(WIRE_V1, 8), None, "version 1 has no custody");
+        assert!(
+            (7..=255).filter(|b| *b != 8).all(|b| StreamKind::on(WIRE_V2, b).is_none())
+                && StreamKind::on(WIRE_V2, 0).is_none()
+        );
         assert_eq!(wire::alpns(WIRE_V2), vec![wire::ALPN_V2, wire::ALPN_V1]);
         assert_eq!(wire::alpns(WIRE_V1), vec![wire::ALPN_V1]);
         assert_eq!(wire::version_of(b"mycel/node/3"), None);
