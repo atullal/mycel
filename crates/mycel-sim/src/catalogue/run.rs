@@ -233,6 +233,9 @@ pub fn study_result(st: &Study, r: &crate::uq::Study) -> ScenarioResult {
     out.wall_s = r.wall_s;
     let mut fid = s.fidelity();
     fid.region = format!("{} ({} points × {} seeds)", r.region.label(), r.points.len(), r.plan.seeds.len());
+    if !s.uq.narrowed.is_empty() {
+        fid.region.push_str(&format!(", narrowed: {}", s.uq.narrowed.join(", ")));
+    }
     let hinges = r.hinges_on();
     fid.robust_pass = Some(format!(
         "{}; {}{}",
@@ -317,6 +320,19 @@ mod tests {
         let a = st.run(&x, 3);
         assert_eq!(a, st.run(&x, 3), "deterministic");
         assert!(a.is_nan() || (0.0..=100.0).contains(&a));
+    }
+
+    /// `robust --bound` narrows a varied parameter, and says so.
+    #[test]
+    fn a_study_can_narrow_its_region_and_says_so() {
+        let mut s = find("festival").unwrap();
+        assert!(s.narrow("adoption", 0.02, 0.2).is_ok());
+        let r = s.region().unwrap();
+        let p = r.params.iter().find(|p| p.name == "adoption").unwrap();
+        assert_eq!((p.lo, p.hi), (0.02, 0.2));
+        assert!(p.source.contains("narrowed"), "{}", p.source);
+        assert!(s.narrow("pause_s", 10.0, 20.0).is_err(), "not varied");
+        assert!(s.narrow("adoption", 0.1, 0.2).is_err(), "leaves out the nominal 0.05");
     }
 
     /// A study becomes a scorecard row: level, the region it covered and

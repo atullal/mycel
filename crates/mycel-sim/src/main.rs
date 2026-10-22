@@ -13,7 +13,7 @@
 //! `mycel-sim catalogue` lists it with each scenario's status and
 //! fidelity; `mycel-sim catalogue NAME... [--runs K] [--full]` runs
 //! scenarios (`all` for every runnable one; a path for a file of your
-//! own); `mycel-sim robust NAME [--points N] [--runs K] [--morris-r R]`
+//! own); `mycel-sim robust NAME [--points N] [--runs K] [--morris-r R] [--bound P=LO,HI]`
 //! studies a verdict over its uncertainty region (docs/SIMULATION.md §7).
 
 use std::path::PathBuf;
@@ -70,6 +70,10 @@ struct Args {
     /// flood-reduction, dtn, churn, outages, adversaries, battery).
     #[arg(long, value_delimiter = ',')]
     off: Vec<String>,
+    /// Robust: narrow a parameter's range for this study, NAME=LO,HI
+    /// (repeatable); the report marks it.
+    #[arg(long)]
+    bound: Vec<String>,
     /// Catalogue and robust: people present instead of the CI (or full) size.
     #[arg(long)]
     people: Option<usize>,
@@ -432,7 +436,12 @@ fn robust(a: &Args) -> anyhow::Result<()> {
     let mut md = String::from("# Mycel robustness studies\n\n");
     let mut all = Vec::new();
     let mut rows = Vec::new();
-    for s in specs {
+    for mut s in specs {
+        for b in &a.bound {
+            let (name, range) = b.split_once('=').ok_or_else(|| anyhow::anyhow!("--bound NAME=LO,HI, not {b:?}"))?;
+            let (lo, hi) = range.split_once(',').ok_or_else(|| anyhow::anyhow!("--bound NAME=LO,HI, not {b:?}"))?;
+            s.narrow(name, lo.trim().parse()?, hi.trim().parse()?)?;
+        }
         let size = size_of(a, &s);
         let st = Study::new(s, size)?;
         let (threshold, higher_is_better) = st.threshold();

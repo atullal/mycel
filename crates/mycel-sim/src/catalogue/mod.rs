@@ -491,6 +491,10 @@ pub struct UqSpec {
     pub bounds: BTreeMap<String, [f64; 2]>,
     #[serde(default)]
     pub correlate: Vec<Correlation>,
+    /// Parameters whose range a study narrowed on the command line
+    /// (`robust --bound`), so reports say the region is not the scenario's.
+    #[serde(skip)]
+    pub narrowed: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -701,6 +705,18 @@ impl Spec {
         })
     }
 
+    /// Narrow a varied parameter's range for one study (`robust --bound`):
+    /// a study that cannot afford the whole region says so in its report.
+    pub fn narrow(&mut self, name: &str, lo: f64, hi: f64) -> anyhow::Result<()> {
+        anyhow::ensure!(self.uq.parameters.iter().any(|p| p == name), "{}: {name:?} isn't varied", self.name);
+        anyhow::ensure!(lo.is_finite() && hi.is_finite() && lo < hi, "{name}: bad range {lo}..{hi}");
+        let nominal = self.nominal(name).unwrap_or(lo);
+        anyhow::ensure!((lo..=hi).contains(&nominal), "{name}: range {lo}..{hi} leaves out the nominal {nominal}");
+        self.uq.bounds.insert(name.to_string(), [lo, hi]);
+        self.uq.narrowed.push(name.to_string());
+        Ok(())
+    }
+
     /// The uncertainty region of the robustness study.
     pub fn region(&self) -> anyhow::Result<Region> {
         let mut params = Vec::new();
@@ -709,7 +725,11 @@ impl Spec {
             if let Some([lo, hi]) = self.uq.bounds.get(name) {
                 p.lo = *lo;
                 p.hi = *hi;
-                p.source = format!("{} (range set by the scenario)", p.source);
+                p.source = if self.uq.narrowed.contains(name) {
+                    format!("{} (range **narrowed for this study** on the command line)", p.source)
+                } else {
+                    format!("{} (range set by the scenario)", p.source)
+                };
             }
             p.nominal = self.nominal(name).expect("every builtin has a nominal");
             params.push(p);
