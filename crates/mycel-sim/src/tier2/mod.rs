@@ -1,6 +1,7 @@
 //! Tier 2: a discrete-event simulation of routing for up to 100k+ devices,
 //! in virtual time, with the routing logic as sans-IO [`Router`]s.
 
+pub mod custody;
 pub mod dtn;
 pub mod engine;
 pub mod global;

@@ -53,6 +53,7 @@ pub const CI_SUITE: &[(&str, f64)] = &[
     ("adversarial", 0.1),
     ("routing-convergence", 0.1),
     ("disaster-dtn", 0.1),
+    ("offline-recipient", 0.1),
 ];
 
 /// The nightly soak's: the gate's, the heavier ones, and the liar ceiling

@@ -80,6 +80,11 @@ fn mailbox() {
 }
 
 #[test]
+fn offline_recipient() {
+    check("offline-recipient");
+}
+
+#[test]
 fn flood_hop_limit() {
     check("flood-hop-limit");
 }

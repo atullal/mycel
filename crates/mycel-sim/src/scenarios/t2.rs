@@ -66,6 +66,12 @@ pub fn scenarios() -> Vec<Scenario> {
         },
         Scenario { name: "mailbox", title: "Mailbox: destination offline for hours, one drain", tier: 2, run: mailbox },
         Scenario {
+            name: "offline-recipient",
+            title: "Offline recipient, internet only: custodians vs keepers only",
+            tier: 2,
+            run: offline_recipient,
+        },
+        Scenario {
             name: "global-scale",
             title: "100k devices on 6 continents, mixed connectivity",
             tier: 2,
@@ -1466,6 +1472,102 @@ fn mailbox(o: Opts) -> ScenarioResult {
     r.at_most("everything delivered within (after it reappears)", last.max(0.0), 30.0, "s");
     expect(&mut r, &o, true);
     r.note("The Berlin gateway's record for the recipient outlives its absence; senders' gateways send there and the gateway keeps a mailbox until the recipient's announcements return. Without a mailbox, live routing retries end to end for 10 minutes and gives up.");
+    r
+}
+
+// ───────────────────────────── offline-recipient ─────────────────────────────
+
+/// Seeds the scenario pools (worlds and runs), the given seed first.
+const OFFLINE_SEEDS: u64 = 12;
+
+fn offline_recipient(o: Opts) -> ScenarioResult {
+    use crate::tier2::custody::{Cfg, Mode, Outcome, run};
+    let mut r = ScenarioResult::new(
+        "offline-recipient",
+        "Offline recipient, internet only: custodians vs keepers only",
+        2,
+        o.seed,
+        o.scale,
+    );
+    let cfg = Cfg { people: o.n(2000, 60), ..Cfg::default() };
+    let per_seed: Vec<(Outcome, Outcome)> = (0..OFFLINE_SEEDS)
+        .into_par_iter()
+        .map(|k| {
+            let seed = o.seed.wrapping_add(k);
+            rayon::join(|| run(&cfg, seed, Mode::KeepersOnly), || run(&cfg, seed, Mode::Custodians))
+        })
+        .collect();
+    let mean = |f: &dyn Fn(&(Outcome, Outcome)) -> f64| per_seed.iter().map(f).sum::<f64>() / per_seed.len() as f64;
+    let base_all = 100.0 * mean(&|x| x.0.ratio());
+    let cust_all = 100.0 * mean(&|x| x.1.ratio());
+    let base_off = 100.0 * mean(&|x| x.0.offline_ratio());
+    let cust_off = 100.0 * mean(&|x| x.1.offline_ratio());
+    let pool = |pick: &dyn Fn(&(Outcome, Outcome)) -> &Outcome| {
+        let xs: Vec<f64> = per_seed.iter().flat_map(|x| pick(x).latency_s.iter().copied()).collect();
+        crate::stats::Summary::of(&xs)
+    };
+    let (lb, lc) = (pool(&|x| &x.0), pool(&|x| &x.1));
+    let carried = mean(&|x| x.1.carried as f64 / x.1.offline_at_send.max(1) as f64) * 100.0;
+    let copies = mean(&|x| x.1.custodians_per_carried);
+    let peak = per_seed.iter().map(|x| x.1.peak_custodian_bytes).max().unwrap_or(0);
+    let refused: u64 = per_seed.iter().map(|x| x.1.refused).sum();
+    // within an hour and four, for messages sent while the recipient was offline
+    let within = |o: &Outcome, h: f64| {
+        o.offline_latency_s.iter().filter(|s| **s <= h * 3600.0).count() as f64 / o.offline_at_send.max(1) as f64
+    };
+    let b1 = 100.0 * mean(&|x| within(&x.0, 1.0));
+    let c1 = 100.0 * mean(&|x| within(&x.1, 1.0));
+    let b4 = 100.0 * mean(&|x| within(&x.0, 4.0));
+    let c4 = 100.0 * mean(&|x| within(&x.1, 4.0));
+    let wins = per_seed.iter().filter(|x| within(&x.1, 4.0) > within(&x.0, 4.0)).count();
+    r.at_least(
+        &format!("recipient offline at send: delivered within 4 h, mean of {OFFLINE_SEEDS} seeds"),
+        c4,
+        80.0,
+        "%",
+    );
+    r.at_least(&format!("… gain over keepers only within 4 h, mean of {OFFLINE_SEEDS} seeds"), c4 - b4, 12.0, "points");
+    r.at_least("… seeds where custodians deliver more within 4 h", wins as f64, OFFLINE_SEEDS as f64, "");
+    r.at_least("… delivered within 24 h", cust_off, base_off, "%");
+    // (calibrated on base 2000's seeds: 4 h 86.1–86.5% at CI size, 88.4% at
+    // full size; gain 17.4–18.1 points; p50 0.37–0.40×, p95 0.58–0.61×)
+    r.at_most("latency p50 vs keepers only", lc.p50 / lb.p50.max(1e-9), 0.6, "×");
+    r.at_most("latency p95 vs keepers only", lc.p95 / lb.p95.max(1e-9), 0.8, "×");
+    r.at_most("custodians per carried message", copies, 3.0, "");
+    r.headline(format!(
+        "recipient offline at send: within 1 h {c1:.1}% vs {b1:.1}%, within 4 h {c4:.1}% vs {b4:.1}%, within 24 h {cust_off:.1}% vs {base_off:.1}% (custodians vs keepers only; all messages {cust_all:.1}% vs {base_all:.1}%)"
+    ));
+    r.headline(format!(
+        "latency p50 {} s vs {} s, p95 {} s vs {} s",
+        fmt(lc.p50),
+        fmt(lb.p50),
+        fmt(lc.p95),
+        fmt(lb.p95)
+    ));
+    r.note(format!(
+        "{} people ({} messages per seed) in four time zones (UTC−5, +1, +5, +9), internet-only devices: phones used 07–23 local, online a quarter of that in ~15 min spells; half have a laptop (09–18, half the time); 5% an always-on device; 10% of direct chats have a keeper; 30% of phones refuse custody; 10% of messages go to someone sharing no group.",
+        cfg.people,
+        per_seed[0].0.sent
+    ));
+    r.note(format!(
+        "recipient offline at send, delivered within 4 h by seed (keepers only → custodians): {}",
+        per_seed
+            .iter()
+            .map(|x| format!("{:.0}→{:.0}%", 100.0 * within(&x.0, 4.0), 100.0 * within(&x.1, 4.0)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+    r.note(format!(
+        "{carried:.1}% of offline-case messages found a custodian, {copies:.2} custodians each; the busiest custodian held {} KB; {refused} deposits refused (custody off on that phone, or a limit).",
+        peak / 1024
+    ));
+    r.note("Within 24 h both reach ~100%: everyone is awake at some point. What custodians change is how soon: the recipient gets the message the next time it is online while any of three custodians is, instead of only while the sender is. The p95 is set by time zones (a recipient asleep until morning), which no custodian can shorten.");
+    r.note("Optimistic for custody: the XOR-closest lookup is assumed converged, and a custodian and the recipient online at once find each other within a second. Not modelled: custodians' delivery backoff when only the custodian dials, phones suspended in the background (slow mode), receipts' own travel.");
+    r.metrics = json!({
+        "keepers_only": {"offline_within_1h_pct": b1, "offline_within_4h_pct": b4, "offline_delivery_pct": base_off, "all_delivery_pct": base_all, "latency_s": lb},
+        "custodians": {"offline_within_1h_pct": c1, "offline_within_4h_pct": c4, "offline_delivery_pct": cust_off, "all_delivery_pct": cust_all, "latency_s": lc,
+            "carried_pct": carried, "custodians_per_carried": copies, "peak_custodian_bytes": peak, "refused": refused},
+    });
     r
 }
 
