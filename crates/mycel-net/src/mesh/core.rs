@@ -184,6 +184,8 @@ const CONTROL_QUEUE: usize = 1024;
 const UNMEASURED_CONTROL_COST: u32 = 16_384;
 /// Bytes of an announcement on the wire without its name (`wire.rs`).
 const ANN_BYTES: usize = 117;
+/// The fewest bytes any announcement takes on the wire (no name, no chain).
+const MIN_ANN_WIRE: usize = super::wire::OGM_FIXED + 64;
 /// An internet hop's cost before it is measured (100 ms).
 pub const DEFAULT_INTERNET_COST: u32 = 1_000;
 /// Routes much costlier than the best one aren't worth a QUIC path.
@@ -387,6 +389,12 @@ pub struct Config {
     /// ([`Announce::same`]). Off: every copy carries its chain (what the
     /// simulator's liars do, re-signing each lie).
     pub chain_reuse: bool,
+    /// With `chain_reuse`: a neighbour at least as near the origin as we
+    /// are (it sent us an attested route that says so) gets our copies
+    /// without the chain: it doesn't route through us, and a receiver asks
+    /// for a chain it lacks only when the route would be its best
+    /// ([`Announce::same`]).
+    pub chain_pull: bool,
 }
 
 /// Defences against lying relays that need no wire change
@@ -449,6 +457,7 @@ impl Default for Config {
             affinity_step: AFFINITY_STEP,
             attest: true,
             chain_reuse: true,
+            chain_pull: true,
         }
     }
 }
@@ -460,8 +469,9 @@ impl Config {
     /// `defences` (all, default, none), or one by one: `aggregate`, `corroborate`,
     /// `affinity`, `budget` (on, off); `affinity_step` (percent); `attest`
     /// (on, off: signed route attestations); `reuse` (on, off: refreshes
-    /// without their chain, [`Config::chain_reuse`]); `verified` (signature
-    /// cache size).
+    /// without their chain, [`Config::chain_reuse`]); `pull` (on, off:
+    /// chains only to neighbours that may route through us,
+    /// [`Config::chain_pull`]); `verified` (signature cache size).
     pub fn tune(&mut self, s: &str) -> Result<(), String> {
         let on = |kv: &str, v: &str| match v {
             "on" => Ok(true),
@@ -489,6 +499,7 @@ impl Config {
                 ("budget", v) => self.defences.budget = on(kv, v)?,
                 ("attest", v) => self.attest = on(kv, v)?,
                 ("reuse", v) => self.chain_reuse = on(kv, v)?,
+                ("pull", v) => self.chain_pull = on(kv, v)?,
                 ("verified", n) => self.verified_max = n.parse().map_err(|e| format!("{kv}: {e}"))?,
                 _ => return Err(format!("{kv}: unknown knob")),
             }
@@ -827,6 +838,10 @@ pub struct Stats {
     pub chains_reused: u64,
     pub chains_unheld: u64,
     pub chains_elided: u64,
+    /// Copies sent without their chain to a neighbour at least as near the
+    /// origin ([`Config::chain_pull`]), and chains asked for again.
+    pub chains_withheld: u64,
+    pub chains_asked: u64,
     /// Routes withdrawn at once on a loss, and fresh-seqno requests sent.
     pub retractions_sent: u64,
     pub seqreqs_sent: u64,
@@ -879,6 +894,11 @@ impl Bucket {
             false
         }
     }
+
+    /// The tokens it would have at `now` (taking none).
+    fn level(&self, now: Time) -> f64 {
+        (self.tokens + now.saturating_sub(self.at) as f64 / 1000.0 * self.rate).min(self.burst)
+    }
 }
 
 struct Nb {
@@ -895,6 +915,13 @@ struct Nb {
     /// those waiting for it.
     ctl: Bucket,
     ctl_q: Vec<Announce>,
+    /// `ctl_q` is in the order it is sent in (fewest hops last): it is
+    /// sorted again only after it changed.
+    ctl_sorted: bool,
+    /// The bytes of control budget the head of `ctl_q` needs (the least
+    /// any announcement takes after the queue changed): it isn't looked at
+    /// again until `ctl` has them.
+    ctl_need: f64,
     /// Whether it takes signed route attestations (`ROUTE_ATTEST`).
     attests: Attests,
     /// Signature checks its attested announcements may still cost us (and
@@ -951,6 +978,8 @@ impl Nb {
             last_used: now,
             ctl,
             ctl_q: Vec::new(),
+            ctl_sorted: true,
+            ctl_need: MIN_ANN_WIRE as f64,
             attests: Attests::No,
             verify_budget,
             session: 0,
@@ -1013,13 +1042,16 @@ struct Origin {
     via: Vec<(SignPk, Via)>,
     /// The attestation chain each attested route came with, by neighbour,
     /// and its epoch, one of each kind (near and full scope: an origin's
-    /// announcements alternate); what we extend when we advertise it.
-    chains: Vec<(SignPk, Arc<Hop>, u64)>,
+    /// announcements alternate), and its length (kept: walking chains to
+    /// count them was a router's hot spot); what we extend when we
+    /// advertise it.
+    chains: Vec<(SignPk, Arc<Hop>, u64, u8)>,
     /// What each neighbour holds of the chains we sent it ([`Sent`]).
     sent: Vec<(SignPk, Sent)>,
     /// The epoch (+ 1) in which we last asked a neighbour for a chain it
-    /// sent a refresh of without our holding it.
-    chain_asked: u64,
+    /// sent a refresh of without our holding it, and which neighbour (once
+    /// an epoch each, while it is the last asked).
+    chain_asked: (u64, SignPk),
     /// Newest sequence number we have passed on (or decided not to), and
     /// when we last did.
     forwarded: u64,
@@ -1050,10 +1082,10 @@ impl Origin {
     }
 
     /// The chain the route through `n` came with (of the newest
-    /// announcement's kind, near or full scope).
-    fn chain_of(&self, n: &SignPk) -> Option<&Arc<Hop>> {
+    /// announcement's kind, near or full scope), and its length.
+    fn chain_of(&self, n: &SignPk) -> Option<(&Arc<Hop>, usize)> {
         let e = epoch_of(&self.latest);
-        self.chains.iter().find(|(k, _, x)| k == n && same_kind(*x, e)).map(|(_, c, _)| c)
+        self.chains.iter().find(|(k, _, x, _)| k == n && same_kind(*x, e)).map(|(_, c, _, l)| (c, *l as usize))
     }
 
     /// The chain of an announcement from `n` (`None`: it came unattested,
@@ -1061,8 +1093,10 @@ impl Origin {
     fn set_chain(&mut self, n: SignPk, chain: Option<(Arc<Hop>, u64)>) {
         match chain {
             Some((c, epoch)) => {
-                self.chains.retain(|(k, _, x)| !(*k == n && same_kind(*x, epoch)));
-                self.chains.push((n, c, epoch));
+                self.chains.retain(|(k, _, x, _)| !(*k == n && same_kind(*x, epoch)));
+                // (checked chains are at most MAX_CHAIN long)
+                let len = c.len().min(u8::MAX as usize) as u8;
+                self.chains.push((n, c, epoch, len));
             }
             None => self.chains.retain(|(k, ..)| *k != n),
         }
@@ -1079,11 +1113,10 @@ impl Origin {
 /// one ([`Announce::same`]): of `a`'s epoch (and kind), as long as `a`'s hops, ending
 /// with `from`'s own hop or naming `from`, and claiming no less than that
 /// allows (the sender may advertise more than its hop signed, never less).
-fn held_chain(chains: &[(SignPk, Arc<Hop>, u64)], from: &SignPk, a: &Announce) -> Option<Arc<Hop>> {
+fn held_chain(chains: &[(SignPk, Arc<Hop>, u64, u8)], from: &SignPk, a: &Announce) -> Option<Arc<Hop>> {
     let e = epoch_of(a);
-    let (_, c, _) = chains.iter().find(|(k, _, x)| k == from && *x == e)?;
-    let h = a.hops as usize;
-    let n = c.len();
+    let (_, c, _, n) = chains.iter().find(|(k, _, x, _)| k == from && *x == e)?;
+    let (h, n) = (a.hops as usize, *n as usize);
     let fits = if n == h + 1 {
         c.signer == *from && a.cost >= c.cost
     } else {
@@ -1502,7 +1535,7 @@ impl Router {
 
     /// Whether `peer` takes signed route attestations (`ROUTE_ATTEST` in
     /// both hop hellos): `None` while its hello is on the way (its greeting
-    /// then waits for it, at most [`HELLO_WAIT`]). Without
+    /// then waits for it, at most `HELLO_WAIT`, 1 s). Without
     /// [`Config::attest`] nobody is sent any. A neighbour that turns out to
     /// take them gets our own announcement again, attested.
     pub fn set_attests(&mut self, peer: SignPk, attests: Option<bool>, now: Time) {
@@ -1548,12 +1581,28 @@ impl Router {
     /// own hop for the caller to sign if `to` may pass it on; else the chain
     /// alone, which still bounds our claim); otherwise unattested (also when
     /// the chain would no longer fit in a datagram every hop carries).
-    fn advert(&self, o: &Origin, n: &SignPk, via: &Via, to: &SignPk) -> Option<Announce> {
+    /// With `pull`, a neighbour that sent us an attested route at least as
+    /// cheap as ours gets it without the chain ([`Config::chain_pull`]): it
+    /// doesn't route through us, and asks if that changes (a request is
+    /// answered with `pull` off). (Not one whose route came unattested:
+    /// held to it until our chain came, it would advertise it, and Babel's
+    /// feasibility condition would then keep it off ours until the next
+    /// seqno.)
+    fn advert(&self, o: &Origin, n: &SignPk, via: &Via, to: &SignPk, pull: bool) -> Option<Announce> {
         let a = Announce { hops: via.hops, cost: via.cost, ..o.latest.clone() };
         let attesting = self.nbs.get(to).filter(|t| t.attests == Attests::Yes);
         if let Some(t) = attesting
             && via.attested
-            && let Some(c) = o.chain_of(n).filter(|c| c.len() == via.hops as usize)
+            && pull
+            && self.cfg.chain_reuse
+            && self.cfg.chain_pull
+            && o.via.iter().any(|(k, v)| k == to && v.attested && v.adv <= via.cost.saturating_add(t.hop_cost()))
+        {
+            return Some(Announce { same: true, ..a });
+        }
+        if let Some(t) = attesting
+            && via.attested
+            && let Some((c, _)) = o.chain_of(n).filter(|(_, len)| *len == via.hops as usize)
         {
             let own = via.hops.saturating_add(1) < o.latest.scope.min(self.cfg.max_hops);
             let attested = Announce { chain: Some(c.clone()), sign_link: own.then(|| t.hop_cost()), ..a.clone() };
@@ -1589,7 +1638,9 @@ impl Router {
             {
                 continue;
             }
-            let Some(a) = self.origins.get(&origin).and_then(|o| self.advert(o, &n, &via, &peer)) else { continue };
+            let Some(a) = self.origins.get(&origin).and_then(|o| self.advert(o, &n, &via, &peer, true)) else {
+                continue;
+            };
             let Some(o) = self.origins.get_mut(&origin) else { continue };
             o.fd = match o.fd {
                 Some((s, c)) if s == o.newest => Some((s, c.min(via.cost))),
@@ -1854,6 +1905,18 @@ impl Router {
                 let was_cheapest = o.via.iter().any(|(k, old)| *k == from && old.cost < c);
                 !was_cheapest && cost as u64 * CORROBORATE_FACTOR < c as u64
             });
+        // a refresh whose chain we lack is worth asking for only if the
+        // route would be our best: cheaper than every usable attested route
+        // through another neighbour ([`Config::chain_pull`]; any other we
+        // rank behind those anyway)
+        let wanted = unheld
+            && (!self.cfg.chain_pull
+                || self.origins.get(&origin).is_none_or(|o| {
+                    o.via
+                        .iter()
+                        .filter(|(k, w)| *k != from && w.attested && self.usable(o, k, w, now))
+                        .all(|(_, w)| cost < w.cost)
+                }));
         // before the update: it may stop being a gateway
         self.touch(origin);
         let expires = self.expires(now, hops);
@@ -1864,7 +1927,7 @@ impl Router {
             via: Vec::new(),
             chains: Vec::new(),
             sent: Vec::new(),
-            chain_asked: 0,
+            chain_asked: (0, SignPk([0; 32])),
             forwarded: 0,
             flooded: None,
             pending: None,
@@ -1901,9 +1964,9 @@ impl Router {
         o.set_chain(from, chain.map(|c| (c, epoch)));
         // a refresh whose chain we lack: asked for once an epoch (its sender
         // answers a request for a seqno it sent with its chain again)
-        let ask = unheld && seq == o.newest && o.chain_asked != epoch + 1;
+        let ask = wanted && seq == o.newest && o.chain_asked != (epoch + 1, from);
         if ask {
-            o.chain_asked = epoch + 1;
+            o.chain_asked = (epoch + 1, from);
         }
         if o.feasible(&via) {
             o.retracted = false;
@@ -1923,6 +1986,7 @@ impl Router {
         // after: it may have become one
         self.touch(origin);
         if ask {
+            self.stats.chains_asked += 1;
             self.stats.seqreqs_sent += 1;
             self.out.push(Out::SeqReq { to: from, req: SeqReq { origin, seq, hops: 1 } });
         }
@@ -2140,8 +2204,8 @@ impl Router {
             return;
         }
         let best = self.best_route(&req.origin, now);
-        let advert =
-            best.and_then(|(n, via)| self.origins.get(&req.origin).and_then(|o| self.advert(o, &n, &via, &from)));
+        let advert = best
+            .and_then(|(n, via)| self.origins.get(&req.origin).and_then(|o| self.advert(o, &n, &via, &from, false)));
         let Some(o) = self.origins.get_mut(&req.origin) else { return };
         if o.newest >= req.seq
             && let Some((_, via)) = best
@@ -2227,7 +2291,9 @@ impl Router {
                 direct.iter().filter(|pk| **pk != origin && !o.heard.iter().any(|(k, _)| k == *pk)).copied().collect();
             for pk in targets {
                 // (each its own: attested or not, and our hop names it)
-                let Some(a) = self.origins.get(&origin).and_then(|o| self.advert(o, &n, &via, &pk)) else { continue };
+                let Some(a) = self.origins.get(&origin).and_then(|o| self.advert(o, &n, &via, &pk, true)) else {
+                    continue;
+                };
                 self.send_announce(pk, a, now);
             }
         }
@@ -2236,7 +2302,13 @@ impl Router {
     /// Push an announcement for `to`: an attested one it holds the chain of
     /// goes without it ([`Router::elided`]); what it holds is noted.
     fn push_announce(&mut self, to: SignPk, a: Announce) {
+        let withheld = a.same; // ([`Router::advert`])
         let a = self.elided(&to, &a).unwrap_or(a);
+        if withheld {
+            self.stats.chains_withheld += 1;
+        } else if a.same {
+            self.stats.chains_elided += 1;
+        }
         self.note_sent(&to, &a);
         self.stats.announcements_sent += 1;
         self.out.push(Out::Announce { to, ann: a });
@@ -2277,7 +2349,6 @@ impl Router {
     /// chain (until it changes), or, after an unattested one, nothing.
     fn note_sent(&mut self, to: &SignPk, a: &Announce) {
         if a.same {
-            self.stats.chains_elided += 1;
             return;
         }
         let Some(session) = self.nbs.get(to).map(|n| n.session) else { return };
@@ -2321,6 +2392,7 @@ impl Router {
             return;
         }
         self.stats.announcements_deferred += 1;
+        (n.ctl_sorted, n.ctl_need) = (false, MIN_ANN_WIRE as f64);
         if let Some(w) = n.ctl_q.iter_mut().find(|w| w.origin == a.origin) {
             *w = a;
             self.stats.announcements_shed += 1;
@@ -2350,12 +2422,23 @@ impl Router {
         waiting.sort();
         for to in waiting {
             let Some(n) = self.nbs.get_mut(&to) else { continue };
-            let mut q = std::mem::take(&mut n.ctl_q);
             if !n.up {
+                n.ctl_q.clear();
+                n.ctl_sorted = true;
                 continue;
             }
+            // nothing fits yet: wait without looking (a queue of hundreds,
+            // sorted and its head rebuilt every tick, was most of a router's
+            // time when attested announcements kept budgets short)
+            if n.ctl.level(now) < n.ctl_need {
+                self.ctl_waiting.push(to);
+                continue;
+            }
+            let mut q = std::mem::take(&mut n.ctl_q);
             // fewest hops first; popped from the end
-            q.sort_by_key(|a| (Reverse(a.hops), a.origin));
+            if !std::mem::replace(&mut n.ctl_sorted, true) {
+                q.sort_by_key(|a| (Reverse(a.hops), a.origin));
+            }
             while let Some(a) = q.last() {
                 let origin = a.origin;
                 let fresh = self.best_route(&origin, now).filter(|(k, _)| *k != to).and_then(|(n, via)| {
@@ -2363,7 +2446,7 @@ impl Router {
                     let ok = via.seq == o.newest
                         && via.hops < o.latest.scope.min(self.cfg.max_hops)
                         && !o.heard.iter().any(|(k, _)| *k == to);
-                    if ok { self.advert(o, &n, &via, &to) } else { None }
+                    if ok { self.advert(o, &n, &via, &to, true) } else { None }
                 });
                 let Some(fresh) = fresh else {
                     q.pop();
@@ -2371,7 +2454,9 @@ impl Router {
                     continue;
                 };
                 let size = super::wire::wire_len(self.elided(&to, &fresh).as_ref().unwrap_or(&fresh)) as f64;
-                if !self.nbs.get_mut(&to).is_some_and(|n| n.ctl.take(size, now)) {
+                let Some(n) = self.nbs.get_mut(&to) else { break };
+                if !n.ctl.take(size, now) {
+                    n.ctl_need = size;
                     break;
                 }
                 q.pop();

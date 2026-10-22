@@ -145,7 +145,7 @@ pub fn verify_announce(a: &Announce) -> bool {
     a.origin.verify(OGM_CTX, &p.each(), &a.sig).is_ok()
 }
 
-const OGM_FIXED: usize = 1 + 1 + 4 + 32 + 8 + 1 + 1 + 4 + 1;
+pub(crate) const OGM_FIXED: usize = 1 + 1 + 4 + 32 + 8 + 1 + 1 + 4 + 1;
 
 pub fn encode_announce(a: &Announce) -> Bytes {
     let mut b = BytesMut::with_capacity(OGM_FIXED + a.name.len() + 64);

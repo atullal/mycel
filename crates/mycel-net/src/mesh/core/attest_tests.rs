@@ -650,3 +650,93 @@ fn refreshes_keep_a_signed_mesh_attested_and_cost_fewer_bytes() {
     let (over, over_off) = (bytes - plain, bytes_off - plain);
     assert!(over * 2 < over_off, "attestation bytes {over} with reuse, {over_off} without, over {plain}");
 }
+
+// ─────────────── chains only where they may be used (`Config::chain_pull`) ───────────────
+
+#[test]
+fn a_neighbour_whose_attested_route_beats_ours_gets_it_without_the_chain() {
+    // O — U — me, and Y, Z our other neighbours
+    let (o, u, v, me, y, z) = (dk(1), dk(2), dk(8), dk(4), dk(6), dk(7));
+    let s0 = epoch_start(&o.sign_pk(), 8);
+    let mut r = router(&me, &[u.sign_pk(), y.sign_pk(), z.sign_pk()], 100);
+    r.drain(&mut Vec::new());
+    // Y has an attested route of its own (O — V — Y), no costlier than ours
+    // through U plus our link to Y; Z told us of one without a chain
+    r.on_announce(y.sign_pk(), relayed(&o, &[&v, &y], me.sign_pk(), &[300, 400, 500], s0, 8), 10, s0, wire::verify);
+    let zs = Announce { chain: None, ..relayed(&o, &[&v, &z], me.sign_pk(), &[300, 400, 500], s0, 8) };
+    r.on_announce(z.sign_pk(), zs, 20, s0, wire::verify);
+    assert!(via(&r, &o.sign_pk(), &z.sign_pk()).is_some_and(|v| !v.attested));
+    r.tick(1_000);
+    r.drain(&mut Vec::new());
+    // the next seqno through U: ours costs 300 + 400 (+ our hop to Y)
+    let seq = s0 + 1_000;
+    r.on_announce(u.sign_pk(), relayed(&o, &[&u], me.sign_pk(), &[300, 400], seq, 8), 2_000, seq, wire::verify);
+    r.tick(2_100);
+    let mut out = Vec::new();
+    r.drain(&mut out);
+    let to = |n: &DeviceKeys| -> Vec<Announce> {
+        out.iter()
+            .filter_map(|x| match x {
+                Out::Announce { to, ann } if *to == n.sign_pk() && ann.origin == o.sign_pk() => Some(ann.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let (ty, tz) = (to(&y), to(&z));
+    assert!(ty.len() == 1 && ty[0].same && ty[0].chain.is_none() && ty[0].sign_link.is_none(), "{ty:?}");
+    assert_eq!(wire::wire_len(&ty[0]), wire::wire_len(&Announce { same: false, ..ty[0].clone() }));
+    // Z's route came unattested: held to it, Z needs ours with its chain
+    assert!(tz.len() == 1 && !tz[0].same && tz[0].chain_len() == 2 && tz[0].sign_link.is_some(), "{tz:?}");
+    assert_eq!(r.stats().chains_withheld, 1);
+    // Y asks after all (its own route went): the chain, to Y alone
+    r.on_seqreq(y.sign_pk(), SeqReq { origin: o.sign_pk(), seq, hops: 1 }, 2_200);
+    let mut out = Vec::new();
+    r.drain(&mut out);
+    let answers: Vec<(SignPk, &Announce)> =
+        out.iter().filter_map(|x| if let Out::Announce { to, ann } = x { Some((*to, ann)) } else { None }).collect();
+    assert!(answers.len() == 1 && answers[0].0 == y.sign_pk(), "{answers:?}");
+    assert!(!answers[0].1.same && answers[0].1.chain_len() == 2 && answers[0].1.sign_link.is_some());
+    // with pull off, Y gets the chain at once
+    let mut r = router(&me, &[u.sign_pk(), y.sign_pk()], 100);
+    r.cfg.chain_pull = false;
+    r.on_announce(y.sign_pk(), relayed(&o, &[&v, &y], me.sign_pk(), &[300, 400, 500], s0, 8), 10, s0, wire::verify);
+    r.tick(1_000);
+    r.drain(&mut Vec::new());
+    r.on_announce(u.sign_pk(), relayed(&o, &[&u], me.sign_pk(), &[300, 400], seq, 8), 2_000, seq, wire::verify);
+    let got = sent_to(&mut r, y.sign_pk(), o.sign_pk(), 2_100);
+    assert!(got.len() == 1 && !got[0].same && got[0].chain_len() == 2, "{got:?}");
+}
+
+#[test]
+fn a_chain_we_lack_is_asked_for_only_when_its_route_would_be_our_best() {
+    let (o, a, b, c, me) = (dk(1), dk(2), dk(3), dk(5), dk(4));
+    let s0 = epoch_start(&o.sign_pk(), 8);
+    let mut r = router(&me, &[a.sign_pk(), b.sign_pk(), c.sign_pk()], 100);
+    // attested through A: 300 + 400, and our hop
+    r.on_announce(a.sign_pk(), relayed(&o, &[&a], me.sign_pk(), &[300, 400], s0, 8), 0, s0, wire::verify);
+    r.drain(&mut Vec::new());
+    let unheld = |seq: u64, hops: u8, cost: u32| Announce {
+        hops,
+        cost,
+        same: true,
+        ..sign_announce(&o, Origination { seq, flags: 0, scope: 8, uplink: 0 }, "o")
+    };
+    let asked = |r: &mut Router| -> Vec<(SignPk, SeqReq)> {
+        let mut out = Vec::new();
+        r.drain(&mut out);
+        out.into_iter().filter_map(|x| if let Out::SeqReq { to, req } = x { Some((to, req)) } else { None }).collect()
+    };
+    // a costlier refresh from B whose chain we don't hold: taken
+    // unattested, not asked for (A's attested route beats it anyway)
+    r.on_announce(b.sign_pk(), unheld(s0 + 1_000, 3, 2_000), 1_000, s0 + 1_000, wire::verify);
+    assert!(via(&r, &o.sign_pk(), &b.sign_pk()).is_some_and(|v| !v.attested));
+    assert_eq!(asked(&mut r), vec![]);
+    // a cheaper one from C: asked for, of C alone
+    r.on_announce(c.sign_pk(), unheld(s0 + 2_000, 1, 300), 2_000, s0 + 2_000, wire::verify);
+    assert_eq!(asked(&mut r), vec![(c.sign_pk(), SeqReq { origin: o.sign_pk(), seq: s0 + 2_000, hops: 1 })]);
+    // ... once an epoch
+    r.on_announce(c.sign_pk(), unheld(s0 + 3_000, 1, 300), 3_000, s0 + 3_000, wire::verify);
+    assert_eq!(asked(&mut r), vec![]);
+    let s = r.stats();
+    assert_eq!((s.chains_unheld, s.chains_asked, s.neighbours_distrusted), (3, 1, 0));
+}
