@@ -18,7 +18,7 @@ use automerge::{AutoCommit, ObjType, ROOT};
 use bytes::Bytes;
 use mycel_crypto::{DeviceKeys, Hash32, SignPk};
 use mycel_net::link::CustomAddr;
-use mycel_net::mesh::core::{Frame, Origination, SeqReq};
+use mycel_net::mesh::core::{Announce, Frame, Origination, SeqReq};
 use mycel_net::mesh::{directory, wire as mesh};
 use mycel_net::wire::{BlobReq, BlobResp, ContactCard, Data, DtnPayload, EphMsg, Inventory, SyncMsg};
 use mycel_sync::{FeedEntry, Replica, StreamId, StreamKind};
@@ -159,6 +159,19 @@ fn main() {
     for (i, batch) in mesh::encode_announces(&[ann, ann2], 1_200).iter().enumerate() {
         s.put("mesh_wire", &format!("announce-batch-{i}"), None, batch);
     }
+    // attested (ROUTE_ATTEST): the selector is the sending neighbour's key
+    // byte; one hop's chain with the sender's own hop, then a refresh
+    // without it
+    let relay = SignPk([7; 32]);
+    let o = Origination { seq: 1_760_000_000_000, flags: 0, scope: 10, uplink: 0 };
+    let mut a = mesh::sign_announce(&founder, o, "Alice's phone");
+    a.sign_link = Some(320);
+    let mut a = mesh::sign_hop(&founder, a, &relay);
+    (a.hops, a.cost, a.sign_link) = (1, 320, Some(450));
+    let a = a.signed_by(relay, mycel_crypto::Sig([3; 64]));
+    let refresh = Announce { seq: a.seq + 128_000, chain: None, same: true, ..a.clone() };
+    let (grams, _) = mesh::encode_attested(vec![a, refresh], 1_200);
+    s.put("mesh_wire", "attested-batch", Some(7), &grams[0]);
     let req = SeqReq { origin: writer.sign_pk(), seq: 9, hops: 3 };
     s.put("mesh_wire", "seqreq", None, &mesh::encode_seqreq(&req));
     let payload = Bytes::from((0..600u32).map(|i| i as u8).collect::<Vec<_>>());

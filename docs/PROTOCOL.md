@@ -182,14 +182,18 @@ store-and-forward uses streams on the same connection.
 **Route attestations** (`T_AOGMS`, `docs/ROUTING.md` §6 item 13). The
 device at position *j* of a route (0 the origin, then each relay) signs, in
 context `mycel/v2/mesh-attest-hop`, 81 bytes: the origin's key (32), the
-announcement's epoch (u64: (seq + offset) / 64,000, where offset is the
-origin key's first 8 bytes, big-endian, mod 64,000), *j*, the cost it
+announcement's epoch (u64: (seq + offset) / L, where L is 64,000 for an
+announcement of scope ≤ 2 and 448,000, with the top bit set in the result,
+for a wider scope, and offset is the origin key's first 8 bytes,
+big-endian, mod L), *j*, the cost it
 advertises (u32; 0 for the origin), the key of the neighbour it sends to
 (32) and its own measured cost to that neighbour (u32, `HOP_PENALTY`
 included). The origin's own signature (always carried) binds the seqno and
-the other fields; hops bind only the epoch, so within one (64 s, four
-announcement periods) a chain attests any of the origin's announcements:
-that is how stale a route a relay can replay, never a cheaper link than
+the other fields; hops bind only the epoch, so within one a chain attests
+any of the origin's announcements of that kind: that is how stale a route
+a relay can replay (64 s in the near scope, four announcement periods; 448
+s in the full scope, which an origin refreshes every 128 s and whose
+routes live 3.5 refreshes unrefreshed anyway), never a cheaper link than
 its upstream measured. What is implicit is never sent: the origin hop's
 cost (0) and signer (the origin), the sender's own hop's cost (the
 announcement's) and signer (the hop's peer), each hop's next (the
@@ -201,10 +205,13 @@ link; no link under `MIN_HOP_COST`; no device twice.
 
 *Refreshes without their chain* (`A_SAME`): a sender that sent a
 neighbour a chain for an origin, on the same hop connection and in the
-same epoch, sends the origin's next announcements without it while the
-chain under its own hop is the same, its link is no more than 1/8 below
-what its hop signed and its cost no more than 1/8 below (it then
-advertises what it signed). Such an entry is as long as a `T_OGM`. Its
+same epoch (one of each kind, near and full scope, is remembered on both
+sides), sends the origin's next announcements of that kind without it
+while it advertises the same hops, its link is no more than 1/8 below what
+its hop signed and its cost no more than 1/8 below (it then advertises
+what it signed): the chain the receiver holds still shows a route the
+sender had this epoch at no less than it claims, whichever upstream copy
+reached the sender first this time. Such an entry is as long as a `T_OGM`. Its
 receiver attests it with the chain it holds from that sender if that is
 of the announcement's epoch, as long as its hops (+ 1 with the sender's
 own hop) and the announcement claims no less than it allows (the sender's
