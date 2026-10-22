@@ -708,7 +708,9 @@ impl Driver {
         drop(hops);
         let cwnd = self.hop_window(to, &conn, path);
         let bytes: usize = datagrams.iter().map(|d| d.len()).sum();
-        if queued + bytes > (cwnd / QUEUE_CWND_DIV).max(MIN_QUEUE) || crate::buggify::buggify!("mesh: hop queue full") {
+        if queued + bytes > (cwnd / QUEUE_CWND_DIV).max(MIN_QUEUE)
+            || crate::buggify::buggify!("mesh: hop queue full", &self.me.0)
+        {
             self.dropped_queue.fetch_add(1, Ordering::Relaxed);
             return;
         }
@@ -1181,7 +1183,7 @@ impl Driver {
             // a kind from a newer neighbour: nothing it needs answered
             _ => return Ok(()),
         };
-        if crate::buggify::buggify!("mesh: summary stream lost at the receiver") {
+        if crate::buggify::buggify!("mesh: summary stream lost at the receiver", &self.me.0) {
             // (simulation: its read timed out on a stalled link, or a budget
             // refused it, while the connection lives on: the sender believes
             // it arrived; docs/TESTING.md, "Model checking")
@@ -1319,7 +1321,7 @@ impl Driver {
                 // (opening waits while the neighbour has as many streams from us as it allows)
                 let open = crate::resources::within(crate::resources::REPLY_TIMEOUT, "no stream", conn.open_uni());
                 let sent = match open.await {
-                    _ if crate::buggify::buggify!("mesh: summary stream fails to open") => false,
+                    _ if crate::buggify::buggify!("mesh: summary stream fails to open", &me.me.0) => false,
                     Ok(mut tx) => crate::resources::write_all(&mut tx, &msg).await.is_ok() && tx.finish().is_ok(),
                     Err(_) => false,
                 };
@@ -1463,7 +1465,7 @@ async fn run(d: Arc<Driver>) {
     let mut last_dtn = Instant::now();
     loop {
         tokio::time::sleep(tick).await;
-        if crate::buggify::buggify!("mesh: timer fires late") {
+        if crate::buggify::buggify!("mesh: timer fires late", &d.me.0) {
             // (simulation: the OS ran us late, as a busy or napping app is)
             tokio::time::sleep(tick * 25).await;
         }

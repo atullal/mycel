@@ -221,7 +221,7 @@ impl Pool {
         let dialed = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
             // (simulation: a dial that fails although the device is there,
             // as radios and NATs make some do)
-            _ if crate::buggify::buggify!("pool: dial fails spuriously") => {
+            _ if crate::buggify::buggify!("pool: dial fails spuriously", self.endpoint.id().as_bytes()) => {
                 Err(anyhow!("can't reach the device: dial failed (injected)"))
             }
             Ok(Ok(c)) => Ok(c),
@@ -236,7 +236,7 @@ impl Pool {
             }
         };
         self.dialed.fetch_add(1, Ordering::Relaxed);
-        if crate::buggify::buggify!("pool: connection lost right after the dial") {
+        if crate::buggify::buggify!("pool: connection lost right after the dial", self.endpoint.id().as_bytes()) {
             // (simulation: the link drops just after the handshake; the
             // connection is handed out closed, as a real one can be)
             conn.close(0u32.into(), b"injected");
