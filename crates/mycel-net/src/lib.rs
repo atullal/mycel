@@ -47,6 +47,7 @@
 //! membership change, a local write, a newly reachable peer).
 
 mod blobs;
+pub mod custody;
 pub mod emu;
 #[cfg(fuzzing)]
 #[doc(hidden)]
@@ -87,6 +88,7 @@ use n0_future::StreamExt;
 use pool::{Pool, PooledConn};
 use tokio::sync::{Notify, Semaphore, broadcast, mpsc};
 
+pub use custody::node::{CustodyOptions, CustodyStats};
 pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_free_space, free_space, human_size};
 pub use iroh;
 pub use link::{Link, LinkEvent, LinkStatus, PathKind, path_in_use};
@@ -139,6 +141,8 @@ const MAX_BUNDLE_PAYLOAD: usize = 200 * 1024;
 const BUNDLE_LIFETIME: Duration = Duration::from_secs(3 * 24 * 3600);
 /// Max membership ops accepted in a pushed invite.
 const MAX_INVITE_OPS: usize = 4096;
+/// Bundles whose contents are remembered for the delivery state.
+const BUNDLE_ITEMS_MAX: usize = 1024;
 
 fn to_sign_pk(pk: &PublicKey) -> SignPk {
     SignPk(*pk.as_bytes())
@@ -206,6 +210,9 @@ pub struct NodeOptions {
     /// sessions, refuse `SyncV2` streams as an unknown kind, sync every
     /// member), for mixed groups in tests and v1 baselines.
     pub sync_v2: bool,
+    /// Offline delivery through the internet: custodians
+    /// (docs/OFFLINE_DELIVERY.md). On by default, with conservative limits.
+    pub custody: CustodyOptions,
 }
 
 /// Another protocol served on the node's endpoint: incoming connections with
@@ -236,6 +243,7 @@ impl NodeOptions {
             max_ephemeral: MAX_EPHEMERAL,
             protocol: Protocol::default(),
             sync_v2: true,
+            custody: CustodyOptions::default(),
         }
     }
 }
@@ -374,6 +382,11 @@ struct Inner {
     v2: sync_v2::V2,
     /// Periodic anti-entropy schedule per space.
     periodic: Mutex<HashMap<SpaceId, Backoff>>,
+    /// Custody: our parcels, others' parcels we keep, known custodians.
+    custody: Mutex<custody::node::State>,
+    /// What each of our recent store-and-forward bundles carries (envelope
+    /// ids), so the app can show who carries a message.
+    bundle_items: Mutex<HashMap<Hash32, Vec<EnvelopeId>>>,
 }
 
 /// Why a sync runs: only some outcomes are signs of loss for the backoff.
@@ -635,8 +648,9 @@ impl Inner {
     /// Remember what was agreed with `peer` on a connection we dialed
     /// (diagnostics, and formats sent without a connection:
     /// store-and-forward). We chose to dial it, so it may get an entry.
-    fn note_protocol(&self, peer: SignPk, p: PeerProtocol) {
+    fn note_protocol(self: &Arc<Self>, peer: SignPk, p: PeerProtocol) {
         self.peers.lock().entry(peer).or_default().protocol = Some(p);
+        self.custody_on_protocol(peer, p, true);
     }
 
     /// The same, on a connection `peer` dialed: before any exchange, so
@@ -644,14 +658,17 @@ impl Inner {
     /// already track or share a space with is noted; a stranger gets no
     /// entry, which would never be removed. (Its connection still knows its
     /// version.)
-    fn note_accepted_protocol(&self, peer: SignPk, p: PeerProtocol) {
+    fn note_accepted_protocol(self: &Arc<Self>, peer: SignPk, p: PeerProtocol) {
         let member = self.spaces.lock().values().any(|r| r.is_member(&peer));
-        let mut peers = self.peers.lock();
-        match peers.get_mut(&peer) {
-            Some(state) => state.protocol = Some(p),
-            None if member => peers.entry(peer).or_default().protocol = Some(p),
-            None => {}
+        {
+            let mut peers = self.peers.lock();
+            match peers.get_mut(&peer) {
+                Some(state) => state.protocol = Some(p),
+                None if member => peers.entry(peer).or_default().protocol = Some(p),
+                None => {}
+            }
         }
+        self.custody_on_protocol(peer, p, member);
     }
 
     /// The memory budget for what `peer` sends us on a stream it opened: a
@@ -714,7 +731,18 @@ impl Inner {
         if self.bundled.lock().insert((peer, space), id) == Some(id) {
             return; // already on its way
         }
-        mesh.send_bundle(peer, payload.into(), BUNDLE_LIFETIME);
+        let items: Vec<EnvelopeId> = postcard::from_bytes::<DtnPayload>(&payload)
+            .map(|p| p.data.envelopes.iter().map(|e| e.id()).collect())
+            .unwrap_or_default();
+        if let Some(id) = mesh.send_bundle(peer, payload.into(), BUNDLE_LIFETIME) {
+            let mut b = self.bundle_items.lock();
+            if b.len() >= BUNDLE_ITEMS_MAX
+                && let Some(k) = b.keys().next().copied()
+            {
+                b.remove(&k);
+            }
+            b.insert(id, items);
+        }
     }
 
     /// A bundle for us arrived through carriers: apply it like a sync from
@@ -1022,6 +1050,7 @@ async fn serve_bi(
         StreamKind::Card => serve_card(inner, tx).await,
         StreamKind::Blob => blobs::serve(inner, peer, tx, rx).await,
         StreamKind::Hello => serve_hello(inner, version, peer, tx, rx).await,
+        StreamKind::Custody => custody::node::serve(inner, conn, peer, tx, rx).await,
         StreamKind::Ephemeral => bail!("ephemeral messages use uni-streams"),
     }
 }
@@ -1049,8 +1078,9 @@ async fn serve_hello(
         bail!("test: hello dropped");
     }
     inner.hellos_served.fetch_add(1, Ordering::Relaxed);
-    inner.note_accepted_protocol(peer, PeerProtocol::agreed(version, inner.protocol.caps, theirs.caps));
-    send(&mut tx, &Hello::ours(inner.protocol.caps)).await?;
+    let caps = inner.caps();
+    inner.note_accepted_protocol(peer, PeerProtocol::agreed(version, caps, theirs.caps));
+    send(&mut tx, &Hello::ours(caps)).await?;
     tx.finish()?;
     Ok(())
 }
@@ -1238,7 +1268,7 @@ fn start_hello(inner: &Arc<Inner>, peer: SignPk, c: &PooledConn) {
     }
     let (inner, conn) = (inner.clone(), c.share());
     tokio::spawn(async move {
-        let caps = inner.protocol.caps;
+        let caps = inner.caps();
         let hello = async {
             let (mut tx, mut rx) = open_bi(&conn, StreamKind::Hello).await?;
             let len = send_len(&mut tx, &Hello::ours(caps)).await?;
@@ -1397,6 +1427,7 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Tri
             r = &mut session => r,
             _ = tokio::time::sleep(BUNDLE_AFTER) => {
                 inner.offer_bundle(peer, space);
+                inner.offer_custody(peer, space);
                 session.await
             }
         };
@@ -1423,6 +1454,7 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Tri
         let ok = res.is_ok();
         if let Ok(stats) = &res {
             inner.mark_ok(peer);
+            inner.custody_synced(peer, space);
             // A periodic session that found something means pushes are
             // being missed: back to the short interval.
             if trigger == Trigger::Periodic && sync_v2::moved(stats) {
@@ -1431,6 +1463,7 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Tri
         } else {
             inner.mark_fail(peer);
             inner.offer_bundle(peer, space);
+            inner.offer_custody(peer, space);
         }
         let mut inflight = inner.inflight.lock();
         match inflight.get_mut(&(peer, space)) {
@@ -1700,6 +1733,7 @@ impl Node {
         };
         let (events, _) = broadcast::channel(1024);
         let pool = Pool::new(endpoint.clone(), opts.protocol.version);
+        let keys_pk = keys.sign_pk();
         let inner = Arc::new(Inner {
             keys,
             mode: opts.mode,
@@ -1746,6 +1780,8 @@ impl Node {
             dirty_local: Mutex::default(),
             v2: sync_v2::V2::default(),
             periodic: Mutex::default(),
+            custody: Mutex::new(custody::node::State::new(keys_pk, opts.custody)),
+            bundle_items: Mutex::default(),
         });
         // (the router's order is the listener's preference: newest first)
         let mut router = Router::builder(endpoint);
@@ -1761,7 +1797,7 @@ impl Node {
             }
         }
         let router = router.spawn();
-        let mut tasks = vec![tokio::spawn(scheduler(inner.clone()))];
+        let mut tasks = vec![tokio::spawn(scheduler(inner.clone())), tokio::spawn(custody::node::run(inner.clone()))];
         let reaper = inner.clone();
         tasks.push(tokio::spawn(async move {
             loop {
@@ -2067,7 +2103,7 @@ impl Node {
 
     /// What this node offers: its newest wire version and its capabilities.
     pub fn protocol(&self) -> Protocol {
-        self.inner.protocol
+        Protocol { caps: self.inner.caps(), ..self.inner.protocol }
     }
 
     /// The wire version and capabilities agreed with `peer`: on the pooled
@@ -2077,6 +2113,63 @@ impl Node {
     pub async fn negotiate(&self, peer: SignPk) -> Result<PeerProtocol> {
         let conn = pooled(&self.inner, &peer).await?;
         Ok(conn.protocol(resources::REPLY_TIMEOUT).await)
+    }
+
+    /// What custody has done here (docs/OFFLINE_DELIVERY.md).
+    pub fn custody_stats(&self) -> CustodyStats {
+        self.inner.custody_stats()
+    }
+
+    /// Keep parcels for others (a custodian) or not, from now on: a phone
+    /// on battery or a metered network may stop. Peers learn it from the
+    /// next connection's hello ([`Caps::CUSTODIAN`]); deposits meanwhile
+    /// are refused. Parcels already held are still delivered.
+    pub fn set_custodian(&self, on: bool) {
+        let mut c = self.inner.custody.lock();
+        let on = on && c.enabled;
+        c.vault.set_serving(on);
+    }
+
+    /// Whether this device keeps parcels for others now.
+    pub fn custodian(&self) -> bool {
+        self.inner.custody.lock().vault.serving()
+    }
+
+    /// Our own other devices: the custodians tried first for our parcels.
+    pub fn set_own_devices(&self, own: Vec<SignPk>) {
+        self.inner.set_own_devices(own);
+    }
+
+    /// Remember `peer` as a custodian (as a hello advertising
+    /// [`Caps::CUSTODIAN`] would): for tests, and devices known some other way.
+    pub fn add_custodian_hint(&self, peer: SignPk) {
+        self.inner.custody.lock().directory.add(peer, custody::node::wall_ms());
+    }
+
+    /// How many devices hold an acknowledged, sealed copy of `item` (an
+    /// envelope of ours) for members we couldn't reach: internet
+    /// custodians and store-and-forward carriers that took it.
+    pub fn carried(&self, item: &EnvelopeId) -> usize {
+        self.inner.carried(item)
+    }
+
+    /// Ask `custodian` for our mail now (it is also asked on connecting,
+    /// and the custodians closest to our key periodically).
+    pub async fn fetch_custody(&self, custodian: SignPk) {
+        custody::node::fetch_from(self.inner.clone(), custodian).await;
+    }
+
+    /// Deposit an already sealed parcel with `custodian` (with a proof of
+    /// work if it shares no space with us). The node does this itself for
+    /// members it can't reach; this is for tests and tools.
+    pub async fn deposit_parcel(&self, custodian: SignPk, parcel: custody::Parcel) -> Result<custody::Deposit> {
+        custody::node::deposit_at(&self.inner, custodian, &Arc::new(parcel)).await
+    }
+
+    /// The custodians we can find XOR-closest to `target` (a Kademlia-style
+    /// lookup through the custodians we know).
+    pub async fn find_custodians(&self, target: SignPk) -> Vec<SignPk> {
+        custody::node::find(&self.inner, target).await
     }
 
     /// QUIC connections (handshakes) this node has dialed and accepted.

@@ -606,7 +606,15 @@ pub struct Carrier {
     partial_used: u64,
     housekept: Option<Time>,
     stats: DtnStats,
+    /// Neighbours that took copies of our own bundles (kept after the last
+    /// copy is handed on, until a receipt or [`CARRIED_MAX`] newer ones):
+    /// the app shows a message as carried.
+    carried: Map<Hash32, Vec<SignPk>>,
+    carried_order: VecDeque<Hash32>,
 }
+
+/// Own bundles whose carriers are remembered.
+const CARRIED_MAX: usize = 1024;
 
 impl Carrier {
     pub fn new(me: SignPk, cfg: DtnConfig) -> Carrier {
@@ -638,6 +646,8 @@ impl Carrier {
             partial_used: 0,
             housekept: None,
             stats: DtnStats::default(),
+            carried: Map::default(),
+            carried_order: VecDeque::new(),
         }
     }
 
@@ -991,8 +1001,25 @@ impl Carrier {
 
     // ───────────── receipts and summaries ─────────────
 
+    /// The neighbours that took copies of our own bundle `id` (until it is
+    /// receipted or long forgotten).
+    pub fn carriers(&self, id: &Hash32) -> &[SignPk] {
+        self.carried.get(id).map_or(&[], Vec::as_slice)
+    }
+
+    fn trim_carried(&mut self) {
+        while self.carried_order.len() > CARRIED_MAX {
+            if let Some(old) = self.carried_order.pop_front() {
+                self.carried.remove(&old);
+            }
+        }
+    }
+
     /// We delivered `r.id` to ourselves (we are `r.dst`), or learnt of it.
     pub fn add_receipt(&mut self, r: Receipt) {
+        if self.carried.remove(&r.id).is_some() {
+            self.carried_order.retain(|x| *x != r.id);
+        }
         if self.held.contains_key(&r.id) {
             self.drop_held(&r.id);
             self.stats.cleared_by_receipt += 1;
@@ -1421,6 +1448,15 @@ impl Carrier {
                 if h.b.src == self.me && !h.given.contains(&to) {
                     h.given.push(to);
                 }
+                if h.b.src == self.me {
+                    let v = self.carried.entry(id).or_default();
+                    if v.is_empty() {
+                        self.carried_order.push_back(id);
+                    }
+                    if !v.contains(&to) && v.len() < 64 {
+                        v.push(to);
+                    }
+                }
                 h.copies = h.copies.saturating_sub(copies);
                 h.copies == 0
             }
@@ -1429,6 +1465,7 @@ impl Carrier {
         if gone {
             self.drop_held(&id);
         }
+        self.trim_carried();
         self.stats.handed_on += 1;
     }
 

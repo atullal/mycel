@@ -53,15 +53,24 @@ impl Caps {
     pub const SYNC_V2: Caps = Caps(1 << 0);
     /// Per-hop route attestations on mesh announcements (mesh protocol).
     pub const ROUTE_ATTEST: Caps = Caps(1 << 1);
+    /// Speaks the custody protocol: deposits parcels for offline members
+    /// with custodians and fetches its own (node protocol, stream kind
+    /// `Custody`; docs/OFFLINE_DELIVERY.md). Bit 2 is taken by the Sync v2
+    /// stage 3 work (`GOSSIP`).
+    pub const CUSTODY: Caps = Caps(1 << 3);
+    /// Keeps parcels for others now (a custodian). Not a feature both
+    /// sides need: read from what the peer advertised
+    /// ([`PeerProtocol::advertised`]), beside an agreed [`Caps::CUSTODY`].
+    pub const CUSTODIAN: Caps = Caps(1 << 4);
     /// Bits never assigned: hellos set one at random so that peers keep
     /// ignoring bits they don't know (see the module docs).
     pub const RESERVED: Caps = Caps(0xffff << 48);
     /// Every bit this build has a name for.
-    pub const KNOWN: Caps = Caps(Self::SYNC_V2.0 | Self::ROUTE_ATTEST.0);
+    pub const KNOWN: Caps = Caps(Self::SYNC_V2.0 | Self::ROUTE_ATTEST.0 | Self::CUSTODY.0 | Self::CUSTODIAN.0);
     /// What this build implements, and so advertises by default.
     /// (`ROUTE_ATTEST` is registered for the work that implements it; a
     /// build sets it here once it does.)
-    pub const SUPPORTED: Caps = Caps::SYNC_V2;
+    pub const SUPPORTED: Caps = Caps(Self::SYNC_V2.0 | Self::CUSTODY.0 | Self::CUSTODIAN.0);
 
     /// The raw bits, unknown ones included.
     pub const fn bits(self) -> u64 {
@@ -146,6 +155,18 @@ pub const CAPABILITIES: &[Capability] = &[
         name: "ROUTE_ATTEST",
         protocol: "mesh",
         summary: "per-hop attestations on route announcements",
+    },
+    Capability {
+        cap: Caps::CUSTODY,
+        name: "CUSTODY",
+        protocol: "node",
+        summary: "custody stream: sealed parcels for offline members deposited with custodians, fetched by their recipient",
+    },
+    Capability {
+        cap: Caps::CUSTODIAN,
+        name: "CUSTODIAN",
+        protocol: "node",
+        summary: "keeps parcels for others now (read from what the peer advertised)",
     },
 ];
 

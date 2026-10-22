@@ -1632,6 +1632,11 @@ impl Mesh {
         self.d.carrier.as_ref().map(|c| c.lock().stats()).unwrap_or_default()
     }
 
+    /// The neighbours that took copies of our own bundle `id`.
+    pub fn bundle_carriers(&self, id: &Hash32) -> Vec<SignPk> {
+        self.d.carrier.as_ref().map(|c| c.lock().carriers(id).to_vec()).unwrap_or_default()
+    }
+
     /// Whether this device holds bundle `id` (for others or its own).
     pub fn holds_bundle(&self, id: &Hash32) -> bool {
         self.d.carrier.as_ref().is_some_and(|c| c.lock().holds(id))
