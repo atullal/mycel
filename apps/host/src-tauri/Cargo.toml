@@ -35,7 +35,7 @@ serde_json = "1"
 # libc 0.2.190 declares the routing-socket constants and `in6_ifreq` for macOS
 # only, which breaks Iroh's `netwatch` and `netdev` on iOS. Stay below it until
 # they stop relying on those items there.
-libc = ">=0.2.189, <0.2.190"
+libc = ">=0.2.189, <0.2.191"
 tokio = { version = "1", features = ["sync"] }
 
 # The device's name for a new profile, and the share sheet for attachments.
