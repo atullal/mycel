@@ -7,19 +7,32 @@
 //!   minute), or through a keeper of the conversation, if it has one
 //!   (an always-on device; [`Cfg::dm_keeper`] of direct chats have one).
 //! - **Custodians**: also, when the live attempt fails, a sealed parcel goes
-//!   to up to 3 custodians online at that moment, chosen by the real
-//!   [`mycel_net::custody::select`] (own always-on devices, devices sharing a
-//!   group with the recipient, then the online custodians XOR-closest to the
-//!   recipient), stored under the real [`mycel_net::custody::Vault`] limits;
-//!   the recipient gets it the first time it and any custodian holding it
-//!   are online at once (it asks on connecting, and custodians push), and
-//!   its receipt clears every copy.
+//!   to up to 3 custodians, chosen by the real
+//!   [`mycel_net::custody::select`] from the build's tiers (the sender's
+//!   keepers, devices sharing a group with the recipient, then the
+//!   custodians XOR-closest to the recipient, online or not: a dial to an
+//!   offline one fails and uses up one of the 8 attempts), stored under the
+//!   real [`mycel_net::custody::Vault`] limits. How the recipient then gets
+//!   it follows the build, per tier:
+//!   - a co-member custodian: the next time both are online (the recipient
+//!     syncs its groups on coming back, and a custodian pushes to a device
+//!     that connects to it);
+//!   - any custodian: the custodian's own pushes, at the build's backoff
+//!     (now, then 2, 4, 8 ... minutes, at most an hour apart), each landing
+//!     only if both are online at that moment;
+//!   - a volunteer among the 8 closest to the recipient's key: also the
+//!     recipient's own "anything for me?" every 30 minutes (at a random
+//!     phase per device), landing only if both are online then.
+//!
+//!   The recipient's receipt clears every copy.
 //!
 //! No radios: every device is internet-only, so store-and-forward carriers
 //! (the mesh) can't help, the case the bug report describes. Assumptions
-//! that favour custody are marked: the XOR-closest lookup finds the true
-//! closest online custodians (a converged Kademlia lookup), and a custodian
-//! and recipient that are both online find each other within a second.
+//! that favour custody are marked: the XOR lookups (sender's and
+//! recipient's) are converged, finding the true closest custodians; a dial
+//! to an online device finds it at once; and a person's always-on device is
+//! a keeper of their chats (the build's first tier is the sender's
+//! keepers; a laptop is not one, so laptops only volunteer).
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -202,6 +215,37 @@ fn next_on(s: &Spells, t: Time) -> Option<Time> {
     s.get(i).map(|x| x.0.max(t))
 }
 
+/// The build's delivery retries after a custodian takes a parcel (s): one
+/// within a tick, then after 2, 4, 8 ... minutes, at most an hour apart
+/// (`CustodyOptions::retry`, `retry_max`).
+fn push_times(at: Time, until: Time) -> impl Iterator<Item = Time> {
+    let mut t = at + 5 * SEC;
+    let mut wait = 60 * SEC;
+    std::iter::from_fn(move || {
+        if t >= until {
+            return None;
+        }
+        let now = t;
+        wait = (wait * 2).min(HOUR);
+        t += wait;
+        Some(now)
+    })
+}
+
+/// The recipient's periodic fetch from the custodians closest to its key
+/// (`CustodyOptions::fetch_every`), from `at` on, at `phase` in the period.
+fn fetch_times(at: Time, phase: Time, until: Time) -> impl Iterator<Item = Time> {
+    let first = at + (phase + FETCH_EVERY - at % FETCH_EVERY) % FETCH_EVERY;
+    (0..).map(move |k| first + k * FETCH_EVERY).take_while(move |t| *t < until)
+}
+
+const FETCH_EVERY: Time = 30 * MIN;
+
+/// The first of `times` at which both are online.
+fn both_on(a: &Spells, b: &Spells, times: impl Iterator<Item = Time>) -> Option<Time> {
+    times.into_iter().find(|t| online(a, *t) && online(b, *t))
+}
+
 /// The first time at or after `t` that both are online.
 fn overlap(a: &Spells, b: &Spells, t: Time) -> Option<Time> {
     let (mut i, mut j) = (a.partition_point(|x| x.1 <= t), b.partition_point(|x| x.1 <= t));
@@ -224,12 +268,12 @@ struct Device {
     key: SignPk,
     spells: Spells,
     serves: bool,
+    /// Where in the fetch period its periodic fetch falls.
+    phase: Time,
 }
 
 struct Person {
     phone: usize,
-    /// Own other devices (laptop, always-on box).
-    own: Vec<usize>,
     always_on: Option<usize>,
     groups: Vec<usize>,
 }
@@ -244,6 +288,13 @@ enum Ev {
 
 fn secret_of(i: usize) -> [u8; 32] {
     Hash32::digest("mycel-sim/custody-secret", &(i as u64).to_le_bytes()).0
+}
+
+fn opt_min(a: Option<Time>, b: Option<Time>) -> Option<Time> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
 }
 
 /// Run one world for `seed` in `mode`.
@@ -263,24 +314,26 @@ pub fn run(cfg: &Cfg, seed: u64, mode: Mode) -> Outcome {
         let tz = cfg.zones[i * cfg.zones.len().max(1) / cfg.people.max(1)];
         let phone = devices.len();
         let on = spells(&mut rng, cfg.phone_on_s, cfg.phone_off_s, until);
+        let phase = |rng: &mut Rng| (rng.f64() * FETCH_EVERY as f64) as Time;
         devices.push(Device {
             key: key(&mut rng),
             spells: awake(on, tz, cfg.phone_hours, until),
             serves: !rng.chance(cfg.phone_refuses),
+            phase: phase(&mut rng),
         });
-        let mut own = Vec::new();
         if rng.chance(cfg.laptop_share) {
-            own.push(devices.len());
+            // (a device of its own: Mycel has no multi-device identity, so a
+            // laptop is no "own device" tier; it can volunteer)
             let on = spells(&mut rng, cfg.laptop_on_s, cfg.laptop_off_s, until);
-            devices.push(Device { key: key(&mut rng), spells: awake(on, tz, cfg.laptop_hours, until), serves: true });
+            let spells = awake(on, tz, cfg.laptop_hours, until);
+            devices.push(Device { key: key(&mut rng), spells, serves: true, phase: phase(&mut rng) });
         }
         let mut always_on = None;
         if rng.chance(cfg.always_on_share) {
             always_on = Some(devices.len());
-            own.push(devices.len());
-            devices.push(Device { key: key(&mut rng), spells: always(until), serves: true });
+            devices.push(Device { key: key(&mut rng), spells: always(until), serves: true, phase: phase(&mut rng) });
         }
-        people.push(Person { phone, own, always_on, groups: Vec::new() });
+        people.push(Person { phone, always_on, groups: Vec::new() });
     }
     // groups: communities of neighbours on a ring, so groups overlap
     let n_groups = (cfg.people * cfg.groups_per_person / cfg.group_size).max(1);
@@ -342,6 +395,10 @@ pub fn run(cfg: &Cfg, seed: u64, mode: Mode) -> Outcome {
     let mut queue: BinaryHeap<Reverse<(Time, Ev)>> =
         msgs.iter().enumerate().map(|(i, m)| Reverse((m.0, Ev::Send(i)))).collect();
     let mut custodians_total = 0usize;
+    // the custodians XOR-closest to each recipient (a converged lookup:
+    // the sender's and the recipient's agree), online or not
+    let mut closest: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    let index: std::collections::HashMap<SignPk, usize> = devices.iter().enumerate().map(|(j, d)| (d.key, j)).collect();
     const T0_MS: u64 = 1_800_000_000_000;
     let retry = |rng: &mut Rng| (rng.f64() * 60.0 * SEC as f64) as Time;
     while let Some(Reverse((now, ev))) = queue.pop() {
@@ -373,24 +430,33 @@ pub fn run(cfg: &Cfg, seed: u64, mode: Mode) -> Outcome {
                     let at = attempt + 10 * SEC;
                     let me = devices[src].key;
                     let dkey = devices[dst].key;
-                    let own: Vec<SignPk> = people[from].own.iter().map(|d| devices[*d].key).collect();
+                    // the build's first tier: the sender's keepers (assumed:
+                    // its always-on device, if it has one)
+                    let own: Vec<SignPk> = people[from].always_on.iter().map(|d| devices[*d].key).collect();
                     let shares: Vec<SignPk> = people[from]
                         .groups
                         .iter()
                         .filter(|g| groups[**g].contains(&to))
-                        .flat_map(|g| groups[*g].iter().map(|p| devices[people[*p].phone].key))
+                        .flat_map(|g| groups[*g].iter().map(|p| people[*p].phone))
+                        // (co-members' hellos say whether they keep custody)
+                        .filter(|d| devices[*d].serves)
+                        .map(|d| devices[d].key)
                         .collect();
-                    // (assumption: a converged lookup finds the true closest)
-                    let mut serving: Vec<([u8; 32], usize)> = devices
-                        .iter()
-                        .enumerate()
-                        .filter(|(j, d)| d.serves && *j != src && *j != dst && online(&d.spells, at))
-                        .map(|(j, d)| (custody::distance(&dkey, &d.key), j))
-                        .collect();
-                    serving.sort_unstable();
+                    let near = closest.entry(dst).or_insert_with(|| {
+                        let mut serving: Vec<([u8; 32], usize)> = devices
+                            .iter()
+                            .enumerate()
+                            .filter(|(j, d)| d.serves && *j != dst)
+                            .map(|(j, d)| (custody::distance(&dkey, &d.key), j))
+                            .collect();
+                        serving.sort_unstable();
+                        serving.into_iter().take(custody::FIND_MAX + 1).map(|(_, j)| j).collect()
+                    });
                     let volunteers: Vec<SignPk> =
-                        serving.iter().take(custody::FIND_MAX).map(|(_, j)| devices[*j].key).collect();
-                    let by_key = |k: &SignPk| devices.iter().position(|d| d.key == *k);
+                        near.iter().filter(|j| **j != src).take(custody::FIND_MAX).map(|j| devices[*j].key).collect();
+                    // what the recipient's periodic fetch asks: what its lookup names
+                    let asked: Vec<usize> = near.iter().copied().take(custody::FIND_MAX).collect();
+                    let by_key = |k: &SignPk| index.get(k).copied();
                     let is_on = |k: &SignPk| by_key(k).is_some_and(|j| online(&devices[j].spells, at));
                     let picked = custody::select(&dkey, &me, &own, &shares, &volunteers, &is_on, custody::MAX_ATTEMPTS);
                     let parcel = Parcel {
@@ -402,7 +468,8 @@ pub fn run(cfg: &Cfg, seed: u64, mode: Mode) -> Outcome {
                         sealed: vec![0; 1500 + (i % 7) * 40],
                     };
                     let id = parcel.id();
-                    for (k, _) in picked {
+                    let mut tiers = Vec::new();
+                    for (k, tier) in picked {
                         if parcels[i].len() >= cfg.copies {
                             break;
                         }
@@ -414,10 +481,15 @@ pub fn run(cfg: &Cfg, seed: u64, mode: Mode) -> Outcome {
                             Vault::new(VaultConfig { serve: devices[j].serves, ..vault_cfg.clone() })
                         });
                         v.tick(T0_MS + at / 1000);
-                        let d = Depositor { key: me, origin: Origin::Ip([from as u8; 16]), known: true };
+                        // (a volunteer shares no space with the sender: a stranger's share)
+                        let mut ip = [0u8; 16];
+                        ip[..8].copy_from_slice(&(from as u64).to_le_bytes());
+                        let known = tier != custody::Tier::Volunteer;
+                        let d = Depositor { key: me, origin: Origin::Ip(ip), known };
                         match v.deposit(&d, parcel.clone(), 0, &k, T0_MS + at / 1000) {
                             Deposit::Stored | Deposit::Duplicate => {
                                 parcels[i].push((j, id));
+                                tiers.push(tier);
                                 out.peak_custodian_bytes = out.peak_custodian_bytes.max(v.used().0);
                             }
                             Deposit::Refused(_) => out.refused += 1,
@@ -427,11 +499,19 @@ pub fn run(cfg: &Cfg, seed: u64, mode: Mode) -> Outcome {
                         out.carried += 1;
                         custodians_total += parcels[i].len();
                     }
-                    for (j, _) in &parcels[i] {
-                        if let Some(x) = overlap(&devices[*j].spells, &devices[dst].spells, at) {
-                            // (assumption: they find each other within a second)
-                            best = Some(best.map_or(x + SEC, |b| b.min(x + SEC)));
+                    for ((j, _), tier) in parcels[i].iter().zip(&tiers) {
+                        let (cs, ds) = (&devices[*j].spells, &devices[dst].spells);
+                        // the custodian's pushes, at its backoff
+                        let mut x = both_on(cs, ds, push_times(at, until));
+                        // a co-member: the recipient syncs with it on coming back
+                        if *tier == custody::Tier::Shares {
+                            x = opt_min(x, overlap(cs, ds, at).map(|t| t + SEC));
                         }
+                        // one of the closest to its key: its periodic fetch
+                        if asked.contains(j) {
+                            x = opt_min(x, both_on(cs, ds, fetch_times(at, devices[dst].phase, until)));
+                        }
+                        best = opt_min(best, x.map(|t| t + SEC));
                     }
                 }
                 if let Some(x) = best
@@ -479,6 +559,19 @@ mod tests {
         assert_eq!(overlap(&a, &b, 0), Some(5));
         assert_eq!(overlap(&a, &b, 6), Some(25));
         assert_eq!(overlap(&a, &b, 31), None);
+    }
+
+    #[test]
+    fn pushes_back_off_and_fetches_follow_their_phase() {
+        let p: Vec<Time> = push_times(0, 4 * HOUR).collect();
+        assert_eq!(p[..6], [5 * SEC, 125 * SEC, 365 * SEC, 845 * SEC, 1805 * SEC, 3725 * SEC]);
+        assert!(p.windows(2).all(|w| w[1] - w[0] <= HOUR));
+        let f: Vec<Time> = fetch_times(40 * MIN, 5 * MIN, 2 * HOUR).collect();
+        assert_eq!(f, vec![65 * MIN, 95 * MIN]);
+        let a = vec![(0, 10 * MIN), (60 * MIN, 70 * MIN)];
+        let b = vec![(0, HOUR + 7 * MIN)];
+        assert_eq!(both_on(&a, &b, push_times(0, HOUR)), Some(5 * SEC));
+        assert_eq!(both_on(&a, &b, push_times(11 * MIN, 2 * HOUR)), None);
     }
 
     #[test]

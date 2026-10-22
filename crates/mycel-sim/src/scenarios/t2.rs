@@ -1523,16 +1523,17 @@ fn offline_recipient(o: Opts) -> ScenarioResult {
     r.at_least(
         &format!("recipient offline at send: delivered within 4 h, mean of {OFFLINE_SEEDS} seeds"),
         c4,
-        80.0,
+        75.0,
         "%",
     );
-    r.at_least(&format!("… gain over keepers only within 4 h, mean of {OFFLINE_SEEDS} seeds"), c4 - b4, 12.0, "points");
+    r.at_least(&format!("… gain over keepers only within 4 h, mean of {OFFLINE_SEEDS} seeds"), c4 - b4, 8.0, "points");
     r.at_least("… seeds where custodians deliver more within 4 h", wins as f64, OFFLINE_SEEDS as f64, "");
     r.at_least("… delivered within 24 h", cust_off, base_off, "%");
-    // (calibrated on base 2000's seeds: 4 h 86.1–86.5% at CI size, 88.4% at
-    // full size; gain 17.4–18.1 points; p50 0.37–0.40×, p95 0.58–0.61×)
-    r.at_most("latency p50 vs keepers only", lc.p50 / lb.p50.max(1e-9), 0.6, "×");
-    r.at_most("latency p95 vs keepers only", lc.p95 / lb.p95.max(1e-9), 0.8, "×");
+    // (calibrated on base 2000's and 3000's seeds: 4 h 78.9% at CI size,
+    // 82.4% at full size; gain 10.6–11.1 points; p50 0.53–0.54×, p95
+    // 0.77–0.78×)
+    r.at_most("latency p50 vs keepers only", lc.p50 / lb.p50.max(1e-9), 0.65, "×");
+    r.at_most("latency p95 vs keepers only", lc.p95 / lb.p95.max(1e-9), 0.85, "×");
     r.at_most("custodians per carried message", copies, 3.0, "");
     r.headline(format!(
         "recipient offline at send: within 1 h {c1:.1}% vs {b1:.1}%, within 4 h {c4:.1}% vs {b4:.1}%, within 24 h {cust_off:.1}% vs {base_off:.1}% (custodians vs keepers only; all messages {cust_all:.1}% vs {base_all:.1}%)"
@@ -1545,7 +1546,7 @@ fn offline_recipient(o: Opts) -> ScenarioResult {
         fmt(lb.p95)
     ));
     r.note(format!(
-        "{} people ({} messages per seed) in four time zones (UTC−5, +1, +5, +9), internet-only devices: phones used 07–23 local, online a quarter of that in ~15 min spells; half have a laptop (09–18, half the time); 5% an always-on device; 10% of direct chats have a keeper; 30% of phones refuse custody; 10% of messages go to someone sharing no group.",
+        "{} people ({} messages per seed) in four time zones (UTC−5, +1, +5, +9), internet-only devices: phones used 07–23 local, online a quarter of that in ~15 min spells; half have a laptop (09–18, half the time; a device of its own, which can volunteer); 5% an always-on device; 10% of direct chats have a keeper; 30% of phones refuse custody; 10% of messages go to someone sharing no group.",
         cfg.people,
         per_seed[0].0.sent
     ));
@@ -1561,8 +1562,8 @@ fn offline_recipient(o: Opts) -> ScenarioResult {
         "{carried:.1}% of offline-case messages found a custodian, {copies:.2} custodians each; the busiest custodian held {} KB; {refused} deposits refused (custody off on that phone, or a limit).",
         peak / 1024
     ));
-    r.note("Within 24 h both reach ~100%: everyone is awake at some point. What custodians change is how soon: the recipient gets the message the next time it is online while any of three custodians is, instead of only while the sender is. The p95 is set by time zones (a recipient asleep until morning), which no custodian can shorten.");
-    r.note("Optimistic for custody: the XOR-closest lookup is assumed converged, and a custodian and the recipient online at once find each other within a second. Not modelled: custodians' delivery backoff when only the custodian dials, phones suspended in the background (slow mode), receipts' own travel.");
+    r.note("Within 24 h both reach ~100%: everyone is awake at some point. What custodians change is how soon. The recipient gets a co-member custodian's copy the next time both are online (it syncs its groups on coming back); a volunteer's at its next periodic fetch (every 30 min) or the custodian's next push (backing off to an hour apart) that finds both online; a keeper's only by push. The p95 is set by time zones (a recipient asleep until morning), which no custodian can shorten.");
+    r.note("Optimistic for custody: the sender's and recipient's XOR lookups are assumed converged (both find the true closest custodians), a dial to an online device reaches it at once, and a person's always-on device is taken to be a keeper of their chats (the build's first tier). Volunteers are the closest serving devices online or not, as the build's directory knows no presence: dials to offline ones use up the 8 attempts. Not modelled: phones suspended in the background (slow mode), receipts' own travel.");
     r.metrics = json!({
         "keepers_only": {"offline_within_1h_pct": b1, "offline_within_4h_pct": b4, "offline_delivery_pct": base_off, "all_delivery_pct": base_all, "latency_s": lb},
         "custodians": {"offline_within_1h_pct": c1, "offline_within_4h_pct": c4, "offline_delivery_pct": cust_off, "all_delivery_pct": cust_all, "latency_s": lc,
