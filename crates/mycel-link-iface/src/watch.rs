@@ -18,7 +18,11 @@ impl Watcher {
         let fd = open()?;
         // SAFETY: `open` returned a fresh descriptor we now own.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok(Watcher { fd: tokio::io::unix::AsyncFd::new(fd)? })
+        // SAFETY: an `OwnedFd` stays open, and always returns the same
+        // descriptor, until it is dropped, which only the `AsyncFd` can do.
+        let fd = unsafe { tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE) }
+            .map_err(|e| e.into_parts().1)?;
+        Ok(Watcher { fd })
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos", target_os = "ios")))]
