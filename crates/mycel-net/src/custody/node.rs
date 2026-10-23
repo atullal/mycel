@@ -765,10 +765,13 @@ pub(crate) async fn serve(
         }
         Msg::Fetch => {
             drop(permit);
+            // (one delivery to a device at a time: a push already under
+            // way hands it the same parcels, and a second one alongside it
+            // would send them twice)
             let ok = {
                 let mut c = inner.custody.lock();
                 c.stats.fetches_served += 1;
-                c.fetch_rate.take(peer, now)
+                c.fetch_rate.take(peer, now) && c.delivering.insert(peer)
             };
             if !ok {
                 send(&mut tx, &Msg::Listing { items: Vec::new() }).await?;
@@ -776,7 +779,6 @@ pub(crate) async fn serve(
                 return Ok(());
             }
             // (the connection is authenticated to `peer`: only its mail)
-            inner.custody.lock().delivering.insert(peer);
             let res = push(inner, peer, tx, rx).await;
             let mut c = inner.custody.lock();
             c.delivering.remove(&peer);
