@@ -262,6 +262,12 @@ pub trait Link: Send + Sync + 'static {
     fn start(&self, events: mpsc::UnboundedSender<LinkEvent>) -> Result<()>;
     /// The display name changed (some links advertise it).
     fn set_name(&self, _name: &str) {}
+    /// `Some`: link only with these nodes, and reveal this device to no one
+    /// else (a phone's app is in the background, where a radio that links
+    /// with anyone in range would hand its node key to any device that
+    /// asks, all day). `None`: link with anyone again. Links that never
+    /// reveal anything before an authenticated handshake ignore it.
+    fn restrict_to(&self, _peers: Option<&[SignPk]>) {}
     fn status(&self) -> LinkStatus;
     /// One status per medium, for links that drive several (one per network
     /// interface kind).

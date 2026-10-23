@@ -1,11 +1,13 @@
-import { useState } from "react";
-import { isMobile } from "@mycel/sdk";
+import { useCallback, useEffect, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
+import { isMobile, isTauri } from "@mycel/sdk";
 import { useProfile } from "@mycel/sdk/react";
 import { Glyph } from "../icons.tsx";
 import { applyTheme, readTheme, type ThemeChoice } from "../theme.ts";
 import { Qr } from "./Qr.tsx";
 import { Avatar, errorText, shortId } from "./common.tsx";
 import { notificationStatus, type NotificationPermission } from "../notificationStatus.ts";
+import { backgroundCopy, type BackgroundStatus } from "../backgroundStatus.ts";
 
 interface NotificationsState {
   native: boolean;
@@ -108,6 +110,8 @@ export function ProfilePanel({ notifications }: { notifications?: NotificationsS
 
       {notifications?.native && <NotificationsCard notifications={notifications} />}
 
+      {isTauri() && isMobile() && <BackgroundCard />}
+
       <section className="p-card">
         <h4>Appearance</h4>
         <div className="p-seg" role="radiogroup" aria-label="Theme">
@@ -130,9 +134,7 @@ function NotificationsCard({ notifications }: { notifications: NotificationsStat
       <p className="p-help" role="status">
         {status.text}
       </p>
-      {isMobile() && (
-        <p className="p-help">Alerts arrive while Mycel is connected. Your phone may pause the connection when Mycel is in the background.</p>
-      )}
+      {isMobile() && <p className="p-help">Alerts arrive while Mycel is connected: see “In the background” below.</p>}
       {status.button && (
         <button className="h-btn h-btn-quiet" onClick={() => void notifications.checkPermission()}>
           {status.button}
@@ -141,6 +143,74 @@ function NotificationsCard({ notifications }: { notifications: NotificationsStat
       {notifications.error && (
         <p className="p-error" role="alert">
           {notifications.error}
+        </p>
+      )}
+    </section>
+  );
+}
+
+/**
+ * How Mycel keeps receiving in the background on this phone, said honestly:
+ * Android stays connected (and explains before asking to be let off battery
+ * optimisation), iPhone and iPad run in slow mode.
+ */
+function BackgroundCard() {
+  const [status, setStatus] = useState<BackgroundStatus | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setStatus(await invoke<BackgroundStatus>("background_status"));
+      setError(null);
+    } catch (e) {
+      setError(errorText(e));
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    // Coming back from the system's battery prompt or Settings.
+    const onVisible = () => {
+      if (document.visibilityState === "visible") void refresh();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", onVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", onVisible);
+    };
+  }, [refresh]);
+
+  const allow = async () => {
+    try {
+      await invoke("request_background_exemption");
+    } catch (e) {
+      setError(errorText(e));
+    }
+  };
+
+  if (!status) return error ? <p className="p-error">{error}</p> : null;
+  const copy = backgroundCopy(status);
+  return (
+    <section className="p-card" aria-label="In the background">
+      <h4>In the background</h4>
+      <p className="p-help" role="status">
+        <strong>{copy.text}</strong>
+      </p>
+      {copy.details.map((line) => (
+        <p className="p-help" key={line}>
+          {line}
+        </p>
+      ))}
+      {copy.tip && <p className="p-help">{copy.tip}</p>}
+      {copy.button && (
+        <button className="h-btn h-btn-quiet" onClick={() => void allow()}>
+          {copy.button}
+        </button>
+      )}
+      {error && (
+        <p className="p-error" role="alert">
+          {error}
         </p>
       )}
     </section>

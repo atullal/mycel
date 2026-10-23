@@ -15,6 +15,15 @@ extend-exclude = [
   "*.svg",
   "bench/results/",
   "crates/mycel-sync/src/fixtures/",
+  # Fuzzing inputs, named after their hashes.
+  "fuzz/seeds/",
+]
+
+[default]
+extend-ignore-re = [
+  # Base64url data pinned in tests (contact codes, keys): 40 or more
+  # characters with no word break are data, not words.
+  "[A-Za-z0-9_-]{40,}",
 ]
 
 [default.extend-identifiers]
@@ -36,3 +45,5 @@ sur = "sur"
 ines = "ines"
 # zlib's DEFLATE crates (flate2)
 flate = "flate"
+# ablation: the simulator's ABL_VARIANTS (crates/mycel-sim/examples/ablation.rs)
+abl = "abl"

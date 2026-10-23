@@ -136,8 +136,8 @@ async fn pair(ip: bool, nets: &[&MemNet], path: Option<PathKind>) -> Pair {
     let (ka, kb) = (a.node.id().0, b.node.id().0);
     let va = Arc::new(VideoCall::new(ka, src(), a_ui.clone(), rt.clone()));
     let vb = Arc::new(VideoCall::new(kb, src(), b_ui.clone(), rt));
-    va.add_peer(kb, ca.clone(), path);
-    vb.add_peer(ka, cb.clone(), path);
+    va.add_peer(kb, ca.clone(), path, 2);
+    vb.add_peer(ka, cb.clone(), path, 2);
     route(ca.clone(), va.clone(), kb);
     route(cb.clone(), vb.clone(), ka);
     Pair { a: va, b: vb, a_ui, b_ui, _conns: (ca, cb), _nodes: (a.node, b.node) }

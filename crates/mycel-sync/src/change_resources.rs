@@ -4,6 +4,9 @@
 //! private encodings come from storage/change.rs, storage/columns and columnar/
 //! encoding/{rle,boolean}. Count runs without expanding them; leave operation
 //! semantics, column relationships, actor indices and UTF-8 to Automerge.
+//! The one value check: operation ids must fit Automerge's `u32` counters and
+//! actor numbers, which its loader converts with `unwrap` (it panics on
+//! anything larger; found by fuzzing, docs/TESTING.md).
 
 use crate::{Result, SyncError};
 
@@ -133,7 +136,7 @@ pub(super) fn check(body: &[u8], limits: &Limits) -> Result<()> {
     let mut budget = Budget::new(limits, body.len());
     for (spec, length) in descriptors {
         let bytes = input.take(length)?;
-        let rows = check_column(spec & 7, bytes, &mut budget)?;
+        let rows = check_column(spec, bytes, &mut budget)?;
         if spec == 0x42 && rows > limits.ops as u64 {
             return Err(SyncError::TooLarge);
         }
@@ -143,12 +146,32 @@ pub(super) fn check(body: &[u8], limits: &Limits) -> Result<()> {
     Ok(())
 }
 
-fn check_column(kind: u32, bytes: &[u8], budget: &mut Budget) -> Result<u64> {
+/// Column ids whose values become operation ids (Automerge 0.12
+/// storage/change/change_op_columns.rs), by their full specification:
+/// object counter (ULEB). Every actor column (type 1) and delta column (type
+/// 3: key and predecessor counters) in a change holds operation ids too.
+const OBJ_COUNTER: u32 = 0x02;
+
+fn check_column(spec: u32, bytes: &[u8], budget: &mut Budget) -> Result<u64> {
+    let kind = spec & 7;
     if kind == 7 {
         return Ok(0);
     } // raw value bytes, no run encoding
+    let ids = matches!(kind, 1 | 3) || spec == OBJ_COUNTER;
     let mut input = Input(bytes);
     let mut rows = 0u64;
+    // A delta column's running value (each run is monotonic, so checking
+    // after every run checks every value in it).
+    let mut absolute = 0i128;
+    let mut bounded = |value: i128, repeat: u64| -> Result<()> {
+        let value = if kind == 3 {
+            absolute += value * i128::from(repeat);
+            absolute
+        } else {
+            value
+        };
+        if ids && value > i128::from(u32::MAX) { Err(SyncError::Encoding) } else { Ok(()) }
+    };
     while !input.0.is_empty() {
         if kind == 4 {
             // alternating Boolean runs
@@ -162,36 +185,34 @@ fn check_column(kind: u32, bytes: &[u8], budget: &mut Budget) -> Result<u64> {
         charge(&mut rows, count, budget.max_values)?;
         charge(&mut budget.values, count, budget.max_values)?;
         if control > 0 {
-            check_value(kind, &mut input, count, budget)?;
+            bounded(check_value(kind, &mut input, count, budget)?, count)?;
         } else if control < 0 {
             for _ in 0..count {
-                check_value(kind, &mut input, 1, budget)?;
+                bounded(check_value(kind, &mut input, 1, budget)?, 1)?;
             }
         }
     }
     Ok(rows)
 }
 
-fn check_value(kind: u32, input: &mut Input<'_>, repeat: u64, budget: &mut Budget) -> Result<()> {
-    match kind {
+/// Checks one encoded value; returns it if it is an integer (else 0).
+fn check_value(kind: u32, input: &mut Input<'_>, repeat: u64, budget: &mut Budget) -> Result<i128> {
+    Ok(match kind {
         0 => {
             // group counts can allocate predecessor vectors inside one op
             let count = input.unsigned()?.checked_mul(repeat).ok_or(SyncError::TooLarge)?;
             charge(&mut budget.values, count, budget.max_values)?;
+            0
         }
-        3 => {
-            input.signed()?;
-        } // delta-encoded integers
+        3 => i128::from(input.signed()?), // delta-encoded integers
         5 => {
             let bytes = input.bytes()?;
             let count = (bytes.len() as u64).checked_mul(repeat).ok_or(SyncError::TooLarge)?;
             charge(&mut budget.strings, count, budget.max_strings)?;
+            0
         }
-        _ => {
-            input.unsigned()?;
-        } // actors, integers, value metadata
-    }
-    Ok(())
+        _ => i128::from(input.unsigned()?), // actors, integers, value metadata
+    })
 }
 
 #[cfg(test)]
@@ -232,5 +253,46 @@ mod tests {
         let mut null = vec![0];
         leb128::write::unsigned(&mut null, u64::MAX).unwrap();
         assert!(matches!(check_column(2, &null, &mut budget()), Err(SyncError::TooLarge)));
+    }
+
+    /// Found by fuzzing (`fuzz/fuzz_targets/sync_change.rs`): Automerge 0.12
+    /// stores operation counters and actor numbers as `u32` and converts what
+    /// it decodes with `unwrap`, so a change naming a larger operation id
+    /// panicked inside its loader (`bounded_change::parse` caught it, but a
+    /// parser must refuse, not crash). Such columns are refused here first.
+    #[test]
+    fn operation_ids_beyond_u32_are_refused() {
+        let run = |control: i64, value: i64| {
+            let mut b = Vec::new();
+            leb128::write::signed(&mut b, control).unwrap();
+            leb128::write::signed(&mut b, value).unwrap();
+            b
+        };
+        let uleb = |value: u64| {
+            let mut b = vec![1]; // a run of one
+            leb128::write::unsigned(&mut b, value).unwrap();
+            b
+        };
+        let max = i64::from(u32::MAX);
+        // predecessor counters (delta): a run climbing to exactly u32::MAX passes
+        let (pred_ctr, key_ctr) = (0x73, 0x13);
+        assert!(check_column(pred_ctr, &run(3, max / 3), &mut budget()).is_ok());
+        let mut over = run(3, max / 3);
+        over.extend(run(1, 1));
+        assert!(matches!(check_column(pred_ctr, &over, &mut budget()), Err(SyncError::Encoding)));
+        assert!(matches!(check_column(key_ctr, &run(2, max), &mut budget()), Err(SyncError::Encoding)));
+        // going down and back up stays within range
+        let mut zigzag = run(1, max);
+        zigzag.extend(run(1, -max));
+        zigzag.extend(run(-2, max));
+        zigzag.push(0);
+        assert!(check_column(pred_ctr, &zigzag, &mut budget()).is_ok());
+        // object counters and every actor column
+        for spec in [OBJ_COUNTER, 0x01, 0x11, 0x71] {
+            assert!(check_column(spec, &uleb(u64::from(u32::MAX)), &mut budget()).is_ok());
+            assert!(matches!(check_column(spec, &uleb(1 << 32), &mut budget()), Err(SyncError::Encoding)));
+        }
+        // other integer columns are not operation ids
+        assert!(check_column(0x42, &uleb(1 << 32), &mut budget()).is_ok());
     }
 }

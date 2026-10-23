@@ -10,14 +10,14 @@ use parking_lot::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
 use data_encoding::BASE64URL_NOPAD;
-use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallManager};
+use mycel_call::{BoxFuture, CallEvent, CallHost, CallManager};
 use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, SignPk, SymKey, random};
 use mycel_kit_chat::alerts::{self, AlertPolicy, ChatAlert, Latest, ThreadState};
 #[cfg(test)]
 use mycel_kit_chat::reduce;
 use mycel_kit_chat::thread::{self as chat_thread, Direct, Membership, Source};
 use mycel_kit_chat::{AttachmentRef, ChatOp, ChatSignal, ChatState, ChatView, ProfileHistory, messages_feed};
-use mycel_net::{ContactCard, ExtraProtocol, NetEvent, NetMode, Node, NodeOptions, PathKind, PeerState};
+use mycel_net::{ContactCard, NetEvent, NetMode, Node, NodeOptions, PathKind, PeerState};
 use mycel_sync::{FeedCursor, Replica};
 use mycel_trust::{Role, SpaceId};
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,11 @@ pub fn chat_rules_hash() -> String {
     mycel_rules::RulesHash::of(CHAT_RULES_WASM).to_string()
 }
 const CONTACT_PREFIX: &str = "mycel:";
+/// Contact codes are format 1: `mycel:` + base64url(postcard(card)), then
+/// optional `@hints` (docs/PROTOCOL.md §3.3). A later format is written
+/// `mycel<N>:` (N ≥ 2): this build refuses it with a typed error ("update
+/// Mycel") instead of misreading it, and older builds see no contact code.
+pub const CONTACT_CODE_FORMAT: u32 = 1;
 
 /// Bound unsolicited request metadata independently of blob consent. Accepted
 /// conversations and their sync history are outside these admission limits,
@@ -229,8 +234,7 @@ impl CallHost for RuntimeCallHost {
         let rt = self.rt.clone();
         Box::pin(async move {
             let rt = rt.upgrade().context("shutting down")?;
-            rt.node
-                .connect(peer, ALPN_CALL)
+            mycel_call::proto::connect(&rt.node, peer)
                 .await
                 .map_err(|e| anyhow!("{} can't be reached right now ({e:#})", rt.name_of(&peer)))
         })
@@ -414,9 +418,30 @@ pub fn decode_contact_code(code: &str) -> Result<ContactCard> {
     Ok(decode_contact_code_with_hints(code)?.0)
 }
 
+/// A contact code's format and what follows its prefix: `mycel:` is format
+/// 1, `mycel<N>:` format N; with no prefix (bare base64), format 1.
+fn contact_code_format(code: &str) -> Result<(u32, &str)> {
+    let Some((digits, body)) = code.strip_prefix("mycel").and_then(|rest| rest.split_once(':')) else {
+        return Ok((CONTACT_CODE_FORMAT, code));
+    };
+    if digits.is_empty() {
+        return Ok((1, body));
+    }
+    match digits.parse::<u32>() {
+        Ok(n) if digits.bytes().all(|b| b.is_ascii_digit()) => Ok((n, body)),
+        // not a format prefix (a bare code with a `:` in its hints): the
+        // card decodes or doesn't as format 1
+        _ => Ok((CONTACT_CODE_FORMAT, code)),
+    }
+}
+
 pub fn decode_contact_code_with_hints(code: &str) -> Result<(ContactCard, Vec<std::net::SocketAddr>)> {
     let code: String = code.split_whitespace().collect();
-    let body = code.strip_prefix(CONTACT_PREFIX).unwrap_or(&code);
+    let (format, body) = contact_code_format(&code)?;
+    if format != CONTACT_CODE_FORMAT {
+        let (what, newest) = ("contact code", CONTACT_CODE_FORMAT);
+        return Err(mycel_net::VersionError::Unsupported { what, version: format, newest }.into());
+    }
     let (card_part, hints) = body.split_once('@').unwrap_or((body, ""));
     let bytes = BASE64URL_NOPAD.decode(card_part.as_bytes()).context("not a Mycel contact code")?;
     let card: ContactCard = postcard::from_bytes(&bytes).context("not a Mycel contact code")?;
@@ -704,7 +729,7 @@ impl Runtime {
         // ciphertext only: no calls.
         let (call_tx, call_rx) = tokio::sync::mpsc::unbounded_channel();
         if !opts.keeper {
-            nopts.extra_protocols.push(ExtraProtocol { alpn: ALPN_CALL.to_vec(), incoming: call_tx });
+            nopts.extra_protocols.extend(mycel_call::proto::extra_protocols(call_tx));
         }
         let engine =
             mycel_rules::RulesEngine::load(CHAT_RULES_WASM).map_err(|e| anyhow!("chat rules failed to load: {e:?}"))?;
@@ -1026,6 +1051,14 @@ impl Runtime {
                 NetworkMode::Lan
             }
         }
+    }
+
+    /// Whether `data_dir` already holds a Mycel profile. Read-only (no lease,
+    /// nothing created): a host started with nobody watching (a phone after a
+    /// reboot, a background catch-up) opens the runtime only for an existing
+    /// profile, never creating one nobody named.
+    pub fn profile_exists(data_dir: &Path) -> Result<bool> {
+        crate::identity::established(data_dir)
     }
 
     /// The network mode saved by `set_network_mode`, if any; an error if the
@@ -2493,11 +2526,36 @@ impl Runtime {
         })
     }
 
-    /// Sync every conversation with every member now (pull-to-refresh).
+    /// Sync every conversation with every member now, all at once
+    /// (pull-to-refresh, a phone's background catch-up): a member who is
+    /// asleep costs one connect timeout in all, not one per conversation
+    /// ([`Node::sync_everything`]).
     pub async fn sync_now(&self) {
+        self.node.sync_everything().await;
+    }
+
+    /// The app on a phone went to the background (`true`) or came back
+    /// (`false`). While it's away, radios that would link with any device
+    /// in range (Bluetooth) link only with [`Runtime::known_peers`], so a
+    /// locked phone never hands its node key to a stranger that advertises
+    /// Mycel (docs/TRUST.md §8b).
+    pub fn set_background(&self, background: bool) {
+        let known = background.then(|| self.known_peers());
+        self.node.restrict_links(known.as_deref());
+    }
+
+    /// Devices this profile deals with: contacts and everyone in its
+    /// conversations (members and keepers), never itself.
+    pub fn known_peers(&self) -> Vec<SignPk> {
+        let me = self.keys.sign_pk();
+        let mut known: BTreeSet<SignPk> = self.contacts.lock().keys().copied().collect();
         for s in self.node.space_ids() {
-            self.node.sync_all(s).await;
+            if let Ok(members) = self.node.with_space(&s, |r| r.members()) {
+                known.extend(members.into_iter().map(|(k, _)| k.sign_pk));
+            }
         }
+        known.remove(&me);
+        known.into_iter().collect()
     }
 }
 
@@ -2612,6 +2670,54 @@ fn sample_rate(s: &mut std::collections::VecDeque<(Instant, u64)>, now: Instant,
 
 #[cfg(test)]
 mod tests {
+    /// Contact codes name their format; a later one is refused with a
+    /// typed error, never decoded as this one.
+    #[test]
+    fn contact_codes_carry_their_format() {
+        use super::*;
+        let keys = DeviceKeys::generate();
+        let card = ContactCard::new(&keys, "Alice");
+        let code = encode_contact_code_with_hints(&card, &["127.0.0.1:4433".into()]);
+        assert!(code.starts_with("mycel:"));
+        let (back, hints) = decode_contact_code_with_hints(&code).unwrap();
+        assert_eq!((back, hints.len()), (card.clone(), 1));
+        // bare base64 (what older builds also took)
+        let bare = code.strip_prefix("mycel:").unwrap();
+        assert_eq!(decode_contact_code(bare).unwrap().keys.sign_pk, keys.sign_pk());
+        let newer = code.replacen("mycel:", "mycel2:", 1);
+        let err = decode_contact_code(&newer).unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<mycel_net::VersionError>(),
+            Some(&mycel_net::VersionError::Unsupported { what: "contact code", version: 2, newest: 1 })
+        );
+        assert!(err.to_string().contains("update Mycel"), "{err}");
+        for junk in ["mycelx:abc", "mycel-1:abc", "mycel99999999999999:abc", "mycel:!!!"] {
+            assert!(decode_contact_code(junk).is_err(), "{junk}");
+        }
+    }
+
+    /// A version 1 contact code byte for byte, as the pre-release code
+    /// (main `98d9b7b`, before versioning) writes it for these fixed keys:
+    /// this build writes the same and reads it. (See mycel-net's
+    /// `mesh::v1_vectors`: never regenerate this from this build.)
+    #[test]
+    fn version_1_contact_codes_are_pinned() {
+        use super::*;
+        let pre_release = [
+            "mycel:iojj3XQJ8ZX9UtstPLpdcspnCb8dlBIb83SIAbQPb1yoHF9XrnzfuxijIND63YK6YgmQU1KOa--XJT-r9k6m",
+            "BEAnw1U91gShebjJfzEerR201PFtzWOZ6gEyvxkfASnF_4gyCo1vgIsWLHjkGrhmFFYT6qmqDv7lzCPoVKHcUfMHA0",
+            "FkYUC4MlyRPlK9BCUGF9yZv1ueUM6PhFIyeSutkdPkkt3EvC5AWi5qr-ujSB_ULigXG5LhYAoJmxEL8YXDajquSagI",
+        ]
+        .concat();
+        let card = ContactCard::new(&DeviceKeys::from_seed([1; 32]), "Ada");
+        assert_eq!(encode_contact_code(&card), pre_release);
+        assert_eq!(decode_contact_code(&pre_release).unwrap(), card);
+        let with_hint = format!("{pre_release}@10.0.0.2:4433");
+        assert_eq!(decode_contact_code_with_hints(&with_hint).unwrap().1, vec!["10.0.0.2:4433".parse().unwrap()]);
+        let bare = format!("{}@10.0.0.2:4433", pre_release.strip_prefix("mycel:").unwrap());
+        assert_eq!(decode_contact_code(&bare).unwrap(), card);
+    }
+
     #[test]
     fn notices_last_until_dismissed() {
         use super::*;
@@ -3925,5 +4031,37 @@ mod tests {
         }
         let rate = sample_rate(&mut s, at(7_000), 100_000_000);
         assert_eq!(rate, 50_000_000);
+    }
+
+    /// Who a phone in the background still links with over Bluetooth:
+    /// contacts and conversation members, never a stranger or itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn known_peers_are_contacts_and_conversation_members() {
+        use super::*;
+        let dir = |tag: &str| std::env::temp_dir().join(format!("mycel-known-{tag}-{}", mycel_crypto::random_u64()));
+        let (da, db, dc, ds) = (dir("a"), dir("b"), dir("c"), dir("s"));
+        let alice = Runtime::open(&da, NetworkMode::Local, Some("Alice".into())).await.unwrap();
+        let bob = Runtime::open(&db, NetworkMode::Local, Some("Bob".into())).await.unwrap();
+        let carol = Runtime::open(&dc, NetworkMode::Local, Some("Carol".into())).await.unwrap();
+        let stranger = Runtime::open(&ds, NetworkMode::Local, Some("Stranger".into())).await.unwrap();
+        assert!(alice.known_peers().is_empty());
+        let b = alice.add_contact(bob.profile().contact_code).unwrap();
+        let c = alice.add_contact(carol.profile().contact_code).unwrap();
+        alice.create_conversation(None, vec![b.id.clone(), c.id.clone()]).unwrap();
+        // Carol stays a member after she is no longer a contact.
+        alice.remove_contact(c.id).unwrap();
+        let known = alice.known_peers();
+        assert_eq!(known.len(), 2, "{known:?}");
+        assert!(known.contains(&bob.keys.sign_pk()) && known.contains(&carol.keys.sign_pk()));
+        assert!(!known.contains(&alice.keys.sign_pk()) && !known.contains(&stranger.keys.sign_pk()));
+        // No Bluetooth link in tests, so this only must not fail.
+        alice.set_background(true);
+        alice.set_background(false);
+        for rt in [alice, bob, carol, stranger] {
+            rt.shutdown().await.unwrap();
+        }
+        for d in [da, db, dc, ds] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }

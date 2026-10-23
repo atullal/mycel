@@ -3,7 +3,7 @@
 //!
 //! Every device is both a BLE *peripheral* (advertises the Mycel service,
 //! publishes an L2CAP connection-oriented channel, and serves a GATT
-//! characteristic with the channel's PSM plus its node key and name) and a
+//! characteristic with the channel's PSM plus its node key, never its name) and a
 //! *central* (scans for the service, reads the characteristic, opens the
 //! channel). Both devices dial; the first channel up carries the traffic and
 //! is never hung up (see [`core`] for the rules that keep exactly one channel
@@ -53,7 +53,7 @@ pub use hub::Radio;
 
 /// The Mycel GATT service, advertised by every device.
 pub const SERVICE_UUID: &str = "8E12485D-50ED-4B8D-A6F0-276C27F29CB6";
-/// Read-only characteristic: [`wire::GattInfo`] (L2CAP PSM, node key, name).
+/// Read-only characteristic: [`wire::GattInfo`] (L2CAP PSM and node key).
 pub const INFO_CHAR_UUID: &str = "CDCCEDAE-E668-4342-8B67-80BE49E7ED5B";
 /// Bytes of outgoing frames queued per channel before new packets are dropped.
 /// ~0.3 s at typical BLE L2CAP rates: enough to keep the radio busy, small
@@ -64,11 +64,12 @@ pub const OUT_QUEUE_BYTES: usize = 16 * 1024;
 /// (`hub.input(..)`) and carries out the commands that returns.
 pub(crate) trait Backend: Send + Sync + 'static {
     fn start(&self, hub: Arc<Hub>) -> Result<()>;
-    fn set_name(&self, _name: &str) {}
     fn stop(&self) {}
 }
 
-/// The Bluetooth link for node `me`, advertising `name`.
+/// The Bluetooth link for node `me`. It never sends the display name: the
+/// channel isn't encrypted, so a nearby device learns the name from the
+/// signed contact card, inside the encrypted QUIC session.
 ///
 /// On macOS this uses CoreBluetooth. The host app's Info.plist must contain
 /// `NSBluetoothAlwaysUsageDescription` (macOS kills an app without it on first
@@ -76,8 +77,8 @@ pub(crate) trait Backend: Send + Sync + 'static {
 /// permission. On Linux it uses BlueZ (`bluetoothd`); the user needs to be
 /// allowed to advertise (the `bluetooth` group on most distributions). On
 /// other platforms the link reports itself unavailable.
-pub fn link(me: SignPk, name: &str) -> Arc<dyn Link> {
-    BleLink::new(me, name, platform_backend())
+pub fn link(me: SignPk) -> Arc<dyn Link> {
+    BleLink::new(me, platform_backend())
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -116,8 +117,8 @@ pub(crate) struct BleLink {
 }
 
 impl BleLink {
-    pub(crate) fn new(me: SignPk, name: &str, backend: Box<dyn Backend>) -> Arc<BleLink> {
-        let (hub, rx) = Hub::new(me, name);
+    pub(crate) fn new(me: SignPk, backend: Box<dyn Backend>) -> Arc<BleLink> {
+        let (hub, rx) = Hub::new(me);
         Arc::new(BleLink { hub, backend, rx: Arc::new(tokio::sync::Mutex::new(rx)) })
     }
 }
@@ -161,9 +162,8 @@ impl Link for BleLink {
         self.backend.start(self.hub.clone())
     }
 
-    fn set_name(&self, name: &str) {
-        self.hub.set_name(name);
-        self.backend.set_name(name);
+    fn restrict_to(&self, peers: Option<&[SignPk]>) {
+        self.hub.restrict(peers.map(|p| p.iter().copied().collect()));
     }
 
     fn status(&self) -> LinkStatus {
@@ -273,7 +273,7 @@ mod tests {
 
     #[test]
     fn unsupported_backend_reports_unavailable() {
-        let l = BleLink::new(SignPk([1; 32]), "x", Box::new(Unsupported));
+        let l = BleLink::new(SignPk([1; 32]), Box::new(Unsupported));
         let (tx, _rx) = mpsc::unbounded_channel();
         assert!(l.start(tx).is_err());
         let s = l.status();

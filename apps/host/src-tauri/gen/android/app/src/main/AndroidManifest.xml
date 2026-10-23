@@ -11,10 +11,19 @@
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- Keep running in the background (MycelService) and tell the user about
-         new messages and calls. -->
+         new messages and calls. The "connected device" type needs one of
+         CHANGE_NETWORK_STATE / CHANGE_WIFI_STATE / CHANGE_WIFI_MULTICAST_STATE
+         declared (no runtime prompt); Mycel declares two. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Stay connected after a reboot or an update (BootReceiver). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Ask, after explaining in the Profile panel, to run unrestricted in the
+         background: there is no push server to wake Mycel, the case Google
+         Play allows this for. Nothing happens unless the user agrees. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
 
@@ -44,10 +53,21 @@
             </intent-filter>
         </activity>
 
+        <!-- connectedDevice, not dataSync: dataSync is capped at 6 hours a
+             day from Android 15 and may not start after a reboot. -->
         <service
           android:name=".MycelService"
           android:exported="false"
           android:foregroundServiceType="connectedDevice" />
+
+        <receiver
+          android:name=".BootReceiver"
+          android:exported="false">
+          <intent-filter>
+            <action android:name="android.intent.action.BOOT_COMPLETED" />
+            <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+          </intent-filter>
+        </receiver>
 
         <provider
           android:name="androidx.core.content.FileProvider"

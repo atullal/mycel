@@ -10,14 +10,38 @@ use std::time::Duration;
 use tokio::io::AsyncRead;
 
 use crate::resources::{FramePermit, PeerFrames};
+use crate::version::{AlpnTable, Hello, MAX_HELLO, WIRE_V1, WIRE_V2, WireVersion, alpn_table_ok, alpns_in, version_in};
 
-/// Mycel's protocol. One QUIC connection per pair of devices carries every
-/// exchange (sync sessions, contact cards, ephemeral messages, blob
+/// Mycel's protocol (the "node protocol"), wire version 2: version 1 plus
+/// a capability hello ([`StreamKind::Hello`]) and typed refusals of
+/// unknown stream kinds. One QUIC connection per pair of devices carries
+/// every exchange (sync sessions, contact cards, ephemeral messages, blob
 /// transfers) as its own QUIC stream, so there is no handshake per exchange
-/// and QUIC stream priorities put chat ahead of file bytes. (Replaces the
-/// per-exchange-connection ALPNs `mycel/sync/1`, `mycel/card/0`,
-/// `mycel/eph/0`, `mycel/blob/0`.)
-pub const ALPN: &[u8] = b"mycel/2";
+/// and QUIC stream priorities put chat ahead of file bytes. Dialers offer
+/// every version they speak ([`alpns`]); see docs/PROTOCOL.md.
+pub const ALPN: &[u8] = ALPN_V2;
+/// The node protocol, wire version 2.
+pub const ALPN_V2: &[u8] = b"mycel/node/2";
+/// The node protocol as pre-release builds speak it (wire version 1; the
+/// name predates versioning). (It replaced the per-exchange-connection
+/// ALPNs `mycel/sync/1`, `mycel/card/0`, `mycel/eph/0`, `mycel/blob/0`.)
+pub const ALPN_V1: &[u8] = b"mycel/2";
+
+/// The node protocol's ALPN for each wire version (see [`AlpnTable`]).
+pub const ALPNS: AlpnTable = [(WIRE_V1, ALPN_V1), (WIRE_V2, ALPN_V2)];
+const _: () = assert!(alpn_table_ok(&ALPNS), "one node-protocol ALPN per wire version, each its own");
+
+/// The node protocol's ALPNs for wire versions `newest` down to the oldest
+/// supported, newest first: what a dialer offers and, in that order of
+/// preference, what a listener accepts.
+pub fn alpns(newest: WireVersion) -> Vec<&'static [u8]> {
+    alpns_in(&ALPNS, newest)
+}
+
+/// The wire version a negotiated node-protocol ALPN stands for.
+pub fn version_of(alpn: &[u8]) -> Option<WireVersion> {
+    version_in(&ALPNS, alpn)
+}
 
 /// The first byte of every stream on [`ALPN`]: what the stream carries. (A
 /// label, like HTTP/3's stream types; QUIC does the multiplexing.)
@@ -32,15 +56,32 @@ pub enum StreamKind {
     Ephemeral = 3,
     /// Bi-stream: one blob request (see `blobs.rs`).
     Blob = 4,
+    /// Bi-stream, wire version 2 and later: the dialer's [`Hello`], then
+    /// the listener's, once per connection.
+    Hello = 5,
+    /// Bi-stream, wire version 2 and later: one Sync v2 session
+    /// (`sync_v2.rs`, `mycel_sync::reconcile`), opened only to a peer that
+    /// agreed [`crate::Caps::SYNC_V2`]. A device that refuses it anyway is
+    /// synced with `Sync`.
+    SyncV2 = 6,
 }
 
 impl StreamKind {
+    /// The kind a stream's first byte names on a connection of wire
+    /// `version`; `None` for a kind that version doesn't have (the stream
+    /// is then refused, see [`crate::version::STREAM_REFUSED`]).
+    pub fn on(version: WireVersion, b: u8) -> Option<Self> {
+        Self::from_byte(b).filter(|k| !matches!(k, StreamKind::Hello | StreamKind::SyncV2) || version >= WIRE_V2)
+    }
+
     pub fn from_byte(b: u8) -> Option<Self> {
         Some(match b {
             1 => StreamKind::Sync,
             2 => StreamKind::Card,
             3 => StreamKind::Ephemeral,
             4 => StreamKind::Blob,
+            5 => StreamKind::Hello,
+            6 => StreamKind::SyncV2,
             _ => return None,
         })
     }
@@ -148,6 +189,17 @@ pub(crate) async fn recv_held<T: DeserializeOwned>(
     recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, MAX_FRAME, frames).await
 }
 
+/// [`recv_held`] with a smaller frame limit (`max`): a bigger declared
+/// length is refused before anything is buffered.
+pub(crate) async fn recv_bounded<T: DeserializeOwned>(
+    r: &mut RecvStream,
+    wait: Duration,
+    max: usize,
+    frames: &PeerFrames,
+) -> Result<(T, FramePermit)> {
+    recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, max, frames).await
+}
+
 /// [`recv_held`] for messages that are always small (blob requests and
 /// answers, contact cards): a bigger declared length is refused outright.
 pub(crate) async fn recv_small<T: DeserializeOwned>(
@@ -156,6 +208,13 @@ pub(crate) async fn recv_small<T: DeserializeOwned>(
     frames: &PeerFrames,
 ) -> Result<T> {
     Ok(recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, MAX_SMALL_FRAME, frames).await?.0)
+}
+
+/// A capability hello, held to [`MAX_HELLO`] bytes like a mesh hop's
+/// ([`Hello::decode`]): a hello that one protocol takes, the other does
+/// too. Bytes after the fields this build knows are ignored.
+pub(crate) async fn recv_hello(r: &mut RecvStream, wait: Duration, frames: &PeerFrames) -> Result<Hello> {
+    Ok(recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, MAX_HELLO, frames).await?.0)
 }
 
 /// An ephemeral message of up to `max_plain` bytes: sizes are checked
@@ -179,7 +238,7 @@ pub(crate) async fn recv_ephemeral<R: AsyncRead + Unpin>(
     Ok((msg, permit))
 }
 
-async fn recv_frame<T: DeserializeOwned, R: AsyncRead + Unpin>(
+pub(crate) async fn recv_frame<T: DeserializeOwned, R: AsyncRead + Unpin>(
     r: &mut R,
     wait: Duration,
     idle: Duration,
@@ -188,7 +247,8 @@ async fn recv_frame<T: DeserializeOwned, R: AsyncRead + Unpin>(
 ) -> Result<(T, FramePermit)> {
     use tokio::io::AsyncReadExt;
     let mut len = [0u8; 4];
-    crate::resources::within(wait, "no answer", r.read_exact(&mut len)).await?;
+    // (a peer that doesn't know this stream kind resets it: a typed error)
+    crate::resources::within(wait, "no answer", r.read_exact(&mut len)).await.map_err(crate::version::refusal)?;
     let len = u32::from_le_bytes(len) as usize;
     if len > max.min(MAX_FRAME) {
         bail!("frame too large");

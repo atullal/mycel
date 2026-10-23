@@ -2,8 +2,9 @@
 
 How Mycel decides who may read and write what, with no server to ask. This
 is the layer as implemented in `crates/mycel-crypto`, `crates/mycel-trust`
-and `crates/mycel-sync`; the wire format is version 0 (`mycel/v0/…` context
-strings).
+and `crates/mycel-sync`. Its records are generation 0 (`mycel/v0/…` context
+strings), unchanged by wire version 2; how they would change is in
+[PROTOCOL.md](PROTOCOL.md) §3.10.
 
 > **Rule zero: no custom cryptography.** Only standard, widely reviewed
 > primitives. **This layer has not had an external review.** Don't rely on
@@ -23,6 +24,7 @@ strings).
 - **A removed member keeps what they already decrypted,** and can read content that partitioned peers keep encrypting under an old epoch before they learn of the removal.
 - **Metadata is visible to keepers:** membership public keys, envelope authors, sizes and timing.
 - **Availability:** keepers can withhold data. Mitigation is multiple keepers. Withholding cannot be detected.
+- **Phones that are asleep:** with no push server, a suspended iPhone receives nothing until iOS lends Mycel time or it is opened ("slow mode"). An optional wake relay is designed, not built (§8e).
 - **Forward secrecy within an epoch:** not provided. Only post-compromise security on rotation.
 - **A compromised device** can act as its member until removed.
 
@@ -103,7 +105,17 @@ Ops whose parents are unknown are **pending** and are not evaluated until the pa
 
 **Pending caps.** Pending ops are held in memory before anyone can tell whether they are authorized, so the pool is bounded: at most `MAX_PENDING` (4,096) in total and `MAX_PENDING_PER_AUTHOR` (256) per author. The per-author cap stops one member (or one stolen key) from filling the shared pool and starving everyone else's out-of-order ops; ops whose parents are all known bypass the pool entirely, so a full pool never blocks a ready admin op such as a revocation. An op refused by a full pool is not lost: it is offered again by the next sync. To keep honest syncs inside these caps, peers send ops in resolution order (`op_ids()`/`all_ops()`: topological, then pending ops by id), so a receiver normally admits every op directly; a new member receives a single admin's 10,000-op history in one exchange.
 
-**Cost.** Resolution keeps a running state while history is linear (each op's past contains every valid op before it), so a long run of one admin's ops resolves in linear time; only ops concurrent with others replay their own past.
+**Named keys (admission rule A2).** Only *named* keys may author ops or envelopes; anything else is dropped before storage. A key is named if it is the founder, or a stored op whose parents are all known (not pending) adds it, and that op's author was **ever granted Admin**: by genesis, an `Add` with the Admin role or a `SetRole` to Admin, made by the founder or by another ever-admin key. Validity and revocations are deliberately ignored, so the rule depends only on which ops are held, never on arrival order, the pending pool or resolution: honest peers holding the same ops name the same keys, and Sync v2 can summarise one canonical set. What it buys: a Writer, Reader, keeper or removed member can't mint author keys (each minted key could store envelopes and grow every sync frontier); only keys some admin once added can. The trade-off: an admin whose rights were later revoked can still mint authors (their later `Add`s are invalid, so the minted keys are never members and their envelopes are never valid, but they are stored and synced), so a revoked admin's key can cost storage until the space is re-founded. Grants by a key not yet known to be an admin are held and applied if it becomes one, in any order.
+
+An op whose author isn't named yet (its `Add` hasn't arrived, or is pending) is not lost: within one batch (`insert_many`, which restore and sync use) it is admitted as soon as a later op of the batch names its author, so a batch in any order, such as a restore that reads ops in key order, admits exactly what a causally ordered one does. Between batches such ops wait in a bounded pool (`MAX_UNNAMED`, 1,024 in total, 64 per author), outside the graph so peers keep offering them, and are admitted and persisted when their author is named.
+
+**Cost.** Admission (rule A2 above) happens before resolution: the resolver and its oracle (below) see the same admitted op set. Peers resolve incrementally (`crates/mycel-trust/src/resolve.rs`) and get exactly the result of the steps above. The from-scratch implementation of those steps is kept as `oracle::resolve_full`, and differential tests require identical results (order, validity, heads, winners, state, `state_at`, ancestry) after every insert of random concurrent histories (§9).
+
+- **Ancestry** comes from a chain cover index (`reach.rs`), the approach Synapse uses for Matrix auth chains, instead of an n × n ancestor bitset. A linear op costs O(1); a merge stores one sparse vector of the other chains it reaches. Side branches that get merged stop costing anything once merged, and ops nobody builds on (the losers of a revocation storm) never take a chain position. Memory is O(n · k) in the worst case for `k` chains that stay open and partly reached, not O(n²).
+- **Fast path.** An op that descends from the current valid heads and conflicts with nothing is checked against the running state of each round and applied in place: O(op), plus, for a reader `Add`, one recipient insert per epoch the member lacks (§6).
+- **Concurrency** re-resolves only a **region**: the ops that arrived after the newest cut the new op can be resolved against. A cut is the valid heads after an earlier update; it qualifies when the new op descends from it and nothing before it can change (no older op outside it that is valid or could win is concurrent with the new op, and seniority does not move for anyone with older revocations). This is the conflicted-subgraph idea of Matrix state resolution v2.1. Cuts thin out geometrically (O(log n) kept), so an op whose parents arrived `lag` ops ago re-resolves fewer than about `2 · lag`. Everything is re-resolved (a full recompute) when a new op moves the seniority of a member with older revocations, when one update ranks a member and also carries their revocation of someone whose older conflicting op is still in play, and when a new op's parents are older than every cut kept. The last costs O(n) and any key ever named can trigger it with one cheap invalid op (§10).
+- **Rounds** of the winners loop (step 6) are all kept, because the loop is path dependent, but they share storage: each op's flags are stored as runs over the rounds and rounds whose valid ops agree share one state. A removed member's k concurrent `Leave`s make k + 1 rounds (each wins one round, then fails); later inserts still cost what they did before.
+- **Measured** (one insert at a time, Apple M5 Pro, `cargo bench -p mycel-trust --features oracle --bench resolve --profile replay`): insert cost stays flat from 1,000 to 100,000 ops, 27–28 µs for one admin's linear history and 38–45 µs in a revocation storm, of which 24–33 µs is the signature check; memory is linear, about 1.1–1.5 KiB per op. Before, every insert ran the from-scratch resolution: 80 ms at 10,000 linear ops and 9.1 s at 100,000 (with a 1.2 GB bitset), and 588 s in a 10,000-op storm. Details, and the adversarial cases of §10, in [BENCHMARKS.md §7](BENCHMARKS.md#7-membership-resolution-mycel-trust).
 
 ## 6. Epochs and encryption keys
 
@@ -135,11 +147,20 @@ ciphertext = XChaCha20-Poly1305(key = epoch key, nonce, aad = "mycel/v0/content"
 5. **cutoff rule:** for every winning revocation `w` of the author that is *not* in `past(auth_heads)`, the envelope must lie in the author's hash chain at or before `w.cutoff`. `cutoff` = the latest envelope from that member the revoker had seen. This blocks a removed member from backdating `auth_heads` to keep writing;
 6. the per-author chain is consistent: `author_prev` must be the author's envelope with `author_seq − 1`. Forks (equivocation) after a cutoff are excluded by rule 5. Before a cutoff, a fork is accepted but flagged.
 
+**Storage window** (before validity, so keepers apply it too): an envelope
+is stored only if its `author_seq` is below the author's *reach* plus 4,096,
+where reach is one past the highest seq held on a chain from seq 0. The rule
+depends only on what is held, never on arrival order, so peers that end up
+with the same items store the same set; it bounds a writer's dangling
+envelopes (no predecessor held) to 4,096 seqs per chain. Senders send each
+author's chain in ascending seq, so honest data never waits on it; a
+refused envelope is offered again once its prefix has arrived.
+
 **After decrypting** (members only):
 7. the Automerge change's actor ID must equal `header.author`. Authors cannot write under someone else's actor.
 
-8. the change must be consistent with its **declared history** (its `deps` and their ancestors), never with whatever else a peer happens to hold: its actor sequence number is exactly one more than that actor's latest change in that history; its operation counters start above every counter in that history and fit in 32 bits; every actor in its actor table wrote something in that history; and every object, list/text element and predecessor its operations name exists in that history (or earlier in the same change) with the right shape (objects are maps, lists or text; elements are insertions into that same object). A change that fails is rejected for good. Checking this uses a per-document causal index (author, sequence, counter range and run-length operation summary per change, plus a sparse vector clock), so it costs the size of the change plus a logarithmic lookup per reference — no replay.
-9. **resource limits** (before Automerge parses anything): at most 16 MiB after decompression, 1,048,576 operations, and a logical expansion of run-length/group-encoded columns of at most 64 values (or string bytes) per byte of change body, never below 4M (deleting a long run encodes in a few bytes) and never above 16M values / 16 MiB of strings. Writers stay far inside this: a local edit is written as changes of at most 65,536 operations and 512 KiB each, so a multi-megabyte paste becomes several consecutive changes that every released version accepts.
+8. the change must be consistent with its **declared history** (its `deps` and their ancestors), never with whatever else a peer happens to hold: its actor sequence number is exactly one more than that actor's latest change in that history; its operation counters start above every counter in that history and fit in 32 bits; every actor in its actor table wrote something in that history; and every object, list/text element and predecessor its operations name exists in that history (or earlier in the same change) with the right shape (objects are maps, lists or text; elements are insertions into that same object). Its operations have the shapes Automerge writes: deletes and increments never insert, marks always insert, and an element key naming an actor never has counter 0 (counter 0 is the head of a sequence). A change that fails is rejected for good. Checking this uses a per-document causal index (author, sequence, counter range and run-length operation summary per change, plus a sparse vector clock), so it costs the size of the change plus a logarithmic lookup per reference — no replay.
+9. **resource limits** (before Automerge parses anything): every operation id (object, key and predecessor counters, and actor numbers) fits in 32 bits, as Automerge stores them; at most 16 MiB after decompression, 1,048,576 operations, and a logical expansion of run-length/group-encoded columns of at most 64 values (or string bytes) per byte of change body, never below 4M (deleting a long run encodes in a few bytes) and never above 16M values / 16 MiB of strings. Writers stay far inside this: a local edit is written as changes of at most 65,536 operations and 512 KiB each, so a multi-megabyte paste becomes several consecutive changes that every released version accepts.
 
 **Materialization:** a document = the valid, decryptable changes, applied in causal order. A change waits, still encrypted, until its dependencies are applied; validated changes reach Automerge in batches. Equivocation (two changes for one actor sequence number) is resolved by the lowest envelope ID, on every peer; if a lower-ID fork displaces a change that was already applied, the document is re-derived once per received batch, however many forks the batch carries. If a newly arrived revocation invalidates envelopes that were already applied, the peer **rebuilds** the document from its envelope store; other membership changes only touch envelopes whose validity or decryptability changed. Every peer holding the same graph and envelopes arrives at the same document.
 
@@ -161,7 +182,7 @@ aad_i    = "mycel/v0/stream-chunk" ‖ len(A): u32 LE ‖ A ‖ chunk_size: u32 
 - **Legacy format:** attachments from earlier versions used one-shot `XChaCha20-Poly1305(key, nonce, A, plaintext)`. A blob without the magic prefix is opened that way. Only blobs up to 64 MiB are opened like that, so a hostile reference can't make a peer read a huge blob into memory.
 - Code: `crates/mycel-crypto/src/stream.rs`. Tests cover roundtrip at chunk boundaries (0, 1, chunk − 1, chunk, chunk + 1, many chunks), tampering, wrong key/nonce/AAD, truncation, extension, reordering, duplication and chunk-size changes.
 
-**Transfer.** Blobs are stored per space (`blobs/<space>/<blob>`) and served only to the space's members (stream kind `Blob` on ALPN `mycel/2`). They are streamed between QUIC and disk into `<blob>.part`, in disjoint ranges from every member that has the blob. The receiver checks the BLAKE3 hash of the whole blob before renaming it into place, so a peer can't substitute data. An interrupted transfer resumes from the `.part`, possibly from a different member. The final hash check covers the prefix too, and a bad prefix is discarded and fetched again.
+**Transfer.** Blobs are stored per space (`blobs/<space>/<blob>`) and served only to the space's members (stream kind `Blob` on the node protocol). They are streamed between QUIC and disk into `<blob>.part`, in disjoint ranges from every member that has the blob. The receiver checks the BLAKE3 hash of the whole blob before renaming it into place, so a peer can't substitute data. An interrupted transfer resumes from the `.part`, possibly from a different member. The final hash check covers the prefix too, and a bad prefix is discarded and fetched again.
 
 **Availability and disk use.** There is no size limit and no per-space quota.
 - Blobs up to 16 MiB are pushed to every member as soon as they're posted. Bigger ones are pushed only to keepers, and members fetch them when their user clicks download, from anyone in the space who has them.
@@ -170,11 +191,12 @@ aad_i    = "mycel/v0/stream-chunk" ‖ len(A): u32 LE ‖ A ‖ chunk_size: u32 
 
 ## 8. Transport rules
 
-- **ALPN** `mycel/2`: one connection per pair of devices; sync, cards, ephemeral messages and blobs are QUIC streams on it, labelled by a stream-kind byte. Iroh authenticates the remote node ID, which equals the remote `sign_pk`.
+- **ALPN** `mycel/node/2` (`mycel/2` with a pre-release build, [PROTOCOL.md](PROTOCOL.md)): one connection per pair of devices; sync, cards, ephemeral messages and blobs are QUIC streams on it, labelled by a stream-kind byte. Iroh authenticates the remote node ID, which equals the remote `sign_pk`.
 - **Responders serve a space only to its current members**, including Relays. Requests from non-members are refused.
-- **Sync order:** membership ops first, then envelopes (set difference over full ID inventories).
+- **Sync order:** membership ops first (resolution order, ancestry-closed), then envelopes, each author's chain in ascending seq. Sync v2 (stream kind `SyncV2`) finds the difference from a 32-byte digest and per-author chain heads (full ids); v1 (`Sync`, for builds without v2) by set difference over full ID inventories. Neither summary admits or hides anything: every item still goes through the receiver's checks, and a lying peer can only waste bounded bytes or withhold.
+- **Sync v2 limits** (none depends on the peer acknowledging anything): one session at a time per (peer, space) in either role (when two devices open to each other at once the lower key's session runs and the other side gets `Busy`, which is never a failure: it waits and runs its own session afterwards), at most 4 served per peer across spaces; sessions that find a difference, per (peer, space): a burst of 32, then 4 per second (`Busy` beyond); bytes sent per (peer, space): one full catch-up of our current set (it grows with the set, during a session too), then 1 MiB/min (the session stops and resumes later, keeping what arrived); phase-2 (fork placement) sessions: 6 per peer per hour; a peer's frontier: at least 65,536 authors whatever we know ourselves (2 × the authors we know + 1,024 if that is more), 4 chain heads per author on average and at most 64 listed per author (more are covered by a commitment); probes: 16 ids each, 64 runs and 8 rounds per session; session frames at most 1.1 MiB plus one envelope. The opening `Open` (it may carry an invite) and the answer to it (it may carry a `Removed` proof) both carry the whole membership history, so they get v1's 64 MiB frame limit, and an `Open` from a device we share no space with is charged to the stranger frame budget, as v1's `Hello` is. Received bytes are bounded per session (4 GiB) but not yet per peer over time (see §10).
 - **Everything received is validated by the receiver.** Nothing is trusted because of who sent it.
-- **ALPN** `mycel/mesh/1`: hop connections between nearby devices for multi-hop relaying ([ARCHITECTURE.md](ARCHITECTURE.md) §8). Accepted from anyone nearby: relaying needs no membership. What crosses a relay is the QUIC traffic of a connection between two *other* devices, so the rules above still apply end to end. See §8b.
+- **ALPN** `mycel/mesh/2` (`mycel/mesh/1` with a pre-release build): hop connections between nearby devices for multi-hop relaying ([ARCHITECTURE.md](ARCHITECTURE.md) §8). Accepted from anyone nearby: relaying needs no membership. What crosses a relay is the QUIC traffic of a connection between two *other* devices, so the rules above still apply end to end. See §8b.
 
 ## 8b. Mesh relays: what they can and can't do
 
@@ -209,6 +231,7 @@ A relay forwards QUIC packets of a connection between two other devices.
 **Limits (known):**
 - No onion routing or padding: relays see endpoints, sizes and timing. Hiding who-talks-to-whom would need onion-style layered encryption and cover traffic, at a large bandwidth cost on Bluetooth.
 - Sybil devices nearby can each be a neighbour (each is rate-limited separately); the radio's range is the practical bound.
+- **Bluetooth shows the device key to anyone in range.** The link has no pairing and the L2CAP channel isn't encrypted. The readable GATT characteristic carries the L2CAP PSM and the device's long-term key, and the first frame on a channel (the hello) carries the key again, to whichever device opened or accepted it. Neither carries the display name any more (the hello's name field is always empty; older builds still send one): a nearby device learns the name from the signed contact card, fetched inside the encrypted QUIC session, which a stranger can still do once it has a channel. So a nearby attacker scanning for Mycel's service can recognise a device by its key (passive), and one advertising the service can get the key from a channel and the name from the card (active). How long a device is exposed: computers whenever Mycel runs; iPhones and iPads while Mycel is open. In the background an iPhone keeps scanning and dialing (the `bluetooth-central` background mode) but **links only with known devices**: contacts and members of its conversations (`Runtime::set_background`, `mycel-link-ble`'s restricted mode). It still connects to an unknown advertiser long enough to read its GATT key (that read reveals nothing about the iPhone but its rotating Bluetooth address), then hangs up and doesn't dial it again; a channel a stranger opens to it is closed at the stranger's hello. `bluetooth-peripheral` is deliberately not declared, so a locked iPhone neither advertises nor serves the characteristic. Residual: an attacker who knows the key of one of the victim's contacts (read passively from that contact's Mac, say) can advertise that key and receive the iPhone's key in its hello before QUIC's handshake fails; that tracks a targeted victim, not every passer-by. Android has no Bluetooth link yet. The fix for all of it, rotating tokens in place of the key and identity only inside an encrypted handshake, is not built.
 
 ## 8c. Gateways, records and carriers (global routing, store-and-forward)
 
@@ -275,12 +298,60 @@ Bluetooth still completes. Code: `crates/mycel-net/src/resources.rs` and
 - **Attachments:** see §7b. Concurrent transfers reserve disk space from one
   shared account, so they can't each count the same free space.
 
+## 8e. Optional wake relay (designed, not built)
+
+**Not built, and off by default if it ever is.** Design:
+[WAKE_RELAY.md](WAKE_RELAY.md). It would let a contact wake a suspended
+iPhone through Apple's push service, which needs a server holding the app
+developer's APNs key. It is the only place Mycel's design would admit an
+operator, so its trust is fixed here before any code:
+
+- **Trusted for availability only.** It can drop, delay, replay or reorder
+  wakes, or stop running; the device then stays in slow mode. It is never
+  trusted for confidentiality or integrity: it relays no content and holds
+  no key that decrypts any, and envelopes are checked by the trust layer as
+  always.
+- **Content-blind.** A wake is a capability ID plus a fixed-size HPKE blob
+  (RFC 9180 PSK mode, X25519 / HKDF-SHA256 / ChaCha20-Poly1305) sealed to
+  that capability's own wake key with that capability's own 32-byte random
+  PSK, both separate from the device's Mycel keys and from every other
+  capability's. The blob holds only a timestamp and a
+  fetch hint the extension doesn't trust; the content comes over Mycel's
+  own paths.
+- **Identity-blind.** The relay sees a push token and random registration
+  and capability IDs, never Mycel identity keys. Wakes reach it through a
+  one-hop proxy or Oblivious HTTP (RFC 9458), so it doesn't see senders'
+  addresses.
+- **Unlinkable, revocable capabilities.** Each contact gets its own
+  capability (a random ID and its own wake key) over the end-to-end
+  channel; two capabilities share nothing but the relay's URL, so contacts
+  can't link theirs to others'; the device can revoke any; the relay
+  rate-limits each.
+- **Wakes are attributed by capability, never by their contents.** HPKE's
+  PSK mode lets the device check that the sender held the capability's
+  PSK, so a wake proves only "from whoever holds this capability", which
+  the device gave to exactly one contact. The assumption, stated: the PSK
+  stays secret between the device and that contact (it travels only end to
+  end and lives only in their keychains); the wake public key needs no
+  secrecy. Abuse is counted and revoked per capability ID: a malicious
+  contact can burn only its own, never forge one that passes for another
+  contact's. The relay can't forge wakes (it never sees a PSK), only drop
+  or replay them.
+- **What it learns:** a push token (which Apple can tie to an Apple ID),
+  how many capabilities a registration has, and when each fires. Timing is
+  the residual leak, shared with Apple; random delay, coalescing and cover
+  wakes reduce it but can't hide it from Apple.
+- **Who can run one:** only the holder of a build's APNs key can send pushes
+  for it, so "self-hosted" means per build. Android needs no relay: the
+  same capability can be a UnifiedPush endpoint at a distributor the user
+  chose (also only designed).
+
 ## 9. Code and tests
 
 | Spec section | Code | What the tests cover |
 |---|---|---|
 | §2 primitives | `crates/mycel-crypto` | Domain separation, framing, kex binding, lockbox info binding, AEAD tamper; the streaming attachment AEAD (§7b): chunk boundaries, tamper, truncation, extension, reorder, duplication, chunk-size change, legacy detection, incremental digest |
-| §3–§6 graph, resolution, epochs | `crates/mycel-trust` (`resolve.rs` = §5) | Forged admin ops, pending ops, removal and rotation, concurrent revocation, mutual removal (seniority), delivery-order convergence, rotation recipient checks, bad key commitment, last admin, self-healing rotation, leave, epoch-ID reuse, ops from never-added keys; fan-outs of invalid ops, wide valid frontiers, pending-pool limits and ready admin ops |
+| §3–§6 graph, resolution, epochs | `crates/mycel-trust` (`resolve.rs` = §5, incremental; `oracle.rs` = §5 from scratch; `reach.rs` = ancestry) | Forged admin ops, pending ops, removal and rotation, concurrent revocation, mutual removal (seniority), delivery-order convergence, rotation recipient checks, bad key commitment, last admin, self-healing rotation, leave, epoch-ID reuse, ops from never-added keys; fan-outs of invalid ops, wide valid frontiers, pending-pool limits and ready admin ops; rule A2: only keys added by an ever-admin are named, named keys don't depend on arrival order, a batch in any order (a restore in key order, an admin chain, seeded shuffles) admits what a causal one does, an op before its author's `Add` is admitted once the `Add` arrives, the unnamed pool is bounded. **Differential tests** (`diff_tests.rs`, proptest): random concurrent histories from four replicas (concurrent adds, removals and role changes, revocation storms, mutual revocation cycles, equivocation, reused epochs, stale recipients, out-of-order and duplicate delivery, batches, a member's `Add` and their revocation delivered in one update, revocation spam by removed members) must resolve exactly as `resolve_full` after every insert, with and without the fast path; hand-built regressions for histories the generator rarely reaches (a seniority move inside one update, seniority moves before a cut, round-0 states, re-added readers, lagging ops, dead chains, concurrent `Leave`s); the ancestry index is checked against brute force |
 | §7 envelopes | `crates/mycel-sync` | Replication, reader writes rejected, keeper can't read, outsider and tampered envelopes, forged actor, backdated writes after removal, 3-way convergence, demotion, feed causal order, restore from storage, equivocation; decompression and expansion bombs, malformed and deferred changes, declared-history checks (actor, counters, object references), delivery-order and restore consistency |
 | §8–§8d transport, mesh, limits | `crates/mycel-net`, `crates/mycel-node` | End to end over real Iroh QUIC with five nodes (admin, writer, reader, keeper, outsider); forged, renamed and replayed mesh announcements; signed-field cache mutation; stream and frame budgets, stalled and progressing I/O, duplicate requests, invitation validation order, ephemeral limits; attachment consent and disk reservations across restarts |
 
@@ -324,6 +395,8 @@ the code does now:
 | Attachment consent | Membership granted by a pending request let a stranger push files before the user accepted | Consent is stored before the invite is admitted and survives restarts; pending and hidden requests can't push files or be downloaded from |
 | Pre-authentication work | Junk ops and envelopes from unknown keys cost CPU and memory | Ops and envelopes from never-added keys are dropped before storage; parents, `auth_heads`, invites and lockboxes are capped; state caches are bounded |
 | Revocation | A fan-out of invalid ops, or a flood of ops with missing parents, could stop an admin from removing a member | Authoring uses the frontier of *valid* ops; the pending pool is capped per author and ready ops bypass it (§5) |
+| Author minting | Any member (a Reader, a keeper, a removed member) could add unlimited author keys whose envelopes every peer stored and listed in every sync frontier | Only keys added by an ever-admin are named (rule A2, §5) |
+| Restore order | With rule A2, a restore (ops read in key order) dropped ops whose author's `Add` was still pending at that point, a member's `Remove` among them, so the device kept treating a removed member as a member | A batch admits ops of authors named later in the same batch; between batches they wait in a bounded pool (§5) |
 | Epoch IDs | Reusing an epoch ID with a different key could break convergence | `EpochId = H(commitment)`, checked structurally; each key is checked against its own op's commitment |
 | Equivocation | Two changes for one Automerge (actor, seq) could make documents diverge; a revocation could leave stale exclusions | The lowest envelope ID wins everywhere; exclusions are recomputed from the currently valid changes, so live and restored replicas agree |
 | Change parsing | A malformed change from any writer crashed every member, and kept crashing them after restart; small compressed changes expanded without limit | Decompression and logical expansion are bounded before parsing (§7 rule 9); parser and apply panics are contained; changes apply to a candidate document first; changes waiting for dependencies stay outside Automerge |
@@ -366,10 +439,57 @@ What this layer does **not** do:
   the user profile's permissions). Downloaded attachments are plaintext in
   the app's files folder. There is no database encryption, app lock or
   app-switcher redaction.
-- **Scale.** Resolution is linear for linear history but O(n²) for heavily
-  concurrent membership ops, and envelope validity is recomputed on each
-  membership change. Rotation sends one lockbox per reader: fine up to a
-  few hundred members. Sync exchanges full ID inventories.
+- **Scale.** Membership resolution is incremental (§5): flat per-insert
+  cost to 100,000 ops, linear or in revocation storms. What remains
+  superlinear, partly under an attacker's control (any key ever named in
+  the space can author ops, valid or not):
+  - A new op whose parents lie far back re-resolves everything that
+    arrived after the newest cut it can use: up to about twice its lag, or
+    the whole history when its parents are older than every cut kept
+    (roughly, older than half the history). An honest device back from a
+    long time offline pays this once; a removed member can send such ops
+    at will, e.g. ops on their own `Add` from before their removal:
+    measured 5 ms per op at 10,000 ops and 99 ms at 100,000, against
+    25 µs for an op on the heads, so a few such ops per second keep one
+    core busy in a 100,000-op space. Re-resolving only the ops concurrent
+    with the new one, instead of every op since the cut, would remove
+    this; it is not done.
+  - A removed member's k pairwise-concurrent `Leave`s add k rounds to the
+    winners loop (§5 step 6). Later inserts are unaffected (measured
+    33 µs after 1,000 such `Leave`s at 10,000 ops), but inserting the
+    `Leave`s costs about k³: the i-th re-resolves up to i ops in each of
+    i rounds. Measured 0.3 s for 200 and 57 s for 1,000 (worst single
+    insert 0.2 s). Dropping revocation candidates whose author is not a
+    member in their causal state ignoring concurrency would end this, but
+    it changes which ops are valid in rare histories (a member added on a
+    branch that only becomes valid in a later round), so it needs a
+    protocol decision.
+  - The ancestry index grows with chains that stay open and partly
+    reached, O(n · k) in the worst case, and whoever appends ops can make
+    `k` grow with their op count: merges that each name a non-tip op of
+    many side chains keep those chains open. Measured with crafted ops:
+    0.3, 1.3 and 5.1 million vector entries (8 bytes each) at 19,000,
+    38,000 and 76,000 ops, 4× per doubling (an estimate by that trend:
+    about 500 million entries, 4 GB, at 760,000 ops). Bounding the
+    vectors is not done.
+  - Inserting an op into the topological order shifts the ops after it,
+    and a reader `Add` writes the member into every epoch they lack, since
+    the state lists each epoch's recipients.
+
+  Envelope validity is recomputed on each membership change. Rotation
+  sends one lockbox per reader: fine up to a few hundred members. Sync v2
+  costs about what differs (an idle check is one round trip and a few
+  hundred bytes), but v1 sessions with devices without it still exchange
+  full ID inventories. Invites and `Removed` proofs carry the whole
+  membership history in one frame (at most 64 MiB, as in v1: about 1,900
+  removals in a 300-reader group); a space whose history outgrows that
+  can't invite or tell a removed member. A space with more than 65,536
+  authors ever named fails v2 sessions with devices that know fewer than
+  half of them (no fallback to v1 for that).
+- **Received sync bytes** are bounded per session (4 GiB), not per (peer,
+  space) over time: a misbehaving member can stream valid but useless or
+  duplicate items, at most 4 sessions at a time, each checked by the
+  receiver. The byte budget restrains only honest senders.
 - **Rebuild costs.** A batch carrying a lower-ID fork of an already-applied
   change costs one linear rebuild of that document, and the displaced
   change's descendants are dropped, as for revocations. Honest edits built
@@ -382,3 +502,7 @@ What this layer does **not** do:
   Accepted members' history and attachments have no cumulative storage
   quota, and a process killed mid-push can leave staging files behind.
 - **Forks before a cutoff** are tolerated but not shown in the UI.
+- **No timely delivery to a suspended iPhone.** Without a push server, iOS
+  wakes Mycel only on its own schedule (background refresh, Bluetooth
+  events) or when it's opened; the wake relay that would change that is a
+  design only (§8e).

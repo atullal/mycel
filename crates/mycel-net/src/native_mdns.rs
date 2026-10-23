@@ -116,10 +116,8 @@ struct ServiceKey {
     domain: String,
     iface: u32,
 }
-/// One SRV record of a peer's instance: a host and a port. iroh's mDNS
-/// advertises one per port (its LAN socket, a NAT mapping, ...), each with
-/// its own host name and addresses.
-type Target = (String, u16);
+use crate::mdns_records::Target;
+use crate::mdns_records::{parse_srv, parse_txt};
 enum Event {
     Restart,
     /// Our registration failed (`true`: another responder holds our name).
@@ -200,38 +198,6 @@ unsafe extern "C" fn browse(
     }
     let c = unsafe { &*(ctx as *const Context) };
     c.send(Event::Browse(ServiceKey { name, ty, domain, iface }, flags & ADD != 0));
-}
-/// An SRV record's target name, from its uncompressed wire format into the
-/// presentation form DNSServiceGetAddrInfo takes.
-fn wire_name(mut wire: &[u8]) -> Option<String> {
-    let mut name = String::new();
-    loop {
-        let (&len, rest) = wire.split_first()?;
-        if len == 0 {
-            break;
-        }
-        let len = len as usize;
-        if len > 63 || rest.len() < len {
-            return None;
-        }
-        for &b in &rest[..len] {
-            match b {
-                b'.' | b'\\' => {
-                    name.push('\\');
-                    name.push(b as char);
-                }
-                b' '..=b'~' => name.push(b as char),
-                _ => return None,
-            }
-        }
-        name.push('.');
-        wire = &rest[len..];
-    }
-    (!name.is_empty() && name.len() <= 255).then_some(name)
-}
-fn parse_srv(rdata: &[u8]) -> Option<Target> {
-    let port = u16::from_be_bytes(rdata.get(4..6)?.try_into().ok()?);
-    Some((wire_name(rdata.get(6..)?)?, port))
 }
 unsafe extern "C" fn record(
     _r: Ref,
@@ -338,20 +304,6 @@ unsafe extern "C" fn registered(
         let c = unsafe { &*(ctx as *const Context) };
         c.send(Event::RegisterFailed(err == NAME_CONFLICT));
     }
-}
-fn parse_txt(mut txt: &[u8]) -> Option<UserData> {
-    while let Some((&len, rest)) = txt.split_first() {
-        let len = len as usize;
-        if rest.len() < len {
-            return None;
-        }
-        let value = &rest[..len];
-        txt = &rest[len..];
-        if let Some(value) = value.strip_prefix(b"user-data=") {
-            return std::str::from_utf8(value).ok()?.parse().ok();
-        }
-    }
-    None
 }
 fn make_txt(data: &EndpointData) -> Vec<u8> {
     let Some(user) = data.user_data() else {
@@ -1127,11 +1079,11 @@ mod tests {
         rdata.push(0);
         assert_eq!(parse_srv(&rdata), Some(("abc-35493.local.".into(), 35493)));
         // a dot inside a label is escaped, not a separator
-        assert_eq!(wire_name(&[3, b'a', b'.', b'b', 0]).as_deref(), Some("a\\.b."));
+        assert_eq!(crate::mdns_records::wire_name(&[3, b'a', b'.', b'b', 0]).as_deref(), Some("a\\.b."));
         // truncated, oversized or binary labels are refused
         assert!(parse_srv(&rdata[..8]).is_none());
-        assert!(wire_name(&[64, b'a', 0]).is_none());
-        assert!(wire_name(&[1, 0x01, 0]).is_none());
+        assert!(crate::mdns_records::wire_name(&[64, b'a', 0]).is_none());
+        assert!(crate::mdns_records::wire_name(&[1, 0x01, 0]).is_none());
         assert!(parse_srv(&[0, 0, 0, 0]).is_none());
     }
 

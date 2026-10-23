@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use mycel_call::audio::{AudioIo, TestAudio, TestSource};
 use mycel_call::level::estimate_frequency;
-use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallManager, CallPhase};
+use mycel_call::{BoxFuture, CallEvent, CallHost, CallManager, CallPhase};
 use mycel_crypto::{DeviceKeys, Hash32, SignPk};
 use mycel_net::emu::{EmuLink, EmuNet, Latency, Medium, PairShape, Pos};
 use mycel_net::iroh::endpoint::Connection;
@@ -192,7 +192,7 @@ impl CallHost for Host {
 
     fn connect(&self, peer: SignPk) -> BoxFuture<anyhow::Result<Connection>> {
         let node = self.node.clone();
-        Box::pin(async move { node.connect(peer, ALPN_CALL).await })
+        Box::pin(async move { mycel_call::proto::connect(&node, peer).await })
     }
 
     fn note_connection(&self, peer: &SignPk, conn: &Connection) {
@@ -279,7 +279,7 @@ impl Lab {
         });
         let (tx, rx) = mpsc::unbounded_channel();
         if o.tone.is_some() {
-            opts.extra_protocols.push(ExtraProtocol { alpn: ALPN_CALL.to_vec(), incoming: tx });
+            opts.extra_protocols.extend(mycel_call::proto::extra_protocols(tx));
         }
         if o.bulk {
             let (btx, mut brx) = mpsc::unbounded_channel::<Connection>();

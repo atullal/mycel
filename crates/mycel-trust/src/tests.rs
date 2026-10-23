@@ -84,6 +84,171 @@ fn non_admin_ops_are_invalid() {
     assert!(g.state().role(&outsider.pk()).is_none());
 }
 
+/// A hand-crafted `Add` by `by` (no role check), on `g`'s heads.
+fn forged_add(g: &SpaceGraph, by: &Peer, who: &Peer, role: Role, nonce: u64) -> SignedOp {
+    SignedOp::sign(
+        &by.keys,
+        Op {
+            space: Some(g.space_id()),
+            parents: g.heads(),
+            author: by.pk(),
+            nonce,
+            action: Action::Add { member: who.keys.public(), role, keyring: None },
+        },
+    )
+}
+
+#[test]
+fn only_keys_added_by_an_ever_admin_are_named() {
+    // Admission rule A2: a writer, reader or relay can't mint authors (each
+    // minted key could store envelopes and grow every sync frontier).
+    let (mut g, a) = space();
+    let w = Peer::new();
+    let r = Peer::new();
+    add(&mut g, &a, &w, Role::Writer);
+    add(&mut g, &a, &r, Role::Reader);
+    for (i, by) in [&w, &r].into_iter().enumerate() {
+        let minted = Peer::new();
+        let op = forged_add(&g, by, &minted, Role::Relay, i as u64);
+        assert_eq!(g.insert(op).unwrap(), Inserted::New, "kept: peers converge on the DAG");
+        assert!(!g.ever_named(&minted.pk()));
+        // So the minted key can't author ops (or store envelopes).
+        let own = forged_add(&g, &minted, &Peer::new(), Role::Relay, 9);
+        assert!(matches!(g.insert(own), Err(TrustError::NotAuthorized(_))));
+    }
+    assert!(g.ever_named(&w.pk()) && g.ever_named(&r.pk()));
+}
+
+#[test]
+fn named_keys_do_not_depend_on_arrival_order() {
+    // The writer adds a key while still a writer (an invalid op); the
+    // founder concurrently promotes the writer to admin. Ever-admin counts,
+    // so the key is named on every replica, whichever op arrived first.
+    let (mut g, a) = space();
+    let w = Peer::new();
+    add(&mut g, &a, &w, Role::Writer);
+    let base = replica(&g);
+    let x = Peer::new();
+    let by_writer = forged_add(&g, &w, &x, Role::Relay, 1);
+    let (promote, _) = g.set_role(&a.keys, w.pk(), Role::Admin, None).unwrap();
+    for order in [[&by_writer, &promote], [&promote, &by_writer]] {
+        let mut r = replica(&base);
+        for op in order {
+            r.insert(op.clone()).unwrap();
+        }
+        assert!(r.ever_named(&x.pk()));
+    }
+    // A pending Add names no one until it is resolvable.
+    let mut r = replica(&base);
+    let y = Peer::new();
+    let mut h = replica(&base);
+    h.insert(promote.clone()).unwrap();
+    let add_y = forged_add(&h, &w, &y, Role::Relay, 2);
+    assert_eq!(r.insert(add_y).unwrap(), Inserted::Pending);
+    assert!(!r.ever_named(&y.pk()));
+    r.insert(promote).unwrap();
+    assert!(r.ever_named(&y.pk()));
+}
+
+/// Review regression: with rule A2 an op whose author's `Add` was still
+/// pending (missing a parent) when the op arrived was dropped, so a batch in
+/// a non-causal order (a restore reads ops in key order, op-id hash order)
+/// lost ops, a member's `Leave` among them.
+#[test]
+fn a_batch_in_any_order_admits_what_a_causal_one_does() {
+    let (mut g, f) = space();
+    let mut a = Peer::new();
+    add(&mut g, &f, &a, Role::Admin);
+    g.unlock(&a.keys, &mut a.ring);
+    let c = Peer::new();
+    let c_add = add(&mut g, &f, &c, Role::Writer);
+    let b = Peer::new();
+    let b_add = add(&mut g, &a, &b, Role::Writer);
+    let b_leave = g.leave(&b.keys, None).unwrap();
+    g.insert(b_leave.clone()).unwrap();
+    let a_add = g.get(&g.resolution().order[1]).unwrap().clone();
+    // B's Add (by A) has C's Add as a parent, which comes last: B's Add is
+    // pending when B's Leave arrives.
+    let mut r = SpaceGraph::from_genesis(g.get(&g.space_id()).unwrap().clone()).unwrap();
+    let (added, rejected) = r.insert_many([a_add, b_add, b_leave.clone(), c_add]);
+    assert_eq!((added.len(), rejected), (4, 0));
+    assert!(r.contains(&b_leave.id()));
+    assert!(r.state().role(&b.pk()).is_none(), "B left on this replica too");
+    assert_eq!(r.heads(), g.heads());
+}
+
+/// The same for a chain of admins each adding the next, in every order a
+/// restore could produce (reversed, and seeded shuffles).
+#[test]
+fn a_restore_in_key_order_keeps_an_admin_chain() {
+    let (mut g, f) = space();
+    let mut prev = f;
+    let mut admins = Vec::new();
+    for _ in 0..5 {
+        let mut next = Peer::new();
+        add(&mut g, &prev, &next, Role::Admin);
+        g.unlock(&next.keys, &mut next.ring);
+        admins.push(prev);
+        prev = next;
+    }
+    let w = Peer::new();
+    add(&mut g, &prev, &w, Role::Writer);
+    let (remove, _, _) = g.remove_member(&prev.keys, w.pk(), None).unwrap();
+    g.insert(remove).unwrap();
+    assert!(g.state().role(&w.pk()).is_none());
+    let space = g.space_id();
+    let all: Vec<SignedOp> =
+        g.resolution().order.iter().filter(|id| **id != space).map(|id| g.get(id).unwrap().clone()).collect();
+    let mut orders = vec![all.iter().rev().cloned().collect::<Vec<_>>()];
+    let mut by_id = all.clone();
+    by_id.sort_by_key(|o| o.id());
+    orders.push(by_id);
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    for _ in 0..20 {
+        let mut o = all.clone();
+        for i in (1..o.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            o.swap(i, (seed % (i as u64 + 1)) as usize);
+        }
+        orders.push(o);
+    }
+    for order in orders {
+        let mut r = SpaceGraph::from_genesis(g.get(&space).unwrap().clone()).unwrap();
+        let (added, rejected) = r.insert_many(order);
+        assert_eq!((added.len(), rejected), (all.len(), 0));
+        assert!(r.state().role(&w.pk()).is_none(), "the removal is kept");
+        assert_eq!(r.heads(), g.heads());
+    }
+}
+
+/// Across separate inserts, an op that arrives before its author is named
+/// waits in a bounded pool and is admitted (and reported for persisting)
+/// once a later op names the author.
+#[test]
+fn an_op_before_its_authors_add_is_admitted_once_the_add_arrives() {
+    let (mut g, f) = space();
+    let w = Peer::new();
+    let w_add = add(&mut g, &f, &w, Role::Writer);
+    let w_leave = g.leave(&w.keys, None).unwrap();
+    g.insert(w_leave.clone()).unwrap();
+    let mut r = SpaceGraph::from_genesis(g.get(&g.space_id()).unwrap().clone()).unwrap();
+    assert!(matches!(r.insert(w_leave.clone()), Err(TrustError::NotAuthorized(_))));
+    assert!(!r.contains(&w_leave.id()), "not held: peers keep offering it");
+    assert_eq!(r.insert(w_add).unwrap(), Inserted::New);
+    assert!(r.contains(&w_leave.id()));
+    assert_eq!(r.take_released(), vec![w_leave.id()]);
+    assert!(r.state().role(&w.pk()).is_none());
+    // The pool is bounded: ops from never-named keys can't grow it.
+    let mut r = SpaceGraph::from_genesis(g.get(&g.space_id()).unwrap().clone()).unwrap();
+    let junk: Vec<SignedOp> =
+        (0..MAX_UNNAMED as u64 + 50).map(|i| forged_add(&g, &Peer::new(), &Peer::new(), Role::Relay, i)).collect();
+    let (_, rejected) = r.insert_many(junk);
+    assert_eq!(rejected, MAX_UNNAMED + 50);
+    assert!(r.unnamed.values().map(HashMap::len).sum::<usize>() <= MAX_UNNAMED);
+}
+
 #[test]
 fn tampered_and_foreign_ops_rejected() {
     let (mut g, a) = space();

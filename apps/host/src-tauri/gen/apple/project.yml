@@ -92,6 +92,8 @@ targets:
       - sdk: Network.framework
       # peer-to-peer links: Bluetooth LE (Network.framework above does AWDL)
       - sdk: CoreBluetooth.framework
+      # "slow mode" catch-ups (main.mm)
+      - sdk: BackgroundTasks.framework
       # video calls: camera frames and hardware H.264
       - sdk: CoreMedia.framework
       - sdk: CoreVideo.framework

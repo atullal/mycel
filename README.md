@@ -71,7 +71,7 @@ All screenshots are from the browser demo (`npm run dev`), with simulated people
 |---|---|---|
 | macOS 11+ (Apple silicon and Intel) | everything, including Bluetooth and peer-to-peer Wi-Fi | the full test suite; the app on real Macs, over the LAN and Bluetooth to an iPhone. Peer-to-peer Wi-Fi on emulated links and on one Mac only |
 | iPhone and iPad (iOS 16.4+) | everything, including Bluetooth and peer-to-peer Wi-Fi; calls continue in the background | the iOS Simulator; a real iPhone: LAN discovery through Bonjour, Bluetooth links to Macs. Peer-to-peer Wi-Fi and the camera haven't run on a device |
-| Android 9+ | everything except Bluetooth and peer-to-peer Wi-Fi; keeps running in the background | the Android 14 emulator only |
+| Android 9+ | everything except Bluetooth and peer-to-peer Wi-Fi; keeps running in the background, also after a restart | the Android 14 emulator only |
 | Windows 10+ | everything except Bluetooth, peer-to-peer Wi-Fi and the interface link; no echo cancellation | GitHub Actions runners only (build, core tests, launch, video without a camera); no run on real hardware |
 | Linux (glibc 2.35+) | everything, with Bluetooth through BlueZ and Wi-Fi Direct groups (off by default); no echo cancellation | GitHub Actions runners only (build, core tests, launch, video without a camera); no run on real hardware, so BlueZ and Wi-Fi Direct are tested on emulated links only |
 
@@ -79,9 +79,10 @@ Details per feature: [docs/PLATFORMS.md](docs/PLATFORMS.md).
 
 **Limitations to know:** Bluetooth runs on macOS, iOS and Linux, and
 peer-to-peer Wi-Fi on macOS and iOS; Android and Windows have neither. A
-suspended iPhone or iPad doesn't receive messages until Mycel is opened again:
-waking it would need Apple's push service, which needs a server, which
-Mycel doesn't use. Each device is its own identity, and its key is the
+suspended iPhone or iPad runs in "slow mode": it catches up when iOS lends
+it time and over Bluetooth, so new messages may wait until Mycel is opened;
+waking it on time would need Apple's push service, which needs a server,
+which Mycel doesn't use. Each device is its own identity, and its key is the
 account: there is no recovery if it is lost. Every device must run the same
 build, because the wire format still changes.
 
@@ -100,7 +101,9 @@ To run the current code, build from source.
   SmartScreen needs **More info > Run anyway**.
 - **iPhone and iPad** need a build signed with your own Apple developer
   account (`scripts/package-ios.sh --install`).
-- **Every device you test with needs the same build.**
+- **Use the same build on every device you test with when you can.** Builds
+  negotiate the protocol version ([docs/PROTOCOL.md](docs/PROTOCOL.md)),
+  but older pre-release builds changed formats unannounced.
 
 Installing, permissions, connecting devices, logs and troubleshooting:
 [docs/USER_GUIDE.md](docs/USER_GUIDE.md).
@@ -176,6 +179,7 @@ docs/               the documents below
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | layers, design decisions, what is built, limitations, the mesh and global routing |
 | [TRUST.md](docs/TRUST.md) | the trust layer: threat model, membership, keys, envelopes, resource limits, hardening, limitations |
 | [ROUTING.md](docs/ROUTING.md) | routing: a survey of ~20 protocols, what Mycel reuses, and why |
+| [PROTOCOL.md](docs/PROTOCOL.md) | every wire, signed and on-disk format, its version, and how versions and capabilities are negotiated |
 | [RUNTIME_API.md](docs/RUNTIME_API.md) | the API apps use (Rust, Tauri commands, HTTP) |
 | [RULES_ABI.md](docs/RULES_ABI.md) | the WASM rules ABI |
 | [TESTING.md](docs/TESTING.md) | how to run the tests, what they cover, measured results |

@@ -1,0 +1,74 @@
+# Nightly: the simulator's scenarios on fresh seeds, to find the seeds that
+# break them. Each failing seed replays exactly (`--seed`); once its cause
+# is fixed, pin it in crates/mycel-sim/src/seeds.rs (PINNED) so the
+# ten-seed gate in CI replays it on every change (docs/SIMULATION.md §1).
+name: Simulation soak
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base seed (default: this run's id, a fresh one each night)"
+        required: false
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: sim-soak
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "10"
+  RUSTUP_MAX_RETRIES: "10"
+  RUST_BACKTRACE: short
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  soak:
+    name: Soak (twenty fresh seeds)
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config
+      - run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: false
+      # The gate's scenarios plus the heavier ones and the liar ceiling
+      # (seeds::SOAK_SUITE), each on 20 seeds from a base no run used before.
+      - name: Soak
+        env:
+          BASE: ${{ inputs.base || github.run_id }}
+        run: |
+          set -o pipefail
+          echo "base seed $BASE"
+          cargo run --locked --release -p mycel-sim -- soak --seed "$BASE" --runs 20 --out "$RUNNER_TEMP/soak" \
+            | tee "$RUNNER_TEMP/failing-seeds.txt"
+      - name: Failing seeds
+        if: always()
+        run: |
+          {
+            echo "## Failing seeds"
+            echo
+            echo "Pin each 'failing seed' in crates/mycel-sim/src/seeds.rs (PINNED) once its cause is fixed."
+            echo "'quality miss (within m of k)' and 'known gap closed' lines are for information."
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/failing-seeds.txt" || true
+            echo '```'
+            cat "$RUNNER_TEMP/soak/gate.md" || true
+          } >> "$GITHUB_STEP_SUMMARY"

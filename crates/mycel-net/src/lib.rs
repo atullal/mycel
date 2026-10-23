@@ -7,16 +7,28 @@
 //! keepers), and everything received is re-validated by the receiving
 //! `Replica` — nothing is trusted because of who sent it.
 //!
-//! Connections: one ALPN ([`wire::ALPN`]), and a long-lived connection per
-//! peer from a small connection pool (`pool.rs`; closed after [`POOL_IDLE`]
-//! without use, redialed when it breaks). Every exchange is a new QUIC stream on it, labelled by a
-//! [`wire::StreamKind`] byte; the server accepts streams in a loop. QUIC does
-//! the multiplexing, flow control and loss recovery; stream priorities send
-//! messages ahead of file bytes. No handshake per sync, and the connection's
-//! extra paths (links, other interfaces) stay open and measured.
+//! Connections: one protocol ([`wire::ALPN`], in every wire version the
+//! node speaks: see [`version`] and docs/PROTOCOL.md), and a long-lived
+//! connection per peer from a small connection pool (`pool.rs`; closed
+//! after [`POOL_IDLE`] without use, redialed when it breaks). Every exchange
+//! is a new QUIC stream on it, labelled by a [`wire::StreamKind`] byte; the
+//! server accepts streams in a loop, and refuses a kind it doesn't know
+//! with [`version::STREAM_REFUSED`]. QUIC does the multiplexing, flow
+//! control and loss recovery; stream priorities send messages ahead of
+//! file bytes. No handshake per sync, and the connection's extra paths
+//! (links, other interfaces) stay open and measured. On wire version 2 the
+//! dialer sends a capability hello ([`wire::StreamKind::Hello`]) on a
+//! stream of its own, beside the exchange it dialed for: the two race, so
+//! nothing may assume the hello arrives (or is answered) first, and a hello
+//! that fails is tried again later on the same connection.
 //!
-//! Sync protocol (stream kind `Sync`), one bi-stream, strictly alternating so
-//! neither side can deadlock on flow control:
+//! Sync v2 (stream kind `SyncV2`, wire version 2 and later, `sync_v2.rs`
+//! driving `mycel_sync::reconcile`): an idle check costs one round trip and
+//! a few hundred bytes, a difference costs about what differs. It is used
+//! with a peer whose hello agreed [`Caps::SYNC_V2`]; with any other peer,
+//! or one that refuses the stream anyway, the opener uses v1 (stream kind
+//! `Sync`), one bi-stream, strictly alternating so neither side can
+//! deadlock on flow control:
 //!
 //! ```text
 //! C → S  Hello{space, inv, invite?}
@@ -24,15 +36,31 @@
 //! C → S  DataAndWant{data, want}
 //! S → C  Data{data}
 //! ```
+//!
+//! Scheduling: after a change a device syncs the space with every member in
+//! groups of up to [`FULL_MESH`] devices, and otherwise with a bounded view
+//! (two nearby members, two chosen at random by rendezvous hash, and those
+//! that recently chose it), forwarding what it learns the same way; so a
+//! change costs O(members) sessions, not O(members²). Periodic
+//! anti-entropy backs off from 15 s to 10 min while it finds nothing, and
+//! returns to 15 s on signs of loss (a periodic session that moved items, a
+//! membership change, a local write, a newly reachable peer).
 
 mod blobs;
 pub mod emu;
+#[cfg(fuzzing)]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod link;
+#[cfg(any(target_os = "macos", target_os = "ios", fuzzing))]
+mod mdns_records;
 pub mod mesh;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod native_mdns;
 mod pool;
 mod resources;
+mod sync_v2;
+pub mod version;
 pub mod wire;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -48,7 +76,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, PublicKey, SecretKey,
     address_lookup::{MemoryLookup, UserData},
-    endpoint::{Connection, RecvStream, SendStream, presets},
+    endpoint::{ConnectOptions, Connection, RecvStream, SendStream, presets},
     protocol::{AcceptError, ProtocolHandler, Router},
 };
 use iroh_mdns_address_lookup::{DiscoveryEvent, MdnsAddressLookup};
@@ -63,6 +91,9 @@ pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_fr
 pub use iroh;
 pub use link::{Link, LinkEvent, LinkStatus, PathKind, path_in_use};
 pub use mesh::{Mesh, MeshOptions, MeshRoute, MeshStats, Tap};
+pub use sync_v2::{V1_REMEMBERED, V2Totals};
+pub use version::{Caps, PeerProtocol, Protocol, VersionError, WireVersion};
+use version::{Hello, STREAM_REFUSED, WIRE_V2};
 use wire::*;
 pub use wire::{ContactCard, MAX_EPHEMERAL};
 
@@ -74,7 +105,28 @@ pub const POOL_IDLE: Duration = Duration::from_secs(60);
 /// away only fails once the peer has had [`resources::REPLY_TIMEOUT`] to
 /// answer, and a passer-by who could carry it may be gone by then.
 const BUNDLE_AFTER: Duration = Duration::from_secs(10);
+/// How long [`Node::sync_with`] keeps retrying a peer that answers `Busy`.
+pub const EXPLICIT_BUSY_WAIT: Duration = Duration::from_secs(300);
+/// Background retries after `Busy` (see `sync_once`).
+const BUSY_RETRIES: u32 = 3;
+/// Periodic anti-entropy: the first interval, and the cap it backs off to
+/// while periodic sessions find nothing.
 const PERIODIC_SYNC: Duration = Duration::from_secs(15);
+const PERIODIC_MAX: Duration = Duration::from_secs(600);
+/// Groups up to this size sync every member after a change; larger ones a
+/// bounded view (see the crate docs).
+pub const FULL_MESH: usize = 6;
+/// The bounded view: nearby members, random members, and at most this many
+/// members that recently chose us.
+const VIEW_NEARBY: usize = 2;
+const VIEW_RANDOM: usize = 2;
+const VIEW_INBOUND: usize = 8;
+/// The author of a change pushes it to every member in groups up to this
+/// size (one hop to everyone it can reach, O(members) sessions); larger
+/// groups use the bounded view for the author too.
+pub const AUTHOR_FULL: usize = 32;
+/// Views are re-drawn this often.
+const VIEW_EPOCH: Duration = Duration::from_secs(600);
 /// How long shutting down waits for peers to acknowledge the close.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 const ONLINE_WINDOW: Duration = Duration::from_secs(45);
@@ -145,6 +197,15 @@ pub struct NodeOptions {
     /// device. What is queued for the app (up to 1024 events) can hold
     /// that much per event.
     pub max_ephemeral: usize,
+    /// The newest wire version offered and the capabilities advertised, on
+    /// the node protocol and the mesh alike (docs/PROTOCOL.md). Default:
+    /// everything this build speaks.
+    pub protocol: Protocol,
+    /// Speak Sync v2 (default). Off: behave as a build without it (don't
+    /// advertise [`Caps::SYNC_V2`] even if `protocol` lists it, run only v1
+    /// sessions, refuse `SyncV2` streams as an unknown kind, sync every
+    /// member), for mixed groups in tests and v1 baselines.
+    pub sync_v2: bool,
 }
 
 /// Another protocol served on the node's endpoint: incoming connections with
@@ -173,6 +234,8 @@ impl NodeOptions {
             extra_protocols: Vec::new(),
             mesh: None,
             max_ephemeral: MAX_EPHEMERAL,
+            protocol: Protocol::default(),
+            sync_v2: true,
         }
     }
 }
@@ -220,6 +283,9 @@ pub struct PeerState {
     pub via: Option<PathKind>,
     /// When `via` is the mesh: which neighbour it leaves through, how many hops.
     pub mesh: Option<MeshRoute>,
+    /// The wire version and capabilities last agreed with the peer, on a
+    /// connection either side dialed (`None`: none agreed yet).
+    pub protocol: Option<PeerProtocol>,
 }
 
 impl PeerState {
@@ -280,14 +346,88 @@ struct Inner {
     accepted: AtomicU64,
     /// Blob bytes served to fetching members.
     blob_served: AtomicU64,
+    /// Capability hellos answered (one per connection a v2 peer dials).
+    hellos_served: AtomicU64,
+    /// Capability hellos we sent that failed (see [`ConnectionCounts`]).
+    hellos_failed: AtomicU64,
+    /// Tests: refuse this many hellos we're sent, as a lossy path would.
+    #[cfg(test)]
+    drop_hellos: std::sync::atomic::AtomicU32,
     /// The last store-and-forward bundle sent per (member, space).
     bundled: Mutex<HashMap<(SignPk, SpaceId), Hash32>>,
     /// See [`NodeOptions::max_ephemeral`].
     max_ephemeral: usize,
+    /// See [`NodeOptions::protocol`].
+    protocol: Protocol,
     /// Memory for what devices send us: those we share a space with, and
     /// the rest (`resources.rs`).
     member_frames: resources::Frames,
     stranger_frames: resources::Frames,
+    /// See [`NodeOptions::sync_v2`].
+    sync_v2: bool,
+    /// Spaces with a local write since the last periodic round (sessions
+    /// then send the frontier in `Open`, saving a round trip).
+    local_writes: Mutex<HashSet<SpaceId>>,
+    /// Spaces with a local write not yet pushed (the author pushes to more
+    /// members than a forwarder: see [`AUTHOR_FULL`]).
+    dirty_local: Mutex<HashSet<SpaceId>>,
+    v2: sync_v2::V2,
+    /// Periodic anti-entropy schedule per space.
+    periodic: Mutex<HashMap<SpaceId, Backoff>>,
+}
+
+/// Why a sync runs: only some outcomes are signs of loss for the backoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Trigger {
+    /// A local write or forwarded items (event-driven).
+    Change,
+    /// Periodic anti-entropy.
+    Periodic,
+    /// A peer became reachable.
+    Discovery,
+    /// The app asked.
+    Manual,
+}
+
+/// Idle backoff for periodic anti-entropy in one space: the interval starts
+/// at [`PERIODIC_SYNC`] and doubles each round up to [`PERIODIC_MAX`],
+/// unless a sign of loss arrived since the last round, which brings it back
+/// to the start. Rounds are jittered ±20% so devices don't synchronise.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Backoff {
+    interval: Duration,
+    next: Instant,
+    reset: bool,
+}
+
+impl Backoff {
+    /// The first round comes soon (within ~2 s): it also tells the members
+    /// of our view that we chose them, so they push to us (symmetric edges).
+    fn new(now: Instant, jitter: f64) -> Self {
+        Backoff { interval: PERIODIC_SYNC / 2, next: now + (PERIODIC_SYNC / 8).mul_f64(jitter), reset: true }
+    }
+
+    fn due(&self, now: Instant) -> bool {
+        now >= self.next
+    }
+
+    /// A round runs now; `jitter` in [0.8, 1.2].
+    fn round(&mut self, now: Instant, jitter: f64) {
+        self.interval = if self.reset { PERIODIC_SYNC } else { (self.interval * 2).min(PERIODIC_MAX) };
+        self.reset = false;
+        self.next = now + self.interval.mul_f64(jitter);
+    }
+
+    /// A sign of loss: the next round comes within the first interval.
+    fn signal(&mut self, now: Instant) {
+        self.reset = true;
+        self.interval = PERIODIC_SYNC;
+        self.next = self.next.min(now + PERIODIC_SYNC);
+    }
+}
+
+fn jitter() -> f64 {
+    (0.8 + (mycel_crypto::random_u64() % 4001) as f64 / 10_000.0).min(1.2)
 }
 
 /// How many QUIC connections (handshakes) a node has made.
@@ -297,6 +437,10 @@ pub struct ConnectionCounts {
     pub dialed: u64,
     /// Accepted from peers.
     pub accepted: u64,
+    /// Capability hellos we sent on dialed connections that failed (lost
+    /// stream, timeout). Each is tried again later on the same connection,
+    /// a few times; meanwhile that connection has no capabilities.
+    pub hellos_failed: u64,
 }
 
 impl Inner {
@@ -306,6 +450,25 @@ impl Inner {
         if let Some(m) = &self.mesh {
             m.watch(conn);
         }
+    }
+
+    /// Tell the mesh who shares a space with us: relays it prefers
+    /// (`Router::set_affinity`). Members of a space we are in are one step
+    /// away; we don't know other devices' spaces, so everyone else counts as
+    /// unknown. Nothing about it leaves this device. Nothing is built
+    /// unless the mesh uses it ([`MeshOptions::defences`]).
+    fn refresh_affinity(&self) {
+        let Some(mesh) = self.mesh.as_ref().filter(|m| m.uses_affinity()) else { return };
+        let me = self.keys.sign_pk();
+        let near: HashSet<SignPk> = self
+            .spaces
+            .lock()
+            .values()
+            .filter(|r| r.my_role().is_some())
+            .flat_map(|r| r.members().into_iter().map(|(k, _)| k.sign_pk))
+            .filter(|k| *k != me)
+            .collect();
+        mesh.set_affinity(near.into_iter().map(|k| (k, 1)));
     }
 
     fn prepare(&self, r: &mut Replica) {
@@ -421,7 +584,8 @@ impl Inner {
             let shared: Vec<SpaceId> =
                 self.spaces.lock().iter().filter(|(_, r)| r.is_member(&peer)).map(|(s, _)| *s).collect();
             for s in shared {
-                tokio::spawn(sync_once(self.clone(), peer, s));
+                self.loss_signal(s);
+                tokio::spawn(sync_once(self.clone(), peer, s, Trigger::Discovery));
             }
         }
     }
@@ -466,6 +630,28 @@ impl Inner {
         let p = peers.entry(pk).or_default();
         p.failures = p.failures.saturating_add(1);
         p.last_fail = Some(Instant::now());
+    }
+
+    /// Remember what was agreed with `peer` on a connection we dialed
+    /// (diagnostics, and formats sent without a connection:
+    /// store-and-forward). We chose to dial it, so it may get an entry.
+    fn note_protocol(&self, peer: SignPk, p: PeerProtocol) {
+        self.peers.lock().entry(peer).or_default().protocol = Some(p);
+    }
+
+    /// The same, on a connection `peer` dialed: before any exchange, so
+    /// anyone may have dialed (a fresh key costs nothing). Only a device we
+    /// already track or share a space with is noted; a stranger gets no
+    /// entry, which would never be removed. (Its connection still knows its
+    /// version.)
+    fn note_accepted_protocol(&self, peer: SignPk, p: PeerProtocol) {
+        let member = self.spaces.lock().values().any(|r| r.is_member(&peer));
+        let mut peers = self.peers.lock();
+        match peers.get_mut(&peer) {
+            Some(state) => state.protocol = Some(p),
+            None if member => peers.entry(peer).or_default().protocol = Some(p),
+            None => {}
+        }
     }
 
     /// The memory budget for what `peer` sends us on a stream it opened: a
@@ -532,18 +718,134 @@ impl Inner {
     }
 
     /// A bundle for us arrived through carriers: apply it like a sync from
-    /// its (authenticated) source, if that source is a member.
-    fn on_bundle(&self, src: SignPk, payload: &[u8]) {
-        let Ok(DtnPayload { space, data }) = postcard::from_bytes::<DtnPayload>(payload) else { return };
+    /// its (authenticated) source, if that source is a member. A payload
+    /// kind this build doesn't know (a newer sender's) is refused unread;
+    /// it was still delivered (the mesh has sent its receipt), so carriers
+    /// stop carrying it.
+    fn on_bundle(&self, src: SignPk, kind: u16, payload: &[u8]) -> Result<()> {
+        if kind != mesh::dtn::KIND_SPACE_SYNC {
+            return Err(
+                VersionError::Unsupported { what: "bundle payload kind", version: kind.into(), newest: 1 }.into()
+            );
+        }
+        let DtnPayload { space, data } = postcard::from_bytes::<DtnPayload>(payload)?;
         if !self.with_space(&space, |r| r.is_member(&src)).unwrap_or(false) {
-            return;
+            return Ok(());
         }
         self.ingest(&space, src, data, &[]);
+        Ok(())
     }
 
     fn schedule(&self, space: SpaceId) {
         self.dirty.lock().insert(space);
         self.wake.notify_one();
+    }
+
+    /// New items arrived in `space` (from any sync or a bundle): tell the
+    /// app and forward them (epidemic: others may not reach the author). A
+    /// membership change is also a sign of loss for the backoff.
+    fn on_new_items(&self, space: SpaceId, membership: bool) {
+        self.emit(NetEvent::SpaceChanged { space });
+        if membership {
+            self.loss_signal(space);
+        }
+        self.schedule(space);
+    }
+
+    /// Did we write to `space` locally since the last periodic round? Then
+    /// a session sends its frontier in `Open` (saving a round trip) even
+    /// without a record of the peer.
+    fn dirty_since_last(&self, _peer: &SignPk, space: &SpaceId) -> bool {
+        self.local_writes.lock().contains(space)
+    }
+
+    /// We just learned how to reach `peer` (an address hint): a sign of a
+    /// reachability change. Sync the spaces we share with it now, without
+    /// waiting out a failure backoff or the periodic schedule.
+    fn peer_reachable(self: &Arc<Self>, peer: SignPk) {
+        let Ok(rt) = tokio::runtime::Handle::try_current() else { return };
+        let shared: Vec<SpaceId> =
+            self.spaces.lock().iter().filter(|(_, r)| r.is_member(&peer)).map(|(s, _)| *s).collect();
+        if shared.is_empty() {
+            return;
+        }
+        if let Some(p) = self.peers.lock().get_mut(&peer) {
+            p.failures = 0;
+        }
+        for s in shared {
+            self.loss_signal(s);
+            rt.spawn(sync_once(self.clone(), peer, s, Trigger::Discovery));
+        }
+    }
+
+    /// See [`Backoff::signal`].
+    fn loss_signal(&self, space: SpaceId) {
+        let now = Instant::now();
+        let mut periodic = self.periodic.lock();
+        periodic.entry(space).or_insert_with(|| Backoff::new(now, jitter())).signal(now);
+        drop(periodic);
+        self.wake.notify_one();
+    }
+
+    /// Who to sync `space` with after a change or in a periodic round
+    /// (excluding us): every member in small groups and on builds without
+    /// v2; otherwise the bounded view (see the crate docs).
+    fn targets(&self, space: &SpaceId, r: &Replica, peers: &HashMap<SignPk, PeerState>, local: bool) -> Vec<SignPk> {
+        let me = self.keys.sign_pk();
+        let members: Vec<SignPk> = r.members().into_iter().map(|(k, _)| k.sign_pk).filter(|pk| *pk != me).collect();
+        let full = if local { AUTHOR_FULL } else { FULL_MESH };
+        if !self.sync_v2 || members.len() <= full {
+            return members;
+        }
+        let epoch = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() / VIEW_EPOCH.as_secs());
+        let score =
+            |p: &SignPk| Hash32::digest("mycel/v2/view", &[&space.0[..], &me.0, &p.0, &epoch.to_le_bytes()].concat());
+        let mut ranked: Vec<(Hash32, SignPk)> = members.iter().map(|p| (score(p), *p)).collect();
+        ranked.sort();
+        let mut out: Vec<SignPk> = ranked
+            .iter()
+            .filter(|(_, p)| peers.get(p).is_some_and(PeerState::is_directly_discovered))
+            .take(VIEW_NEARBY)
+            .map(|(_, p)| *p)
+            .collect();
+        // Random edges (by rendezvous hash over the whole member list, so
+        // physical clusters can't split the overlay), preferring members
+        // with recent evidence of reachability: one that fails drops a
+        // tier and the next by rank takes its place (HyParView's active
+        // view), so offline picks can't cut a device off for an epoch.
+        let tier = |p: &SignPk| match peers.get(p) {
+            Some(s) if s.backing_off() => 2,
+            Some(s) if s.online() => 0,
+            _ => 1,
+        };
+        let random = pick_ranked(&ranked, &out, VIEW_RANDOM, tier);
+        out.extend(random);
+        for p in self.v2.inbound(space, VIEW_INBOUND) {
+            if members.contains(&p) && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        // Members on builds without v2 still re-sync epidemically with
+        // everyone; only the two members nearest each of them by
+        // rendezvous hash push to it, so they hear of changes once.
+        for v in self.v2.v1_only_peers() {
+            if out.contains(&v) || !members.contains(&v) {
+                continue;
+            }
+            let mut by: Vec<(Hash32, SignPk)> = members
+                .iter()
+                .chain(std::iter::once(&me))
+                .filter(|m| **m != v)
+                .map(|m| (Hash32::digest("mycel/v2/v1-designated", &[&space.0[..], &v.0, &m.0].concat()), *m))
+                .collect();
+            by.sort();
+            if by.iter().take(2).any(|(_, m)| *m == me) {
+                out.push(v);
+            }
+        }
+        out
     }
 
     /// Blobs are stored per space: a member of one space can't fetch or fill
@@ -567,9 +869,7 @@ impl Inner {
             res
         };
         if res.changed() {
-            self.emit(NetEvent::SpaceChanged { space: *space });
-            // Epidemic forwarding: others may not be reachable by the author.
-            self.schedule(*space);
+            self.on_new_items(*space, res.ops > 0);
         } else if !sent.is_empty() {
             // delivery status changed
             self.emit(NetEvent::SpaceChanged { space: *space });
@@ -662,56 +962,97 @@ async fn serve_conn(inner: &Arc<Inner>, conn: Connection) {
     inner.accepted.fetch_add(1, Ordering::Relaxed);
     inner.watch(&conn);
     let peer = to_sign_pk(&conn.remote_id());
+    // (the router only hands us connections with one of our ALPNs)
+    let Some(version) = wire::version_of(conn.alpn()) else { return };
+    if version < WIRE_V2 {
+        inner.note_accepted_protocol(peer, PeerProtocol::baseline(version));
+    }
     loop {
         tokio::select! {
             bi = conn.accept_bi() => {
                 let Ok((tx, rx)) = bi else { break };
                 let (inner, conn) = (inner.clone(), conn.clone());
                 tokio::spawn(async move {
-                    let _ = serve_bi(&inner, &conn, peer, tx, rx).await;
+                    let _ = serve_bi(&inner, &conn, version, peer, tx, rx).await;
                 });
             }
             uni = conn.accept_uni() => {
                 let Ok(rx) = uni else { break };
                 let inner = inner.clone();
                 tokio::spawn(async move {
-                    let _ = serve_uni(&inner, peer, rx).await;
+                    let _ = serve_uni(&inner, version, peer, rx).await;
                 });
             }
         }
     }
 }
 
-async fn stream_kind(rx: &mut RecvStream) -> Result<StreamKind> {
+/// The kind byte a stream starts with. One this wire `version` doesn't
+/// have is refused at once: both directions are stopped with
+/// [`STREAM_REFUSED`], so the opener (an older or newer build) learns it
+/// in one round trip instead of waiting for an answer that never comes.
+async fn stream_kind(version: WireVersion, tx: Option<&mut SendStream>, rx: &mut RecvStream) -> Result<StreamKind> {
     let mut b = [0u8; 1];
     resources::first(rx.read_exact(&mut b)).await?;
-    StreamKind::from_byte(b[0]).ok_or_else(|| anyhow!("unknown stream kind {}", b[0]))
+    StreamKind::on(version, b[0]).ok_or_else(|| {
+        let code = iroh::endpoint::VarInt::from_u32(STREAM_REFUSED);
+        rx.stop(code).ok();
+        if let Some(tx) = tx {
+            tx.reset(code).ok();
+        }
+        VersionError::UnknownStreamKind(b[0]).into()
+    })
 }
 
 async fn serve_bi(
     inner: &Arc<Inner>,
     conn: &Connection,
+    version: WireVersion,
     peer: SignPk,
-    tx: SendStream,
+    mut tx: SendStream,
     mut rx: RecvStream,
 ) -> Result<()> {
-    let kind = stream_kind(&mut rx).await?;
+    let kind = stream_kind(version, Some(&mut tx), &mut rx).await?;
     tx.set_priority(kind.priority()).ok();
     match kind {
         // No total deadline: over a slow link a large sync takes minutes,
         // and each wait inside is bounded while bytes keep moving.
         StreamKind::Sync => serve_sync(inner, conn, peer, tx, rx).await,
+        StreamKind::SyncV2 => sync_v2::serve(inner, conn, peer, tx, rx).await,
         StreamKind::Card => serve_card(inner, tx).await,
         StreamKind::Blob => blobs::serve(inner, peer, tx, rx).await,
+        StreamKind::Hello => serve_hello(inner, version, peer, tx, rx).await,
         StreamKind::Ephemeral => bail!("ephemeral messages use uni-streams"),
     }
 }
 
-async fn serve_uni(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) -> Result<()> {
-    match stream_kind(&mut rx).await? {
+async fn serve_uni(inner: &Arc<Inner>, version: WireVersion, peer: SignPk, mut rx: RecvStream) -> Result<()> {
+    match stream_kind(version, None, &mut rx).await? {
         StreamKind::Ephemeral => serve_eph(inner, peer, rx).await,
         other => bail!("{other:?} needs a bi-stream"),
     }
+}
+
+/// A dialer's capability hello: answer with ours. (Anyone may send one:
+/// capabilities are public, and both hellos are a few bytes.)
+async fn serve_hello(
+    inner: &Arc<Inner>,
+    version: WireVersion,
+    peer: SignPk,
+    mut tx: SendStream,
+    mut rx: RecvStream,
+) -> Result<()> {
+    let theirs = recv_hello(&mut rx, resources::FIRST_FRAME, &inner.frames(&peer)).await?;
+    #[cfg(test)]
+    if inner.drop_hellos.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+        tx.reset(0u32.into()).ok();
+        bail!("test: hello dropped");
+    }
+    inner.hellos_served.fetch_add(1, Ordering::Relaxed);
+    inner.note_accepted_protocol(peer, PeerProtocol::agreed(version, inner.protocol.caps, theirs.caps));
+    send(&mut tx, &Hello::ours(inner.protocol.caps)).await?;
+    tx.finish()?;
+    Ok(())
 }
 
 async fn serve_sync(
@@ -855,15 +1196,19 @@ async fn serve_eph(inner: &Arc<Inner>, peer: SignPk, mut rx: RecvStream) -> Resu
 
 // ─────────────────────────────── client side ───────────────────────────────
 
-/// A fresh connection for another protocol ([`Node::connect`]).
-async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpn: &[u8]) -> Result<Connection> {
+/// A fresh connection for another protocol ([`Node::connect_offering`]):
+/// `alpns` newest first, the peer picks one.
+async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpns: &[&[u8]]) -> Result<Connection> {
     let addr = inner.addr_of(peer)?;
-    match tokio::time::timeout(CONNECT_TIMEOUT, inner.endpoint.connect(addr, alpn)).await {
+    let (first, rest) = alpns.split_first().ok_or_else(|| anyhow!("no protocol to offer"))?;
+    let options = ConnectOptions::new().with_additional_alpns(rest.iter().map(|a| a.to_vec()).collect());
+    let connect = async { anyhow::Ok(inner.endpoint.connect_with_opts(addr, first, options).await?.await?) };
+    match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(c)) => {
             inner.watch(&c);
             Ok(c)
         }
-        Ok(Err(e)) => Err(e.into()),
+        Ok(Err(e)) => Err(e),
         Err(_) => Err(anyhow!("connect timed out")),
     }
 }
@@ -873,7 +1218,46 @@ async fn connect(inner: &Arc<Inner>, peer: &SignPk, alpn: &[u8]) -> Result<Conne
 pub(crate) async fn pooled(inner: &Arc<Inner>, peer: &SignPk) -> Result<PooledConn> {
     let c = inner.pool.get(peer).await?;
     inner.watch(&c);
+    if c.claim_hello() {
+        start_hello(inner, *peer, &c);
+    }
     Ok(c)
+}
+
+/// A connection we just dialed (or whose last hello failed a while ago:
+/// [`PooledConn::claim_hello`]): agree on capabilities, beside whatever
+/// exchange it was dialed for (nothing waits for this unless it needs a
+/// capability: [`PooledConn::protocol`]). Version 1 has no hello.
+fn start_hello(inner: &Arc<Inner>, peer: SignPk, c: &PooledConn) {
+    let version = c.version();
+    if version < WIRE_V2 {
+        let p = PeerProtocol::baseline(version);
+        c.set_protocol(p);
+        inner.note_protocol(peer, p);
+        return;
+    }
+    let (inner, conn) = (inner.clone(), c.share());
+    tokio::spawn(async move {
+        let caps = inner.protocol.caps;
+        let hello = async {
+            let (mut tx, mut rx) = open_bi(&conn, StreamKind::Hello).await?;
+            let len = send_len(&mut tx, &Hello::ours(caps)).await?;
+            tx.finish()?;
+            recv_hello(&mut rx, resources::reply_timeout(len), &inner.reply_frames(&peer)).await
+        };
+        match hello.await {
+            Ok(theirs) => {
+                let p = PeerProtocol::agreed(version, caps, theirs.caps);
+                conn.set_protocol(p);
+                inner.note_protocol(peer, p);
+            }
+            // (no capabilities until a later try succeeds)
+            Err(_) => {
+                inner.hellos_failed.fetch_add(1, Ordering::Relaxed);
+                conn.hello_failed(PeerProtocol::baseline(version));
+            }
+        }
+    });
 }
 
 /// Run one exchange (`$body`, a future using `$conn`) on the pooled
@@ -904,17 +1288,38 @@ pub(crate) use on_conn;
 /// Open a bi-stream of `kind` (labelled and prioritised). Waits while the
 /// peer already has as many of our streams open as it allows.
 pub(crate) async fn open_bi(conn: &Connection, kind: StreamKind) -> Result<(SendStream, RecvStream)> {
+    open_bi_raw(conn, kind as u8, kind.priority()).await
+}
+
+/// [`open_bi`] with any kind byte (tests: kinds a peer doesn't know).
+pub(crate) async fn open_bi_raw(conn: &Connection, kind: u8, priority: i32) -> Result<(SendStream, RecvStream)> {
     let (mut tx, rx) = resources::within(resources::REPLY_TIMEOUT, "no stream", conn.open_bi()).await?;
-    tx.set_priority(kind.priority()).ok();
-    tx.write_all(&[kind as u8]).await?;
+    tx.set_priority(priority).ok();
+    tx.write_all(&[kind]).await.map_err(|e| version::refusal(e.into()))?;
     Ok((tx, rx))
 }
 
 async fn sync_session(inner: &Arc<Inner>, peer: SignPk, space: SpaceId, trust_peer: bool) -> Result<SyncStats> {
+    if inner.sync_v2 && !inner.v2.is_v1_only(&peer) && peer_has_sync_v2(inner, peer).await? {
+        let eager = inner.dirty_since_last(&peer, &space);
+        if let Some(stats) = sync_v2::sync(inner, peer, space, trust_peer, eager).await? {
+            return Ok(stats);
+        }
+        // The peer doesn't speak v2 (remembered): v1 below.
+    }
     let hello =
         inner.with_space(&space, |r| (trust_peer || r.is_member(&peer)).then(|| (inventory(r), r.all_ops())))?;
     let (inv, ops) = hello.ok_or_else(|| anyhow!("peer is not a member of this space"))?;
     on_conn!(inner, &peer, |conn| sync_exchange(inner, &conn, peer, space, inv.clone(), ops.clone()))
+}
+
+/// Whether `peer`'s hello agreed [`Caps::SYNC_V2`] on the pooled connection
+/// (dialed if there is none). On a new connection this waits for its hello,
+/// sent as soon as it was dialed, so normally one round trip; a peer on
+/// wire version 1, or whose hello failed or is late, gets v1 this time.
+async fn peer_has_sync_v2(inner: &Arc<Inner>, peer: SignPk) -> Result<bool> {
+    let conn = pooled(inner, &peer).await?;
+    Ok(conn.protocol(resources::REPLY_TIMEOUT).await.supports(Caps::SYNC_V2))
 }
 
 /// One sync session on its own stream of `conn`.
@@ -971,7 +1376,7 @@ async fn sync_exchange(
     Ok(inner.ingest(&space, peer, data, &sent))
 }
 
-async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
+async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId, trigger: Trigger) {
     {
         let mut inflight = inner.inflight.lock();
         if let Some(again) = inflight.get_mut(&(peer, space)) {
@@ -982,6 +1387,7 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
         inflight.insert((peer, space), false);
     }
     let _slot = inner.sync_slots.acquire().await;
+    let mut busy_retries = 0;
     loop {
         // No total deadline (a large sync over Bluetooth takes minutes):
         // every wait inside is bounded, and a dead connection fails it.
@@ -994,9 +1400,34 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
                 session.await
             }
         };
+        // `Busy`: the peer is syncing this space with us already, or over
+        // its limits. Not a failure: no backoff, no bundle. A crossing
+        // session carries our set only as of its start, so try again a few
+        // times even without a new change (cheap: an idle check or what came
+        // after, once the crossing session has ended).
+        if let Err(e) = &res
+            && let Some(busy) = e.downcast_ref::<sync_v2::PeerBusy>()
+        {
+            let retry = busy.retry_after();
+            if busy_retries < BUSY_RETRIES {
+                busy_retries += 1;
+                if let Some(a) = inner.inflight.lock().get_mut(&(peer, space)) {
+                    *a = false;
+                }
+                tokio::time::sleep(retry).await;
+                continue;
+            }
+            inner.inflight.lock().remove(&(peer, space));
+            return;
+        }
         let ok = res.is_ok();
-        if ok {
+        if let Ok(stats) = &res {
             inner.mark_ok(peer);
+            // A periodic session that found something means pushes are
+            // being missed: back to the short interval.
+            if trigger == Trigger::Periodic && sync_v2::moved(stats) {
+                inner.loss_signal(space);
+            }
         } else {
             inner.mark_fail(peer);
             inner.offer_bundle(peer, space);
@@ -1012,39 +1443,62 @@ async fn sync_once(inner: Arc<Inner>, peer: SignPk, space: SpaceId) {
     }
 }
 
-/// Push dirty spaces to their members; periodically sync everything.
+/// Push dirty spaces to their members (or the bounded view); run periodic
+/// anti-entropy per space on its backoff schedule.
 async fn scheduler(inner: Arc<Inner>) {
-    let mut last_full = Instant::now();
     loop {
+        let wait = {
+            let now = Instant::now();
+            let periodic = inner.periodic.lock();
+            periodic.values().map(|b| b.next.saturating_duration_since(now)).min().unwrap_or(PERIODIC_SYNC)
+        };
         tokio::select! {
             _ = inner.wake.notified() => {}
-            _ = tokio::time::sleep(PERIODIC_SYNC) => {}
+            _ = tokio::time::sleep(wait.max(DEBOUNCE)) => {}
         }
         tokio::time::sleep(DEBOUNCE).await;
-        let periodic = last_full.elapsed() >= PERIODIC_SYNC;
+        // membership may have changed (ours or another member's ops)
+        inner.refresh_affinity();
         let explicit: HashSet<SpaceId> = std::mem::take(&mut *inner.dirty.lock());
-        let mut dirty = explicit.clone();
-        if periodic {
-            last_full = Instant::now();
-            dirty.extend(inner.spaces.lock().keys().copied());
-        }
-        let me = inner.keys.sign_pk();
-        let targets: Vec<(SignPk, SpaceId)> = {
-            let spaces = inner.spaces.lock();
-            let peers = inner.peers.lock();
-            dirty
-                .iter()
-                .filter_map(|s| spaces.get(s).map(|r| (s, r)))
-                // No longer a member: only push explicit local changes (e.g. our
-                // own Leave op); periodic syncs would just be refused.
-                .filter(|(s, r)| explicit.contains(*s) || r.my_role().is_some())
-                .flat_map(|(s, r)| r.members().into_iter().map(move |(k, _)| (k.sign_pk, *s)).collect::<Vec<_>>())
-                .filter(|(pk, _)| *pk != me)
-                .filter(|(pk, _)| !peers.get(pk).is_some_and(|p| p.backing_off() && !p.nearby))
+        let local: HashSet<SpaceId> = std::mem::take(&mut *inner.dirty_local.lock());
+        let now = Instant::now();
+        let due: HashSet<SpaceId> = {
+            let spaces: Vec<SpaceId> = inner.spaces.lock().keys().copied().collect();
+            let mut periodic = inner.periodic.lock();
+            periodic.retain(|s, _| spaces.contains(s));
+            spaces
+                .into_iter()
+                .filter(|s| {
+                    let b = periodic.entry(*s).or_insert_with(|| Backoff::new(now, jitter()));
+                    let due = b.due(now);
+                    if due {
+                        b.round(now, jitter());
+                        inner.local_writes.lock().remove(s);
+                    }
+                    due
+                })
                 .collect()
         };
-        for (peer, space) in targets {
-            tokio::spawn(sync_once(inner.clone(), peer, space));
+        let targets: Vec<(SignPk, SpaceId, Trigger)> = {
+            let spaces = inner.spaces.lock();
+            let peers = inner.peers.lock();
+            explicit
+                .iter()
+                .map(|s| (*s, Trigger::Change))
+                .chain(due.iter().filter(|s| !explicit.contains(*s)).map(|s| (*s, Trigger::Periodic)))
+                .filter_map(|(s, t)| spaces.get(&s).map(|r| (s, t, r)))
+                // No longer a member: only push explicit local changes (e.g. our
+                // own Leave op); periodic syncs would just be refused.
+                .filter(|(s, _, r)| explicit.contains(s) || r.my_role().is_some())
+                .flat_map(|(s, t, r)| {
+                    let local = t == Trigger::Change && local.contains(&s);
+                    inner.targets(&s, r, &peers, local).into_iter().map(move |pk| (pk, s, t)).collect::<Vec<_>>()
+                })
+                .filter(|(pk, _, _)| !peers.get(pk).is_some_and(|p| p.backing_off() && !p.nearby))
+                .collect()
+        };
+        for (peer, space, trigger) in targets {
+            tokio::spawn(sync_once(inner.clone(), peer, space, trigger));
         }
     }
 }
@@ -1086,7 +1540,8 @@ fn on_lan_discovery(inner: &Arc<Inner>, source: &'static str, ev: DiscoveryEvent
                 let shared: Vec<SpaceId> =
                     inner.spaces.lock().iter().filter(|(_, r)| r.is_member(&pk)).map(|(s, _)| *s).collect();
                 for s in shared {
-                    tokio::spawn(sync_once(inner.clone(), pk, s));
+                    inner.loss_signal(s);
+                    tokio::spawn(sync_once(inner.clone(), pk, s, Trigger::Discovery));
                 }
             }
         }
@@ -1157,12 +1612,19 @@ impl Node {
         // Same Ed25519 key for transport and for Mycel signatures (domain-separated).
         let secret = SecretKey::from_bytes(&keys.seed());
         let memory = MemoryLookup::new();
-        let mut alpns: Vec<Vec<u8>> = vec![ALPN.to_vec()];
+        // Every wire version we speak, newest (preferred) first: a peer
+        // that only speaks an older one still gets that one.
+        let node_alpns = wire::alpns(opts.protocol.version);
+        let mesh_alpns = mesh::alpns(opts.protocol.version);
+        let mut alpns: Vec<Vec<u8>> = node_alpns.iter().map(|a| a.to_vec()).collect();
         alpns.extend(opts.extra_protocols.iter().map(|p| p.alpn.clone()));
-        let mesh = opts.mesh.clone().map(|o| Mesh::new(keys.clone(), &opts.name, o));
+        let mesh = opts.mesh.clone().map(|o| {
+            let o = MeshOptions { protocol: opts.protocol, ..o };
+            Mesh::new(keys.clone(), &opts.name, o)
+        });
         let mut links = opts.links;
         if let Some(m) = &mesh {
-            alpns.push(mesh::ALPN.to_vec());
+            alpns.extend(mesh_alpns.iter().map(|a| a.to_vec()));
             links.push(Arc::new(m.clone()));
         }
         let builder = match opts.mode {
@@ -1237,7 +1699,7 @@ impl Node {
             None
         };
         let (events, _) = broadcast::channel(1024);
-        let pool = Pool::new(endpoint.clone());
+        let pool = Pool::new(endpoint.clone(), opts.protocol.version);
         let inner = Arc::new(Inner {
             keys,
             mode: opts.mode,
@@ -1265,17 +1727,38 @@ impl Node {
             pool,
             accepted: AtomicU64::new(0),
             blob_served: AtomicU64::new(0),
+            hellos_served: AtomicU64::new(0),
+            hellos_failed: AtomicU64::new(0),
+            #[cfg(test)]
+            drop_hellos: Default::default(),
             bundled: Mutex::default(),
             max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
+            // (a node without Sync v2 doesn't advertise it)
+            protocol: if opts.sync_v2 {
+                opts.protocol
+            } else {
+                Protocol { caps: opts.protocol.caps.difference(Caps::SYNC_V2), ..opts.protocol }
+            },
             member_frames: resources::Frames::members(),
             stranger_frames: resources::Frames::strangers(),
+            sync_v2: opts.sync_v2,
+            local_writes: Mutex::default(),
+            dirty_local: Mutex::default(),
+            v2: sync_v2::V2::default(),
+            periodic: Mutex::default(),
         });
-        let mut router = Router::builder(endpoint).accept(ALPN, Handler { inner: inner.clone() });
+        // (the router's order is the listener's preference: newest first)
+        let mut router = Router::builder(endpoint);
+        for alpn in node_alpns {
+            router = router.accept(alpn, Handler { inner: inner.clone() });
+        }
         for p in opts.extra_protocols {
             router = router.accept(p.alpn, Forward(p.incoming));
         }
         if let Some(m) = &mesh {
-            router = router.accept(mesh::ALPN, m.protocol());
+            for alpn in mesh_alpns {
+                router = router.accept(alpn, m.protocol());
+            }
         }
         let router = router.spawn();
         let mut tasks = vec![tokio::spawn(scheduler(inner.clone()))];
@@ -1301,12 +1784,12 @@ impl Node {
             tasks.push(tokio::spawn(watch_mdns(inner.clone(), mdns)));
         }
         if let Some(m) = &inner.mesh {
-            let (tx, mut rx) = mpsc::unbounded_channel::<(SignPk, bytes::Bytes)>();
+            let (tx, mut rx) = mpsc::unbounded_channel::<(SignPk, u16, bytes::Bytes)>();
             m.set_bundle_sink(tx);
             let inner = inner.clone();
             tasks.push(tokio::spawn(async move {
-                while let Some((src, payload)) = rx.recv().await {
-                    inner.on_bundle(src, &payload);
+                while let Some((src, kind, payload)) = rx.recv().await {
+                    let _ = inner.on_bundle(src, kind, &payload);
                 }
             }));
         }
@@ -1371,12 +1854,15 @@ impl Node {
                 a = a.with_ip_addr(*x);
             }
             self.inner.memory.add_endpoint_info(a);
+            self.inner.peer_reachable(peer);
         }
     }
 
     /// Tell the node how to reach a peer directly (tests / manual pairing).
     pub fn add_peer_addr(&self, addr: EndpointAddr) {
+        let peer = to_sign_pk(&addr.id);
         self.inner.memory.add_endpoint_info(addr);
+        self.inner.peer_reachable(peer);
     }
 
     /// The mesh router, if this node relays.
@@ -1416,6 +1902,7 @@ impl Node {
         self.inner.prepare(&mut r);
         let id = r.space_id();
         self.inner.spaces.lock().insert(id, r);
+        self.inner.refresh_affinity();
         Ok((id, genesis))
     }
 
@@ -1424,6 +1911,7 @@ impl Node {
         self.inner.prepare(&mut r);
         let id = r.space_id();
         self.inner.spaces.lock().entry(id).or_insert(r);
+        self.inner.refresh_affinity();
         Ok(id)
     }
 
@@ -1432,6 +1920,7 @@ impl Node {
         self.inner.prepare(&mut r);
         let id = r.space_id();
         self.inner.spaces.lock().insert(id, r);
+        self.inner.refresh_affinity();
         id
     }
 
@@ -1447,20 +1936,48 @@ impl Node {
     /// Local change happened: push to members soon and notify the app.
     pub fn changed(&self, space: SpaceId) {
         self.inner.emit(NetEvent::SpaceChanged { space });
+        self.inner.local_writes.lock().insert(space);
+        self.inner.dirty_local.lock().insert(space);
+        self.inner.loss_signal(space);
         self.inner.schedule(space);
+    }
+
+    /// Sync v2 counters (sessions, fallbacks, bytes): for tests and the
+    /// Network panel.
+    pub fn sync_v2_totals(&self) -> V2Totals {
+        self.inner.v2.totals()
     }
 
     /// One full bidirectional sync of `space` with `peer`, now.
     ///
     /// `trust_peer` lets a freshly-invited device sync with its inviter before
     /// it has learned (via that very sync) that the inviter is a member.
+    ///
+    /// A peer that is syncing this space with us already (it opened to us at
+    /// the same moment) or is over its session limits answers `Busy`: not a
+    /// failure. This waits and runs its own session then (cheap once the
+    /// crossing one has ended), for up to [`EXPLICIT_BUSY_WAIT`].
     pub async fn sync_with(&self, peer: SignPk, space: SpaceId, trust_peer: bool) -> Result<SyncStats> {
-        let res = sync_session(&self.inner, peer, space, trust_peer).await;
-        match &res {
-            Ok(_) => self.inner.mark_ok(peer),
-            Err(_) => self.inner.mark_fail(peer),
+        let deadline = Instant::now() + EXPLICIT_BUSY_WAIT;
+        loop {
+            let res = sync_session(&self.inner, peer, space, trust_peer).await;
+            if let Err(e) = &res
+                && let Some(busy) = e.downcast_ref::<sync_v2::PeerBusy>()
+            {
+                let retry = busy.retry_after();
+                if Instant::now() + retry < deadline {
+                    tokio::time::sleep(retry).await;
+                    continue;
+                }
+                // (no backoff: the peer is up)
+                return res;
+            }
+            match &res {
+                Ok(_) => self.inner.mark_ok(peer),
+                Err(_) => self.inner.mark_fail(peer),
+            }
+            return res;
         }
-        res
     }
 
     /// Sync `space` with every member now and wait (best effort).
@@ -1470,16 +1987,74 @@ impl Node {
             self.with_space(&space, |r| r.members().into_iter().map(|(k, _)| k.sign_pk).collect()).unwrap_or_default();
         let mut set = tokio::task::JoinSet::new();
         for pk in members.into_iter().filter(|p| *p != me) {
-            set.spawn(sync_once(self.inner.clone(), pk, space));
+            set.spawn(sync_once(self.inner.clone(), pk, space, Trigger::Manual));
         }
         while set.join_next().await.is_some() {}
+    }
+
+    /// Sync every space with every member now, all at once, and wait (best
+    /// effort): a phone's background catch-up and pull-to-refresh.
+    ///
+    /// Every (space, member) sync starts together and the node's sync slots
+    /// bound how many run, so a member who is asleep holds up only its own
+    /// syncs, and each unreachable peer costs one connect timeout in all
+    /// (the pool shares a failed dial with every sync waiting for it).
+    /// Keepers and peers that are reachable right now go first; peers in
+    /// failure backoff that aren't nearby are skipped, as the scheduler
+    /// skips them.
+    pub async fn sync_everything(&self) {
+        let inner = &self.inner;
+        let me = self.id();
+        let mut targets: Vec<(u8, SignPk, SpaceId)> = {
+            let spaces = inner.spaces.lock();
+            let peers = inner.peers.lock();
+            spaces
+                .iter()
+                .filter(|(_, r)| r.my_role().is_some())
+                .flat_map(|(s, r)| r.members().into_iter().map(move |(k, role)| (k.sign_pk, role, *s)))
+                .filter(|(pk, _, _)| *pk != me)
+                .filter_map(|(pk, role, s)| {
+                    let p = peers.get(&pk);
+                    if p.is_some_and(|p| p.backing_off() && !p.nearby) {
+                        return None;
+                    }
+                    let keeper = role == Role::Relay;
+                    let reachable = p.is_some_and(PeerState::online);
+                    Some((u8::from(!keeper) + u8::from(!reachable), pk, s))
+                })
+                .collect()
+        };
+        targets.sort_by_key(|(rank, _, _)| *rank);
+        let mut set = tokio::task::JoinSet::new();
+        for (_, pk, space) in targets {
+            set.spawn(sync_once(inner.clone(), pk, space, Trigger::Manual));
+        }
+        while set.join_next().await.is_some() {}
+    }
+
+    /// Restrict every link to `peers` (`Some`: a phone's app went to the
+    /// background, so a radio that would otherwise link with any device in
+    /// range links only with these), or lift the restriction (`None`).
+    /// See [`Link::restrict_to`].
+    pub fn restrict_links(&self, peers: Option<&[SignPk]>) {
+        for l in &self.inner.links {
+            l.restrict_to(peers);
+        }
     }
 
     /// Open a connection to a device for another protocol (see
     /// [`ExtraProtocol`]): dialed by key over every path the node knows
     /// (network, links, relay), with multipath failover.
     pub async fn connect(&self, peer: SignPk, alpn: &[u8]) -> Result<Connection> {
-        let res = connect(&self.inner, &peer, alpn).await;
+        self.connect_offering(peer, &[alpn]).await
+    }
+
+    /// [`Node::connect`] offering several versions of a protocol, newest
+    /// (preferred) first: the peer's TLS picks the first of its own it was
+    /// offered, which `Connection::alpn` then names. That is how a protocol
+    /// served beside the node's gets versions too (docs/PROTOCOL.md §1).
+    pub async fn connect_offering(&self, peer: SignPk, alpns: &[&[u8]]) -> Result<Connection> {
+        let res = connect(&self.inner, &peer, alpns).await;
         match &res {
             Ok(c) => {
                 self.inner.note_path(peer, c);
@@ -1490,11 +2065,26 @@ impl Node {
         res
     }
 
+    /// What this node offers: its newest wire version and its capabilities.
+    pub fn protocol(&self) -> Protocol {
+        self.inner.protocol
+    }
+
+    /// The wire version and capabilities agreed with `peer`: on the pooled
+    /// connection, dialed if there is none, after its hello (one round trip
+    /// on a new connection; nothing on one already agreed). A capability is
+    /// used with a peer only if [`PeerProtocol::supports`] it.
+    pub async fn negotiate(&self, peer: SignPk) -> Result<PeerProtocol> {
+        let conn = pooled(&self.inner, &peer).await?;
+        Ok(conn.protocol(resources::REPLY_TIMEOUT).await)
+    }
+
     /// QUIC connections (handshakes) this node has dialed and accepted.
     pub fn connection_counts(&self) -> ConnectionCounts {
         ConnectionCounts {
             dialed: self.inner.pool.dialed.load(Ordering::Relaxed),
             accepted: self.inner.accepted.load(Ordering::Relaxed),
+            hellos_failed: self.inner.hellos_failed.load(Ordering::Relaxed),
         }
     }
 
@@ -1588,6 +2178,35 @@ impl Node {
 mod discovery_tests {
     use super::*;
     use link::{CustomAddr, TRANSPORT_BLUETOOTH, TRANSPORT_MESH, TRANSPORT_PEER_WIFI};
+
+    #[test]
+    fn periodic_backoff_doubles_to_its_cap_and_resets_on_loss() {
+        let t0 = Instant::now();
+        let mut b = Backoff::new(t0, 1.0);
+        assert!(b.next - t0 <= Duration::from_secs(2), "the first round comes soon");
+        let mut now = b.next;
+        b.round(now, 1.0);
+        assert_eq!(b.interval, PERIODIC_SYNC);
+        let mut seen = Vec::new();
+        for _ in 0..8 {
+            now = b.next;
+            b.round(now, 1.0);
+            seen.push(b.interval.as_secs());
+        }
+        assert_eq!(seen, [30, 60, 120, 240, 480, 600, 600, 600]);
+        // A sign of loss: the next round is within the first interval, and
+        // the schedule starts over.
+        let mid = now + Duration::from_secs(100);
+        b.signal(mid);
+        assert!(b.next <= mid + PERIODIC_SYNC);
+        b.round(b.next, 1.0);
+        assert_eq!(b.interval, PERIODIC_SYNC);
+        b.round(b.next, 1.0);
+        assert_eq!(b.interval, PERIODIC_SYNC * 2);
+        for _ in 0..1000 {
+            assert!((0.8..=1.2).contains(&jitter()));
+        }
+    }
 
     #[test]
     fn direct_discovery_excludes_mesh_and_recent_exchanges() {
@@ -1694,6 +2313,297 @@ mod discovery_tests {
 }
 
 #[cfg(test)]
+mod version_tests {
+    use super::*;
+    use version::{WIRE_V1, WIRE_V2};
+
+    async fn node(name: &str, protocol: Protocol) -> Node {
+        let mut opts = NodeOptions::new(NetMode::Local, name);
+        opts.protocol = protocol;
+        Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap()
+    }
+
+    /// Two current devices agree on version 2 and on exactly the
+    /// capabilities both have; bits one of them doesn't know are ignored.
+    #[tokio::test]
+    async fn current_devices_negotiate_version_2_and_common_capabilities() {
+        let future = Caps::from_bits(1 << 40);
+        let a = node("a", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 | Caps::ROUTE_ATTEST | future }).await;
+        let b = node("b", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        // (b notes what a dialer agreed only for a device it shares a space with)
+        let (space, _) = b.create_space().unwrap();
+        b.with_space(&space, |r| r.add_member(a.keys().public(), Role::Writer)).unwrap().unwrap();
+        a.add_peer_addr(b.addr());
+        let p = a.negotiate(b.id()).await.unwrap();
+        assert_eq!((p.version, p.caps), (WIRE_V2, Caps::SYNC_V2));
+        assert!(p.supports(Caps::SYNC_V2) && !p.supports(Caps::ROUTE_ATTEST));
+        assert_eq!(a.peers()[&b.id()].protocol, Some(p));
+        // b agreed the same from a's hello, and set a's unknown bit aside
+        let q = b.peers()[&a.id()].protocol.expect("b took a's hello");
+        assert_eq!((q.version, q.caps), (WIRE_V2, Caps::SYNC_V2));
+        assert!(q.advertised.contains(future) && q.advertised.contains(Caps::ROUTE_ATTEST));
+        // agreed once per connection: asking again sends nothing
+        assert_eq!(a.negotiate(b.id()).await.unwrap(), p);
+        assert_eq!(a.connection_counts().dialed, 1);
+        assert_eq!(b.inner.hellos_served.load(Ordering::Relaxed), 1, "one hello for the connection");
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    /// A hello lost on the way (as on a flaky Bluetooth or multi-hop path)
+    /// doesn't cost the connection its capabilities for good: it is
+    /// counted, the connection has none for now, and a later use of the
+    /// same connection tries again and agrees them. Tries are bounded.
+    #[tokio::test]
+    async fn a_failed_hello_is_retried_on_the_same_connection() {
+        let a = node("a", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        let b = node("b", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        a.add_peer_addr(b.addr());
+        b.inner.drop_hellos.store(1, Ordering::SeqCst);
+        let p = a.negotiate(b.id()).await.unwrap();
+        assert_eq!((p.version, p.caps), (WIRE_V2, Caps::NONE), "no capabilities while the hello failed");
+        assert_eq!(a.connection_counts().hellos_failed, 1);
+        // too soon to try again: still none, nothing sent
+        assert_eq!(a.negotiate(b.id()).await.unwrap().caps, Caps::NONE);
+        tokio::time::sleep(pool::HELLO_RETRY + Duration::from_millis(100)).await;
+        let p = a.negotiate(b.id()).await.unwrap();
+        assert_eq!((p.version, p.caps), (WIRE_V2, Caps::SYNC_V2), "agreed on the retry");
+        assert_eq!(a.peers()[&b.id()].protocol, Some(p));
+        let counts = a.connection_counts();
+        assert_eq!((counts.dialed, counts.hellos_failed), (1, 1), "same connection, one failure");
+        assert_eq!(b.inner.hellos_served.load(Ordering::Relaxed), 1);
+        a.shutdown().await.unwrap();
+
+        // every try lost: bounded, then the connection stays without
+        let c = node("c", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        c.add_peer_addr(b.addr());
+        b.inner.drop_hellos.store(u32::MAX, Ordering::SeqCst);
+        for i in 0..pool::HELLO_TRIES + 2 {
+            assert_eq!(c.negotiate(b.id()).await.unwrap().caps, Caps::NONE);
+            tokio::time::sleep(pool::HELLO_RETRY * 2u32.pow(i.min(pool::HELLO_TRIES)) + Duration::from_millis(50))
+                .await;
+        }
+        assert_eq!(c.connection_counts().hellos_failed, pool::HELLO_TRIES as u64);
+        assert_eq!(c.connection_counts().dialed, 1);
+        b.inner.drop_hellos.store(0, Ordering::SeqCst);
+        c.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    /// Devices b has never dealt with (fresh keys cost nothing) dial it,
+    /// on version 1 and with a hello on version 2: b answers them all but
+    /// keeps no state about them, which nothing would ever remove. A member
+    /// that dials is noted.
+    #[tokio::test]
+    async fn strangers_that_dial_leave_no_peer_state() {
+        let b = node("b", Protocol::default()).await;
+        for i in 0..8 {
+            let version = if i % 2 == 0 { WIRE_V1 } else { WIRE_V2 };
+            let s = node("stranger", Protocol { version, caps: Caps::SYNC_V2 }).await;
+            s.add_peer_addr(b.addr());
+            assert_eq!(s.fetch_card(b.id()).await.unwrap().keys.sign_pk, b.id());
+            assert_eq!(s.negotiate(b.id()).await.unwrap().version, version);
+            s.shutdown().await.unwrap();
+        }
+        assert_eq!(b.inner.hellos_served.load(Ordering::Relaxed), 4, "the version 2 strangers were answered");
+        assert_eq!(b.connection_counts().accepted, 8);
+        assert!(b.peers().is_empty(), "no state for strangers: {:?}", b.peers().keys().collect::<Vec<_>>());
+
+        let m = node("member", Protocol { version: WIRE_V1, caps: Caps::NONE }).await;
+        let (space, _) = b.create_space().unwrap();
+        b.with_space(&space, |r| r.add_member(m.keys().public(), Role::Writer)).unwrap().unwrap();
+        m.add_peer_addr(b.addr());
+        m.negotiate(b.id()).await.unwrap();
+        let noted = || b.peers().get(&m.id()).and_then(|p| p.protocol);
+        let until = Instant::now() + Duration::from_secs(5);
+        while noted().is_none() && Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(noted(), Some(PeerProtocol::baseline(WIRE_V1)));
+        assert_eq!(b.peers().len(), 1);
+        m.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    /// A pre-release device (version 1 only) and a current one still do
+    /// everything they did together: version 1 is chosen in the handshake
+    /// whoever dials, no hello is sent, no capability is used, and spaces
+    /// sync both ways.
+    #[tokio::test]
+    async fn a_version_1_device_and_a_version_2_device_talk_version_1() {
+        let new = node("new", Protocol { version: WIRE_V2, caps: Caps::SYNC_V2 }).await;
+        let old = node("old", Protocol { version: WIRE_V1, caps: Caps::SYNC_V2 }).await;
+        new.add_peer_addr(old.addr());
+        old.add_peer_addr(new.addr());
+        assert_eq!(new.negotiate(old.id()).await.unwrap(), PeerProtocol::baseline(WIRE_V1));
+        assert_eq!(old.negotiate(new.id()).await.unwrap(), PeerProtocol::baseline(WIRE_V1));
+        let (space, _) = new.create_space().unwrap();
+        new.with_space(&space, |r| r.add_member(old.keys().public(), Role::Writer)).unwrap().unwrap();
+        new.with_space(&space, |r| r.append(mycel_sync::StreamId::new_feed(), b"from new".to_vec())).unwrap().unwrap();
+        new.sync_with(old.id(), space, false).await.unwrap();
+        assert_eq!(old.with_space(&space, |r| r.envelope_ids().len()).unwrap(), 1, "the invitation and its data");
+        old.with_space(&space, |r| r.append(mycel_sync::StreamId::new_feed(), b"from old".to_vec())).unwrap().unwrap();
+        old.sync_with(new.id(), space, false).await.unwrap();
+        assert_eq!(new.with_space(&space, |r| r.envelope_ids().len()).unwrap(), 2);
+        assert_eq!(new.fetch_card(old.id()).await.unwrap().keys.sign_pk, old.id());
+        assert_eq!(old.fetch_card(new.id()).await.unwrap().keys.sign_pk, new.id());
+        new.shutdown().await.unwrap();
+        old.shutdown().await.unwrap();
+    }
+
+    /// Sync v2 is chosen by capability: two current devices use it, and a
+    /// device that refuses the stream all the same (here: a build without
+    /// Sync v2, opened regardless of its hello) is synced with v1 and
+    /// remembered as v1-only at once, since the refusal is explicit.
+    #[tokio::test]
+    async fn a_refused_sync_v2_falls_back_and_is_remembered() {
+        let new = node("new", Protocol::default()).await;
+        let mut opts = NodeOptions::new(NetMode::Local, "old");
+        opts.sync_v2 = false;
+        let old = Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap();
+        let peer = node("peer", Protocol::default()).await;
+        for (a, b) in [(&new, &old), (&old, &new), (&new, &peer), (&peer, &new)] {
+            a.add_peer_addr(b.addr());
+        }
+        assert!(new.negotiate(peer.id()).await.unwrap().supports(Caps::SYNC_V2));
+        assert!(!new.negotiate(old.id()).await.unwrap().supports(Caps::SYNC_V2));
+        let (space, _) = new.create_space().unwrap();
+        new.with_space(&space, |r| r.add_member(old.keys().public(), Role::Writer)).unwrap().unwrap();
+        new.with_space(&space, |r| r.add_member(peer.keys().public(), Role::Writer)).unwrap().unwrap();
+        new.with_space(&space, |r| r.append(mycel_sync::StreamId::new_feed(), b"hi".to_vec())).unwrap().unwrap();
+        new.sync_with(peer.id(), space, false).await.unwrap();
+        assert_eq!(peer.with_space(&space, |r| r.envelope_ids().len()).unwrap(), 1);
+        assert!(new.sync_v2_totals().client_sessions >= 1, "both have it: v2");
+        // Opened despite the hello: refused, so nothing ran, and remembered.
+        let ran = sync_v2::sync(&new.inner, old.id(), space, false, false).await.unwrap();
+        assert!(ran.is_none());
+        let t = new.sync_v2_totals();
+        assert_eq!((t.fallbacks, t.remembered_v1), (1, 1), "{t:?}");
+        assert!(new.inner.v2.is_v1_only(&old.id()));
+        new.sync_with(old.id(), space, false).await.unwrap();
+        assert_eq!(old.with_space(&space, |r| r.envelope_ids().len()).unwrap(), 1, "v1: the invitation and its data");
+        for n in [new, old, peer] {
+            n.shutdown().await.unwrap();
+        }
+    }
+
+    /// A stream kind the device doesn't know (a newer build's) is refused
+    /// at once with a typed error: never a timeout, never bytes read as
+    /// something else; the connection carries on. A version 1 connection
+    /// has no hello, so a hello on one is unknown too.
+    #[tokio::test]
+    async fn unknown_stream_kinds_are_refused_cleanly() {
+        use iroh::endpoint::VarInt;
+        let a = node("a", Protocol::default()).await;
+        let b = node("b", Protocol::default()).await;
+        a.add_peer_addr(b.addr());
+        let conn = pooled(&a.inner, &b.id()).await.unwrap();
+        let start = Instant::now();
+        let (mut tx, mut rx) = open_bi_raw(&conn, 0xee, 1).await.unwrap();
+        let _ = send(&mut tx, &42u32).await;
+        let err = recv::<u32>(&mut rx).await.unwrap_err();
+        assert_eq!(err.downcast_ref::<VersionError>(), Some(&VersionError::StreamRefused), "{err:#}");
+        assert!(start.elapsed() < Duration::from_secs(5), "refused, not timed out");
+        let mut uni = conn.open_uni().await.unwrap();
+        uni.write_all(&[0xee, 1, 2, 3]).await.unwrap();
+        let stopped = tokio::time::timeout(Duration::from_secs(5), uni.stopped()).await.unwrap().unwrap();
+        assert_eq!(stopped, Some(VarInt::from_u32(STREAM_REFUSED)));
+        assert_eq!(a.fetch_card(b.id()).await.unwrap().keys.sign_pk, b.id(), "the connection still works");
+        drop(conn);
+
+        let v1 = a.inner.endpoint.connect(b.addr(), wire::ALPN_V1).await.unwrap();
+        assert_eq!(wire::version_of(v1.alpn()), Some(WIRE_V1));
+        let (mut tx, mut rx) = open_bi(&v1, StreamKind::Hello).await.unwrap();
+        let _ = send(&mut tx, &Hello::ours(Caps::NONE)).await;
+        let err = recv::<Hello>(&mut rx).await.unwrap_err();
+        assert_eq!(err.downcast_ref::<VersionError>(), Some(&VersionError::StreamRefused), "{err:#}");
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    /// A node serves its versions newest first, so a dialer that offers
+    /// several lands on the newest, on the node protocol and on mesh hops
+    /// alike, even one listing the oldest first (TLS goes by the listener's
+    /// order). A node registering an old version first would quietly put
+    /// every current pair on it.
+    #[tokio::test]
+    async fn a_node_serves_its_newest_versions_first() {
+        let a = node("a", Protocol::default()).await;
+        let mut opts = NodeOptions::new(NetMode::Local, "b");
+        opts.mesh = Some(MeshOptions::default());
+        let b = Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap();
+        for (table, newest) in [(&wire::ALPNS, wire::ALPN_V2), (&mesh::ALPNS, mesh::ALPN_V2)] {
+            let oldest_first: Vec<&[u8]> = table.iter().map(|(_, a)| *a).collect();
+            let (first, rest) = oldest_first.split_first().unwrap();
+            let options = ConnectOptions::new().with_additional_alpns(rest.iter().map(|a| a.to_vec()).collect());
+            let conn = a.inner.endpoint.connect_with_opts(b.addr(), first, options).await.unwrap().await.unwrap();
+            assert_eq!(conn.alpn(), newest, "offered {oldest_first:?}");
+            conn.close(0u32.into(), b"");
+        }
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn stream_kinds_per_version() {
+        assert_eq!(StreamKind::on(WIRE_V2, 5), Some(StreamKind::Hello));
+        assert_eq!(StreamKind::on(WIRE_V1, 5), None, "version 1 has no hello");
+        assert_eq!(StreamKind::on(WIRE_V1, 1), Some(StreamKind::Sync));
+        assert_eq!(StreamKind::on(WIRE_V2, 6), Some(StreamKind::SyncV2));
+        assert_eq!(StreamKind::on(WIRE_V1, 6), None, "version 1 has no Sync v2");
+        assert!((7..=255).all(|b| StreamKind::on(WIRE_V2, b).is_none()) && StreamKind::on(WIRE_V2, 0).is_none());
+        assert_eq!(wire::alpns(WIRE_V2), vec![wire::ALPN_V2, wire::ALPN_V1]);
+        assert_eq!(wire::alpns(WIRE_V1), vec![wire::ALPN_V1]);
+        assert_eq!(wire::version_of(b"mycel/node/3"), None);
+    }
+
+    /// Every supported version has one ALPN per protocol, its own: none
+    /// shared between versions or protocols, and each maps back to its
+    /// version. (A version added without its ALPNs doesn't build.)
+    #[test]
+    fn every_version_has_its_own_alpns() {
+        use version::{MIN_WIRE_VERSION, WIRE_VERSION, alpn_table_ok};
+        let mut seen: Vec<&[u8]> = Vec::new();
+        for v in MIN_WIRE_VERSION..=WIRE_VERSION {
+            let (node, mesh) =
+                (wire::ALPNS[usize::from(v - MIN_WIRE_VERSION)], mesh::ALPNS[usize::from(v - MIN_WIRE_VERSION)]);
+            assert_eq!((node.0, mesh.0), (v, v));
+            assert_eq!(wire::version_of(node.1), Some(v));
+            assert_eq!(mesh::version_of(mesh.1), Some(v));
+            assert_eq!(wire::alpns(v)[0], node.1, "the newest offered first");
+            assert_eq!(mesh::alpns(v)[0], mesh.1);
+            assert!(!seen.contains(&node.1) && !seen.contains(&mesh.1) && node.1 != mesh.1);
+            seen.extend([node.1, mesh.1]);
+        }
+        assert_eq!(wire::alpns(WIRE_VERSION).len(), usize::from(WIRE_VERSION - MIN_WIRE_VERSION) + 1);
+        // what the compile-time check refuses
+        assert!(!alpn_table_ok(&[(WIRE_V1, b"same"), (WIRE_V2, b"same")]), "two versions, one name");
+        assert!(!alpn_table_ok(&[(WIRE_V2, b"a"), (WIRE_V1, b"b")]), "out of place");
+        assert!(!alpn_table_ok(&[(WIRE_V1, b"a"), (WIRE_V2, b"")]), "no name");
+    }
+
+    /// A store-and-forward payload of a kind this build doesn't know is
+    /// refused unread with a typed error (it was delivered: the mesh sent
+    /// its receipt); a known kind that doesn't decode is an error, not a
+    /// panic.
+    #[tokio::test]
+    async fn bundles_of_an_unknown_payload_kind_are_refused_unread() {
+        let n = node("n", Protocol::default()).await;
+        let src = DeviceKeys::generate().sign_pk();
+        let err = n.inner.on_bundle(src, 999, b"from a newer build").unwrap_err();
+        assert!(
+            matches!(
+                err.downcast_ref::<VersionError>(),
+                Some(VersionError::Unsupported { what: "bundle payload kind", version: 999, .. })
+            ),
+            "{err:#}"
+        );
+        assert!(n.inner.on_bundle(src, mesh::dtn::KIND_SPACE_SYNC, &[0xff; 3]).is_err());
+        n.shutdown().await.unwrap();
+    }
+}
+
+#[cfg(test)]
 mod security_tests {
     use super::*;
 
@@ -1777,7 +2687,7 @@ mod security_exchange_tests {
             tokio::spawn(async move {
                 let conn = remote.accept().await.unwrap().await.unwrap();
                 let (mut tx, mut rx) = conn.accept_bi().await.unwrap();
-                assert_eq!(stream_kind(&mut rx).await.unwrap(), StreamKind::Sync);
+                assert_eq!(stream_kind(WIRE_V2, None, &mut rx).await.unwrap(), StreamKind::Sync);
                 assert!(matches!(recv::<SyncMsg>(&mut rx).await.unwrap(), SyncMsg::Hello { .. }));
                 send(
                     &mut tx,
@@ -1832,5 +2742,35 @@ mod security_exchange_tests {
         assert!(node.send_ephemeral(space, vec![42; MAX_EPHEMERAL]).is_ok());
         assert!(node.send_ephemeral(space, vec![42; MAX_EPHEMERAL + 1]).is_err());
         node.shutdown().await.unwrap();
+    }
+}
+
+/// `n` members of `ranked` (rendezvous order) not in `skip`: lowest `tier`
+/// first (0 recently reachable, 1 unknown, 2 failing), by rank within a tier.
+fn pick_ranked(ranked: &[(Hash32, SignPk)], skip: &[SignPk], n: usize, tier: impl Fn(&SignPk) -> u8) -> Vec<SignPk> {
+    let mut picks: Vec<(u8, usize, SignPk)> =
+        ranked.iter().enumerate().filter(|(_, (_, p))| !skip.contains(p)).map(|(i, (_, p))| (tier(p), i, *p)).collect();
+    picks.sort_unstable();
+    picks.into_iter().take(n).map(|(_, _, p)| p).collect()
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn view_replaces_unreachable_members_by_rank() {
+        let ranked: Vec<(Hash32, SignPk)> = (0..10u8).map(|i| (Hash32([i; 32]), SignPk([i; 32]))).collect();
+        let pk = |i: u8| SignPk([i; 32]);
+        // Nothing known: the first two by rank.
+        assert_eq!(pick_ranked(&ranked, &[], 2, |_| 1), vec![pk(0), pk(1)]);
+        // The first two fail: the next two by rank replace them.
+        let failing = |p: &SignPk| if p.0[0] < 2 { 2 } else { 1 };
+        assert_eq!(pick_ranked(&ranked, &[], 2, failing), vec![pk(2), pk(3)]);
+        // A recently reachable member is preferred over unknown ones.
+        let seen = |p: &SignPk| if p.0[0] == 7 { 0 } else { 1 };
+        assert_eq!(pick_ranked(&ranked, &[pk(0)], 2, seen), vec![pk(7), pk(1)]);
+        // Everyone failing: still the best by rank (retried after backoff).
+        assert_eq!(pick_ranked(&ranked, &[], 2, |_| 2), vec![pk(0), pk(1)]);
     }
 }

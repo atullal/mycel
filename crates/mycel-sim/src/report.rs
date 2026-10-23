@@ -11,6 +11,29 @@ pub struct Slo {
     pub target: String,
     pub actual: String,
     pub pass: bool,
+    /// The measured number, for objectives that have one (calibration
+    /// across seeds reads it).
+    #[serde(default)]
+    pub value: Option<f64>,
+    /// An invariant (no loops, no route through a black hole after the
+    /// defence, convergence at all) must hold on every seed; any other
+    /// objective is a quality metric, judged on how many seeds pass
+    /// ([`crate::seeds`]).
+    #[serde(default)]
+    pub invariant: bool,
+}
+
+impl Slo {
+    /// Make this objective an invariant: zero tolerance on every seed.
+    pub fn invariant(&mut self) {
+        self.invariant = true;
+    }
+
+    /// An invariant only where the candidate models it (`on`); elsewhere a
+    /// quality objective, which an expected failure covers.
+    pub fn invariant_if(&mut self, on: bool) {
+        self.invariant = on;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -40,6 +63,11 @@ pub struct ScenarioResult {
     pub notes: Vec<String>,
     pub metrics: serde_json::Value,
     pub wall_s: f64,
+    /// The candidate's optimality ratios (achieved / fastest feasible), one
+    /// per delivered message, for pooling across seeds ([`crate::seeds`]):
+    /// p99 only means something over thousands. Not written out.
+    #[serde(skip)]
+    pub optimality: Vec<f64>,
 }
 
 impl ScenarioResult {
@@ -57,6 +85,7 @@ impl ScenarioResult {
             notes: Vec::new(),
             metrics: serde_json::Value::Null,
             wall_s: 0.0,
+            optimality: Vec::new(),
         }
     }
 
@@ -64,28 +93,44 @@ impl ScenarioResult {
         self.expected_fail = Some(why.into());
     }
 
+    fn push(&mut self, slo: Slo) -> &mut Slo {
+        self.slos.push(slo);
+        self.slos.last_mut().expect("just pushed")
+    }
+
     /// Require `actual <= max`.
-    pub fn at_most(&mut self, name: &str, actual: f64, max: f64, unit: &str) {
-        self.slos.push(Slo {
+    pub fn at_most(&mut self, name: &str, actual: f64, max: f64, unit: &str) -> &mut Slo {
+        self.push(Slo {
             name: name.into(),
             target: format!("≤ {} {unit}", fmt(max)),
             actual: format!("{} {unit}", fmt(actual)),
             pass: actual.is_finite() && actual <= max,
-        });
+            value: Some(actual),
+            invariant: false,
+        })
     }
 
     /// Require `actual >= min`.
-    pub fn at_least(&mut self, name: &str, actual: f64, min: f64, unit: &str) {
-        self.slos.push(Slo {
+    pub fn at_least(&mut self, name: &str, actual: f64, min: f64, unit: &str) -> &mut Slo {
+        self.push(Slo {
             name: name.into(),
             target: format!("≥ {} {unit}", fmt(min)),
             actual: format!("{} {unit}", fmt(actual)),
             pass: actual.is_finite() && actual >= min,
-        });
+            value: Some(actual),
+            invariant: false,
+        })
     }
 
-    pub fn check(&mut self, name: &str, ok: bool, actual: impl Into<String>) {
-        self.slos.push(Slo { name: name.into(), target: "true".into(), actual: actual.into(), pass: ok });
+    pub fn check(&mut self, name: &str, ok: bool, actual: impl Into<String>) -> &mut Slo {
+        self.push(Slo {
+            name: name.into(),
+            target: "true".into(),
+            actual: actual.into(),
+            pass: ok,
+            value: None,
+            invariant: false,
+        })
     }
 
     pub fn headline(&mut self, s: impl Into<String>) {
@@ -96,8 +141,15 @@ impl ScenarioResult {
         self.notes.push(s.into());
     }
 
-    /// Settle the status from the SLOs and the expectation.
+    /// Settle the status from the SLOs and the expectation. An expectation
+    /// covers quality objectives only: a broken invariant fails the
+    /// scenario whatever is expected of it (a candidate that doesn't model
+    /// one mustn't emit it as an invariant).
     pub fn finish(&mut self) {
+        if self.slos.iter().any(|s| s.invariant && !s.pass) {
+            self.status = Status::Fail;
+            return;
+        }
         let ok = self.slos.iter().all(|s| s.pass);
         self.status = match (ok, self.expected_fail.is_some()) {
             (true, false) => Status::Pass,
@@ -176,4 +228,21 @@ pub fn markdown(results: &[ScenarioResult]) -> String {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_expected_failure_never_hides_a_broken_invariant() {
+        let mut r = ScenarioResult::new("x", "x", 2, 1, 1.0);
+        r.at_least("delivery", 80.0, 90.0, "%");
+        r.expect_fail("a known gap");
+        r.finish();
+        assert_eq!(r.status, Status::ExpectedFail);
+        r.at_most("loops", 1.0, 0.0, "").invariant();
+        r.finish();
+        assert_eq!(r.status, Status::Fail, "the gap is expected, the loop isn't");
+    }
 }

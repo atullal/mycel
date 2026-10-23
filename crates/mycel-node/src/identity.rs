@@ -507,6 +507,13 @@ pub(crate) struct Identity {
     pub replaced: Option<PathBuf>,
 }
 
+/// Whether `dir` holds an established profile (any of [`PROFILE_STATE`]).
+/// Read-only: takes no lease and creates nothing, so a host can ask before
+/// deciding whether a start with nobody watching may open the runtime.
+pub(crate) fn established(dir: &Path) -> Result<bool> {
+    Ok(!DiskProfile(dir).is_pristine()?)
+}
+
 /// The lease is required at the call site and retained by Runtime.
 pub(crate) fn load(dir: &Path, _lease: &ProfileLock) -> Result<Identity> {
     let mut profile = DiskProfile(dir);
@@ -804,6 +811,27 @@ mod tests {
         fs::write(dir.0.join(MARKER), br#"{"version":999}"#).unwrap();
         assert!(load(&dir.0, &lease).is_err());
         assert_eq!(fs::read(dir.0.join(SEED)).unwrap(), [42; 32]);
+    }
+
+    #[test]
+    fn established_only_counts_mycel_state_and_writes_nothing() {
+        let dir = TestDir::new();
+        assert!(!established(&dir.0).unwrap(), "an empty folder");
+        assert!(!established(&dir.0.join("missing")).unwrap(), "a folder that isn't there");
+        // Platform and host files say nothing about a profile.
+        for other in ["mycel.log", "mycel.log.1", "link-diagnostics", "cache", "files"] {
+            fs::write(dir.0.join(other), b"x").unwrap();
+        }
+        assert!(!established(&dir.0).unwrap());
+        assert!(!dir.0.join(LOCK).exists(), "no lease taken");
+        for state in PROFILE_STATE {
+            let one = TestDir::new();
+            fs::write(one.0.join(state), b"x").unwrap();
+            assert!(established(&one.0).unwrap(), "{state}");
+        }
+        let lease = ProfileLock::acquire(&dir.0).unwrap();
+        load(&dir.0, &lease).unwrap();
+        assert!(established(&dir.0).unwrap());
     }
 
     #[test]

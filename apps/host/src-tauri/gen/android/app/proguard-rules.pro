@@ -27,3 +27,8 @@
 -keep class dev.mycel.host.MycelService {
     public static void notify(android.content.Context, java.lang.String, java.lang.String);
 }
+-keep class dev.mycel.host.MycelRuntime {
+    public static java.lang.String backgroundStatus(android.content.Context);
+    public static void requestBatteryExemption(android.content.Context);
+    native <methods>;
+}

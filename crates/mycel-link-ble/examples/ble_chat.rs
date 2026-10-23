@@ -72,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
     let keys = Arc::new(DeviceKeys::generate());
     let me = keys.sign_pk();
     println!("node {} \"{name}\"", short(&me));
-    let link = mycel_link_ble::link(me, &name);
+    let link = mycel_link_ble::link(me);
 
     if scan_only_mode {
         return scan_only(link).await;

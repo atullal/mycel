@@ -208,6 +208,28 @@ fn concurrent_edits_converge() {
     assert_eq!(a.doc_json(&doc).as_object().unwrap().len(), 4);
 }
 
+/// Found by fuzzing (`fuzz/fuzz_targets/sync_doc.rs`): Automerge adds
+/// counter increments with plain `i64` arithmetic, so two honest concurrent
+/// increments can overflow when merged. Release builds wrap, the same on
+/// every device; debug builds panicked inside Automerge, so a debug build
+/// refused an honest change that release builds accept. Automerge is now
+/// built without overflow checks in every profile (root `Cargo.toml`).
+#[test]
+fn concurrent_counter_increments_that_overflow_converge() {
+    let (mut a, mut b, _) = pair(Role::Writer);
+    let doc = Replica::new_doc_id();
+    a.change(doc, |d| d.put(ROOT, "n", automerge::ScalarValue::counter(i64::MAX - 1))).unwrap();
+    sync(&mut a, &mut b);
+    let (_, ea) = a.change(doc, |d| d.increment(ROOT, "n", 1)).unwrap();
+    let (_, eb) = b.change(doc, |d| d.increment(ROOT, "n", 1)).unwrap();
+    sync(&mut a, &mut b);
+    for id in [ea.unwrap().id(), eb.unwrap().id()] {
+        assert_eq!((a.status(&id), b.status(&id)), (Status::Valid, Status::Valid));
+    }
+    assert_eq!(a.doc_json(&doc), json!({"n": i64::MIN}), "wraps, as release builds do");
+    assert_eq!(a.doc_json(&doc), b.doc_json(&doc));
+}
+
 #[test]
 fn demoted_writer_becomes_read_only() {
     let (mut a, mut b, bk) = pair(Role::Writer);

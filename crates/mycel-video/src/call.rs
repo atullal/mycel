@@ -46,9 +46,12 @@ impl VideoCall {
         }
     }
 
-    /// A peer joined (or its connection was replaced): video with it on `conn`.
-    pub fn add_peer(&self, peer: [u8; 32], conn: Connection, path: Option<PathKind>) {
-        let t = VideoTrack::start(conn, self.ui.clone(), TrackOptions { me: self.me, peer, path }, self.rt.clone());
+    /// A peer joined (or its connection was replaced): video with it on
+    /// `conn`, a leg of call protocol version `call_version`
+    /// ([`TrackOptions::call_version`]).
+    pub fn add_peer(&self, peer: [u8; 32], conn: Connection, path: Option<PathKind>, call_version: u16) {
+        let opts = TrackOptions { me: self.me, peer, path, call_version };
+        let t = VideoTrack::start(conn, self.ui.clone(), opts, self.rt.clone());
         t.set_camera(self.camera.lock().is_some());
         let mut tracks = self.tracks.lock();
         tracks.insert(peer, t);

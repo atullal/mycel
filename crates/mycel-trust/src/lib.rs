@@ -4,7 +4,11 @@
 //! the same deterministic algorithm, so peers holding the same ops agree on
 //! membership, roles and encryption epochs.
 
+#[cfg(any(test, feature = "oracle"))]
 mod bitset;
+#[cfg(any(test, feature = "oracle"))]
+pub mod oracle;
+mod reach;
 mod resolve;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -28,6 +32,13 @@ pub const MAX_MEMBERS: usize = 1024;
 pub const MAX_PENDING: usize = 4096;
 /// One author cannot exhaust the shared missing-parent pool.
 pub const MAX_PENDING_PER_AUTHOR: usize = 256;
+/// Validly signed ops whose author isn't named yet (rule A2), kept between
+/// inserts in case a later op names it: in all, and per author. Within one
+/// [`SpaceGraph::insert_many`] call nothing is dropped (the batch is in
+/// memory anyway), so a batch in any order, such as a restore from storage
+/// in key order, admits exactly what a causally ordered one does.
+pub const MAX_UNNAMED: usize = 1024;
+pub const MAX_UNNAMED_PER_AUTHOR: usize = 64;
 const STATE_CACHE_MAX: usize = 1024;
 const CTX_OP_ID: &str = "mycel/v0/op-id";
 const CTX_LOCKBOX: &str = "mycel/v0/lockbox";
@@ -226,11 +237,22 @@ impl SignedOp {
     }
 }
 
-/// The key an op names as founder or added member, if any.
+/// The key an op names as founder or added member, if any (seniority, in
+/// the resolver).
 fn names(op: &SignedOp) -> Option<SignPk> {
     match &op.op.action {
         Action::Genesis { founder, .. } => Some(founder.sign_pk),
         Action::Add { member, .. } => Some(member.sign_pk),
+        _ => None,
+    }
+}
+
+/// What an op grants for admission rule A2: (key named, also made admin).
+fn grants(op: &SignedOp) -> Option<(SignPk, bool)> {
+    match &op.op.action {
+        Action::Genesis { founder, .. } => Some((founder.sign_pk, true)),
+        Action::Add { member, role, .. } => Some((member.sign_pk, role.is_admin())),
+        Action::SetRole { member, role, .. } if role.is_admin() => Some((*member, true)),
         _ => None,
     }
 }
@@ -302,6 +324,7 @@ impl MemberState {
         self.epochs.iter().rev().find(|e| e.recipients == readers).map(|e| e.id)
     }
 
+    #[cfg(any(test, feature = "oracle"))]
     pub(crate) fn admin_count(&self) -> usize {
         self.members.values().filter(|m| m.role.is_admin()).count()
     }
@@ -332,6 +355,16 @@ impl Keyring {
 
 // ───────────────────────────── space graph ─────────────────────────────
 
+/// How [`SpaceGraph::stage`] placed an op.
+enum Staged {
+    /// In the resolvable graph.
+    Ready,
+    /// In the pending pool (missing parents).
+    Pending,
+    /// Its author isn't named (yet): handed back for the `unnamed` pool.
+    Unnamed(Box<SignedOp>),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Inserted {
     New,
@@ -347,8 +380,24 @@ pub struct SpaceGraph {
     pending: HashMap<OpId, SignedOp>,
     /// Unresolved ops per author, for the per-author pending quota.
     pending_by_author: HashMap<SignPk, usize>,
-    /// Every key any known op (valid or not) names as founder or added member.
+    /// Admission rule A2: the founder and every key added by an op whose
+    /// author was ever granted Admin (valid or not, revoked or not), among
+    /// stored, resolvable ops. Only these keys may author ops or envelopes.
     named: HashSet<SignPk>,
+    /// Keys ever granted Admin, by the founder or by such a key.
+    admins: HashSet<SignPk>,
+    /// Stored grants (`Add`, `SetRole` to Admin) whose author isn't an
+    /// admin yet: applied if it becomes one, whatever the arrival order.
+    held_grants: HashMap<SignPk, Vec<OpId>>,
+    /// Validly signed ops whose author isn't named yet, staged again when
+    /// it is (see [`MAX_UNNAMED`]). Outside the graph: `contains` is false
+    /// for them, so peers keep offering them until they are admitted.
+    unnamed: HashMap<SignPk, HashMap<OpId, SignedOp>>,
+    /// Keys named since the pool was last checked.
+    newly_named: Vec<SignPk>,
+    /// Ops admitted from the pool, for the caller to persist
+    /// ([`SpaceGraph::take_released`]).
+    released: Vec<OpId>,
     res: Resolution,
     state_cache: Mutex<HashMap<Vec<OpId>, MemberState>>,
 }
@@ -379,20 +428,29 @@ impl SpaceGraph {
             return Err(TrustError::Malformed("first op must be genesis"));
         }
         let space = genesis.id();
-        let mut named = HashSet::new();
-        named.extend(names(&genesis));
+        let founder = genesis.op.author;
         let mut ops = HashMap::new();
         ops.insert(space, genesis);
-        let res = resolve::resolve(&ops);
-        Ok(SpaceGraph {
+        let res = Resolution::new(&ops, space);
+        let mut graph = SpaceGraph {
             space,
             ops,
             pending: HashMap::new(),
             pending_by_author: HashMap::new(),
-            named,
+            named: HashSet::new(),
+            admins: HashSet::new(),
+            held_grants: HashMap::new(),
+            unnamed: HashMap::new(),
+            newly_named: Vec::new(),
+            released: Vec::new(),
             res,
             state_cache: Mutex::new(HashMap::new()),
-        })
+        };
+        graph.named.insert(founder);
+        graph.make_admin(founder);
+        graph.admit(&space);
+        graph.newly_named.clear();
+        Ok(graph)
     }
 
     pub fn space_id(&self) -> SpaceId {
@@ -432,60 +490,92 @@ impl SpaceGraph {
         if self.contains(&id) {
             return Ok(Inserted::Duplicate);
         }
-        let ready = self.stage(op)?;
-        let promoted = self.promote_pending();
-        if ready || promoted.contains(&id) {
-            self.reresolve();
-            Ok(Inserted::New)
-        } else {
-            Ok(Inserted::Pending)
+        let ready = match self.stage(op)? {
+            Staged::Ready => true,
+            Staged::Pending => false,
+            Staged::Unnamed(op) => {
+                self.hold_unnamed(*op);
+                self.trim_unnamed();
+                return Err(TrustError::NotAuthorized("author was never added to this space"));
+            }
+        };
+        let mut promoted = HashSet::new();
+        if ready {
+            promoted.insert(id);
         }
+        // `settle` may also admit pooled ops of authors this op named: they
+        // all go into the incremental re-resolve together.
+        self.settle(&mut promoted);
+        let new = promoted.contains(&id);
+        if !promoted.is_empty() {
+            self.reresolve(promoted);
+        }
+        Ok(if new { Inserted::New } else { Inserted::Pending })
     }
 
     /// Insert many ops, resolving the graph once. Bad ops are skipped and
     /// reported; returns (ids that became part of the graph, rejected count).
+    /// The order doesn't matter: an op whose author is named by a later op
+    /// of the batch is admitted too (and counted as rejected only if its
+    /// author is still not named at the end).
     pub fn insert_many(&mut self, ops: impl IntoIterator<Item = SignedOp>) -> (Vec<OpId>, usize) {
         let mut rejected = 0;
         let mut promoted = HashSet::new();
+        let mut waiting: HashSet<OpId> = HashSet::new();
         for op in ops {
             if self.contains(&op.id()) {
                 continue;
             }
             let id = op.id();
             match self.stage(op) {
-                Ok(true) => {
+                Ok(Staged::Ready) => {
                     promoted.insert(id);
-                    // Release newly resolvable ops before admitting the next
-                    // item, so only genuinely missing parents consume quota.
-                    promoted.extend(self.promote_pending());
+                    // Release newly resolvable ops (and ops of newly named
+                    // authors) before admitting the next item, so only
+                    // genuinely missing parents consume quota.
+                    self.settle(&mut promoted);
                 }
-                Ok(false) => {}
+                Ok(Staged::Pending) => {}
+                Ok(Staged::Unnamed(op)) => {
+                    waiting.insert(id);
+                    self.hold_unnamed(*op);
+                }
                 Err(_) => rejected += 1,
             }
         }
-        promoted.extend(self.promote_pending());
+        self.settle(&mut promoted);
+        rejected += waiting.iter().filter(|id| !self.contains(id)).count();
+        self.trim_unnamed();
+        let added: Vec<OpId> = promoted.iter().copied().collect();
         if !promoted.is_empty() {
-            self.reresolve();
+            self.reresolve(promoted);
         }
-        (promoted.into_iter().collect(), rejected)
+        (added, rejected)
     }
 
-    /// Returns true when inserted directly into the resolvable graph.
-    fn stage(&mut self, op: SignedOp) -> Result<bool> {
+    /// Verify an op and stage it (see [`Staged`]).
+    fn stage(&mut self, op: SignedOp) -> Result<Staged> {
         op.verify_standalone()?;
         if op.op.space != Some(self.space) {
             return Err(TrustError::WrongSpace);
         }
-        // DoS guard: only keys that some known op ever added may author ops.
-        // (An op that arrives before its author's Add is simply re-fetched on
-        // a later sync, so this doesn't affect convergence.)
+        // Admission rule A2: only named keys (see `named`) may author ops.
+        // An op that arrives before its author is named waits in the
+        // `unnamed` pool (and a peer offers it again if the pool dropped it),
+        // so this doesn't affect convergence.
         if !self.ever_named(&op.op.author) {
-            return Err(TrustError::NotAuthorized("author was never added to this space"));
+            return Ok(Staged::Unnamed(Box::new(op)));
         }
+        self.stage_named(op)
+    }
+
+    /// Stage a verified op of a named author.
+    fn stage_named(&mut self, op: SignedOp) -> Result<Staged> {
         if op.op.parents.iter().all(|parent| self.ops.contains_key(parent)) {
-            self.named.extend(names(&op));
-            self.ops.insert(op.id(), op);
-            return Ok(true);
+            let id = op.id();
+            self.ops.insert(id, op);
+            self.admit(&id);
+            return Ok(Staged::Ready);
         }
         if self.pending.len() >= MAX_PENDING {
             return Err(TrustError::Malformed("too many pending ops"));
@@ -495,18 +585,113 @@ impl SpaceGraph {
             return Err(TrustError::Malformed("too many pending ops by author"));
         }
         *by_author += 1;
-        self.named.extend(names(&op));
+        // (pending ops name no one: what is named mustn't depend on which
+        // ops the bounded pending pool happened to keep)
         self.pending.insert(op.id(), op);
-        Ok(false)
+        Ok(Staged::Pending)
     }
 
-    /// Has any known op (valid or not) named `pk` as founder or added member?
+    fn hold_unnamed(&mut self, op: SignedOp) {
+        self.unnamed.entry(op.op.author).or_default().insert(op.id(), op);
+    }
+
+    /// Bound the `unnamed` pool between inserts (see [`MAX_UNNAMED`]).
+    fn trim_unnamed(&mut self) {
+        for ops in self.unnamed.values_mut() {
+            while ops.len() > MAX_UNNAMED_PER_AUTHOR {
+                let Some(id) = ops.keys().next().copied() else { break };
+                ops.remove(&id);
+            }
+        }
+        let mut total: usize = self.unnamed.values().map(HashMap::len).sum();
+        while total > MAX_UNNAMED {
+            let Some(author) = self.unnamed.keys().next().copied() else { break };
+            total -= self.unnamed.remove(&author).map_or(0, |o| o.len());
+        }
+    }
+
+    /// Promote pending ops whose parents are in, and stage the pooled ops
+    /// of newly named authors, until neither changes anything.
+    fn settle(&mut self, promoted: &mut HashSet<OpId>) {
+        loop {
+            promoted.extend(self.promote_pending());
+            let keys = std::mem::take(&mut self.newly_named);
+            if keys.is_empty() {
+                return;
+            }
+            for key in keys {
+                for (id, op) in self.unnamed.remove(&key).unwrap_or_default() {
+                    if self.contains(&id) {
+                        continue;
+                    }
+                    match self.stage_named(op) {
+                        Ok(Staged::Ready) => {
+                            promoted.insert(id);
+                            self.released.push(id);
+                        }
+                        Ok(_) => self.released.push(id),
+                        Err(_) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ops admitted (or made pending) from the `unnamed` pool since the last
+    /// call: they weren't in the batch that admitted them, so a caller that
+    /// persists what each insert added persists these too.
+    pub fn take_released(&mut self) -> Vec<OpId> {
+        std::mem::take(&mut self.released)
+    }
+
+    /// Has a stored, resolvable op of an ever-admin (valid or not) named `pk`
+    /// as founder or added member? (Admission rule A2: monotone in the op
+    /// set, never in arrival order, so honest replicas agree on it.)
     pub fn ever_named(&self, pk: &SignPk) -> bool {
         self.named.contains(pk)
     }
 
-    fn reresolve(&mut self) {
-        self.res = resolve::resolve(&self.ops);
+    /// Apply what a newly stored op grants (rule A2).
+    fn admit(&mut self, id: &OpId) {
+        let Some(op) = self.ops.get(id) else { return };
+        let Some((key, admin)) = grants(op) else { return };
+        let author = op.op.author;
+        if !self.admins.contains(&author) {
+            self.held_grants.entry(author).or_default().push(*id);
+            return;
+        }
+        if matches!(op.op.action, Action::Genesis { .. } | Action::Add { .. }) && self.named.insert(key) {
+            self.newly_named.push(key);
+        }
+        if admin {
+            self.make_admin(key);
+        }
+    }
+
+    /// `key` was granted Admin: its held grants now count.
+    fn make_admin(&mut self, key: SignPk) {
+        let mut work = vec![key];
+        while let Some(k) = work.pop() {
+            if !self.admins.insert(k) {
+                continue;
+            }
+            for id in self.held_grants.remove(&k).unwrap_or_default() {
+                let Some(op) = self.ops.get(&id) else { continue };
+                let Some((key, admin)) = grants(op) else { continue };
+                if matches!(op.op.action, Action::Add { .. }) && self.named.insert(key) {
+                    self.newly_named.push(key);
+                }
+                if admin {
+                    work.push(key);
+                }
+            }
+        }
+    }
+
+    /// Fold ops that just became resolvable into the resolution.
+    fn reresolve(&mut self, new: HashSet<OpId>) {
+        let new: Vec<OpId> = new.into_iter().collect();
+        self.res.add(&self.ops, &new);
         self.state_cache.lock().unwrap().clear();
     }
 
@@ -531,6 +716,7 @@ impl SpaceGraph {
                     }
                 }
                 self.ops.insert(id, op);
+                self.admit(&id);
                 promoted.insert(id);
             }
         }
@@ -588,7 +774,7 @@ impl SpaceGraph {
     /// Winning revocations targeting `pk`: (op id, cutoff).
     pub fn revocations_of(&self, pk: &SignPk) -> Vec<(OpId, Option<Hash32>)> {
         self.res
-            .winners
+            .winners_against(pk)
             .iter()
             .filter_map(|id| {
                 let op = &self.ops[id].op;
@@ -762,5 +948,7 @@ impl SpaceGraph {
     }
 }
 
+#[cfg(test)]
+mod diff_tests;
 #[cfg(test)]
 mod tests;

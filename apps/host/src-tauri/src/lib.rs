@@ -20,12 +20,15 @@
 //!   environment variables (a phone), a `link-diagnostics` file in the data
 //!   folder holding the level turns them on (see `link_diagnostics`).
 
+#[cfg(target_os = "android")]
+mod android;
+mod background;
 mod commands;
 mod notify;
 mod open_file;
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use mycel_node::api::{Event, NetworkMode};
 use mycel_node::{Runtime, RuntimeOptions};
@@ -39,6 +42,11 @@ pub const EVENT: &str = "mycel://event";
 pub type Rt = Arc<Runtime>;
 
 fn network_mode(data_dir: &std::path::Path) -> Result<NetworkMode, String> {
+    // Tests never reach a network (nor read the environment, which other
+    // threads may be changing).
+    if cfg!(test) {
+        return Ok(NetworkMode::Local);
+    }
     match std::env::var("MYCEL_NET").ok().as_deref().map(str::trim) {
         // An unreadable saved mode means local paths only, never wider.
         None | Some("") => Ok(Runtime::launch_network_mode(data_dir, NetworkMode::Internet)),
@@ -56,9 +64,14 @@ pub(crate) fn set_window_title(app: &AppHandle, name: &str) {
     }
 }
 
+/// The app, once there is a window: a phone can run the runtime before
+/// (Android, `start_in_background`), and the window adopts it.
+pub(crate) type AppSlot = Arc<OnceLock<AppHandle>>;
+
 /// Forward runtime events to the webview until the runtime shuts down. The
 /// chat layer's alerts go to the notification bridge instead (never blocks).
-fn forward_events(app: AppHandle, runtime: Rt, notifier: Arc<notify::Notifier>) {
+/// With no window yet, only the alerts go anywhere.
+fn forward_events(app: AppSlot, runtime: Rt, notifier: Arc<notify::Notifier>) {
     // Subscribe before spawning so nothing emitted after startup is missed.
     let mut rx = runtime.subscribe();
     tauri::async_runtime::spawn(async move {
@@ -66,11 +79,13 @@ fn forward_events(app: AppHandle, runtime: Rt, notifier: Arc<notify::Notifier>) 
             match rx.recv().await {
                 Ok(event) if event.is_for_shell() => notifier.on_event(&event),
                 Ok(event) => {
+                    let Some(app) = app.get() else { continue };
                     if let Err(e) = app.emit(EVENT, &event) {
                         eprintln!("mycel-host: failed to emit event: {e}");
                     }
                 }
                 Err(RecvError::Lagged(skipped)) => {
+                    let Some(app) = app.get() else { continue };
                     // We dropped events: tell the UI to refresh everything it shows.
                     eprintln!("mycel-host: event stream lagged by {skipped}; asking UI to refresh");
                     let mut refresh = vec![
@@ -234,7 +249,9 @@ fn log_in_use(path: &std::path::Path) -> bool {
 /// (`xcrun devicectl device copy to --domain-type appDataContainer ...` on a
 /// development-signed build). Debug builds turn level 1 on by themselves.
 fn link_diagnostics(data_dir: &std::path::Path) {
-    if std::env::var_os("MYCEL_BLE_LOG").is_some() {
+    // Set once, before the runtime starts: never again once it runs (a
+    // window adopting a background start logs to the file again).
+    if std::env::var_os("MYCEL_BLE_LOG").is_some() || CORE.get().is_some() {
         return;
     }
     let level = diagnostics_level(&data_dir.join("link-diagnostics")).or(cfg!(debug_assertions).then_some(1));
@@ -559,24 +576,58 @@ fn env_from_properties() {
     }
 }
 
-/// Open the runtime and wire it to the app.
-fn start(app: &mut tauri::App) -> Result<(), String> {
-    #[cfg(target_os = "android")]
-    env_from_properties();
-    let data_dir = match std::env::var_os("MYCEL_DATA_DIR") {
-        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
-        _ => app.path().app_data_dir().map_err(|e| format!("cannot find the app data folder: {e}"))?,
-    };
-    std::fs::create_dir_all(&data_dir).map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
-    log_to_file(&data_dir);
-    let mode = network_mode(&data_dir)?;
-    let name = std::env::var("MYCEL_NAME").ok().filter(|n| !n.trim().is_empty());
+/// What runs with or without a window: the runtime, the alert bridge and
+/// the event forwarder. One per process.
+pub(crate) struct Core {
+    pub(crate) runtime: Rt,
+    pub(crate) notifier: Arc<notify::Notifier>,
+    app: AppSlot,
+}
 
+static CORE: OnceLock<Core> = OnceLock::new();
+/// Held while opening, so a background start and a window opening at the
+/// same moment never both open the profile: the second adopts the first's.
+static OPENING: Mutex<()> = Mutex::new(());
+
+/// The open core, if any (background catch-ups use it).
+#[cfg_attr(not(any(target_os = "android", target_os = "ios")), allow(dead_code))]
+pub(crate) fn core() -> Option<&'static Core> {
+    CORE.get()
+}
+
+/// Open the core for `data_dir`, once per process. `app`: the window's app;
+/// `None` is a start with nobody watching (no window), which opens only an
+/// existing profile (`Ok(None)` otherwise): a new profile is named and
+/// created in the app, never behind the user's back. A core opened in the
+/// background is adopted by the window that opens later.
+fn open_core(data_dir: &Path, app: Option<AppHandle>) -> Result<Option<&'static Core>, String> {
+    let _opening = OPENING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(core) = CORE.get() {
+        // One profile per process: say so if a caller wanted another folder
+        // (both entry points read MYCEL_DATA_DIR, so they shouldn't).
+        if core.runtime.data_dir() != data_dir {
+            eprintln!(
+                "mycel-host: asked to open {} but {} is open; using it",
+                data_dir.display(),
+                core.runtime.data_dir().display()
+            );
+        }
+        if let Some(app) = app {
+            let _ = core.app.set(app);
+        }
+        return Ok(Some(core));
+    }
+    let watched = app.is_some();
+    if !watched && !Runtime::profile_exists(data_dir).unwrap_or(false) {
+        return Ok(None);
+    }
+    let mode = network_mode(data_dir)?;
+    let name = std::env::var("MYCEL_NAME").ok().filter(|n| !n.trim().is_empty());
     let runtime: Rt = tauri::async_runtime::block_on(Runtime::open_with(RuntimeOptions {
-        data_dir: data_dir.clone(),
+        data_dir: data_dir.to_path_buf(),
         mode,
         name,
-        default_name: device_name(),
+        default_name: if watched { device_name() } else { None },
         keeper: false,
         port: 0,
     }))
@@ -588,15 +639,110 @@ fn start(app: &mut tauri::App) -> Result<(), String> {
             };
             format!("cannot open Mycel data in {}: {e:#}{hint}", data_dir.display())
         })?;
+    let slot: AppSlot = Arc::new(OnceLock::new());
+    if let Some(app) = app {
+        let _ = slot.set(app);
+    }
+    let notifier = notify::Notifier::start(slot.clone(), data_dir);
+    // Nobody is looking until a window says so, nor when iOS launched the
+    // app straight into the background (a catch-up, a Bluetooth event): an
+    // incoming call must ring as a notification then.
+    let away = notify::starts_away(watched, watched && launched_in_background());
+    notifier.set_away(away);
+    if away && cfg!(mobile) {
+        runtime.set_background(true);
+    }
+    forward_events(slot.clone(), runtime.clone(), notifier.clone());
+    eprintln!(
+        "mycel-host: data dir {}, network {:?}{}",
+        data_dir.display(),
+        mode,
+        if watched { "" } else { ", started in the background" }
+    );
+    Ok(Some(CORE.get_or_init(|| Core { runtime, notifier, app: slot })))
+}
 
-    allow_attachment_files(app, &data_dir)?;
+/// iOS launched the app straight into the background (`BGTaskScheduler`, or
+/// a relaunch for a Bluetooth event): it has a window, but nobody is
+/// looking, and no `Suspended` event will say so.
+#[cfg(target_os = "ios")]
+fn launched_in_background() -> bool {
+    use objc2::MainThreadMarker;
+    use objc2_ui_kit::{UIApplication, UIApplicationState};
+    // Setup runs on the main thread, during launch.
+    let Some(mtm) = MainThreadMarker::new() else { return false };
+    UIApplication::sharedApplication(mtm).applicationState() == UIApplicationState::Background
+}
 
-    let notifier = notify::Notifier::start(app.handle().clone(), &data_dir);
-    forward_events(app.handle().clone(), runtime.clone(), notifier.clone());
-    app.manage(notifier);
-    app.manage(runtime);
+#[cfg(not(target_os = "ios"))]
+fn launched_in_background() -> bool {
+    false
+}
 
-    eprintln!("mycel-host: data dir {}, network {:?}", data_dir.display(), mode);
+/// On a phone, whether `event` sends the app to the background (`true`) or
+/// brings it back (`false`): radios link only with known devices while
+/// it's away ([`Runtime::set_background`]). Focus alone doesn't count (a
+/// pulled-down notification centre would drop links to strangers).
+#[cfg(mobile)]
+fn background_change(event: &WindowEvent) -> Option<bool> {
+    match event {
+        WindowEvent::Suspended | WindowEvent::Destroyed => Some(true),
+        WindowEvent::Resumed => Some(false),
+        _ => None,
+    }
+}
+
+/// `MYCEL_DATA_DIR`, if set: the data folder instead of the app's own.
+fn data_dir_override() -> Option<PathBuf> {
+    std::env::var_os("MYCEL_DATA_DIR").filter(|dir| !dir.is_empty()).map(PathBuf::from)
+}
+
+/// Open the runtime with no window (Android after a reboot or an update, a
+/// restarted service, a background catch-up), for an existing profile only.
+/// True once a runtime is running in this process.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) fn start_in_background(data_dir: PathBuf) -> bool {
+    if CORE.get().is_some() {
+        return true;
+    }
+    #[cfg(target_os = "android")]
+    env_from_properties();
+    // The same folder a window would open (`start`).
+    let data_dir = data_dir_override().unwrap_or(data_dir);
+    if std::fs::create_dir_all(&data_dir).is_err() {
+        return false;
+    }
+    log_to_file(&data_dir);
+    match open_core(&data_dir, None) {
+        Ok(core) => core.is_some(),
+        Err(msg) => {
+            eprintln!("mycel-host: background start failed: {msg}");
+            false
+        }
+    }
+}
+
+/// Open the runtime (or adopt the one a background start opened) and wire
+/// it to the app.
+fn start(app: &mut tauri::App) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    if CORE.get().is_none() {
+        env_from_properties();
+    }
+    let data_dir = match data_dir_override() {
+        Some(dir) => dir,
+        None => app.path().app_data_dir().map_err(|e| format!("cannot find the app data folder: {e}"))?,
+    };
+    std::fs::create_dir_all(&data_dir).map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
+    // Also after a background start: tao points stderr at logcat when the
+    // first activity is created, so this takes it back (the background
+    // start's log becomes mycel.log.1).
+    log_to_file(&data_dir);
+    let core = open_core(&data_dir, Some(app.handle().clone()))?.ok_or("Mycel couldn't open its data")?;
+    // The folder actually open (a background start was told it by Android).
+    allow_attachment_files(app, core.runtime.data_dir())?;
+    app.manage(core.notifier.clone());
+    app.manage(core.runtime.clone());
     Ok(())
 }
 
@@ -639,6 +785,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            background::background_status,
+            background::request_background_exemption,
             notify::prepare_notifications,
             notify::set_notification_context,
             notify::notification_target,
@@ -718,6 +866,14 @@ pub fn run() {
         {
             notifier.set_away(away);
         }
+        #[cfg(mobile)]
+        if let RunEvent::WindowEvent { label, event, .. } = &event
+            && label == "main"
+            && let Some(background) = background_change(event)
+            && let Some(runtime) = app.try_state::<Rt>()
+        {
+            runtime.set_background(background);
+        }
         #[cfg(target_os = "ios")]
         if let RunEvent::WindowEvent { event: WindowEvent::Suspended, .. } = &event {
             finish_in_background(app);
@@ -731,4 +887,166 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Tests that touch the process-wide core, the one-catch-up-at-a-time
+    /// flag or the catch-up tickets take this, so they never overlap.
+    pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        SERIAL.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+        for _ in 0..200 {
+            if check() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("mycel-host-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Regression: the `bluetooth-peripheral` background mode kept a locked
+    /// iPhone advertising and serving its node key to anyone in Bluetooth
+    /// range, all day. Background modes in both copies of the iOS
+    /// Info.plist (Tauri's source and the Xcode project's).
+    #[test]
+    fn ios_never_advertises_over_bluetooth_in_the_background() {
+        for plist in [include_str!("../Info.ios.plist"), include_str!("../gen/apple/mycel-host_iOS/Info.plist")] {
+            let modes = plist.split("<key>UIBackgroundModes</key>").nth(1).expect("background modes declared");
+            let modes = &modes[..modes.find("</array>").expect("an array")];
+            assert!(!modes.contains("bluetooth-peripheral"), "{modes}");
+            for mode in ["fetch", "processing", "bluetooth-central"] {
+                assert!(modes.contains(&format!("<string>{mode}</string>")), "{mode} missing: {modes}");
+            }
+        }
+    }
+
+    /// The whole windowless lifecycle in one test: the core is one per
+    /// process, so its steps can't run as separate tests.
+    #[test]
+    fn a_windowless_start_opens_only_an_existing_profile_and_catches_up() {
+        let _serial = serial();
+        assert!(CORE.get().is_none(), "nothing else in this binary opens the core");
+
+        // With no runtime there is nothing to catch up with.
+        assert!(!background::catch_up_now(background::begin_catch_up(), Duration::from_secs(5)));
+
+        // No profile: nothing opens, nothing is created behind the user's back.
+        let empty = temp_dir("empty");
+        assert!(open_core(&empty, None).unwrap().is_none());
+        assert!(CORE.get().is_none());
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0, "the folder stays empty");
+
+        // A profile made in the app (here directly): Bob, who shares a
+        // conversation with Alice. Then his phone sleeps (closed).
+        let dir = temp_dir("profile");
+        let alice_dir = temp_dir("alice");
+        let open = |dir: &Path, name: &str| {
+            tauri::async_runtime::block_on(Runtime::open_with(RuntimeOptions {
+                data_dir: dir.to_path_buf(),
+                mode: NetworkMode::Local,
+                name: Some(name.into()),
+                default_name: None,
+                keeper: false,
+                port: 0,
+            }))
+            .unwrap()
+        };
+        let made = open(&dir, "bob");
+        let alice = open(&alice_dir, "alice");
+        let bob_contact = alice.add_contact(made.profile().contact_code).unwrap();
+        made.add_contact(alice.profile().contact_code).unwrap();
+        alice.node().add_peer_addr(made.node().addr());
+        made.node().add_peer_addr(alice.node().addr());
+        let conversation = alice.create_conversation(None, vec![bob_contact.id]).unwrap().id;
+        eventually("Bob has the conversation", || made.conversation(conversation.clone()).is_ok());
+        let id = made.profile().id;
+        tauri::async_runtime::block_on(made.shutdown()).unwrap();
+        drop(made);
+        // Alice writes while Bob's phone is asleep.
+        tauri::async_runtime::block_on(alice.send_message(
+            conversation.clone(),
+            "while you slept".into(),
+            None,
+            vec![],
+        ))
+        .unwrap();
+        let bodies = |rt: &Rt| -> Vec<String> {
+            rt.messages(conversation.clone(), None, None).unwrap().into_iter().map(|m| m.body).collect()
+        };
+
+        // Opened with no window, as that profile.
+        let core = open_core(&dir, None).unwrap().expect("an existing profile opens");
+        assert_eq!(core.runtime.profile().id, id);
+        assert_eq!(core.runtime.data_dir(), dir.as_path());
+        assert!(core.app.get().is_none(), "no window yet");
+        assert!(core.notifier.is_away_for_test(), "nobody is looking");
+
+        // Later opens (the window's, a second background start) adopt it
+        // rather than opening the profile twice. A different folder gets
+        // the open core too (logged), never a second runtime.
+        assert!(std::ptr::eq(open_core(&dir, None).unwrap().unwrap(), core));
+        assert!(std::ptr::eq(open_core(&empty, None).unwrap().unwrap(), core));
+        assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+        assert!(std::ptr::eq(super::core().unwrap(), core));
+
+        // A catch-up against the real runtime delivers what Alice wrote:
+        // sync, linger, flush; only a completed one is recorded. (Alice has
+        // Bob's old address only, so nothing reaches him before it.)
+        core.runtime.node().add_peer_addr(alice.node().addr());
+        assert!(!bodies(&core.runtime).contains(&"while you slept".to_string()));
+        let ticket = background::begin_catch_up();
+        let start = std::time::Instant::now();
+        assert!(background::catch_up_for_test(ticket, Duration::from_secs(15), Duration::from_millis(200)));
+        assert!(start.elapsed() < Duration::from_secs(10));
+        assert!(bodies(&core.runtime).contains(&"while you slept".to_string()), "the catch-up delivered it");
+        let recorded = background::last_catch_up_for_test();
+        assert!(recorded.is_some());
+
+        // A message Alice pushes while the catch-up lingers arrives too.
+        alice.node().add_peer_addr(core.runtime.node().addr());
+        let pusher = {
+            let (alice, conversation) = (alice.clone(), conversation.clone());
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(500));
+                tauri::async_runtime::block_on(alice.send_message(
+                    conversation,
+                    "during the linger".into(),
+                    None,
+                    vec![],
+                ))
+                .unwrap();
+            })
+        };
+        let ticket = background::begin_catch_up();
+        assert!(background::catch_up_for_test(ticket, Duration::from_secs(15), Duration::from_secs(4)));
+        pusher.join().unwrap();
+        assert!(bodies(&core.runtime).contains(&"during the linger".to_string()), "pushed during the linger");
+
+        // A sync the budget cuts short (a peer that stalls) isn't a check.
+        std::thread::sleep(Duration::from_millis(5));
+        let recorded = background::last_catch_up_for_test();
+        let ticket = background::begin_catch_up();
+        assert!(!background::stalled_catch_up_for_test(ticket, Duration::from_secs(4)));
+        assert_eq!(background::last_catch_up_for_test(), recorded, "an incomplete catch-up isn't recorded");
+
+        tauri::async_runtime::block_on(alice.shutdown()).unwrap();
+        let _ = std::fs::remove_dir_all(&alice_dir);
+        tauri::async_runtime::block_on(core.runtime.shutdown()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&empty);
+    }
 }
