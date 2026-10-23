@@ -216,11 +216,18 @@ receiver attests it with the chain it holds from that sender if that is
 of the announcement's epoch, as long as its hops (+ 1 with the sender's
 own hop) and the announcement claims no less than it allows (the sender's
 hop's cost, or without one the last hop's cost plus link); otherwise it
-takes it unattested and asks once per epoch with a `T_SEQREQ` of hops 1
-and the seqno it got, which the sender answers with the chain (to it
-alone, within its signature budget; an origin asked, with hops 1, for
-the seqno it sent last answers that neighbour only, not with a fresh
-announcement to everyone).
+takes it unattested and, if the route would then beat every usable
+attested route it has through another neighbour, asks once per epoch and
+sender with a `T_SEQREQ` of hops 1 and the seqno it got, which the sender
+answers with the chain (to it alone, within its signature budget; an
+origin asked, with hops 1, for the seqno it sent last answers that
+neighbour only, not with a fresh announcement to everyone). A sender also
+sends `A_SAME`, whether or not the receiver holds a chain of its, to a
+neighbour that sent it an attested route to that origin no costlier than
+its own plus its link to that neighbour: such a neighbour doesn't route
+through it, and asks (as above) if that changes. `A_SAME` is a claim the
+receiver checks, never trusted: without a chain that bounds it, the route
+is unattested.
 Retractions are never attested (`T_OGM`/`T_OGMS`).
 `mycel/v0/mesh-verified-hop` keys the device-local cache of hops checked
 (it never leaves the device).
@@ -592,7 +599,7 @@ ignored or carried unread.
 | `version_tests::unknown_stream_kinds_are_refused_cleanly` | An unknown bi or uni stream kind is refused in under 5 s with `StreamRefused` and the connection carries on; a hello on a v1 connection is refused too |
 | `version_tests::bundles_of_an_unknown_payload_kind_are_refused_unread` | The destination refuses an unknown payload kind with a typed error |
 | `mesh::tests::hops_negotiate_versions_and_capabilities` | Mesh hops: v2 with shared capabilities between v2 devices, v1 with none to a v1 device |
-| `mesh::core::attest_tests::*`, `mesh::wire::tests::attested_announcements_round_trip_and_verify`, `malformed_attested_announcements_are_dropped`, `refreshes_without_their_chain_cost_what_version_1_does` | `ROUTE_ATTEST` with real Ed25519: chains round-trip and every hop verifies naming the next, within its epoch only; a relay claiming a cheaper link than its upstream signed, a forged, raised, replayed (an epoch later, or under a seqno the origin didn't sign), truncated or re-addressed chain is refused and its sender distrusted; refreshes without their chain are attested by the chain held from their sender only (not from another neighbour, not an epoch later, never claiming less than it allows), cost what a `T_OGM` does, and a missing chain is asked for and re-sent to the asker alone; a relay re-sends its chain only when it changes, the epoch turns or the hop reconnects; a path through the receiver is a loop, not a lie; a mixed mesh (one device without the capability) routes everyone, prefers the attested route though costlier, and falls back to the other; the greeting waits for the hello; signature checks are cached across copies and budgeted per neighbour |
+| `mesh::core::attest_tests::*`, `mesh::wire::tests::attested_announcements_round_trip_and_verify`, `malformed_attested_announcements_are_dropped`, `refreshes_without_their_chain_cost_what_version_1_does` | `ROUTE_ATTEST` with real Ed25519: chains round-trip and every hop verifies naming the next, within its epoch only; a relay claiming a cheaper link than its upstream signed, a forged, raised, replayed (an epoch later, or under a seqno the origin didn't sign), truncated or re-addressed chain is refused and its sender distrusted; refreshes without their chain are attested by the chain held from their sender only (not from another neighbour, not an epoch later, never claiming less than it allows), cost what a `T_OGM` does, and a missing chain is asked for (only when its route would be the receiver's best, once an epoch per sender) and re-sent to the asker alone; a neighbour whose attested route beats ours gets our copies without the chain, one whose route came unattested gets it; a relay re-sends its chain only when it changes, the epoch turns or the hop reconnects; a path through the receiver is a loop, not a lie; a mixed mesh (one device without the capability) routes everyone, prefers the attested route though costlier, and falls back to the other; the greeting waits for the hello; signature checks are cached across copies and budgeted per neighbour |
 | `mesh::tests::bundles_cross_hops_by_their_format` | A carrier carries a v2 bundle of an unknown payload kind, refuses an unknown header version, and a v2 bundle is never offered over a v1 hop (`encode_offer` gives nothing, and the v1 carrier refuses nothing: it was never asked); v1 bundles cross both |
 | `mesh::tests::the_planner_sends_bundles_only_over_hops_that_take_their_format` | Through the planner (`Mesh::send_bundle_as`): a v2 bundle reaches only the v2 neighbour and is never offered to the v1 one; a v1 bundle then reaches both |
 | `mesh::v1_vectors::*` | Every version 1 encoding byte for byte against vectors printed by main `98d9b7b`: ALPNs, stream kinds, every `SyncMsg` (one carrying a signed op and an envelope), `DtnPayload`, `EphMsg`, every blob request and answer, a contact card and its signature, a signed announcement, a `T_OGMS` pair, a `T_SEQREQ`, a data-frame header and a control frame's, a bundle id and signature, a `K_OFFER` frame, offer answers, a receipt, a carrier summary; and that this build decodes them. Not pinned: the reachability record inside a control frame (pkarr-signed, with a timestamp) |
