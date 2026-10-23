@@ -764,13 +764,13 @@ that gap (design record and measurements: [OFFLINE_DELIVERY.md](OFFLINE_DELIVERY
   share a space with the recipient, then volunteers XOR-closest to the
   recipient's key: each device keeps the custodians it has talked to in
   Kademlia k-buckets (16 per bucket, old live entries kept) and answers
-  `Find{target}` with its 8 closest; a lookup asks 3, then the 3 closest of
-  what they named. The recipient looks up its own key and finds the same
+  `Find{target}` with its 8 closest, never naming its own contacts; a lookup
+  asks 3, then the 3 closest of what they named. The recipient looks up its own key and finds the same
   ones, with no index.
 - **Delivery:** the recipient asks every custodian it connects to, and every
-  30 min the 3 closest to its key; a custodian pushes when the recipient
+  30 min the 8 closest to its key; a custodian pushes when the recipient
   connects to it, and dials it (a record lookup) with backoff from 1 min to
-  1 h. Only the key on the other end of the QUIC connection gets its
+  1 h, recipients taking turns. Only the key on the other end of the QUIC connection gets its
   parcels. Receipts drop copies; the sender withdraws its parcels after a
   live sync.
 - **Not a relay:** custodians never pass parcels on, so there is no
@@ -783,9 +783,10 @@ that gap (design record and measurements: [OFFLINE_DELIVERY.md](OFFLINE_DELIVERY
   union of custodians that acknowledged a parcel and neighbours that took
   our bundle.
 - **Measured** (`offline-recipient`, 12 seeds, internet-only devices in
-  four time zones): messages sent while the recipient was offline reach it
-  within 1 h 59.9% of the time instead of 32.7%, within 4 h 85.9% instead of
-  68.5%; p50 latency 1,508 s instead of 4,109 s.
+  four time zones, delivery per tier as the build does it): messages sent
+  while the recipient was offline reach it within 1 h 46.5% of the time
+  instead of 32.5%, within 4 h 78.5% instead of 68.0%; p50 latency 2,213 s
+  instead of 4,043 s (CI size; 50.3% / 82.4% at 2,000 people).
 
 ## 8. Why not route globally over Bluetooth alone
 

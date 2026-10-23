@@ -438,7 +438,7 @@ frame at most 300 KiB, later ones 2 MiB plus 64 KiB):
 | fetch | `Fetch` | the delivery rounds below, the custodian listing first |
 | delivery (custodian opens) | `Listing{items: [(id, size)]}` (≤ 64) | `Take{want, receipts}` → `Parcels{parcels}` (≤ 2 MiB) → `Receipts{receipts}`, repeated until an empty `Listing` |
 | release | `Release{id, secret}` | `Released{ok}` |
-| lookup | `Find{target}` | `Found{custodians}` (≤ 8 keys, XOR-closest to `target`) |
+| lookup | `Find{target}` | `Found{custodians}` (≤ 8 keys, XOR-closest to `target`; never a device the answerer shares a space with) |
 
 `Msg` and `Refusal` variants are only ever appended; a new one needs a capability.
 

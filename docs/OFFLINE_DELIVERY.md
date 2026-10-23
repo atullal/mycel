@@ -62,9 +62,11 @@ sealed sender inside, and SimpleX-style recipient-authenticated pull:
 2. **Volunteers without an index**: every device keeps the custodians it has
    talked to in Kademlia k-buckets (`custody::Directory`, 16 per bucket,
    keeping old live entries as Kademlia does), and answers `Find{target}`
-   with the 8 closest it knows. A lookup asks the 3 closest known, then the
-   3 closest of what they named (two rounds of α = 3). Sender and recipient
-   both look up the recipient's key, so they find the same custodians. Keys
+   with the 8 closest it knows, leaving out devices it shares a space with
+   (its contacts: an answer to anyone must not hand out its social graph).
+   A lookup asks the 3 closest known, then the 3 closest of what they named
+   (two rounds of α = 3). Sender and recipient both look up the recipient's
+   key, so they find the same custodians if their lookups converge. Keys
    from answers are only candidates for that lookup; a device enters the
    directory only after its own hello advertised custody, so others' answers
    can't fill it.
@@ -102,28 +104,39 @@ routing every deposit (a large build for a privacy gain the threat model in
    items (`MAX_BUNDLE_PAYLOAD`), with the space's ops the first time. So a
    backlog goes out as successive parcels, not the same one again. Sealed
    (`custody::seal`), registered in the outbox as pending.
-3. `candidates`: the tiers above; within the first two, devices seen online
+3. `candidates`: the tiers above (co-members whose last hello said they
+   keep no custody are skipped); within the first two, devices seen online
    first, then a fixed order per recipient (rendezvous hash) so retries go
-   to the same devices.
+   to the same devices. Volunteers come in XOR order whether online or not
+   (the directory knows no presence), so dials to offline ones use up some
+   of the 8 attempts.
 4. Deposits run in parallel to the first 3; each failure (offline,
    refusal) starts the next candidate. A custodian that shares no space with
    the sender asks for a proof of work, so the sender mints one for it
    (bound to that parcel and that custodian). Each `Stored` answer is an
    acknowledgement: the outbox records the custodian and the app's delivery
    state changes.
-5. A live sync with the member later withdraws its parcels (`Release`).
+5. A live sync with the member later withdraws its parcels (`Release`);
+   one still being deposited is withdrawn when depositing is over.
 
 ### Keeping and delivering
 
 - A custodian stores the parcel in its `Vault` (limits in §5).
 - **Pull**: a device asks for its mail ("anything for me?", `Fetch`) of every
   custodian it connects to (at most every 10 min per custodian, and only
-  custodians it dialed or shares a space with), and every 30 min of the 3
-  custodians closest to its own key.
+  custodians it dialed or shares a space with), and every 30 min of every
+  custodian a lookup of its own key names (8: senders go down that list
+  past offline volunteers, so copies often land beyond the closest 3).
 - **Push**: a custodian holding mail for a device delivers when that device
   connects to it, and otherwise tries to dial it (which looks up its
   record, so a device whose record says it is online is reached), backing
-  off from 1 min to 1 h, at most 4 new attempts every 10 s.
+  off from 1 min to 1 h, at most 4 new attempts every 10 s, taken in turn:
+  recipients it shares a space with first, then the longest waiting (so
+  parcels for made-up recipients can't starve a real one).
+- **Junk**: a parcel addressed to the recipient, in a format it reads, that
+  doesn't open (anyone may deposit for anyone) is receipted like a good
+  one, so the custodian drops it after one delivery instead of pushing it
+  again on every retry and fetch until it expires.
 - **Rounds**: `Listing` (ids and sizes) → `Take` (what it lacks, receipts
   for what it already has) → `Parcels` (up to 2 MiB) → `Receipts`, until
   the listing is empty or a round makes no progress. The recipient opens
@@ -151,14 +164,14 @@ Custody is on by default with conservative limits (`VaultConfig::default`):
 | Store | 32 MiB | Half the mesh carrier's 64 MiB, on top of it |
 | Parcel | 256 KiB | The carrier's bundle cap |
 | Per depositor key | 2 MiB, 256 parcels (twice for a device that shares a space with us) | One device can't take the store |
-| Per source address | 8 MiB per IPv4 address or IPv6 /64; 16 MiB for everyone behind the internet relay | Fresh keys are free; addresses aren't |
-| Per recipient | 4 MiB | Nobody can bury one victim's mailbox, nor make one recipient cost the custodian the store |
+| Per source address (strangers only) | 8 MiB per IPv4 address or IPv6 /64; 16 MiB for everyone behind the internet relay | Fresh keys are free; addresses aren't (though someone with a whole IPv6 /48 has 65,536 /64s). A device sharing a space with us isn't a fresh key, so a flood behind the relay can't lock it out |
+| Per recipient | 4 MiB; when full, room comes from the stranger holding the most of it (a co-member's deposit may evict any stranger's) | Nobody can bury one victim's mailbox, lock it with junk, nor make one recipient cost the custodian the store |
 | Parcels in total | 8,192 | Small parcels can't exhaust memory by count |
 | Lifetime | At most 7 days from arrival (parcels ask 3 days) | As carriers |
 | Clock skew | `created` at most 10 min in the future | |
 | Deposit rate | Per key: 32, then one per 2 s; per address: 128, then one per 0.5 s | Bursts, then a trickle |
 | Proof of work | 16 bits (about 65,000 BLAKE3 hashes) from depositors that share no space with the custodian, bound to the parcel and the custodian | A fresh key must pay, and a stamp is good once, at one custodian |
-| When full | The soonest-expiring parcel of the biggest depositor goes, only if it holds more than the newcomer would | A flood evicts itself, never a small depositor |
+| When full | The soonest-expiring parcel of the biggest depositor goes, only if it holds more than the newcomer would; strangers go before co-members, and a stranger never evicts a co-member; at most 64 parcels per deposit | A flood evicts itself, never a small depositor; a deposit's cost is bounded |
 | Find, fetch | 16 lookups (then one per s) and 8 fetches (then one per 5 s) per peer | |
 
 - **No amplification**: custodians never pass parcels to other custodians;
@@ -169,6 +182,12 @@ Custody is on by default with conservative limits (`VaultConfig::default`):
   the other end of the connection; a parcel for someone else is never
   listed or handed out, receipts are verified against the parcel's
   recipient, and a release needs the sender's secret.
+- **Contacts stay private**: a `Find` answer never names a device the
+  answerer shares a space with, though its directory holds them (they
+  advertised custody when they connected). Without that, anyone could read
+  a device's contacts out of its directory with a few hundred lookups from
+  fresh keys. It may name devices that connected to it without sharing a
+  space (for instance, depositors).
 - **Sybil and eclipse**: grinding keys close to a target is cheap, so a
   volunteer tier alone could be captured; the first two tiers (own devices,
   co-members) come before volunteers, and a captured volunteer can only
@@ -193,6 +212,7 @@ Custody is on by default with conservative limits (`VaultConfig::default`):
 | **Who deposited it** (key and address) | The QUIC connection. In the common case that is the sender. If the sender deposits through one of its own devices, that device learns it instead |
 | The recipient's address when it fetches | The QUIC connection |
 | That the depositor and recipient are probably in contact | Both of the above |
+| That a device talks to it, for anyone who asks it `Find` | Its directory: devices that advertised custody when they connected and share no space with it (never its contacts) |
 
 It does **not** learn the content, the space, the other members, the
 sender's identity from the parcel itself (a parcel at rest, or handed on,
@@ -215,7 +235,7 @@ cover parcels too.
 
 ## 7. Measured
 
-- **Unit tests** (`cargo test -p mycel-net --lib custody`, 14 tests): parcels
+- **Unit tests** (`cargo test -p mycel-net --lib custody`, 18 tests): parcels
   open only for their recipient and carry no sender in the clear; the header
   can't be changed or re-addressed; padding classes; stamps bind parcel and
   custodian; a custodian delivers only to the recipient and drops on a
@@ -223,9 +243,12 @@ cover parcels too.
   don't; malformed, expired, oversized and newer-format parcels are
   refused; a spammer hits its depositor share, then fresh keys from one
   address hit the address share, bursts hit the rate limit; a full store
-  evicts from the biggest depositor only; selection order; the directory's
-  bucket policy; the outbox's coverage, acknowledgements and release.
-- **Real QUIC nodes** (`cargo test -p mycel-net --test custody`, 3 tests, loopback):
+  evicts from the biggest depositor only; a full mailbox makes room from
+  strangers, never from co-members; a shared address doesn't lock out
+  co-members; one deposit evicts at most 64 parcels; pushes take turns;
+  selection order; the directory's bucket policy; the outbox's coverage,
+  acknowledgements and release (also of a parcel settled after a live sync).
+- **Real QUIC nodes** (`cargo test -p mycel-net --test custody`, 5 tests, loopback):
   - A writes to B while B is offline; C (in a group with A and B) takes
     custody about 16 s after the write (the live attempt has to fail
     first: a dial to a dead address times out); A shuts down; Eve fetching
@@ -236,6 +259,9 @@ cover parcels too.
     proof of work, B finds the volunteer by looking up its own key.
   - A stranger flooding a custodian is cut off with `DepositorShare` within
     its 48 KiB share; an honest device's deposit is still stored.
+  - Junk deposited for B is fetched once: B receipts it, the custodian
+    drops it, and a second fetch costs nothing.
+  - A stranger's lookup through V names V but not V's contact A.
 - **Runtime** (`cargo test -p mycel-node --test runtime
   a_message_to_an_offline_device_is_carried_and_delivered_later`): through the
   whole app API, a message to an offline device reads `Local`, then
@@ -244,25 +270,37 @@ cover parcels too.
 - **Simulation** (`offline-recipient`, tier 2, `crates/mycel-sim/src/tier2/custody.rs`;
   [SIMULATION.md](SIMULATION.md)): internet-only devices in four time zones,
   phones used 07–23 local and online a quarter of that in ~15 min spells,
-  half the people with a laptop, 5% with an always-on device, 10% of direct
-  chats with a keeper, 30% of phones refusing custody; the real `select` and
-  `Vault`. 12 seeds per run, "keepers only" (before) against custodians:
+  half the people with a laptop (a device of its own: it can volunteer),
+  5% with an always-on device, 10% of direct chats with a keeper, 30% of
+  phones refusing custody; the real `select` and `Vault`. Delivery follows
+  the build per tier: a co-member custodian's copy when the recipient next
+  syncs with it; a volunteer's (among the 8 closest to the recipient's key)
+  at the recipient's next periodic fetch, every 30 min, that finds both
+  online; any custodian's at one of its pushes (now, then 2, 4, 8 ... min,
+  at most an hour apart) that finds both online. 12 seeds per run, "keepers
+  only" (before) against custodians:
 
   | Messages sent while the recipient was offline | Keepers only | Custodians |
   |---|---|---|
-  | Delivered within 1 h (200 people, CI size, seeds from 1) | 32.7% | **59.9%** |
-  | Delivered within 4 h | 68.5% | **85.9%** |
-  | Delivered within 24 h | 99.6% | 100.0% |
-  | Latency p50 / p95 (all messages) | 4,109 s / 50,555 s | **1,508 s / 29,505 s** |
-  | Within 1 h / 4 h, 2,000 people, seeds from 2000 | 34.2% / 71.2% | **62.7% / 88.4%** |
+  | Delivered within 1 h (200 people, CI size, seeds from 1) | 32.5% | **46.5%** |
+  | Delivered within 4 h | 68.0% | **78.5%** |
+  | Delivered within 24 h | 99.5% | 99.9% |
+  | Latency p50 / p95 (all messages) | 4,043 s / 51,498 s | **2,213 s / 39,318 s** |
+  | Within 1 h / 4 h, 2,000 people, seeds from 2000 | 34.7% / 71.4% | **50.3% / 82.4%** |
 
-  98.4% of those messages found a custodian, 2.89 on average; the busiest
-  custodian held 27 KB. Within a day both reach ~100% (everyone is awake at
-  some point): custody changes how soon. The tail is set by time zones (a
-  recipient asleep until morning), which no custodian shortens. The model
-  favours custody in two ways, stated in the scenario: the XOR lookup is
-  taken as converged, and a custodian and recipient online together are
-  taken to find each other within a second.
+  86% of those messages found a custodian, 2.0 on average (the rest spent
+  their 8 attempts on offline devices); the busiest custodian held 22 KB.
+  Within a day both reach ~100% (everyone is awake at some point): custody
+  changes how soon. The tail is set by time zones (a recipient asleep until
+  morning), which no custodian shortens, and by pushes backing off to an
+  hour while phones are online ~15 min at a time. The model favours custody
+  in three ways, stated in the scenario: the sender's and recipient's XOR
+  lookups are taken as converged, a dial to an online device reaches it at
+  once, and a person's always-on device is taken to be a keeper of their
+  chats. (A first version of this scenario reported 59.9% / 85.9%: it
+  counted laptops as "own devices", let volunteers be only those online at
+  that moment, and delivered from any custodian the first second both were
+  online. A review found all three, and the model now follows the build.)
 - **Fuzzing** (`fuzz/fuzz_targets/custody.rs`): the custody messages, parcel
   opening, and a store driven by hostile steps with `Vault::check` after
   each: 159,453 inputs in 3 minutes, no finding.
@@ -285,6 +323,19 @@ cover parcels too.
 - **Lookup convergence**: two rounds of α = 3 over each device's directory;
   in a large network without shared contacts a sender's and a recipient's
   lookups may find different volunteers. The simulator assumes they agree.
+  Leaving contacts out of `Find` answers (§5) makes directories thinner
+  still: volunteers become known mostly through devices that connected
+  without sharing a space.
+- **Push latency**: a custodian that isn't a co-member reaches the recipient
+  only at its pushes (backing off to an hour) or the recipient's 30-min
+  fetch, while a phone is online ~15 min at a time; a fetch when the device
+  comes back online would close much of that gap and isn't built.
+- **Sender restarts**: the outbox (what is in custody, and the secrets that
+  withdraw it) is in memory too; after a restart the sender re-deposits
+  what is still undelivered and can't withdraw the old copies, so the
+  recipient may get a parcel twice (applying it twice changes nothing).
+- **Big spaces**: the first parcel carries every op of the space; a space
+  whose ops alone exceed 200 KB gets no parcels (sync has to do).
 - **Parcels repeat what bundles carry**: a sender with mesh neighbours sends
   both a carrier bundle and custody parcels for the same envelopes. Both
   are bounded; receipts and releases clear them.
