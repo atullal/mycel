@@ -27,7 +27,7 @@ nix.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 futures-util = "0.3"
-zbus = { version = "5.19.0", default-features = false, features = ["tokio"] }
+zbus = { version = "6.0.0", default-features = false, features = ["tokio"] }
 
 [dev-dependencies]
 mycel-sync = { version = "0.1.0", path = "../mycel-sync" }
