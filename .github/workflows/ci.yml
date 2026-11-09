@@ -66,7 +66,7 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libdbus-1-dev libasound2-dev libssl-dev pkg-config
       - run: rustup toolchain install --no-self-update
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
@@ -94,7 +94,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config
       - run: rustup toolchain install --no-self-update
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # How late this runner wakes a sleeping process. The hosted macOS
@@ -147,7 +147,7 @@ jobs:
       - name: System libraries
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config
       - run: rustup toolchain install --no-self-update
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # No retries: a security regression must stay a failure.
@@ -171,7 +171,7 @@ jobs:
       - name: System libraries
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config
       - run: rustup toolchain install --no-self-update
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # Broken intra-doc links and stray HTML in doc comments fail the build.
@@ -213,7 +213,7 @@ jobs:
           persist-credentials: false
       # cargo-deny reads the dependency graph with this toolchain's cargo.
       - run: rustup toolchain install --no-self-update
-      - uses: taiki-e/install-action@1168f6810a3cb30a3514bf5756a3b7f0422c6df8 # v2.87.28
+      - uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: cargo-deny@0.20.2
       # Advisories, licences, bans and sources (deny.toml).
@@ -298,7 +298,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: crate-ci/typos@7f9d0819ca1c008ade73f4b41fa9d258d48f605b # v1.51.1
+      - uses: crate-ci/typos@4c8b7f51ca60df14e3c5ca82770dfbbe6c3dae85 # v1.52.0
 
   workflows:
     name: Workflows (actionlint, zizmor)
@@ -322,7 +322,7 @@ jobs:
           tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" actionlint
           # The runner's preinstalled ShellCheck also checks every run: script.
           "$RUNNER_TEMP/actionlint" -color
-      - uses: zizmorcore/zizmor-action@f9597c869b2e67095f9b527070297a13a6efe928 # v0.7.0
+      - uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
         with:
           version: 1.31.0
           inputs: .github/workflows .github/dependabot.yml
@@ -339,7 +339,7 @@ jobs:
         with:
           persist-credentials: false
       # The checked-in gradle-wrapper.jar must be an official Gradle build.
-      - uses: gradle/actions/wrapper-validation@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+      - uses: gradle/actions/wrapper-validation@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
 
   result:
     name: CI result
