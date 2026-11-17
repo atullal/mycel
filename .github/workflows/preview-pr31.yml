@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: be32b3bf76eccec86e2a2b21cbcc16862eecb687
+          ref: 9061f00874e544c65154f1f87a735f267f09432d
           persist-credentials: false
       - name: Test globe and download offers
         run: |
@@ -69,15 +69,30 @@ jobs:
                   }));
                   const animations=await figure.evaluate(el=>el.getAnimations({subtree:true}).length);
                   assert(motion?animations===0:animations>0);
-                  const broken=await figure.locator('use').evaluateAll(nodes=>nodes.filter(node=>!document.getElementById(node.getAttribute('href').slice(1))||node.getBBox().width===0).length);
-                  assert.equal(broken,0);
+                  const object=figure.locator('..');
+                  const face=figure.locator('rect.deck').last();
+                  const point=await face.evaluate(el=>{
+                    const box=el.getBBox(), pt=new DOMPoint(box.x+box.width/2,box.y+box.height/2).matrixTransform(el.getScreenCTM());
+                    return {x:pt.x,y:pt.y};
+                  });
+                  await page.mouse.click(point.x,point.y);
+                  assert.equal(await object.getAttribute('data-state'),'1');
+                  const button=object.locator('button');
+                  const actions=(await object.getAttribute('data-actions')).split('|');
+                  const states=(await object.getAttribute('data-states')).split('|');
+                  assert.equal(await object.locator('output').innerText(),states[1]);
+                  for(let j=2;j<=states.length;j++){
+                    await button.focus(); await button.press('Enter');
+                    assert.equal(await object.locator('output').innerText(),states[j%states.length]);
+                    assert.equal(await button.innerText(),actions[j%states.length]);
+                  }
                 }
                 const section=page.locator('#how');
                 const columns=await section.locator('.mechanism-grid').evaluate(el=>getComputedStyle(el).gridTemplateColumns.split(' ').length);
                 assert.equal(columns,name==='mobile'?1:2);
                 await page.evaluate(()=>Promise.all(document.querySelector('#how').getAnimations({subtree:true}).map(a=>a.finished)));
                 const data=(await (name==='mobile'?section.locator('article').first():section).screenshot({type:'jpeg',quality:60})).toString('base64');
-                for(let i=0;i<data.length;i+=3500) console.log('FIGURE_IMG '+name+' '+i+' '+data.slice(i,i+3500));
+                for(let i=0;i<data.length;i+=3500) console.log('ISO_IMG '+name+' '+i+' '+data.slice(i,i+3500));
               }
               await page.close();
             }
