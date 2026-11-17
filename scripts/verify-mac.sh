@@ -14,11 +14,12 @@ verify_signature() {
   local details
   details="$(codesign -dvvv "$1" 2>&1)"
   echo "$details"
-  echo "$details" | grep -q '^Timestamp='
+  # Read all output: grep -q can SIGPIPE codesign under pipefail.
+  echo "$details" | grep '^Timestamp=' >/dev/null
 }
 verify_app() {
   verify_signature "$1"
-  codesign -dvvv "$1" 2>&1 | grep -q 'flags=.*(.*runtime.*)'
+  codesign -dvvv "$1" 2>&1 | grep 'flags=.*(.*runtime.*)' >/dev/null
   xcrun stapler validate "$1"
   spctl --assess --type execute --verbose=2 "$1"
 }

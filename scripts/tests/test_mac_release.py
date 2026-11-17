@@ -30,7 +30,9 @@ elif name == 'xcrun':
     elif args[:2] == ['stapler', 'validate'] and os.environ.get('MOCK_STAPLER_FAIL'):
         sys.exit(1)
 elif name == 'codesign' and '-dvvv' in args:
-    print('Timestamp=Nov 17, 2026\nCodeDirectory flags=0x10000(runtime)', file=sys.stderr)
+    print('Timestamp=Nov 17, 2026\nCodeDirectory flags=0x10000(runtime)', file=sys.stderr, flush=True)
+    if os.environ.get('MOCK_STREAM_SIGNATURE_DETAILS'):
+        for _ in range(64): os.write(2, b'x' * 1024 + b'\n')
 elif name == 'spctl':
     if os.environ.get('MOCK_MOUNTED_APP_FAIL') and '/Mycel.app' in args[-1] and '/image/' not in args[-1] and '/extracted/' not in args[-1]:
         sys.exit(1)
@@ -119,6 +121,11 @@ class MacReleaseTests(unittest.TestCase):
         self.assert_no_packages()
         calls = [json.loads(line) for line in (self.root/'calls.jsonl').read_text().splitlines()]
         self.assertTrue(any(c[0] == 'hdiutil' and c[1] == 'detach' for c in calls))
+
+    def test_streamed_signature_details_do_not_abort_publication(self):
+        result = self.run_package(MYCEL_SIGN_IDENTITY=IDENTITY, MYCEL_NOTARY_PROFILE='test', MOCK_STREAM_SIGNATURE_DETAILS='1')
+        self.assertEqual(result.returncode, 0, result.stderr[-1000:])
+        self.assertEqual(len(list((self.root/'dist-release').glob('Mycel_*'))), 2)
 
     def test_missing_staple_blocks_publication(self):
         result = self.run_package(MYCEL_SIGN_IDENTITY=IDENTITY, MYCEL_NOTARY_PROFILE='test', MOCK_STAPLER_FAIL='1')
