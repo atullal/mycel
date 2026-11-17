@@ -287,7 +287,6 @@ footer {
 }
 
 /* Six small ink drawings, each paired with its explanation. */
-.figure-symbols { position: absolute; width: 0; height: 0; overflow: hidden; }
 .mechanism-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -295,59 +294,59 @@ footer {
   margin-top: 32px;
 }
 .mechanism-grid article { border-top: 1px solid var(--line); padding-top: 16px; }
+
+.iso-figure { margin: 8px 0 20px; }
 .mechanism-drawing {
-  display: block;
-  width: 100%;
-  max-width: 420px;
-  height: auto;
-  margin: 12px auto 16px;
-  color: var(--ink);
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.35;
-  stroke-linejoin: round;
-  stroke-linecap: round;
+  display: block; width: 100%; max-width: 416px; margin: 0 auto;
+  stroke: var(--ink); stroke-width: 1.1; fill: none;
+  stroke-linejoin: round; stroke-linecap: round;
 }
-.mechanism-drawing :is(path, circle, rect) { vector-effect: non-scaling-stroke; }
-.mechanism-drawing :is(use, .paper, .relay-ring) { fill: var(--bg); }
-.mechanism-drawing .trace { stroke: var(--line-strong); stroke-dasharray: 2 4; }
-.mechanism-drawing text {
-  fill: var(--ink-2);
-  stroke: none;
-  text-anchor: middle;
-  font: 11px var(--font-mono);
+.mechanism-drawing :is(path, rect) { vector-effect: non-scaling-stroke; }
+.mechanism-drawing .deck { fill: var(--bg); }
+.mechanism-drawing .front-face { fill: oklch(91% .015 108); }
+.mechanism-drawing .side-face { fill: oklch(85% .019 120); }
+.mechanism-drawing .glass { fill: oklch(91% .023 120); }
+.mechanism-drawing .slot, .mechanism-drawing .ink { fill: var(--ink); }
+.mechanism-drawing .detail { fill: none; stroke-width: 1; }
+.mechanism-drawing text { stroke: none; fill: var(--ink); font: 6.5px var(--font-mono); }
+.mechanism-drawing .guide { stroke: var(--line-strong); stroke-dasharray: 2 5; }
+.iso-figure figcaption {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+  min-height: 36px; gap: 4px 12px; border-bottom: 1px solid var(--line);
 }
-.mechanism-drawing .layer-label { text-anchor: start; }
-.file-pieces rect { fill: var(--accent); }
+.iso-figure button {
+  padding: 6px 0; border: 0; background: transparent; color: var(--accent);
+  font: inherit; font-size: .86rem; cursor: pointer; text-decoration: underline; text-underline-offset: 3px;
+}
+.iso-figure button:active { color: var(--ink); }
+.iso-figure output { margin-left: auto; color: var(--ink-2); font: .76rem var(--font-mono); }
+.iso-figure[data-state="1"] .seal-token { transform: translate(89px, 26px); }
+.iso-figure[data-state="1"] .carry-token { transform: translate(115px, 32px); }
+.iso-figure[data-state="0"] .wave { opacity: .4; }
+.iso-figure[data-state="1"] .member { opacity: .13; }
+.iso-figure[data-state="1"] .key-token { transform: translateY(-12px); }
+.iso-figure .mode-1, .iso-figure .mode-2 { display: none; }
+.iso-figure[data-state="1"] .mode-0, .iso-figure[data-state="2"] .mode-0 { display: none; }
+.iso-figure[data-state="1"] .mode-1, .iso-figure[data-state="2"] .mode-2 { display: block; }
+.iso-figure[data-state="0"] .key-0, .iso-figure[data-state="1"] .key-1, .iso-figure[data-state="2"] .key-2 { transform: translateY(3px); }
+.iso-figure[data-state="0"] .upper-layer { transform: translateY(28px); }
+.iso-figure[data-state="0"] .mid-layer { transform: translateY(14px); }
 @media (prefers-reduced-motion: no-preference) {
-  .illustrating .sealed-hop { animation: sealed-hop 2.6s ease-in-out both; }
-  .illustrating .radio-wave { animation: radio-wave 1.5s ease-out both; }
-  .illustrating .radio-wave + .radio-wave { animation-delay: .25s; }
-  .illustrating .radio-wave + .radio-wave + .radio-wave { animation-delay: .5s; }
-  .illustrating .carried { animation: carry-envelope 3.8s ease-in-out both; }
-  .illustrating .remove-member { stroke-dasharray: 40; animation: write-line .7s ease-out both; }
-  .illustrating .rotate-key { animation: rotate-key 1.4s .6s ease-in-out both; }
-  .illustrating .message-ink { stroke-dasharray: 40; animation: write-line .7s ease-in-out both; }
-  .illustrating .file-pieces rect { animation: file-piece .5s .6s both; }
-  .illustrating .file-pieces rect:nth-child(2) { animation-delay: .85s; }
-  .illustrating .file-pieces rect:nth-child(3) { animation-delay: 1.1s; }
-  .illustrating .voice-wave { transform-origin: 292px 55px; animation: voice-wave .6s 1.4s 2 ease-in-out; }
-  .illustrating .middle-layer { animation: spread-middle 1.6s ease-out both; }
-  .illustrating .top-layer { animation: spread-top 1.6s ease-out both; }
+  .iso-figure :is(.upper-layer,.mid-layer,.key-token,.mode-key,.carry-token,.seal-token) { transition: transform .55s ease-in-out; }
+  .iso-figure :is(.wave,.member) { transition: opacity .4s; }
+  .illustrating .seal-token { animation: seal-in 1.2s ease-out; }
+  .illustrating .wave { animation: discover 1.3s ease-out; }
+  .illustrating .wave-1 { animation-delay: .12s; }
+  .illustrating .wave-2 { animation-delay: .24s; }
+  .illustrating .carry-token { animation: carry-in 1.4s ease-out; }
+  .illustrating .key-token, .illustrating .mode-key { animation: key-in .9s ease-out; }
+  .illustrating .upper-layer { animation: stack-in 1.3s ease-out; }
 }
-@keyframes sealed-hop { from { transform: translateX(-186px); } to { transform: translateX(0); } }
-@keyframes radio-wave { from { opacity: .12; transform: translateX(-8px); } to { opacity: 1; transform: translateX(0); } }
-@keyframes carry-envelope {
-  0% { transform: translateX(-230px); }
-  34%, 65% { transform: translateX(-115px); }
-  100% { transform: translateX(0); }
-}
-@keyframes write-line { from { stroke-dashoffset: 40; } to { stroke-dashoffset: 0; } }
-@keyframes rotate-key { from { transform: rotate(-160deg); } to { transform: rotate(0); } }
-@keyframes file-piece { from { opacity: .15; } to { opacity: 1; } }
-@keyframes voice-wave { 50% { transform: scaleY(.45); } }
-@keyframes spread-middle { from { transform: translateY(15px); } to { transform: translateY(0); } }
-@keyframes spread-top { from { transform: translateY(30px); } to { transform: translateY(0); } }
+@keyframes seal-in { from { transform: translate(-90px,14px); } }
+@keyframes carry-in { from { transform: translate(-100px,26px); } }
+@keyframes discover { 50% { opacity: 1; transform: translateX(3px); } }
+@keyframes key-in { 50% { transform: translateY(-5px); } }
+@keyframes stack-in { from { transform: translateY(0); } }
 @media (max-width: 720px) {
   .mechanism-grid { grid-template-columns: minmax(0, 1fr); gap: 28px; }
 }

@@ -87,3 +87,22 @@ if ('IntersectionObserver' in window) {
   }, { threshold: .65 });
   document.querySelectorAll('.mechanism-drawing').forEach(svg => illustrations.observe(svg));
 }
+
+// The drawing and its caption operate the same native keyboard-accessible control.
+for (const figure of document.querySelectorAll('.iso-figure')) {
+  const button = figure.querySelector('button');
+  const drawing = figure.querySelector('svg');
+  const output = figure.querySelector('output');
+  const actions = figure.dataset.actions.split('|');
+  const states = figure.dataset.states.split('|');
+  button.hidden = false;
+  drawing.style.cursor = 'pointer';
+  drawing.addEventListener('click', () => button.click());
+  button.addEventListener('click', () => {
+    drawing.classList.remove('illustrating');
+    const next = (Number(figure.dataset.state) + 1) % states.length;
+    figure.dataset.state = String(next);
+    output.value = states[next];
+    button.textContent = actions[next];
+  });
+}

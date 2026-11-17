@@ -9,6 +9,7 @@
 // SITE_RELEASE_JSON=<file> reads a saved release instead of asking GitHub
 // (for working on the page offline).
 
+import { renderFigure } from './isometric.mjs';
 import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -181,7 +182,8 @@ const version = versionOf(release);
 
 let page = await readFile(join(here, 'index.html'), 'utf8');
 const fill = {
-  HOW_IT_WORKS: await readFile(join(here, 'how-it-works.html'), 'utf8'),
+  HOW_IT_WORKS: (await readFile(join(here, 'how-it-works.html'), 'utf8'))
+    .replace(/\{\{FIGURE_(\w+)\}\}/g, (_, id) => renderFigure(id)),
   HERO_DOWNLOAD: heroDownload(release, builds, version),
   DOWNLOADS: downloads(release, builds, version),
   REPO_URL: repoUrl,

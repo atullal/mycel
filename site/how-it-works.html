@@ -1,82 +1,34 @@
 <section id="how" class="guide-section mechanisms wrap" aria-labelledby="how-title">
   <h2 id="how-title">How it works</h2>
-  <svg class="figure-symbols" aria-hidden="true" focusable="false" xmlns="http://www.w3.org/2000/svg">
-    <defs>
-      <g id="diagram-phone"><rect x="-15" y="-25" width="30" height="50" rx="5"/><path d="M-6 -21H6 M-4 20H4"/></g>
-      <g id="diagram-envelope"><rect x="-10" y="-7" width="20" height="14" rx="2"/><path d="m-9 -5 9 6 9-6"/></g>
-      <g id="diagram-key"><circle cx="-6" cy="0" r="4"/><path d="M-2 0h13m-3 0v4m-4-4v3"/></g>
-      <g id="diagram-layer"><path d="m112 66 50-23 54 20-51 25z M112 66v5l53 22 51-25v-5 M165 88v5"/></g>
-    </defs>
-  </svg>
   <div class="mechanism-grid">
     <article>
       <h3>No server holds your messages</h3>
-      <svg class="mechanism-drawing" viewBox="0 0 360 120" aria-hidden="true">
-        <path class="trace" d="M77 55H283"/>
-        <use href="#diagram-phone" x="62" y="55"/><use href="#diagram-key" x="62" y="55"/>
-        <use href="#diagram-phone" x="298" y="55"/><use href="#diagram-key" x="298" y="55"/>
-        <g class="relay-ring"><circle cx="180" cy="55" r="19"/><circle cx="180" cy="55" r="15"/></g>
-        <g class="sealed-hop"><use href="#diagram-envelope" x="273" y="55"/></g>
-        <text x="62" y="100">Sender’s key</text><text x="180" y="100">Relay</text><text x="298" y="100">Recipient’s key</text>
-      </svg>
+      {{FIGURE_seal}}
       <p>Each device keeps its own keys, encrypts messages end to end and checks what it receives. By default, Mycel uses n0’s lookup service to find peers and its public relays when a direct connection fails. Relays forward ciphertext. With those services off, devices can find peers through the BitTorrent DHT and relay for each other.</p>
     </article>
     <article>
       <h3>It works with no internet</h3>
-      <svg class="mechanism-drawing" viewBox="0 0 360 120" aria-hidden="true">
-        <use href="#diagram-phone" x="103" y="58"/>
-        <path class="paper" d="M225 39h47a3 3 0 0 1 3 3v31h-53V42a3 3 0 0 1 3-3ZM217 78h63l-5-5h-53z"/>
-        <g class="radio-wave"><path d="M132 49q10 9 0 18"/></g>
-        <g class="radio-wave"><path d="M144 42q18 16 0 32"/></g>
-        <g class="radio-wave"><path d="M157 35q26 23 0 46"/></g>
-        <path class="trace" d="M176 58h39"/>
-        <text x="180" y="100">Local only</text>
-      </svg>
+      {{FIGURE_local}}
       <p>Devices can talk directly on the same network or over a cable. On supported platforms they can also use Bluetooth or peer-to-peer Wi-Fi. Choose <strong>Local only</strong> in Network and restart Mycel to keep connections off the internet.</p>
     </article>
     <article>
       <h3>Every device carries for the others</h3>
-      <svg class="mechanism-drawing" viewBox="0 0 360 120" aria-hidden="true">
-        <path class="trace" d="M65 58h230"/>
-        <circle class="paper" cx="65" cy="58" r="7"/>
-        <g class="paper"><rect x="159" y="41" width="42" height="34" rx="4"/><path d="M159 51h42 M168 64h14"/><circle cx="191" cy="64" r="1"/></g>
-        <use href="#diagram-phone" x="295" y="58"/>
-        <g class="carried"><use href="#diagram-envelope" x="295" y="58"/></g>
-        <text x="65" y="100">Send</text><text x="180" y="100">Hold</text><text x="295" y="100">Deliver</text>
-      </svg>
+      {{FIGURE_carry}}
       <p>Devices can pass a sealed message along over several hops, or hold it while its recipient is offline. You can also choose an always-on device as a <em>keeper</em>. It stores and serves the chat without being able to read it.</p>
     </article>
     <article>
       <h3>Membership is signed, keys rotate</h3>
-      <svg class="mechanism-drawing" viewBox="0 0 360 120" aria-hidden="true">
-        <g class="paper"><rect x="65" y="25" width="67" height="60" rx="3"/><path d="M76 39h42M76 50h22m7-1 3 3 7-7M76 61h22m7-1 3 3 7-7"/><path class="remove-member" d="M76 72h40"/></g>
-        <path class="trace" d="M135 55h65"/>
-        <path d="M201 55a23 23 0 0 1 41-14m-1-6 2 7-7-1 M247 55a23 23 0 0 1-41 14m1 6-2-7 7 1"/>
-        <g transform="translate(224 55)"><g class="rotate-key"><use href="#diagram-key"/></g></g>
-        <text x="99" y="103">Signed roster</text><text x="224" y="103">New chat key</text>
-      </svg>
+      {{FIGURE_roster}}
       <p>Each chat keeps a signed record of its members. Removing a member changes the chat key. Keys also rotate on a schedule. Mycel seals each member’s keys using X25519 together with ML-KEM-768, a post-quantum scheme.</p>
     </article>
     <article>
       <h3>Chat, files and calls</h3>
-      <svg class="mechanism-drawing" viewBox="0 0 360 120" aria-hidden="true">
-        <g class="paper"><path d="M38 33h53q4 0 4 4v26q0 4-4 4H56l-12 9v-9h-6q-4 0-4-4V37q0-4 4-4Z"/><path class="message-ink" d="M46 45h35M46 55h23"/></g>
-        <g class="paper"><path d="M159 29h29l12 12v37h-41Z M188 29v12h12"/>
-          <g class="file-pieces"><rect x="165" y="59" width="7" height="9"/><rect x="176" y="59" width="7" height="9"/><rect x="187" y="59" width="7" height="9"/></g></g>
-        <path d="M258 55h8m48 0h9"/><g class="voice-wave"><path d="M270 49v12m7-21v30m7-39v48m7-38v28m7-22v16m7-23v30m7-19v8"/></g>
-        <text x="64" y="103">Message</text><text x="179" y="103">File</text><text x="292" y="103">Call</text>
-      </svg>
+      {{FIGURE_media}}
       <p>Direct and group chats support replies, edits, reactions and voice notes. Files of any size travel in pieces that are checked on arrival and resume after an interruption. Voice and video calls support up to eight people.</p>
     </article>
     <article>
       <h3>Open from top to bottom</h3>
-      <svg class="mechanism-drawing" viewBox="0 0 360 120" aria-hidden="true">
-        <g class="paper"><use href="#diagram-layer" transform="translate(0 11)"/>
-          <g class="middle-layer"><use href="#diagram-layer" transform="translate(0 -7)"/></g>
-          <g class="top-layer"><use href="#diagram-layer" transform="translate(0 -25)"/><path d="m151 37 6-6m13 1 6 3-7 4"/></g></g>
-        <path class="trace" d="M204 35h37 M214 56h27 M211 79h30"/>
-        <text class="layer-label" x="248" y="39">Apps</text><text class="layer-label" x="248" y="60">Protocol</text><text class="layer-label" x="248" y="83">Tests</text>
-      </svg>
+      {{FIGURE_stack}}
       <p>The apps, protocol and tests share <a href="{{REPO_URL}}">one repository</a>, under the MIT and Apache 2.0 licences. The <a href="{{REPO_URL}}/blob/main/docs/TRUST.md">security specification</a> explains what Mycel protects and where those protections end.</p>
     </article>
   </div>
