@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 5c7530211d0dca536e3143e09ffacf1234c418f0
+          ref: 4b4f0b3f760417c97bb9282a526c677ab3ed167f
           persist-credentials: false
       - name: Test globe and download offers
         run: |
@@ -35,12 +35,13 @@ jobs:
               ['Unknown','Unknown','','0','choose']
             ]){
               const width=touch?390:1440;
-              const page=await browser.newPage({viewport:{width,height:touch?844:900},userAgent:ua,reducedMotion:name==='desktop'?'no-preference':'reduce'});
+              const page=await browser.newPage({viewport:{width,height:touch?844:900},userAgent:ua,colorScheme:name==='mobile'?'dark':'light',reducedMotion:name==='desktop'?'no-preference':'reduce'});
               await page.addInitScript(([platform,touch])=>{
                 Object.defineProperties(navigator,{platform:{get:()=>platform},maxTouchPoints:{get:()=>Number(touch)},userAgentData:{get:()=>undefined}});
               },[platform,touch]);
               const errors=[];page.on('pageerror',e=>errors.push(e.message));
               await page.goto('http://127.0.0.1:4178/',{waitUntil:'networkidle'});
+              assert.equal(await page.evaluate(()=>getComputedStyle(document.documentElement).colorScheme),'light');
               const button=page.locator('.hero .button:visible');
               assert.equal(await button.count(),1);
               assert.equal(await button.getAttribute('data-system'),expected);
