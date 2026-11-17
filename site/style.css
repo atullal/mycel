@@ -320,33 +320,14 @@ footer {
 }
 .iso-figure button:active { color: var(--ink); }
 .iso-figure output { margin-left: auto; color: var(--ink-2); font: .76rem var(--font-mono); }
-.iso-figure[data-state="1"] .seal-token { transform: translate(89px, 26px); }
-.iso-figure[data-state="1"] .carry-token { transform: translate(115px, 32px); }
-.iso-figure[data-state="0"] .wave { opacity: .4; }
-.iso-figure[data-state="1"] .member { opacity: .13; }
-.iso-figure[data-state="1"] .key-token { transform: translateY(-12px); }
-.iso-figure .mode-1, .iso-figure .mode-2 { display: none; }
-.iso-figure[data-state="1"] .mode-0, .iso-figure[data-state="2"] .mode-0 { display: none; }
-.iso-figure[data-state="1"] .mode-1, .iso-figure[data-state="2"] .mode-2 { display: block; }
-.iso-figure[data-state="0"] .key-0, .iso-figure[data-state="1"] .key-1, .iso-figure[data-state="2"] .key-2 { transform: translateY(3px); }
-.iso-figure[data-state="0"] .upper-layer { transform: translateY(28px); }
-.iso-figure[data-state="0"] .mid-layer { transform: translateY(14px); }
-@media (prefers-reduced-motion: no-preference) {
-  .iso-figure :is(.upper-layer,.mid-layer,.key-token,.mode-key,.carry-token,.seal-token) { transition: transform .55s ease-in-out; }
-  .iso-figure :is(.wave,.member) { transition: opacity .4s; }
-  .illustrating .seal-token { animation: seal-in 1.2s ease-out; }
-  .illustrating .wave { animation: discover 1.3s ease-out; }
-  .illustrating .wave-1 { animation-delay: .12s; }
-  .illustrating .wave-2 { animation-delay: .24s; }
-  .illustrating .carry-token { animation: carry-in 1.4s ease-out; }
-  .illustrating .key-token, .illustrating .mode-key { animation: key-in .9s ease-out; }
-  .illustrating .upper-layer { animation: stack-in 1.3s ease-out; }
-}
-@keyframes seal-in { from { transform: translate(-90px,14px); } }
-@keyframes carry-in { from { transform: translate(-100px,26px); } }
-@keyframes discover { 50% { opacity: 1; transform: translateX(3px); } }
-@keyframes key-in { 50% { transform: translateY(-5px); } }
-@keyframes stack-in { from { transform: translateY(0); } }
+/* The static frame also works before the timeline is available. */
+.mechanism-drawing :is(.receipt,.local-packet,.local-receipt,.carry-receipt,.epoch-new,.mode-1,.mode-2) { opacity: 0; }
+.mechanism-drawing .keeper-light { fill: var(--accent); }
+.mechanism-drawing .wave { opacity: .25; }
+.mechanism-drawing .file-progress { stroke-dasharray: 14; }
+.mechanism-drawing .waveform { transform-box: fill-box; transform-origin: center; }
+.iso-figure [data-play] { color: var(--ink-2); }
+.iso-figure [data-step] { margin-right: 4px; }
 @media (max-width: 720px) {
   .mechanism-grid { grid-template-columns: minmax(0, 1fr); gap: 28px; }
 }
