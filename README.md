@@ -1,216 +1,175 @@
-# Mycel
-
-Mycel is a platform for private, peer-to-peer apps with no server. Every
-device keeps its own keys, encrypts end to end, and checks everything it
-receives; every device is also a router. Devices reach each other over the
-same network, over the internet by key, over Bluetooth and peer-to-peer
-Wi-Fi, and through other devices running Mycel, and messages for someone
-who is offline are carried toward them by devices that can't read them. It
-runs as one app on macOS, iPhone and iPad, Android, Windows and Linux, with
-Messaging (chat, files, voice and video calls) built on it.
-
-> **Experimental.** The cryptography and the trust layer have not had an
-> external audit. Don't rely on Mycel to keep anything secret or safe yet.
-
 <p align="center">
-  <img src="docs/screenshots/01-chat.png" width="840" alt="Mycel Messaging on a desktop: a one-to-one chat with Ines Duarte showing a shared map photo, a quoted reply that was edited, read receipts and the Encrypted badge. The conversation list on the left shows a message request from someone who is not a contact, a group, and which people are nearby or online.">
+  <img src="apps/host/public/mycel.svg" width="88" height="88" alt="">
+</p>
+<h1 align="center">Mycel</h1>
+<p align="center">Private messaging with no server.</p>
+<p align="center">
+  <a href="https://github.com/atullal/mycel/actions/workflows/ci.yml"><img src="https://github.com/atullal/mycel/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="#licence"><img src="https://img.shields.io/badge/licence-MIT%20or%20Apache--2.0-2d5e4b" alt="Licence: MIT or Apache-2.0"></a>
 </p>
 
-## What works today
+Mycel is a messaging app, and the platform under it, in which devices talk to
+each other directly. Every device keeps its own keys, encrypts end to end and
+checks everything it receives. When two devices have no direct path, other
+devices running Mycel carry the traffic between them without being able to
+read it, and hold messages for someone who is offline.
 
-- **Messaging:** direct chats and groups, message requests from strangers
-  (nothing is sent back or stored until you accept), replies, edits,
-  deletes, reactions, read receipts, typing, search, voice notes.
-- **Files of any size**, encrypted in pieces that are each checked as they
-  arrive, resumable, and downloaded from every device that has them at
-  once. A file for someone who is away waits with contacts and nearby
-  devices that agree to hold it; a file sent as *public* is stored and sent
-  once wherever it is used ([docs/TRUST.md](docs/TRUST.md) §7c).
-- **Voice and video calls**, 1:1 and groups of up to 8, device to device,
-  moving between paths mid-call.
-- **End-to-end encryption with signed membership.** Each chat is a space
-  with a signed membership graph, roles, and epoch keys sealed to each
-  reader; removing a member rotates the key. Every change is signed and
-  encrypted in its own envelope and checked before it is applied, so
-  always-on **keepers** can store and serve a chat without being able to
-  read it.
-- **Rules in WebAssembly:** the chat rules, written in Rust and compiled to
-  WASM, run deterministically on every peer.
-- **Every path at once:** the same network (mDNS; Bonjour on iOS), the
-  internet (hole punching, relays), Bluetooth LE, peer-to-peer Wi-Fi (Apple's
-  AWDL), and other network interfaces such as a cable between two computers.
-  Multipath QUIC adds up comparable paths and fails over between them.
-  Bluetooth has run between a real iPhone and Macs; peer-to-peer Wi-Fi and
-  Linux's Bluetooth and Wi-Fi Direct are built and tested on emulated links,
-  not between real devices.
-- **Every device a router:** a multi-hop mesh through nearby devices,
-  gateways that let a Bluetooth-only device be reached from anywhere (signed
-  records in the Mainline DHT), and store-and-forward through strangers.
-- **The internet without a server, if you choose:** by default Mycel uses
-  n0's public relay and DNS servers, which see only ciphertext. Switched
-  off (`MYCEL_RELAYS=none MYCEL_N0_DNS=0`), devices find each other through
-  the BitTorrent DHT, and a device the internet can reach relays for
-  devices behind routers. Tested between processes on one computer, not
-  yet across real routers ([ARCHITECTURE.md](docs/ARCHITECTURE.md) §9b).
-- **No internet needed:** a *Local only* mode never contacts the internet.
-- **Tested at scale in simulation** up to 10,003 devices, and against The
-  ONE's routers on real contact traces: on Infocom 2006, 57 % of large
-  messages delivered against the best router's 38 %, with 7 relays per
-  delivery against 203 ([BENCHMARKS.md](docs/BENCHMARKS.md)).
+It runs on macOS, Windows, Linux, Android, iPhone and iPad.
 
-What is built, layer by layer, and its limitations:
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) §7.
-
-## Screenshots
+> [!WARNING]
+> Mycel is experimental. Its cryptography and trust layer have not had an
+> outside audit. Do not rely on it yet to keep anything secret or safe.
 
 <p align="center">
-  <img src="docs/screenshots/02-group-dark.png" width="76%" alt="A group chat in the dark theme with its members panel open: four people with their roles (admin or member) and whether each is online or nearby, a section for adding a keeper, and messages with a shared text file, a reaction and a deleted message.">
-  <img src="docs/screenshots/04-phone-chat.png" width="22%" alt="The same group chat in the phone layout, light theme: messages from three people, a shared file, a reaction and delivery ticks.">
-</p>
-<p align="center">
-  <img src="docs/screenshots/03-network.png" width="76%" alt="The Network panel: a map of the people this device can reach and how (nearby, connected, or not reachable), the Local only connection mode, and the paths in use (same network, peer-to-peer Wi-Fi, Bluetooth, a cable).">
-  <img src="docs/screenshots/05-phone-call.png" width="22%" alt="An incoming voice call on a phone, dark theme, reached over the local network, with buttons to decline, answer with video or answer with voice.">
+  <img src="docs/screenshots/01-chat.png" width="840" alt="Mycel on a desktop: a conversation with a shared photo, a quoted reply, read receipts and the Encrypted badge, beside a list of chats that shows who is nearby and who is online.">
 </p>
 
-All screenshots are from the browser demo (`npm run dev`), with simulated people.
+## What it does
 
-## Platforms
+- Direct chats and groups, with replies, edits, reactions, read receipts,
+  search and voice notes. A message from someone who is not a contact arrives
+  as a request, and nothing is sent back until you accept it.
+- Files of any size, sent in pieces that are checked as they arrive, resumed
+  where they stopped, and fetched from every device that has them.
+- Voice and video calls, one to one and in groups of up to eight, that move
+  between network paths without dropping.
+- End-to-end encryption with signed membership. Each chat has a signed record
+  of who belongs to it; removing someone changes the key. Keys are sealed to
+  each member with X25519 combined with ML-KEM-768, and are replaced on a
+  schedule.
+- Every path a device has, at once: the local network, the internet,
+  Bluetooth, peer-to-peer Wi-Fi and a cable. A Local only mode never contacts
+  the internet.
+- A mesh. Devices forward each other's sealed traffic over several hops, a
+  device the internet can reach relays for devices behind routers, and
+  messages for someone offline wait with devices that agree to hold them.
+- No server of its own. By default Mycel uses the public relay and lookup
+  servers that [n0](https://n0.computer) runs for Iroh, which see only
+  ciphertext. They can be switched off, and devices then find each other
+  through the BitTorrent DHT.
 
-| Platform | What runs | How it was tested |
-|---|---|---|
-| macOS 11+ (Apple silicon and Intel) | everything, including Bluetooth and peer-to-peer Wi-Fi | the full test suite; the app on real Macs, over the LAN and Bluetooth to an iPhone. Peer-to-peer Wi-Fi on emulated links and on one Mac only |
-| iPhone and iPad (iOS 16.4+) | everything, including Bluetooth and peer-to-peer Wi-Fi; calls continue in the background | the iOS Simulator; a real iPhone: LAN discovery through Bonjour, Bluetooth links to Macs. Peer-to-peer Wi-Fi and the camera haven't run on a device |
-| Android 9+ | everything except Bluetooth and peer-to-peer Wi-Fi; keeps running in the background | the Android 14 emulator only |
-| Windows 10+ | everything except Bluetooth, peer-to-peer Wi-Fi and the interface link; no echo cancellation | GitHub Actions runners only (build, core tests, launch, video without a camera); no run on real hardware |
-| Linux (glibc 2.35+) | everything, with Bluetooth through BlueZ and Wi-Fi Direct groups (off by default); no echo cancellation | GitHub Actions runners only (build, core tests, launch, video without a camera); no run on real hardware, so BlueZ and Wi-Fi Direct are tested on emulated links only |
+Not every feature runs on every platform, and several have only been tested
+in simulation or on one kind of device. [Platforms](docs/PLATFORMS.md) and
+the [status](#status) section below say which.
 
-Details per feature: [docs/PLATFORMS.md](docs/PLATFORMS.md).
+## Install
 
-**Limitations to know:** Bluetooth runs on macOS, iOS and Linux, and
-peer-to-peer Wi-Fi on macOS and iOS; Android and Windows have neither. A
-suspended iPhone or iPad doesn't receive messages until Mycel is opened again:
-waking it would need Apple's push service, which needs a server, which
-Mycel doesn't use. Each device is its own identity, and its key is the
-account: there is no recovery if it is lost. Every device must run the same
-build, because the wire format still changes.
+The [website](https://atullal.xyz/mycel/) offers the build for your system.
+Every build, for macOS, Windows, Linux and Android, is also on the
+[releases page](https://github.com/atullal/mycel/releases), with a
+`SHA256SUMS` file and a build provenance attestation:
 
-## Try it
+```sh
+gh attestation verify <downloaded file> --repo atullal/mycel
+```
 
-Test builds are on the [Releases](https://github.com/atullal/mycel/releases)
-page; use the newest pre-release: a universal DMG for macOS, an APK for
-Android, an installer and MSI for Windows, and a `.deb`, `.rpm` and AppImage
-for Linux. Builds from CI come with a `SHA256SUMS` file and a build
-provenance attestation (`gh attestation verify <file> --repo atullal/mycel`).
-To run the current code, build from source.
+The [user guide](docs/USER_GUIDE.md) covers installing, the permissions the
+app asks for, adding a contact and troubleshooting. Two things to know first:
 
-- **The apps are unsigned.** On a Mac, right-click **Mycel > Open** the first
-  time; if macOS says the app is damaged, run
-  `xattr -dr com.apple.quarantine /Applications/Mycel.app`. Windows
-  SmartScreen needs **More info > Run anyway**.
-- **iPhone and iPad** need a build signed with your own Apple developer
-  account (`scripts/package-ios.sh --install`).
-- **Every device you test with needs the same build.**
-
-Installing, permissions, connecting devices, logs and troubleshooting:
-[docs/USER_GUIDE.md](docs/USER_GUIDE.md).
+- Everyone you talk to needs the same version. The format on the wire still
+  changes between versions.
+- iPhone and iPad need a build signed with your own Apple developer account
+  ([how](docs/PLATFORMS.md)).
 
 ## Build from source
 
-Needs Rust (stable), Node.js 22.18 or later, and on a Mac the Xcode Command
-Line Tools. On Linux, install the libraries the Linux job in
-`.github/workflows/apps.yml` installs (WebKitGTK, D-Bus, ALSA, …). For the native
-app also `cargo install tauri-cli --version '^2' --locked`.
+You need Rust (the toolchain in `rust-toolchain.toml` installs itself through
+rustup), Node.js 22.18 or later, and on a Mac the Xcode Command Line Tools.
+On Linux, install the libraries the Linux job in
+[`apps.yml`](.github/workflows/apps.yml) installs.
 
 ```sh
-npm install && npm run build                  # the UI
-cargo build -p mycel-cli                      # the `mycel` CLI
-./target/debug/mycel serve --name Alice       # a device with the web UI on http://127.0.0.1:7777
-./target/debug/mycel keeper --data ~/.mycel-keeper   # an always-on keeper
-./target/debug/mycel id                       # print this device's contact code
-cargo test --workspace --exclude mycel-host   # about 500 Rust tests
-npm test                                      # the TypeScript tests
+npm install && npm run build                 # the user interface
+cargo build -p mycel-cli                     # the mycel command
+./target/debug/mycel serve --name Alice      # a device, with the UI on http://127.0.0.1:7777
 ```
 
-`npm run dev` serves the UI in a browser with simulated people, no network.
-The native apps (output in `dist-release/`; details in
-[docs/PLATFORMS.md](docs/PLATFORMS.md)):
+`npm run dev` serves the interface in a browser with simulated people and no
+network, which is the quickest way to look around. The native apps are built
+with `scripts/package-mac.sh`, `scripts/package-ios.sh`,
+`scripts/package-android.sh`, or `cargo tauri build` in `apps/host`;
+[Platforms](docs/PLATFORMS.md) has the details.
 
-| Platform | Build | Output |
+To run the tests:
+
+```sh
+cargo test --workspace --exclude mycel-host
+npm test
+```
+
+[Testing](docs/TESTING.md) lists every check CI runs and how to run it
+locally.
+
+## How it is put together
+
+Mycel is a Rust core in a [Tauri](https://tauri.app) shell, with the
+interface in React. The transport is [Iroh](https://iroh.computer): QUIC
+connections dialled by public key, over several paths at once.
+
+| Layer | Crates | What it does |
 |---|---|---|
-| macOS (Apple silicon + Intel) | `scripts/package-mac.sh --universal` | `Mycel_<v>_universal.dmg` |
-| iPhone and iPad | `scripts/package-ios.sh` (`--install`, `--simulator`, `--unsigned`) | `Mycel_<v>_ios.ipa` |
-| Android 9+ | `scripts/package-android.sh` (`--debug`) | `Mycel_<v>_android.apk` |
-| Windows, Linux | `cargo tauri build` in `apps/host`, or the Apps workflow in GitHub Actions | installers, packages |
+| Apps | `apps/messaging`, `apps/host` | the Messaging app and the host it runs in |
+| SDK | `packages/sdk`, `mycel-kit-chat` | the TypeScript client and the chat data model |
+| Rules | `mycel-rules`, `rules/` | validation rules compiled to WebAssembly, run the same on every device |
+| Data and sync | `mycel-sync` | signed, encrypted changes; documents and ordered feeds |
+| Trust | `mycel-trust`, `mycel-crypto` | signed membership, keys and their rotation |
+| Network | `mycel-net`, `mycel-link-*` | connections, discovery, the mesh, store-and-forward |
+| Calls | `mycel-call`, `mycel-video` | voice and video over the same connections |
+| Runtime | `mycel-node`, `mycel-cli` | storage, identity, the API that apps use |
 
-## Repository layout
-
-```
-crates/
-  mycel-crypto      Ed25519, HPKE lockboxes (X25519 + ML-KEM-768), XChaCha20-Poly1305, streaming AEAD, BLAKE3
-  mycel-trust       spaces: signed membership DAG, deterministic resolution, epochs
-  mycel-sync        signed, encrypted envelopes → Automerge docs and causal feeds
-  mycel-net         Iroh QUIC multipath, live sync, discovery, invites, blobs, the mesh
-                    (mesh/core.rs routing, mesh/dtn.rs store-and-forward, gateways)
-  mycel-link-awdl   link over Apple peer-to-peer Wi-Fi (AWDL, Network.framework)
-  mycel-link-ble    link over Bluetooth LE L2CAP (CoreBluetooth; BlueZ on Linux)
-  mycel-link-iface  link over any other network interface (a cable, a second NIC,
-                    Wi-Fi Direct groups formed on Linux, …)
-  mycel-call        voice calls, 1:1 and group: Opus over QUIC datagrams on every path
-  mycel-video       video calls: hardware H.264 on Apple platforms, frames on QUIC streams
-  mycel-rules       deterministic WASM rules engine (wasmi); mycel-rules-abi: the shared ABI
-  mycel-kit-chat    the chat data model and deterministic reducer
-  mycel-node        the runtime: storage, identity, contacts, messaging and calls API
-  mycel-cli         `mycel serve | keeper | id | call`
-  mycel-sim         simulator: real nodes over emulated radios, and up to 10,000+
-                    virtual devices in virtual time
-rules/              rule modules written in Rust, compiled to WASM (`rules/build.sh`)
-packages/sdk        @mycel/sdk: TypeScript client, transports, React hooks
-apps/messaging      the Messaging app (React, SDK only)
-apps/host           the Tauri 2 host; src-tauri/gen/{apple,android} are the
-                    iPhone/iPad Xcode and Android Gradle projects
-bench/              benchmarks against The ONE on real contact traces
-scripts/            packaging, CI helpers, the security check
-vendor/             Iroh with a multipath patch, noq and noq-proto with a crash fix,
-                    swarm-discovery, swift-rs and the Tauri notification plugin
-                    with small fixes (see each MYCEL_PATCH.md)
-docs/               the documents below
-```
+`mycel-sim` runs real nodes over emulated radios and up to ten thousand
+virtual devices in virtual time; `bench/` compares store-and-forward delivery
+with the routers of The ONE simulator on real contact traces.
+[Architecture](docs/ARCHITECTURE.md) explains each layer and the reasons
+behind the design.
 
 ## Documentation
 
+The [documentation index](docs/README.md) lists everything. The places to
+start:
+
 | | |
 |---|---|
-| [USER_GUIDE.md](docs/USER_GUIDE.md) | installing, connecting devices, logs, troubleshooting |
-| [PLATFORMS.md](docs/PLATFORMS.md) | what works on which platform, how it was tested, building each app |
-| [ARCHITECTURE.md](docs/ARCHITECTURE.md) | layers, design decisions, what is built, limitations, the mesh and global routing |
-| [TRUST.md](docs/TRUST.md) | the trust layer: threat model, membership, keys, envelopes, resource limits, hardening, limitations |
-| [ROUTING.md](docs/ROUTING.md) | routing: a survey of ~20 protocols, what Mycel reuses, and why |
-| [RUNTIME_API.md](docs/RUNTIME_API.md) | the API apps use (Rust, Tauri commands, HTTP) |
-| [RULES_ABI.md](docs/RULES_ABI.md) | the WASM rules ABI |
-| [TESTING.md](docs/TESTING.md) | how to run the tests, what they cover, measured results |
-| [SIMULATION.md](docs/SIMULATION.md) | the simulator: method, models, scenarios, findings |
-| [BENCHMARKS.md](docs/BENCHMARKS.md) | store-and-forward against The ONE's routers on real contact traces |
-| [CHANGELOG.md](CHANGELOG.md) | what this version contains |
+| [User guide](docs/USER_GUIDE.md) | installing and using the app |
+| [Architecture](docs/ARCHITECTURE.md) | how Mycel is built and why |
+| [Security specification](docs/TRUST.md) | what is defended, how, and what is not |
+| [Runtime API](docs/RUNTIME_API.md) | the API an app uses |
+| [Configuration](docs/CONFIGURATION.md) | every setting |
+
+## Status
+
+Mycel works and is tested in CI on Linux, macOS and Windows, but it is not
+ready to be relied on.
+
+- No outside audit of the cryptography or the trust layer.
+- Versions do not interoperate yet, and there is no migration between them.
+- A device's key is the account. If the device is lost, there is no recovery.
+- macOS and iPhone have run on real devices. Windows and Linux have only run
+  in CI, and Android only in an emulator.
+- Relaying between devices over the internet and lookups through the DHT have
+  been tested between processes on one computer, not across real routers.
+- A suspended iPhone or iPad receives nothing until Mycel is opened again:
+  waking it would need a push server, and Mycel has none.
+
+The [changelog](CHANGELOG.md) records what each version contains and its
+known limitations.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and the
-[Code of Conduct](CODE_OF_CONDUCT.md). In short: `main` stays green. A change
-merges through a reviewed pull request with CI passing, after the workspace
-tests pass twice in a row, with rustfmt and clippy (`-D warnings`) clean
-([TESTING.md](docs/TESTING.md)).
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to
+set up, which checks to run and how changes land; the
+[Code of Conduct](CODE_OF_CONDUCT.md) applies to everyone taking part.
 
 ## Security
 
-Please report vulnerabilities privately, as described in
-[SECURITY.md](SECURITY.md), not in public issues. What the trust layer
-defends against, and what it doesn't: [docs/TRUST.md](docs/TRUST.md).
+Report vulnerabilities privately, as [SECURITY.md](SECURITY.md) describes,
+and not in public issues.
 
 ## Licence
 
-Licensed under either of the [Apache License, Version 2.0](LICENSE-APACHE)
-or the [MIT licence](LICENSE-MIT), at your option. Vendored and bundled
-third-party components keep their own licences: see
+Licensed under either the [Apache License, Version 2.0](LICENSE-APACHE) or
+the [MIT licence](LICENSE-MIT), at your option. Vendored and bundled
+third-party components keep their own licences, listed in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Unless you explicitly state otherwise, any contribution you intentionally
