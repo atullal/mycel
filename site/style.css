@@ -1,7 +1,7 @@
 /* Hallmark · redesign: full · theme: Mycel brand · genre: editorial · hero: interactive route · nav: project links · footer: project resources · job: download · signature: hairline globe */
 /* Critique: the illustrated route carries the network explanation; the screenshots show the app visitors download. */
 :root {
-  color-scheme: light dark;
+  color-scheme: light;
   --bg: oklch(97% .014 105);
   --surface: oklch(98% .012 105);
   --surface-2: oklch(93% .019 122);
@@ -20,25 +20,6 @@
   --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --font-display: ui-serif, "New York", "Iowan Old Style", Georgia, serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: oklch(19% .019 152);
-    --plate: oklch(26% .031 152);
-    --surface: oklch(35% .034 151);
-    --surface-2: oklch(28% .024 152);
-    --glass: oklch(45% .052 142);
-    --glass-hover: oklch(52% .069 142);
-    --ink: oklch(94% .019 120);
-    --ink-2: oklch(82% .024 130);
-    --ink-3: oklch(76% .022 135);
-    --accent: oklch(84% .10 136);
-    --accent-hover: oklch(90% .078 130);
-    --accent-ink: oklch(20% .021 150);
-    --line: oklch(94% .019 120 / .23);
-    --line-strong: oklch(94% .019 120 / .65);
-    --link: oklch(65% .035 145);
-  }
 }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
@@ -141,37 +122,26 @@ h1 {
 }
 
 /* Atlantic route demo. The projected coastline and the two journeys share a viewBox. */
-.hero-band {
-  --ocean: oklch(20% .038 157);
-  --paper: oklch(96% .024 104);
-  --quiet: oklch(84% .035 126);
-  --signal: oklch(91% .158 109);
-  color: var(--paper);
-  background: var(--ocean);
-}
-.hero-band .lede, .hero-band .fine { color: var(--quiet); }
-.hero-band .button { color: var(--ocean); background: var(--paper); }
-.hero-band .button:hover, .hero-band .button:active { background: var(--signal); }
-.hero-band a:hover { color: var(--signal); }
-.hero-band a.button:hover { color: var(--ocean); }
-.hero-band :focus-visible { outline-color: var(--signal); }
 .hero { padding-block: clamp(32px, 4vw, 64px); gap: clamp(16px, 2vw, 32px); }
 .globe { min-width: 0; margin: 0; }
 .globe svg { display: block; width: 100%; overflow: visible; }
-.globe .chat { color: var(--signal); }
-.globe .file { color: var(--quiet); }
+.globe .chat { color: var(--accent); }
+.globe .file { color: var(--ink-2); }
+.file .hop { stroke-dasharray: 4 3; }
 .hop { fill: none; stroke: currentColor; stroke-width: 1.35; }
-.pin { fill: var(--ocean); stroke: currentColor; stroke-width: 1.5; }
+.pin { fill: var(--bg); stroke: currentColor; stroke-width: 1.5; }
 .packet { fill: currentColor; }
-.arrival { fill: var(--paper); }
-.arrival text { fill: var(--ocean); font: 15px var(--font-ui); }
+.arrival { fill: var(--surface); }
+.arrival rect { stroke: var(--line-strong); stroke-width: .8; }
+.arrival path { fill: currentColor; }
+.arrival text { fill: var(--ink); font: 15px var(--font-ui); }
 .globe figcaption {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   justify-content: center;
   gap: 4px 16px;
-  color: var(--quiet);
+  color: var(--ink-2);
   font-size: .86rem;
 }
 .route-controls { display: flex; gap: 16px; }
@@ -179,13 +149,13 @@ h1 {
   padding: 8px 0;
   border: 0;
   background: transparent;
-  color: var(--paper);
+  color: var(--ink);
   font: inherit;
   text-decoration: underline;
   text-underline-offset: 4px;
   cursor: pointer;
 }
-.route-controls button:hover, .route-controls button:active { color: var(--signal); }
+.route-controls button:hover, .route-controls button:active { color: var(--accent); }
 .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
 @media (max-width: 520px) {
   .globe svg { width: 112%; margin-inline: -6%; }
@@ -210,9 +180,7 @@ h1 {
 }
 .shot-copy p { max-width: 36em; color: var(--ink-2); }
 .shots img { display: block; width: 100%; height: auto; border-radius: 6px; }
-@media (prefers-color-scheme: light) {
-  .shots img { mix-blend-mode: multiply; }
-}
+.shots img { mix-blend-mode: multiply; }
 .note { grid-column: 1 / -1; font-size: .86rem; color: var(--ink-2); }
 /* download */
 
