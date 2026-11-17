@@ -11,37 +11,53 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 796decd2c272e89e9063de0769d63f2aabbd735f
+          ref: 5c7530211d0dca536e3143e09ffacf1234c418f0
           persist-credentials: false
-      - name: Build and render the proposed site
+      - name: Test globe and download offers
         run: |
           node site/build.mjs
           python3 -m http.server 4178 --bind 127.0.0.1 --directory site/dist >/tmp/site.log 2>&1 &
           d=$(mktemp -d)
           npm install --prefix "$d" --no-audit --no-fund playwright-core@1.56.1
           NODE_PATH="$d/node_modules" node <<'JS'
-          const {chromium}=require('playwright-core');
-          const fs=require('node:fs');
-          const assert=require('node:assert/strict');
+          const { chromium } = require('playwright-core');
+          const assert = require('node:assert/strict');
           (async()=>{
-            const browser=await chromium.launch({channel:'chrome',headless:true});
-            for(const [name,width,height,theme] of [['desktop',1440,1000,'light'],['mobile',390,844,'light'],['mobile-dark',390,844,'dark']]){
-              const page=await browser.newPage({viewport:{width,height},colorScheme:theme,reducedMotion:'reduce'});
-              const errors=[];page.on('pageerror', e=>errors.push(String(e)));
+            const browser = await chromium.launch({channel:'chrome',headless:true});
+            for(const [name,ua,platform,touch,expected] of [
+              ['desktop','Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)','MacIntel',0,'mac'],
+              ['mobile','Mozilla/5.0 (Linux; Android 15; Pixel 9)','Linux armv8l',5,'android'],
+              ['Windows','Mozilla/5.0 (Windows NT 10.0; Win64; x64)','Win32',0,'windows'],
+              ['Linux','Mozilla/5.0 (X11; Linux x86_64)','Linux x86_64',0,'linux'],
+              ['iPhone','Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)','iPhone',5,'ios'],
+              ['iPad','Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15)','MacIntel',5,'ios'],
+              ['ChromeOS','Mozilla/5.0 (X11; CrOS x86_64 15474.61.0)','Linux x86_64',0,'choose'],
+              ['Unknown','Unknown','','0','choose']
+            ]){
+              const width=touch?390:1440;
+              const page=await browser.newPage({viewport:{width,height:touch?844:900},userAgent:ua,reducedMotion:name==='desktop'?'no-preference':'reduce'});
+              await page.addInitScript(([platform,touch])=>{
+                Object.defineProperties(navigator,{platform:{get:()=>platform},maxTouchPoints:{get:()=>Number(touch)},userAgentData:{get:()=>undefined}});
+              },[platform,touch]);
+              const errors=[];page.on('pageerror',e=>errors.push(e.message));
               await page.goto('http://127.0.0.1:4178/',{waitUntil:'networkidle'});
-              await page.locator('picture img').evaluateAll(async imgs=>{await Promise.all(imgs.map(img=>{img.loading='eager';return img.decode()}))});
-              assert(await page.locator('h1').isVisible());
-              assert.equal(await page.locator('.hero .button:visible').count(),1);
-              await page.locator('.tick.on').waitFor({state:'attached'});
-              const sizes=await page.evaluate(()=>({page:document.documentElement.scrollWidth,viewport:innerWidth,hero:document.querySelector('h1').getBoundingClientRect().toJSON(),map:document.querySelector('.mesh').getBoundingClientRect().toJSON(),images:[...document.querySelectorAll('picture img')].map(x=>[x.naturalWidth,x.naturalHeight])}));
-              assert(sizes.page<=width);console.log(name,JSON.stringify(sizes));
-              const img=await page.screenshot({type:'jpeg',quality:68,path:name+'.jpg'});
-              // Small image chunks keep the screenshot retrievable from the QA job.
-              const encoded=img.toString('base64');
-              for(let i=0;i<encoded.length;i+=3500)console.log('PREVIEW_IMAGE '+name+' '+i+' '+encoded.slice(i,i+3500));
-              await page.locator('[data-id=hana]').click();
-              assert((await page.locator('#mesh-say').innerText()).includes('Tobias'));
-              assert.deepEqual(errors,[]);await page.close();
+              const button=page.locator('.hero .button:visible');
+              assert.equal(await button.count(),1);
+              assert.equal(await button.getAttribute('data-system'),expected);
+              assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth),width);
+              for(const kind of ['file','chat']){
+                await page.locator('[data-send='+kind+']').click();
+                if(name==='desktop')await page.waitForFunction(kind=>document.querySelector('.'+kind+' .packets').getAttribute('visibility')==='visible',kind);
+                await page.waitForFunction(()=>document.querySelector('[role=status]').textContent.includes('delivered'));
+                assert.equal(await page.locator('.'+kind+' .arrival').getAttribute('visibility'),null);
+              }
+              assert.deepEqual(errors,[]); console.log('PASS',name,await button.innerText());
+              if(['desktop','mobile'].includes(name)){
+                await page.evaluate(()=>scrollTo({top:0,behavior:'instant'}));
+                const data=(await page.screenshot({type:'jpeg',quality:75})).toString('base64');
+                for(let i=0;i<data.length;i+=3500) console.log('GLOBE_IMG '+name+' '+i+' '+data.slice(i,i+3500));
+              }
+              await page.close();
             }
             await browser.close();
           })().catch(e=>{console.error(e);process.exit(1)});
