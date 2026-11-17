@@ -1,0 +1,74 @@
+# The website (site/): a landing page with the downloads of the newest
+# release. Built on every pull request that touches it, and published to
+# GitHub Pages from main and whenever a release changes.
+name: Site
+
+on:
+  pull_request:
+    paths: ["site/**", "docs/screenshots/**", ".github/workflows/site.yml"]
+  push:
+    branches: [main]
+    paths: ["site/**", "docs/screenshots/**", ".github/workflows/site.yml"]
+  release:
+    types: [published, edited, deleted]
+  workflow_dispatch:
+  # Releases created with GITHUB_TOKEN do not emit another release workflow.
+  # Safe: checkout uses the default branch, with no upstream artifacts,
+  # caches, head refs or privileged build permissions.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: [Apps]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: site-${{ github.event.pull_request.number || 'pages' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build the site
+    # Use only the default branch; never checkout or consume run artifacts.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          # Nothing is installed (the build has no dependencies), and a
+          # workflow that publishes shouldn't restore a cache.
+          package-manager-cache: false
+      # The download links come from the newest release (site/build.mjs).
+      - run: node site/build.mjs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        if: github.event_name != 'pull_request'
+        with:
+          path: site/dist
+
+  publish:
+    name: Publish to GitHub Pages
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
