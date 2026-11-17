@@ -4,14 +4,14 @@
 #   scripts/package-mac.sh              # this Mac's architecture (arm64 or x86_64)
 #   scripts/package-mac.sh --universal  # one app that runs on Apple silicon AND Intel Macs
 #
-# By default the app is unsigned (docs/USER_GUIDE.md says how to open it on
-# another Mac). To sign it with a Developer ID and have Apple notarise it, so
-# that it opens anywhere without a warning, set:
+# Public packages require a Developer ID signature and Apple notarization.
+# Missing credentials stop the build. For local development use cargo tauri dev.
+# Set:
 #
 #   MYCEL_SIGN_IDENTITY    "Developer ID Application: Name (TEAMID)"
 #   MYCEL_SIGN_KEYCHAIN    the keychain file that holds it (default: your own)
 #
-# and, to notarise as well, one of:
+# and one of:
 #
 #   MYCEL_NOTARY_PROFILE   a profile saved with `xcrun notarytool store-credentials`
 #   MYCEL_NOTARY_KEY       an App Store Connect API key (path to the .p8), with
@@ -32,14 +32,6 @@ case "${1:-}" in
   *) echo "unknown option: $1 (use --universal or nothing)" >&2; exit 2 ;;
 esac
 
-command -v cargo >/dev/null || { echo "cargo not found: install Rust from https://rustup.rs" >&2; exit 1; }
-if [ -n "${TAURI_CLI:-}" ]; then
-  tauri() { npx --yes "$TAURI_CLI" "$@"; }
-else
-  cargo tauri --version >/dev/null 2>&1 || { echo "cargo-tauri not found: cargo install tauri-cli --version '^2' --locked" >&2; exit 1; }
-  tauri() { cargo tauri "$@"; }
-fi
-
 # Signing and notarisation (see the top of this file).
 IDENTITY="${MYCEL_SIGN_IDENTITY:-}"
 sign=(codesign --force --timestamp --sign "$IDENTITY")
@@ -52,8 +44,26 @@ elif [ -n "${MYCEL_NOTARY_KEY:-}" ]; then
 elif [ -n "${MYCEL_NOTARY_APPLE_ID:-}" ]; then
   notary=(--apple-id "$MYCEL_NOTARY_APPLE_ID" --password "${MYCEL_NOTARY_PASSWORD:?set MYCEL_NOTARY_PASSWORD}" --team-id "${MYCEL_NOTARY_TEAM_ID:?set MYCEL_NOTARY_TEAM_ID}")
 fi
-if [ ${#notary[@]} -gt 0 ] && [ -z "$IDENTITY" ]; then
-  echo "notarisation needs a signed app: set MYCEL_SIGN_IDENTITY" >&2; exit 2
+case "$IDENTITY" in
+  "Developer ID Application: "*) ;;
+  *) echo "Public Mac packages require MYCEL_SIGN_IDENTITY (Developer ID Application). See docs/PLATFORMS.md." >&2; exit 2 ;;
+esac
+if [ ${#notary[@]} -eq 0 ]; then
+  echo "Public Mac packages require notarization credentials. See docs/PLATFORMS.md." >&2; exit 2
+fi
+export MYCEL_SIGN_IDENTITY
+# Fail before compiling or touching distribution files if credentials are absent.
+identities=(security find-identity -v -p codesigning)
+[ -z "${MYCEL_SIGN_KEYCHAIN:-}" ] || identities+=("$MYCEL_SIGN_KEYCHAIN")
+"${identities[@]}" | grep -F -- "\"$IDENTITY\"" >/dev/null
+xcrun notarytool history "${notary[@]}" >/dev/null
+
+command -v cargo >/dev/null || { echo "cargo not found: install Rust from https://rustup.rs" >&2; exit 1; }
+if [ -n "${TAURI_CLI:-}" ]; then
+  tauri() { npx --yes "$TAURI_CLI" "$@"; }
+else
+  cargo tauri --version >/dev/null 2>&1 || { echo "cargo-tauri not found: cargo install tauri-cli --version '^2' --locked" >&2; exit 1; }
+  tauri() { cargo tauri "$@"; }
 fi
 
 # Have Apple notarise a .zip or .dmg; fails unless it is accepted.
@@ -79,65 +89,52 @@ source "$ROOT/scripts/remap-paths.sh"
 cd "$ROOT/apps/host"
 if [ -n "$TARGET" ]; then
   rustup target add aarch64-apple-darwin x86_64-apple-darwin
-  tauri build --bundles app --target "$TARGET"
+  tauri build --bundles app --target "$TARGET" -- --locked
   BUNDLE="$ROOT/target/$TARGET/release/bundle"
   LABEL="universal"
 else
-  tauri build --bundles app
+  tauri build --bundles app -- --locked
   BUNDLE="$ROOT/target/release/bundle"
   case "$(uname -m)" in arm64) LABEL="aarch64" ;; x86_64) LABEL="x64" ;; *) LABEL="$(uname -m)" ;; esac
 fi
 
 VERSION="$(sed -n 's/^ *"version": *"\([^"]*\)".*/\1/p' "$ROOT/apps/host/src-tauri/tauri.conf.json" | head -1)"
 
-# The build signs the app ad hoc. With an identity: sign it again with the
-# hardened runtime and the entitlements the microphone and camera need, have
-# Apple notarise it, and staple the ticket to it so that it also opens on a
-# Mac that is offline.
-if [ -n "$IDENTITY" ]; then
-  "${sign[@]}" --options runtime --entitlements "$ROOT/apps/host/src-tauri/Entitlements.plist" "$BUNDLE/macos/Mycel.app"
-  codesign --verify --strict --verbose=2 "$BUNDLE/macos/Mycel.app"
-  if [ ${#notary[@]} -gt 0 ]; then
-    SUBMIT="$(mktemp -d)"
-    ditto -c -k --keepParent "$BUNDLE/macos/Mycel.app" "$SUBMIT/Mycel.zip"
-    notarise "$SUBMIT/Mycel.zip"
-    rm -rf "$SUBMIT"
-    xcrun stapler staple "$BUNDLE/macos/Mycel.app"
-  fi
-fi
-
+# Work privately until every final container has passed verification. A failed
+# submission must never leave a new file under a public release filename.
 OUT="$ROOT/dist-release"
+mkdir -p "$OUT"
+STAGE="$(mktemp -d "$OUT/.mac-release.XXXXXX")"
+trap 'rm -rf "$STAGE"' EXIT
+mkdir "$STAGE/image" "$STAGE/packages"
+APP="$STAGE/image/Mycel.app"
+ditto "$BUNDLE/macos/Mycel.app" "$APP"
+ln -s /Applications "$STAGE/image/Applications"
+"${sign[@]}" --options runtime --entitlements "$ROOT/apps/host/src-tauri/Entitlements.plist" "$APP"
+ditto -c -k --keepParent "$APP" "$STAGE/Mycel.zip"
+notarise "$STAGE/Mycel.zip"
+xcrun stapler staple "$APP"
+"$ROOT/scripts/verify-mac.sh" "$APP"
+
+# ZIPs cannot carry a stapled ticket; recreate the archive after stapling the
+# app, then check the extracted copy, exactly as a recipient will see it.
+ZIP="$STAGE/packages/Mycel_${VERSION}_${LABEL}_notarized.app.zip"
+ditto -c -k --keepParent "$APP" "$ZIP"
+mkdir "$STAGE/extracted"
+ditto -x -k "$ZIP" "$STAGE/extracted"
+"$ROOT/scripts/verify-mac.sh" "$STAGE/extracted/Mycel.app"
+
+# Headless drag-to-Applications image, signed and notarized as a container too.
+DMG="$STAGE/packages/Mycel_${VERSION}_${LABEL}_notarized.dmg"
+hdiutil create -quiet -volname "Mycel" -srcfolder "$STAGE/image" -fs HFS+ -format UDZO -ov "$DMG"
+"${sign[@]}" "$DMG"
+notarise "$DMG"
+xcrun stapler staple "$DMG"
+"$ROOT/scripts/verify-mac.sh" "$DMG"
+
+# Only verified packages receive the filenames accepted by CI and the website.
 mkdir -p "$OUT/$LABEL"
 rm -rf "$OUT/$LABEL/Mycel.app"
-ditto "$BUNDLE/macos/Mycel.app" "$OUT/$LABEL/Mycel.app"
-# A zip of the .app is the easiest thing to AirDrop / copy on a USB stick.
-rm -f "$OUT/Mycel_${VERSION}_${LABEL}.app.zip"
-ditto -c -k --keepParent "$BUNDLE/macos/Mycel.app" "$OUT/Mycel_${VERSION}_${LABEL}.app.zip"
-# Plain drag-to-Applications disk image. (Tauri's own dmg bundler drives Finder
-# with AppleScript, which fails without Automation permission / in headless shells.)
-STAGE="$(mktemp -d)"
-trap 'rm -rf "$STAGE"' EXIT
-ditto "$BUNDLE/macos/Mycel.app" "$STAGE/Mycel.app"
-ln -s /Applications "$STAGE/Applications"
-DMG="$OUT/Mycel_${VERSION}_${LABEL}.dmg"
-rm -f "$DMG"
-hdiutil create -quiet -volname "Mycel" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG"
-# The disk image is what people download: sign and notarise it too.
-if [ -n "$IDENTITY" ]; then
-  "${sign[@]}" "$DMG"
-  if [ ${#notary[@]} -gt 0 ]; then
-    notarise "$DMG"
-    xcrun stapler staple "$DMG"
-    # What Gatekeeper will say on someone else's Mac.
-    spctl --assess --type execute --verbose=2 "$OUT/$LABEL/Mycel.app"
-    spctl --assess --type open --context context:primary-signature --verbose=2 "$DMG"
-  fi
-fi
-
-echo
-if [ -z "$IDENTITY" ]; then SIGNED="unsigned"
-elif [ ${#notary[@]} -gt 0 ]; then SIGNED="signed and notarised"
-else SIGNED="signed, not notarised"; fi
-echo "Built Mycel $VERSION ($LABEL, $SIGNED):"
-ls -lh "$OUT" "$OUT/$LABEL"
-lipo -archs "$OUT/$LABEL/Mycel.app/Contents/MacOS/"* 2>/dev/null || true
+ditto "$APP" "$OUT/$LABEL/Mycel.app"
+mv -f "$ZIP" "$DMG" "$OUT/"
+echo "Built signed and notarized Mycel $VERSION ($LABEL) in $OUT"

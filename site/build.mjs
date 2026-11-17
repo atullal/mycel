@@ -19,17 +19,15 @@ const out = join(here, 'dist');
 const repo = process.env.GITHUB_REPOSITORY || 'atullal/mycel';
 const repoUrl = `https://github.com/${repo}`;
 
-// Whether the Mac app in the release is signed with a Developer ID and
-// notarised. Until it is, the page says how to open it.
-const MAC_SIGNED = false;
-
 /** Each system, what its builds are called in a release, and what it needs. */
 const SYSTEMS = [
   {
     id: 'mac',
     name: 'macOS',
     needs: 'macOS 11 or later, Apple silicon and Intel',
-    files: [[/_universal\.dmg$/, 'Disk image']],
+    // Only package-mac.sh's verified release output is offered. Legacy
+    // ad-hoc DMGs are intentionally excluded, even on older releases.
+    files: [[/_universal_notarized\.dmg$/, 'Disk image']],
   },
   {
     id: 'windows',
@@ -109,19 +107,23 @@ const dateOf = (release) =>
 // the one for the visitor's system instead.
 function heroDownload(release, builds, version) {
   const first = builds.find((b) => b.id === 'mac') ?? builds[0];
-  const hide = (b) => (b === first ? '' : ' hidden');
+  const macPending = !builds.some((b) => b.id === 'mac');
+  const hide = (b) => (!macPending && b === first ? '' : ' hidden');
   if (!first) {
     return `<p class="get"><a class="button" href="${repoUrl}/releases">See the releases</a></p>
     <p class="fine">Experimental preview. No build is published for download yet;
       <a href="${repoUrl}#build-from-source">building from source</a> takes a few minutes.</p>`;
   }
-  const buttons = builds
+  const pendingButton = macPending
+    ? `<a class="button" data-system="mac" href="#download">See available downloads</a>\n      `
+    : '';
+  const buttons = pendingButton + builds
     .map(
       (b) =>
         `<a class="button" data-system="${b.id}" href="${esc(b.files[0].url)}"${hide(b)}>Download for ${esc(b.name)} <span class="v">${esc(version)}</span></a>`,
     )
     .join('\n      ');
-  const needs = builds.map((b) => `<span data-system="${b.id}"${hide(b)}>${esc(b.needs)}.</span>`).join(' ');
+  const needs = (macPending ? '<span data-system="mac">A signed Mac download is coming. See the available systems below.</span> ' : '') + builds.map((b) => `<span data-system="${b.id}"${hide(b)}>${esc(b.needs)}.</span>`).join(' ');
   return `<p class="get">
       ${buttons}
     </p>
@@ -148,11 +150,11 @@ function downloads(release, builds, version) {
     .join('\n');
   const sums = release.assets.find((a) => /^SHA256SUMS/.test(a.name));
   const after = [];
-  if (!MAC_SIGNED && builds.some((b) => b.id === 'mac')) {
-    after.push(`<p><strong>The Mac app is not signed yet.</strong> The first time, right-click Mycel in
-      Applications and choose Open. If macOS says the app is damaged, run
-      <code>xattr -dr com.apple.quarantine /Applications/Mycel.app</code> in Terminal.</p>`);
-  }
+  after.push(builds.some((b) => b.id === 'mac')
+    ? `<p><strong>The Mac app is signed and notarized by Apple.</strong> Open the disk image,
+      drag Mycel to Applications, then open Mycel.</p>`
+    : `<p><strong>A signed Mac download is not available in this release.</strong>
+      It will appear here after signing and notarization are complete.</p>`);
   if (builds.some((b) => b.id === 'windows')) {
     after.push(`<p><strong>Windows shows a SmartScreen warning,</strong> because the installer is not
       signed: choose More info, then Run anyway.</p>`);

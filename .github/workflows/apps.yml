@@ -11,6 +11,12 @@ name: Apps
 
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: Platforms to build
+        type: choice
+        default: all
+        options: [all, macos]
   push:
     branches: [main]
     tags: ["dev-*", "v*"]
@@ -31,6 +37,7 @@ env:
 
 jobs:
   linux:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'macos'
     name: Linux app (deb, rpm, AppImage)
     runs-on: ubuntu-22.04
     timeout-minutes: 90
@@ -135,6 +142,7 @@ jobs:
           if-no-files-found: error
 
   windows:
+    if: github.event_name != 'workflow_dispatch' || inputs.platform != 'macos'
     name: Windows app (installer, MSI)
     runs-on: windows-latest
     timeout-minutes: 90
@@ -198,15 +206,13 @@ jobs:
           if-no-files-found: error
 
   # The Mac app, for Apple silicon and Intel in one. Signed with the project's
-  # Developer ID and notarised by Apple when the repository has the secrets
-  # for it (docs/PLATFORMS.md, "Signing the Mac app"); without them the build
-  # is unsigned, and the release notes and the website say how to open it.
-  # Runs on the project's own Mac when the repository variable MACOS_RUNNER is
-  # `self-hosted` (every trigger of this workflow is a maintainer's), else on
-  # GitHub's.
+  # Developer ID and notarised by Apple. Missing credentials fail the job
+  # and block publication (docs/PLATFORMS.md, "Signing the Mac app").
+  # Public releases and manual rehearsals use a fresh GitHub-hosted Mac.
+  # MACOS_RUNNER may select the project's own Mac for branch-push builds.
   macos:
     name: macOS app (universal dmg)
-    runs-on: ${{ vars.MACOS_RUNNER == 'self-hosted' && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'macos-latest' }}
+    runs-on: ${{ github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/') && vars.MACOS_RUNNER == 'self-hosted' && fromJSON('["self-hosted", "macOS", "ARM64"]') || 'macos-latest' }}
     timeout-minutes: 120
     permissions:
       contents: read
@@ -221,8 +227,10 @@ jobs:
           package-manager-cache: false
       - run: npm ci
       # The certificate goes into a keychain of its own, which only this job
-      # uses and which is deleted at the end: the runner's own keychains and
-      # their search list are left alone.
+      # uses and which is deleted at the end. Add it to the search list for
+      # certificate-chain lookup, then restore the original list in cleanup.
+      - name: Mac publication gate tests
+        run: python3 -m unittest discover -s scripts/tests -p test_mac_release.py -v
       - name: Signing certificate
         id: certificate
         env:
@@ -230,32 +238,46 @@ jobs:
           CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
           if [ -z "$CERTIFICATE" ]; then
-            echo "::notice::No APPLE_CERTIFICATE secret: this build is unsigned."
-            exit 0
+            echo "::error::APPLE_CERTIFICATE is required for public Mac downloads."
+            exit 1
           fi
           keychain="$RUNNER_TEMP/mycel-signing.keychain-db"
           password="$(openssl rand -hex 24)"
           # Publish the cleanup path before any keychain setup can fail.
           echo "keychain=$keychain" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::$password"
+          security list-keychains -d user > "$RUNNER_TEMP/mycel-signing-keychains.txt.tmp"
+          mv "$RUNNER_TEMP/mycel-signing-keychains.txt.tmp" "$RUNNER_TEMP/mycel-signing-keychains.txt"
           security create-keychain -p "$password" "$keychain"
           security set-keychain-settings -lut 7200 "$keychain"
           security unlock-keychain -p "$password" "$keychain"
+          python3 - "$keychain" "$RUNNER_TEMP/mycel-signing-keychains.txt" <<'PYTHON'
+          import shlex, subprocess, sys
+          with open(sys.argv[2]) as saved:
+              original = shlex.split(saved.read())
+          subprocess.run(["security", "list-keychains", "-d", "user", "-s", sys.argv[1], *original], check=True)
+          PYTHON
           printf '%s' "$CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
           security import "$RUNNER_TEMP/certificate.p12" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           rm -f "$RUNNER_TEMP/certificate.p12"
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" > /dev/null
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" > /dev/null
           identity="$(security find-identity -v -p codesigning "$keychain" | sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' | head -1)"
           if [ -z "$identity" ]; then
             echo "::error::APPLE_CERTIFICATE holds no Developer ID Application certificate with its private key"
             exit 1
           fi
+          # Exercise actual key access before the expensive universal build.
+          cp /usr/bin/true "$RUNNER_TEMP/mycel-signing-probe"
+          codesign --force --timestamp --options runtime --sign "$identity" --keychain "$keychain" "$RUNNER_TEMP/mycel-signing-probe"
+          codesign --verify --strict '-R=anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists' "$RUNNER_TEMP/mycel-signing-probe"
+          rm -f "$RUNNER_TEMP/mycel-signing-probe"
           {
             echo "MYCEL_SIGN_IDENTITY=$identity"
             echo "MYCEL_SIGN_KEYCHAIN=$keychain"
           } >> "$GITHUB_ENV"
       # Either an App Store Connect API key (APPLE_API_KEY_P8, APPLE_API_KEY_ID,
       # APPLE_API_ISSUER) or an Apple ID (APPLE_ID, APPLE_APP_PASSWORD,
-      # APPLE_TEAM_ID). Neither: signed but not notarised.
+      # APPLE_TEAM_ID). Missing credentials block publication.
       - name: Notarisation credentials
         if: steps.certificate.outputs.keychain != ''
         env:
@@ -267,6 +289,7 @@ jobs:
           TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           if [ -n "$API_KEY_P8" ]; then
+            : "${API_KEY_ID:?Missing APPLE_API_KEY_ID}" "${API_ISSUER:?Missing APPLE_API_ISSUER}"
             printf '%s' "$API_KEY_P8" > "$RUNNER_TEMP/notary.p8"
             {
               echo "MYCEL_NOTARY_KEY=$RUNNER_TEMP/notary.p8"
@@ -274,13 +297,15 @@ jobs:
               echo "MYCEL_NOTARY_ISSUER=$API_ISSUER"
             } >> "$GITHUB_ENV"
           elif [ -n "$APPLE_ID" ]; then
+            : "${APP_PASSWORD:?Missing APPLE_APP_PASSWORD}" "${TEAM_ID:?Missing APPLE_TEAM_ID}"
             {
               echo "MYCEL_NOTARY_APPLE_ID=$APPLE_ID"
               echo "MYCEL_NOTARY_PASSWORD=$APP_PASSWORD"
               echo "MYCEL_NOTARY_TEAM_ID=$TEAM_ID"
             } >> "$GITHUB_ENV"
           else
-            echo "::warning::No notarisation credentials: the app is signed but macOS will still warn about it."
+            echo "::error::Notarization credentials are required for public Mac downloads."
+            exit 1
           fi
       - name: Build
         run: scripts/package-mac.sh --universal
@@ -291,14 +316,23 @@ jobs:
         env:
           KEYCHAIN: ${{ steps.certificate.outputs.keychain }}
         run: |
+          if [ -f "$RUNNER_TEMP/mycel-signing-keychains.txt" ]; then
+            python3 - "$RUNNER_TEMP/mycel-signing-keychains.txt" <<'PYTHON'
+          import shlex, subprocess, sys
+          with open(sys.argv[1]) as saved:
+              original = shlex.split(saved.read())
+          subprocess.run(["security", "list-keychains", "-d", "user", "-s", *original], check=True)
+          PYTHON
+          fi
           [ -z "$KEYCHAIN" ] || security delete-keychain "$KEYCHAIN" || true
-          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/certificate.p12"
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/certificate.p12" "$RUNNER_TEMP/mycel-signing-probe" \
+            "$RUNNER_TEMP/mycel-signing-keychains.txt" "$RUNNER_TEMP/mycel-signing-keychains.txt.tmp"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: mycel-macos
           path: |
-            dist-release/Mycel_*_universal.dmg
-            dist-release/Mycel_*_universal.app.zip
+            dist-release/Mycel_*_universal_notarized.dmg
+            dist-release/Mycel_*_universal_notarized.app.zip
           if-no-files-found: error
 
   # Tags only. Runs no project code: it takes the installers the jobs above
@@ -323,6 +357,8 @@ jobs:
         run: |
           mkdir dist
           find "$RUNNER_TEMP/artifacts" -type f -exec mv -t dist -- {} +
+          test -s dist/Mycel_*_universal_notarized.dmg
+          test -s dist/Mycel_*_universal_notarized.app.zip
           cd dist
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
@@ -335,7 +371,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          notes="Builds of $TAG. Check a download against SHA256SUMS, and its provenance with: gh attestation verify <file> --repo $GH_REPO"
+          notes="Builds of $TAG. The universal Mac app and DMG are Developer ID signed and notarized by Apple. Check a download against SHA256SUMS, and its provenance with: gh attestation verify <file> --repo $GH_REPO"
           if gh release view "$TAG" >/dev/null 2>&1; then
             # A release made by hand before this run: add the files to it.
             gh release upload "$TAG" --clobber dist/*

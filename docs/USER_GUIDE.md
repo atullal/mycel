@@ -72,19 +72,15 @@ other.
 
 ### macOS
 
-Open the disk image and drag Mycel to Applications. The app is not signed
-with an Apple developer ID, so macOS blocks a plain double-click the first
-time:
+Use a `_notarized.dmg` download from the website. Open the disk image, drag
+Mycel to Applications, then open Mycel. These packages are signed with a
+Developer ID and notarized by Apple. The website offers the Mac download
+only after these checks pass.
 
-1. Right-click (or Control-click) Mycel and choose *Open*, then *Open* again.
-2. On recent macOS, if there is no *Open* button, try once, then go to
-   *System Settings > Privacy & Security* and choose *Open Anyway*.
-3. If macOS says the app "is damaged", that is the quarantine flag on a
-   downloaded unsigned app. Remove it:
-
-   ```sh
-   xattr -dr com.apple.quarantine /Applications/Mycel.app
-   ```
+Older prereleases contain unsigned DMGs. Use a signed replacement when one
+is available. If macOS reports a signed download as damaged, download a fresh
+copy and [report the problem](#report-a-problem). Do not remove its quarantine
+flag to bypass verification.
 
 macOS then asks for the following. The settings named here are all in
 *System Settings*.
@@ -95,8 +91,7 @@ macOS then asks for the following. The settings named here are all in
 - "Do you want the application Mycel to accept incoming network
   connections?" This appears only with the macOS firewall on. Choose
   *Allow*. If you missed it, open *Network > Firewall > Options…* and set
-  Mycel to *Allow incoming connections*. Because the app is unsigned, macOS
-  may ask again after you replace it with a new build.
+  Mycel to *Allow incoming connections*.
 - "Mycel would like to use Bluetooth". Choose *Allow*. The setting is in
   *Privacy & Security > Bluetooth*.
 - The microphone and the camera, on your first call. The settings are in
@@ -801,8 +796,9 @@ logs described under [Turn on link logs](#turn-on-link-logs) and
 
 ### macOS says Mycel is damaged and can't be opened
 
-That is Gatekeeper's quarantine on a downloaded unsigned app. The command
-that removes it is under [macOS](#macos).
+Older prereleases were unsigned. Use the signed, notarized package offered
+on the website when available. For a `_notarized.dmg` download, try a fresh
+copy and [report the problem](#report-a-problem) if the warning persists.
 
 ### Mycel says another copy is using the data folder
 

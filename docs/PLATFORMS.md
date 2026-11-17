@@ -220,14 +220,14 @@ scripts/package-mac.sh --universal   # one app for Apple silicon and Intel
 scripts/package-mac.sh               # this Mac's architecture only
 ```
 
-`--universal` builds `dist-release/Mycel_<v>_universal.dmg`, the same app as
-`Mycel_<v>_universal.app.zip`, and the unpacked app in
+`--universal` builds `dist-release/Mycel_<v>_universal_notarized.dmg`, the same app as
+`Mycel_<v>_universal_notarized.app.zip`, and the unpacked app in
 `dist-release/universal/`. Without the option, `aarch64` or `x64` takes the
 place of `universal` in those names.
 
-By default the app carries only an ad hoc signature (`signingIdentity` in
-`tauri.conf.json` is `-`), and macOS warns before opening it on another Mac.
-[USER_GUIDE.md](USER_GUIDE.md) says how to open it anyway.
+Public packaging requires a Developer ID Application certificate and notarization
+credentials. Missing credentials stop the build before compilation. Local
+development with `cargo tauri dev` does not need release credentials.
 
 #### Signing the Mac app
 
@@ -247,7 +247,12 @@ MYCEL_NOTARY_PROFILE=mycel \
 hardened runtime and the entitlements the microphone and camera need, has
 Apple notarise it, staples the ticket to the app so that it also opens on a
 Mac that is offline, and does the same for the disk image. Its header lists
-the other ways to give it credentials.
+the other ways to give it credentials. `scripts/verify-mac.sh` checks the
+Developer ID certificate type and team, secure timestamp, hardened runtime,
+stapled ticket and Gatekeeper assessment. Packaging checks both the extracted
+ZIP and the app mounted from the final DMG before exposing release files.
+The `_notarized` filenames are reserved for these verified outputs; the
+website excludes older unsigned DMGs.
 
 The Apps workflow does this on GitHub when the repository has these secrets:
 
@@ -258,11 +263,23 @@ The Apps workflow does this on GitHub when the repository has these secrets:
 | `APPLE_API_KEY_P8`, `APPLE_API_KEY_ID`, `APPLE_API_ISSUER` | an App Store Connect API key, for notarisation |
 | `APPLE_ID`, `APPLE_APP_PASSWORD`, `APPLE_TEAM_ID` | an Apple ID with an app-specific password, in place of the API key |
 
-Without the certificate the workflow builds the app unsigned and says so in
-a notice; with the certificate but no notarisation credentials it signs the
-app and warns that macOS will still object. The signing and notarisation
-steps have not run yet: no Developer ID certificate has been available to
-run them with.
+Without the certificate or complete notarization credentials, the Mac job
+fails and the release job cannot publish. There is no unsigned fallback,
+including for development prereleases. Only packages that pass every check
+are uploaded, checksummed and attested. Tagged public Mac releases use fresh
+GitHub-hosted runners, as do manual release rehearsals;
+`MACOS_RUNNER=self-hosted` applies only to branch-push development builds.
+Use `gh workflow run apps.yml --ref <branch> -f platform=macos` to rehearse
+the signed Mac packaging without publishing a release. npm and Cargo use the committed lockfiles.
+
+To create the certificate, the Apple Developer Account Holder uploads a
+certificate signing request at [Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/certificates/add),
+selecting **Developer ID Application** (not Apple Development or Apple
+Distribution). Install the downloaded certificate with its matching private
+key in Keychain Access, then export both as a password-protected `.p12`
+for `APPLE_CERTIFICATE`. Keep keys and passwords outside the repository.
+Notarization additionally needs one of the credential sets in the table.
+The first live release still needs to be verified with the issued certificate.
 
 ### iPhone and iPad
 
