@@ -163,7 +163,7 @@
       return `There is no path to Ines right now. ${holder[0].toUpperCase()}${holder.slice(1)} holds the message, sealed, until one opens.`;
     }
 
-    // ── one message at a time: travel, arrive (or wait with a carrier), again ──
+    // A message travels once, then waits for the visitor to change a relay.
 
     let run = 0;
     let held = FROM; // where the message is when a trip starts
@@ -199,35 +199,29 @@
       tick.classList.remove('on');
       parcel.classList.remove('waiting');
       if (!nodes.get(held).on) held = FROM;
-      for (;;) {
-        const way = path(held, TO);
-        const route = way ?? carrier(held);
-        draw(route);
-        const text = describe(way ? [FROM, ...route.filter((id) => id !== FROM)] : route, Boolean(way));
-        if (say.textContent !== text) say.textContent = text;
-        if (still.matches) {
-          place(route.at(-1));
-          tick.classList.toggle('on', Boolean(way));
-          return;
-        }
-        place(route[0]);
-        for (let i = 1; i < route.length; i++) {
-          if (!(await hop(route[i - 1], route[i], mine))) return;
-          if (i < route.length - 1 && !(await pause(160, mine))) return;
-        }
-        if (way) {
-          tick.classList.add('on');
-          held = FROM;
-          if (!(await pause(2600, mine))) return;
-          tick.classList.remove('on');
-          place(FROM);
-          if (!(await pause(700, mine))) return;
-        } else {
-          // waits here; a device coming back on restarts the trip from here
-          held = route.at(-1);
-          parcel.classList.add('waiting');
-          return;
-        }
+      const way = path(held, TO);
+      const route = way ?? carrier(held);
+      draw(route);
+      const text = describe(way ? [FROM, ...route.filter((id) => id !== FROM)] : route, Boolean(way));
+      if (say.textContent !== text) say.textContent = text;
+      if (still.matches) {
+        place(route.at(-1));
+        tick.classList.toggle('on', Boolean(way));
+        return;
+      }
+      place(route[0]);
+      for (let i = 1; i < route.length; i++) {
+        if (!(await hop(route[i - 1], route[i], mine))) return;
+        if (i < route.length - 1 && !(await pause(160, mine))) return;
+      }
+      if (way) {
+        tick.classList.add('on');
+        held = FROM;
+      } else {
+        // waits here; a device coming back on restarts the trip from here
+        held = route.at(-1);
+        parcel.classList.add('waiting');
+        return;
       }
     }
 
