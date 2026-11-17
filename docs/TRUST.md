@@ -414,8 +414,8 @@ checks on every pull request and the Audit workflow runs them daily against
 new advisories. Vulnerabilities always fail; so do unmaintained and unsound
 crates, unless `deny.toml` accepts one by ID with the reason Mycel isn't
 exposed and a review date (`.cargo/audit.toml` mirrors the list for
-`cargo audit --deny unsound --deny unmaintained`). As of 2026-10-21 it
-accepts, all on Linux or at build time only:
+`cargo audit --deny unsound --deny unmaintained`). As of 2026-11-17 it
+accepts, each on one platform or at build time only:
 
 - RUSTSEC-2024-0429, unsound `glib::VariantStrIter` in glib 0.18, which
   comes with Tauri's GTK 3 webview: no Tauri release is on gtk-rs 0.19 yet,
@@ -424,7 +424,10 @@ accepts, all on Linux or at build time only:
   `zvariant_derive` "unmaintained" since zbus 6 absorbed them; zbus 5 still
   comes with Tauri's notification and opener plugins;
 - RUSTSEC-2024-0370 and RUSTSEC-2024-0436, the `proc-macro-error` and
-  `paste` proc macros, which never run in a shipped binary.
+  `paste` proc macros, which never run in a shipped binary;
+- RUSTSEC-2026-0543, `chrono` "unmaintained": on Windows only, where it
+  comes with `wmi`, which Iroh's network monitor uses. Neither has a release
+  without it, and nothing in this repository uses it.
 
 `zip` was moved to 9.0.5 for RUSTSEC-2026-0367/0368/0369 (extraction
 flaws; Mycel only writes archives, when it zips a shared folder).
@@ -433,6 +436,11 @@ flaws; Mycel only writes archives, when it zips a shared folder).
 intermediates whose private keys are public could anchor a TLS chain; these
 crates sit on the relay and HTTPS client paths through Iroh, reqwest and
 Tauri). Lockfile only, no vendored code changed.
+`ctutils` was moved to 0.4.8 for RUSTSEC-2026-0385 (constant-time helpers
+that could compile to a branch on a secret value; the RustCrypto hashes and
+Iroh use them) and `rustix` to 1.1.6 for RUSTSEC-2026-0486 (unsound
+extended-attribute reads into an empty buffer). `async-executor` 1.14.0 was
+withdrawn by its authors and is now 1.14.1. Lockfile only again.
 
 ## 9b. Hardening
 

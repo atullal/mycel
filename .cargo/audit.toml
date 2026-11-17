@@ -22,6 +22,10 @@ ignore = [
   "RUSTSEC-2026-0370",
   "RUSTSEC-2026-0371",
   "RUSTSEC-2026-0372",
+  # chrono: a default feature of wmi 0.18, which netwatch (Iroh's network
+  # monitor) uses on Windows; no release of either without it. Review by
+  # 2027-01-31.
+  "RUSTSEC-2026-0543",
   # atomic-polyfill: heapless 0.7 (via postcard) uses it only on AVR or with
   # its `cas` feature, neither of which Mycel builds; cargo-deny, limited to
   # the shipping targets, doesn't see it at all.
