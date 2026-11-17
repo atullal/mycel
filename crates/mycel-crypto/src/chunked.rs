@@ -8,11 +8,12 @@
 //! The reference a message carries is the root's id and the root's key.
 //!
 //! ```text
-//! leaf   = XChaCha20-Poly1305(key, NODE_NONCE, "mycel/v0/chunk-leaf", plaintext piece)
+//! leaf   = XChaCha20-Poly1305(key, N(key), "mycel/v0/chunk-leaf", plaintext piece)
 //! index  = "MYCELINDEX1\0" ‖ level: u8 ‖ count: u32 LE ‖ count × (child id: 32 ‖ child length: u32 LE)
-//!          ‖ XChaCha20-Poly1305(key, NODE_NONCE, "mycel/v0/chunk-index" ‖ BLAKE3(all of the above),
+//!          ‖ XChaCha20-Poly1305(key, N(key), "mycel/v0/chunk-index" ‖ BLAKE3(all of the above),
 //!                               count × child key: 32 ‖ hint count: u8 ‖ hints × 32)
 //! id     = BLAKE3-derive_key("mycel/v0/chunk", node bytes)
+//! N(key) = the first 24 bytes of BLAKE3-derive_key("mycel/v0/chunk-nonce", key)
 //! ```
 //!
 //! An index at level 1 lists leaves; at level `n` it lists indexes of level
@@ -22,8 +23,9 @@
 //! sealed: only someone with the root key can open anything.
 //!
 //! A node's key is derived from that node's content, so no key ever seals
-//! two different nodes and the nonce can be a constant. What else goes into
-//! the key is the file's **mode**:
+//! two different nodes, and the nonce is derived from the key: nothing is
+//! stored beside the ciphertext. What else goes into the key is the file's
+//! **mode**:
 //!
 //! - **Private** (the default): each key is derived from a fresh random
 //!   secret, the node's position and the node's content. The same file sent
@@ -53,10 +55,7 @@ const CTX_PRIVATE_KEY: &str = "mycel/v0/chunk-key";
 const CTX_PUBLIC_LEAF_KEY: &str = "mycel/v0/chunk-convergent-leaf";
 const CTX_PUBLIC_INDEX_KEY: &str = "mycel/v0/chunk-convergent-index";
 const CTX_GEAR: &str = "mycel/v0/chunker-gear";
-/// Not a secret, and never used with one key for two different nodes: a
-/// node's key is derived from that node's content ([`Mode`]), so the same
-/// key and nonce can only ever seal the same bytes again.
-const NODE_NONCE: [u8; 24] = *b"mycel/v0/chunk-nonce\0\0\0\0";
+const CTX_NODE_NONCE: &str = "mycel/v0/chunk-nonce";
 
 /// Magic prefix of an index node.
 pub const INDEX_MAGIC: &[u8; 12] = b"MYCELINDEX1\0";
@@ -101,10 +100,10 @@ pub fn marker(public: bool) -> [u8; 24] {
     m
 }
 
-/// `Some(public)` if a reference's `nonce` field says it is a chunked file,
-/// `None` for the older single-blob format.
-pub fn parse_marker(nonce: &[u8; 24]) -> Option<bool> {
-    nonce.starts_with(CHUNKED_MARKER).then(|| nonce[CHUNKED_MARKER.len()] & FLAG_PUBLIC != 0)
+/// `Some(public)` if a reference's `nonce` field holds the marker of a
+/// chunked file, `None` if it holds the nonce of an older single blob.
+pub fn parse_marker(field: &[u8; 24]) -> Option<bool> {
+    field.starts_with(CHUNKED_MARKER).then(|| field[CHUNKED_MARKER.len()] & FLAG_PUBLIC != 0)
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -231,8 +230,8 @@ impl Mode {
 
     /// The key of the node at this position with this `content`: a digest
     /// of everything the key will seal and authenticate. Either way the key
-    /// depends on the content, which is what lets every node share one
-    /// nonce: a key is never used for anything but the node it came from.
+    /// depends on the content, so a key is never used for anything but the
+    /// node it came from.
     fn node_key(&self, level: u8, ordinal: u64, content: Hash32) -> SymKey {
         match self {
             Mode::Private(secret) => {
@@ -254,9 +253,17 @@ pub struct Child {
     pub len: u32,
 }
 
+/// The nonce a node is sealed with, derived from the node's key. A key only
+/// ever seals the one node it was derived from ([`Mode`]), so neither it nor
+/// its nonce is used for two different messages. The nonce is not stored: a
+/// reader derives it again.
+fn node_nonce(key: &SymKey) -> [u8; 24] {
+    Hash32::digest(CTX_NODE_NONCE, &key.0).0[..24].try_into().expect("24 of 32 bytes")
+}
+
 /// Seal one piece of plaintext. Returns the leaf's bytes.
 fn seal_leaf(key: &SymKey, plain: &[u8]) -> Result<Vec<u8>> {
-    key.seal(&NODE_NONCE, CTX_LEAF, plain).map_err(|_| ChunkedError::Encrypt)
+    key.seal(&node_nonce(key), CTX_LEAF, plain).map_err(|_| ChunkedError::Encrypt)
 }
 
 /// Check that `bytes` are the node `id` names.
@@ -270,7 +277,7 @@ pub fn open_leaf(id: &Hash32, key: &SymKey, bytes: &[u8]) -> Result<Vec<u8>> {
         return Err(ChunkedError::Malformed("leaf size"));
     }
     verify_node(id, bytes)?;
-    key.open(&NODE_NONCE, CTX_LEAF, bytes).map_err(|_| ChunkedError::Decrypt)
+    key.open(&node_nonce(key), CTX_LEAF, bytes).map_err(|_| ChunkedError::Decrypt)
 }
 
 fn index_aad(header: &[u8]) -> Vec<u8> {
@@ -305,7 +312,7 @@ fn seal_index(
         tail.extend_from_slice(h);
     }
     let key = mode.index_key(level, ordinal, &node, &tail);
-    let sealed = key.seal(&NODE_NONCE, &index_aad(&node), &tail).map_err(|_| ChunkedError::Encrypt)?;
+    let sealed = key.seal(&node_nonce(&key), &index_aad(&node), &tail).map_err(|_| ChunkedError::Encrypt)?;
     node.extend_from_slice(&sealed);
     Ok((node, key))
 }
@@ -365,7 +372,8 @@ impl<'a> Index<'a> {
 
     /// Open the sealed part: the children with their keys, and the hints.
     pub fn open(&self, key: &SymKey) -> Result<(Vec<Child>, Vec<[u8; 32]>)> {
-        let tail = key.open(&NODE_NONCE, &index_aad(self.header), self.sealed).map_err(|_| ChunkedError::Decrypt)?;
+        let tail =
+            key.open(&node_nonce(key), &index_aad(self.header), self.sealed).map_err(|_| ChunkedError::Decrypt)?;
         let keys_len = self.children.len() * 32;
         let hints = tail.get(keys_len).copied().ok_or(ChunkedError::Malformed("index keys"))? as usize;
         if hints > MAX_HINTS || tail.len() != keys_len + 1 + hints * 32 {
@@ -864,9 +872,10 @@ mod tests {
         out
     }
 
-    /// The nonce is a constant, so a key must never seal two different
-    /// nodes. That holds even for a secret used for two files (which the
-    /// runtime never does): they share a key only where they share the node.
+    /// A node's nonce comes from its key, so a key must never seal two
+    /// different nodes. That holds even for a secret used for two files
+    /// (which the runtime never does): they share a key only where they
+    /// share the node.
     #[test]
     fn a_secret_used_twice_never_gives_one_key_to_two_nodes() {
         let mode = Mode::private();

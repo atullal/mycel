@@ -222,16 +222,17 @@ New attachments are **chunked files**: a tree of small, separately sealed nodes,
 **Format** (`crates/mycel-crypto/src/chunked.rs`).
 
 ```
-leaf   = XChaCha20-Poly1305(key, N, "mycel/v0/chunk-leaf", piece of the plaintext)
+leaf   = XChaCha20-Poly1305(key, N(key), "mycel/v0/chunk-leaf", piece of the plaintext)
 index  = "MYCELINDEX1\0" ‖ level: u8 ‖ count: u32 LE ‖ count × (child id: 32 ‖ child length: u32 LE)
-         ‖ XChaCha20-Poly1305(key, N, "mycel/v0/chunk-index" ‖ H(all of the above),
-                              count × child key: 32 ‖ hint count: u8 ‖ hints × 32)
+         ‖ XChaCha20-Poly1305(key, N(key), "mycel/v0/chunk-index" ‖ H(all of the above),
+                                   count × child key: 32 ‖ hint count: u8 ‖ hints × 32)
 id     = BLAKE3-derive_key("mycel/v0/chunk", node bytes)
-N      = "mycel/v0/chunk-nonce" ‖ 4 zero bytes          H = BLAKE3-derive_key("mycel/v0/chunk-index-header", ·)
+N(key) = first 24 bytes of BLAKE3-derive_key("mycel/v0/chunk-nonce", key)
+H      = BLAKE3-derive_key("mycel/v0/chunk-index-header", ·)
 ```
 
 - An index at level 1 lists leaves; at level *n* it lists indexes of level *n* − 1 (at most 8,192 children, 4 levels). A full index is only closed when another child arrives, so the same pieces always give the same tree.
-- A node's key is derived from that node's content (below), so no key ever seals two different nodes, and the nonce is a constant: the same key and nonce can only seal the same bytes again.
+- A node's key is derived from that node's content (below), so no key ever seals two different nodes. The nonce is derived from the key and stored nowhere: the same key and nonce can only seal the same bytes again.
 - The child ids and lengths are in the clear; the child keys are sealed. So a keeper or a cache can tell which nodes make up a file and whether it has them all, with no key, and only someone with the root key can open anything.
 - **The reference.** The message's `AttachmentRef` keeps its shape (so older messages and the chat rules are unchanged): `blob` is the root node's id, `key` opens the root, and `nonce` holds the marker `MYCELCHUNKED1\0`, one flag byte (bit 0: public) and zeros instead of a nonce. A reference whose `nonce` doesn't start with the marker is a §7b blob.
 - **A reader checks** each node against its id before using it, each index's level against its place in the tree, every length against the format's limits, and stops rather than write more plaintext than the message's `size`. A leaf never opens as an index or the other way round (different associated data). Before fetching, a tree that lists more nodes or bytes than a file of that `size` can have is refused, so a small reference can't unfold into a huge download.
