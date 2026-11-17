@@ -1,256 +1,153 @@
-// The page works without this file: the download list is plain links and the
-// mesh is a still drawing. This adds two things: the download button offers
-// the build for the visitor's system, and the mesh shows a message finding
-// its way, around whichever devices the visitor switches off.
-
-(() => {
-  pickBuild();
-  runMesh();
-
-  // ───────────────────────────── download button ─────────────────────────────
-
-  // The page has a button for every system with a build, all but one hidden.
-  function pickBuild() {
-    const ua = navigator.userAgent;
-    const system =
-      /Android/.test(ua) ? 'android'
-      : /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1) ? 'ios'
-      : /Macintosh|Mac OS X/.test(ua) ? 'mac'
-      : /Windows/.test(ua) ? 'windows'
-      : /Linux|X11/.test(ua) ? 'linux'
-      : null;
-    const offers = [...document.querySelectorAll('.hero [data-system]')];
-    if (!offers.some((el) => el.dataset.system === system)) return;
-    for (const el of offers) el.hidden = el.dataset.system !== system;
+// Keep the ordinary platform list available if a browser withholds its OS.
+function pickBuild() {
+  const offers = [...document.querySelectorAll('.hero [data-system]')];
+  const ua = navigator.userAgent;
+  const platform = navigator.userAgentData?.platform || navigator.platform || '';
+  let system = 'choose';
+  if (/iPhone|iPad|iPod/.test(ua) || (/Mac/.test(platform + ua) && navigator.maxTouchPoints > 1)) {
+    system = 'ios';
+  } else if (/Android/i.test(platform + ua)) {
+    system = 'android';
+  } else if (/Windows/i.test(platform + ua)) {
+    system = 'windows';
+  } else if (/Mac/i.test(platform + ua)) {
+    system = 'mac';
+  } else if (/Linux/i.test(platform + ua) && !/CrOS|Chromium OS|Chrome OS|arm|aarch64/i.test(platform + ua)) {
+    system = 'linux';
   }
+  if (!offers.some(el => el.dataset.system === system)) system = 'choose';
+  for (const el of offers) el.hidden = el.dataset.system !== system;
+}
 
-  // ────────────────────────────────── mesh ──────────────────────────────────
-
-  function runMesh() {
-    const root = document.getElementById('mesh');
-    if (!root) return;
-    const say = document.getElementById('mesh-say');
-    const parcel = root.querySelector('.parcel');
-    const tick = root.querySelector('.tick');
-    const still = matchMedia('(prefers-reduced-motion: reduce)');
-
-    const nodes = new Map();
-    for (const el of root.querySelectorAll('.node')) {
-      nodes.set(el.dataset.id, {
-        el,
-        x: Number(el.dataset.x),
-        y: Number(el.dataset.y),
-        name: el.dataset.name,
-        on: true,
-      });
-    }
-    const edges = [...root.querySelectorAll('.edge')].map((el) => ({ el, a: el.dataset.a, b: el.dataset.b }));
-    const FROM = 'you';
-    const TO = 'ines';
-
-    // Hops from each device to the destination with everything switched on:
-    // how close a device is, for choosing who holds a message that can't
-    // get through.
-    const closeness = distances(TO, () => true);
-
-    for (const node of nodes.values()) {
-      if (!node.name) continue;
-      const el = node.el;
-      el.setAttribute('role', 'button');
-      el.setAttribute('tabindex', '0');
-      const flip = () => {
-        node.on = !node.on;
-        label(node);
-        draw();
-        restart();
-      };
-      el.addEventListener('click', flip);
-      el.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault();
-          flip();
-        }
-      });
-      label(node);
-    }
-    document.getElementById('mesh-hint').hidden = false;
-
-    function label(node) {
-      node.el.setAttribute('aria-pressed', String(!node.on));
-      node.el.setAttribute('aria-label', `${node.name}: ${node.on ? 'on. Switch it off' : 'off. Switch it on'}`);
-      node.el.classList.toggle('off', !node.on);
-    }
-
-    function neighbours(id, usable) {
-      const out = [];
-      for (const e of edges) {
-        const other = e.a === id ? e.b : e.b === id ? e.a : null;
-        if (other && usable(other)) out.push(other);
+// Each track uses a fraction of the same scene clock. Start and end poses match.
+const move = (x, y) => ({ transform: `translate(${x}px, ${y}px)` });
+const alpha = opacity => ({ opacity });
+const pose = (x, y, opacity) => ({ ...move(x, y), opacity });
+const icon = opacity => ({ opacity, filter: `blur(${4 * (1 - opacity)}px)` });
+function figureTracks(id, track) {
+  switch (id) {
+    case 'seal':
+      track('.seal-token', [
+        [0, pose(0, 0, 0)], [.16, pose(0, 0, 0)], [.24, pose(0, -5, 1)],
+        [.42, pose(53, -26, 1)], [.55, pose(104, -47, 1)], [.75, pose(199, 0, 1)],
+        [.8, pose(199, 5, 0)], [1, pose(0, 0, 0)]
+      ]);
+      track('.receipt', [[0,alpha(0)],[.75,alpha(0)],[.8,alpha(1)],[.92,alpha(1)],[1,alpha(0)]]);
+      break;
+    case 'local':
+      for (let i = 0; i < 3; i++) {
+        const shift = .037 * i;
+        track('.wave-' + i, [[0,alpha(.25)],[.16+shift,alpha(.25)],[.24+shift,alpha(1)],
+          [.33+shift,alpha(.25)],[.44+shift,alpha(1)],[.64,alpha(.7)],[1,alpha(.25)]]);
       }
-      return out;
-    }
-
-    function distances(from, usable) {
-      const dist = new Map([[from, 0]]);
-      const queue = [from];
-      while (queue.length) {
-        const at = queue.shift();
-        for (const next of neighbours(at, usable)) {
-          if (!dist.has(next)) {
-            dist.set(next, dist.get(at) + 1);
-            queue.push(next);
-          }
-        }
+      track('.local-packet', [[0,pose(0,0,0)],[.5,pose(0,0,0)],[.55,pose(0,-2,1)],
+        [.71,pose(95,-30,1)],[.76,pose(101,-31,0)],[1,pose(0,0,0)]]);
+      track('.local-receipt', [[0,alpha(0)],[.71,alpha(0)],[.76,alpha(1)],[.92,alpha(1)],[1,alpha(0)]]);
+      break;
+    case 'carry':
+      track('.carry-token', [[0,pose(0,0,0)],[.07,pose(0,0,1)],[.22,pose(105,-38,1)],
+        [.27,pose(105,-30,0)],[.51,pose(105,-30,0)],[.58,pose(105,-38,1)],
+        [.76,pose(228,4,1)],[.81,pose(228,9,0)],[1,pose(0,0,0)]]);
+      track('.keeper-light', [[0,alpha(.2)],[.22,alpha(.2)],[.27,alpha(1)],[.52,alpha(1)],[.6,alpha(.2)],[1,alpha(.2)]]);
+      track('.carry-receipt', [[0,alpha(0)],[.76,alpha(0)],[.81,alpha(1)],[.92,alpha(1)],[1,alpha(0)]]);
+      break;
+    case 'roster':
+      track('.member', [[0,alpha(1)],[.21,alpha(1)],[.31,alpha(.12)],[.91,alpha(.12)],[1,alpha(1)]]);
+      track('.key-token', [[0,move(0,0)],[.47,move(0,0)],[.59,move(0,-16)],[.67,move(0,-16)],[.76,move(0,0)],[1,move(0,0)]]);
+      track('.epoch-new', [[0,alpha(0)],[.58,alpha(0)],[.67,alpha(1)],[.91,alpha(1)],[1,alpha(0)]]);
+      break;
+    case 'media':
+      for (let i = 0; i < 3; i++) {
+        const from = i / 3, to = (i + 1) / 3;
+        // Cross-fade through the wrap as well as between adjacent modes.
+        const levels = i === 0 ? [[0,1],[to-.05,1],[to,0],[.95,0],[1,1]]
+          : [[0,0],[from-.05,0],[from,1],[to-.05,1],[to,0],...(i === 1 ? [[1,0]] : [])];
+        track('.mode-' + i, levels.map(([t,v]) => [t,icon(v)]));
+        track('.key-' + i, levels.map(([t,v]) => [t,move(0,3*v)]));
       }
-      return dist;
-    }
-
-    // The shortest way from one device to another through devices that are on.
-    function path(from, to) {
-      const prev = new Map([[from, null]]);
-      const queue = [from];
-      while (queue.length) {
-        const at = queue.shift();
-        if (at === to) break;
-        for (const next of neighbours(at, (id) => nodes.get(id).on)) {
-          if (!prev.has(next)) {
-            prev.set(next, at);
-            queue.push(next);
-          }
-        }
-      }
-      if (!prev.has(to)) return null;
-      const out = [];
-      for (let at = to; at !== null; at = prev.get(at)) out.unshift(at);
-      return out;
-    }
-
-    // With no way through: as far as the message can get, to the device in
-    // reach that is closest to where it is going.
-    function carrier(from) {
-      const reach = distances(from, (id) => nodes.get(id).on);
-      let best = from;
-      for (const id of reach.keys()) {
-        if ((closeness.get(id) ?? Infinity) < (closeness.get(best) ?? Infinity)) best = id;
-      }
-      return best === from ? [from] : path(from, best);
-    }
-
-    function draw(route = []) {
-      for (const e of edges) {
-        const up = nodes.get(e.a).on && nodes.get(e.b).on;
-        e.el.classList.toggle('down', !up);
-        const i = route.indexOf(e.a);
-        const j = route.indexOf(e.b);
-        e.el.classList.toggle('route', up && i >= 0 && j >= 0 && Math.abs(i - j) === 1);
-      }
-    }
-
-    const list = (names) =>
-      names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} and ${names.at(-1)}`;
-    const device = (id) => (id === 'laptop' ? "someone's laptop" : `${nodes.get(id).name}'s phone`);
-
-    function describe(route, delivered) {
-      const between = route.slice(1, delivered ? -1 : undefined);
-      if (delivered) {
-        const who = between.length === 1 ? 'which cannot read it' : 'and neither can read it';
-        return `The message reaches Ines through ${list(between.map(device))}, ${who}.`;
-      }
-      if (route.length === 1 && route[0] === FROM) {
-        return 'No device is in reach. The message waits on your phone until one is.';
-      }
-      const holder = device(route.at(-1));
-      return `There is no path to Ines right now. ${holder[0].toUpperCase()}${holder.slice(1)} holds the message, sealed, until one opens.`;
-    }
-
-    // ── one message at a time: travel, arrive (or wait with a carrier), again ──
-
-    let run = 0;
-    let held = FROM; // where the message is when a trip starts
-
-    const place = (id) => {
-      const n = nodes.get(id);
-      parcel.setAttribute('cx', n.x);
-      parcel.setAttribute('cy', n.y);
-    };
-    const pause = (ms, mine) =>
-      new Promise((resolve) => setTimeout(() => resolve(mine === run), ms));
-
-    function hop(a, b, mine) {
-      const from = nodes.get(a);
-      const to = nodes.get(b);
-      return new Promise((resolve) => {
-        const start = performance.now();
-        const step = (now) => {
-          if (mine !== run) return resolve(false);
-          const t = Math.min(1, (now - start) / 850);
-          const k = t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
-          parcel.setAttribute('cx', from.x + (to.x - from.x) * k);
-          parcel.setAttribute('cy', from.y + (to.y - from.y) * k);
-          if (t < 1) requestAnimationFrame(step);
-          else resolve(true);
-        };
-        requestAnimationFrame(step);
-      });
-    }
-
-    async function trip() {
-      const mine = ++run;
-      tick.classList.remove('on');
-      parcel.classList.remove('waiting');
-      if (!nodes.get(held).on) held = FROM;
-      for (;;) {
-        const way = path(held, TO);
-        const route = way ?? carrier(held);
-        draw(route);
-        const text = describe(way ? [FROM, ...route.filter((id) => id !== FROM)] : route, Boolean(way));
-        if (say.textContent !== text) say.textContent = text;
-        if (still.matches) {
-          place(route.at(-1));
-          tick.classList.toggle('on', Boolean(way));
-          return;
-        }
-        place(route[0]);
-        for (let i = 1; i < route.length; i++) {
-          if (!(await hop(route[i - 1], route[i], mine))) return;
-          if (i < route.length - 1 && !(await pause(160, mine))) return;
-        }
-        if (way) {
-          tick.classList.add('on');
-          held = FROM;
-          if (!(await pause(2600, mine))) return;
-          tick.classList.remove('on');
-          place(FROM);
-          if (!(await pause(700, mine))) return;
-        } else {
-          // waits here; a device coming back on restarts the trip from here
-          held = route.at(-1);
-          parcel.classList.add('waiting');
-          return;
-        }
-      }
-    }
-
-    function restart() {
-      trip();
-    }
-
-    still.addEventListener('change', restart);
-    document.addEventListener('visibilitychange', () => {
-      if (!document.hidden) restart();
-      else run++;
-    });
-    // start when the drawing is on screen
-    if ('IntersectionObserver' in window) {
-      const seen = new IntersectionObserver((entries) => {
-        if (entries.some((e) => e.isIntersecting)) {
-          seen.disconnect();
-          restart();
-        }
-      });
-      seen.observe(root);
-    } else {
-      restart();
-    }
+      track('.file-progress', [[0,{strokeDashoffset:14}],[.35,{strokeDashoffset:14}],[.56,{strokeDashoffset:0}],[.68,{strokeDashoffset:0}],[1,{strokeDashoffset:14}]]);
+      track('.waveform', [0,.65,.69,.73,.77,.81,.85,.89,.93,1].map((t,i) => [t,{transform:`scaleY(${i%2 ? .4 : 1})`}]));
+      break;
+    case 'stack':
+      track('.upper-layer', [[0,move(0,38)],[.16,move(0,38)],[.3,move(0,8)],[.43,move(0,8)],[.55,move(0,-12)],[.82,move(0,-12)],[.97,move(0,38)],[1,move(0,38)]]);
+      track('.mid-layer', [[0,move(0,19)],[.43,move(0,19)],[.55,move(0,0)],[.82,move(0,0)],[.94,move(0,19)],[1,move(0,19)]]);
+      track('.test-check', [[0,alpha(.25)],[.67,alpha(.25)],[.75,alpha(1)],[.87,alpha(1)],[1,alpha(.25)]]);
+      break;
   }
-})();
+}
+
+const motionPreference = matchMedia('(prefers-reduced-motion: reduce)');
+function loopPlayer(figure, duration, draw) {
+  const button = figure.querySelector('[data-play]');
+  let elapsed = 0, previous = null, frame = 0;
+  let visible = !('IntersectionObserver' in window);
+  let paused = motionPreference.matches;
+  const tick = now => {
+    if (previous !== null) elapsed = (elapsed + now - previous) % duration;
+    previous = now;
+    draw(elapsed / duration);
+    frame = requestAnimationFrame(tick);
+  };
+  function sync() {
+    cancelAnimationFrame(frame);
+    previous = null;
+    button.hidden = false;
+    button.textContent = paused ? 'Play' : 'Pause';
+    button.setAttribute('aria-label', button.textContent + ' ' + (figure.closest('article')?.querySelector('h3')?.textContent || 'message routes') + ' animation');
+    if (!paused && visible && !document.hidden) frame = requestAnimationFrame(tick);
+  }
+  if ('IntersectionObserver' in window) {
+    new IntersectionObserver(([entry]) => { visible = entry.isIntersecting; sync(); }).observe(figure);
+  }
+  button.addEventListener('click', () => { paused = !paused; sync(); });
+  motionPreference.addEventListener('change', () => { paused = motionPreference.matches; sync(); });
+  document.addEventListener('visibilitychange', sync);
+  draw(0);
+  sync();
+  return { get paused() { return paused; }, seek(fraction) {
+    elapsed = fraction * duration;
+    previous = null;
+    draw(fraction);
+  } };
+}
+
+function illustration(figure) {
+  const id = figure.dataset.scene;
+  const states = figure.dataset.states.split('|');
+  const output = figure.querySelector('output'), step = figure.querySelector('[data-step]');
+  const duration = {seal:6900,local:7400,carry:8900,roster:7600,media:8200,stack:9200}[id];
+  const stops = {seal:[0,.16,.38,.8],local:[0,.16,.5,.76],carry:[0,.27,.51,.81],
+    roster:[0,.31,.48,.76],media:[0,1/3,2/3],stack:[0,.2,.46,.7]}[id];
+  const tracks = [];
+  figureTracks(id, (selector, points) => {
+    const frames = points.map(([offset, style]) => ({offset, easing:'ease-in-out', ...style}));
+    const animation = figure.querySelector(selector).animate(frames, {duration, fill:'both'});
+    animation.pause();
+    tracks.push(animation);
+  });
+  let current = -1;
+  const player = loopPlayer(figure, duration, fraction => {
+    for (const track of tracks) track.currentTime = fraction * duration;
+    const state = stops.findLastIndex(stop => stop <= fraction);
+    if (state !== current) {
+      current = state;
+      figure.dataset.state = state;
+      output.value = states[state];
+    }
+  });
+  step.hidden = false;
+  const advance = () => {
+    const next = (current + 1) % stops.length;
+    const end = stops[next+1] ?? 1;
+    player.seek((stops[next] + end) / 2);
+  };
+  step.addEventListener('click', advance);
+  const drawing = figure.querySelector('svg');
+  drawing.style.cursor = 'pointer';
+  drawing.addEventListener('click', advance);
+}
+
+pickBuild();
+document.querySelectorAll('.iso-figure').forEach(illustration);
+const globe = document.querySelector('.globe');
+if (globe) routeDemo(globe);

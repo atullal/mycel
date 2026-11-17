@@ -1,0 +1,35 @@
+<section id="how" class="guide-section mechanisms wrap" aria-labelledby="how-title">
+  <h2 id="how-title">How it works</h2>
+  <div class="mechanism-grid">
+    <article>
+      <h3>No server holds your messages</h3>
+      {{FIGURE_seal}}
+      <p>Each device keeps its own keys, encrypts messages end to end and checks what it receives. By default, Mycel uses n0’s lookup service to find peers and its public relays when a direct connection fails. Relays forward ciphertext. With those services off, devices can find peers through the BitTorrent DHT and relay for each other.</p>
+    </article>
+    <article>
+      <h3>It works with no internet</h3>
+      {{FIGURE_local}}
+      <p>Devices can talk directly on the same network or over a cable. On supported platforms they can also use Bluetooth or peer-to-peer Wi-Fi. Choose <strong>Local only</strong> in Network and restart Mycel to keep connections off the internet.</p>
+    </article>
+    <article>
+      <h3>Every device carries for the others</h3>
+      {{FIGURE_carry}}
+      <p>Devices can pass a sealed message along over several hops, or hold it while its recipient is offline. You can also choose an always-on device as a <em>keeper</em>. It stores and serves the chat without being able to read it.</p>
+    </article>
+    <article>
+      <h3>Membership is signed, keys rotate</h3>
+      {{FIGURE_roster}}
+      <p>Each chat keeps a signed record of its members. Removing a member changes the chat key. Keys also rotate on a schedule. Mycel seals each member’s keys using X25519 together with ML-KEM-768, a post-quantum scheme.</p>
+    </article>
+    <article>
+      <h3>Chat, files and calls</h3>
+      {{FIGURE_media}}
+      <p>Direct and group chats support replies, edits, reactions and voice notes. Files of any size travel in pieces that are checked on arrival and resume after an interruption. Voice and video calls support up to eight people.</p>
+    </article>
+    <article>
+      <h3>Open from top to bottom</h3>
+      {{FIGURE_stack}}
+      <p>The apps, protocol and tests share <a href="{{REPO_URL}}">one repository</a>, under the MIT and Apache 2.0 licences. The <a href="{{REPO_URL}}/blob/main/docs/TRUST.md">security specification</a> explains what Mycel protects and where those protections end.</p>
+    </article>
+  </div>
+</section>

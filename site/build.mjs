@@ -9,6 +9,7 @@
 // SITE_RELEASE_JSON=<file> reads a saved release instead of asking GitHub
 // (for working on the page offline).
 
+import { renderFigure } from './isometric.mjs';
 import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -105,12 +106,9 @@ function versionOf(release) {
 const dateOf = (release) =>
   new Date(release.published_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
 
-// One button per system, all but the first hidden: the page's script shows
-// the one for the visitor's system instead.
+// The platform list works before detection and when the browser's OS is unknown.
 function heroDownload(release, builds, version) {
-  const first = builds.find((b) => b.id === 'mac') ?? builds[0];
-  const hide = (b) => (b === first ? '' : ' hidden');
-  if (!first) {
+  if (!builds.length) {
     return `<p class="get"><a class="button" href="${repoUrl}/releases">See the releases</a></p>
     <p class="fine">Experimental preview. No build is published for download yet;
       <a href="${repoUrl}#build-from-source">building from source</a> takes a few minutes.</p>`;
@@ -118,11 +116,13 @@ function heroDownload(release, builds, version) {
   const buttons = builds
     .map(
       (b) =>
-        `<a class="button" data-system="${b.id}" href="${esc(b.files[0].url)}"${hide(b)}>Download for ${esc(b.name)} <span class="v">${esc(version)}</span></a>`,
+        `<a class="button" data-system="${b.id}" href="${esc(b.files[0].url)}" hidden>Download for ${esc(b.name)} <span class="v">${esc(version)}</span></a>`,
     )
     .join('\n      ');
-  const needs = builds.map((b) => `<span data-system="${b.id}"${hide(b)}>${esc(b.needs)}.</span>`).join(' ');
+  const needs = builds.map((b) => `<span data-system="${b.id}" hidden>${esc(b.needs)}.</span>`).join(' ');
   return `<p class="get">
+      <a class="button" data-system="choose" href="#download">Choose a download</a>
+      <a class="button" data-system="ios" href="${repoUrl}/blob/main/docs/PLATFORMS.md" hidden>iPhone and iPad setup</a>
       ${buttons}
     </p>
     <p class="fine">${needs} Experimental preview:
@@ -182,6 +182,9 @@ const version = versionOf(release);
 
 let page = await readFile(join(here, 'index.html'), 'utf8');
 const fill = {
+  COASTLINES: (await readFile(join(here, 'coastlines.json'), 'utf8')).trim(),
+  HOW_IT_WORKS: (await readFile(join(here, 'how-it-works.html'), 'utf8'))
+    .replace(/\{\{FIGURE_(\w+)\}\}/g, (_, id) => renderFigure(id)),
   HERO_DOWNLOAD: heroDownload(release, builds, version),
   DOWNLOADS: downloads(release, builds, version),
   REPO_URL: repoUrl,
@@ -193,7 +196,7 @@ if (left) throw new Error(`unfilled placeholder ${left[0]}`);
 await rm(out, { recursive: true, force: true });
 await mkdir(out, { recursive: true });
 await writeFile(join(out, 'index.html'), page);
-for (const file of ['style.css', 'site.js']) await cp(join(here, file), join(out, file));
+for (const file of ['style.css', 'site.js', 'globe.js']) await cp(join(here, file), join(out, file));
 await cp(join(here, 'assets'), join(out, 'assets'), { recursive: true });
 await cp(join(root, 'docs', 'screenshots'), join(out, 'screenshots'), { recursive: true });
 // GitHub Pages runs Jekyll unless told not to.
