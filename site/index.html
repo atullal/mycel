@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mycel: private messaging with no server</title>
+<meta name="description" content="Mycel is private messaging with no server. Chats, files and calls go straight between devices, and through other devices when there is no direct path. Free and open source, for macOS, Windows, Linux and Android.">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#e9ede8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1412" media="(prefers-color-scheme: dark)">
+<meta property="og:title" content="Mycel: private messaging with no server">
+<meta property="og:description" content="Chats, files and calls go straight between devices, and through other devices when there is no direct path.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="screenshots/01-chat.png">
+<link rel="icon" href="assets/mycel.svg" type="image/svg+xml">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="top wrap">
+  <nav aria-label="On this page">
+    <a href="#download">Download</a>
+    <a href="#how">How it works</a>
+    <a href="#status">Status</a>
+  </nav>
+  <nav aria-label="Project">
+    <a href="{{REPO_URL}}/tree/main/docs">Documentation</a>
+    <a href="{{REPO_URL}}">Source</a>
+  </nav>
+</header>
+
+<main>
+
+<section class="hero wrap">
+  <div class="hero-text">
+    <img class="mark" src="assets/mycel.svg" width="56" height="56" alt="">
+    <h1>Mycel</h1>
+    <p class="lede">Private messaging with no server. Chats, files and calls go
+      straight between devices, and through other devices when there is no
+      direct path.</p>
+    {{HERO_DOWNLOAD}}
+  </div>
+
+  <figure class="mesh" id="mesh">
+    <svg viewBox="36 52 500 362" role="group" aria-label="Six devices and the paths between them">
+      <g class="edges">
+        <line class="edge near" data-a="you" data-b="hana" x1="92" y1="222" x2="212" y2="108"/>
+        <line class="edge near" data-a="you" data-b="tobias" x1="92" y1="222" x2="222" y2="326"/>
+        <line class="edge net" data-a="hana" data-b="laptop" x1="212" y1="108" x2="352" y2="208"/>
+        <line class="edge net" data-a="tobias" data-b="laptop" x1="222" y1="326" x2="352" y2="208"/>
+        <line class="edge near" data-a="tobias" data-b="kofi" x1="222" y1="326" x2="392" y2="352"/>
+        <line class="edge net" data-a="kofi" data-b="ines" x1="392" y1="352" x2="486" y2="112"/>
+        <line class="edge net" data-a="laptop" data-b="ines" x1="352" y1="208" x2="486" y2="112"/>
+      </g>
+      <circle class="parcel" r="7" cx="92" cy="222"/>
+      <g class="nodes">
+        <g class="node self" data-id="you" data-x="92" data-y="222">
+          <circle class="halo" cx="92" cy="222" r="38"/>
+          <circle class="disc" cx="92" cy="222" r="29"/>
+          <text class="initials" x="92" y="227">You</text>
+        </g>
+        <g class="node tone-slate" data-id="hana" data-x="212" data-y="108" data-name="Hana">
+          <circle class="disc" cx="212" cy="108" r="24"/>
+          <text class="initials" x="212" y="113">HS</text>
+          <text class="name" x="212" y="153">Hana</text>
+        </g>
+        <g class="node tone-ochre" data-id="tobias" data-x="222" data-y="326" data-name="Tobias">
+          <circle class="disc" cx="222" cy="326" r="24"/>
+          <text class="initials" x="222" y="331">TW</text>
+          <text class="name" x="222" y="371">Tobias</text>
+        </g>
+        <g class="node stranger" data-id="laptop" data-x="352" data-y="208" data-name="Someone's laptop">
+          <circle class="disc" cx="352" cy="208" r="24"/>
+          <path class="glyph" d="M342 201h20v12h-20zM338 216h28"/>
+          <text class="name" x="352" y="252">Someone's</text>
+          <text class="name" x="352" y="270">laptop</text>
+        </g>
+        <g class="node tone-plum" data-id="kofi" data-x="392" data-y="352" data-name="Kofi">
+          <circle class="disc" cx="392" cy="352" r="24"/>
+          <text class="initials" x="392" y="357">KM</text>
+          <text class="name" x="392" y="397">Kofi</text>
+        </g>
+        <g class="node tone-tide dest" data-id="ines" data-x="486" data-y="112">
+          <circle class="disc" cx="486" cy="112" r="26"/>
+          <text class="initials" x="486" y="117">ID</text>
+          <text class="name" x="486" y="74">Ines</text>
+          <g class="tick" transform="translate(509 132)">
+            <circle r="10"/>
+            <path d="M-4.5 0.5l3 3 6-6.5"/>
+          </g>
+        </g>
+      </g>
+    </svg>
+    <figcaption>
+      <p class="mesh-say" id="mesh-say" aria-live="polite">Your phone has no signal. The
+        message reaches Ines through Hana's phone and someone's laptop, and
+        neither can read it.</p>
+      <ul class="legend">
+        <li><span class="swatch near"></span>Nearby: Bluetooth or Wi-Fi</li>
+        <li><span class="swatch net"></span>Over the internet</li>
+        <li><span class="swatch off"></span>Switched off</li>
+      </ul>
+      <p class="mesh-hint" id="mesh-hint" hidden>Switch a device off to see the message take another way.</p>
+    </figcaption>
+  </figure>
+</section>
+
+<section class="shots wrap" aria-label="Screenshots">
+  <picture class="shot-desktop">
+    <source srcset="screenshots/02-group-dark.png" media="(prefers-color-scheme: dark)">
+    <img src="screenshots/01-chat.png" width="2560" height="1600" loading="lazy"
+         alt="Mycel on a desktop: a conversation with a shared photo, a quoted reply, read receipts and the Encrypted badge, beside a list of chats that shows who is nearby and who is online.">
+  </picture>
+  <picture class="shot-phone">
+    <source srcset="screenshots/05-phone-call.png" media="(prefers-color-scheme: dark)">
+    <img src="screenshots/04-phone-chat.png" width="780" height="1688" loading="lazy"
+         alt="Mycel on a phone: a group chat with a shared file, a reaction and delivery ticks.">
+  </picture>
+  <p class="note">Screenshots are from the browser demo, with simulated people.</p>
+</section>
+
+<section class="how wrap" id="how">
+  <h2>How it works</h2>
+  <div class="points">
+    <div>
+      <h3>No server holds your messages</h3>
+      <p>Each device keeps its own keys, encrypts end to end and checks
+        everything it receives. To cross the internet, Mycel by default uses
+        public relay and lookup servers run by n0, the team behind Iroh, which
+        see only ciphertext. Switch them off and devices find each other
+        through the BitTorrent DHT and relay for one another.</p>
+    </div>
+    <div>
+      <h3>It works with no internet</h3>
+      <p>Devices on the same network, in Bluetooth range, or joined by
+        peer-to-peer Wi-Fi or a cable talk to each other directly. A
+        Local&nbsp;only mode never contacts the internet at all.</p>
+    </div>
+    <div>
+      <h3>Every device carries for the others</h3>
+      <p>Devices pass each other's sealed messages along, over several hops if
+        that is what it takes, and hold them for someone who is offline. An
+        always-on device you choose, a keeper, can store and serve a chat
+        without being able to read it.</p>
+    </div>
+    <div>
+      <h3>Membership is signed, keys rotate</h3>
+      <p>Every chat has a signed record of who belongs to it, and removing
+        someone changes the key. Keys are sealed to each member with X25519
+        combined with ML-KEM-768, a post-quantum scheme, and are replaced on a
+        schedule.</p>
+    </div>
+    <div>
+      <h3>Chat, files and calls</h3>
+      <p>Direct chats and groups, replies, edits, reactions and voice notes.
+        Files of any size, sent in pieces that are checked as they arrive and
+        resumed where they stopped. Voice and video calls, one to one or in
+        groups of up to eight.</p>
+    </div>
+    <div>
+      <h3>Open from top to bottom</h3>
+      <p>The apps, the protocol and the tests are in one repository under the
+        MIT and Apache&nbsp;2.0 licences. The
+        <a href="{{REPO_URL}}/blob/main/docs/TRUST.md">security specification</a>
+        says what is defended and what is not.</p>
+    </div>
+  </div>
+</section>
+
+<section class="download wrap" id="download">
+  <h2>Download</h2>
+  {{DOWNLOADS}}
+</section>
+
+<section class="status wrap" id="status">
+  <h2>Before you rely on it</h2>
+  <p class="status-lede">Mycel is an experimental preview. It works, and it is
+    tested, but it has not earned your trust yet.</p>
+  <ul>
+    <li>The cryptography and the trust layer have not had an outside audit. Do
+      not use Mycel yet for anything that must stay secret.</li>
+    <li>Everyone you talk to must run the same version. The format on the wire
+      still changes between versions.</li>
+    <li>Your device's key is your account. If you lose the device, there is no
+      recovery.</li>
+    <li>macOS and iPhone have run on real devices. Windows and Linux have only
+      run in automated tests, and Android only in an emulator.</li>
+    <li>A sleeping iPhone or iPad receives nothing until Mycel is opened
+      again. Waking it would need a push server, and Mycel has none.</li>
+  </ul>
+  <p>What is built and what is not, in detail:
+    <a href="{{REPO_URL}}/blob/main/docs/ARCHITECTURE.md">architecture</a>,
+    <a href="{{REPO_URL}}/blob/main/docs/PLATFORMS.md">platforms</a>.</p>
+</section>
+
+</main>
+
+<footer class="wrap">
+  <p>Mycel is free software under the MIT and Apache&nbsp;2.0 licences.
+    <a href="{{REPO_URL}}">Source</a>,
+    <a href="{{REPO_URL}}/blob/main/CONTRIBUTING.md">contributing</a>,
+    <a href="{{REPO_URL}}/blob/main/SECURITY.md">reporting a vulnerability</a>.</p>
+  <p>This page loads nothing from other sites and keeps no record of your visit.</p>
+</footer>
+
+<script type="application/json" id="builds">{{BUILDS_JSON}}</script>
+<script src="site.js" defer></script>
+</body>
+</html>
