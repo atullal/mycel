@@ -54,6 +54,6 @@ test('mixed releases select the verified DMG', async t => {
 
 test('a release with only unsigned Mac files has no direct download', async t => {
   const page = await build(t, ['Mycel_0.1.0_universal.dmg']);
-  assert.doesNotMatch(page, /https:\/\/example.com/);
+  assert.equal(page.includes('https://example.com/'), false);
   assert.match(page, /No build is published for download yet/);
 });
