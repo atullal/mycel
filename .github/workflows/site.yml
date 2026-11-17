@@ -13,7 +13,9 @@ on:
     types: [published, edited, deleted]
   workflow_dispatch:
   # Releases created with GITHUB_TOKEN do not emit another release workflow.
-  workflow_run:
+  # Safe: checkout uses the default branch, with no upstream artifacts,
+  # caches, head refs or privileged build permissions.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
     workflows: [Apps]
     types: [completed]
 
