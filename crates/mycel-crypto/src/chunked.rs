@@ -21,16 +21,18 @@
 //! to it and whether it has them all, without any key. The child *keys* are
 //! sealed: only someone with the root key can open anything.
 //!
-//! Every node has its own key, used for that node only, so the nonce is a
-//! constant. Where the keys come from is the file's **mode**:
+//! A node's key is derived from that node's content, so no key ever seals
+//! two different nodes and the nonce can be a constant. What else goes into
+//! the key is the file's **mode**:
 //!
 //! - **Private** (the default): each key is derived from a fresh random
-//!   secret and the node's position. The same file sent twice shares nothing.
+//!   secret, the node's position and the node's content. The same file sent
+//!   twice shares nothing.
 //!   Pieces are a fixed size: cutting by content would let their lengths
 //!   fingerprint the file to whoever stores them, and buys nothing when
 //!   nothing is shared anyway.
-//! - **Public**: each key is derived from the node's own content (convergent
-//!   encryption) and the plaintext is cut where its content says
+//! - **Public**: each key is derived from the node's content alone
+//!   (convergent encryption) and the plaintext is cut where its content says
 //!   ([`cdc_cut`]). The same bytes give the same nodes on every device, so
 //!   they are stored and fetched once, by anyone. The price: whoever has a
 //!   file can compute its ids and check who holds or asks for it.
@@ -51,7 +53,9 @@ const CTX_PRIVATE_KEY: &str = "mycel/v0/chunk-key";
 const CTX_PUBLIC_LEAF_KEY: &str = "mycel/v0/chunk-convergent-leaf";
 const CTX_PUBLIC_INDEX_KEY: &str = "mycel/v0/chunk-convergent-index";
 const CTX_GEAR: &str = "mycel/v0/chunker-gear";
-/// Not a secret and never reused under one key: every node has its own key.
+/// Not a secret, and never used with one key for two different nodes: a
+/// node's key is derived from that node's content ([`Mode`]), so the same
+/// key and nonce can only ever seal the same bytes again.
 const NODE_NONCE: [u8; 24] = *b"mycel/v0/chunk-nonce\0\0\0\0";
 
 /// Magic prefix of an index node.
@@ -195,10 +199,14 @@ fn cdc_cut_with(buf: &[u8], eof: bool, min: usize, avg: usize, max: usize) -> Op
 /// How a file's keys are made (module docs).
 #[derive(Clone, Debug)]
 pub enum Mode {
-    /// Keys from this secret and each node's position. Use a fresh one per
-    /// file ([`Mode::private`]); it is not needed again after sealing.
+    /// Keys from this secret, each node's position and its content. Use a
+    /// fresh secret per file ([`Mode::private`]), so that two copies share
+    /// nothing; it is not needed again after sealing. A secret used twice
+    /// gives the same node for the same content at the same position (which
+    /// shows that two files begin alike), but never one key for two
+    /// different nodes.
     Private(SymKey),
-    /// Keys from each node's content.
+    /// Keys from each node's content alone.
     Public,
 }
 
@@ -212,28 +220,29 @@ impl Mode {
     }
 
     fn leaf_key(&self, ordinal: u64, plain: &[u8]) -> SymKey {
-        match self {
-            Mode::Private(secret) => position_key(secret, 0, ordinal),
-            Mode::Public => SymKey(Hash32::digest(CTX_PUBLIC_LEAF_KEY, plain).0),
-        }
+        self.node_key(0, ordinal, Hash32::digest(CTX_PUBLIC_LEAF_KEY, plain))
     }
 
     fn index_key(&self, level: u8, ordinal: u64, header: &[u8], tail: &[u8]) -> SymKey {
+        let mut d = Digest::new(CTX_PUBLIC_INDEX_KEY);
+        d.update(header).update(tail);
+        self.node_key(level, ordinal, d.finalize())
+    }
+
+    /// The key of the node at this position with this `content`: a digest
+    /// of everything the key will seal and authenticate. Either way the key
+    /// depends on the content, which is what lets every node share one
+    /// nonce: a key is never used for anything but the node it came from.
+    fn node_key(&self, level: u8, ordinal: u64, content: Hash32) -> SymKey {
         match self {
-            Mode::Private(secret) => position_key(secret, level, ordinal),
-            Mode::Public => {
-                let mut d = Digest::new(CTX_PUBLIC_INDEX_KEY);
-                d.update(header).update(tail);
+            Mode::Private(secret) => {
+                let mut d = Digest::new(CTX_PRIVATE_KEY);
+                d.update(&secret.0).update(&[level]).update(&ordinal.to_le_bytes()).update(&content.0);
                 SymKey(d.finalize().0)
             }
+            Mode::Public => SymKey(content.0),
         }
     }
-}
-
-fn position_key(secret: &SymKey, level: u8, ordinal: u64) -> SymKey {
-    let mut d = Digest::new(CTX_PRIVATE_KEY);
-    d.update(&secret.0).update(&[level]).update(&ordinal.to_le_bytes());
-    SymKey(d.finalize().0)
 }
 
 /// A child as its parent's holder of the key sees it.
@@ -838,6 +847,50 @@ mod tests {
         assert_eq!(store.len(), order.len(), "identical pieces seal to different nodes");
         let (_, store, order) = seal(&Mode::Public, SMALL, &data);
         assert!(store.len() < order.len(), "a public file stores a repeated piece once");
+    }
+
+    /// Every key in a sealed tree, with the id of the node it opens.
+    fn keys_of(f: &SealedFile, store: &Store) -> Vec<(SymKey, Hash32)> {
+        let mut out = vec![(f.key.clone(), f.root)];
+        let mut at = 0;
+        while at < out.len() {
+            let (key, id) = out[at].clone();
+            at += 1;
+            if store[&id].starts_with(INDEX_MAGIC) {
+                let (_, children, _) = open_index(&id, &key, &store[&id]).unwrap();
+                out.extend(children.into_iter().map(|c| (c.key, c.id)));
+            }
+        }
+        out
+    }
+
+    /// The nonce is a constant, so a key must never seal two different
+    /// nodes. That holds even for a secret used for two files (which the
+    /// runtime never does): they share a key only where they share the node.
+    #[test]
+    fn a_secret_used_twice_never_gives_one_key_to_two_nodes() {
+        let mode = Mode::private();
+        let one = pseudo_random(64 * 9, 31);
+        // the same length (so the same tree shape), another third piece
+        let mut two = one.clone();
+        two[64 * 2] ^= 1;
+        let (a, sa, _) = seal(&mode, SMALL, &one);
+        let (b, sb, _) = seal(&mode, SMALL, &two);
+        let mut by_key: HashMap<[u8; 32], Hash32> = HashMap::new();
+        let (ka, kb) = (keys_of(&a, &sa), keys_of(&b, &sb));
+        assert_eq!(ka.len(), kb.len());
+        for (key, id) in ka.iter().chain(&kb) {
+            assert_eq!(*by_key.entry(key.0).or_insert(*id), *id, "one key, two different nodes");
+        }
+        // the pieces they have in common are the same nodes; the changed
+        // piece and every index above it are not
+        let shared = ka.iter().filter(|k| kb.contains(k)).count();
+        assert!(shared > 0 && shared < ka.len(), "{shared} of {}", ka.len());
+        assert_ne!(a.key.0, b.key.0);
+        assert_eq!(open(&a, &sa, one.len() as u64).unwrap(), one);
+        assert_eq!(open(&b, &sb, two.len() as u64).unwrap(), two);
+        // and the same file under the same secret is the same file
+        assert_eq!(seal(&mode, SMALL, &one).0, a);
     }
 
     #[test]
