@@ -33,6 +33,9 @@ pub(crate) struct Net {
     pub nodes: Vec<Router>,
     index: BTreeMap<SignPk, usize>,
     links: BTreeSet<(usize, usize)>,
+    /// Devices behind a router that lets nothing in: they dial out over
+    /// the internet, but nobody can dial them.
+    pub nat: BTreeSet<usize>,
     pub now: Time,
     delay: Time,
     queue: BinaryHeap<Reverse<Due>>,
@@ -54,6 +57,7 @@ impl Net {
             nodes,
             index,
             links: BTreeSet::new(),
+            nat: BTreeSet::new(),
             now: 0,
             delay: 5,
             queue: BinaryHeap::new(),
@@ -131,7 +135,7 @@ impl Net {
                 Out::Deliver { src, payload, .. } => self.delivered.push((i, src, payload)),
                 Out::Control { .. } => {}
                 Out::Dial(peer) => match self.index.get(&peer).copied() {
-                    Some(j) if self.nodes[j].internet() && self.nodes[i].internet() => {
+                    Some(j) if self.nodes[j].internet() && self.nodes[i].internet() && !self.nat.contains(&j) => {
                         self.nodes[i].hop_up(peer, now);
                         self.nodes[j].hop_up(me, now);
                         self.effects(j);
@@ -520,6 +524,218 @@ fn no_open_proxy() {
     net.send(0, 2, 1, b"proxy?");
     assert!(net.delivered.is_empty());
     assert!(net.nodes[1].stats().dropped_no_route >= 1);
+}
+
+/// ... not even between two hops that happen to be up: only for a device
+/// that asked to be relayed for.
+#[test]
+fn no_relaying_between_live_hops_without_a_client() {
+    let mut net = Net::fast(3);
+    for i in 0..3 {
+        net.nodes[i].set_internet(true);
+    }
+    let (a, b, c) = (net.k(0), net.k(1), net.k(2));
+    let now = net.now;
+    // hops 0–1 and 2–1 are up: each talked to 1 a moment ago
+    for (x, kx) in [(0, a), (2, c)] {
+        net.nodes[x].hop_up(b, now);
+        net.nodes[1].hop_up(kx, now);
+    }
+    net.send(0, 2, 1, b"proxy?");
+    assert!(net.delivered.is_empty());
+    // a relay doesn't either: neither of them is its client
+    net.nodes[1].set_relaying(true);
+    net.send(0, 2, 1, b"proxy?");
+    assert!(net.delivered.is_empty());
+    assert_eq!(net.nodes[1].stats().relayed_internet, 0);
+    // for a client it does
+    let now = net.now;
+    assert!(net.nodes[1].relay_join(c, false, now));
+    net.send(0, 2, 1, b"for a client");
+    assert_eq!(net.delivered.len(), 1);
+    assert_eq!(net.nodes[1].stats().relayed_internet, 1);
+}
+
+/// A device the internet can't dial in to names a relay in its record and
+/// keeps a hop up to it. Someone else behind a router reaches it through
+/// that relay, and the answer comes back the same way.
+#[test]
+fn a_relay_carries_between_two_devices_behind_routers() {
+    // 0 [behind a router]    1 [relay: the internet reaches it]    2 [behind a router]
+    let mut net = Net::fast(3);
+    for i in 0..3 {
+        net.nodes[i].set_internet(true);
+    }
+    net.nat.extend([0, 2]);
+    net.nodes[1].set_relaying(true);
+    let (d, r, s) = (net.k(0), net.k(1), net.k(2));
+    // nobody reaches 0 without a relay
+    net.send(2, 0, 0, b"direct?");
+    assert!(net.delivered.is_empty());
+    // 0 dials its relay and keeps the hop, asks it (the driver's control
+    // message) and names it in its record
+    let now = net.now;
+    net.nodes[0].set_relays(vec![r], now);
+    net.run(100);
+    let rec = net.nodes[0].relays_up();
+    assert_eq!(rec.iter().map(|(k, _)| *k).collect::<Vec<_>>(), vec![r]);
+    let now = net.now;
+    assert!(net.nodes[1].relay_join(d, false, now));
+    net.records.push((0, rec));
+    net.send(2, 0, 1, b"in through the relay");
+    assert_eq!(net.delivered.last().map(|(i, src, _)| (*i, *src)), Some((0, s)));
+    assert_eq!(net.nodes[1].stats().relayed_internet, 1);
+    net.send(0, 2, 1, b"and back");
+    assert_eq!(net.delivered.last().map(|(i, src, _)| (*i, *src)), Some((2, d)));
+    assert_eq!(net.nodes[1].stats().relayed_internet, 2);
+    // the sender needn't know the relay: the record names it (once the
+    // "no record" it was told at first has lapsed)
+    net.run(NO_RECORD_TTL);
+    net.send(2, 0, 0, b"by the record");
+    assert_eq!(net.delivered.last().map(|(i, _, p)| (*i, p.clone())), Some((0, Bytes::from_static(b"by the record"))));
+}
+
+/// On mobile data a device carries nobody else's traffic over its uplink:
+/// it stops announcing itself as a gateway and takes no relay clients.
+#[test]
+fn a_metered_device_is_no_gateway_and_no_relay() {
+    // 0 —(ble)— 1 [internet, metered]        2 [internet]
+    let mut net = Net::fast(3);
+    net.link(0, 1);
+    net.nodes[1].set_internet(true);
+    net.nodes[2].set_internet(true);
+    net.run(3_000);
+    let g = net.k(1);
+    assert!(net.nodes[0].is_gateway(&g));
+    net.nodes[1].set_metered(true);
+    net.run(3_000);
+    assert!(!net.nodes[0].is_gateway(&g), "the gateway flag is gone from its announcements");
+    // and it won't carry what still arrives for the internet
+    net.send(0, 2, 1, b"over your data plan?");
+    assert!(net.delivered.is_empty());
+    assert_eq!(net.nodes[1].stats().gateway_out, 0);
+    // nor relay between internet hops
+    net.nodes[1].set_relaying(true);
+    assert!(!net.nodes[1].relaying());
+    // its own traffic still goes out
+    net.send(1, 2, 2, b"mine");
+    assert_eq!(net.delivered.len(), 1);
+    // unmetered again: a gateway again
+    net.nodes[1].set_metered(false);
+    net.run(3_000);
+    assert!(net.nodes[0].is_gateway(&g));
+}
+
+#[test]
+fn relay_clients_are_bounded_and_lapse() {
+    let mut r = Router::new(key(1), Config { max_relay_clients: 2, ..Config::default() });
+    r.set_internet(true);
+    for i in 10..13 {
+        r.hop_up(key(i), 0);
+    }
+    assert!(!r.relay_join(key(10), false, 0), "not a relay yet");
+    r.set_relaying(true);
+    assert!(r.relay_join(key(10), false, 0) && r.relay_join(key(11), false, 0));
+    assert!(!r.relay_join(key(12), false, 0), "full");
+    assert_eq!(r.stats().relay_refused, 1);
+    assert!(r.relay_join(key(10), false, 1_000), "a client asking again isn't refused");
+    assert!(!r.relay_join(key(99), false, 0), "no hop to it");
+    // someone in radio range needs no relay
+    r.set_direct(key(20), true, 0);
+    r.hop_up(key(20), 0);
+    assert!(!r.relay_join(key(20), false, 0));
+    // a client whose hop drops is forgotten, and so is one that stops asking
+    r.hop_down(key(10), 2_000);
+    assert_eq!(r.relay_clients(), 1);
+    r.tick(RELAY_CLIENT_TTL + 1);
+    assert_eq!(r.relay_clients(), 0);
+    // full of strangers: another stranger is refused, a device we know
+    // takes the place of the one that asked longest ago
+    let t = RELAY_CLIENT_TTL + 2;
+    for i in 30..33 {
+        r.hop_up(key(i), t);
+    }
+    assert!(r.relay_join(key(30), false, t) && r.relay_join(key(31), false, t + 1));
+    assert!(!r.relay_join(key(32), false, t + 2));
+    assert!(r.relay_join(key(32), true, t + 2));
+    assert_eq!(r.relay_clients(), 2);
+    assert!(!r.relay_join(key(30), false, t + 3), "the stranger that made room is out");
+    // ... and nobody we know is put out for anyone
+    r.hop_up(key(33), t);
+    assert!(r.relay_join(key(31), true, t + 3));
+    assert!(!r.relay_join(key(33), true, t + 4));
+    r.hop_down(key(31), t + 5);
+    r.hop_down(key(32), t + 5);
+    // and all of them when we stop relaying
+    assert!(r.relay_join(key(12), false, RELAY_CLIENT_TTL + 2));
+    r.set_relaying(false);
+    assert_eq!(r.relay_clients(), 0);
+    assert!(!r.relay_join(key(12), false, RELAY_CLIENT_TTL + 3));
+}
+
+/// A hop to a relay is dialed again when it drops and isn't hung up for
+/// being idle: it is how traffic for the client gets in.
+#[test]
+fn relay_hops_are_redialed_and_never_idle_out() {
+    let mut net = Net::fast(2);
+    net.nodes[0].set_internet(true);
+    net.nodes[1].set_internet(true);
+    net.nat.insert(0);
+    net.nodes[1].set_relaying(true);
+    let (d, r) = (net.k(0), net.k(1));
+    let now = net.now;
+    net.nodes[0].set_relays(vec![r], now);
+    net.run(100);
+    // unused for four times the idle timeout; the client asks again as
+    // the driver does
+    for _ in 0..4 * INTERNET_IDLE / RELAY_REFRESH {
+        let now = net.now;
+        assert!(net.nodes[1].relay_join(d, false, now));
+        net.run(RELAY_REFRESH);
+    }
+    assert_eq!(net.nodes[0].relays_up().len(), 1);
+    assert_eq!(net.nodes[1].relay_clients(), 1);
+    // the hop drops (the relay restarted): dialed again
+    let now = net.now;
+    net.nodes[0].hop_down(r, now);
+    net.nodes[1].hop_down(d, now);
+    assert!(net.nodes[0].relays_up().is_empty());
+    net.run(100);
+    assert_eq!(net.nodes[0].relays_up().len(), 1);
+    // no longer our relay: its hop idles out like any other
+    let now = net.now;
+    net.nodes[0].set_relays(vec![], now);
+    net.run(INTERNET_IDLE + 1_000);
+    assert!(!net.nodes[0].is_neighbour(&r));
+}
+
+#[test]
+fn relaying_between_internet_hops_has_its_own_budget() {
+    let mut r = Router::new(key(1), Config { internet_relay_rate: 2_000, ..Config::default() });
+    r.set_internet(true);
+    r.set_relaying(true);
+    r.hop_up(key(10), 0);
+    r.hop_up(key(11), 0);
+    assert!(r.relay_join(key(11), false, 0));
+    for id in 0..3 {
+        let f = Frame {
+            ttl: 8,
+            reached: true,
+            control: false,
+            dst: key(11),
+            src: key(10),
+            waypoint: key(1),
+            id,
+            offset: 0,
+            total: 1000,
+            payload: Bytes::from(vec![0u8; 1000]),
+        };
+        r.on_frame(key(10), f, 0);
+    }
+    let mut outs = Vec::new();
+    r.drain(&mut outs);
+    assert_eq!(outs.iter().filter(|o| matches!(o, Out::Frame { .. })).count(), 2);
+    assert_eq!((r.stats().relayed_internet, r.stats().dropped_budget), (2, 1));
 }
 
 #[test]

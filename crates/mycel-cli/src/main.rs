@@ -151,7 +151,7 @@ async fn main() -> Result<()> {
             })
             .await?;
             let p = rt.profile();
-            println!("name: {}\nid:   {}\ncode: {}", p.name, p.id, p.contact_code);
+            println!("name: {}\nid:   {}\ncode: {}\nfull: {}", p.name, p.id, p.contact_code, p.contact_code_full);
             rt.shutdown().await
         }
         Cmd::Call { command, args, http, data } => call(http, &expand(&data), &command, &args).await,

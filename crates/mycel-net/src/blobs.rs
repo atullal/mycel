@@ -146,10 +146,10 @@ pub fn ensure_free_space(dir: &Path, need: u64) -> Result<()> {
 /// bytes already written may be double-counted briefly, which is conservative.
 static RESERVED: LazyLock<Mutex<u64>> = LazyLock::new(Mutex::default);
 
-struct SpaceReservation(u64);
+pub(crate) struct SpaceReservation(u64);
 
 impl SpaceReservation {
-    fn acquire(dir: &Path, need: u64) -> Result<Self> {
+    pub(crate) fn acquire(dir: &Path, need: u64) -> Result<Self> {
         let mut reserved = RESERVED.lock();
         Self::claim(&mut reserved, free_space(dir), need)?;
         Ok(Self(need))

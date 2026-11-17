@@ -1242,6 +1242,18 @@
 .mx-pending button:hover {
   background: var(--surface);
 }
+/* private or public file: a word, not an icon */
+.mx-pending button.mx-pending-mode {
+  width: auto;
+  padding: 0 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  flex: none;
+}
+.mx-pending button.mx-pending-mode.is-on {
+  background: var(--accent);
+  color: var(--surface);
+}
 .mx-pending li.is-sending,
 .mx-pending li.is-staging {
   position: relative;

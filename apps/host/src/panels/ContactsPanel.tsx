@@ -88,7 +88,9 @@ export function ContactsPanel({ onShowNearby }: { onShowNearby: () => void }) {
               <Avatar id={c.id} name={c.name} size={36} status={s} />
               <span className="p-person-text">
                 <span className="p-person-name">{c.name}</span>
-                <span className={`p-person-note is-${s}`}>{STATUS_LABEL[s]}</span>
+                <span className={`p-person-note is-${s}`}>
+                  {c.awaitingKeys ? "Waiting to connect once before you can start a conversation" : STATUS_LABEL[s]}
+                </span>
               </span>
               {confirm === c.id ? (
                 <span className="p-confirm">

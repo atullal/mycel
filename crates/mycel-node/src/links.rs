@@ -26,12 +26,30 @@ use mycel_net::{Link, MeshOptions};
 
 /// Multi-hop relaying through nearby devices, on unless `MYCEL_MESH=0`.
 /// `MYCEL_MESH_RELAY=0` still uses the mesh but relays nothing for others.
+///
+/// Over the internet, a device that can be dialed from outside relays for
+/// devices that can't (they ask first), unless `MYCEL_INTERNET_RELAY=0`.
+/// Whether it can be dialed, and whether its uplink is mobile data (then it
+/// carries nobody else's traffic), it finds out itself; `MYCEL_REACHABLE`
+/// and `MYCEL_METERED` (`1` or `0`) say so instead.
 pub fn mesh_options() -> Option<MeshOptions> {
-    let off = |var: &str| std::env::var(var).is_ok_and(|v| v.trim() == "0");
+    let var = |name: &str| std::env::var(name).ok().map(|v| v.trim().to_string());
+    let off = |name: &str| var(name).as_deref() == Some("0");
+    let flag = |name: &str| match var(name).as_deref() {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    };
     if off("MYCEL_MESH") {
         return None;
     }
-    Some(MeshOptions { relay: !off("MYCEL_MESH_RELAY"), ..MeshOptions::default() })
+    Some(MeshOptions {
+        relay: !off("MYCEL_MESH_RELAY"),
+        internet_relay: !off("MYCEL_INTERNET_RELAY"),
+        reachable: flag("MYCEL_REACHABLE"),
+        metered: flag("MYCEL_METERED"),
+        ..MeshOptions::default()
+    })
 }
 
 /// Links this platform has, in the order they start.

@@ -35,6 +35,11 @@ pub fn messages_feed() -> StreamId {
 
 /// A file attached to a message. The blob is encrypted with `key`/`nonce`,
 /// which travel only inside the (end-to-end encrypted) message.
+///
+/// A **chunked** file (docs/TRUST.md §7c; every new attachment) uses the
+/// same fields, so older messages keep decoding: `blob` is the id of the
+/// file's root node, `key` opens that root, and `nonce` holds a fixed marker
+/// and a flag instead of a nonce ([`AttachmentRef::chunked_mode`]).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachmentRef {
     pub blob: Hash32,
@@ -43,6 +48,20 @@ pub struct AttachmentRef {
     pub name: String,
     pub mime: String,
     pub size: u64,
+}
+
+impl AttachmentRef {
+    /// A reference to a chunked file: its root node's id and key.
+    pub fn chunked(root: Hash32, key: [u8; 32], public: bool, name: String, mime: String, size: u64) -> Self {
+        AttachmentRef { blob: root, key, nonce: mycel_crypto::chunked::marker(public), name, mime, size }
+    }
+
+    /// `Some(public)` for a chunked file (`public`: sealed by its content,
+    /// so identical files are one file everywhere), `None` for the older
+    /// single-blob format.
+    pub fn chunked_mode(&self) -> Option<bool> {
+        mycel_crypto::chunked::parse_marker(&self.nonce)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

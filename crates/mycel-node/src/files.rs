@@ -11,7 +11,11 @@ use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
-use mycel_crypto::{Digest, Hash32, STREAM_MAGIC, SymKey, is_stream, open_stream, seal_stream};
+use mycel_crypto::chunked::{self, Mode, SealedFile};
+#[cfg(test)]
+use mycel_crypto::{Digest, seal_stream};
+use mycel_crypto::{Hash32, STREAM_MAGIC, SignPk, SymKey, is_stream, open_stream};
+use mycel_net::chunks::ChunkStore;
 
 /// Legacy (one-shot) attachments were capped at 50 MiB; anything bigger
 /// that isn't a stream is refused rather than read into memory.
@@ -165,11 +169,13 @@ impl<R: Read, W: Write> Read for Tee<R, W> {
 }
 
 /// Hashes everything written through it (the blob id).
+#[cfg(test)]
 struct Hashing<W> {
     inner: W,
     digest: Digest,
 }
 
+#[cfg(test)]
 impl<W: Write> Write for Hashing<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.inner.write(buf)?;
@@ -182,9 +188,96 @@ impl<W: Write> Write for Hashing<W> {
     }
 }
 
+/// Stream `src` into the chunk store as a chunked file (docs/TRUST.md §7c)
+/// kept for `owner`, and into a plaintext copy at `plain_copy`, in one pass
+/// with bounded memory. `public`: sealed by its content, so the same file
+/// is the same nodes on every device. `hints` (private files): devices
+/// likely to hold the file, readable only by whoever gets its reference.
+pub fn seal_chunked(
+    src: &Path,
+    plain_copy: &Path,
+    store: &std::sync::Arc<ChunkStore>,
+    public: bool,
+    hints: &[SignPk],
+    owner: Hash32,
+    progress: impl FnMut(u64),
+) -> Result<SealedFile> {
+    if let Some(d) = plain_copy.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let input = File::open(src).map_err(|e| read_error(src, e))?;
+    let copy = File::create(plain_copy).with_context(|| format!("can't write {}", plain_copy.display()))?;
+    let mut tee = Tee { src: input, copy: BufWriter::with_capacity(1 << 20, copy), read_err: None };
+    let mode = if public { Mode::Public } else { Mode::private() };
+    let hints: Vec<[u8; 32]> = hints.iter().map(|h| h.0).collect();
+    // Until the file is whole and pinned, its nodes are only protected by
+    // this session: dropped on any error, they are left to the cache.
+    let mut session = store.begin_seal();
+    let sealed = match chunked::seal_file(&mode, &hints, &mut tee, |id, bytes| session.put(id, bytes), progress) {
+        Ok(sealed) => sealed,
+        Err(e) => {
+            return Err(match tee.read_err.take() {
+                Some(re) => read_error(src, re),
+                None => anyhow!("couldn't encrypt {}: {e}", src.display()),
+            });
+        }
+    };
+    tee.copy.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    session.finish(sealed.root, owner);
+    Ok(sealed)
+}
+
+/// Decrypt the chunked file under `root` from the chunk store into `out`.
+/// Every node is checked against its id on the way; `max_len` is the size
+/// the message gives. Returns the plaintext size.
+pub fn open_chunked(store: &ChunkStore, root: &Hash32, key: &SymKey, max_len: u64, out: &Path) -> Result<u64> {
+    let mut w = BufWriter::with_capacity(1 << 20, File::create(out)?);
+    let len = chunked::open_file(root, key, max_len, |id| store.read(id), &mut w, |_| {})
+        .map_err(|e| anyhow!("attachment failed to decrypt ({e})"))?;
+    w.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    Ok(len)
+}
+
+/// Compares what is written to it with a file, byte for byte.
+struct SameAs<R> {
+    file: R,
+    buf: Vec<u8>,
+}
+
+impl<R: Read> Write for SameAs<R> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.buf.resize(bytes.len(), 0);
+        self.file.read_exact(&mut self.buf)?;
+        if self.buf != bytes {
+            return Err(io::Error::other("the file differs"));
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Whether the file at `path` is still, byte for byte, the plaintext of the
+/// chunked file under `root` (our copy of an attachment may have been
+/// edited since). Decrypts from the chunk store with bounded memory.
+pub fn same_as_chunked(store: &ChunkStore, root: &Hash32, key: &SymKey, size: u64, path: &Path) -> bool {
+    let Ok(file) = File::open(path) else { return false };
+    if file.metadata().map(|m| m.len()).ok() != Some(size) {
+        return false;
+    }
+    let mut same = SameAs { file: io::BufReader::with_capacity(1 << 20, file), buf: Vec::new() };
+    chunked::open_file(root, key, size, |id| store.read(id), &mut same, |_| {}).is_ok_and(|n| n == size)
+}
+
+/// The older format (one blob per attachment), which new messages no longer
+/// produce: kept to test that attachments sealed this way still open.
+///
 /// Stream `src` into a sealed blob at `sealed` (hashing it on the way) and a
 /// plaintext copy at `plain_copy`, in one pass with bounded memory.
 /// Returns the blob hash and the plaintext size.
+#[cfg(test)]
 pub fn seal_file(
     src: &Path,
     plain_copy: &Path,

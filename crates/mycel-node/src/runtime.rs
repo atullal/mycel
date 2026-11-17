@@ -9,15 +9,14 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 
 use anyhow::{Context, Result, anyhow, bail};
-use data_encoding::BASE64URL_NOPAD;
 use mycel_call::{ALPN_CALL, BoxFuture, CallEvent, CallHost, CallManager};
-use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, SignPk, SymKey, random};
+use mycel_crypto::{DeviceKeys, Hash32, MemberKeys, SignPk, SymKey};
 use mycel_kit_chat::alerts::{self, AlertPolicy, ChatAlert, Latest, ThreadState};
 #[cfg(test)]
 use mycel_kit_chat::reduce;
 use mycel_kit_chat::thread::{self as chat_thread, Direct, Membership, Source};
 use mycel_kit_chat::{AttachmentRef, ChatOp, ChatSignal, ChatState, ChatView, ProfileHistory, messages_feed};
-use mycel_net::{ContactCard, ExtraProtocol, NetEvent, NetMode, Node, NodeOptions, PathKind, PeerState};
+use mycel_net::{ExtraProtocol, NetEvent, NetMode, Node, NodeOptions, PathKind, PeerState};
 use mycel_sync::{FeedCursor, Replica};
 use mycel_trust::{Role, SpaceId};
 use serde::{Deserialize, Serialize};
@@ -25,6 +24,13 @@ use tokio::sync::broadcast;
 
 use crate::api::*;
 use crate::store::DbStore;
+
+mod contacts;
+mod space_keys;
+pub use contacts::{
+    ContactCode, ContactStub, decode_contact_code, decode_contact_code_with_hints, encode_contact_code,
+    encode_contact_code_with_hints, encode_short_contact_code, parse_contact_code,
+};
 
 const ATTACHMENT_AAD: &[u8] = b"mycel/v0/attachment";
 /// Transfer progress events are throttled to one per this interval.
@@ -64,7 +70,6 @@ impl mycel_sync::FeedValidator for WasmRules {
 pub fn chat_rules_hash() -> String {
     mycel_rules::RulesHash::of(CHAT_RULES_WASM).to_string()
 }
-const CONTACT_PREFIX: &str = "mycel:";
 
 /// Bound unsolicited request metadata independently of blob consent. Accepted
 /// conversations and their sync history are outside these admission limits,
@@ -144,6 +149,13 @@ pub struct Runtime {
     events: broadcast::Sender<Event>,
     name: Mutex<String>,
     contacts: Arc<Mutex<BTreeMap<SignPk, StoredContact>>>,
+    /// Contacts added from a short contact code whose keys (their signed
+    /// card) haven't been fetched yet, with the name the code gave.
+    awaiting: Arc<Mutex<BTreeMap<SignPk, String>>>,
+    /// The fetches of those cards.
+    card_fetches: contacts::CardFetches,
+    /// This runtime, for the tasks it starts.
+    this: Weak<Runtime>,
     mode: NetworkMode,
     /// The mode the next launch will use (`set_network_mode`).
     next_mode: Mutex<NetworkMode>,
@@ -399,32 +411,6 @@ fn parse_hash(s: &str) -> Result<Hash32> {
     Ok(Hash32(parse32(s)?))
 }
 
-pub fn encode_contact_code(card: &ContactCard) -> String {
-    format!("{CONTACT_PREFIX}{}", BASE64URL_NOPAD.encode(&postcard::to_allocvec(card).unwrap()))
-}
-
-/// Contact code plus optional `@ip:port,ip:port` address hints (unsigned,
-/// only used to find the device; its identity is still the signed card).
-pub fn encode_contact_code_with_hints(card: &ContactCard, hints: &[String]) -> String {
-    let base = encode_contact_code(card);
-    if hints.is_empty() { base } else { format!("{base}@{}", hints.join(",")) }
-}
-
-pub fn decode_contact_code(code: &str) -> Result<ContactCard> {
-    Ok(decode_contact_code_with_hints(code)?.0)
-}
-
-pub fn decode_contact_code_with_hints(code: &str) -> Result<(ContactCard, Vec<std::net::SocketAddr>)> {
-    let code: String = code.split_whitespace().collect();
-    let body = code.strip_prefix(CONTACT_PREFIX).unwrap_or(&code);
-    let (card_part, hints) = body.split_once('@').unwrap_or((body, ""));
-    let bytes = BASE64URL_NOPAD.decode(card_part.as_bytes()).context("not a Mycel contact code")?;
-    let card: ContactCard = postcard::from_bytes(&bytes).context("not a Mycel contact code")?;
-    card.verify().context("contact code signature is invalid")?;
-    let hints = hints.split(',').filter_map(|h| h.parse().ok()).take(8).collect();
-    Ok((card, hints))
-}
-
 /// A friendly default name: the computer's name.
 fn default_device_name() -> String {
     #[cfg(target_os = "macos")]
@@ -599,6 +585,9 @@ impl Runtime {
                 }
             }
         };
+        let awaiting: Arc<Mutex<BTreeMap<SignPk, String>>> = Arc::new(Mutex::new(
+            store.kv_decode::<Vec<(SignPk, String)>>("contacts-awaiting")?.unwrap_or_default().into_iter().collect(),
+        ));
         let contacts: Arc<Mutex<BTreeMap<SignPk, StoredContact>>> = Arc::new(Mutex::new(
             store
                 .kv_decode::<Vec<StoredContact>>("contacts")?
@@ -616,6 +605,10 @@ impl Runtime {
             nopts.links = crate::links::device_links(keys.sign_pk(), &name);
             nopts.mesh = crate::links::mesh_options();
         }
+        // Which outside services the internet mode uses, and the DHT nodes
+        // known when this device last ran (see `upkeep`).
+        nopts.services = mycel_net::Services::from_env();
+        nopts.services.dht_nodes = store.kv_decode::<Vec<String>>(DHT_NODES)?.unwrap_or_default();
         // MYCEL_IP=0: no Wi-Fi/Ethernet IP at all, links only (to test or
         // demonstrate peer-to-peer Wi-Fi and Bluetooth).
         if std::env::var("MYCEL_IP").is_ok_and(|v| v.trim() == "0") {
@@ -633,6 +626,7 @@ impl Runtime {
         let (arriving_for_policy, requests_for_policy, request_store) =
             (arriving.clone(), requests.clone(), store.clone());
         let (contacts_for_policy, evicted): (_, Arc<Mutex<Vec<SpaceId>>>) = (contacts.clone(), Arc::default());
+        let awaiting_for_policy = awaiting.clone();
         let evicted_by_policy = evicted.clone();
         let arrival_order: Mutex<Vec<SpaceId>> = Mutex::default();
         let keeper = opts.keeper;
@@ -651,8 +645,10 @@ impl Runtime {
                 let mut order = arrival_order.lock();
                 order.retain(|s| requests.contains_key(s));
                 let admission = {
-                    let contacts = contacts_for_policy.lock();
-                    admit_request(&requests, &order, |p| contacts.contains_key(p), from, space)
+                    // (a contact still awaited is a contact: see `contacts.rs`)
+                    let (contacts, awaiting) = (contacts_for_policy.lock(), awaiting_for_policy.lock());
+                    let is_contact = |p: &SignPk| contacts.contains_key(p) || awaiting.contains_key(p);
+                    admit_request(&requests, &order, is_contact, from, space)
                 };
                 let evict = match admission {
                     Admission::Refuse => return false,
@@ -710,13 +706,51 @@ impl Runtime {
             mycel_rules::RulesEngine::load(CHAT_RULES_WASM).map_err(|e| anyhow!("chat rules failed to load: {e:?}"))?;
         nopts.feed_validator = Some(Arc::new(WasmRules(engine)));
         let node = Node::spawn(keys.clone(), nopts).await?;
+        // Files held for others (docs/TRUST.md §7c): contacts before
+        // strangers, nothing from blocked devices; and contacts are who we
+        // ask to hold a file for a member we can't reach.
+        {
+            let (known, refused) = (contacts.clone(), blocked.clone());
+            node.set_cache_policy(Arc::new(move |pk| {
+                if refused.lock().contains(pk) {
+                    mycel_net::chunks::CacheTier::Refuse
+                } else if known.lock().contains_key(pk) {
+                    mycel_net::chunks::CacheTier::Contact
+                } else {
+                    mycel_net::chunks::CacheTier::Stranger
+                }
+            }));
+            let known = contacts.clone();
+            node.set_replica_candidates(Arc::new(move || known.lock().keys().copied().collect()));
+            // `MYCEL_FILE_CACHE_MB`: disk space donated to holding other
+            // people's files (0: none).
+            if let Some(mb) = std::env::var("MYCEL_FILE_CACHE_MB").ok().and_then(|v| v.parse::<u64>().ok()) {
+                node.set_cache_budget(mb.saturating_mul(1024 * 1024));
+            }
+            // With the internet, holders are announced and looked up on
+            // the Mainline DHT, through the DHT node this device already
+            // runs for its records. Never in the local modes (they don't
+            // touch the internet), nor with the DHT switched off.
+            if let Some(holders) = node.dht_holders() {
+                node.set_holders(Arc::new(holders));
+            }
+        }
 
         for (space, (ops, envs)) in stored_spaces {
             let Some(genesis) = ops.iter().find(|o| o.id() == space).cloned() else {
                 continue;
             };
             let rest: Vec<_> = ops.into_iter().filter(|o| o.id() != space).collect();
-            match Replica::restore(keys.clone(), genesis, rest, envs, Some(store.clone())) {
+            // (its reader keys and keyring: unreadable means "none kept")
+            let secrets = store.space_secrets(&space).ok().flatten();
+            match Replica::restore_with_secrets(
+                keys.clone(),
+                genesis,
+                rest,
+                envs,
+                secrets.as_deref(),
+                Some(store.clone()),
+            ) {
                 Ok(r) => {
                     node.insert_replica(r);
                 }
@@ -740,6 +774,9 @@ impl Runtime {
             events,
             name: Mutex::new(name),
             contacts,
+            awaiting,
+            card_fetches: Default::default(),
+            this: weak.clone(),
             mode: opts.mode,
             next_mode: Mutex::new(next_mode),
             keeper: opts.keeper,
@@ -780,6 +817,9 @@ impl Runtime {
             rt.seed_alerts();
         }
         tokio::spawn(bridge(Arc::downgrade(&rt), rt.node.subscribe()));
+        tokio::spawn(upkeep(Arc::downgrade(&rt)));
+        rt.fetch_awaited_cards();
+        rt.use_reader_keys_where_taking_part();
         // catch up with everyone right away
         for s in rt.node.space_ids() {
             rt.node.changed(s);
@@ -864,15 +904,7 @@ impl Runtime {
         Ok(())
     }
 
-    // ───────────── identity & contacts ─────────────
-
-    pub fn profile(&self) -> Profile {
-        Profile {
-            id: hex_id(&self.keys.sign_pk()),
-            name: self.name.lock().clone(),
-            contact_code: encode_contact_code_with_hints(&self.node.card(), &self.node.local_addresses()),
-        }
-    }
+    // ───────────── identity & contacts (more in `contacts.rs`) ─────────────
 
     pub fn set_name(&self, name: String) -> Result<Profile> {
         let name = name.trim().chars().take(64).collect::<String>();
@@ -891,68 +923,21 @@ impl Runtime {
         Ok(self.profile())
     }
 
-    fn save_contacts(&self) {
-        let list: Vec<StoredContact> = self.contacts.lock().values().cloned().collect();
-        self.store.kv_put("contacts", postcard::to_allocvec(&list).unwrap());
-    }
-
-    fn remember(&self, keys: MemberKeys, name: String) -> Result<Contact> {
-        if keys.sign_pk == self.keys.sign_pk() {
-            bail!("that's your own contact code");
+    /// The devices that might relay for us: contacts, then everyone else in
+    /// our conversations (keepers included: an always-on device is the
+    /// likeliest to be reachable).
+    fn offer_relay_candidates(&self) {
+        let Some(mesh) = self.node.mesh() else { return };
+        let me = self.keys.sign_pk();
+        let mut list: Vec<SignPk> = self.contacts.lock().keys().copied().collect();
+        for space in self.node.space_ids() {
+            if let Ok(members) = self.node.with_space(&space, |r| r.members()) {
+                list.extend(members.into_iter().map(|(k, _)| k.sign_pk));
+            }
         }
-        keys.verify_binding()?;
-        self.contacts.lock().insert(keys.sign_pk, StoredContact { keys, name });
-        self.save_contacts();
-        self.emit(Event::ContactsChanged);
-        self.contact(&keys.sign_pk).context("contact vanished")
-    }
-
-    pub fn add_contact(&self, code: String) -> Result<Contact> {
-        let (card, hints) = decode_contact_code_with_hints(&code)?;
-        if !hints.is_empty() {
-            self.node.add_peer_hints(card.keys.sign_pk, &hints);
-            let mut all = self.hints.lock();
-            all.insert(card.keys.sign_pk, hints.iter().map(|h| h.to_string()).collect());
-            let list: Vec<(SignPk, Vec<String>)> = all.iter().map(|(k, v)| (*k, v.clone())).collect();
-            self.store.kv_put("hints", postcard::to_allocvec(&list).unwrap());
-        }
-        self.remember(card.keys, card.name)
-    }
-
-    pub async fn add_nearby_contact(&self, id: PeerId) -> Result<Contact> {
-        let pk = parse_pk(&id)?;
-        let card = self.node.fetch_card(pk).await?;
-        self.remember(card.keys, card.name)
-    }
-
-    pub fn remove_contact(&self, id: PeerId) -> Result<()> {
-        let pk = parse_pk(&id)?;
-        self.contacts.lock().remove(&pk);
-        self.save_contacts();
-        self.emit(Event::ContactsChanged);
-        Ok(())
-    }
-
-    fn contact(&self, pk: &SignPk) -> Option<Contact> {
-        // Don't hold the contacts lock across name_of (it locks contacts too).
-        let known = self.contacts.lock().contains_key(pk);
-        if !known {
-            return None;
-        }
-        let peers = self.node.peers();
-        Some(Contact {
-            id: hex_id(pk),
-            name: self.name_of(pk),
-            nearby: peers.get(pk).is_some_and(PeerState::is_directly_discovered),
-            online: peers.get(pk).is_some_and(|p| p.online()),
-        })
-    }
-
-    pub fn contacts(&self) -> Vec<Contact> {
-        let pks: Vec<SignPk> = self.contacts.lock().keys().copied().collect();
-        let mut out: Vec<Contact> = pks.iter().filter_map(|pk| self.contact(pk)).collect();
-        out.sort_by_key(|c| c.name.to_lowercase());
-        out
+        let mut seen = HashSet::new();
+        list.retain(|k| *k != me && seen.insert(*k));
+        mesh.set_relay_candidates(list);
     }
 
     pub fn nearby(&self) -> Vec<NearbyPeer> {
@@ -960,15 +945,10 @@ impl Runtime {
     }
 
     fn nearby_from_peers(&self, peers: HashMap<SignPk, PeerState>) -> Vec<NearbyPeer> {
-        let contacts = self.contacts.lock().clone();
         let mut out: Vec<NearbyPeer> = peers
             .into_iter()
             .filter(|(_, p)| p.is_directly_discovered())
-            .map(|(pk, _)| NearbyPeer {
-                id: hex_id(&pk),
-                name: self.name_of(&pk),
-                is_contact: contacts.contains_key(&pk),
-            })
+            .map(|(pk, _)| NearbyPeer { id: hex_id(&pk), name: self.name_of(&pk), is_contact: self.is_contact(&pk) })
             .collect();
         out.sort_by_key(|p| p.name.to_lowercase());
         out
@@ -1009,6 +989,19 @@ impl Runtime {
             addresses: self.node.local_addresses(),
             links: self.node.link_status(),
             peers: paths,
+            relay: self
+                .node
+                .mesh()
+                .map(|m| {
+                    let s = m.relay_status();
+                    RelayInfo {
+                        relaying: s.relaying,
+                        clients: s.clients as u32,
+                        relays: s.relays.iter().map(|k| self.name_of(k)).collect(),
+                        metered: s.metered,
+                    }
+                })
+                .unwrap_or_default(),
         }
     }
 
@@ -1066,6 +1059,7 @@ impl Runtime {
             return n;
         }
         let contact_name = self.contacts.lock().get(pk).map(|c| c.name.clone());
+        let contact_name = contact_name.or_else(|| self.awaiting.lock().get(pk).cloned());
         if let Some(n) = contact_name.filter(|n| !n.is_empty()) {
             return n;
         }
@@ -1206,11 +1200,6 @@ impl Runtime {
         }
     }
 
-    fn contact_keys(&self, id: &str) -> Result<MemberKeys> {
-        let pk = parse_pk(id)?;
-        self.contacts.lock().get(&pk).map(|c| c.keys).ok_or_else(|| anyhow!("{} is not in your contacts", pk.short()))
-    }
-
     fn summary(&self, space: &SpaceId) -> Result<ConversationSummary> {
         if self.arriving.lock().contains(space) {
             bail!("unknown conversation");
@@ -1291,6 +1280,7 @@ impl Runtime {
                     mime: a.mime.clone(),
                     size: a.size,
                     local_path: self.file_path(a).filter(|p| p.exists()).map(|p| p.to_string_lossy().into_owned()),
+                    public: a.chunked_mode() == Some(true),
                 })
                 .collect(),
             reactions: m
@@ -1589,10 +1579,11 @@ impl Runtime {
         }
         self.store.check_writable()?;
         let (space, _) = self.node.create_space()?;
+        self.use_reader_keys(&space);
         let name = self.name.lock().clone();
         self.node.with_space(&space, |r| -> Result<()> {
             for k in &keys {
-                r.add_member(*k, Role::Writer)?;
+                r.add_member(k.clone(), Role::Writer)?;
             }
             r.append(messages_feed(), ChatOp::Meta { title: title.clone(), direct }.encode())?;
             r.append(messages_feed(), ChatOp::Profile { name }.encode())?;
@@ -1722,6 +1713,21 @@ impl Runtime {
         reply_to: Option<MessageId>,
         attachments: Vec<String>,
     ) -> Result<MessageView> {
+        self.send_message_with(id, body, reply_to, attachments, Vec::new()).await
+    }
+
+    /// [`Runtime::send_message`], sending those of `attachments` that are
+    /// also listed in `public` as public files: sealed by their content, so
+    /// the same file is stored and fetched once wherever it is sent, and
+    /// findable by anyone who has it (docs/TRUST.md §7c).
+    pub async fn send_message_with(
+        &self,
+        id: ConversationId,
+        body: String,
+        reply_to: Option<MessageId>,
+        attachments: Vec<String>,
+        public: Vec<String>,
+    ) -> Result<MessageView> {
         let requested = parse_space(&id)?;
         let reply_to = reply_to.map(|r| parse_hash(&r)).transpose()?;
         let space = match reply_to {
@@ -1734,7 +1740,7 @@ impl Runtime {
         }
         let mut refs = Vec::new();
         for path in &attachments {
-            refs.push(self.upload(space, path).await?);
+            refs.push(self.upload(space, path, public.contains(path)).await?);
         }
         let msg_id = self.post(space, ChatOp::Text { body, reply_to, attachments: refs })?;
         // Files the HTTP UI staged under uploads/ are now in files/; drop the staging copies.
@@ -1784,11 +1790,14 @@ impl Runtime {
         Ok(path.to_string_lossy().into_owned())
     }
 
-    /// Encrypt one attachment into the blob store (streaming, any size) and
+    /// Encrypt one attachment into the chunk store (streaming, any size) and
     /// keep a plaintext copy in `files/<blob>/`. Folders and macOS packages
     /// (`.app`, `.pages`, `.key`, `.rtfd`, …) are sent as a `.zip`.
-    async fn upload(&self, space: SpaceId, raw: &str) -> Result<AttachmentRef> {
+    async fn upload(&self, space: SpaceId, raw: &str, public: bool) -> Result<AttachmentRef> {
         let path = crate::files::local_path(raw);
+        if let Some(forwarded) = self.forwarded(space, &path).await {
+            return Ok(forwarded);
+        }
         let meta = tokio::fs::metadata(&path).await.map_err(|e| crate::files::read_error(&path, e))?;
         if meta.is_dir() {
             let base = sanitize_file_name(&path.file_name().unwrap_or_default().to_string_lossy());
@@ -1800,7 +1809,7 @@ impl Runtime {
                 .await?
                 .with_context(|| format!("couldn't zip the folder {}", path.display()));
             let res = match zipped {
-                Ok(()) => self.encrypt_attachment(space, &out, name, raw).await,
+                Ok(()) => self.encrypt_attachment(space, &out, name, raw, public).await,
                 Err(e) => Err(e),
             };
             let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -1810,45 +1819,95 @@ impl Runtime {
             bail!("{} isn't a regular file", path.display());
         }
         let name = sanitize_file_name(&path.file_name().unwrap_or_default().to_string_lossy());
-        self.encrypt_attachment(space, &path, name, raw).await
+        self.encrypt_attachment(space, &path, name, raw, public).await
     }
 
-    async fn encrypt_attachment(&self, space: SpaceId, src: &Path, name: String, id: &str) -> Result<AttachmentRef> {
+    async fn encrypt_attachment(
+        &self,
+        space: SpaceId,
+        src: &Path,
+        name: String,
+        id: &str,
+        public: bool,
+    ) -> Result<AttachmentRef> {
         let size = tokio::fs::metadata(src).await.map_err(|e| crate::files::read_error(src, e))?.len();
-        // room for the sealed blob plus our plaintext copy
+        // room for the sealed pieces plus our plaintext copy
         mycel_net::ensure_free_space(&self.data_dir, mycel_crypto::sealed_len(size) + size)?;
-        let staged = self.node.blob_staging_path().context("blob storage disabled")?;
+        let store = self.node.chunk_store().context("blob storage disabled")?;
         let files = self.data_dir.join("files");
         let incoming = files.join(format!(".incoming-{:016x}", mycel_crypto::random_u64()));
-        let key = SymKey::generate();
-        let nonce: [u8; 24] = random();
         let progress = self.progress(TransferDirection::Upload, id.to_string());
         let job = {
-            let (src, copy, staged, key, progress) =
-                (src.to_path_buf(), incoming.join(&name), staged.clone(), key.clone(), progress.clone());
+            let (src, copy, progress) = (src.to_path_buf(), incoming.join(&name), progress.clone());
             tokio::task::spawn_blocking(move || {
-                crate::files::seal_file(&src, &copy, &staged, &key, &nonce, ATTACHMENT_AAD, |done| progress(done, size))
+                // No holders are named in the file: it would show the
+                // conversation which devices we know.
+                crate::files::seal_chunked(&src, &copy, &store, public, &[], space, |done| progress(done, size))
             })
         };
+        // Kept for the conversation and sent on by the push policy; if a
+        // member can't be reached, contacts are asked to hold it.
         let res = match job.await {
-            Ok(Ok((blob, len))) => self.node.add_blob(space, &staged, blob).await.map(|()| (blob, len)),
+            Ok(Ok(sealed)) => self.node.add_file(space, sealed.root, Vec::new()).await.map(|()| sealed),
             Ok(Err(e)) => Err(e),
             Err(e) => Err(e.into()),
         };
-        let (blob, len) = match res {
+        let sealed = match res {
             Ok(v) => v,
             Err(e) => {
-                let _ = tokio::fs::remove_file(&staged).await;
                 let _ = tokio::fs::remove_dir_all(&incoming).await;
                 return Err(e);
             }
         };
-        progress(len, len);
+        if public {
+            // a public file is found with whoever has it
+            self.node.announce_file(sealed.root);
+        }
+        progress(sealed.len, sealed.len);
         // our decrypted copy: files/<blob>/<name>
-        if tokio::fs::rename(&incoming, files.join(blob.to_string())).await.is_err() {
+        if tokio::fs::rename(&incoming, files.join(sealed.root.to_string())).await.is_err() {
             let _ = tokio::fs::remove_dir_all(&incoming).await;
         }
-        Ok(AttachmentRef { blob, key: key.0, nonce, mime: guess_mime(&name).into(), name, size: len })
+        Ok(AttachmentRef::chunked(
+            sealed.root,
+            sealed.key.0,
+            public,
+            name.clone(),
+            guess_mime(&name).into(),
+            sealed.len,
+        ))
+    }
+
+    /// Forwarding: `path` is our own copy of a chunked attachment
+    /// (`files/<blob>/<name>`), unchanged since. It is then the same file
+    /// again: the same reference, kept for `space` too and sent on from
+    /// the nodes already here, with nothing sealed or stored anew. `None`
+    /// for anything else (it is sealed as a new file).
+    async fn forwarded(&self, space: SpaceId, path: &Path) -> Option<AttachmentRef> {
+        let files = self.data_dir.join("files").canonicalize().ok()?;
+        let path = path.canonicalize().ok()?;
+        let dir = path.parent()?;
+        if dir.parent()? != files {
+            return None;
+        }
+        let blob = parse_hash(dir.file_name()?.to_str()?).ok()?;
+        let a = self.node.space_ids().into_iter().find_map(|s| {
+            let view = self.view(&s).ok()?;
+            view.messages.iter().flat_map(|m| &m.attachments).find(|a| a.blob == blob).cloned()
+        })?;
+        a.chunked_mode()?;
+        if self.file_path(&a)?.canonicalize().ok()? != path {
+            return None;
+        }
+        let store = self.node.chunk_store()?;
+        let (key, size) = (SymKey(a.key), a.size);
+        let unchanged =
+            tokio::task::spawn_blocking(move || crate::files::same_as_chunked(&store, &blob, &key, size, &path)).await;
+        if !unchanged.ok()? {
+            return None;
+        }
+        self.node.add_file(space, blob, Vec::new()).await.ok()?;
+        Some(a)
     }
 
     /// Where an attachment's decrypted copy lives. Always inside `files/`.
@@ -1884,16 +1943,30 @@ impl Runtime {
             return Ok(out.to_string_lossy().into_owned());
         }
         let progress = self.progress(TransferDirection::Download, blob.clone());
-        let blob_path = self.node.fetch_blob_with_progress(space, hash, progress.clone()).await?;
-        let sealed = tokio::fs::metadata(&blob_path).await?.len();
-        mycel_net::ensure_free_space(&self.data_dir, sealed)?;
         let dir = out.parent().context("no file path")?.to_path_buf();
-        tokio::fs::create_dir_all(&dir).await?;
         // Decrypt next to the final name, then rename: a half-written file
         // never shows up as the attachment.
         let tmp = dir.join(format!(".{:016x}.part", mycel_crypto::random_u64()));
-        let job = {
-            let (blob_path, tmp, key, nonce) = (blob_path.clone(), tmp.clone(), SymKey(a.key), a.nonce);
+        let job = if let Some(public) = a.chunked_mode() {
+            // every node into the chunk store (from members, then from
+            // whoever else holds it), then decrypt from there
+            self.node.fetch_file(space, hash, a.size, Some(SymKey(a.key)), progress.clone()).await?;
+            mycel_net::ensure_free_space(&self.data_dir, a.size)?;
+            tokio::fs::create_dir_all(&dir).await?;
+            if public {
+                self.node.announce_file(hash);
+            }
+            let store = self.node.chunk_store().context("blob storage disabled")?;
+            let (tmp, key, size) = (tmp.clone(), SymKey(a.key), a.size);
+            tokio::task::spawn_blocking(move || crate::files::open_chunked(&store, &hash, &key, size, &tmp))
+        } else {
+            // the older format: one blob, held by the conversation's members
+            let blob_path = self.node.fetch_blob_with_progress(space, hash, progress.clone()).await?;
+            let sealed = tokio::fs::metadata(&blob_path).await?.len();
+            mycel_net::ensure_free_space(&self.data_dir, sealed)?;
+            tokio::fs::create_dir_all(&dir).await?;
+            progress(sealed, sealed);
+            let (tmp, key, nonce) = (tmp.clone(), SymKey(a.key), a.nonce);
             tokio::task::spawn_blocking(move || crate::files::open_file(&blob_path, &tmp, &key, &nonce, ATTACHMENT_AAD))
         };
         let res = match job.await {
@@ -1906,7 +1979,6 @@ impl Runtime {
         }
         tokio::fs::rename(&tmp, &out).await?;
         quarantine(&out);
-        progress(sealed, sealed);
         self.emit(Event::BlobReady { blob });
         self.emit(Event::ConversationUpdated { conversation: space.to_string() });
         Ok(out.to_string_lossy().into_owned())
@@ -2069,7 +2141,7 @@ impl Runtime {
         }
         for space in spaces {
             self.node
-                .with_space(&space, |r| (!r.is_member(&k.sign_pk)).then(|| r.add_member(k, Role::Relay)))?
+                .with_space(&space, |r| (!r.is_member(&k.sign_pk)).then(|| r.add_member(k.clone(), Role::Relay)))?
                 .transpose()?;
             self.touch(space);
         }
@@ -2153,6 +2225,8 @@ impl Runtime {
         {
             self.remember(keys, String::new())?;
         }
+        // Accepted: this device now answers, starting with its reader key.
+        self.use_reader_keys(&space);
         if self.my_role(&space).is_some_and(Role::can_write) {
             let name = self.name.lock().clone();
             self.post(space, ChatOp::Profile { name })?;
@@ -2200,7 +2274,7 @@ impl Runtime {
         self.leave_evicted_requests();
         self.invalidate(&space);
         if !self.keeper {
-            let known = self.contacts.lock().contains_key(&from);
+            let known = self.is_contact(&from);
             if known {
                 let cleared = {
                     let mut requests = self.requests.lock();
@@ -2215,6 +2289,9 @@ impl Runtime {
                 };
                 // Storage failure retains the conservative request: it shows
                 // as a request to accept, rather than not at all.
+                if cleared {
+                    self.use_reader_keys(&space);
+                }
                 // A contact added us: introduce ourselves right away.
                 if cleared && self.my_role(&space).is_some_and(Role::can_write) {
                     let name = self.name.lock().clone();
@@ -2552,6 +2629,40 @@ fn alert_events(actions: Vec<alerts::Action>, thread: &str, target: &str) -> Vec
 }
 
 /// Translate network events into app events (and react to invites).
+/// DHT nodes known when the device last ran (`ip:port` strings).
+const DHT_NODES: &str = "dht_nodes";
+/// How many of them are kept.
+const DHT_NODES_KEPT: usize = 32;
+const UPKEEP_EVERY: Duration = Duration::from_secs(60);
+
+/// Every minute, while the runtime lives:
+/// - tell the mesh which devices might relay for this one when the
+///   internet can't dial in to it: contacts first, then the people and
+///   keepers in its conversations (each is asked only if its own record
+///   says it relays);
+/// - remember the DHT nodes it knows, so the next start joins the DHT
+///   through them and doesn't depend on the DHT's well-known bootstrap
+///   hosts.
+async fn upkeep(rt: Weak<Runtime>) {
+    let mut saved: Vec<String> = Vec::new();
+    loop {
+        {
+            let Some(rt) = rt.upgrade() else { return };
+            rt.offer_relay_candidates();
+            let mut nodes = rt.node.dht_nodes().await;
+            nodes.truncate(DHT_NODES_KEPT);
+            if !nodes.is_empty()
+                && nodes != saved
+                && let Ok(bytes) = postcard::to_allocvec(&nodes)
+            {
+                rt.store.kv_put(DHT_NODES, bytes);
+                saved = nodes;
+            }
+        }
+        tokio::time::sleep(UPKEEP_EVERY).await;
+    }
+}
+
 async fn bridge(rt: Weak<Runtime>, mut rx: broadcast::Receiver<NetEvent>) {
     loop {
         let ev = match rx.recv().await {
@@ -2683,10 +2794,10 @@ mod tests {
         let db = std::env::temp_dir().join(format!("mycel-name-b-{}", mycel_crypto::random_u64()));
         let mut alice = Runtime::open(&da, NetworkMode::Local, Some("Alice".into())).await.unwrap();
         let bob = Runtime::open(&db, NetworkMode::Local, Some("iPhone".into())).await.unwrap();
-        let imported_code = bob.profile().contact_code;
+        let imported_code = bob.profile().contact_code_full;
         let contact = alice.add_contact(imported_code.clone()).unwrap();
         assert_eq!(contact.name, "iPhone", "authenticated card is the initial fallback");
-        bob.add_contact(alice.profile().contact_code).unwrap();
+        bob.add_contact(alice.profile().contact_code_full).unwrap();
         alice.node.add_peer_addr(bob.node.addr());
         bob.node.add_peer_addr(alice.node.addr());
         let conversation = alice.create_conversation(None, vec![contact.id.clone()]).unwrap();
@@ -3045,13 +3156,13 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mycel-direct-{}", mycel_crypto::random_u64()));
         let runtime = Runtime::open(&dir, NetworkMode::Local, Some("Direct test".into())).await.unwrap();
         let peer = DeviceKeys::generate().public();
-        runtime.contacts.lock().insert(peer.sign_pk, StoredContact { keys: peer, name: "Peer".into() });
+        runtime.contacts.lock().insert(peer.sign_pk, StoredContact { keys: peer.clone(), name: "Peer".into() });
         let create_legacy = || {
             let (space, _) = runtime.node.create_space().unwrap();
             runtime
                 .node
                 .with_space(&space, |r| -> Result<()> {
-                    r.add_member(peer, Role::Writer)?;
+                    r.add_member(peer.clone(), Role::Writer)?;
                     r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode())?;
                     Ok(())
                 })
@@ -3097,7 +3208,7 @@ mod tests {
 
         // Keeper membership adds a transport/storage participant, not a person.
         let keeper = DeviceKeys::generate().public();
-        runtime.node.with_space(&selected, |r| r.add_member(keeper, Role::Relay)).unwrap().unwrap();
+        runtime.node.with_space(&selected, |r| r.add_member(keeper.clone(), Role::Relay)).unwrap().unwrap();
         runtime.touch(selected);
         assert_eq!(runtime.create_conversation(None, vec![peer_id]).unwrap().id, selected.to_string());
 
@@ -3106,7 +3217,7 @@ mod tests {
         runtime
             .node
             .with_space(&former_group, |r| -> Result<()> {
-                r.add_member(third, Role::Writer)?;
+                r.add_member(third.clone(), Role::Writer)?;
                 r.append(
                     messages_feed(),
                     ChatOp::Text { body: "Former group history".into(), reply_to: None, attachments: vec![] }.encode(),
@@ -3129,7 +3240,7 @@ mod tests {
         runtime
             .node
             .with_space(&promoted_keeper, |r| -> Result<()> {
-                r.add_member(third, Role::Relay)?;
+                r.add_member(third.clone(), Role::Relay)?;
                 r.set_role(third.sign_pk, Role::Reader)?;
                 r.set_role(third.sign_pk, Role::Relay)?;
                 Ok(())
@@ -3186,7 +3297,7 @@ mod tests {
         runtime
             .contacts
             .lock()
-            .insert(bluetooth.sign_pk, StoredContact { keys: bluetooth, name: "Alice's phone".into() });
+            .insert(bluetooth.sign_pk, StoredContact { keys: bluetooth.clone(), name: "Alice's phone".into() });
         runtime.announced.lock().insert(wifi, "Bob's phone".into());
         let mut peers = HashMap::from([
             (bluetooth.sign_pk, PeerState { links: BTreeSet::from([PathKind::Bluetooth]), ..Default::default() }),
@@ -3240,9 +3351,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mycel-arrival-{}", mycel_crypto::random_u64()));
         let runtime = Runtime::open(&dir, NetworkMode::Local, Some("Arrival test".into())).await.unwrap();
         let peer = DeviceKeys::generate().public();
-        runtime.contacts.lock().insert(peer.sign_pk, StoredContact { keys: peer, name: "Peer".into() });
+        runtime.contacts.lock().insert(peer.sign_pk, StoredContact { keys: peer.clone(), name: "Peer".into() });
         let (space, _) = runtime.node.create_space().unwrap();
-        runtime.node.with_space(&space, |r| r.add_member(peer, Role::Writer)).unwrap().unwrap();
+        runtime.node.with_space(&space, |r| r.add_member(peer.clone(), Role::Writer)).unwrap().unwrap();
         // As invite_policy leaves an admitted invitation.
         runtime.requests.lock().insert(space, peer.sign_pk);
         runtime.arriving.lock().insert(space);
@@ -3368,9 +3479,9 @@ mod tests {
             alice.requests.lock().insert(fake(n), inviter);
         }
         let alice_id = alice.profile().id;
-        alice.add_contact(bob.profile().contact_code).unwrap();
-        bob.add_contact(alice.profile().contact_code).unwrap();
-        carol.add_contact(alice.profile().contact_code).unwrap();
+        alice.add_contact(bob.profile().contact_code_full).unwrap();
+        bob.add_contact(alice.profile().contact_code_full).unwrap();
+        carol.add_contact(alice.profile().contact_code_full).unwrap();
 
         let from_bob = bob.create_conversation(Some("From a contact".into()), vec![alice_id.clone()]).unwrap();
         eventually(|| alice.conversations().iter().any(|c| c.id == from_bob.id && !c.request)).await;
@@ -3393,14 +3504,14 @@ mod tests {
     }
 
     /// A direct chat with `peer` as this device creates one, plus a contact.
-    fn direct_space(runtime: &super::Runtime, peer: super::MemberKeys) -> super::SpaceId {
+    fn direct_space(runtime: &super::Runtime, peer: &super::MemberKeys) -> super::SpaceId {
         use super::*;
-        runtime.contacts.lock().insert(peer.sign_pk, StoredContact { keys: peer, name: "Peer".into() });
+        runtime.contacts.lock().insert(peer.sign_pk, StoredContact { keys: peer.clone(), name: "Peer".into() });
         let (space, _) = runtime.node.create_space().unwrap();
         runtime
             .node
             .with_space(&space, |r| -> Result<()> {
-                r.add_member(peer, Role::Writer)?;
+                r.add_member(peer.clone(), Role::Writer)?;
                 r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode())?;
                 Ok(())
             })
@@ -3436,7 +3547,7 @@ mod tests {
         use super::*;
         let (runtime, dir) = scratch_runtime("canonical").await;
         let peer = DeviceKeys::generate().public();
-        let (a, b) = (direct_space(&runtime, peer), direct_space(&runtime, peer));
+        let (a, b) = (direct_space(&runtime, &peer), direct_space(&runtime, &peer));
         let (low, high) = (a.min(b), a.max(b));
         assert_eq!(runtime.posting_space(&high), low, "both can write everywhere: the lowest space");
         // The peer can't write in the lowest space any more (made a reader
@@ -3471,8 +3582,8 @@ mod tests {
         let (runtime, dir) = scratch_runtime("admin").await;
         let peer = DeviceKeys::generate().public();
         let third = DeviceKeys::generate().public();
-        runtime.contacts.lock().insert(third.sign_pk, StoredContact { keys: third, name: "Third".into() });
-        let (a, b) = (direct_space(&runtime, peer), direct_space(&runtime, peer));
+        runtime.contacts.lock().insert(third.sign_pk, StoredContact { keys: third.clone(), name: "Third".into() });
+        let (a, b) = (direct_space(&runtime, &peer), direct_space(&runtime, &peer));
         say(&runtime, a, "in one alias");
         say(&runtime, b, "in the other");
         let (low, high) = (a.min(b), a.max(b));
@@ -3535,10 +3646,10 @@ mod tests {
         let (runtime, dir) = scratch_runtime("backdate").await;
         let peer = DeviceKeys::generate().public();
         // Written first (the earliest timestamps)...
-        let late = direct_space(&runtime, peer);
+        let late = direct_space(&runtime, &peer);
         say(&runtime, late, "claims to come first");
         std::thread::sleep(Duration::from_millis(5));
-        let original = direct_space(&runtime, peer);
+        let original = direct_space(&runtime, &peer);
         say(&runtime, original, "old one");
         std::thread::sleep(Duration::from_millis(5));
         say(&runtime, original, "old two");
@@ -3563,7 +3674,7 @@ mod tests {
         let (runtime, dir) = scratch_runtime("first-seen").await;
         let peer = DeviceKeys::generate().public();
         let started = now_ms();
-        let space = direct_space(&runtime, peer);
+        let space = direct_space(&runtime, &peer);
         runtime.conversations();
         let seen = runtime.first_seen.lock()[&space];
         assert!(seen >= started);
@@ -3648,10 +3759,10 @@ mod tests {
         let peers: Vec<(MemberKeys, bool)> =
             (0..chats).map(|n| (DeviceKeys::generate().public(), n % 4 == 0)).collect();
         let jobs: Vec<MemberKeys> =
-            peers.iter().flat_map(|(p, two)| std::iter::repeat_n(*p, 1 + usize::from(*two))).collect();
+            peers.iter().flat_map(|(p, two)| std::iter::repeat_n(p.clone(), 1 + usize::from(*two))).collect();
         let build = |peer: &MemberKeys| {
             let (mut r, _) = Replica::create(runtime.keys.clone(), None).unwrap();
-            r.add_member(*peer, Role::Writer).unwrap();
+            r.add_member(peer.clone(), Role::Writer).unwrap();
             r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode()).unwrap();
             for i in 0..messages {
                 let body = format!("message {i}");
@@ -3709,7 +3820,7 @@ mod tests {
         use super::*;
         let (runtime, dir) = scratch_runtime("paging").await;
         let peer = DeviceKeys::generate().public();
-        let (a, b) = (direct_space(&runtime, peer), direct_space(&runtime, peer));
+        let (a, b) = (direct_space(&runtime, &peer), direct_space(&runtime, &peer));
         let mut hidden = String::new();
         for n in 0..30 {
             let id = say(&runtime, if n % 3 == 0 { b } else { a }, &format!("m{n}"));
@@ -3763,7 +3874,7 @@ mod tests {
         use super::*;
         let peer = DeviceKeys::generate().public();
         let (mut r, _) = Replica::create(runtime.keys.clone(), None).unwrap();
-        r.add_member(peer, Role::Writer).unwrap();
+        r.add_member(peer.clone(), Role::Writer).unwrap();
         r.append(messages_feed(), ChatOp::Meta { title: None, direct: true }.encode()).unwrap();
         for n in 0..messages {
             r.append(
@@ -3925,5 +4036,198 @@ mod tests {
         }
         let rate = sample_rate(&mut s, at(7_000), 100_000_000);
         assert_eq!(rate, 50_000_000);
+    }
+}
+
+#[cfg(test)]
+mod chunked_attachment_tests {
+    use super::*;
+
+    async fn eventually(what: &str, mut check: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if check() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("timed out waiting for: {what}");
+    }
+
+    fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        let mut out = Vec::with_capacity(len + 8);
+        while out.len() < len {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            out.extend_from_slice(&x.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// New attachments are chunked files (private unless asked otherwise);
+    /// one sealed the old way, as every attachment sent before was, still
+    /// downloads and opens.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_attachments_are_chunked_and_old_ones_still_open() {
+        let da = std::env::temp_dir().join(format!("mycel-chunked-a-{}", mycel_crypto::random_u64()));
+        let db = std::env::temp_dir().join(format!("mycel-chunked-b-{}", mycel_crypto::random_u64()));
+        let alice = Runtime::open(&da, NetworkMode::Local, Some("Alice".into())).await.unwrap();
+        let bob = Runtime::open(&db, NetworkMode::Local, Some("Bob".into())).await.unwrap();
+        alice.contacts.lock().insert(bob.keys.sign_pk(), StoredContact { keys: bob.keys.public(), name: "Bob".into() });
+        bob.contacts
+            .lock()
+            .insert(alice.keys.sign_pk(), StoredContact { keys: alice.keys.public(), name: "Alice".into() });
+        alice.node.add_peer_addr(bob.node.addr());
+        bob.node.add_peer_addr(alice.node.addr());
+        let conv = alice.create_conversation(None, vec![bob.profile().id]).unwrap();
+        let space = parse_space(&conv.id).unwrap();
+        eventually("bob has the conversation", || bob.conversations().len() == 1).await;
+        let bob_has = |body: &'static str| {
+            let (bob, id) = (bob.clone(), conv.id.clone());
+            move || bob.messages(id.clone(), None, None).is_ok_and(|ms| ms.iter().any(|m| m.body == body))
+        };
+
+        // A new attachment: a chunked file, private.
+        let content = pseudo_random(3 * 1024 * 1024 + 17, 1);
+        let file = da.join("clip.mp4");
+        std::fs::write(&file, &content).unwrap();
+        let path = file.to_string_lossy().into_owned();
+        let sent = alice.send_message(conv.id.clone(), "new".into(), None, vec![path.clone()]).await.unwrap();
+        assert!(!sent.attachments[0].public);
+        assert_eq!(sent.attachments[0].size, content.len() as u64);
+        let view = alice.view(&space).unwrap();
+        let attached = &view.messages.last().unwrap().attachments[0];
+        assert_eq!(attached.chunked_mode(), Some(false));
+        assert!(alice.node.file_complete(attached.blob).await);
+        eventually("bob sees it", bob_has("new")).await;
+        let got = bob.fetch_attachment(sent.attachments[0].blob.clone()).await.unwrap();
+        assert_eq!(std::fs::read(&got).unwrap(), content);
+        assert!(bob.node.chunk_store().unwrap().is_pinned(&attached.blob, Some(&space)));
+
+        // The same file again: nothing in common with the first copy ...
+        let again = alice.send_message(conv.id.clone(), "again".into(), None, vec![path.clone()]).await.unwrap();
+        assert_ne!(again.attachments[0].blob, sent.attachments[0].blob);
+        // ... unless it is sent as a public file: then it is one file, whoever sends it.
+        let public = |rt: Arc<Runtime>, path: String, body: &'static str| {
+            let id = conv.id.clone();
+            async move { rt.send_message_with(id, body.into(), None, vec![path.clone()], vec![path]).await.unwrap() }
+        };
+        let p1 = public(alice.clone(), path.clone(), "public").await;
+        assert!(p1.attachments[0].public);
+        eventually("bob sees the public one", bob_has("public")).await;
+        let copy = db.join("same-clip.mp4");
+        std::fs::write(&copy, &content).unwrap();
+        let p2 = public(bob.clone(), copy.to_string_lossy().into_owned(), "public too").await;
+        assert_eq!(p2.attachments[0].blob, p1.attachments[0].blob, "the same content is the same file");
+        let shown = bob.messages(conv.id.clone(), None, None).unwrap();
+        assert!(shown.iter().find(|m| m.body == "public").unwrap().attachments[0].public);
+        let got = bob.fetch_attachment(p1.attachments[0].blob.clone()).await.unwrap();
+        assert_eq!(std::fs::read(&got).unwrap(), content);
+
+        // Forwarding (sending our own copy of an attachment on) reuses its
+        // reference: the same file, kept for the other conversation too.
+        let group = alice.create_conversation(Some("Group".into()), vec![bob.profile().id]).unwrap();
+        let group_space = parse_space(&group.id).unwrap();
+        eventually("bob has the group", || bob.conversations().len() == 2).await;
+        let mine = sent.attachments[0].local_path.clone().unwrap();
+        let forwarded =
+            alice.send_message(group.id.clone(), "forwarded".into(), None, vec![mine.clone()]).await.unwrap();
+        assert_eq!(forwarded.attachments[0].blob, sent.attachments[0].blob);
+        assert_eq!(forwarded.attachments[0].name, "clip.mp4");
+        assert!(alice.node.chunk_store().unwrap().is_pinned(&attached.blob, Some(&group_space)));
+        eventually("bob keeps it for the group too", || {
+            bob.node.chunk_store().unwrap().is_pinned(&attached.blob, Some(&group_space))
+        })
+        .await;
+        assert_eq!(alice.node.chunk_store().unwrap().owners(&attached.blob).len(), 2, "one copy, two conversations");
+        // ... unless our copy was changed since: then it is a new file.
+        let mut edited = std::fs::read(&mine).unwrap();
+        edited[100] ^= 1;
+        std::fs::write(&mine, &edited).unwrap();
+        let changed = alice.send_message(group.id.clone(), "edited".into(), None, vec![mine]).await.unwrap();
+        assert_ne!(changed.attachments[0].blob, sent.attachments[0].blob);
+
+        // An attachment in the older format (one blob, a random nonce).
+        let old_content = pseudo_random(300_000, 2);
+        let src = da.join("old.bin");
+        std::fs::write(&src, &old_content).unwrap();
+        let staged = alice.node.blob_staging_path().unwrap();
+        let (key, nonce) = (SymKey::generate(), mycel_crypto::random::<24>());
+        let (blob, len) =
+            crate::files::seal_file(&src, &da.join("old-copy.bin"), &staged, &key, &nonce, ATTACHMENT_AAD, |_| {})
+                .unwrap();
+        alice.node.add_blob(space, &staged, blob).await.unwrap();
+        let old = AttachmentRef {
+            blob,
+            key: key.0,
+            nonce,
+            name: "old.bin".into(),
+            mime: "application/octet-stream".into(),
+            size: len,
+        };
+        assert_eq!(old.chunked_mode(), None);
+        alice.post(space, ChatOp::Text { body: "old".into(), reply_to: None, attachments: vec![old] }).unwrap();
+        eventually("bob sees the old one", bob_has("old")).await;
+        let shown = bob.messages(conv.id.clone(), None, None).unwrap();
+        assert!(!shown.iter().find(|m| m.body == "old").unwrap().attachments[0].public);
+        let got = bob.fetch_attachment(blob.to_string()).await.unwrap();
+        assert_eq!(std::fs::read(&got).unwrap(), old_content);
+
+        alice.shutdown().await.unwrap();
+        bob.shutdown().await.unwrap();
+        drop((alice, bob));
+        let _ = std::fs::remove_dir_all(da);
+        let _ = std::fs::remove_dir_all(db);
+    }
+
+    /// Whose files a device holds: its contacts' willingly, strangers'
+    /// within a small share, a blocked device's never.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn files_are_held_for_contacts_and_never_for_blocked_devices() {
+        use mycel_crypto::chunked::{Mode, seal_file};
+        let dh = std::env::temp_dir().join(format!("mycel-chunked-h-{}", mycel_crypto::random_u64()));
+        let holder = Runtime::open(&dh, NetworkMode::Local, Some("Holder".into())).await.unwrap();
+        let sender = |name: &'static str| async move {
+            let dir = std::env::temp_dir().join(format!("mycel-chunked-s-{}", mycel_crypto::random_u64()));
+            let mut opts = NodeOptions::new(NetMode::Local, name);
+            opts.blob_dir = Some(dir.clone());
+            (Node::spawn(Arc::new(DeviceKeys::generate()), opts).await.unwrap(), dir)
+        };
+        let (friend, d1) = sender("friend").await;
+        let (stranger, d2) = sender("stranger").await;
+        let (blocked, d3) = sender("blocked").await;
+        holder
+            .contacts
+            .lock()
+            .insert(friend.id(), StoredContact { keys: friend.keys().public(), name: "Friend".into() });
+        holder.blocked.lock().insert(blocked.id());
+        holder.node.set_cache_budget(64 * 1024 * 1024);
+        // 6 MiB: more than a stranger's share (a sixteenth: 4 MiB)
+        let data = pseudo_random(6 * 1024 * 1024, 3);
+        let mut roots = Vec::new();
+        for n in [&friend, &stranger, &blocked] {
+            n.add_peer_addr(holder.node.addr());
+            let store = n.chunk_store().unwrap();
+            let mut session = store.begin_seal();
+            let f = seal_file(&Mode::private(), &[], &mut &data[..], |id, b| session.put(id, b), |_| {}).unwrap();
+            session.finish(f.root, Hash32([1; 32]));
+            roots.push(f.root);
+        }
+        friend.push_file(holder.keys.sign_pk(), None, roots[0]).await.unwrap();
+        assert!(holder.node.file_complete(roots[0]).await);
+        assert!(stranger.push_file(holder.keys.sign_pk(), None, roots[1]).await.is_err());
+        assert!(blocked.push_file(holder.keys.sign_pk(), None, roots[2]).await.is_err());
+        assert!(!holder.node.chunk_store().unwrap().has(&roots[1]));
+        assert!(!holder.node.chunk_store().unwrap().has(&roots[2]));
+        holder.shutdown().await.unwrap();
+        for n in [&friend, &stranger, &blocked] {
+            n.shutdown().await.unwrap();
+        }
+        drop(holder);
+        for d in [dh, d1, d2, d3] {
+            let _ = std::fs::remove_dir_all(d);
+        }
     }
 }

@@ -3677,6 +3677,7 @@ dependencies = [
  "hpke",
  "postcard",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
  "zeroize",
 ]
@@ -3799,6 +3800,7 @@ dependencies = [
  "n0-future",
  "n0-mainline",
  "n0-watcher",
+ "netwatch",
  "nix 0.31.3",
  "noq-udp",
  "parking_lot",

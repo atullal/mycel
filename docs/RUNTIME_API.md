@@ -30,6 +30,7 @@ impl Runtime {
     pub fn messages_around(&self, id: ConversationId, message: MessageId, before: Option<u32>, after: Option<u32>) -> Result<MessageWindow>;
     pub fn search_messages(&self, id: ConversationId, query: String, limit: Option<u32>) -> Result<Vec<MessageView>>; // newest first
     pub async fn send_message(&self, id: ConversationId, body: String, reply_to: Option<MessageId>, attachments: Vec<String> /* file paths */) -> Result<MessageView>;
+    pub async fn send_message_with(&self, id: ConversationId, body: String, reply_to: Option<MessageId>, attachments: Vec<String>, public: Vec<String> /* those of `attachments` to send as public files */) -> Result<MessageView>;
     pub fn edit_message(&self, id: ConversationId, message: MessageId, body: String) -> Result<()>;
     pub fn delete_message(&self, id: ConversationId, message: MessageId) -> Result<()>;          // own message, for everyone
     pub fn delete_message_local(&self, id: ConversationId, message: MessageId) -> Result<()>;    // any message, this device only
@@ -86,7 +87,7 @@ impl Runtime {
 | `list_messages` | `{ id, limit?, before? }` | `MessageView[]` |
 | `messages_around` | `{ id, message, before?, after? }` | `MessageWindow` (`{ messages, hasEarlier, hasLater }`) |
 | `search_messages` | `{ id, query, limit? }` | `MessageView[]`, newest first: every whitespace-separated term, case-insensitive, in the text or an attachment name |
-| `send_message` | `{ id, body, replyTo?, attachments? }` | `MessageView` |
+| `send_message` | `{ id, body, replyTo?, attachments?, publicAttachments? }` | `MessageView` |
 | `edit_message` | `{ id, message, body }` | `null` |
 | `delete_message` | `{ id, message }` | `null` |
 | `delete_message_local` | `{ id, message }` | `null` |
@@ -139,12 +140,15 @@ Errors are rejected promises carrying a human-readable string. It includes the c
 - **Message order:** messages arrive in causal order. `sentAt` is display-only (the author's clock).
 - **Attachments are lazy:** an attachment's `localPath` is `null` until fetched. Call `fetch_attachment`, then wait for `blobReady`.
 - **Attachments of any size:**
-  - There is no size limit. Files are encrypted and transferred as streams with bounded memory (docs/TRUST.md §7b).
+  - There is no size limit. Files are encrypted in pieces with bounded memory, and each piece is checked when it arrives (docs/TRUST.md §7c).
   - Attachments up to 16 MiB are pushed to members right away. Bigger ones are downloaded when you call `fetch_attachment`, from the sender, a keeper or any member that has them. An interrupted download resumes where it stopped.
+  - If a member can't be reached when a file is sent, the file is also handed to contacts (and devices nearby on a fast link) willing to hold it, and the member finds it with them later, even if the sender is gone by then. A device holds other people's files inside a budget (1 GiB; `MYCEL_FILE_CACHE_MB` changes it, 0 holds nothing) and lets go of the least requested first.
+  - **Public files.** Paths listed in `publicAttachments` (they must also be in `attachments`) are sent as public files: the same file is one file wherever it is sent, stored and downloaded once, and kept available by everyone who has it. In exchange, anyone who has the file can tell that this device sent or holds it. `Attachment.public` says which were sent this way; everything else is private.
   - A transfer is refused, with a clear error, if it would leave less than 1 GiB of free disk.
   - `send_message` resolves once the files are encrypted locally. Watch `transferProgress` while it runs.
 - **What `attachments` accepts:**
   - Local file paths, or `file://` URLs.
+  - An attachment's own `localPath`, to forward it: if that copy is unchanged, the message refers to the same file, so nothing is encrypted again and nothing is sent to devices that already have it.
   - A folder or macOS package (`.app`, `.pages`, `.key`, `.rtfd`, …) is sent as `<name>.zip`.
   - Files staged under the data dir's `uploads/` (HTTP uploads, `stage_file`) are deleted once the message is sent; the attachment then lives in `files/`.
 - **Offline-first:** everything works with no network at all. Peers on the same LAN find each other via mDNS with no internet.
@@ -290,7 +294,7 @@ When someone who isn't your contact adds you, the conversation arrives with `req
 
 ## Contract details
 - **Leaving:** call `remove_member(id, myId)`. Anyone can leave; the last admin can't. Leaving doesn't rotate keys itself; the next writer automatically rotates to a key the leaver doesn't have.
-- **Contact codes** are opaque strings: `mycel:` + base64url(signed contact card). Paste them as-is.
+- **Contact codes** are opaque strings starting with `mycel:`. Paste them as-is. `Profile.contactCode` is the short one (the device key and its signed name, plus address hints): show it as text and as a QR code. A contact added from it has `awaitingKeys: true` until this device has reached theirs and fetched its signed card; `create_conversation` and `add_members` fail for it until then, with an error that says so, and `contactsChanged` fires when the keys arrive. `Profile.contactCodeFull` (about 1.8 kB) holds the card itself: a contact added from it is usable at once, with no connection.
 - **Untitled groups** show the members' names. Renaming makes a conversation a group. `create_conversation` always creates a new conversation.
 - **Keepers** don't count toward `delivered` or `read`; they only make `sent` possible while everyone else is offline.
 - **`localPath`** is a filesystem path under the data dir: `files/<blob>/<name>`. Senders also get a decrypted copy there.

@@ -260,9 +260,14 @@ fn reader_feed_appends_rejected() {
 }
 
 #[derive(Default)]
-struct MemStore {
-    ops: std::sync::Mutex<Vec<SignedOp>>,
-    envs: std::sync::Mutex<Vec<Envelope>>,
+pub(crate) struct MemStore {
+    pub ops: std::sync::Mutex<Vec<SignedOp>>,
+    pub envs: std::sync::Mutex<Vec<Envelope>>,
+    /// The latest sealed secrets, and how many of the writes were durable.
+    pub secrets: std::sync::Mutex<Option<Vec<u8>>>,
+    pub durable_writes: std::sync::atomic::AtomicUsize,
+    /// Refuse to store secrets (a full or failing disk).
+    pub fail_secrets: std::sync::atomic::AtomicBool,
 }
 impl Store for MemStore {
     fn put_op(&self, _: &SpaceId, op: &SignedOp) {
@@ -270,6 +275,16 @@ impl Store for MemStore {
     }
     fn put_envelope(&self, _: &SpaceId, env: &Envelope) {
         self.envs.lock().unwrap().push(env.clone());
+    }
+    fn put_secrets(&self, _: &SpaceId, sealed: Vec<u8>, durable: bool) -> std::result::Result<(), String> {
+        if self.fail_secrets.load(Ordering::Relaxed) {
+            return Err("disk full".into());
+        }
+        *self.secrets.lock().unwrap() = Some(sealed);
+        if durable {
+            self.durable_writes.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(())
     }
 }
 

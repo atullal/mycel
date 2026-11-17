@@ -488,6 +488,31 @@ impl Store for DbStore {
         let v = postcard::to_allocvec(env).expect("encodes");
         self.enqueue(Write::Env(key(space, &env.id()), v));
     }
+
+    fn put_secrets(&self, space: &SpaceId, sealed: Vec<u8>, durable: bool) -> std::result::Result<(), String> {
+        let k = secrets_key(space);
+        if durable {
+            self.kv_batch_durable(vec![(k, Some(sealed))]).map_err(|e| format!("{e:#}"))
+        } else {
+            self.kv_put(&k, sealed);
+            Ok(())
+        }
+    }
+}
+
+/// Where a space's sealed secrets are kept (TRUST.md §6): the replica's
+/// reader keys and the epoch keys it has opened, encrypted by the replica
+/// under a key derived from the device's seed.
+fn secrets_key(space: &SpaceId) -> String {
+    format!("space-secrets/{space}")
+}
+
+impl DbStore {
+    /// What [`Store::put_secrets`] last kept for `space`, for
+    /// `Replica::restore_with_secrets`.
+    pub fn space_secrets(&self, space: &SpaceId) -> Result<Option<Vec<u8>>> {
+        self.kv_get(&secrets_key(space))
+    }
 }
 
 #[cfg(test)]

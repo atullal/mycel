@@ -51,6 +51,8 @@ export interface Commands {
       body: string;
       replyTo?: MessageId | null;
       attachments?: string[] | null;
+      /** Those of `attachments` to send as public files (see `SendOptions`). */
+      publicAttachments?: string[] | null;
     },
     MessageView,
   ];

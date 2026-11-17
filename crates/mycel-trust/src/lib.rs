@@ -11,7 +11,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Mutex;
 
 use mycel_crypto::{
-    CryptoError, DeviceKeys, Hash32, Lockbox, MemberKeys, Sig, SignPk, SymKey, random_u64, seal_lockbox,
+    CryptoError, DeviceKeys, Hash32, KexPk, KexSecret, Lockbox, MemberKeys, Sig, SignPk, SymKey, random_u64,
+    seal_lockbox,
 };
 use serde::{Deserialize, Serialize};
 
@@ -139,6 +140,24 @@ pub enum Action {
     Leave {
         cutoff: Option<Hash32>,
     },
+    /// The author, a reader, publishes a *reader key*: from this op on,
+    /// lockboxes for the author are sealed to `key` instead of its previous
+    /// reader key, or of the kex key in its `MemberKeys` if it had none
+    /// (TRUST.md §6). The op's signature is the author's device key vouching
+    /// for `key`, as `kex_sig` does for the kex key.
+    ///
+    /// A reader key is random, not derived from the device's seed, and the
+    /// device deletes its private half some time after replacing it: what
+    /// was sealed to it can then be opened by nobody, the device included.
+    ///
+    /// `lost_previous`: the author no longer holds (some of) the reader keys
+    /// it published before, so an epoch whose author hadn't seen this op may
+    /// be closed to it. Writers then move to a new epoch
+    /// ([`SpaceGraph::epoch_closed_to_a_reader`]).
+    ReaderKey {
+        key: KexPk,
+        lost_previous: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,6 +237,8 @@ impl SignedOp {
                     Action::SetRole { rotation: Some(r), .. }
                     | Action::Remove { rotation: r, .. }
                     | Action::Rotate { rotation: r } => check_rotation(r)?,
+                    // Others will seal to it: it must be a key they can seal to.
+                    Action::ReaderKey { key, .. } => key.validate()?,
                     _ => {}
                 }
             }
@@ -244,15 +265,22 @@ fn keyring_info(space: &SpaceId, nonce: u64, recipient: &SignPk) -> Vec<u8> {
     [CTX_KEYRING.as_bytes(), &space.0, &nonce.to_le_bytes(), &recipient.0].concat()
 }
 
-/// Generate a new epoch key sealed to exactly `recipients`.
+/// Generate a new epoch key sealed to exactly `recipients`, each to the kex
+/// key in its `MemberKeys`.
 pub fn new_rotation<'a>(recipients: impl IntoIterator<Item = &'a MemberKeys>) -> Result<(Rotation, SymKey)> {
+    new_rotation_to(recipients.into_iter().map(|m| (m.sign_pk, &m.kex_pk)))
+}
+
+/// Generate a new epoch key sealed to exactly these recipients, each to the
+/// key given for it (see [`Member::seal_key`]).
+pub fn new_rotation_to<'a>(recipients: impl IntoIterator<Item = (SignPk, &'a KexPk)>) -> Result<(Rotation, SymKey)> {
     let key = SymKey::generate();
     let epoch = EpochId::for_commitment(&key.commitment());
     let mut lockboxes = recipients
         .into_iter()
-        .map(|m| {
-            let lb = seal_lockbox(&m.kex_pk, &lockbox_info(&epoch, &m.sign_pk), &key.0)?;
-            Ok((m.sign_pk, lb))
+        .map(|(pk, seal_to)| {
+            let lb = seal_lockbox(seal_to, &lockbox_info(&epoch, &pk), &key.0)?;
+            Ok((pk, lb))
         })
         .collect::<Result<Vec<_>>>()?;
     lockboxes.sort_by_key(|(pk, _)| *pk);
@@ -261,10 +289,32 @@ pub fn new_rotation<'a>(recipients: impl IntoIterator<Item = &'a MemberKeys>) ->
 
 // ─────────────────────────── membership state ───────────────────────────
 
+/// A member's current reader key and the op that published it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReaderKey {
+    pub key: KexPk,
+    pub op: OpId,
+    /// The member's latest reader-key op that said its earlier reader keys
+    /// were gone (`lost_previous`), if it ever published one.
+    pub lost_before: Option<OpId>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Member {
     pub keys: MemberKeys,
     pub role: Role,
+    /// The reader key the member last published (`Action::ReaderKey`), in
+    /// the graph's order; `None` until it publishes one.
+    pub reader: Option<ReaderKey>,
+}
+
+impl Member {
+    /// The key to seal this member's lockboxes to: its reader key, or the
+    /// kex key in its `MemberKeys` while it has published none. Either way
+    /// a key its device key signed.
+    pub fn seal_key(&self) -> &KexPk {
+        self.reader.as_ref().map_or(&self.keys.kex_pk, |r| &r.key)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -610,18 +660,36 @@ impl SpaceGraph {
 
     /// Unseal every lockbox addressed to `me` in valid ops into `keyring`,
     /// checking each key against its public commitment. Returns how many keys
-    /// were newly added.
+    /// were newly added. Opens only what was sealed to the kex key in `me`'s
+    /// `MemberKeys`: a device that publishes reader keys uses
+    /// [`SpaceGraph::unlock_with`].
     pub fn unlock(&self, me: &DeviceKeys, keyring: &mut Keyring) -> usize {
+        self.unlock_with(me, &[], keyring)
+    }
+
+    /// [`SpaceGraph::unlock`], also opening what was sealed to the reader
+    /// keys this device still holds (`readers`, oldest first).
+    ///
+    /// An epoch whose key is already in `keyring` is skipped, so a keyring
+    /// kept from an earlier run costs nothing to bring up to date, and stays
+    /// complete after the reader keys its lockboxes were sealed to are gone.
+    pub fn unlock_with(&self, me: &DeviceKeys, readers: &[KexSecret], keyring: &mut Keyring) -> usize {
         let my_pk = me.sign_pk();
         let commitments: HashMap<EpochId, Hash32> =
             self.res.state.epochs.iter().map(|e| (e.id, e.commitment)).collect();
+        // Which key a lockbox was sealed to depends on what its author had
+        // seen of our reader keys: try the newest first, then the one every
+        // device has.
+        let open = |info: &[u8], lb: &Lockbox| {
+            readers.iter().rev().find_map(|k| k.open_lockbox(info, lb).ok()).or_else(|| me.open_lockbox(info, lb).ok())
+        };
         let mut added = 0;
         for id in &self.res.order {
             if !self.res.is_valid(id) {
                 continue;
             }
             let op = &self.ops[id].op;
-            let mut try_insert = |epoch: EpochId, key: SymKey| {
+            let mut try_insert = |keyring: &mut Keyring, epoch: EpochId, key: SymKey| {
                 if keyring.get(&epoch).is_none() && commitments.get(&epoch) == Some(&key.commitment()) {
                     keyring.insert(epoch, key);
                     added += 1;
@@ -632,20 +700,24 @@ impl SpaceGraph {
                 | Action::SetRole { rotation: Some(rotation), .. }
                 | Action::Remove { rotation, .. }
                 | Action::Rotate { rotation } => {
-                    if let Some((_, lb)) = rotation.lockboxes.iter().find(|(pk, _)| *pk == my_pk)
-                        && let Ok(bytes) = me.open_lockbox(&lockbox_info(&rotation.epoch, &my_pk), lb)
+                    if keyring.get(&rotation.epoch).is_none()
+                        && let Some((_, lb)) = rotation.lockboxes.iter().find(|(pk, _)| *pk == my_pk)
+                        && let Some(bytes) = open(&lockbox_info(&rotation.epoch, &my_pk), lb)
                         && let Ok(arr) = <[u8; 32]>::try_from(bytes.as_slice())
                         && SymKey(arr).commitment() == rotation.commitment
                     {
-                        try_insert(rotation.epoch, SymKey(arr));
+                        try_insert(keyring, rotation.epoch, SymKey(arr));
                     }
                 }
+                // (always sealed to the kex key in `MemberKeys`: a member
+                // being added has published no reader key in this space)
                 Action::Add { member, keyring: Some(lb), .. } if member.sign_pk == my_pk => {
-                    if let Ok(bytes) = me.open_lockbox(&keyring_info(&self.space, op.nonce, &my_pk), lb)
+                    if commitments.keys().any(|e| keyring.get(e).is_none())
+                        && let Ok(bytes) = me.open_lockbox(&keyring_info(&self.space, op.nonce, &my_pk), lb)
                         && let Ok(entries) = postcard::from_bytes::<Vec<(EpochId, SymKey)>>(&bytes)
                     {
                         for (epoch, key) in entries {
-                            try_insert(epoch, key);
+                            try_insert(keyring, epoch, key);
                         }
                     }
                 }
@@ -671,9 +743,39 @@ impl SpaceGraph {
         }
     }
 
+    /// A fresh epoch for `readers`, each lockbox sealed to that reader's
+    /// current reader key (or its kex key, if it has published none).
     fn rotation_for(&self, readers: &BTreeSet<SignPk>) -> Result<(Rotation, SymKey)> {
         let st = self.state();
-        new_rotation(readers.iter().map(|pk| &st.members[pk].keys))
+        new_rotation_to(readers.iter().map(|pk| (*pk, st.members[pk].seal_key())))
+    }
+
+    /// A reader: publish `key` as this device's reader key in the space.
+    /// The caller holds its private half, and must have stored it before
+    /// anyone can see this op (what is sealed to it can't be opened without).
+    /// `lost_previous`: this device can't open what was sealed to its
+    /// earlier reader keys (see [`Action::ReaderKey`]).
+    pub fn publish_reader_key(&self, me: &DeviceKeys, key: KexPk, lost_previous: bool) -> Result<SignedOp> {
+        self.require_role(me, Role::can_read)?;
+        key.validate()?;
+        Ok(self.author_op(me, Action::ReaderKey { key, lost_previous }))
+    }
+
+    /// Was `epoch` sealed to a reader key that one of today's readers has
+    /// since said it lost? True when a reader's `lost_previous` op isn't in
+    /// the causal past of the op that created the epoch: its author sealed
+    /// to an earlier key of that reader. A writer that finds its write
+    /// epoch like this rotates, so nobody keeps writing what a reader can't
+    /// open. (A policy for writers, not a validity rule: envelopes under
+    /// such an epoch stay valid.)
+    pub fn epoch_closed_to_a_reader(&self, epoch: &EpochId) -> bool {
+        let st = self.state();
+        let Some(e) = st.epoch(epoch) else { return false };
+        st.members
+            .values()
+            .filter(|m| m.role.can_read())
+            .filter_map(|m| m.reader.as_ref().and_then(|r| r.lost_before))
+            .any(|lost| !self.in_past(&lost, &[e.created_by]))
     }
 
     /// Admin: add a member. Readers receive every epoch key in `keyring`.
@@ -762,5 +864,7 @@ impl SpaceGraph {
     }
 }
 
+#[cfg(test)]
+mod reader_tests;
 #[cfg(test)]
 mod tests;

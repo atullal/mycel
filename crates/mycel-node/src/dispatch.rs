@@ -66,6 +66,7 @@ struct Send {
     body: String,
     reply_to: Option<String>,
     attachments: Option<Vec<String>>,
+    public_attachments: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -232,7 +233,8 @@ pub async fn dispatch(rt: &Runtime, cmd: &str, a: Value) -> Result<Value> {
         }
         "send_message" => {
             let s: Send = args(a)?;
-            ok(rt.send_message(s.id, s.body, s.reply_to, s.attachments.unwrap_or_default()).await?)
+            let (files, public) = (s.attachments.unwrap_or_default(), s.public_attachments.unwrap_or_default());
+            ok(rt.send_message_with(s.id, s.body, s.reply_to, files, public).await?)
         }
         "edit_message" => {
             let e: Edit = args(a)?;

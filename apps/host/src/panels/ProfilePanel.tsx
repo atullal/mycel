@@ -18,7 +18,7 @@ export function ProfilePanel({ notifications }: { notifications?: NotificationsS
   const { profile, setName, error: loadError } = useProfile();
   const [editing, setEditing] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<"short" | "full" | null>(null);
   const [theme, setTheme] = useState<ThemeChoice>(readTheme());
 
   if (!profile) return loadError ? <p className="p-error">{errorText(loadError)}</p> : null;
@@ -35,17 +35,17 @@ export function ProfilePanel({ notifications }: { notifications?: NotificationsS
     }
   };
 
-  const copy = async () => {
+  const copy = async (which: "short" | "full") => {
     try {
-      await navigator.clipboard.writeText(profile.contactCode);
+      await navigator.clipboard.writeText(which === "full" ? (profile.contactCodeFull ?? profile.contactCode) : profile.contactCode);
     } catch {
       // Clipboard API unavailable: fall back to selecting the text.
       const el = document.getElementById("contact-code");
       if (el) window.getSelection()?.selectAllChildren(el);
       return;
     }
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1600);
+    setCopied(which);
+    setTimeout(() => setCopied(null), 1600);
   };
 
   const pickTheme = (t: ThemeChoice) => {
@@ -99,11 +99,31 @@ export function ProfilePanel({ notifications }: { notifications?: NotificationsS
         </div>
         <div className="p-code">
           <code id="contact-code">{profile.contactCode}</code>
-          <button className={`h-btn h-btn-quiet${copied ? " is-done" : ""}`} onClick={copy} aria-live="polite">
-            {copied ? <Glyph.Check /> : <Glyph.Copy />}
-            {copied ? "Copied" : "Copy"}
+          <button
+            className={`h-btn h-btn-quiet${copied === "short" ? " is-done" : ""}`}
+            onClick={() => void copy("short")}
+            aria-live="polite"
+          >
+            {copied === "short" ? <Glyph.Check /> : <Glyph.Copy />}
+            {copied === "short" ? "Copied" : "Copy"}
           </button>
         </div>
+        {profile.contactCodeFull && (
+          <>
+            <p className="p-help">
+              With this code or the QR code, the other device has to connect to yours once before you can start a
+              conversation. The full code is longer and needs no connection first: use it when you aren't both online.
+            </p>
+            <button
+              className={`h-btn h-btn-quiet${copied === "full" ? " is-done" : ""}`}
+              onClick={() => void copy("full")}
+              aria-live="polite"
+            >
+              {copied === "full" ? <Glyph.Check /> : <Glyph.Copy />}
+              {copied === "full" ? "Copied" : "Copy full code"}
+            </button>
+          </>
+        )}
       </section>
 
       {notifications?.native && <NotificationsCard notifications={notifications} />}

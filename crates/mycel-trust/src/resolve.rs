@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashMap};
 use mycel_crypto::SignPk;
 
 use crate::bitset::BitSet;
-use crate::{Action, Epoch, Member, MemberState, OpId, Role, Rotation, SignedOp};
+use crate::{Action, Epoch, Member, MemberState, OpId, ReaderKey, Role, Rotation, SignedOp};
 
 /// Result of resolving a DAG: topo order, ancestry, validity and current state.
 #[derive(Clone, Debug, Default)]
@@ -259,6 +259,8 @@ fn authorized(op: &SignedOp, idx: usize, st: &MemberState) -> bool {
                 && recipients(rotation) == st.readers()
         }
         Action::Leave { .. } => author_role.is_some() && admins_after(st, &op.op.author, None) > 0,
+        // Only someone lockboxes are sealed to has a use for a reader key.
+        Action::ReaderKey { .. } => author_role.is_some_and(Role::can_read),
     }
 }
 
@@ -295,11 +297,11 @@ fn apply(
     let op = &ops[&id].op;
     match &op.action {
         Action::Genesis { founder, rotation } => {
-            st.members.insert(founder.sign_pk, Member { keys: *founder, role: Role::Admin });
+            st.members.insert(founder.sign_pk, Member { keys: founder.clone(), role: Role::Admin, reader: None });
             push_epoch(st, rotation, id);
         }
         Action::Add { member, role, .. } => {
-            st.members.insert(member.sign_pk, Member { keys: *member, role: *role });
+            st.members.insert(member.sign_pk, Member { keys: member.clone(), role: *role, reader: None });
             if role.can_read() {
                 // The keyring covers exactly the epochs in the adder's causal past.
                 for e in st.epochs.iter_mut() {
@@ -312,6 +314,11 @@ fn apply(
         Action::SetRole { member, role, rotation, .. } => {
             if let Some(m) = st.members.get_mut(member) {
                 m.role = *role;
+                if !role.can_read() {
+                    // No lockboxes for it any more, so it stops keeping
+                    // reader keys: if it reads again, it starts afresh.
+                    m.reader = None;
+                }
             }
             if let Some(r) = rotation {
                 push_epoch(st, r, id);
@@ -324,6 +331,15 @@ fn apply(
         Action::Rotate { rotation } => push_epoch(st, rotation, id),
         Action::Leave { .. } => {
             st.members.remove(&op.author);
+        }
+        // The last one applied is the member's reader key. A device
+        // publishes them one after another, so that is its newest; if it
+        // ever published two side by side, every peer still picks the same.
+        Action::ReaderKey { key, lost_previous } => {
+            if let Some(m) = st.members.get_mut(&op.author) {
+                let lost_before = if *lost_previous { Some(id) } else { m.reader.as_ref().and_then(|r| r.lost_before) };
+                m.reader = Some(ReaderKey { key: key.clone(), op: id, lost_before });
+            }
         }
     }
 }
