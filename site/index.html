@@ -22,88 +22,47 @@
   <nav aria-label="Project"><a href="#download">Downloads</a><a href="{{REPO_URL}}/tree/main/docs">Docs</a><a href="{{REPO_URL}}">GitHub</a></nav>
 </header>
 <main>
-<section class="hero wrap">
+<section class="hero-band"><div class="hero wrap">
   <div class="hero-text">
     <h1>Messaging,<br>even offline.</h1>
     <p class="lede">Send encrypted messages over Bluetooth, Wi-Fi or the internet.</p>
     {{HERO_DOWNLOAD}}
   </div>
 
-  <figure class="mesh" id="mesh">
-    <div class="plate-title">Message route <span>Your phone to Ines</span></div>
-    <svg viewBox="26 38 507 367" role="group" aria-label="Six devices and the paths between them">
-      <g class="edges">
-        <line class="edge near route" data-a="you" data-b="hana" x1="92" y1="222" x2="212" y2="108"/>
-        <line class="edge near" data-a="you" data-b="tobias" x1="92" y1="222" x2="222" y2="326"/>
-        <line class="edge net route" data-a="hana" data-b="laptop" x1="212" y1="108" x2="352" y2="208"/>
-        <line class="edge net" data-a="tobias" data-b="laptop" x1="222" y1="326" x2="352" y2="208"/>
-        <line class="edge near" data-a="tobias" data-b="kofi" x1="222" y1="326" x2="392" y2="352"/>
-        <line class="edge net" data-a="kofi" data-b="ines" x1="392" y1="352" x2="486" y2="112"/>
-        <line class="edge net route" data-a="laptop" data-b="ines" x1="352" y1="208" x2="486" y2="112"/>
-      </g>
-      <circle class="parcel" r="7" cx="92" cy="222"/>
-      <defs>
-        <!-- Face-local coordinates keep the glass, bezel and keys in perspective. -->
-        <g id="handset" class="device">
-          <g transform="matrix(.866 .5 0 1 -38.898 3.5)"><rect width="30" height="5" rx="2"/></g>
-          <g transform="matrix(.866 -.5 0 1 -12.918 18.5)"><rect width="53" height="5" rx="2"/></g>
-          <g transform="matrix(.866 .5 -.866 .5 7 -23)">
-            <rect width="30" height="53" rx="5"/>
-            <rect class="glass" x="3" y="3" width="24" height="46" rx="2"/>
-            <path class="detail" d="M12 6h7M12 46h7"/>
+  <figure class="globe" aria-label="Message route demo">
+    <svg viewBox="0 0 600 512" role="img" aria-labelledby="route-title route-desc">
+      <title id="route-title">Messages and files travel from peer to peer</title>
+      <desc id="route-desc">Example routes from Boston via Reykjavík to Lisbon, and São Paulo via Dakar to Cape Town. The callouts show what arrives.</desc>
+      <image href="assets/globe.svg" width="600" height="512"/>
+      <g class="journey chat" data-kind="chat">
+          <path class="hop" d="M185.5 131.5 Q249.9 70.0 314.4 72.6"/><path class="hop" d="M314.4 72.6 Q340.0 80.5 365.6 152.4"/>
+          <circle class="pin" cx="185.5" cy="131.5" r="3.6"/><circle class="pin" cx="314.4" cy="72.6" r="3.6"/><circle class="pin" cx="365.6" cy="152.4" r="3.6"/>
+          <g class="packets" visibility="hidden"><circle class="packet" r="4.1"/></g>
+          <g class="arrival" transform="translate(365.6 152.4)">
+            <path d="M0 -4l-3 -11h10z"/><rect x="-12" y="-43" width="145" height="30" rx="6"/>
+            <text x="60.5" y="-23" text-anchor="middle">Made it home.</text>
           </g>
         </g>
-        <g id="notebook" class="device">
-          <g transform="matrix(.866 .5 0 1 -14 -45)"><rect width="51" height="34" rx="2"/><rect class="glass" x="3" y="3" width="45" height="27"/></g>
-          <g transform="matrix(.866 .5 -.866 .5 -14 -11)"><rect width="51" height="28" rx="2"/><path class="detail" d="M5 5h41M5 9h41M5 13h41M20 18h13v6H20z"/></g>
+      <g class="journey file" data-kind="file">
+          <path class="hop" d="M238.1 395.6 Q293.8 290.7 349.6 249.8"/><path class="hop" d="M349.6 249.8 Q398.0 299.5 446.5 413.2"/>
+          <circle class="pin" cx="238.1" cy="395.6" r="3.6"/><circle class="pin" cx="349.6" cy="249.8" r="3.6"/><circle class="pin" cx="446.5" cy="413.2" r="3.6"/>
+          <g class="packets" visibility="hidden"><rect class="packet" x="-3" y="-3" width="6" height="6" rx="1"/><rect class="packet" x="-3" y="-3" width="6" height="6" rx="1"/><rect class="packet" x="-3" y="-3" width="6" height="6" rx="1"/></g>
+          <g class="arrival" transform="translate(446.5 413.2)">
+            <path d="M0 -4l-3 -11h10z"/><rect x="-133" y="-43" width="145" height="30" rx="6"/>
+            <text x="-60.5" y="-23" text-anchor="middle">field-notes.pdf</text>
+          </g>
         </g>
-      </defs>
-      <g class="nodes">
-        <g class="node" data-id="you" data-x="92" data-y="222" transform="translate(92 222)">
-          <rect class="hit" x="-42" y="-48" width="84" height="91" rx="7"/>
-          <use href="#handset"/>
-          <text class="name" y="39">Your phone</text>
-        </g>
-        <g class="node" data-id="hana" data-x="212" data-y="108" data-name="Hana" transform="translate(212 108)">
-          <rect class="hit" x="-42" y="-48" width="84" height="91" rx="7"/>
-          <use href="#handset"/>
-          <text class="name" y="39">Hana</text>
-        </g>
-        <g class="node" data-id="tobias" data-x="222" data-y="326" data-name="Tobias" transform="translate(222 326)">
-          <rect class="hit" x="-42" y="-48" width="84" height="91" rx="7"/>
-          <use href="#handset"/>
-          <text class="name" y="39">Tobias</text>
-        </g>
-        <g class="node" data-id="laptop" data-x="352" data-y="208" data-name="Someone's laptop" transform="translate(352 208)">
-          <rect class="hit" x="-42" y="-48" width="84" height="91" rx="7"/>
-          <use href="#notebook"/>
-          <text class="name" y="39">Laptop</text>
-        </g>
-        <g class="node" data-id="kofi" data-x="392" data-y="352" data-name="Kofi" transform="translate(392 352)">
-          <rect class="hit" x="-42" y="-48" width="84" height="91" rx="7"/>
-          <use href="#handset"/>
-          <text class="name" y="39">Kofi</text>
-        </g>
-        <g class="node" data-id="ines" data-x="486" data-y="112" transform="translate(486 112)">
-          <rect class="hit" x="-42" y="-48" width="84" height="91" rx="7"/>
-          <use href="#handset"/>
-          <text class="name" y="39">Ines</text><g class="tick" transform="translate(22 -26)"><circle r="8"/><path d="m-4 0 3 3 5-6"/></g>
-        </g>
-      </g>
     </svg>
     <figcaption>
-      <p class="mesh-say" id="mesh-say" aria-live="polite">Your phone has no signal. The
-        message reaches Ines through Hana’s phone and someone’s laptop, and
-        neither can read it.</p>
-      <ul class="legend">
-        <li><span class="swatch near"></span>Nearby: Bluetooth or Wi-Fi</li>
-        <li><span class="swatch net"></span>Over the internet</li>
-        <li><span class="swatch off"></span>Switched off</li>
-      </ul>
-      <p class="mesh-hint" id="mesh-hint" hidden>Select a relay to switch it on or off.</p>
+      <span>Example routes</span>
+      <div class="route-controls" hidden>
+        <button type="button" data-send="chat">Send a message</button>
+        <button type="button" data-send="file">Send a file</button>
+      </div>
+      <span class="sr-only" role="status"></span>
     </figcaption>
   </figure>
-</section>
+</div></section>
 
 <section id="how" class="shots wrap" aria-label="Inside the app">
   <div class="shot-copy"><h2>Inside Mycel</h2><p>Start a chat, share a file or call a group of up to eight. Nearby devices can pass a sealed message along until its recipient comes back online.</p></div>

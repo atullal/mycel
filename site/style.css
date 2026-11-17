@@ -1,5 +1,5 @@
-/* Hallmark · redesign: full · theme: Mycel brand · genre: editorial · hero: interactive route · nav: project links · footer: project resources · job: download · signature: switchable isometric relays */
-/* Critique: the device drawing carries the network explanation; the screenshots show the app visitors download. */
+/* Hallmark · redesign: full · theme: Mycel brand · genre: editorial · hero: interactive route · nav: project links · footer: project resources · job: download · signature: hairline globe */
+/* Critique: the illustrated route carries the network explanation; the screenshots show the app visitors download. */
 :root {
   color-scheme: light dark;
   --bg: oklch(97% .014 105);
@@ -84,7 +84,7 @@ h2 { font-size: 2.1rem; letter-spacing: -0.01em; }
 p { margin: 0; }
 
 /* Navigation and introduction */
-.top, .brand, .top nav, .plate-title {
+.top, .brand, .top nav {
   display: flex;
   align-items: center;
 }
@@ -140,76 +140,57 @@ h1 {
   max-width: 34em;
 }
 
-/* Interactive route diagram */
-.mesh {
-  margin: 0;
-  background: var(--plate);
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  padding: 0 clamp(12px, 2vw, 24px) 16px;
+/* Atlantic route demo. The projected coastline and the two journeys share a viewBox. */
+.hero-band {
+  --ocean: oklch(20% .038 157);
+  --paper: oklch(96% .024 104);
+  --quiet: oklch(84% .035 126);
+  --signal: oklch(91% .158 109);
+  color: var(--paper);
+  background: var(--ocean);
 }
-.plate-title {
-  justify-content: space-between;
-  gap: 12px;
-  padding-block: 12px;
-  border-bottom: 1px solid var(--line);
-  font-size: .9rem;
-  font-weight: 650;
-}
-.plate-title span { font-weight: 400; color: var(--ink-2); }
-.mesh svg { display: block; width: 100%; height: auto; max-height: 380px; }
-.edge { stroke: var(--link); stroke-width: 2; stroke-linecap: round; }
-.edge.net { stroke-dasharray: 5 5; }
-.edge.route { stroke: var(--accent); stroke-width: 3.5; }
-.edge.down { stroke: var(--link); stroke-dasharray: 1 7; }
-.device rect {
-  fill: var(--surface);
-  stroke: var(--ink);
-  stroke-width: 1.5;
-  vector-effect: non-scaling-stroke;
-}
-.device .glass { fill: var(--device-glass, var(--glass)); }
-.device .detail {
-  fill: none;
-  stroke: var(--ink);
-  stroke-width: 1;
-  vector-effect: non-scaling-stroke;
-}
-.node .name { text-anchor: middle; font: 600 14px var(--font-ui); fill: var(--ink); }
-.node .hit { fill: transparent; }
-.node[role="button"] { cursor: pointer; }
-.node[role="button"]:hover { --device-glass: var(--glass-hover); }
-.node[role="button"]:focus { outline: none; }
-.node[role="button"]:focus-visible .hit { stroke: var(--accent); stroke-width: 2; }
-.node.off use { opacity: .4; }
-.node.off .name { fill: var(--ink-2); }
-.parcel { fill: var(--ink); stroke: var(--surface); stroke-width: 2; pointer-events: none; }
-.tick { opacity: 0; filter: blur(4px); transition: opacity .2s, filter .2s; }
-.tick.on { opacity: 1; filter: blur(0); }
-.tick circle { fill: var(--accent); }
-.tick path { fill: none; stroke: var(--accent-ink); stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-.mesh figcaption { border-top: 1px solid var(--line); padding-top: 12px; }
-.mesh-say { min-height: 3em; font-size: .98rem; }
-.legend {
+.hero-band .lede, .hero-band .fine { color: var(--quiet); }
+.hero-band .button { color: var(--ocean); background: var(--paper); }
+.hero-band .button:hover, .hero-band .button:active { background: var(--signal); }
+.hero-band a:hover { color: var(--signal); }
+.hero-band a.button:hover { color: var(--ocean); }
+.hero-band :focus-visible { outline-color: var(--signal); }
+.hero { padding-block: clamp(32px, 4vw, 64px); gap: clamp(16px, 2vw, 32px); }
+.globe { min-width: 0; margin: 0; }
+.globe svg { display: block; width: 100%; overflow: visible; }
+.globe .chat { color: var(--signal); }
+.globe .file { color: var(--quiet); }
+.hop { fill: none; stroke: currentColor; stroke-width: 1.35; }
+.pin { fill: var(--ocean); stroke: currentColor; stroke-width: 1.5; }
+.packet { fill: currentColor; }
+.arrival { fill: var(--paper); }
+.arrival text { fill: var(--ocean); font: 15px var(--font-ui); }
+.globe figcaption {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px 20px;
-  list-style: none;
-  margin: 12px 0 0;
-  padding: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 4px 16px;
+  color: var(--quiet);
   font-size: .86rem;
-  color: var(--ink-2);
 }
-.swatch {
-  display: inline-block;
-  width: 18px;
-  margin-right: 8px;
-  vertical-align: middle;
-  border-top: 2px solid var(--line-strong);
+.route-controls { display: flex; gap: 16px; }
+.route-controls button {
+  padding: 8px 0;
+  border: 0;
+  background: transparent;
+  color: var(--paper);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 4px;
+  cursor: pointer;
 }
-.swatch.net { border-top-style: dashed; }
-.swatch.off { border-top-style: dotted; }
-.mesh-hint { margin-top: 12px; font-size: .86rem; font-weight: 600; }
+.route-controls button:hover, .route-controls button:active { color: var(--signal); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+@media (max-width: 520px) {
+  .globe svg { width: 112%; margin-inline: -6%; }
+  .globe figcaption { gap: 0 12px; }
+}
 
 /* Product screenshots */
 .shots {
@@ -296,9 +277,7 @@ footer {
   .hero { gap: 28px; }
   .shots { grid-template-columns: minmax(0, 1fr); }
   .shot-phone { width: 62%; justify-self: center; }
-  .node .name { font-size: 17px; }
 }
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
-  .tick { transition: none; filter: none; }
 }
