@@ -182,6 +182,42 @@ h1 {
 .shots img { display: block; width: 100%; height: auto; border-radius: 6px; }
 .shots img { mix-blend-mode: multiply; }
 .note { grid-column: 1 / -1; font-size: .86rem; color: var(--ink-2); }
+/* Getting started, networking and project resources */
+.guide-section {
+  padding-block: clamp(32px, 5vw, 64px);
+  border-top: 1px solid var(--line);
+  scroll-margin-top: 16px;
+}
+.section-intro, .network-section {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.25fr);
+  align-items: start;
+  gap: clamp(24px, 5vw, 64px);
+}
+.guide-section p { color: var(--ink-2); max-width: 58ch; }
+.guide-section strong { color: var(--ink); font-weight: 600; }
+.chat-steps, .project-links {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: clamp(20px, 3vw, 40px);
+  margin: 32px 0 0;
+}
+.chat-steps { padding-inline-start: 1.5rem; }
+.chat-steps li::marker { color: var(--accent); font-family: var(--font-mono); }
+.guide-section h3 { margin: 0 0 8px; font-size: 1.07rem; }
+.guide-section p + p, .network-section h2 + p { margin-top: 16px; }
+.network-section figure { margin: 0; }
+.network-section img { display: block; width: 100%; height: auto; mix-blend-mode: multiply; }
+.network-section figcaption, .project-links p { margin-block: 8px; }
+.network-section p + a { display: inline-block; margin-top: 16px; }
+@media (max-width: 800px) {
+  .section-intro, .network-section, .chat-steps, .project-links { grid-template-columns: 1fr; }
+  .section-intro { gap: 12px; }
+}
+@media (max-width: 520px) {
+  .top { flex-wrap: wrap; gap: 8px 16px; }
+}
+
 /* download */
 
 .download { padding-bottom: 96px; }

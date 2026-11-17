@@ -18,13 +18,13 @@
 
 <header class="top wrap">
   <a class="brand" href="./"><img src="assets/mycel.svg" alt="" width="30" height="30">Mycel</a>
-  <nav aria-label="Project"><a href="#download">Downloads</a><a href="{{REPO_URL}}/tree/main/docs">Docs</a><a href="{{REPO_URL}}">GitHub</a></nav>
+  <nav aria-label="Project"><a href="#first-chat">Get started</a><a href="#download">Downloads</a><a href="{{REPO_URL}}/tree/main/docs">Docs</a><a href="{{REPO_URL}}">GitHub</a></nav>
 </header>
 <main>
 <section class="hero-band"><div class="hero wrap">
   <div class="hero-text">
     <h1>Messaging,<br>even offline.</h1>
-    <p class="lede">Send encrypted messages over Bluetooth, Wi-Fi or the internet.</p>
+    <p class="lede">Mycel is an open-source messenger. Chat over local Wi-Fi, connect across the internet, or let nearby devices carry a message until it reaches a friend.</p>
     {{HERO_DOWNLOAD}}
   </div>
 
@@ -64,7 +64,7 @@
 </div></section>
 
 <section id="how" class="shots wrap" aria-label="Inside the app">
-  <div class="shot-copy"><h2>Inside Mycel</h2><p>Start a chat, share a file or call a group of up to eight. Nearby devices can pass a sealed message along until its recipient comes back online.</p></div>
+  <div class="shot-copy"><h2>Inside a conversation</h2><p>Reply to a photo, leave a voice note or start a group call with up to eight people. If a file transfer gets interrupted, it picks up where it left off.</p></div>
   <picture class="shot-desktop">
     <img src="screenshots/01-chat.png" width="2560" height="1600" loading="lazy"
          alt="Mycel on desktop, with the chat list beside an open conversation.">
@@ -74,6 +74,29 @@
          alt="Mycel’s mobile interface for conversations and calls.">
   </picture>
   <p class="note">Screenshots are from the browser demo, with simulated people.</p>
+</section>
+
+<section id="first-chat" class="guide-section wrap" aria-labelledby="first-chat-title">
+  <div class="section-intro">
+    <h2 id="first-chat-title">Your first chat</h2>
+    <p>Start with two devices on the same Wi-Fi. Each device has its own identity, so there’s no account to create.</p>
+  </div>
+  <ol class="chat-steps">
+    <li><h3>Open Mycel on both devices</h3><p>Install <a href="#download">the same build</a> on each. Allow local network access when prompted. In <strong>Profile</strong>, give each device a name you’ll recognize.</p></li>
+    <li><h3>Find each other</h3><p>Open <strong>Nearby</strong> and choose <strong>Add</strong> beside the other device. Connecting from farther away? <a href="{{REPO_URL}}/blob/main/docs/USER_GUIDE.md#add-someone-with-a-contact-code">Exchange contact codes</a> instead.</p></li>
+    <li><h3>Send a hello</h3><p>In <strong>Messages</strong>, choose <strong>New conversation</strong>, select your contact and choose <strong>Start chat</strong>. If your hello arrives in <strong>Requests</strong>, the recipient can accept it and reply.</p></li>
+  </ol>
+</section>
+
+<section class="guide-section network-section wrap" aria-labelledby="network-title">
+  <div>
+    <h2 id="network-title">Where does a message go?</h2>
+    <p>On the same Wi-Fi, your devices can talk even if the router loses its internet connection. Open <strong>Network</strong> to see which path Mycel is using.</p>
+    <p>Across the internet, Mycel tries a direct connection first. If the devices can’t reach each other directly, a relay can pass their encrypted traffic along. A device running Mycel can also hold a sealed message for someone who’s offline.</p>
+    <a href="{{REPO_URL}}/blob/main/docs/USER_GUIDE.md#how-devices-reach-each-other">Explore connection options</a>
+  </div>
+  <figure><img src="screenshots/03-network.png" width="2560" height="1600" loading="lazy" alt="Mycel’s Network panel with nearby devices and connection paths.">
+    <figcaption class="note">Network view in the browser demo.</figcaption></figure>
 </section>
 
 <section class="download wrap" id="download">
@@ -102,13 +125,26 @@
     <a href="{{REPO_URL}}/blob/main/docs/TRUST.md">security specification</a>.</p>
 </section>
 
+<section class="guide-section wrap" id="contribute" aria-labelledby="contribute-title">
+  <div class="section-intro">
+    <h2 id="contribute-title">Build on Mycel</h2>
+    <p>The messenger is an app built on the Mycel runtime. The runtime manages device keys, storage and connections. Apps use a TypeScript client or React hooks to work with it.</p>
+  </div>
+  <div class="project-links">
+    <div><h3>Write an app</h3><p>Start with the messaging app as a working example. The SDK lives in the repository alongside it.</p>
+      <a href="{{REPO_URL}}/tree/main/packages/sdk">TypeScript SDK</a> · <a href="{{REPO_URL}}/tree/main/apps/messaging">Messaging app source</a></div>
+    <div><h3>Test on your hardware</h3><p>Try two devices on your own network. If a connection fails, include the platform, build and path shown in Network when you report it.</p>
+      <a href="{{REPO_URL}}/blob/main/docs/TESTING.md">Testing guide</a> · <a href="{{REPO_URL}}/issues">Issue tracker</a></div>
+    <div><h3>Contribute a change</h3><p>The contributor guide covers the Rust and Node.js setup, local checks and how to submit a patch.</p>
+      <a href="{{REPO_URL}}/blob/main/CONTRIBUTING.md">Contributor guide</a> · <a href="{{REPO_URL}}/blob/main/SECURITY.md">Report a vulnerability privately</a></div>
+  </div>
+</section>
+
 </main>
 
 <footer class="wrap">
   <p>Mycel is free software under the MIT and Apache&nbsp;2.0 licences.
-    <a href="{{REPO_URL}}">Source</a>,
-    <a href="{{REPO_URL}}/blob/main/CONTRIBUTING.md">contributing</a>,
-    <a href="{{REPO_URL}}/blob/main/SECURITY.md">reporting a vulnerability</a>.</p>
+    <a href="{{REPO_URL}}">Source on GitHub</a>.</p>
 
 </footer>
 
