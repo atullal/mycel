@@ -21,8 +21,11 @@ Messaging (chat, files, voice and video calls) built on it.
 - **Messaging:** direct chats and groups, message requests from strangers
   (nothing is sent back or stored until you accept), replies, edits,
   deletes, reactions, read receipts, typing, search, voice notes.
-- **Files of any size**, encrypted as a stream, resumable, and downloaded
-  from every member that has them at once.
+- **Files of any size**, encrypted in pieces that are each checked as they
+  arrive, resumable, and downloaded from every device that has them at
+  once. A file for someone who is away waits with contacts and nearby
+  devices that agree to hold it; a file sent as *public* is stored and sent
+  once wherever it is used ([docs/TRUST.md](docs/TRUST.md) §7c).
 - **Voice and video calls**, 1:1 and groups of up to 8, device to device,
   moving between paths mid-call.
 - **End-to-end encryption with signed membership.** Each chat is a space
@@ -43,6 +46,12 @@ Messaging (chat, files, voice and video calls) built on it.
 - **Every device a router:** a multi-hop mesh through nearby devices,
   gateways that let a Bluetooth-only device be reached from anywhere (signed
   records in the Mainline DHT), and store-and-forward through strangers.
+- **The internet without a server, if you choose:** by default Mycel uses
+  n0's public relay and DNS servers, which see only ciphertext. Switched
+  off (`MYCEL_RELAYS=none MYCEL_N0_DNS=0`), devices find each other through
+  the BitTorrent DHT, and a device the internet can reach relays for
+  devices behind routers. Tested between processes on one computer, not
+  yet across real routers ([ARCHITECTURE.md](docs/ARCHITECTURE.md) §9b).
 - **No internet needed:** a *Local only* mode never contacts the internet.
 - **Tested at scale in simulation** up to 10,003 devices, and against The
   ONE's routers on real contact traces: on Infocom 2006, 57 % of large
@@ -137,7 +146,7 @@ The native apps (output in `dist-release/`; details in
 
 ```
 crates/
-  mycel-crypto      Ed25519, HPKE lockboxes, XChaCha20-Poly1305, streaming AEAD, BLAKE3
+  mycel-crypto      Ed25519, HPKE lockboxes (X25519 + ML-KEM-768), XChaCha20-Poly1305, streaming AEAD, BLAKE3
   mycel-trust       spaces: signed membership DAG, deterministic resolution, epochs
   mycel-sync        signed, encrypted envelopes → Automerge docs and causal feeds
   mycel-net         Iroh QUIC multipath, live sync, discovery, invites, blobs, the mesh

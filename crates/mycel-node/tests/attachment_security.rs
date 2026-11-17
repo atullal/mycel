@@ -83,7 +83,7 @@ async fn pending_requests_reject_offer_put_and_download_across_restart() {
     let alice = open(&alice_dir, "Sender").await;
     let mut bob = open(&bob_dir, "Recipient").await;
     connect(&alice, &bob);
-    let contact = alice.add_contact(bob.profile().contact_code).unwrap();
+    let contact = alice.add_contact(bob.profile().contact_code_full).unwrap();
     let conv = alice.create_conversation(None, vec![contact.id]).unwrap();
     eventually(|| bob.conversations().iter().any(|c| c.id == conv.id && c.request)).await;
     let space = bob.node().space_ids()[0];
@@ -145,7 +145,7 @@ async fn declined_requests_reject_pushes_across_restart() {
     let alice = open(&alice_dir, "Sender").await;
     let mut bob = open(&bob_dir, "Recipient").await;
     connect(&alice, &bob);
-    let contact = alice.add_contact(bob.profile().contact_code).unwrap();
+    let contact = alice.add_contact(bob.profile().contact_code_full).unwrap();
     let conv = alice.create_conversation(None, vec![contact.id]).unwrap();
     eventually(|| bob.conversations().iter().any(|c| c.id == conv.id && c.request)).await;
     let space = bob.node().space_ids()[0];

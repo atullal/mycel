@@ -1,7 +1,15 @@
 import { useMemo, useState } from "react";
 import { useContacts, useMycel, useNearby, useNetwork, useProfile } from "@mycel/sdk/react";
-import { isMobile, type LinkStatus, type NetworkMode, type NetworkStatus, type PathKind, type PeerPaths } from "@mycel/sdk";
+import {
+  isMobile,
+  type LinkStatus,
+  type NetworkMode,
+  type NetworkStatus,
+  type PathKind,
+  type PeerPaths,
+} from "@mycel/sdk";
 import { initials, toneFor } from "./common.tsx";
+import { relayLines } from "./relayText.ts";
 
 const MODE: Record<NetworkMode, { name: string; text: string }> = {
   lan: {
@@ -202,6 +210,21 @@ function ModeSwitch({ status }: { status: NetworkStatus }) {
   );
 }
 
+function Relaying({ status }: { status: NetworkStatus }) {
+  const lines = status.mode === "internet" && status.relay ? relayLines(status.relay) : [];
+  if (lines.length === 0) return null;
+  return (
+    <section className="p-card">
+      <h4>Relaying</h4>
+      {lines.map((l) => (
+        <p key={l} className="p-help">
+          {l}
+        </p>
+      ))}
+    </section>
+  );
+}
+
 export function NetworkPanel() {
   const { status, error } = useNetwork();
   const { contacts } = useContacts();
@@ -258,6 +281,8 @@ export function NetworkPanel() {
           ))}
         </ul>
       </section>
+
+      <Relaying status={status} />
 
       {status.peers.length > 0 && (
         <section className="p-card">

@@ -32,10 +32,20 @@
 //!   wins ties); anyone else directly. Frames wait (bounded) meanwhile. A
 //!   record a minute old is looked up again, while a hop up to one of its
 //!   gateways keeps carrying the traffic. Internet hops carry no
-//!   routing (meshes don't merge across the internet), idle ones are hung
-//!   up, and nothing is relayed internet → internet.
+//!   routing (meshes don't merge across the internet) and idle ones are
+//!   hung up.
+//! - **Relays**: a device the internet can reach carries traffic between
+//!   two internet hops, but only for a *client*: a device connected to it
+//!   that asked ([`Router::relay_join`], again every [`RELAY_REFRESH`]).
+//!   A device behind a router that lets nothing in keeps hops up to the
+//!   relays it chose ([`Router::set_relays`]) and names them in its record,
+//!   as a device without the internet names its gateways; whoever reads the
+//!   record reaches it through one of them. Nothing else crosses from one
+//!   internet hop to another: nobody bounces traffic through a device that
+//!   didn't agree to it.
 //! - **Budgets**: transit per neighbour and in total, the mesh ↔ internet
-//!   crossing separately, announcements per neighbour.
+//!   crossing and internet ↔ internet relaying separately, announcements
+//!   per neighbour.
 //! - **Lying neighbours**: a relayed announcement no honest relay can send
 //!   (zero hops, or less cost than its hops add) gets its sender distrusted
 //!   for a while: the routes through it go, and the routes it relays are
@@ -63,12 +73,17 @@
 //!   on_frame(from, Frame, now)    a frame from a neighbour
 //!   on_resolved(target, Option<Vec<(gateway, cost)>>, now)   answer to Out::Resolve
 //!   admit_record(origin, now) -> bool             a gateway may publish this record
+//!   set_relaying(bool)            the internet can reach us: take relay clients
+//!   set_metered(bool)             a metered uplink: no gateway, no relay
+//!   relay_join(peer, known, now) -> bool    peer asks us to be its relay
+//!   set_relays(relays, now)       the relays we asked: their hops are kept up
 //!   tick(now)                     every ~10–20 ms: rebroadcasts, expiry, route
 //!                                 changes, gateway choice, idle hang-ups
 //!   drain(&mut Vec<Out>)          take the effects (in order)
 //!   queries: toward (next hop for custody transfer), route_hops, reachable,
 //!            gateways, gateways_with_cost, my_gateways, next_hop_local,
-//!            is_neighbour, is_gateway, neighbours, origin_name, stats
+//!            is_neighbour, is_gateway, neighbours, origin_name, stats,
+//!            relaying, relays_up, my_relays, relay_clients
 //! ```
 //!
 //! A frame is `(dst, src, waypoint)` plus a TTL: it travels toward the
@@ -184,6 +199,10 @@ pub const REACH_LIFETIME: Time = 30 * 60_000;
 const REACH_MIN_GAP: Time = 5_000;
 /// A gateway publishes one origin's record at most this often.
 pub const RECORD_MIN_GAP: Time = 10_000;
+/// How often a device asks each of its relays again to be its relay.
+pub const RELAY_REFRESH: Time = 60_000;
+/// A relay forgets a client that hasn't asked for this long.
+pub const RELAY_CLIENT_TTL: Time = 3 * RELAY_REFRESH;
 
 /// FNV-1a: deterministic iteration order (a simulator replays exactly).
 #[derive(Default, Clone, Copy)]
@@ -260,6 +279,14 @@ pub struct Config {
     pub gateways: usize,
     /// Internet hop connections open at once.
     pub max_internet_hops: usize,
+    /// While the internet can reach us ([`Router::set_relaying`]): carry
+    /// traffic between two internet hops for the devices that asked us to
+    /// be their relay.
+    pub internet_relay: bool,
+    /// Bytes per second relayed between two internet hops.
+    pub internet_relay_rate: u64,
+    /// Devices we are the relay of, at most.
+    pub max_relay_clients: usize,
     /// Reachability records a gateway publishes for others.
     pub max_records: usize,
     /// Announcements remembered as checked (a 32-byte digest of everything
@@ -288,6 +315,9 @@ impl Default for Config {
             gateway_rate: 2 << 20,
             gateways: 2,
             max_internet_hops: 256,
+            internet_relay: true,
+            internet_relay_rate: 2 << 20,
+            max_relay_clients: 256,
             max_records: 1024,
             verified_max: VERIFIED_MAX,
             seed: 0x6d79_6365_6c21,
@@ -426,8 +456,11 @@ pub enum Out {
     Frame { to: SignPk, frame: Frame, relayed: bool },
     /// A whole QUIC packet for us, from `src` (answer via `waypoint`).
     Deliver { src: SignPk, waypoint: SignPk, payload: Bytes },
-    /// A whole control message for us.
-    Control { from: SignPk, payload: Bytes },
+    /// A whole control message for us. `from` is what the frame says (a
+    /// relay could have written it); `via` is the neighbour that handed it
+    /// to us on its authenticated hop connection (`None`: put together
+    /// from pieces), so `via == Some(from)` proves who sent it.
+    Control { from: SignPk, via: Option<SignPk>, payload: Bytes },
     /// Open an internet hop connection to `peer` (then `hop_up` or `dial_failed`).
     Dial(SignPk),
     /// Close the idle internet hop to `peer` (then `hop_down`).
@@ -477,6 +510,10 @@ pub struct Stats {
     /// Transit frames from the internet into the mesh, and out of it.
     pub gateway_in: u64,
     pub gateway_out: u64,
+    /// Transit frames between two internet hops, for a relay client.
+    pub relayed_internet: u64,
+    /// Devices that asked us to be their relay and were refused (full).
+    pub relay_refused: u64,
     pub resolves: u64,
     pub dials: u64,
     pub records_refused: u64,
@@ -659,6 +696,17 @@ pub struct Router {
     verified: Set<Hash32>,
     total_budget: Bucket,
     gateway_budget: Bucket,
+    internet_budget: Bucket,
+    /// Our uplink is paid for by the byte: nothing of anyone else's goes
+    /// over it.
+    metered: bool,
+    /// The internet can reach us and we take relay clients.
+    relaying: bool,
+    /// Devices we are the relay of: when each last asked, and whether it
+    /// is one we know (a contact, someone in our chats).
+    clients: Map<SignPk, (Time, bool)>,
+    /// The relays we asked to carry traffic to us.
+    my_relays: Vec<SignPk>,
     reach: Map<SignPk, Reach>,
     resolving: Set<SignPk>,
     dialing: Map<SignPk, Time>,
@@ -726,6 +774,7 @@ impl Router {
     pub fn new(me: SignPk, cfg: Config) -> Router {
         let total = cfg.relay_rate_total as f64;
         let gw = cfg.gateway_rate as f64;
+        let inet = cfg.internet_relay_rate as f64;
         let rng = (cfg.seed ^ u64::from_le_bytes(me.0[..8].try_into().unwrap_or([7; 8]))) | 1;
         Router {
             me,
@@ -739,6 +788,11 @@ impl Router {
             verified: Set::default(),
             total_budget: Bucket::new(total, total),
             gateway_budget: Bucket::new(gw, gw),
+            internet_budget: Bucket::new(inet, inet),
+            metered: false,
+            relaying: false,
+            clients: Map::default(),
+            my_relays: Vec::new(),
             reach: Map::default(),
             resolving: Set::default(),
             dialing: Map::default(),
@@ -1002,6 +1056,7 @@ impl Router {
         if let Some(p) = self.pending.remove(&peer) {
             self.stats.dropped_pending += p.frames.len() as u64;
         }
+        self.clients.remove(&peer);
         self.lost_neighbour(peer, now);
     }
 
@@ -1088,7 +1143,7 @@ impl Router {
         self.force_full = false;
         self.originated += 1;
         let scope = if full { self.cfg.max_hops } else { NEAR_SCOPE.min(self.cfg.max_hops) };
-        let gateway = self.internet && self.cfg.gateway && self.cfg.relay;
+        let gateway = self.internet && self.cfg.gateway && self.cfg.relay && !self.metered;
         Origination {
             seq: self.seq,
             flags: if gateway { F_GATEWAY } else { 0 },
@@ -1822,7 +1877,7 @@ impl Router {
             f.reached = true;
         }
         if f.dst == self.me {
-            self.deliver(f, now);
+            self.deliver(f, from, now);
             return;
         }
         if f.src == self.me && from.is_some() {
@@ -1858,6 +1913,14 @@ impl Router {
     fn next_hop(&mut self, target: &SignPk, from: Option<&SignPk>, avoid: bool, now: Time) -> Next {
         // 1. a neighbour (direct, or an internet hop already up)
         if Some(target) != from && self.nbs.get(target).is_some_and(|n| n.up) {
+            // between two internet hops only as the relay of one of them
+            if let Some(f) = from
+                && self.is_internet_hop(f)
+                && self.is_internet_hop(target)
+                && !self.relays_for(f, target)
+            {
+                return Next::Drop;
+            }
             return Next::Via(*target);
         }
         // 2. a mesh route, not through a hop suspected for the target if
@@ -1869,9 +1932,10 @@ impl Router {
         }
         let from_internet = from.is_some_and(|f| self.is_internet_hop(f));
         if self.internet {
-            // 3. over the internet: never internet → internet for others,
-            // and mesh → internet only as a gateway
-            if from_internet || (from.is_some() && !self.cfg.gateway) {
+            // 3. over the internet: never a lookup or a dial for what came
+            // from the internet (a relay carries only between hops that
+            // are up), and mesh → internet only as a gateway
+            if from_internet || (from.is_some() && (!self.cfg.gateway || self.metered)) {
                 return Next::Drop;
             }
             if self.nbs.get(target).is_some_and(|n| n.direct) {
@@ -2031,7 +2095,13 @@ impl Router {
                 return;
             }
             let (from_inet, to_inet) = (self.is_internet_hop(&from), self.is_internet_hop(&next));
-            if from_inet != to_inet {
+            if from_inet && to_inet {
+                if !self.internet_budget.take(len, now) {
+                    self.stats.dropped_budget += 1;
+                    return;
+                }
+                self.stats.relayed_internet += 1;
+            } else if from_inet != to_inet {
                 if !self.gateway_budget.take(len, now) {
                     self.stats.dropped_budget += 1;
                     return;
@@ -2051,11 +2121,11 @@ impl Router {
         self.out.push(Out::Frame { to: next, frame: f, relayed: from.is_some() });
     }
 
-    fn deliver(&mut self, f: Frame, now: Time) {
+    fn deliver(&mut self, f: Frame, via: Option<SignPk>, now: Time) {
         if f.offset == 0 && f.payload.len() == f.total as usize {
             self.stats.frames_delivered += 1;
             self.out.push(if f.control {
-                Out::Control { from: f.src, payload: f.payload }
+                Out::Control { from: f.src, via, payload: f.payload }
             } else {
                 Out::Deliver { src: f.src, waypoint: f.waypoint, payload: f.payload }
             });
@@ -2085,10 +2155,135 @@ impl Router {
             self.stats.frames_delivered += 1;
             let payload = Bytes::from(r.buf);
             self.out.push(if r.control {
-                Out::Control { from: f.src, payload }
+                Out::Control { from: f.src, via: None, payload }
             } else {
                 Out::Deliver { src: f.src, waypoint: r.waypoint, payload }
             });
+        }
+    }
+
+    // ───────────── relays ─────────────
+
+    /// Our uplink is metered (mobile data): we stop being a gateway and a
+    /// relay, so nobody else's traffic is paid for by this device. Relaying
+    /// between nearby devices goes on: it costs no data.
+    pub fn set_metered(&mut self, on: bool) {
+        if self.metered == on {
+            return;
+        }
+        self.metered = on;
+        if on {
+            self.relaying = false;
+            self.clients.clear();
+        }
+        // the gateway flag in our announcement changed
+        self.next_announce = 0;
+    }
+
+    pub fn metered(&self) -> bool {
+        self.metered
+    }
+
+    /// Whether we take relay clients. The driver turns it on while the
+    /// internet can reach this device (and it isn't on a metered uplink).
+    pub fn set_relaying(&mut self, on: bool) {
+        self.relaying = on && self.cfg.relay && self.cfg.internet_relay && !self.metered;
+        if !self.relaying {
+            self.clients.clear();
+        }
+    }
+
+    pub fn relaying(&self) -> bool {
+        self.relaying
+    }
+
+    /// `peer`, connected to us over the internet, asks us to be its relay
+    /// (and again every [`RELAY_REFRESH`]). `false`: we aren't one, or we
+    /// are full. The caller has checked the request came from `peer`
+    /// itself ([`Out::Control`]'s `via`).
+    ///
+    /// `known`: it is a device we know (a contact, someone in our chats).
+    /// When we are full, one of those takes the place of the stranger that
+    /// asked longest ago, so strangers filling every place don't keep the
+    /// people we know out.
+    pub fn relay_join(&mut self, peer: SignPk, known: bool, now: Time) -> bool {
+        if !self.relaying || !self.internet || !self.is_internet_hop(&peer) {
+            return false;
+        }
+        if !self.clients.contains_key(&peer) && self.clients.len() >= self.cfg.max_relay_clients {
+            let stranger = self
+                .clients
+                .iter()
+                .filter(|(_, (_, known))| !known)
+                .min_by_key(|(k, (t, _))| (*t, **k))
+                .map(|(k, _)| *k);
+            match stranger {
+                Some(out) if known => {
+                    self.clients.remove(&out);
+                }
+                _ => {
+                    self.stats.relay_refused += 1;
+                    return false;
+                }
+            }
+        }
+        self.clients.insert(peer, (now, known));
+        self.next_sweep = self.next_sweep.min(now + RELAY_CLIENT_TTL);
+        true
+    }
+
+    /// Devices we are the relay of.
+    pub fn relay_clients(&self) -> usize {
+        self.clients.len()
+    }
+
+    /// Whether we carry traffic between internet hops `a` and `b`: one of
+    /// them is our client.
+    fn relays_for(&self, a: &SignPk, b: &SignPk) -> bool {
+        self.relaying && (self.clients.contains_key(a) || self.clients.contains_key(b))
+    }
+
+    /// The relays we asked to carry traffic to us. Their hops are kept up
+    /// (dialed again, with the usual back-off, when they drop) and never
+    /// hung up as idle.
+    pub fn set_relays(&mut self, mut relays: Vec<SignPk>, now: Time) {
+        relays.retain(|r| *r != self.me);
+        relays.dedup();
+        if relays != self.my_relays {
+            self.my_relays = relays;
+            // hops to relays we dropped may go idle now
+            self.next_sweep = self.next_sweep.min(now + INTERNET_IDLE);
+        }
+    }
+
+    pub fn my_relays(&self) -> &[SignPk] {
+        &self.my_relays
+    }
+
+    /// Our relays with a hop up, each with the hop's cost: what our record
+    /// names.
+    pub fn relays_up(&self) -> Vec<(SignPk, u32)> {
+        self.my_relays.iter().filter_map(|r| self.nbs.get(r).filter(|n| n.up).map(|n| (*r, n.hop_cost()))).collect()
+    }
+
+    /// Dial the relays we have no hop to (unless one is being dialed, or
+    /// backing off after a failure).
+    fn keep_relays(&mut self, now: Time) {
+        if !self.internet {
+            return;
+        }
+        for i in 0..self.my_relays.len() {
+            let r = self.my_relays[i];
+            if self.nbs.get(&r).is_some_and(|n| n.up)
+                || self.dialing.contains_key(&r)
+                || self.backoff.get(&r).is_some_and(|(at, _)| now < *at)
+            {
+                continue;
+            }
+            self.dialing.insert(r, now);
+            self.next_sweep = self.next_sweep.min(now + DIAL_GIVE_UP);
+            self.stats.dials += 1;
+            self.out.push(Out::Dial(r));
         }
     }
 
@@ -2188,6 +2383,7 @@ impl Router {
         }
         self.publish(now);
         self.choose_gateways(now);
+        self.keep_relays(now);
     }
 
     /// Time-outs: half-assembled frames, parked frames, lookup answers,
@@ -2209,8 +2405,12 @@ impl Router {
         for pk in gave_up {
             self.dial_failed(pk, now);
         }
+        self.clients.retain(|_, (t, _)| now.saturating_sub(*t) < RELAY_CLIENT_TTL);
         for (pk, n) in self.nbs.iter_mut() {
-            if n.internet() && now.saturating_sub(n.last_used) >= INTERNET_IDLE {
+            // a relay's hop, or a client's, stays up unused: it is how
+            // traffic for the client gets in
+            let kept = self.my_relays.contains(pk) || self.clients.contains_key(pk);
+            if n.internet() && !kept && now.saturating_sub(n.last_used) >= INTERNET_IDLE {
                 n.last_used = now; // once; the driver reports the hop down
                 self.out.push(Out::Hangup(*pk));
             }
@@ -2240,7 +2440,13 @@ impl Router {
         next = self.distrusted.values().copied().fold(next, Time::min);
         next = self.suspects.values().flatten().map(|(_, t)| *t).fold(next, Time::min);
         next = self.backoff.values().map(|(at, _)| at + DIAL_BACKOFF_MAX).fold(next, Time::min);
-        next = self.nbs.values().filter(|n| n.internet()).map(|n| n.last_used + INTERNET_IDLE).fold(next, Time::min);
+        next = self.clients.values().map(|(t, _)| t + RELAY_CLIENT_TTL).fold(next, Time::min);
+        next = self
+            .nbs
+            .iter()
+            .filter(|(pk, n)| n.internet() && !self.my_relays.contains(pk) && !self.clients.contains_key(*pk))
+            .map(|(_, n)| n.last_used + INTERNET_IDLE)
+            .fold(next, Time::min);
         self.next_sweep = next;
     }
 

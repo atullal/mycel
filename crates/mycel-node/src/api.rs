@@ -23,7 +23,12 @@ pub struct Profile {
     pub id: PeerId,
     pub name: String,
     /// Shareable code: give it to someone so they can add you as a contact.
+    /// Short enough to paste and to scan as a QR code: it names this device,
+    /// and theirs fetches this device's keys the first time it reaches it.
     pub contact_code: String,
+    /// The same with this device's keys in it (about 1.8 kB of text): for
+    /// someone whose device can't reach this one first.
+    pub contact_code_full: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +40,11 @@ pub struct Contact {
     pub nearby: bool,
     /// We have an open/recent connection to them.
     pub online: bool,
+    /// Added from a short contact code, and this device hasn't reached
+    /// theirs yet to fetch its keys: they can't be put in a conversation
+    /// until it has.
+    #[serde(default)]
+    pub awaiting_keys: bool,
 }
 
 /// Someone advertising on the local network, not necessarily a contact.
@@ -102,6 +112,11 @@ pub struct Attachment {
     pub size: u64,
     /// Present once the blob is available locally.
     pub local_path: Option<String>,
+    /// Sent as a public file (`send_message`'s `publicAttachments`): the
+    /// same file is one file everywhere, and whoever has it can tell that
+    /// this device holds it (docs/TRUST.md §7c).
+    #[serde(default)]
+    pub public: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,6 +197,26 @@ pub struct NetworkStatus {
     pub links: Vec<LinkStatus>,
     /// How each reachable peer can be reached, and which path is in use.
     pub peers: Vec<PeerPaths>,
+    /// What this device does about relaying over the internet.
+    #[serde(default)]
+    pub relay: RelayInfo,
+}
+
+/// Relaying over the internet between devices that can't dial each other.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayInfo {
+    /// The internet can dial in to this device, and it relays for devices
+    /// that ask. Its IP address is then published under its key.
+    pub relaying: bool,
+    /// How many devices it is relaying for.
+    pub clients: u32,
+    /// The names of the devices that relay for this one (the internet
+    /// can't dial in to it, and no relay server is connected).
+    pub relays: Vec<String>,
+    /// Its connection is paid for by the byte (mobile data): it carries
+    /// nobody else's traffic over it.
+    pub metered: bool,
 }
 
 /// Paths to one peer.

@@ -149,8 +149,10 @@ pub async fn send_message(
     body: String,
     reply_to: Option<MessageId>,
     attachments: Option<Vec<String>>,
+    public_attachments: Option<Vec<String>>,
 ) -> Res<MessageView> {
-    rt.send_message(id, body, reply_to, attachments.unwrap_or_default()).await.map_err(err)
+    let (files, public) = (attachments.unwrap_or_default(), public_attachments.unwrap_or_default());
+    rt.send_message_with(id, body, reply_to, files, public).await.map_err(err)
 }
 
 #[tauri::command]

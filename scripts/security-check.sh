@@ -9,6 +9,8 @@ cargo test --locked --no-fail-fast \
   -p mycel-net -p mycel-node --lib
 cargo test --locked -p mycel-net --test blob_security
 cargo test --locked -p mycel-node --test attachment_security
+cargo test --locked -p mycel-node --test forward_secrecy
+cargo test --locked -p mycel-node --test contact_codes
 cargo test --locked -p mycel-host --lib
 npm run typecheck
 npm run build

@@ -55,6 +55,8 @@ export function Composer({
   const cameraInput = useRef<HTMLInputElement>(null);
   const [text, setText] = useState("");
   const [files, setFiles] = useState<string[]>([]);
+  /** The attached files to send as public files (the rest are private). */
+  const [publicFiles, setPublicFiles] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [staging, setStaging] = useState(0);
   const [error, setError] = useState<string | null>(null);
@@ -126,9 +128,11 @@ export function Composer({
       await mycel.chat.send(conversation.id, body, {
         replyTo: replyTo?.id,
         attachments: files,
+        publicAttachments: files.filter((f) => publicFiles.includes(f)),
       });
       setText("");
       setFiles([]);
+      setPublicFiles([]);
       onCancelReply();
       lastTyping.current = 0;
     } catch (e) {
@@ -257,7 +261,14 @@ export function Composer({
         <ul className="mx-pending" aria-label="Attachments">
           {!editing &&
             files.map((f) => (
-              <PendingFile key={f} path={f} sending={busy} onRemove={() => setFiles((all) => all.filter((x) => x !== f))} />
+              <PendingFile
+                key={f}
+                path={f}
+                sending={busy}
+                isPublic={publicFiles.includes(f)}
+                onTogglePublic={() => setPublicFiles((all) => (all.includes(f) ? all.filter((x) => x !== f) : [...all, f]))}
+                onRemove={() => setFiles((all) => all.filter((x) => x !== f))}
+              />
             ))}
           {staging > 0 && (
             <li className="is-staging">
@@ -318,7 +329,26 @@ export function Composer({
 }
 
 /** A file waiting to be sent; shows encryption progress while sending. */
-function PendingFile({ path, sending, onRemove }: { path: string; sending: boolean; onRemove: () => void }) {
+/** What sending a file as public or private means, for the toggle's tooltip. */
+export const FILE_MODE_HELP = {
+  private: "Private file: nobody outside this conversation can tell what it is. Click to send it as a public file.",
+  public:
+    "Public file: stored once however many people send it, and kept by other devices for as long as it is asked for. Anyone who has the same file can tell that you sent it. Click to send it as a private file.",
+} as const;
+
+function PendingFile({
+  path,
+  sending,
+  isPublic,
+  onTogglePublic,
+  onRemove,
+}: {
+  path: string;
+  sending: boolean;
+  isPublic: boolean;
+  onTogglePublic: () => void;
+  onRemove: () => void;
+}) {
   const progress = useTransfer(path);
   const name = fileNameFromPath(path);
   const pct = sending && progress && progress.total > 0 ? Math.min(100, Math.round((progress.done / progress.total) * 100)) : null;
@@ -338,9 +368,21 @@ function PendingFile({ path, sending, onRemove }: { path: string; sending: boole
           <span className="mx-pending-bar" style={{ width: `${pct}%` }} aria-hidden="true" />
         </>
       ) : (
-        <button onClick={onRemove} disabled={sending} aria-label={`Remove ${name}`}>
-          <Icon.X size={13} />
-        </button>
+        <>
+          <button
+            className={isPublic ? "mx-pending-mode is-on" : "mx-pending-mode"}
+            onClick={onTogglePublic}
+            disabled={sending}
+            aria-pressed={isPublic}
+            aria-label={`Send ${name} as a public file`}
+            title={isPublic ? FILE_MODE_HELP.public : FILE_MODE_HELP.private}
+          >
+            {isPublic ? "Public" : "Private"}
+          </button>
+          <button onClick={onRemove} disabled={sending} aria-label={`Remove ${name}`}>
+            <Icon.X size={13} />
+          </button>
+        </>
       )}
     </li>
   );

@@ -92,8 +92,8 @@ def sha(path):
 try:
     a, b = start("alice"), start("bob")
     pa, pb = call(a, "get_profile"), call(b, "get_profile")
-    call(a, "add_contact", {"code": pb["contactCode"]})
-    call(b, "add_contact", {"code": pa["contactCode"]})
+    call(a, "add_contact", {"code": pb["contactCodeFull"]})
+    call(b, "add_contact", {"code": pa["contactCodeFull"]})
     conv = call(a, "create_conversation", {"members": [pb["id"]]})
     cid = conv["id"]
     wait("bob has the conversation", lambda: any(c["id"] == cid for c in call(b, "list_conversations")), step=0.05)

@@ -69,11 +69,16 @@ recognise. On a desktop the window title shows it too.
   to start a chat.
 - **Contact codes.** On one device, **Profile > Your contact code**: copy it
   or show the QR code. On the other, **Contacts > Add by contact code**,
-  paste, **Add**. A contact code holds the person's keys and name, plus the
-  device's current network addresses (the part after `@`), so contact codes
-  work on networks that block discovery, as long as the two devices can
-  reach each other's address. If the address changes (a new network, a new
-  DHCP lease), discovery or a fresh code fixes it.
+  paste, **Add**. A contact code names the person's device and holds their
+  name, plus the device's current network addresses (the part after `@`),
+  so contact codes work on networks that block discovery, as long as the
+  two devices can reach each other's address. If the address changes (a new
+  network, a new DHCP lease), discovery or a fresh code fixes it. The code
+  doesn't hold the device's encryption key (it is too long to scan): your
+  device fetches it from theirs the first time the two connect, and you
+  can start a chat with them from then on. For someone whose device yours
+  can't reach first, `mycel id` also prints their *full* code, which is
+  longer and holds the key.
 
 **Message requests.** A chat started by someone who isn't your contact
 arrives as a request. Until you **Accept**, nothing is sent back: no
@@ -101,6 +106,12 @@ their future invites at the network layer) are the alternatives.
    when the other side clicks download, with a progress bar, from anyone in
    the chat who has them. An interrupted download resumes. A transfer is
    refused if it would leave less than 1 GiB of free disk.
+   Each attached file shows **Private** before you send it; click it to
+   send the file as **Public** instead. A public file is stored once however
+   many people send it and is kept by other devices for as long as it is
+   asked for, so something many people share stays available. In exchange,
+   anyone who has the same file can tell that you sent it. Leave anything
+   personal private.
 
 **Delete for everyone** removes your own message from the conversation as
 other devices sync (copies people saved elsewhere remain). **Delete for
@@ -323,6 +334,26 @@ MYCEL_DATA_DIR=/tmp/mycel-b MYCEL_NAME="Laptop B" MYCEL_NET=lan "$APP" &
   own.
 - `MYCEL_MESH=0`: no multi-hop mesh. `MYCEL_MESH_RELAY=0`: use the mesh but
   relay nothing for others.
+- `MYCEL_RELAYS`: the relay servers used on the internet. `n0` (the
+  default), `none`, or the addresses of your own, separated by commas.
+  Without a relay server a device is reached directly if the internet can
+  dial in to it, and otherwise through devices that relay for it.
+- `MYCEL_N0_DNS=0`: don't publish or look up addresses on n0's DNS server.
+  `MYCEL_DHT=0`: nor in the BitTorrent DHT. (With both off, devices find
+  each other only nearby and through contact codes.)
+- `MYCEL_INTERNET_RELAY=0`: don't relay over the internet for devices that
+  can't be dialed. A device does by default when it can be dialed itself;
+  its IP address is then published under its key.
+- `MYCEL_REACHABLE=1` or `0`: say whether the internet can dial in to this
+  device, instead of letting it find out. `MYCEL_METERED=1` or `0`: say
+  whether its connection is paid for by the byte (then it carries nobody
+  else's traffic), instead of going by the interface name.
+- `MYCEL_FILE_CACHE_MB`: disk space, in MiB, for holding other people's
+  files until they come for them (1024 by default; `0` holds none). Files
+  in your own conversations don't count against it.
+
+To run with no server at all, only other devices and the DHT:
+`MYCEL_RELAYS=none MYCEL_N0_DNS=0`.
 
 The CLI can also be a full device without the app: `mycel serve --data
 ~/.mycel-cli --name "Terminal" --net lan`, then open <http://127.0.0.1:7777>,

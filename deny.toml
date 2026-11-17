@@ -64,6 +64,13 @@ ignore = [
   # Neither runs in the shipped binaries. No maintained drop-in release yet.
   { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: build-time only, via glib-macros 0.18 (Tauri, Linux)" },
   { id = "RUSTSEC-2024-0436", reason = "paste: build-time only, via netlink-packet-core (Iroh netwatch, Linux/Android)" },
+  # An "unmaintained" notice, not a vulnerability. Windows only: chrono is
+  # a default feature of wmi 0.18, which netwatch (Iroh's network monitor)
+  # uses there. wmi 0.18.4 is its latest release, and netwatch 0.20 still
+  # asks for wmi with chrono (crates.io, 2026-11-17). No code in this
+  # repository uses chrono (grep, 2026-11-17).
+  # Review by 2027-01-31, or when wmi or netwatch has a release without it.
+  { id = "RUSTSEC-2026-0543", reason = "chrono: a default feature of wmi 0.18, via netwatch (Iroh's network monitor) on Windows; no release of either without it" },
 ]
 
 [licenses]

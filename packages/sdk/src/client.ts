@@ -60,6 +60,13 @@ export interface SendOptions {
   replyTo?: MessageId;
   /** Local file paths to attach (e.g. from `mycel.files.pick()`). */
   attachments?: string[];
+  /**
+   * Those of `attachments` to send as public files. A public file is the
+   * same file wherever it is sent: stored and downloaded once, and kept
+   * available by everyone who has it. In exchange, anyone who has the file
+   * can tell that this device sent or holds it. Everything else is private.
+   */
+  publicAttachments?: string[];
 }
 
 /** The typed Mycel client. One method per runtime command (docs/RUNTIME_API.md). */
@@ -294,6 +301,7 @@ export function createMycel(transport: Transport): Mycel {
         const args: ArgsOf<"send_message"> = { id, body };
         if (opts.replyTo != null) args.replyTo = opts.replyTo;
         if (opts.attachments?.length) args.attachments = opts.attachments;
+        if (opts.publicAttachments?.length) args.publicAttachments = opts.publicAttachments;
         return call("send_message", args);
       },
       edit: (id, message, body) => call("edit_message", { id, message, body }).then(done),

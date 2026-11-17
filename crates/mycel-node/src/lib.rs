@@ -28,6 +28,7 @@ pub use mycel_video as video;
 pub use mycel_net::{NetMode, Node, NodeOptions};
 pub use mycel_trust::Role;
 pub use runtime::{
-    Runtime, RuntimeOptions, chat_rules_hash, decode_contact_code, decode_contact_code_with_hints, encode_contact_code,
-    encode_contact_code_with_hints,
+    ContactCode, ContactStub, Runtime, RuntimeOptions, chat_rules_hash, decode_contact_code,
+    decode_contact_code_with_hints, encode_contact_code, encode_contact_code_with_hints, encode_short_contact_code,
+    parse_contact_code,
 };

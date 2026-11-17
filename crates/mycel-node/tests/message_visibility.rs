@@ -50,7 +50,7 @@ async fn local_deletion_persists_and_author_deletion_clears_all_content_on_three
     for a in [&alice, &bob, &carol] {
         for b in [&alice, &bob, &carol] {
             if a.profile().id != b.profile().id {
-                a.add_contact(b.profile().contact_code).unwrap();
+                a.add_contact(b.profile().contact_code_full).unwrap();
             }
         }
     }

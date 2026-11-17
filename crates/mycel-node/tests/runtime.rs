@@ -53,8 +53,8 @@ async fn direct_chat_creation_reuses_peer_identity_across_concurrent_calls_and_r
     let mut alice = open(&da, "Alice", 0, false).await;
     let bob = open(&db, "Same display name", 0, false).await;
     let charlie = open(&dc, "Same display name", 0, false).await;
-    let b = alice.add_contact(bob.profile().contact_code).unwrap();
-    let c = alice.add_contact(charlie.profile().contact_code).unwrap();
+    let b = alice.add_contact(bob.profile().contact_code_full).unwrap();
+    let c = alice.add_contact(charlie.profile().contact_code_full).unwrap();
 
     let conversations = std::thread::scope(|scope| {
         let barrier = Arc::new(std::sync::Barrier::new(16));
@@ -116,7 +116,7 @@ async fn messaging_end_to_end() {
     let mut bob_events = bob.subscribe();
 
     // exchange contact codes
-    let bob_contact = alice.add_contact(bob.profile().contact_code).unwrap();
+    let bob_contact = alice.add_contact(bob.profile().contact_code_full).unwrap();
     assert_eq!(bob_contact.name, "Bob");
     assert!(alice.add_contact("garbage".into()).is_err());
 
@@ -231,8 +231,8 @@ async fn keeper_delivers_while_sender_is_offline() {
     let keeper = open(&dk, "Keeper", 0, true).await;
     connect_all(&[&alice, &bob, &keeper]);
 
-    let b = alice.add_contact(bob.profile().contact_code).unwrap();
-    let k = alice.add_contact(keeper.profile().contact_code).unwrap();
+    let b = alice.add_contact(bob.profile().contact_code_full).unwrap();
+    let k = alice.add_contact(keeper.profile().contact_code_full).unwrap();
     let conv = alice.create_conversation(Some("Team".into()), vec![b.id.clone()]).unwrap();
     alice.add_keeper(conv.id.clone(), k.id.clone()).unwrap();
     eventually("bob joined", || bob.conversations().len() == 1).await;
@@ -271,8 +271,8 @@ async fn group_admin_removes_member() {
     let bob = open(&dirs[1], "Bob", 0, false).await;
     let carol = open(&dirs[2], "Carol", 0, false).await;
     connect_all(&[&alice, &bob, &carol]);
-    let b = alice.add_contact(bob.profile().contact_code).unwrap();
-    let c = alice.add_contact(carol.profile().contact_code).unwrap();
+    let b = alice.add_contact(bob.profile().contact_code_full).unwrap();
+    let c = alice.add_contact(carol.profile().contact_code_full).unwrap();
     let conv = alice.create_conversation(Some("Trio".into()), vec![b.id.clone(), c.id.clone()]).unwrap();
     eventually("all joined", || bob.conversations().len() == 1 && carol.conversations().len() == 1).await;
     bob.accept_request(conv.id.clone()).unwrap();
@@ -314,7 +314,7 @@ async fn declined_and_blocked_strangers_stay_out() {
     let victim = open(&dv, "Victim", 0, false).await;
     connect_all(&[&mallory, &victim]);
     // Mallory only needs the victim's public card (e.g. from the LAN).
-    let v = mallory.add_contact(victim.profile().contact_code).unwrap();
+    let v = mallory.add_contact(victim.profile().contact_code_full).unwrap();
     let c1 = mallory.create_conversation(None, vec![v.id.clone()]).unwrap();
     mallory.send_message(c1.id.clone(), "click my file".into(), None, vec![]).await.unwrap();
     eventually("request arrives", || victim.conversations().iter().any(|c| c.request)).await;
@@ -347,7 +347,7 @@ async fn contact_code_address_hints_connect_without_discovery() {
     // Local mode: no mDNS, and we deliberately don't call connect_all.
     let alice = open(&tmp("ha"), "Alice", 0, false).await;
     let bob = open(&tmp("hb"), "Bob", 0, false).await;
-    let code = bob.profile().contact_code;
+    let code = bob.profile().contact_code_full;
     assert!(code.contains('@'), "code carries address hints: {code}");
     let b = alice.add_contact(code).unwrap();
     let conv = alice.create_conversation(None, vec![b.id.clone()]).unwrap();
@@ -364,7 +364,7 @@ async fn dm_pair(tag: &str) -> (Arc<Runtime>, Arc<Runtime>, String) {
     let alice = open(&tmp(tag), "Alice", 0, false).await;
     let bob = open(&tmp(tag), "Bob", 0, false).await;
     connect_all(&[&alice, &bob]);
-    let b = alice.add_contact(bob.profile().contact_code).unwrap();
+    let b = alice.add_contact(bob.profile().contact_code_full).unwrap();
     let conv = alice.create_conversation(None, vec![b.id]).unwrap();
     eventually("bob joined", || bob.conversations().len() == 1).await;
     bob.accept_request(conv.id.clone()).unwrap();
@@ -591,7 +591,7 @@ async fn voice_call_between_runtimes() {
 
     // Alice has Bob's code, Bob doesn't have hers: on Bob's side this is a
     // message request, so her call is refused and nothing rings.
-    let bob_contact = alice.add_contact(bob.profile().contact_code).unwrap();
+    let bob_contact = alice.add_contact(bob.profile().contact_code_full).unwrap();
     let conv = alice.create_conversation(None, vec![bob_contact.id.clone()]).unwrap();
     eventually("bob gets the request", || bob.conversations().iter().any(|c| c.id == conv.id && c.request)).await;
     assert!(bob.start_call(conv.id.clone()).await.is_err(), "can't call from an unaccepted request");
@@ -689,8 +689,8 @@ async fn group_call_between_runtimes() {
     for (rt, a) in [&alice, &bob, &carol].iter().zip(&audio) {
         rt.calls().set_audio(a.clone() as Arc<dyn AudioIo>);
     }
-    let b = alice.add_contact(bob.profile().contact_code).unwrap();
-    let c = alice.add_contact(carol.profile().contact_code).unwrap();
+    let b = alice.add_contact(bob.profile().contact_code_full).unwrap();
+    let c = alice.add_contact(carol.profile().contact_code_full).unwrap();
     let conv = alice.create_conversation(Some("Trio".into()), vec![b.id.clone(), c.id.clone()]).unwrap();
     eventually("all joined", || bob.conversations().len() == 1 && carol.conversations().len() == 1).await;
     bob.accept_request(conv.id.clone()).unwrap();

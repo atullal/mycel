@@ -2,7 +2,9 @@
 //!
 //! Thin, opinionated wrappers over vetted crates. No custom cryptography:
 //! - Ed25519 signatures (`ed25519-dalek`, strict verification)
-//! - HPKE RFC 9180 lockboxes: DHKEM(X25519, HKDF-SHA256) + HKDF-SHA256 + ChaCha20-Poly1305
+//! - HPKE (RFC 9180) lockboxes with the X-Wing hybrid KEM (X25519 + ML-KEM-768),
+//!   HKDF-SHA256 and ChaCha20-Poly1305: a lockbox stays sealed unless both
+//!   X25519 and ML-KEM-768 are broken
 //! - XChaCha20-Poly1305 content encryption
 //! - BLAKE3 for ids and key commitments
 //! - Chunked streaming XChaCha20-Poly1305 (STREAM) for attachments of any size
@@ -10,7 +12,9 @@
 //! Every signature / hash / HPKE `info` is domain-separated with a context string.
 
 use std::fmt;
+use std::sync::Arc;
 
+pub mod chunked;
 pub mod stream;
 pub use stream::{
     STREAM_CHUNK, STREAM_HEADER_LEN, STREAM_MAGIC, StreamOpener, StreamSealer, is_stream, open_stream, seal_stream,
@@ -24,11 +28,28 @@ use chacha20poly1305::{
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use hpke::{Deserializable, Kem as _, OpModeR, OpModeS, Serializable};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+/// A buffer that is wiped when dropped, for callers that hold key material
+/// outside the types here.
+pub use zeroize::Zeroizing;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-type HpkeKem = hpke::kem::X25519HkdfSha256;
+type HpkeKem = hpke::kem::XWing;
 type HpkeKdf = hpke::kdf::HkdfSha256;
 type HpkeAead = hpke::aead::ChaCha20Poly1305;
+
+/// Length of a lockbox public key ([`KexPk`]): an X-Wing encapsulation key
+/// (ML-KEM-768's 1184 bytes, then X25519's 32).
+pub const KEX_PK_LEN: usize = 1216;
+/// Length of a lockbox's encapsulated key ([`Lockbox::enc`]): an X-Wing
+/// ciphertext (ML-KEM-768's 1088 bytes, then X25519's 32).
+pub const LOCKBOX_ENC_LEN: usize = 1120;
+/// What a lockbox adds to its plaintext: the encapsulated key and the AEAD tag.
+pub const LOCKBOX_OVERHEAD: usize = LOCKBOX_ENC_LEN + 16;
+
+/// Bound into every lockbox's HPKE `info`, before the caller's own. It names
+/// the suite, so a lockbox made for another one (the X25519-only lockboxes
+/// of earlier builds) never opens as this one.
+const LOCKBOX_SUITE: &str = "mycel/v1/lockbox/xwing-hkdfsha256-chacha20poly1305";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CryptoError {
@@ -38,6 +59,8 @@ pub enum CryptoError {
     BadPublicKey,
     #[error("decryption failed")]
     Decrypt,
+    #[error("lockbox was sealed with a key agreement this build doesn't support (made by an older build?)")]
+    UnsupportedLockbox,
     #[error("encryption failed")]
     Encrypt,
     #[error("os randomness unavailable")]
@@ -165,9 +188,42 @@ impl<'de> Deserialize<'de> for Sig {
     }
 }
 
-/// X25519 public key used for HPKE lockboxes.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct KexPk(pub [u8; 32]);
+/// The public key lockboxes are sealed to: an X-Wing (X25519 + ML-KEM-768)
+/// encapsulation key, [`KEX_PK_LEN`] bytes. Shared, so copies are cheap.
+///
+/// Decoding checks the length only. [`KexPk::validate`] checks that X-Wing
+/// accepts the key; [`MemberKeys::verify_binding`] runs it, so a key that
+/// passed there can always be sealed to.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct KexPk(Arc<[u8; KEX_PK_LEN]>);
+
+impl KexPk {
+    /// A well-formed key from its bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        let key = Self::from_len_checked(bytes).ok_or(CryptoError::BadPublicKey)?;
+        key.validate()?;
+        Ok(key)
+    }
+
+    fn from_len_checked(bytes: &[u8]) -> Option<Self> {
+        let arr: [u8; KEX_PK_LEN] = bytes.try_into().ok()?;
+        Some(KexPk(Arc::new(arr)))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; KEX_PK_LEN] {
+        &self.0
+    }
+
+    /// Is this a key X-Wing can encapsulate to? (ML-KEM requires a canonical
+    /// encoding; any 32 bytes are an X25519 key.)
+    pub fn validate(&self) -> Result<()> {
+        self.parse().map(|_| ())
+    }
+
+    fn parse(&self) -> Result<<HpkeKem as hpke::Kem>::PublicKey> {
+        <HpkeKem as hpke::Kem>::PublicKey::from_bytes(&self.0[..]).map_err(|_| CryptoError::BadPublicKey)
+    }
+}
 
 impl fmt::Debug for KexPk {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -175,20 +231,124 @@ impl fmt::Debug for KexPk {
     }
 }
 
+impl Serialize for KexPk {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_bytes(&self.0[..])
+    }
+}
+
+impl<'de> Deserialize<'de> for KexPk {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        struct Bytes;
+        impl<'de> serde::de::Visitor<'de> for Bytes {
+            type Value = KexPk;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "a {KEX_PK_LEN}-byte lockbox key")
+            }
+
+            fn visit_bytes<E: serde::de::Error>(self, v: &[u8]) -> std::result::Result<KexPk, E> {
+                // The 32-byte X25519 keys of earlier builds end here.
+                KexPk::from_len_checked(v).ok_or_else(|| E::invalid_length(v.len(), &self))
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> std::result::Result<KexPk, A::Error> {
+                let mut bytes = Vec::with_capacity(KEX_PK_LEN);
+                while let Some(b) = seq.next_element::<u8>()? {
+                    if bytes.len() == KEX_PK_LEN {
+                        return Err(serde::de::Error::invalid_length(KEX_PK_LEN + 1, &self));
+                    }
+                    bytes.push(b);
+                }
+                self.visit_bytes(&bytes)
+            }
+        }
+        d.deserialize_bytes(Bytes)
+    }
+}
+
 /// Public identity of a member device, with a self-signature binding the kex key
 /// to the signing key (TRUST.md §3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MemberKeys {
     pub sign_pk: SignPk,
     pub kex_pk: KexPk,
     pub kex_sig: Sig,
 }
 
-const CTX_KEX_BINDING: &str = "mycel/v0/kex-binding";
+/// Not the context earlier builds signed their X25519 keys under.
+const CTX_KEX_BINDING: &str = "mycel/v1/kex-binding";
 
 impl MemberKeys {
+    /// The device key signed this kex key, and the kex key is one lockboxes
+    /// can be sealed to.
     pub fn verify_binding(&self) -> Result<()> {
-        self.sign_pk.verify(CTX_KEX_BINDING, &[&self.kex_pk.0], &self.kex_sig)
+        self.sign_pk.verify(CTX_KEX_BINDING, &[self.kex_pk.as_bytes()], &self.kex_sig)?;
+        self.kex_pk.validate()
+    }
+}
+
+/// A lockbox keypair: X-Wing, which keeps its private key as a 32-byte seed.
+#[derive(Clone)]
+pub struct KexSecret {
+    /// (zeroizes itself on drop)
+    sk: <HpkeKem as hpke::Kem>::PrivateKey,
+    pk: KexPk,
+}
+
+impl KexSecret {
+    /// The keypair X-Wing expands from `seed`.
+    pub fn from_seed(seed: &[u8; 32]) -> Self {
+        let sk = <HpkeKem as hpke::Kem>::PrivateKey::from_bytes(seed).expect("an X-Wing private key is 32 bytes");
+        let pk = HpkeKem::sk_to_pk(&sk);
+        let pk = KexPk::from_len_checked(&pk.to_bytes()).expect("an X-Wing public key is KEX_PK_LEN bytes");
+        KexSecret { sk, pk }
+    }
+
+    /// A fresh random keypair, derived from nothing: a reader key
+    /// (TRUST.md §6), which its owner can delete.
+    pub fn generate() -> Self {
+        let mut seed: [u8; 32] = random();
+        let key = Self::from_seed(&seed);
+        seed.zeroize();
+        key
+    }
+
+    /// The seed, for the owner's own sealed storage. Handle with care.
+    pub fn seed(&self) -> [u8; 32] {
+        let mut seed = [0u8; 32];
+        seed.copy_from_slice(&self.sk.to_bytes());
+        seed
+    }
+
+    pub fn public(&self) -> &KexPk {
+        &self.pk
+    }
+
+    /// Open a lockbox sealed to this key with the same `info`.
+    pub fn open_lockbox(&self, info: &[u8], lockbox: &Lockbox) -> Result<Vec<u8>> {
+        // What an X25519 lockbox of an earlier build looks like: say so,
+        // rather than "decryption failed".
+        if lockbox.enc.len() != LOCKBOX_ENC_LEN {
+            return Err(CryptoError::UnsupportedLockbox);
+        }
+        let encapped =
+            <HpkeKem as hpke::Kem>::EncappedKey::from_bytes(&lockbox.enc).map_err(|_| CryptoError::Decrypt)?;
+        hpke::single_shot_open::<HpkeAead, HpkeKdf, HpkeKem>(
+            &OpModeR::Base,
+            &self.sk,
+            &encapped,
+            &lockbox_info(info),
+            &lockbox.ct,
+            b"",
+        )
+        .map_err(|_| CryptoError::Decrypt)
+    }
+}
+
+impl fmt::Debug for KexSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "KexSecret({:?})", self.pk)
     }
 }
 
@@ -200,7 +360,7 @@ pub struct DeviceKeys {
     #[zeroize(skip)]
     sign: SigningKey,
     #[zeroize(skip)]
-    kex_sk: <HpkeKem as hpke::Kem>::PrivateKey,
+    kex: KexSecret,
     #[zeroize(skip)]
     public: MemberKeys,
 }
@@ -212,12 +372,14 @@ impl DeviceKeys {
 
     pub fn from_seed(seed: [u8; 32]) -> Self {
         let sign = SigningKey::from_bytes(&seed);
-        let kex_ikm = blake3::derive_key("mycel/v0/kex-seed", &seed);
-        let (kex_sk, kex_pk) = HpkeKem::derive_keypair(&kex_ikm);
-        let kex_pk = KexPk(kex_pk.to_bytes().as_slice().try_into().expect("x25519 pk is 32 bytes"));
+        // Not the label earlier builds derived their X25519 key under.
+        let mut kex_seed = blake3::derive_key("mycel/v1/kex-seed/xwing", &seed);
+        let kex = KexSecret::from_seed(&kex_seed);
+        kex_seed.zeroize();
+        let kex_pk = kex.public().clone();
         let sign_pk = SignPk(sign.verifying_key().to_bytes());
-        let kex_sig = Sig(sign.sign(&framed(CTX_KEX_BINDING, &[&kex_pk.0])).to_bytes());
-        DeviceKeys { seed, sign, kex_sk, public: MemberKeys { sign_pk, kex_pk, kex_sig } }
+        let kex_sig = Sig(sign.sign(&framed(CTX_KEX_BINDING, &[kex_pk.as_bytes()])).to_bytes());
+        DeviceKeys { seed, sign, kex, public: MemberKeys { sign_pk, kex_pk, kex_sig } }
     }
 
     /// The seed, for persisting in the OS keychain. Handle with care.
@@ -226,7 +388,7 @@ impl DeviceKeys {
     }
 
     pub fn public(&self) -> MemberKeys {
-        self.public
+        self.public.clone()
     }
 
     pub fn sign_pk(&self) -> SignPk {
@@ -237,18 +399,36 @@ impl DeviceKeys {
         Sig(self.sign.sign(&framed(ctx, msg)).to_bytes())
     }
 
+    /// Open a lockbox sealed to this device's own kex key (the one in
+    /// [`DeviceKeys::public`]).
     pub fn open_lockbox(&self, info: &[u8], lockbox: &Lockbox) -> Result<Vec<u8>> {
-        let encapped =
-            <HpkeKem as hpke::Kem>::EncappedKey::from_bytes(&lockbox.enc).map_err(|_| CryptoError::Decrypt)?;
-        hpke::single_shot_open::<HpkeAead, HpkeKdf, HpkeKem>(
-            &OpModeR::Base,
-            &self.kex_sk,
-            &encapped,
-            info,
-            &lockbox.ct,
-            b"",
-        )
-        .map_err(|_| CryptoError::Decrypt)
+        self.kex.open_lockbox(info, lockbox)
+    }
+
+    /// The key this device seals its own stored secrets of kind `purpose`
+    /// with: derived from the seed, so what is stored is useless without it.
+    fn storage_key(&self, purpose: &str) -> SymKey {
+        let mut h = blake3::Hasher::new_derive_key("mycel/v1/storage-key");
+        h.update(&self.seed);
+        h.update(&framed(purpose, &[]));
+        SymKey(*h.finalize().as_bytes())
+    }
+
+    /// Seal `plaintext` for this device's own storage: a random nonce, then
+    /// XChaCha20-Poly1305 under a key derived from the seed for `purpose`.
+    /// `aad` binds it to where it is kept (which space, which record).
+    pub fn seal_stored(&self, purpose: &str, aad: &[u8], plaintext: &[u8]) -> Result<Vec<u8>> {
+        let nonce: [u8; 24] = random();
+        let mut out = nonce.to_vec();
+        out.extend_from_slice(&self.storage_key(purpose).seal(&nonce, aad, plaintext)?);
+        Ok(out)
+    }
+
+    /// Open what [`DeviceKeys::seal_stored`] made, with the same `purpose`
+    /// and `aad`.
+    pub fn open_stored(&self, purpose: &str, aad: &[u8], sealed: &[u8]) -> Result<Vec<u8>> {
+        let (nonce, ct) = sealed.split_first_chunk::<24>().ok_or(CryptoError::Decrypt)?;
+        self.storage_key(purpose).open(nonce, aad, ct)
     }
 }
 
@@ -257,14 +437,21 @@ impl DeviceKeys {
 /// An HPKE-sealed secret addressed to one recipient's kex key.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lockbox {
+    /// The X-Wing encapsulated key: [`LOCKBOX_ENC_LEN`] bytes.
     pub enc: Vec<u8>,
     pub ct: Vec<u8>,
 }
 
+/// A lockbox's HPKE `info`: the suite, then the caller's context.
+fn lockbox_info(info: &[u8]) -> Vec<u8> {
+    framed(LOCKBOX_SUITE, &[info])
+}
+
 pub fn seal_lockbox(recipient: &KexPk, info: &[u8], plaintext: &[u8]) -> Result<Lockbox> {
-    let pk = <HpkeKem as hpke::Kem>::PublicKey::from_bytes(&recipient.0).map_err(|_| CryptoError::BadPublicKey)?;
-    let (enc, ct) = hpke::single_shot_seal::<HpkeAead, HpkeKdf, HpkeKem>(&OpModeS::Base, &pk, info, plaintext, b"")
-        .map_err(|_| CryptoError::Encrypt)?;
+    let pk = recipient.parse()?;
+    let (enc, ct) =
+        hpke::single_shot_seal::<HpkeAead, HpkeKdf, HpkeKem>(&OpModeS::Base, &pk, &lockbox_info(info), plaintext, b"")
+            .map_err(|_| CryptoError::Encrypt)?;
     Ok(Lockbox { enc: enc.to_bytes().to_vec(), ct })
 }
 
@@ -343,8 +530,179 @@ mod tests {
         let eve = DeviceKeys::generate();
         let lb = seal_lockbox(&bob.public().kex_pk, b"ctx-1", b"secret").unwrap();
         assert_eq!(bob.open_lockbox(b"ctx-1", &lb).unwrap(), b"secret");
-        assert!(bob.open_lockbox(b"ctx-2", &lb).is_err(), "info is bound");
-        assert!(eve.open_lockbox(b"ctx-1", &lb).is_err(), "wrong recipient");
+        assert_eq!(bob.open_lockbox(b"ctx-2", &lb), Err(CryptoError::Decrypt), "info is bound");
+        assert_eq!(eve.open_lockbox(b"ctx-1", &lb), Err(CryptoError::Decrypt), "wrong recipient");
+    }
+
+    /// The hybrid's sizes: what a member's key and each lockbox cost.
+    #[test]
+    fn lockbox_and_key_sizes() {
+        let bob = DeviceKeys::generate();
+        assert_eq!(bob.public().kex_pk.as_bytes().len(), KEX_PK_LEN);
+        assert_eq!(KEX_PK_LEN, 1216);
+        let lb = seal_lockbox(&bob.public().kex_pk, b"ctx", &[7u8; 32]).unwrap();
+        assert_eq!(lb.enc.len(), LOCKBOX_ENC_LEN);
+        assert_eq!(LOCKBOX_ENC_LEN, 1120);
+        assert_eq!(lb.enc.len() + lb.ct.len(), 32 + LOCKBOX_OVERHEAD);
+        // on the wire: two length prefixes more
+        assert_eq!(postcard::to_allocvec(&lb).unwrap().len(), 32 + LOCKBOX_OVERHEAD + 3);
+        assert_eq!(postcard::to_allocvec(&bob.public()).unwrap().len(), 32 + (2 + KEX_PK_LEN) + (1 + 64));
+    }
+
+    #[test]
+    fn a_tampered_lockbox_does_not_open() {
+        let bob = DeviceKeys::generate();
+        let lb = seal_lockbox(&bob.public().kex_pk, b"ctx", b"secret").unwrap();
+        // the ML-KEM part, the X25519 part and the ciphertext
+        for at in [0, 500, LOCKBOX_ENC_LEN - 1] {
+            let mut bad = lb.clone();
+            bad.enc[at] ^= 1;
+            assert_eq!(bob.open_lockbox(b"ctx", &bad), Err(CryptoError::Decrypt), "enc byte {at}");
+        }
+        for at in 0..lb.ct.len() {
+            let mut bad = lb.clone();
+            bad.ct[at] ^= 1;
+            assert_eq!(bob.open_lockbox(b"ctx", &bad), Err(CryptoError::Decrypt), "ct byte {at}");
+        }
+        let mut short = lb.clone();
+        short.ct.pop();
+        assert_eq!(bob.open_lockbox(b"ctx", &short), Err(CryptoError::Decrypt));
+    }
+
+    /// Two seals of the same secret to the same key share nothing.
+    #[test]
+    fn lockboxes_are_randomized() {
+        let bob = DeviceKeys::generate();
+        let a = seal_lockbox(&bob.public().kex_pk, b"ctx", b"secret").unwrap();
+        let b = seal_lockbox(&bob.public().kex_pk, b"ctx", b"secret").unwrap();
+        assert_ne!(a.enc, b.enc);
+        assert_ne!(a.ct, b.ct);
+    }
+
+    /// The kex key is derived from the seed alone, the same way on every
+    /// run and platform: pinned, so a change of derivation (which would
+    /// orphan every lockbox sealed to existing devices) can't go unnoticed.
+    #[test]
+    fn kex_key_derivation_is_pinned() {
+        let d = DeviceKeys::from_seed([7; 32]);
+        let pk = d.public().kex_pk;
+        assert_eq!(pk, DeviceKeys::from_seed([7; 32]).public().kex_pk);
+        assert_ne!(pk, DeviceKeys::from_seed([8; 32]).public().kex_pk);
+        assert_eq!(
+            Hash32::digest("mycel/test/kex-pk", pk.as_bytes()).to_string(),
+            "67cb120f66df5322a730c379b300eb84233173ac2995aa51b5e2800d5fcfb528",
+            "the kex key derived from a seed changed"
+        );
+        // and the private half matches the public one
+        let lb = seal_lockbox(&pk, b"ctx", b"secret").unwrap();
+        assert_eq!(DeviceKeys::from_seed([7; 32]).open_lockbox(b"ctx", &lb).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn kex_secret_from_its_seed() {
+        let seed = random();
+        let a = KexSecret::from_seed(&seed);
+        assert_eq!(a.public(), KexSecret::from_seed(&seed).public());
+        assert!(a.public().validate().is_ok());
+        let lb = seal_lockbox(a.public(), b"ctx", b"secret").unwrap();
+        assert_eq!(KexSecret::from_seed(&seed).open_lockbox(b"ctx", &lb).unwrap(), b"secret");
+        assert_eq!(KexSecret::from_seed(&random()).open_lockbox(b"ctx", &lb), Err(CryptoError::Decrypt));
+        assert!(!format!("{a:?}").contains(&hex::encode(seed)), "Debug never prints the secret");
+    }
+
+    /// A reader key is random: nothing a device's seed gives opens what was
+    /// sealed to it, and its seed round-trips for sealed storage.
+    #[test]
+    fn a_generated_kex_secret_is_not_derived_from_the_device() {
+        let device = DeviceKeys::generate();
+        let (a, b) = (KexSecret::generate(), KexSecret::generate());
+        assert_ne!(a.public(), b.public());
+        assert_ne!(a.public(), &device.public().kex_pk);
+        let lb = seal_lockbox(a.public(), b"ctx", b"secret").unwrap();
+        assert_eq!(device.open_lockbox(b"ctx", &lb), Err(CryptoError::Decrypt));
+        assert_eq!(DeviceKeys::from_seed(device.seed()).open_lockbox(b"ctx", &lb), Err(CryptoError::Decrypt));
+        assert_eq!(KexSecret::from_seed(&a.seed()).open_lockbox(b"ctx", &lb).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn stored_secrets_are_sealed_to_the_seed_purpose_and_place() {
+        let d = DeviceKeys::generate();
+        let sealed = d.seal_stored("space-secrets", b"space-1", b"reader keys").unwrap();
+        assert_eq!(sealed.len(), 24 + b"reader keys".len() + 16);
+        assert_eq!(d.open_stored("space-secrets", b"space-1", &sealed).unwrap(), b"reader keys");
+        // the same device after a restart
+        let again = DeviceKeys::from_seed(d.seed());
+        assert_eq!(again.open_stored("space-secrets", b"space-1", &sealed).unwrap(), b"reader keys");
+        // another place, another purpose, another device, a changed byte, a short record
+        assert_eq!(d.open_stored("space-secrets", b"space-2", &sealed), Err(CryptoError::Decrypt));
+        assert_eq!(d.open_stored("other", b"space-1", &sealed), Err(CryptoError::Decrypt));
+        assert_eq!(DeviceKeys::generate().open_stored("space-secrets", b"space-1", &sealed), Err(CryptoError::Decrypt));
+        for at in [0, 23, 24, sealed.len() - 1] {
+            let mut bad = sealed.clone();
+            bad[at] ^= 1;
+            assert_eq!(d.open_stored("space-secrets", b"space-1", &bad), Err(CryptoError::Decrypt), "byte {at}");
+        }
+        assert_eq!(d.open_stored("space-secrets", b"space-1", &sealed[..10]), Err(CryptoError::Decrypt));
+        // sealed twice: nothing in common (a fresh nonce each time)
+        assert_ne!(sealed, d.seal_stored("space-secrets", b"space-1", b"reader keys").unwrap());
+    }
+
+    /// What earlier builds made (X25519 keys and lockboxes) is refused, with
+    /// an error that says why, and never opens.
+    #[test]
+    fn the_x25519_format_of_earlier_builds_is_refused() {
+        let bob = DeviceKeys::generate();
+        // a 32-byte kex key: not a key
+        assert_eq!(KexPk::from_bytes(&[9u8; 32]), Err(CryptoError::BadPublicKey));
+        let old_key = postcard::to_allocvec(&[9u8; 32]).unwrap();
+        assert!(postcard::from_bytes::<KexPk>(&old_key).is_err());
+        // old member keys (32 + 32 + 64 bytes, no length prefixes) don't decode
+        let old_member = [[1u8; 32].as_slice(), &[2u8; 32], &[3u8; 64]].concat();
+        assert!(postcard::from_bytes::<MemberKeys>(&old_member).is_err());
+        // a lockbox with a 32-byte encapsulated key: named as unsupported
+        let old = Lockbox { enc: vec![1; 32], ct: vec![2; 48] };
+        assert_eq!(bob.open_lockbox(b"ctx", &old), Err(CryptoError::UnsupportedLockbox));
+        assert_eq!(
+            bob.open_lockbox(b"ctx", &Lockbox { enc: vec![], ct: vec![] }),
+            Err(CryptoError::UnsupportedLockbox)
+        );
+    }
+
+    #[test]
+    fn kex_keys_are_length_checked_on_decode_and_validated_before_use() {
+        let bob = DeviceKeys::generate().public();
+        // round trips: postcard (bytes) and JSON (a sequence)
+        let bytes = postcard::to_allocvec(&bob).unwrap();
+        assert_eq!(postcard::from_bytes::<MemberKeys>(&bytes).unwrap(), bob);
+        let json = serde_json::to_string(&bob.kex_pk).unwrap();
+        assert_eq!(serde_json::from_str::<KexPk>(&json).unwrap(), bob.kex_pk);
+        // one byte short or long: refused
+        for len in [KEX_PK_LEN - 1, KEX_PK_LEN + 1] {
+            let wrong = postcard::to_allocvec(&serde_bytes_of(&vec![0u8; len])).unwrap();
+            assert!(postcard::from_bytes::<KexPk>(&wrong).is_err(), "{len} bytes");
+            assert_eq!(KexPk::from_bytes(&vec![0u8; len]), Err(CryptoError::BadPublicKey));
+        }
+        // the right length but not an ML-KEM key (coefficients out of range):
+        // decodes, and is refused wherever it would be used
+        let junk = postcard::to_allocvec(&serde_bytes_of(&vec![0xffu8; KEX_PK_LEN])).unwrap();
+        let junk: KexPk = postcard::from_bytes(&junk).unwrap();
+        assert_eq!(junk.validate(), Err(CryptoError::BadPublicKey));
+        assert_eq!(KexPk::from_bytes(&[0xff; KEX_PK_LEN]), Err(CryptoError::BadPublicKey));
+        assert_eq!(seal_lockbox(&junk, b"ctx", b"secret"), Err(CryptoError::BadPublicKey));
+        let mut forged = bob.clone();
+        forged.kex_pk = junk;
+        assert!(forged.verify_binding().is_err());
+    }
+
+    /// Bytes as serde's byte-string type (what `KexPk` encodes as).
+    fn serde_bytes_of(v: &[u8]) -> impl Serialize + '_ {
+        struct B<'a>(&'a [u8]);
+        impl Serialize for B<'_> {
+            fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+                s.serialize_bytes(self.0)
+            }
+        }
+        B(v)
     }
 
     #[test]

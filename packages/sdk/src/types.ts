@@ -14,8 +14,17 @@ export type MessageId = string;
 export interface Profile {
   id: PeerId;
   name: string;
-  /** Shareable code: give it to someone so they can add you as a contact. */
+  /**
+   * Shareable code: give it to someone so they can add you as a contact.
+   * Short enough to paste and to show as a QR code: it names this device,
+   * and theirs fetches this device's keys the first time it reaches it.
+   */
   contactCode: string;
+  /**
+   * The same with this device's keys in it (about 1.8 kB): for someone
+   * whose device can't reach this one first. Absent in the mock.
+   */
+  contactCodeFull?: string;
 }
 
 export interface Contact {
@@ -25,6 +34,12 @@ export interface Contact {
   nearby: boolean;
   /** We have an open/recent connection to them. */
   online: boolean;
+  /**
+   * Added from a short contact code, and this device hasn't reached theirs
+   * yet to fetch its keys: they can't be put in a conversation until it
+   * has (a `contactsChanged` event follows).
+   */
+  awaitingKeys?: boolean;
 }
 
 /** Someone advertising on the local network, not necessarily a contact. */
@@ -83,6 +98,8 @@ export interface Attachment {
   size: number;
   /** Present once the blob is available locally. */
   localPath: string | null;
+  /** Sent as a public file (`SendOptions.publicAttachments`). */
+  public?: boolean;
 }
 
 export interface Reaction {
@@ -206,6 +223,23 @@ export interface NetworkStatus {
   addresses: string[];
   links: LinkStatus[];
   peers: PeerPaths[];
+  /** What this device does about relaying over the internet. */
+  relay?: RelayInfo;
+}
+
+/** Relaying over the internet between devices that can't dial each other. */
+export interface RelayInfo {
+  /**
+   * The internet can dial in to this device, and it relays for devices that
+   * ask. Its IP address is then published under its key.
+   */
+  relaying: boolean;
+  /** How many devices it is relaying for. */
+  clients: number;
+  /** The names of the devices that relay for this one. */
+  relays: string[];
+  /** On mobile data: it carries nobody else's traffic. */
+  metered: boolean;
 }
 
 // ---------------------------------------------------------------------------

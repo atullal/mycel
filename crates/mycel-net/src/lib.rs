@@ -26,6 +26,7 @@
 //! ```
 
 mod blobs;
+pub mod chunks;
 pub mod emu;
 pub mod link;
 pub mod mesh;
@@ -33,6 +34,7 @@ pub mod mesh;
 mod native_mdns;
 mod pool;
 mod resources;
+mod services;
 pub mod wire;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -62,7 +64,8 @@ use tokio::sync::{Notify, Semaphore, broadcast, mpsc};
 pub use blobs::{EAGER_PUSH_MAX, MIN_FREE_SPACE, Progress, blob_digest, ensure_free_space, free_space, human_size};
 pub use iroh;
 pub use link::{Link, LinkEvent, LinkStatus, PathKind, path_in_use};
-pub use mesh::{Mesh, MeshOptions, MeshRoute, MeshStats, Tap};
+pub use mesh::{Mesh, MeshOptions, MeshRoute, MeshStats, RelayStatus, Tap};
+pub use services::{Relays, Services, is_mobile_data};
 use wire::*;
 pub use wire::{ContactCard, MAX_EPHEMERAL};
 
@@ -139,6 +142,9 @@ pub struct NodeOptions {
     pub extra_protocols: Vec<ExtraProtocol>,
     /// Multi-hop relaying through nearby devices (`mesh.rs`); `None` = off.
     pub mesh: Option<MeshOptions>,
+    /// The outside services used on the internet (relay servers, n0's DNS
+    /// server, the DHT): see [`Services`].
+    pub services: Services,
     /// The largest ephemeral payload sent or taken ([`MAX_EPHEMERAL`] by
     /// default; at most [`wire::MAX_FRAME`] less overhead). A device drops
     /// bigger ones unread, so an app that needs more raises it on every
@@ -172,6 +178,7 @@ impl NodeOptions {
             ip: true,
             extra_protocols: Vec::new(),
             mesh: None,
+            services: Services::default(),
             max_ephemeral: MAX_EPHEMERAL,
         }
     }
@@ -267,6 +274,8 @@ struct Inner {
     link_addrs: Mutex<HashMap<SignPk, HashSet<link::CustomAddr>>>,
     links: Vec<Arc<dyn Link>>,
     mesh: Option<Mesh>,
+    /// The record directory on the internet (it knows about the DHT).
+    pkarr: Option<Arc<mesh::directory::PkarrDirectory>>,
     endpoint: Endpoint,
     /// Spaces needing a push to all members; `None` key = everything (periodic).
     dirty: Mutex<HashSet<SpaceId>>,
@@ -288,6 +297,8 @@ struct Inner {
     /// the rest (`resources.rs`).
     member_frames: resources::Frames,
     stranger_frames: resources::Frames,
+    /// Chunked files (`chunks`): the device-wide store and its policies.
+    chunks: Option<chunks::Chunks>,
 }
 
 /// How many QUIC connections (handshakes) a node has made.
@@ -703,6 +714,7 @@ async fn serve_bi(
         StreamKind::Sync => serve_sync(inner, conn, peer, tx, rx).await,
         StreamKind::Card => serve_card(inner, tx).await,
         StreamKind::Blob => blobs::serve(inner, peer, tx, rx).await,
+        StreamKind::Chunk => chunks::serve(inner, peer, tx, rx).await,
         StreamKind::Ephemeral => bail!("ephemeral messages use uni-streams"),
     }
 }
@@ -1026,7 +1038,14 @@ async fn scheduler(inner: Arc<Inner>) {
         let mut dirty = explicit.clone();
         if periodic {
             last_full = Instant::now();
-            dirty.extend(inner.spaces.lock().keys().copied());
+            let mut spaces = inner.spaces.lock();
+            for r in spaces.values_mut() {
+                // Reader keys due for replacing or deleting (a no-op for a
+                // replica without a key policy). What it authors goes out
+                // with this round.
+                r.key_upkeep();
+            }
+            dirty.extend(spaces.keys().copied());
         }
         let me = inner.keys.sign_pk();
         let targets: Vec<(SignPk, SpaceId)> = {
@@ -1172,7 +1191,7 @@ impl Node {
             NetMode::Lan => Endpoint::builder(presets::Minimal)
                 .relay_mode(iroh::RelayMode::Disabled)
                 .bind_addr(format!("0.0.0.0:{}", opts.port).as_str())?,
-            NetMode::Internet => Endpoint::builder(presets::N0),
+            NetMode::Internet => services::internet_builder(&opts.services)?,
         };
         let mut builder = builder
             .secret_key(secret)
@@ -1195,14 +1214,16 @@ impl Node {
         endpoint.address_lookup()?.add(memory.clone());
         let link_lookup = MemoryLookup::new();
         endpoint.address_lookup()?.add(link_lookup.clone());
+        // Records: where each device says how to reach it. A test's
+        // directory, or on the internet the DHT and n0's DNS server.
+        let given = opts.mesh.as_ref().and_then(|o| o.directory.clone());
+        let records = services::records(&endpoint, &keys, opts.mode, &opts.services, given);
         if let Some(m) = &mesh {
-            // devices beyond our mesh: through gateways (theirs or ours)
+            // devices beyond our mesh: through gateways or relays
             endpoint.address_lookup()?.add(m.address_lookup());
-            if opts.mode == NetMode::Internet && opts.mesh.as_ref().is_some_and(|o| o.directory.is_none()) {
-                match mesh::directory::PkarrDirectory::new(&endpoint, true) {
-                    Ok(d) => m.set_directory(Arc::new(Arc::new(d))),
-                    Err(e) => eprintln!("[mycel] no record directory: {e:#}"),
-                }
+            if let Some(r) = &records {
+                m.set_directory(r.dir.clone());
+                m.set_own_record(r.own.clone());
             }
         }
         // LAN discovery (`_mycel._udp`): iroh's mDNS sends its own multicast,
@@ -1238,6 +1259,7 @@ impl Node {
         };
         let (events, _) = broadcast::channel(1024);
         let pool = Pool::new(endpoint.clone());
+        let chunks = chunks::Chunks::open(opts.blob_dir.as_deref());
         let inner = Arc::new(Inner {
             keys,
             mode: opts.mode,
@@ -1257,6 +1279,7 @@ impl Node {
             link_addrs: Mutex::default(),
             links,
             mesh: mesh.clone(),
+            pkarr: records.as_ref().and_then(|r| r.pkarr.clone()),
             endpoint: endpoint.clone(),
             dirty: Mutex::default(),
             wake: Notify::new(),
@@ -1269,6 +1292,7 @@ impl Node {
             max_ephemeral: opts.max_ephemeral.min(wire::MAX_FRAME - wire::max_ephemeral_frame(0)),
             member_frames: resources::Frames::members(),
             stranger_frames: resources::Frames::strangers(),
+            chunks,
         });
         let mut router = Router::builder(endpoint).accept(ALPN, Handler { inner: inner.clone() });
         for p in opts.extra_protocols {
@@ -1299,6 +1323,12 @@ impl Node {
         }
         if let Some(mdns) = mdns {
             tasks.push(tokio::spawn(watch_mdns(inner.clone(), mdns)));
+        }
+        if let Some(r) = records {
+            tasks.push(tokio::spawn(r.own.run()));
+            if let (Some(pkarr), Some(m)) = (r.pkarr, &inner.mesh) {
+                tasks.push(tokio::spawn(services::watch(pkarr, m.clone(), inner.endpoint.clone())));
+            }
         }
         if let Some(m) = &inner.mesh {
             let (tx, mut rx) = mpsc::unbounded_channel::<(SignPk, bytes::Bytes)>();
@@ -1382,6 +1412,39 @@ impl Node {
     /// The mesh router, if this node relays.
     pub fn mesh(&self) -> Option<&Mesh> {
         self.inner.mesh.as_ref()
+    }
+
+    /// DHT nodes this device knows now (`ip:port`): keep them for
+    /// [`Services::dht_nodes`] on the next start, so joining the DHT then
+    /// doesn't depend on its well-known bootstrap hosts. Empty without the
+    /// DHT.
+    pub async fn dht_nodes(&self) -> Vec<String> {
+        match &self.inner.pkarr {
+            Some(p) => p.dht_nodes().await,
+            None => Vec::new(),
+        }
+    }
+
+    /// Where holders of files are announced and looked up on the internet:
+    /// the DHT node this device already runs for its records. `None` when
+    /// the DHT is switched off or this isn't the internet mode.
+    #[cfg(feature = "dht")]
+    pub fn dht_holders(&self) -> Option<chunks::DhtHolders> {
+        Some(chunks::DhtHolders::with(self.inner.pkarr.as_ref()?.dht()?))
+    }
+
+    /// What the DHT tells this device about itself; `None` without it.
+    pub async fn dht_status(&self) -> Option<mesh::directory::DhtStatus> {
+        self.inner.pkarr.as_ref()?.dht_status().await
+    }
+
+    /// `peer`'s record as the directory on the internet has it now (our own
+    /// too): where to dial it, whether it relays, which devices relay for
+    /// it. `None`: no record, or no directory. For diagnostics and tests.
+    pub async fn published_record(&self, peer: SignPk) -> Option<mesh::directory::Record> {
+        use mesh::directory::Directory;
+        let record = self.inner.pkarr.as_ref()?.get(peer).await?;
+        mesh::directory::read(&record, Some(&peer))
     }
 
     /// Health of each link (peer-to-peer Wi-Fi, Bluetooth, each kind of
@@ -1515,17 +1578,26 @@ impl Node {
 
     /// Fetch a device's self-signed contact card (anyone may ask).
     pub async fn fetch_card(&self, peer: SignPk) -> Result<ContactCard> {
-        let inner = &self.inner;
-        let card: ContactCard = on_conn!(inner, &peer, |conn| async {
-            let (mut tx, mut rx) = open_bi(&conn, StreamKind::Card).await?;
-            tx.finish()?;
-            recv_small(&mut rx, resources::REPLY_TIMEOUT, &inner.reply_frames(&peer)).await
-        })?;
-        card.verify()?;
-        if card.keys.sign_pk != peer {
-            bail!("card does not belong to peer");
+        self.card_fetch(peer).await
+    }
+
+    /// [`Node::fetch_card`] as a future that doesn't borrow the node, for a
+    /// task that must not keep the node's owner alive while it waits.
+    pub fn card_fetch(&self, peer: SignPk) -> impl Future<Output = Result<ContactCard>> + Send + 'static {
+        let inner = self.inner.clone();
+        async move {
+            let inner = &inner;
+            let card: ContactCard = on_conn!(inner, &peer, |conn| async {
+                let (mut tx, mut rx) = open_bi(&conn, StreamKind::Card).await?;
+                tx.finish()?;
+                recv_small(&mut rx, resources::REPLY_TIMEOUT, &inner.reply_frames(&peer)).await
+            })?;
+            card.verify()?;
+            if card.keys.sign_pk != peer {
+                bail!("card does not belong to peer");
+            }
+            Ok(card)
         }
-        Ok(card)
     }
 
     /// Fire-and-forget an encrypted ephemeral message to online members.

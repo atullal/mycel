@@ -32,6 +32,8 @@ pub enum StreamKind {
     Ephemeral = 3,
     /// Bi-stream: one blob request (see `blobs.rs`).
     Blob = 4,
+    /// Bi-stream: one request for a node of a chunked file (see `chunks`).
+    Chunk = 5,
 }
 
 impl StreamKind {
@@ -41,6 +43,7 @@ impl StreamKind {
             2 => StreamKind::Card,
             3 => StreamKind::Ephemeral,
             4 => StreamKind::Blob,
+            5 => StreamKind::Chunk,
             _ => return None,
         })
     }
@@ -49,7 +52,7 @@ impl StreamKind {
     /// messages, cards and presence ahead of bulk file bytes.
     pub fn priority(self) -> i32 {
         match self {
-            StreamKind::Blob => -1,
+            StreamKind::Blob | StreamKind::Chunk => -1,
             _ => 1,
         }
     }
@@ -156,6 +159,17 @@ pub(crate) async fn recv_small<T: DeserializeOwned>(
     frames: &PeerFrames,
 ) -> Result<T> {
     Ok(recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, MAX_SMALL_FRAME, frames).await?.0)
+}
+
+/// [`recv_held`] for a message of at most `max` bytes (chunk requests list
+/// up to a few hundred ids): a bigger declared length is refused outright.
+pub(crate) async fn recv_capped<T: DeserializeOwned>(
+    r: &mut RecvStream,
+    wait: Duration,
+    frames: &PeerFrames,
+    max: usize,
+) -> Result<T> {
+    Ok(recv_frame(r, wait, crate::resources::IDLE_TIMEOUT, max, frames).await?.0)
 }
 
 /// An ephemeral message of up to `max_plain` bytes: sizes are checked

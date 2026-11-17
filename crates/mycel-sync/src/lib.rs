@@ -23,6 +23,9 @@ mod bounded_change;
 mod change_ops;
 mod change_resources;
 mod doc_index;
+mod keys;
+
+pub use keys::{Clock, KeyPolicy};
 
 pub type EnvelopeId = Hash32;
 
@@ -206,6 +209,16 @@ pub trait FeedValidator: Send + Sync {
 pub trait Store: Send + Sync {
     fn put_op(&self, space: &SpaceId, op: &SignedOp);
     fn put_envelope(&self, space: &SpaceId, env: &Envelope);
+    /// Keep the replica's own secrets for `space` (its reader keys and the
+    /// epoch keys it has opened), replacing what was kept before. `sealed`
+    /// is already encrypted under a key derived from the device's seed
+    /// ([`Replica::sealed_secrets`]): store it as it is, and hand it back to
+    /// [`Replica::restore_with_secrets`] at the next start.
+    ///
+    /// `durable`: return only once it can't be lost. The replica publishes
+    /// a reader key only after that, because what others then seal to it
+    /// can be opened with nothing else. An error means "not stored".
+    fn put_secrets(&self, space: &SpaceId, sealed: Vec<u8>, durable: bool) -> std::result::Result<(), String>;
 }
 
 /// What a batch ingest changed.
@@ -484,6 +497,8 @@ pub struct Replica {
     doc_inputs: HashMap<StreamId, DocInputs>,
     /// Envelopes whose status is Pending (re-checked when new inputs arrive).
     pending: HashSet<EnvelopeId>,
+    /// This device's reader keys and key schedule (`keys.rs`).
+    keys: keys::KeyState,
     #[cfg(test)]
     stats: std::cell::Cell<DocStats>,
 }
@@ -501,10 +516,9 @@ impl Replica {
     /// Found a new Space.
     pub fn create(me: Arc<DeviceKeys>, store: Option<Arc<dyn Store>>) -> Result<(Self, SignedOp)> {
         let (graph, genesis, epoch, key) = SpaceGraph::create(&me)?;
-        let mut ring = Keyring::default();
-        ring.insert(epoch, key);
-        let r = Self::from_parts(me, graph, ring, store);
+        let mut r = Self::from_parts(me, graph, Keyring::default(), store);
         r.persist_op(&genesis);
+        r.hold_epoch_key(epoch, key);
         Ok((r, genesis))
     }
 
@@ -512,12 +526,14 @@ impl Replica {
     pub fn join(me: Arc<DeviceKeys>, genesis: SignedOp, store: Option<Arc<dyn Store>>) -> Result<Self> {
         let graph = SpaceGraph::from_genesis(genesis.clone())?;
         let mut r = Self::from_parts(me, graph, Keyring::default(), store);
-        r.graph.unlock(&r.me, &mut r.ring);
         r.persist_op(&genesis);
+        r.unlock();
         Ok(r)
     }
 
-    /// Rebuild a replica from stored inputs (nothing is re-persisted).
+    /// Rebuild a replica from stored inputs (nothing is re-persisted). Only
+    /// for a replica that never published reader keys: one that did needs
+    /// its secrets back ([`Replica::restore_with_secrets`]).
     pub fn restore(
         me: Arc<DeviceKeys>,
         genesis: SignedOp,
@@ -525,12 +541,37 @@ impl Replica {
         envelopes: Vec<Envelope>,
         store: Option<Arc<dyn Store>>,
     ) -> Result<Self> {
+        Self::restore_with_secrets(me, genesis, ops, envelopes, None, store)
+    }
+
+    /// Rebuild a replica from stored inputs and from the secrets the store
+    /// kept for it ([`Store::put_secrets`]): its reader keys, and the epoch
+    /// keys it had opened, which the ops alone no longer give once a reader
+    /// key has been deleted. Ops and envelopes aren't re-persisted.
+    pub fn restore_with_secrets(
+        me: Arc<DeviceKeys>,
+        genesis: SignedOp,
+        ops: Vec<SignedOp>,
+        envelopes: Vec<Envelope>,
+        secrets: Option<&[u8]>,
+        store: Option<Arc<dyn Store>>,
+    ) -> Result<Self> {
         let graph = SpaceGraph::from_genesis(genesis)?;
         let mut r = Self::from_parts(me, graph, Keyring::default(), None);
+        if let Some(sealed) = secrets {
+            r.load_secrets(sealed);
+        }
+        let kept = r.ring.len();
+        let ops = parents_first(r.space_id(), ops);
         r.ingest_batch(ops, envelopes);
-        r.graph.unlock(&r.me, &mut r.ring);
+        r.unlock();
         r.full_refresh();
         r.store = store;
+        if r.ring.len() != kept {
+            // Opened from the ops again (what was stored was behind, or
+            // absent): keep it this time.
+            let _ = r.save_secrets(false);
+        }
         Ok(r)
     }
 
@@ -553,6 +594,7 @@ impl Replica {
             doc_rejected: HashSet::new(),
             doc_inputs: HashMap::new(),
             pending: HashSet::new(),
+            keys: Default::default(),
             #[cfg(test)]
             stats: Default::default(),
         }
@@ -614,7 +656,7 @@ impl Replica {
 
     /// Current members.
     pub fn members(&self) -> Vec<(MemberKeys, Role)> {
-        self.graph.state().members.values().map(|m| (m.keys, m.role)).collect()
+        self.graph.state().members.values().map(|m| (m.keys.clone(), m.role)).collect()
     }
 
     // ───────────── network-facing ─────────────
@@ -681,8 +723,10 @@ impl Replica {
             self.persist_op(&op.clone());
         }
         if new {
-            self.graph.unlock(&self.me, &mut self.ring);
+            self.unlock();
             self.full_refresh();
+            // (we may have just become a reader, or lost what we could open)
+            self.key_upkeep();
         }
         Ok(new)
     }
@@ -748,8 +792,9 @@ impl Replica {
         }
         out.envelopes = new_envs.len();
         if out.ops > 0 {
-            self.graph.unlock(&self.me, &mut self.ring);
+            self.unlock();
             self.full_refresh();
+            self.key_upkeep();
         } else if !new_envs.is_empty() {
             self.incremental(&new_envs);
         }
@@ -1259,15 +1304,25 @@ impl Replica {
 
     /// Ensure there's a usable epoch for writing (rotating if needed).
     fn write_epoch(&mut self) -> Result<(Vec<SignedOp>, EpochId)> {
-        match self.graph.state().write_epoch() {
-            Some(e) if self.ring.get(&e).is_some() => Ok((vec![], e)),
-            _ => {
-                // TRUST.md §6: no usable epoch → rotate first (needs Writer).
-                let (op, epoch, key) = self.graph.rotate(&self.me)?;
-                self.ring.insert(epoch, key);
+        // Our own reader key first, if it is due: a rotation seals to it.
+        let mut ops: Vec<SignedOp> = self.key_upkeep().into_iter().collect();
+        let usable = self.graph.state().write_epoch().filter(|e| self.ring.get(e).is_some());
+        if let Some(e) = usable
+            && !self.should_rotate(&e)
+        {
+            return Ok((ops, e));
+        }
+        // TRUST.md §6: no usable epoch → rotate first (needs Writer). Also
+        // when the usable one is old, or closed to a reader (`keys.rs`).
+        match self.graph.rotate(&self.me) {
+            Ok((op, epoch, key)) => {
+                self.hold_epoch_key(epoch, key);
                 self.ingest_op(op.clone())?;
-                Ok((vec![op], epoch))
+                ops.push(op);
+                Ok((ops, epoch))
             }
+            // Leaving a usable epoch is a choice: failing to isn't an error.
+            Err(e) => usable.map(|epoch| (ops, epoch)).ok_or(e.into()),
         }
     }
 
@@ -1464,7 +1519,7 @@ impl Replica {
     pub fn remove_member(&mut self, member: SignPk) -> Result<SignedOp> {
         let cutoff = self.latest_from(&member);
         let (op, epoch, key) = self.graph.remove_member(&self.me, member, cutoff)?;
-        self.ring.insert(epoch, key);
+        self.hold_epoch_key(epoch, key);
         self.ingest_op(op.clone())?;
         Ok(op)
     }
@@ -1480,7 +1535,7 @@ impl Replica {
         let cutoff = self.latest_from(&member);
         let (op, new_key) = self.graph.set_role(&self.me, member, role, cutoff)?;
         if let Some((epoch, key)) = new_key {
-            self.ring.insert(epoch, key);
+            self.hold_epoch_key(epoch, key);
         }
         self.ingest_op(op.clone())?;
         Ok(op)
@@ -1507,6 +1562,58 @@ impl Replica {
     pub fn open_ephemeral(&self, epoch: &EpochId, nonce: &[u8; 24], aad: &[u8], ct: &[u8]) -> Option<Vec<u8>> {
         self.ring.get(epoch)?.open(nonce, aad, ct).ok()
     }
+}
+
+/// Stored ops in an order the graph takes in one pass: every op after its
+/// parents. A store hands them back in no particular order, and the graph
+/// refuses an op whose author no op has added yet (the op that added it is
+/// in its causal past, so it now comes first) and parks only a bounded
+/// number behind missing parents. Ops with a parent that isn't here go last.
+fn parents_first(genesis: OpId, ops: Vec<SignedOp>) -> Vec<SignedOp> {
+    let mut index: HashMap<OpId, usize> = HashMap::with_capacity(ops.len());
+    let mut ops: Vec<Option<SignedOp>> = ops
+        .into_iter()
+        .filter_map(|op| {
+            // (the genesis is already in the graph, and a duplicate adds nothing)
+            let id = op.id();
+            let fresh = id != genesis && !index.contains_key(&id);
+            fresh.then(|| {
+                index.insert(id, index.len());
+                Some(op)
+            })
+        })
+        .collect();
+    // Parents still to come, per op; `None`: one of them isn't here at all.
+    let mut waiting: Vec<Option<usize>> = vec![Some(0); ops.len()];
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); ops.len()];
+    for (i, op) in ops.iter().enumerate() {
+        let parents = op.as_ref().map(|op| op.op.parents.as_slice()).unwrap_or_default();
+        for parent in parents.iter().filter(|p| **p != genesis) {
+            match index.get(parent) {
+                Some(&p) => {
+                    children[p].push(i);
+                    waiting[i] = waiting[i].map(|n| n + 1);
+                }
+                None => waiting[i] = None,
+            }
+        }
+    }
+    let mut ready: VecDeque<usize> = (0..ops.len()).filter(|&i| waiting[i] == Some(0)).collect();
+    let mut out = Vec::with_capacity(ops.len());
+    while let Some(i) = ready.pop_front() {
+        out.extend(ops[i].take());
+        for &c in &children[i] {
+            if let Some(n) = &mut waiting[c] {
+                *n -= 1;
+                if *n == 0 {
+                    ready.push_back(c);
+                }
+            }
+        }
+    }
+    // What is left waits on an op that isn't here: last, as stored.
+    out.extend(ops.into_iter().flatten());
+    out
 }
 
 /// Split one local change into consecutive changes within the write limits.
@@ -1572,5 +1679,7 @@ fn split_change(change: &Change) -> Result<Vec<Change>> {
     Ok(parts)
 }
 
+#[cfg(test)]
+mod keys_tests;
 #[cfg(test)]
 mod tests;

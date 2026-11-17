@@ -38,6 +38,12 @@
 //! talk end to end: BLE hops → gateway → the internet → gateway → BLE hops,
 //! one QUIC connection, several gateways as several paths.
 //!
+//! **Relays** (`relay.rs`): a device the internet can reach relays between
+//! devices that can't reach each other, for those that ask; a device behind
+//! a router names its relays in its record the way a Bluetooth-only device
+//! names its gateways. With that, reaching a device over the internet needs
+//! no relay server.
+//!
 //! A direct path always beats the mesh: a device with a direct link to C
 //! gets no mesh addresses for C, and the mesh refuses to carry packets to a
 //! neighbour. That also guarantees hop connections never run over the mesh
@@ -46,6 +52,8 @@
 pub mod core;
 pub mod directory;
 pub mod dtn;
+pub mod records;
+mod relay;
 #[cfg(test)]
 mod tests;
 mod watch;
@@ -71,6 +79,7 @@ use tokio::sync::mpsc;
 
 pub use self::core::Stats as MeshStats;
 use self::core::{Config, Out, Router, Time};
+pub use self::relay::RelayStatus;
 use self::wire::{MIN_QUIC_MTU, T_DATA, T_OGM, T_OGMS, T_SEQREQ};
 pub use self::wire::{mesh_addr, parse_mesh_addr};
 use crate::link::{
@@ -146,8 +155,23 @@ pub struct MeshOptions {
     /// Without the internet: how many gateways to publish in our record.
     pub gateways: usize,
     /// Whether this device reaches the internet; `None`: it does while
-    /// connected to its home relay.
+    /// connected to its home relay, or while the node says so
+    /// ([`Mesh::set_online`]).
     pub internet: Option<bool>,
+    /// While the internet can reach this device: relay between devices
+    /// that can't reach each other, for those that ask (`relay.rs`).
+    pub internet_relay: bool,
+    /// Bytes per second relayed between two internet hops.
+    pub internet_relay_rate: u64,
+    /// While the internet can't dial in to this device and no relay server
+    /// is connected: how many devices to ask to be its relay (0: none).
+    pub relays: usize,
+    /// Whether the internet can dial in to this device; `None`: as the
+    /// node finds out ([`Mesh::set_reachable`]).
+    pub reachable: Option<bool>,
+    /// Whether the uplink is metered (then nobody else's traffic goes over
+    /// it); `None`: as the node finds out ([`Mesh::set_metered`]).
+    pub metered: Option<bool>,
     /// Where reachability records are published and looked up (see
     /// [`directory`]); the node sets the real one ([`Mesh::set_directory`]).
     pub directory: Option<Arc<dyn directory::Directory>>,
@@ -176,6 +200,11 @@ impl Default for MeshOptions {
             gateway_rate: c.gateway_rate,
             gateways: c.gateways,
             internet: None,
+            internet_relay: c.internet_relay,
+            internet_relay_rate: c.internet_relay_rate,
+            relays: 2,
+            reachable: None,
+            metered: None,
             directory: None,
             store_and_forward: Some(dtn::DtnConfig::default()),
             max_neighbours: 6,
@@ -195,6 +224,8 @@ impl MeshOptions {
             gateway: self.gateway,
             gateway_rate: self.gateway_rate,
             gateways: self.gateways,
+            internet_relay: self.internet_relay,
+            internet_relay_rate: self.internet_relay_rate,
             seed: mycel_crypto::random_u64(),
             ..Config::default()
         }
@@ -502,6 +533,15 @@ struct Driver {
     watched: Mutex<HashSet<usize>>,
     /// Tests: relay nothing to or from this device (a black hole).
     black_hole: Mutex<Option<SignPk>>,
+    /// Relays among devices (`relay.rs`).
+    relays: Mutex<relay::Relays>,
+    /// What the node found out: the internet can dial in to us, our uplink
+    /// is metered, we are online (with no relay server to tell by).
+    reachable: AtomicBool,
+    metered: AtomicBool,
+    online: AtomicBool,
+    /// Our own record, told our role.
+    own: Mutex<Option<Arc<records::OwnRecord>>>,
 }
 
 /// A bundle being handed to a neighbour; ending lets the next one start.
@@ -595,7 +635,7 @@ impl Driver {
                 Out::Deliver { src, waypoint, payload } => {
                     let _ = self.inbox.try_send((payload, mesh_addr(&src, &waypoint)));
                 }
-                Out::Control { from, payload } => self.on_control(from, payload),
+                Out::Control { from, via, payload } => self.on_control(from, via, payload),
                 Out::Dial(peer) => self.dial_internet(peer),
                 Out::Hangup(peer) => {
                     if let Some(c) = self.conn(&peer) {
@@ -971,9 +1011,11 @@ impl Driver {
         self.directory.lock().clone()
     }
 
-    /// A control message for us: a record to publish, as a gateway.
-    fn on_control(self: &Arc<Self>, _from: SignPk, payload: Bytes) {
+    /// A control message for us: a record to publish, as a gateway, or one
+    /// between a relay and its client.
+    fn on_control(self: &Arc<Self>, from: SignPk, via: Option<SignPk>, payload: Bytes) {
         if payload.first() != Some(&CTRL_REACH) {
+            self.on_relay_control(from, via, &payload);
             return;
         }
         let record = payload.slice(1..);
@@ -1354,10 +1396,13 @@ impl Driver {
     fn internet_now(&self) -> bool {
         match self.opts.internet {
             Some(on) => on,
-            None => self.endpoint.get().is_some_and(|ep| {
-                use n0_watcher::Watcher;
-                ep.home_relay_status().get().iter().any(|s| s.is_connected())
-            }),
+            None => {
+                self.online.load(Ordering::Relaxed)
+                    || self.endpoint.get().is_some_and(|ep| {
+                        use n0_watcher::Watcher;
+                        ep.home_relay_status().get().iter().any(|s| s.is_connected())
+                    })
+            }
         }
     }
 }
@@ -1396,6 +1441,7 @@ async fn run(d: Arc<Driver>) {
             next_slow = Instant::now() + Duration::from_millis(250);
             d.dial_missing();
             d.measure();
+            d.relay_tick();
         }
         let soon = d.dtn_due.load(Ordering::Relaxed) && last_dtn.elapsed() >= DTN_SOON;
         if soon || Instant::now() >= next_dtn {
@@ -1435,6 +1481,7 @@ impl Mesh {
         });
         let mut router = Router::new(me, opts.config());
         router.set_internet(opts.internet.unwrap_or(false));
+        let metered = opts.metered.unwrap_or(false);
         let d = Arc::new(Driver {
             me,
             keys,
@@ -1463,6 +1510,11 @@ impl Mesh {
             frames: crate::resources::Frames::neighbours(),
             watched: Mutex::default(),
             black_hole: Mutex::default(),
+            relays: Mutex::default(),
+            reachable: AtomicBool::new(false),
+            metered: AtomicBool::new(metered),
+            online: AtomicBool::new(false),
+            own: Mutex::default(),
         });
         Mesh { d }
     }
@@ -1552,6 +1604,44 @@ impl Mesh {
     /// Whether the mesh currently thinks we reach the internet.
     pub fn has_internet(&self) -> bool {
         self.d.router.lock().internet()
+    }
+
+    /// Devices that may relay for us when the internet can't dial in to
+    /// us: contacts, the people in our chats, keepers. The first are
+    /// preferred. Each is asked only if its own record says it relays.
+    pub fn set_relay_candidates(&self, candidates: Vec<SignPk>) {
+        self.d.relays.lock().set_candidates(candidates);
+    }
+
+    /// Whether the internet can dial in to this device (a public address,
+    /// a forwarded port). Ignored if [`MeshOptions::reachable`] is set.
+    pub fn set_reachable(&self, on: bool) {
+        self.d.reachable.store(on, Ordering::Relaxed);
+    }
+
+    /// Whether the uplink is metered. Ignored if [`MeshOptions::metered`]
+    /// is set.
+    pub fn set_metered(&self, on: bool) {
+        if self.d.opts.metered.is_none() {
+            self.d.metered.store(on, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether this device is online, when there is no relay server to
+    /// tell by.
+    pub fn set_online(&self, on: bool) {
+        self.d.online.store(on, Ordering::Relaxed);
+    }
+
+    /// Our own record: told whether we are a relay, or behind which relays.
+    pub fn set_own_record(&self, own: Arc<records::OwnRecord>) {
+        *self.d.own.lock() = Some(own);
+    }
+
+    /// Whether this device relays, for how many, and through which relays
+    /// it is reached.
+    pub fn relay_status(&self) -> RelayStatus {
+        self.d.relay_status()
     }
 
     /// Records this device published for others, as a gateway.
