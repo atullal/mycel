@@ -235,6 +235,8 @@ jobs:
           fi
           keychain="$RUNNER_TEMP/mycel-signing.keychain-db"
           password="$(openssl rand -hex 24)"
+          # Publish the cleanup path before any keychain setup can fail.
+          echo "keychain=$keychain" >> "$GITHUB_OUTPUT"
           security create-keychain -p "$password" "$keychain"
           security set-keychain-settings -lut 7200 "$keychain"
           security unlock-keychain -p "$password" "$keychain"
@@ -251,7 +253,6 @@ jobs:
             echo "MYCEL_SIGN_IDENTITY=$identity"
             echo "MYCEL_SIGN_KEYCHAIN=$keychain"
           } >> "$GITHUB_ENV"
-          echo "keychain=$keychain" >> "$GITHUB_OUTPUT"
       # Either an App Store Connect API key (APPLE_API_KEY_P8, APPLE_API_KEY_ID,
       # APPLE_API_ISSUER) or an Apple ID (APPLE_ID, APPLE_APP_PASSWORD,
       # APPLE_TEAM_ID). Neither: signed but not notarised.
