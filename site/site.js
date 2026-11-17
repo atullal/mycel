@@ -147,59 +147,6 @@ function illustration(figure) {
   drawing.addEventListener('click', advance);
 }
 
-function routeDemo(figure) {
-  const clamp = value => Math.min(1, Math.max(0, value));
-  const routes = Array.from(figure.querySelectorAll('.journey'), group => ({
-    kind: group.dataset.kind,
-    hops: Array.from(group.querySelectorAll('.hop'), path => ({path, length:path.getTotalLength()})),
-    pins: [...group.querySelectorAll('.pin')],
-    packets: group.querySelector('.packets'),
-    arrival: group.querySelector('.arrival')
-  }));
-  let announcedRoute = null;
-  const status = figure.querySelector('[role=status]');
-  const delivered = ['Message delivered in Lisbon.', 'File delivered in Cape Town.'];
-  const player = loopPlayer(figure, 10200, fraction => {
-    const phase = fraction * routes.length;
-    routes.forEach((route, index) => {
-      const active = index === Math.floor(phase);
-      const t = phase - index;
-      if (active && t >= .64 && announcedRoute === index) {
-        status.textContent = delivered[index];
-        announcedRoute = null;
-      }
-      const flying = active && t < .58;
-      route.packets.setAttribute('visibility', flying ? 'visible' : 'hidden');
-      route.arrival.style.opacity = active ? Math.min(clamp((t-.56)/.08),clamp((1-t)/.09)) : 0;
-      route.pins.forEach((pin,i) => {
-        const pulse = active ? clamp(1 - Math.abs(t - (.055 + i*.25)) / .07) : 0;
-        pin.setAttribute('r', 3.6 + pulse*2.5);
-      });
-      if (!flying) return;
-      Array.from(route.packets.children).forEach((piece, i) => {
-        const progress = clamp((t - .035 - i*.028) / .47) * route.hops.length;
-        const hop = Math.min(Math.floor(progress), route.hops.length - 1);
-        const {path,length} = route.hops[hop];
-        const point = path.getPointAtLength((progress - hop) * length);
-        piece.setAttribute('transform', `translate(${point.x} ${point.y})`);
-        piece.style.opacity = Math.min(clamp((t-i*.028)/.035),clamp((.58-t)/.055));
-      });
-    });
-  });
-  figure.querySelector('.route-controls').hidden = false;
-  for (const button of figure.querySelectorAll('[data-send]')) {
-    button.addEventListener('click', () => {
-      const i = routes.findIndex(route => route.kind === button.dataset.send);
-      announcedRoute = player.paused ? null : i;
-      player.seek((i + (player.paused ? .78 : .01)) / routes.length);
-      status.textContent = player.paused
-        ? delivered[i]
-        : ['Sending a message from Boston.', 'Sending a file from São Paulo.'][i];
-    });
-  }
-  if (player.paused) player.seek(.39);
-}
-
 pickBuild();
 document.querySelectorAll('.iso-figure').forEach(illustration);
 const globe = document.querySelector('.globe');

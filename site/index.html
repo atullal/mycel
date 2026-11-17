@@ -31,7 +31,8 @@
   <figure class="globe" aria-label="Message route demo">
     <svg viewBox="0 0 600 512" role="img" aria-labelledby="route-title route-desc">
       <title id="route-title">Messages and files travel from peer to peer</title>
-      <desc id="route-desc">Example routes from Boston via Reykjavík to Lisbon, and São Paulo via Dakar to Cape Town. The callouts show what arrives.</desc>
+      <desc id="route-desc">A rotating globe follows example messages and files from the sender, through a relay, to the recipient.</desc>
+      <g class="globe-poster">
       <image href="assets/globe.svg" width="600" height="512"/>
       <g class="journey chat" data-kind="chat">
           <path class="hop" d="M185.5 131.5 Q249.9 70.0 314.4 72.6"/><path class="hop" d="M314.4 72.6 Q340.0 80.5 365.6 152.4"/>
@@ -51,7 +52,9 @@
             <text x="-60.5" y="-23" text-anchor="middle">field-notes.pdf</text>
           </g>
         </g>
+      </g>
     </svg>
+    <script type="application/json" id="coastlines">{{COASTLINES}}</script>
     <figcaption>
       <span>Example routes</span>
       <div class="route-controls" hidden>
@@ -151,6 +154,7 @@
 
 </footer>
 
+<script src="globe.js" defer></script>
 <script src="site.js" defer></script>
 </body>
 </html>

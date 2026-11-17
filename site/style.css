@@ -331,3 +331,18 @@ footer {
 @media (max-width: 720px) {
   .mechanism-grid { grid-template-columns: minmax(0, 1fr); gap: 28px; }
 }
+
+/* Land, graticule and routes rotate in the same geographic projection. */
+.turning-world { fill: none; stroke-linecap: round; stroke-linejoin: round; }
+.world-edge, .world-coast { stroke: var(--line-strong); stroke-width: 1; }
+.world-grid { stroke: var(--ink); stroke-opacity: .19; stroke-width: .8; }
+.world-route, .world-pin, .world-halo, .world-cargo { stroke: var(--accent); }
+.world-route { stroke-width: 1.45; }
+.turning-world[data-kind="file"] .world-route { stroke-dasharray: 3 4; }
+.world-pin, .world-cargo, .world-bubble path { fill: var(--surface); }
+.world-pin, .world-cargo { stroke-width: 1.5; }
+.world-halo { stroke-width: 1; }
+.turning-world[data-kind="file"] .cargo-chat, .turning-world[data-kind="chat"] .cargo-file { display:none; }
+.world-bubble path { stroke: var(--line-strong); stroke-width: 1; }
+.bubble-city { fill: var(--ink-2); font: 10px var(--font-mono); letter-spacing: .4px; }
+.bubble-copy { fill: var(--ink); font: 500 15px var(--font-ui); }

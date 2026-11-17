@@ -182,6 +182,7 @@ const version = versionOf(release);
 
 let page = await readFile(join(here, 'index.html'), 'utf8');
 const fill = {
+  COASTLINES: (await readFile(join(here, 'coastlines.json'), 'utf8')).trim(),
   HOW_IT_WORKS: (await readFile(join(here, 'how-it-works.html'), 'utf8'))
     .replace(/\{\{FIGURE_(\w+)\}\}/g, (_, id) => renderFigure(id)),
   HERO_DOWNLOAD: heroDownload(release, builds, version),
@@ -195,7 +196,7 @@ if (left) throw new Error(`unfilled placeholder ${left[0]}`);
 await rm(out, { recursive: true, force: true });
 await mkdir(out, { recursive: true });
 await writeFile(join(out, 'index.html'), page);
-for (const file of ['style.css', 'site.js']) await cp(join(here, file), join(out, file));
+for (const file of ['style.css', 'site.js', 'globe.js']) await cp(join(here, file), join(out, file));
 await cp(join(here, 'assets'), join(out, 'assets'), { recursive: true });
 await cp(join(root, 'docs', 'screenshots'), join(out, 'screenshots'), { recursive: true });
 // GitHub Pages runs Jekyll unless told not to.
