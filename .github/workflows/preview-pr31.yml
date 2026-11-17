@@ -11,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: 4b4f0b3f760417c97bb9282a526c677ab3ed167f
+          ref: ec406addd4cc030fe818f2368188c0a5b65e8a32
           persist-credentials: false
       - name: Test globe and download offers
         run: |
@@ -55,8 +55,17 @@ jobs:
               assert.deepEqual(errors,[]); console.log('PASS',name,await button.innerText());
               if(['desktop','mobile'].includes(name)){
                 await page.evaluate(()=>scrollTo({top:0,behavior:'instant'}));
-                const data=(await page.screenshot({type:'jpeg',quality:75})).toString('base64');
-                for(let i=0;i<data.length;i+=3500) console.log('GLOBE_IMG '+name+' '+i+' '+data.slice(i,i+3500));
+                await page.locator('#first-chat').scrollIntoViewIfNeeded();
+                const section = page.locator('#first-chat');
+                const columns = await section.locator('ol').evaluate(el=>getComputedStyle(el).gridTemplateColumns.split(' ').length);
+                assert.equal(columns,name==='mobile'?1:3);
+                assert.equal(await section.locator('li').count(),3);
+                await page.locator('.network-section img').evaluate(img=>img.decode());
+                assert.equal(await page.locator('#contribute a').count(),6);
+                const overflow=await page.locator('.guide-section').evaluateAll(sections=>sections.some(el=>el.scrollWidth>el.clientWidth+1));
+                assert.equal(overflow,false);
+                const data=(await section.screenshot({type:'jpeg',quality:75})).toString('base64');
+                for(let i=0;i<data.length;i+=3500) console.log('SECTIONS_IMG '+name+' '+i+' '+data.slice(i,i+3500));
               }
               await page.close();
             }
