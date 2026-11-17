@@ -105,16 +105,27 @@ function versionOf(release) {
 const dateOf = (release) =>
   new Date(release.published_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric', timeZone: 'UTC' });
 
+// One button per system, all but the first hidden: the page's script shows
+// the one for the visitor's system instead.
 function heroDownload(release, builds, version) {
-  const mac = builds.find((b) => b.id === 'mac');
-  const first = mac ?? builds[0];
+  const first = builds.find((b) => b.id === 'mac') ?? builds[0];
+  const hide = (b) => (b === first ? '' : ' hidden');
   if (!first) {
-    return `<p class="get"><a class="button" id="get" href="${repoUrl}/releases"><span class="what">See the releases</span></a></p>
+    return `<p class="get"><a class="button" href="${repoUrl}/releases">See the releases</a></p>
     <p class="fine">Experimental preview. No build is published for download yet;
       <a href="${repoUrl}#build-from-source">building from source</a> takes a few minutes.</p>`;
   }
-  return `<p class="get"><a class="button" id="get" href="${esc(first.files[0].url)}"><span class="what">Download for ${esc(first.name)}</span> <span class="v">${esc(version)}</span></a></p>
-    <p class="fine"><span id="get-needs">${esc(first.needs)}</span>. Experimental preview:
+  const buttons = builds
+    .map(
+      (b) =>
+        `<a class="button" data-system="${b.id}" href="${esc(b.files[0].url)}"${hide(b)}>Download for ${esc(b.name)} <span class="v">${esc(version)}</span></a>`,
+    )
+    .join('\n      ');
+  const needs = builds.map((b) => `<span data-system="${b.id}"${hide(b)}>${esc(b.needs)}.</span>`).join(' ');
+  return `<p class="get">
+      ${buttons}
+    </p>
+    <p class="fine">${needs} Experimental preview:
       <a href="#status">read this first</a>. <a href="#download">Other systems</a>.</p>`;
 }
 
@@ -169,16 +180,10 @@ const release = await newestRelease();
 const builds = buildsIn(release);
 const version = versionOf(release);
 
-// What the page's script needs to offer the visitor's own system.
-const forScript = Object.fromEntries(
-  builds.map((b) => [b.id, { url: b.files[0].url, label: `Download for ${b.name}`, needs: b.needs }]),
-);
-
 let page = await readFile(join(here, 'index.html'), 'utf8');
 const fill = {
   HERO_DOWNLOAD: heroDownload(release, builds, version),
   DOWNLOADS: downloads(release, builds, version),
-  BUILDS_JSON: JSON.stringify(forScript).replace(/</g, '\\u003c'),
   REPO_URL: repoUrl,
 };
 for (const [key, value] of Object.entries(fill)) page = page.replaceAll(`{{${key}}}`, value);

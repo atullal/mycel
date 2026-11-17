@@ -9,16 +9,8 @@
 
   // ───────────────────────────── download button ─────────────────────────────
 
+  // The page has a button for every system with a build, all but one hidden.
   function pickBuild() {
-    const button = document.getElementById('get');
-    const data = document.getElementById('builds');
-    if (!button || !data) return;
-    let builds;
-    try {
-      builds = JSON.parse(data.textContent);
-    } catch {
-      return;
-    }
     const ua = navigator.userAgent;
     const system =
       /Android/.test(ua) ? 'android'
@@ -27,12 +19,9 @@
       : /Windows/.test(ua) ? 'windows'
       : /Linux|X11/.test(ua) ? 'linux'
       : null;
-    const build = system && builds[system];
-    if (!build) return;
-    button.href = build.url;
-    button.querySelector('.what').textContent = build.label;
-    const needs = document.getElementById('get-needs');
-    if (needs) needs.textContent = build.needs;
+    const offers = [...document.querySelectorAll('.hero [data-system]')];
+    if (!offers.some((el) => el.dataset.system === system)) return;
+    for (const el of offers) el.hidden = el.dataset.system !== system;
   }
 
   // ────────────────────────────────── mesh ──────────────────────────────────
