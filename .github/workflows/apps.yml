@@ -198,9 +198,8 @@ jobs:
           if-no-files-found: error
 
   # The Mac app, for Apple silicon and Intel in one. Signed with the project's
-  # Developer ID and notarised by Apple when the repository has the secrets
-  # for it (docs/PLATFORMS.md, "Signing the Mac app"); without them the build
-  # is unsigned, and the release notes and the website say how to open it.
+  # Developer ID and notarised by Apple. Missing credentials fail the job
+  # and block publication (docs/PLATFORMS.md, "Signing the Mac app").
   # Runs on the project's own Mac when the repository variable MACOS_RUNNER is
   # `self-hosted` (every trigger of this workflow is a maintainer's), else on
   # GitHub's.
@@ -223,6 +222,8 @@ jobs:
       # The certificate goes into a keychain of its own, which only this job
       # uses and which is deleted at the end: the runner's own keychains and
       # their search list are left alone.
+      - name: Mac publication gate tests
+        run: python3 -m unittest discover -s scripts/tests -p test_mac_release.py -v
       - name: Signing certificate
         id: certificate
         env:
@@ -230,8 +231,8 @@ jobs:
           CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
           if [ -z "$CERTIFICATE" ]; then
-            echo "::notice::No APPLE_CERTIFICATE secret: this build is unsigned."
-            exit 0
+            echo "::error::APPLE_CERTIFICATE is required for public Mac downloads."
+            exit 1
           fi
           keychain="$RUNNER_TEMP/mycel-signing.keychain-db"
           password="$(openssl rand -hex 24)"
@@ -255,7 +256,7 @@ jobs:
           } >> "$GITHUB_ENV"
       # Either an App Store Connect API key (APPLE_API_KEY_P8, APPLE_API_KEY_ID,
       # APPLE_API_ISSUER) or an Apple ID (APPLE_ID, APPLE_APP_PASSWORD,
-      # APPLE_TEAM_ID). Neither: signed but not notarised.
+      # APPLE_TEAM_ID). Missing credentials block publication.
       - name: Notarisation credentials
         if: steps.certificate.outputs.keychain != ''
         env:
@@ -267,6 +268,7 @@ jobs:
           TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           if [ -n "$API_KEY_P8" ]; then
+            : "${API_KEY_ID:?Missing APPLE_API_KEY_ID}" "${API_ISSUER:?Missing APPLE_API_ISSUER}"
             printf '%s' "$API_KEY_P8" > "$RUNNER_TEMP/notary.p8"
             {
               echo "MYCEL_NOTARY_KEY=$RUNNER_TEMP/notary.p8"
@@ -274,13 +276,15 @@ jobs:
               echo "MYCEL_NOTARY_ISSUER=$API_ISSUER"
             } >> "$GITHUB_ENV"
           elif [ -n "$APPLE_ID" ]; then
+            : "${APP_PASSWORD:?Missing APPLE_APP_PASSWORD}" "${TEAM_ID:?Missing APPLE_TEAM_ID}"
             {
               echo "MYCEL_NOTARY_APPLE_ID=$APPLE_ID"
               echo "MYCEL_NOTARY_PASSWORD=$APP_PASSWORD"
               echo "MYCEL_NOTARY_TEAM_ID=$TEAM_ID"
             } >> "$GITHUB_ENV"
           else
-            echo "::warning::No notarisation credentials: the app is signed but macOS will still warn about it."
+            echo "::error::Notarization credentials are required for public Mac downloads."
+            exit 1
           fi
       - name: Build
         run: scripts/package-mac.sh --universal
@@ -297,8 +301,8 @@ jobs:
         with:
           name: mycel-macos
           path: |
-            dist-release/Mycel_*_universal.dmg
-            dist-release/Mycel_*_universal.app.zip
+            dist-release/Mycel_*_universal_notarized.dmg
+            dist-release/Mycel_*_universal_notarized.app.zip
           if-no-files-found: error
 
   # Tags only. Runs no project code: it takes the installers the jobs above
@@ -323,6 +327,8 @@ jobs:
         run: |
           mkdir dist
           find "$RUNNER_TEMP/artifacts" -type f -exec mv -t dist -- {} +
+          test -s dist/Mycel_*_universal_notarized.dmg
+          test -s dist/Mycel_*_universal_notarized.app.zip
           cd dist
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
@@ -335,7 +341,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          notes="Builds of $TAG. Check a download against SHA256SUMS, and its provenance with: gh attestation verify <file> --repo $GH_REPO"
+          notes="Builds of $TAG. The universal Mac app and DMG are Developer ID signed and notarized by Apple. Check a download against SHA256SUMS, and its provenance with: gh attestation verify <file> --repo $GH_REPO"
           if gh release view "$TAG" >/dev/null 2>&1; then
             # A release made by hand before this run: add the files to it.
             gh release upload "$TAG" --clobber dist/*

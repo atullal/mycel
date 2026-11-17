@@ -19,7 +19,7 @@ builds from a saved release.
 | `index.html` | the page, with `{{PLACEHOLDERS}}` that `build.mjs` fills |
 | `style.css` | the theme tokens and layout |
 | `site.js` | offers the build for the visitor's system; animates the mesh drawing |
-| `build.mjs` | the build; `MAC_SIGNED` says whether to show how to open an unsigned Mac app |
+| `build.mjs` | the build; offers only verified `_universal_notarized.dmg` Mac packages |
 
 The Site workflow (`.github/workflows/site.yml`) builds the page on pull
 requests and publishes it to GitHub Pages from `main` and when a release
