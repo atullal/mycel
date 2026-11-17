@@ -74,3 +74,16 @@ function routeDemo(figure) {
 pickBuild();
 const globe = document.querySelector('.globe');
 if (globe) routeDemo(globe);
+
+// Play each illustration once, when its row reaches the reader.
+if ('IntersectionObserver' in window) {
+  const illustrations = new IntersectionObserver(entries => {
+    for (const entry of entries) {
+      if (entry.isIntersecting) {
+        entry.target.classList.add('illustrating');
+        illustrations.unobserve(entry.target);
+      }
+    }
+  }, { threshold: .65 });
+  document.querySelectorAll('.mechanism-drawing').forEach(svg => illustrations.observe(svg));
+}
