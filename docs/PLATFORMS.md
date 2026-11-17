@@ -266,7 +266,9 @@ The Apps workflow does this on GitHub when the repository has these secrets:
 Without the certificate or complete notarization credentials, the Mac job
 fails and the release job cannot publish. There is no unsigned fallback,
 including for development prereleases. Only packages that pass every check
-are uploaded, checksummed and attested.
+are uploaded, checksummed and attested. Tagged public Mac releases use fresh
+GitHub-hosted runners; `MACOS_RUNNER=self-hosted` applies only to non-tag
+development builds. npm and Cargo use the committed lockfiles.
 
 To create the certificate, the Apple Developer Account Holder uploads a
 certificate signing request at [Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/certificates/add),

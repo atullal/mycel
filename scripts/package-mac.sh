@@ -89,11 +89,11 @@ source "$ROOT/scripts/remap-paths.sh"
 cd "$ROOT/apps/host"
 if [ -n "$TARGET" ]; then
   rustup target add aarch64-apple-darwin x86_64-apple-darwin
-  tauri build --bundles app --target "$TARGET"
+  tauri build --bundles app --target "$TARGET" -- --locked
   BUNDLE="$ROOT/target/$TARGET/release/bundle"
   LABEL="universal"
 else
-  tauri build --bundles app
+  tauri build --bundles app -- --locked
   BUNDLE="$ROOT/target/release/bundle"
   case "$(uname -m)" in arm64) LABEL="aarch64" ;; x86_64) LABEL="x64" ;; *) LABEL="$(uname -m)" ;; esac
 fi
