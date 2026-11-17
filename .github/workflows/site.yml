@@ -12,6 +12,10 @@ on:
   release:
     types: [published, edited, deleted]
   workflow_dispatch:
+  # Releases created with GITHUB_TOKEN do not emit another release workflow.
+  workflow_run:
+    workflows: [Apps]
+    types: [completed]
 
 permissions: {}
 
@@ -22,6 +26,12 @@ concurrency:
 jobs:
   build:
     name: Build the site
+    # Use only the default branch; never checkout or consume run artifacts.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
