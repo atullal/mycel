@@ -1,30 +1,26 @@
 # Contributing to Mycel
 
-Thank you for helping. This page covers how to build and test Mycel, and
-what we look for in a change.
+This guide is for anyone who wants to change Mycel's code or documentation.
+It covers setting up, building and running, the checks to run before a pull
+request, how a change is reviewed and merged, and the rules for commits,
+dependencies and vendored code.
 
-By taking part, you agree to the [code of conduct](CODE_OF_CONDUCT.md).
+For anything larger than a small fix, open an issue first, so the approach
+is agreed before you spend time on code. Security vulnerabilities are never
+reported in an issue or a pull request: [SECURITY.md](SECURITY.md) says how
+to report one privately. By taking part, you agree to the
+[code of conduct](CODE_OF_CONDUCT.md).
 
-## Bugs, ideas and vulnerabilities
+## Set up
 
-- **Security vulnerabilities:** never in a public issue. Report them
-  privately, as [SECURITY.md](SECURITY.md) describes.
-- **Bugs:** open an issue with the bug report form. Say which platform and
-  build you ran, what you did, what you expected, and what happened. Attach
-  `mycel.log` from the data folder if you can, after removing anything
-  private.
-- **Ideas and larger changes:** open an issue first, so we can agree on the
-  approach before you spend time on code.
+You need:
 
-## What you need
-
-- **Rust**, through [rustup](https://rustup.rs). The toolchain version,
-  rustfmt, clippy and the WebAssembly target are pinned in
-  `rust-toolchain.toml`; rustup installs them the first time you run `cargo`
-  in the repository.
-- **Node.js 22.18 or later**, with npm. The TypeScript tests use Node's
-  built-in type stripping.
-- **On Linux**, the libraries for the webview, D-Bus and audio. On Debian or
+- Rust, through [rustup](https://rustup.rs). `rust-toolchain.toml` pins the
+  toolchain version, rustfmt, clippy and the WebAssembly target. rustup
+  installs them the first time you run `cargo` in the repository.
+- Node.js 22.18 or later, with npm. The TypeScript tests use Node's built-in
+  type stripping, which sets the minimum (`engines` in `package.json`).
+- On Linux, the libraries for the web view, D-Bus and audio. On Debian or
   Ubuntu:
 
   ```sh
@@ -32,10 +28,15 @@ By taking part, you agree to the [code of conduct](CODE_OF_CONDUCT.md).
     librsvg2-dev libdbus-1-dev libasound2-dev libssl-dev pkg-config
   ```
 
-- **To run the desktop app:** the Tauri CLI,
-  `cargo install tauri-cli --version '^2' --locked`.
-- **For the iPhone, iPad and Android apps:** Xcode, or the Android SDK, NDK
-  and a JDK. The header of each `scripts/package-*.sh` lists what it needs.
+- The Tauri CLI, to run the desktop app:
+
+  ```sh
+  cargo install tauri-cli --version '^2' --locked
+  ```
+
+- Xcode for the iPhone and iPad app, or the Android SDK, the NDK and a JDK
+  for the Android app. The header of each `scripts/package-*.sh` lists what
+  that script needs.
 
 ## Build and run
 
@@ -45,48 +46,80 @@ cargo build --workspace            # every Rust crate
 (cd apps/host && cargo tauri dev)  # the desktop app, with live reload
 ```
 
-The command-line device, with the web UI on <http://127.0.0.1:7777>:
+On Windows, add `--exclude mycel-sim --exclude mycel-bench` to the workspace
+commands, as CI does: the simulator and the benchmarks are Unix development
+tools.
+
+The command-line device runs the same UI in a browser, on
+<http://127.0.0.1:7777>:
 
 ```sh
 npm run build                      # the web UI it serves
 cargo run -p mycel-cli -- serve
 ```
 
-The rules bundles (WebAssembly) are built separately, and copied into the
-rules runtime's test fixtures:
+To work on the UI without a device, start the Vite development server. In a
+plain browser the UI talks to an in-memory mock of the runtime, which
+[`packages/sdk/README.md`](packages/sdk/README.md) describes:
+
+```sh
+npm run dev                        # http://localhost:1420
+```
+
+The rules bundles are WebAssembly and are built separately. The built
+bundles are checked in under `crates/mycel-rules/fixtures/`, and the runtime
+embeds the chat rules from there. After a change under `rules/`, rebuild
+them:
 
 ```sh
 rules/build.sh
 ```
 
-Packaged apps: `scripts/package-mac.sh`, `scripts/package-ios.sh` and
-`scripts/package-android.sh`. Linux and Windows installers are built by the
-`Apps` workflow.
+The packaged apps come from `scripts/package-mac.sh`,
+`scripts/package-ios.sh` and `scripts/package-android.sh`. The `Apps`
+workflow builds the Linux and Windows installers.
+[PLATFORMS.md](docs/PLATFORMS.md) has the details for each system.
 
-## Test
+## Run the tests
 
 ```sh
 cargo test --workspace             # Rust
 npm run typecheck && npm test      # TypeScript
 ```
 
-Things to know:
+Three things to know before you trust a failure:
 
-- **macOS asks for Local Network permission.** Three LAN discovery tests
-  (`lan_discovery_via_mdns`, `one_path_per_interface`,
-  `sync_over_an_interface_with_ip_off`) fail with "No route to host" if your
-  terminal doesn't have it. Allow it in System Settings > Privacy & Security
-  > Local Network.
-- **Some tests time real work** (sync throughput, calls, multipath). They can
-  miss their deadline on a loaded machine. CI builds tests with
-  `CARGO_PROFILE_DEV_OPT_LEVEL=2` and retries a failed test twice; locally,
-  rerun a failed test on its own before assuming it's broken.
-- **Security regression tests are never retried.** If one fails, it's a
-  real failure.
+- On macOS, three LAN discovery tests (`lan_discovery_via_mdns`,
+  `one_path_per_interface` and `sync_over_an_interface_with_ip_off`) fail
+  with "No route to host" unless your terminal has Local Network permission.
+  Allow it in System Settings > Privacy & Security > Local Network.
+- Some tests time real work, such as sync throughput, calls and multipath,
+  and can miss their deadline on a loaded machine. CI builds the tests with
+  `CARGO_PROFILE_DEV_OPT_LEVEL=2` and retries a failed test twice. Locally,
+  rerun a failed test on its own before you assume it is broken.
+- Security regression tests are never retried. CI runs them in a job of
+  their own, and a failure there is a real failure.
+
+[TESTING.md](docs/TESTING.md) describes every suite, the tests that are
+ignored by default, and what is not tested.
+
+## Code style
+
+- Formatting is whatever `rustfmt` produces with `rustfmt.toml`. Don't
+  format by hand, and don't mix reformatting with other changes.
+- Clippy must pass with `-D warnings`. The workspace lints are in the root
+  `Cargo.toml`. If you must silence a lint, use `#[expect(...)]` on the
+  smallest item, with a comment that says why.
+- Use `unsafe` only where there is no safe way, with a `// SAFETY:` comment
+  that explains why it is sound.
+- Return errors. Don't panic on input from a peer, a file or the network:
+  everything a peer sends is untrusted.
+- Comments and docs say why, in plain, short sentences.
 
 ## Before you open a pull request
 
-CI runs all of these; running them first saves a round trip.
+These are the local forms of the main CI jobs. Running them first saves a
+round trip.
 
 ```sh
 cargo fmt --all
@@ -96,40 +129,41 @@ cargo test --workspace
 npm run typecheck && npm test && npm run build
 ```
 
-Also run, if you have them installed: `cargo deny check` (dependencies,
-licences and advisories), `typos` (spelling), and `actionlint` and `zizmor`
-if you changed a workflow.
+CI runs further checks that need extra tools. Run the ones that apply to
+your change, if you have the tool installed:
 
-## Style
+- `typos` checks the spelling of code, comments and docs. `_typos.toml`
+  holds the accepted words.
+- `cargo deny check` checks dependencies, licences and advisories. Run it
+  after any change to a `Cargo.toml` or to `Cargo.lock`.
+- `actionlint` and `zizmor .github/workflows .github/dependabot.yml` check
+  the workflows. Run them after a change under `.github/`.
 
-- **Formatting** is whatever `rustfmt` produces with `rustfmt.toml`. Don't
-  format by hand, and don't mix reformatting with other changes.
-- **Lints:** clippy must pass with `-D warnings`. The workspace lints are in
-  the root `Cargo.toml`. If you must silence a lint, use `#[expect(...)]` on
-  the smallest item, with a comment that says why.
-- **`unsafe`:** only where there is no safe way, with a `// SAFETY:` comment
-  that explains why it is sound.
-- **Errors:** return them; don't panic on input from a peer, a file or the
-  network. Everything a peer sends is untrusted.
-- **Comments and docs** say why, in plain, short sentences.
+[TESTING.md](docs/TESTING.md) lists every CI job with the command it runs,
+including the documentation build and the rules workspace.
 
-## Commits and pull requests
+## How changes land
+
+Every change reaches `main` through a pull request. A pull request can be
+merged once it has one approving review from a code owner
+(`.github/CODEOWNERS`) and the `CI result` check has passed. `CI result` is
+the last job of the CI workflow, and it fails if any other job failed. Pull
+requests are merged as a squash or as a merge commit.
+
+A pull request should follow these rules:
 
 - Keep a pull request to one change. Split refactors from behaviour changes.
-- Write commit subjects in the imperative ("Fix…", "Add…"), under 72
-  characters. Use the body to explain why.
 - Add or update tests for every behaviour change, and docs for every
   user-visible one.
-- **Wire and storage compatibility.** Mycel doesn't yet promise
-  compatibility between builds: every device has to run the same build. If
-  your change alters what goes over the network or what is stored on disk,
-  say so in the pull request.
+- Say so in the pull request if your change alters what goes over the
+  network or what is stored on disk. Mycel doesn't yet promise compatibility
+  between builds: every device has to run the same build.
+- Write commit subjects in the imperative ("Fix…", "Add…"), under 72
+  characters. Use the body to explain why.
 - Don't commit secrets, signing keys, personal data or build output.
   `.gitignore` covers the usual files; check `git status` anyway.
-- New dependencies need a reason. They must pass `cargo deny check`; prefer
-  crates that are widely used and maintained.
 
-### Sign your commits off (DCO)
+## Sign your commits off (DCO)
 
 Every commit needs a `Signed-off-by` line, which `git commit -s` adds:
 
@@ -142,18 +176,89 @@ that you wrote the change, or otherwise have the right to submit it under
 the project's licence. Use your real name, or the name you are known by.
 To sign off commits you already made: `git rebase --signoff main`.
 
+The `Sign-off (DCO)` job in CI fails a pull request in which any commit,
+merge commits aside, lacks the line.
+
+## Dependencies
+
+A new dependency needs a reason, given in the pull request. Prefer crates
+that are widely used and maintained.
+
+Every Rust dependency must pass `cargo deny check`. The policy is in
+`deny.toml`:
+
+- Vulnerabilities, unmaintained crates, unsound crates and yanked versions
+  are errors.
+- Licences must be on the allowed list, which holds permissive licences
+  compatible with distributing Mycel under MIT or Apache-2.0. Any other
+  licence fails until it is reviewed and listed as an exception for the one
+  crate that needs it.
+- Crates come from crates.io only. Git dependencies and wildcard version
+  requirements are refused.
+
+CI builds with `--locked` and installs with `npm ci`, so commit the change
+to `Cargo.lock` or `package-lock.json` together with the manifest. For npm,
+CI runs `npm audit --omit=dev`, and the `Dependency review` job fails a pull
+request that adds a dependency with a known vulnerability.
+
+### Accepted advisories
+
+An advisory that Mycel is not exposed to can be accepted, with the reason
+written down. The accepted advisories are listed in three files, one for
+each tool that reads them:
+
+| File | Read by |
+|---|---|
+| `deny.toml` | cargo-deny, in CI and in the daily `Audit` workflow |
+| `.cargo/audit.toml` | a local `cargo audit` |
+| `osv-scanner.toml` | OSV-Scanner and OpenSSF Scorecard |
+
+`deny.toml` holds the full entry: the advisory, why Mycel isn't exposed, and
+the date to look again. Keep all three files in step, and remove an entry
+when its reason goes. cargo-deny only reads the platforms Mycel ships on,
+so the other two files can list an advisory that `deny.toml` doesn't need.
+
+### Dependency updates
+
+Dependabot proposes updates every week. Two groups are updated by hand
+instead:
+
+- The crates under `vendor/`. Raising the version requirement of one of
+  them would build against the unpatched upstream release, so they are
+  updated by vendoring the new release again.
+- New minor and major versions of the `tauri` crates and the `@tauri-apps`
+  npm packages. The two must stay on the same minor version, so update them
+  together.
+
 ## Vendored code
 
 `vendor/` holds patched copies of a few upstream crates (Iroh, its QUIC
 stack, and others). Before you touch anything there:
 
-1. Read that crate's `MYCEL_PATCH.md`.
+1. Read that crate's `MYCEL_PATCH.md`. The notes for `noq` are in
+   `vendor/noq-proto/MYCEL_PATCH.md`.
 2. Keep the change as small as possible, mark it `MYCEL PATCH`, describe it in
    `MYCEL_PATCH.md`, and add a test.
 3. Never reformat vendored files or remove their licence files and notices.
 
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) lists each vendored crate,
 its upstream and its licence.
+
+## Where to ask
+
+Questions, bug reports and proposals all go to the
+[issue tracker](https://github.com/atullal/mycel/issues/new/choose).
+
+- For a bug, use the bug report form. Say which platform and build you ran,
+  what you did, what you expected, and what happened. Attach `mycel.log`
+  from the data folder if you can, after removing anything private. The
+  [user guide](docs/USER_GUIDE.md) says where the data folder is.
+- For an idea or a larger change, use the feature request form before you
+  write the code.
+- For a question about a change you are working on, ask in its issue, or
+  open a draft pull request and ask there.
+- For a security vulnerability, never use a public issue. Report it
+  privately, as [SECURITY.md](SECURITY.md) describes.
 
 ## Licence
 
