@@ -1,3 +1,5 @@
+<!-- Security fixes: don't describe a vulnerability here. Report it privately first (SECURITY.md). -->
+
 ## What and why
 
 <!-- What does this change, and why? Link the issue it fixes, if there is one. -->
@@ -6,16 +8,16 @@
 
 <!-- Tests added or changed, and anything you checked by hand (which platforms, how many devices). -->
 
+## Wire format and stored data
+
+<!-- "Unchanged", or what changed and what an older build would see. Every device has to run the same build. -->
+
 ## Checklist
 
-- [ ] Tests cover the change, and `cargo test` / `npm test` pass.
-- [ ] `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings` are clean.
+- [ ] `cargo fmt`, `cargo clippy` and `cargo test` pass, and so do `npm run typecheck`, `npm test` and `npm run build` if TypeScript changed. CONTRIBUTING.md has the exact commands.
+- [ ] Tests cover the change.
 - [ ] Docs are updated for anything a user or app developer would notice.
+- [ ] Every commit is signed off (`git commit -s`).
 - [ ] No secrets, keys, personal data or build output in the diff.
-- [ ] Every commit is signed off (`git commit -s`, see CONTRIBUTING.md).
-- [ ] Wire format and stored data: unchanged, **or** the change is described below.
-      (Every device has to run the same build; say what an older build would see.)
 - [ ] New dependencies, if any, are explained and pass `cargo deny check`.
-- [ ] Changes under `vendor/` follow that crate's `MYCEL_PATCH.md`.
-
-<!-- Security fixes: don't describe a vulnerability here. Report it privately first (SECURITY.md). -->
+- [ ] Changes under `vendor/`, if any, follow that crate's `MYCEL_PATCH.md`.

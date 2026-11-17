@@ -1,88 +1,138 @@
 # Benchmarks against an external simulator
 
-Mycel's store-and-forward code (`crates/mycel-net/src/mesh/dtn.rs`, the real
-`Carrier`) against **The ONE**'s reference routers: Epidemic, PRoPHET,
-binary Spray-and-Wait, MaxProp and Direct Delivery. Both replay the same
-real Bluetooth contact traces and the same message workloads.
+This report measures Mycel's store-and-forward code
+(`crates/mycel-net/src/mesh/dtn.rs`, the real `Carrier`) against the
+reference routers of [The ONE](https://github.com/akeranen/the-one)
+simulator: Epidemic, PRoPHET, binary Spray-and-Wait, MaxProp and Direct
+Delivery. Both sides replay the same real Bluetooth contact traces and the
+same message workloads.
 
-Everything here ran on one Mac (18 cores, 24 GB). Simulations of Mycel's own
-routing at scale are in [SIMULATION.md](SIMULATION.md).
+It is written for contributors who change the carrier, and for readers who
+want the evidence behind its defaults. Everything here ran on one Mac (18
+cores, 24 GB). Simulations of Mycel's own routing at scale are in
+[SIMULATION.md](SIMULATION.md).
 
-## Headline
+Contents:
 
-Mycel's carrier has the fixes of §6, applied to `mesh/dtn.rs` and the
-node's protocol, with the defaults chosen in §6.5: spray-first, a single
-copy follows predictability toward the internet, 32 copies for bundles of
-16 KiB or less falling to 4 at 256 KiB, offers before payloads, resume,
-lifetimes from creation, and eviction of the soonest-expiring carried
-bundles. "Before" is the carrier this benchmark first measured. "≤ 1 h" is
-the share of *all* messages created that arrived within an hour.
+1. [Summary](#1-summary)
+2. [Method](#2-method)
+3. [Results: store-and-forward on real contact traces](#3-results-store-and-forward-on-real-contact-traces)
+4. [What the results show](#4-what-the-results-show)
+5. [Limitations](#5-limitations)
+6. [Where Mycel lost, why, and the fix](#6-where-mycel-lost-why-and-the-fix)
+7. [Reproducing the results](#7-reproducing-the-results)
+
+## 1. Summary
+
+The benchmark replays four contact traces, two of them also with some
+devices given the internet, under two workloads: `heavy` (The ONE's standard
+benchmark, 500 kB–1 MB messages) and `chat` (1–10 kB messages). Each
+combination runs through The ONE's routers and through Mycel's carrier. The
+measures are delivery ratio, latency, overhead (transmissions per delivered
+message) and the share of messages delivered within a time.
+
+In the table:
+
+- "Mycel now" is the carrier with the fixes of
+  [§6](#6-where-mycel-lost-why-and-the-fix), applied to `mesh/dtn.rs` and
+  the node's protocol, with the defaults chosen in
+  [§6.5](#65-results-on-the-real-carrier-and-the-defaults): spray-first, a
+  single copy follows predictability toward the internet, 32 copies for
+  bundles of 16 KiB or less falling to 4 at 256 KiB, offers before payloads,
+  resume, lifetimes from creation, and eviction of the soonest-expiring
+  carried bundles.
+- "Mycel before" is the carrier this benchmark first measured.
+- "≤ 1 h" is the share of all messages created that arrived within an hour.
 
 | Trace | Workload | Best ONE router (delivery) | Its ≤ 1 h | Its overhead | Mycel before | Before ≤ 1 h | Mycel now | Now ≤ 1 h | Now overhead |
 |---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| cambridge | heavy | MaxProp 9.4 % | 8.8 % | 10.4 | 9.4 % | 5.7 % | **14.8 %** | **10.6 %** | 5.1 |
-| infocom2005 | heavy | MaxProp 20.4 % | 16.8 % | 66.0 | 22.0 % | 7.7 % | **32.1 %** | **22.1 %** | 7.1 |
-| infocom2006 | heavy | MaxProp 38.0 % | 30.0 % | 202.8 | 28.9 % | 16.1 % | **57.0 %** | **43.0 %** | 7.3 |
-| infocom2006-gw | heavy | MaxProp 40.3 % | 33.0 % | 277.0 | 40.9 % | 24.8 % | **58.5 %** | **48.2 %** | 5.3 |
-| helsinki | heavy | MaxProp 47.4 % (Spray-and-Wait: 30.5 % ≤ 1 h) | 18.9 % | 31.8 | 30.4 % | 8.2 % | **62.9 %** | 30.5 % | 4.7 |
-| helsinki-gw | heavy | MaxProp 51.2 % (Spray-and-Wait: 31.3 % ≤ 1 h) | 21.4 % | 35.6 | 31.9 % | 8.7 % | **52.7 %** | 27.7 % | 9.7 |
+| cambridge | heavy | MaxProp 9.4 % | 8.8 % | 10.4 | 9.4 % | 5.7 % | 14.8 % | 10.6 % | 5.1 |
+| infocom2005 | heavy | MaxProp 20.4 % | 16.8 % | 66.0 | 22.0 % | 7.7 % | 32.1 % | 22.1 % | 7.1 |
+| infocom2006 | heavy | MaxProp 38.0 % | 30.0 % | 202.8 | 28.9 % | 16.1 % | 57.0 % | 43.0 % | 7.3 |
+| infocom2006-gw | heavy | MaxProp 40.3 % | 33.0 % | 277.0 | 40.9 % | 24.8 % | 58.5 % | 48.2 % | 5.3 |
+| helsinki | heavy | MaxProp 47.4 % (Spray-and-Wait: 30.5 % ≤ 1 h) | 18.9 % | 31.8 | 30.4 % | 8.2 % | 62.9 % | 30.5 % | 4.7 |
+| helsinki-gw | heavy | MaxProp 51.2 % (Spray-and-Wait: 31.3 % ≤ 1 h) | 21.4 % | 35.6 | 31.9 % | 8.7 % | 52.7 % | 27.7 % | 9.7 |
 | cambridge | chat | MaxProp 51.5 % | 11.9 % | 6.0 | 45.9 % | 11.1 % | 50.6 % | 11.5 % | 5.1 |
 | infocom2005 | chat | MaxProp 84.2 % | 24.6 % | 36.8 | 82.5 % | 23.3 % | 84.1 % | 24.4 % | 16.2 |
 | infocom2006 | chat | MaxProp 83.2 % | – | 215.4 | 82.9 % | 44.8 % | 83.2 % | 46.9 % | 18.3 |
-| infocom2006-gw | chat | Spray-and-Wait 76.6 % | – | 3.4 | 84.4 % | 51.3 % | **84.4 %** | 51.6 % | 11.1 |
+| infocom2006-gw | chat | Spray-and-Wait 76.6 % | – | 3.4 | 84.4 % | 51.3 % | 84.4 % | 51.6 % | 11.1 |
 | helsinki | chat | MaxProp 98.1 % | 98.0 % | 90.4 | 87.7 % | 49.7 % | 97.2 % | 94.4 % | 26.1 |
 | helsinki-gw | chat | MaxProp 98.1 % | 98.1 % | 102.1 | 90.7 % | 59.6 % | 96.0 % | 87.7 % | 37.3 |
 
-- **Heavy messages: Mycel now beats the best ONE router on 5 of 6 traces**,
-  on total delivery and on delivery within an hour (Helsinki within an
-  hour: a tie with Spray-and-Wait), with 2–52× fewer transmissions than
-  MaxProp. Before the fixes it delivered as much on the conference
-  traces but far later, and lost on Helsinki: 95–99% of its transfers were
-  refused only after the whole payload had crossed the link (§6.1).
-- **Chat-sized messages: level with MaxProp** on Cambridge and both
-  Infocoms (within 1 point, with up to 12× less overhead), best on
-  Infocom 2006 with gateways. On Helsinki, 32 copies for small bundles
-  take delivery within an hour from 50% to 94%; MaxProp still gets 98%
-  there by copying to everyone (overhead 90 against 26).
-- **Helsinki with gateways, heavy: now ahead on delivery**, at 52.7%
-  against MaxProp's 51.2%, with half the transmissions of before (overhead
-  9.7, was 19.4).
-  - The single copy used to climb toward the 6 tram gateways, which move
-    fast (contacts of seconds) and have 5 MB stores, so transfers to them
-    were cut and their stores filled: 37.2%.
-  - The gradient now discounts a neighbour that can take fewer than 4
-    more bundles of the size (`room_aware`, §6.5).
-  - Spray-and-Wait still gets more there within an hour: 31.3% against
-    27.7%.
+With heavy messages, Mycel now beats the best ONE router on 5 of 6 traces,
+on total delivery and on delivery within an hour (Helsinki within an hour: a
+tie with Spray-and-Wait), with 2–52× fewer transmissions than MaxProp.
+Before the fixes it delivered as much on the conference traces but far
+later, and lost on Helsinki: 95–99% of its transfers were refused only after
+the whole payload had crossed the link
+([§6.1](#61-big-messages-refusals-livelock-the-links-the-heavy-workload)).
 
-## 1. Tools, versions and inputs
+With chat-sized messages, Mycel is level with MaxProp on Cambridge and both
+Infocoms (within 1 point, with up to 12× less overhead), and best on Infocom
+2006 with gateways. On Helsinki, 32 copies for small bundles take delivery
+within an hour from 50% to 94%; MaxProp still gets 98% there by copying to
+everyone (overhead 90 against 26).
 
-| | Version | Notes |
+On Helsinki with gateways, with heavy messages, Mycel is now ahead on
+delivery, at 52.7% against MaxProp's 51.2%, with half the transmissions of
+before (overhead 9.7, was 19.4):
+
+- The single copy used to climb toward the 6 tram gateways, which move fast
+  (contacts of seconds) and have 5 MB stores, so transfers to them were cut
+  and their stores filled: 37.2%.
+- The gradient now discounts a neighbour that can take fewer than 4 more
+  bundles of the size (`room_aware`, §6.5).
+- Spray-and-Wait still gets more there within an hour: 31.3% against 27.7%.
+
+These results come from replaying recorded contacts through a harness, not
+from devices. [§5](#5-limitations) says what that leaves out.
+
+## 2. Method
+
+### 2.1 Tools and versions
+
+| Tool | Version | Notes |
 |---|---|---|
-| [The ONE](https://github.com/akeranen/the-one) | `c973bfb`, OpenJDK 27 (Homebrew) | Batch mode (`bench/one/one.sh`). MaxProp needs `-Djava.util.Arrays.useLegacyMergeSort=true`: its comparator isn't transitive and Java 7+ TimSort rejects it. |
-| Mycel | this repository | `bench/mycel-bench`: `dtn-replay` and `route-check`. They link the real `mycel-net` code. |
+| [The ONE](https://github.com/akeranen/the-one) | `c973bfb`, OpenJDK 27 (Homebrew) | batch mode (`bench/one/one.sh`) |
+| Mycel | this repository | `bench/mycel-bench`: `dtn-replay` and `route-check` |
 
-**Contact traces.** These are real Bluetooth sightings between iMotes carried by people (CRAWDAD
-`cambridge/haggle`: Scott, Gass, Crowcroft, Hui, Diot, Chaintreau,
+`dtn-replay` and `route-check` link the real `mycel-net` code. MaxProp needs
+`-Djava.util.Arrays.useLegacyMergeSort=true`, which `one.sh` passes: its
+comparator isn't transitive and Java 7+ TimSort rejects it.
+
+### 2.2 Contact traces
+
+The traces are real Bluetooth sightings between iMotes carried by people
+(CRAWDAD `cambridge/haggle`: Scott, Gass, Crowcroft, Hui, Diot, Chaintreau,
 doi:10.15783/C70011). You download them yourself, under CRAWDAD's terms:
 cite the dataset, don't try to identify people, don't re-share it.
-`bench/fetch.sh` fetches the unmodified files (IEEE DataPort needs a login,
-so it takes them from the mobemu repository) into the gitignored
-`bench/data/`; they are never redistributed in this repository.
 
-| Trace | Devices | Contacts | Span | Median contact | Gateways (`-gw` variants) |
-|---|---:|---:|---:|---:|---|
-| `cambridge`: students in Cambridge (Exp. 2) | 12 | 2,614 | 126.6 h | 117 s | none |
-| `infocom2005`: conference (Exp. 3) | 41 | 16,738 | 70.6 h | 60 s | none |
-| `infocom2006`: conference (Exp. 6) | 98 | 142,306 | 93.7 h | 60 s | `infocom2006-gw`: the 17 static long-range iMotes have the internet |
-| `helsinki`: The ONE's default scenario (pedestrians, cars, trams), captured with `ConnectivityONEReport` | 126 | 31,643 | 12 h | 2.4 s | `helsinki-gw`: the 6 trams have the internet |
+`bench/fetch.sh` fetches the unmodified files into the gitignored
+`bench/data/`. IEEE DataPort needs a login, so it takes them from the mobemu
+repository. They are never redistributed in this repository.
+
+| Trace | What it is | Devices | Contacts | Span | Median contact |
+|---|---|---:|---:|---:|---:|
+| `cambridge` | students in Cambridge (Exp. 2) | 12 | 2,614 | 126.6 h | 117 s |
+| `infocom2005` | conference (Exp. 3) | 41 | 16,738 | 70.6 h | 60 s |
+| `infocom2006` | conference (Exp. 6) | 98 | 142,306 | 93.7 h | 60 s |
+| `helsinki` | The ONE's default scenario (pedestrians, cars, trams) | 126 | 31,643 | 12 h | 2.4 s |
+
+Two traces also have a `-gw` variant, in which some devices have the
+internet:
+
+- `infocom2006-gw`: the 17 static long-range iMotes have the internet;
+- `helsinki-gw`: the 6 trams have the internet.
 
 Contacts are internal iMotes only (external devices are dropped). The
-Helsinki movement is simulated once and then replayed as a trace, so every
-router, The ONE's included, sees exactly the same contacts.
+Helsinki movement is captured from The ONE with `ConnectivityONEReport`. It
+is simulated once and then replayed as a trace, so every router, The ONE's
+included, sees exactly the same contacts.
 
-**Workloads.** These are generated once by `bench/traces/convert.py workload`, seeded. The
-same message list goes to The ONE (as an external events file) and to
+### 2.3 Workloads
+
+Workloads are generated once by `bench/traces/convert.py workload`, seeded.
+The same message list goes to The ONE (as an external events file) and to
 Mycel.
 
 | Workload | Messages | Size | TTL | Links | Buffer |
@@ -91,81 +141,69 @@ Mycel.
 | `chat` | one every 25–35 s between random devices | 1–10 kB | 24 h | 250 kB/s | 5 MB |
 
 `heavy` is The ONE's `default_settings.txt` workload, its standard
-benchmark. `chat` is closer to what Mycel carries: chat-sized messages
-that have a day to arrive. Spray-and-Wait uses L = 4 copies, the same as
-Mycel's default (The ONE's default is 6). PRoPHET uses The ONE's
-parameters with a 30 s time unit.
+benchmark. `chat` is closer to what Mycel carries: chat-sized messages that
+have a day to arrive.
 
-**How Mycel is driven** (`bench/mycel-bench/src/dtn_replay.rs`): the real
-`Carrier` runs, and the harness around it models what The ONE's
-`ActiveRouter` does.
-- **Links:** a contact is a 250 kB/s link. A device takes part in one
-  transfer at a time. A transfer finishes after `size / speed` if the
-  contact lasts that long, otherwise it is aborted.
-  - Completion is applied at its exact time, before a contact that ends
-    later goes down. The ONE also updates every host at every event.
-  - The first round of results applied completions only at the next
-    1-second step. That aborted 40 ms chat transfers on 2-second contacts:
-    9,620 spurious aborts on Helsinki chat. It cost Mycel 4 points of
-    delivery on Helsinki heavy and 870 s of median latency on Helsinki
-    chat. All numbers here are from after that fix.
-- **Timing:** the carrier plans every second, as the real driver does
-  (`DTN_EVERY`). Summaries go out when a contact comes up and every 5 s
-  after that.
-- **Offers and resume, as on the node:** each bundle is offered before its
-  payload, and a device tries its planned hand-offs in order until one is
-  taken. An offer costs no link time here (it is a round trip, against
-  seconds of payload). A transfer cut when a contact ends leaves the bytes
-  that arrived with the receiver, and the next offer of that bundle sends
-  only the rest (`--no-resume` turns that off: The ONE's routers can't
-  resume).
-- **Live routes:** these come from a breadth-first search over the contacts
-  that are up now. `route-check` runs the real `Router` on the same traces
-  to check that shortcut. On 30 minutes of Infocom 2006, whenever a
-  multi-hop path existed, the router followed a working route 94.1% of the
-  time, so the shortcut slightly flatters Mycel. On Helsinki it was 71%,
-  but multi-hop paths existed only 160 times there.
+Spray-and-Wait uses L = 4 copies, the same as Mycel's default for bundles of
+256 KiB or more (The ONE's default is 6). PRoPHET uses The ONE's parameters
+with a 30 s time unit.
 
-Differences that matter when reading the tables:
-- **Full buffers.** The ONE's buffers drop the oldest messages when full,
-  including the sender's own. Mycel's carrier drops the carried bundles
-  that expire soonest, never the device's own, whose messages don't count
-  against the room it lends to others.
-- **Bundle size.** Mycel's real maximum is 256 KiB, and the node splits
-  bigger data. The replay raises it to 4 MiB so that one message is one
-  bundle, as in The ONE.
+### 2.4 How Mycel is driven
 
-## 2. Running it
+`bench/mycel-bench/src/dtn_replay.rs` runs the real `Carrier`. The harness
+around it models what The ONE's `ActiveRouter` does.
 
-```sh
-bench/fetch.sh                          # tools + traces (once)
-bench/one/one.sh build                  # compile The ONE (once)
-cargo build --profile replay -p mycel-bench   # speed-optimised (the release profile optimises for size)
-bench/run.py                            # every trace × workload, both sides; skips finished runs
-bench/run.py --routers mycel --force    # Mycel only, all traces: after changing mesh/dtn.rs
-bench/run.py --only helsinki --workloads heavy --routers mycel --force   # one case
-bench/run.py --summary-only             # rebuild bench/results/summary.{md,csv}
-bench/ablation.py                       # the carrier's policy knobs (§6.5), one variant at a time
-```
+A contact is a 250 kB/s link, and a device takes part in one transfer at a
+time. A transfer finishes after `size / speed` if the contact lasts that
+long; otherwise it is aborted. Completion is applied at its exact time,
+before a contact that ends later goes down. The ONE also updates every host
+at every event.
 
-`run.py` resumes a killed ONE batch: only routers without a finished report
-run again. Every run takes seconds to minutes except Infocom
-2006 with `chat`, where The ONE takes much longer:
-- Epidemic: about 30 min.
-- PRoPHET: about 20 min.
-- MaxProp: 73 min, and more than 2 h 23 min with gateways (not
-  finished).
+The exact time matters. The first round of results applied completions only
+at the next 1-second step. That aborted 40 ms chat transfers on 2-second
+contacts: 9,620 spurious aborts on Helsinki chat. It cost Mycel 4 points of
+delivery on Helsinki heavy and 870 s of median latency on Helsinki chat. All
+numbers here are from after that fix.
 
-Mycel's replay of all twelve runs takes under 5 minutes with 4 jobs
-(the slowest, Infocom 2006 with gateways, about 3 minutes).
+The carrier plans every second, as the real driver does (`DTN_EVERY`).
+Summaries go out when a contact comes up and every 5 s after that.
+
+Bundles are offered and resumed as on the node. Each bundle is offered
+before its payload, and a device tries its planned hand-offs in order until
+one is taken. An offer costs no link time here (it is a round trip, against
+seconds of payload). A transfer cut when a contact ends leaves the bytes
+that arrived with the receiver, and the next offer of that bundle sends only
+the rest. `--no-resume` turns that off: The ONE's routers can't resume.
+
+Live routes come from a breadth-first search over the contacts that are up
+now. `route-check` runs the real `Router` on the same traces to check that
+shortcut. On 30 minutes of Infocom 2006, whenever a multi-hop path existed,
+the router followed a working route 94.1% of the time, so the shortcut
+slightly flatters Mycel. On Helsinki it was 71%, but multi-hop paths existed
+only 160 times there.
+
+### 2.5 Differences between the two sides
+
+Two differences matter when reading the tables.
+
+Full buffers behave differently. The ONE's buffers drop the oldest messages
+when full, including the sender's own. Mycel's carrier drops the carried
+bundles that expire soonest, never the device's own, whose messages don't
+count against the room it lends to others.
+
+The bundle size is raised. Mycel's real maximum is 256 KiB, and the node
+splits bigger data. The replay raises it to 4 MiB so that one message is one
+bundle, as in The ONE.
 
 ## 3. Results: store-and-forward on real contact traces
 
-Bold rows are Mycel's carrier. "Overhead" is The
-ONE's ratio, (relayed − delivered) / delivered. Latency is over delivered
-messages only.
+The tables are as `bench/run.py` writes them to `bench/results/summary.md`;
+Mycel's rows are in bold there. "Overhead" is The ONE's ratio, (relayed −
+delivered) / delivered. Latency is over delivered messages only.
 
-**Heavy workload** (500 kB–1 MB, TTL 300 min)
+### 3.1 Heavy workload
+
+500 kB–1 MB messages, TTL 300 min.
 
 | Scenario | Router | Delivered | Latency avg (s) | Latency median (s) | Overhead | Hops avg |
 |---|---|---:|---:|---:|---:|---:|
@@ -206,7 +244,9 @@ messages only.
 | helsinki-gw | DirectDelivery | 31.9 % | 6544 | 5666 | 0.00 | 1.00 |
 | helsinki-gw | **Mycel** | 52.7 % | 4666 | 3404 | 9.70 | 2.46 |
 
-**Chat workload** (1–10 kB, TTL 24 h)
+### 3.2 Chat workload
+
+1–10 kB messages, TTL 24 h.
 
 | Scenario | Router | Delivered | Latency avg (s) | Latency median (s) | Overhead | Hops avg |
 |---|---|---:|---:|---:|---:|---:|
@@ -246,19 +286,23 @@ messages only.
 | helsinki-gw | DirectDelivery | 63.3 % | 8027 | 5383 | 0.00 | 1.00 |
 | helsinki-gw | **Mycel** | 96.0 % | 1898 | 1408 | 37.31 | 3.77 |
 
-- Infocom 2006 chat with gateways has no MaxProp row: it hadn't finished
-  after 2 h 23 min, so it was stopped. The same run without gateways took
-  73 min.
-- The ONE's PRoPHET and MaxProp vary by up to about a point between
-  identical runs (MaxProp on Infocom 2006 heavy: 38.8%, then 38.0%). Its
-  other routers and Mycel are deterministic.
+Infocom 2006 chat with gateways has no MaxProp row: it hadn't finished after
+2 h 23 min, so it was stopped. The same run without gateways took 73 min.
 
-**Latency over delivered messages flatters routers that drop messages.**
-In `heavy`, a 5 MB buffer holds 5–10 messages. The ONE's routers drop the
+The ONE's PRoPHET and MaxProp vary by up to about a point between identical
+runs (MaxProp on Infocom 2006 heavy: 38.8%, then 38.0%). Its other routers
+and Mycel are deterministic.
+
+### 3.3 Delivered within a time
+
+Latency over delivered messages flatters routers that drop messages. In
+`heavy`, a 5 MB buffer holds 5–10 messages. The ONE's routers drop the
 oldest when full, so the only messages they deliver are the ones whose
 destination turned up soon after. Mycel's medians count more messages that
-waited hours and still arrived. The fair comparison is the share of *all*
-created messages delivered within a time:
+waited hours and still arrived.
+
+The fair comparison is the share of all created messages delivered within a
+time:
 
 | Scenario | Workload | Router | ≤ 1 min | ≤ 10 min | ≤ 1 h |
 |---|---|---|---:|---:|---:|
@@ -326,208 +370,249 @@ created messages delivered within a time:
 | helsinki-gw | chat | DirectDelivery | 0.6 % | 5.1 % | 24.2 % |
 | helsinki-gw | chat | **Mycel** | 1.0 % | 14.6 % | 87.7 % |
 
-The ONE's chat runs on Infocom 2006 predate the per-message report, so
-only Mycel (and Direct Delivery with gateways) have rows there.
+The ONE's chat runs on Infocom 2006 predate the per-message report, so only
+Mycel (and Direct Delivery with gateways) have rows there.
 
-## 4. Limits
+## 4. What the results show
+
+Mycel is frugal and fast. Its overhead is 4.7–37 relays per delivered
+message, against 6–1,343 for The ONE's routers, and it delivers more:
+
+- Infocom 2006 heavy: 57.0% (43.0% within an hour) at overhead 7, against
+  MaxProp's 38.0% (30.0%) at 203.
+- Infocom 2006 chat: 83.2% at overhead 18, against MaxProp's 83.2% at 215.
+
+Gateways help Mycel and barely help The ONE's routers on the conference
+trace. Adding the 17 static gateways to Infocom 2006 heavy takes Mycel's
+median from 489 s to 200 s (206 s in §3.1, which is with the room-aware
+gradient of §6.5); MaxProp goes from 38.0% to 40.3%. The ONE's routers don't
+know those devices have the internet. Mycel's default route and internet
+gradient do. With fast-moving gateways (Helsinki's trams) the gradient costs
+Mycel instead
+([§6.5](#65-results-on-the-real-carrier-and-the-defaults)).
+
+Live routes are what the router really does. On Infocom 2006, `route-check`
+shows the real `Router` following a working multi-hop route 94.1% of the
+time one exists. Those hops count in the delivered messages' hop counts:
+3.6–4.4 on Infocom 2006, against 1.0–2.1 for Direct Delivery and
+Spray-and-Wait.
+
+## 5. Limitations
+
+This benchmark replays recorded contacts through a harness. It does not run
+devices, radios or the node.
+
+For Mycel, the real code is the carrier (`mesh/dtn.rs`). Everything around
+it is the harness's model ([§2.4](#24-how-mycel-is-driven)): links, live
+routes, and the driver that the node has in `mesh/mod.rs`. The limits that
+follow from that:
 
 - The contact traces are old: iMotes sampled every 120 s, from 2005–2006.
   Contacts shorter than a scan are invisible, so phones today meet more
   often than these traces show.
 - Links are 250 kB/s with no loss, no contention between parallel contacts,
-  and one transfer per device at a time, as in The ONE. Real BLE L2CAP
-  gives ~40–100 kB/s, and AWDL gives far more.
+  and one transfer per device at a time, as in The ONE. Real BLE L2CAP gives
+  ~40–100 kB/s, and AWDL gives far more.
 - In the `-gw` variants, "the internet" is an always-up clique of 250 kB/s
   links between the gateways. Both sides get it: The ONE as permanent
   connections at t = 0, Mycel through the same `--gateways` list. Mycel
   additionally knows these devices have the internet (P = 1 toward
   `INTERNET`, plus a default route toward the nearest one). The ONE's
   routers only see them as well connected.
-- Mycel is run with signatures off (closures that return true). Its CPU
-  cost is not part of these numbers.
+- Mycel is run with signatures off (closures that return true). Its CPU cost
+  is not part of these numbers.
 - Offers cost no link time in the replay. On a real link each is a round
   trip (tens of milliseconds over BLE); Mycel makes 1.0–1.5 offers per
   transfer it starts (`offers` and `started` in each run's output).
-
-## 5. What it shows
-
-- **Frugal and fast.** Mycel's overhead is 4.7–37 relays per
-  delivered message, against 6–1,343 for The ONE's routers, and it
-  delivers more:
-  - Infocom 2006 heavy: 57.0% (43.0% within an hour) at overhead 7, against
-    MaxProp's 38.0% (30.0%) at 203.
-  - Infocom 2006 chat: 83.2% at overhead 18, against MaxProp's 83.2% at 215.
-- **Gateways help Mycel and barely help The ONE's routers** on the
-  conference trace. Adding the 17 static gateways to Infocom 2006 heavy
-  takes Mycel's median from 489 s to 200 s; MaxProp goes from 38.0% to
-  40.3%. The ONE's routers don't know those devices have the internet.
-  Mycel's default route and internet gradient do. With fast-moving
-  gateways (Helsinki's trams) the gradient costs Mycel instead (§6.5).
-- **Live routes are what the router really does.** On Infocom 2006,
-  `route-check` shows the real `Router` following a working multi-hop
-  route 94.1% of the time one exists. Those hops count in the delivered
-  messages' hop counts: 3.6–4.4 on Infocom 2006, against 1.0–2.1 for
-  Direct Delivery and Spray-and-Wait.
+- Live routes are a shortcut that slightly flatters Mycel
+  ([§2.4](#24-how-mycel-is-driven)).
+- Mycel resumes cut transfers and The ONE's routers can't. The "No resume"
+  column in [§6.5](#65-results-on-the-real-carrier-and-the-defaults) shows
+  what that is worth.
+- Each trace and workload has one seeded message list, so the tables say
+  nothing about variation between message lists.
 
 ## 6. Where Mycel lost, why, and the fix
 
-**All of this is now applied** to the real carrier (`mesh/dtn.rs`) and
-the node's protocol (`mesh/mod.rs`); §6.5 has the results and the choice
-of defaults. §6.1–6.4 keep the diagnosis as it was made: an experimental
-copy of the carrier with each fix behind a switch, measured one at a time
-on the same traces (`bench/results/ablation/`, the historical record).
-The copy is retired; the policy choices that remain are `DtnConfig`
-knobs, measured with `bench/ablation.py` into `bench/results/knobs/`.
+All of this is now applied to the real carrier (`mesh/dtn.rs`) and the
+node's protocol (`mesh/mod.rs`).
+[§6.5](#65-results-on-the-real-carrier-and-the-defaults) has the results and
+the choice of defaults.
+
+§6.1–6.4 keep the diagnosis as it was made: an experimental copy of the
+carrier with each fix behind a switch, measured one at a time on the same
+traces. `bench/results/ablation/` is that historical record. The copy is
+retired. The policy choices that remain are `DtnConfig` knobs, measured with
+`bench/ablation.py` into `bench/results/knobs/`.
+
+Two things to know when reading §6.1–6.4. The switch `all` means the four
+fixes of §6.1 together. Code names such as `store` and `mine == 0.0` are
+from the carrier as it was diagnosed, and some no longer exist.
 
 ### 6.1 Big messages: refusals livelock the links (the heavy workload)
 
-**Symptom.** With 500 kB–1 MB messages, Mycel delivers about as many
-messages as the best ONE router, but far later:
+With 500 kB–1 MB messages, Mycel delivered about as many messages as the
+best ONE router, but far later:
 
 | Heavy workload | Mycel median | ONE routers' medians | Delivered within 1 h (all messages) |
 |---|---:|---:|---|
 | Cambridge | 1,395 s | 9–38 s | Mycel 5.7%; every ONE router 6.4–8.8%, Direct Delivery included |
 | Infocom 2005 | 6,370 s | 415–1,953 s | Mycel 7.7%; ONE routers 6.4–16.8% |
 
-**Evidence.** Almost every transfer Mycel starts is refused by the
-receiver after it has crossed the link:
+Almost every transfer Mycel started was refused by the receiver after it had
+crossed the link:
 
-| | Transfers started | Refused ("store full") | Accepted by a carrier |
+| Run | Transfers started | Refused ("store full") | Accepted by a carrier |
 |---|---:|---:|---:|
 | Cambridge, heavy | 155,359 | 152,573 (98%) | 271 |
 | Infocom 2005, heavy | 443,137 | 437,303 (99%) | 742 |
 | Infocom 2006, heavy | 1,377,615 | 1,344,330 (98%) | 18,782 |
 | Infocom 2006 with gateways, heavy | 891,870 | 848,249 (95%) | 32,749 |
 
-**Causes**, all in `mesh/dtn.rs` plus the driver in `mesh/mod.rs`:
-1. **The refusal comes only after the whole payload has been sent.** The
-   driver sends the whole bundle (`send_bundle`), the receiver reads
-   it to the end (`on_bundle_stream`) and only then calls `accept`. Each
-   refusal costs a full 2–4 s transfer of link time, and keeps both
-   devices busy so they can't deliver anything else.
-2. **The same refused bundle is sent again a second later.** `transferred(ok
-   = false)` clears `in_flight`, and nothing remembers that the neighbour
-   is full. The result is a livelock: the link spends its time carrying
-   bundles that will be refused.
-3. **The neighbour is full because of its own messages.** `store` adds a
-   device's own bundles to `used` (the space it lends to others) without
-   any check. They stay there for their whole lifetime, so a device with a
-   backlog of its own messages refuses everyone else's, permanently.
-4. **Lifetimes restart at every hop.** `store` sets `until = now +
-   lifetime`, not `created + lifetime`. Stale bundles keep using space,
-   and the real node then refuses them at the next hop
-   (`verify_bundle` checks `created + lifetime > wall_ms()`), again after
-   the whole transfer. In the replay this shows up as deliveries after the
-   TTL.
+There were four causes, all in `mesh/dtn.rs` and the driver in
+`mesh/mod.rs`:
 
-**Fixes** (switches in the experimental copy; how they were applied is
-in each item):
-- **`free`** (causes 1 and 2): summaries say how much room is left. The
-  planner doesn't send to a neighbour without room for the bundle, unless
-  that neighbour is the destination. A refusal marks the neighbour as full
-  until its next summary. In `mesh/mod.rs` the same idea becomes an offer
-  before the payload: send (id, size, copies, expiry) and wait for
-  accept or refuse. BPv7 custody signalling does the same.
-  *Applied:* `Carrier::offered` answers take (from an offset), duplicate
-  or refuse before any payload; summaries carry `free` and `evictable`
-  (soonest-expiring carried bundles, relative times); a refusal for lack
-  of room stops offers to that neighbour until its next summary.
-- **`own`** (cause 3): a device's own bundles use their own quota, not the
-  space it lends to others. *Applied* (by the simulator work first).
-- **`expiry`** (cause 4): a carrier expires a bundle at `created + lifetime`.
-  On the real node that means converting through `wall_ms()`, with a bound
-  on clock skew, or using a BPv7 Bundle Age block, which needs no clocks.
-  *Applied:* `Carrier::set_clock` gives the carrier its wall-clock
-  offset; a bundle expires at `created + lifetime`, and never later than
-  one lifetime after it arrived, whatever the source's clock says.
-- **`resume`**: an interrupted transfer keeps the bytes that arrived, and
-  the next attempt to the same device sends only the rest. Mycel's file
-  transfers already work this way (`.part` + `.ranges`), and BPv7 calls it
-  reactive fragmentation. Splitting bundles at 256 KiB, as the real node
-  does, gets part of the benefit. *Applied:* `Carrier::keep_partial`
-  keeps a cut transfer's bytes for 5 minutes (at most a quarter of the
-  store, two bundles' worth per source), and the next offer of that
-  bundle, from any carrier, is answered from that offset; the id is
-  checked when the last byte arrives.
+1. The refusal came only after the whole payload had been sent. The driver
+   sent the whole bundle (`send_bundle`), the receiver read it to the end
+   (`on_bundle_stream`) and only then called `accept`. Each refusal cost a
+   full 2–4 s transfer of link time, and kept both devices busy so they
+   couldn't deliver anything else.
+2. The same refused bundle was sent again a second later. `transferred(ok =
+   false)` cleared `in_flight`, and nothing remembered that the neighbour
+   was full. The result was a livelock: the link spent its time carrying
+   bundles that would be refused.
+3. The neighbour was full because of its own messages. `store` added a
+   device's own bundles to `used` (the space it lends to others) without any
+   check. They stayed there for their whole lifetime, so a device with a
+   backlog of its own messages refused everyone else's, permanently.
+4. Lifetimes restarted at every hop. `store` set `until = now + lifetime`,
+   not `created + lifetime`. Stale bundles kept using space, and the real
+   node then refused them at the next hop (`verify_bundle` checks `created +
+   lifetime > wall_ms()`), again after the whole transfer. In the replay
+   this showed up as deliveries after the TTL.
+
+There were four fixes. Each is named after its switch in the experimental
+copy, and each is applied.
+
+`free` answers causes 1 and 2. Summaries say how much room is left. The
+planner doesn't send to a neighbour without room for the bundle, unless that
+neighbour is the destination. A refusal marks the neighbour as full until
+its next summary. In `mesh/mod.rs` the same idea becomes an offer before the
+payload: send (id, size, copies, expiry) and wait for accept or refuse. BPv7
+custody signalling does the same.
+
+As applied, `Carrier::offered` answers take (from an offset), duplicate or
+refuse before any payload. Summaries carry `free` and `evictable`
+(soonest-expiring carried bundles, relative times). A refusal for lack of
+room stops offers to that neighbour until its next summary.
+
+`own` answers cause 3. A device's own bundles use their own quota, not the
+space it lends to others. It was applied by the simulator work first.
+
+`expiry` answers cause 4. A carrier expires a bundle at `created +
+lifetime`. On the real node that means converting through `wall_ms()`, with
+a bound on clock skew, or using a BPv7 Bundle Age block, which needs no
+clocks.
+
+As applied, `Carrier::set_clock` gives the carrier its wall-clock offset. A
+bundle expires at `created + lifetime`, and never later than one lifetime
+after it arrived, whatever the source's clock says.
+
+`resume` keeps the bytes of an interrupted transfer, and the next attempt to
+the same device sends only the rest. Mycel's file transfers already work
+this way (`.part` + `.ranges`), and BPv7 calls it reactive fragmentation.
+Splitting bundles at 256 KiB, as the real node does, gets part of the
+benefit.
+
+As applied, `Carrier::keep_partial` keeps a cut transfer's bytes for 5
+minutes (at most a quarter of the store, two bundles' worth per source). The
+next offer of that bundle, from any carrier, is answered from that offset.
+The id is checked when the last byte arrives.
 
 ### 6.2 Short contacts: Helsinki
 
-**Symptom.** Helsinki is pedestrians, cars and trams. Its median contact
-lasts 2.4 s, and 73% of contacts are shorter than the 4 s a 1 MB bundle
-needs at 250 kB/s. On the heavy workload Mycel delivers 30.4%, against
-44.5% for Spray-and-Wait and 47.4% for MaxProp. Direct Delivery manages
-31.7% by doing nothing, so Mycel is no better than not routing at all.
+Helsinki is pedestrians, cars and trams. Its median contact lasts 2.4 s, and
+73% of contacts are shorter than the 4 s a 1 MB bundle needs at 250 kB/s. On
+the heavy workload Mycel delivered 30.4%, against 44.5% for Spray-and-Wait
+and 47.4% for MaxProp. Direct Delivery manages 31.7% by doing nothing, so
+Mycel was no better than not routing at all.
 
-**Evidence.**
-- 57% of Mycel's transfers are aborted when the contact ends (22,699 of
-  39,773), and 35% are refused (13,974).
+The evidence:
+
+- 57% of Mycel's transfers were aborted when the contact ended (22,699 of
+  39,773), and 35% were refused (13,974).
 - Spray-and-Wait starts 14,086 transfers in total.
-- Almost all of Mycel's transfers (38,018) follow the predictability
-  gradient. That gradient means little in movement without social
-  structure (§6.3).
+- Almost all of Mycel's transfers (38,018) followed the predictability
+  gradient. That gradient means little in movement without social structure
+  ([§6.3](#63-copies-dont-spread-and-the-destination-gradient-wanders)).
 
-**Causes and fixes.** The refusal livelock of §6.1 accounts for part of the
-gap: `free` alone takes delivery to 45.2%. Lost progress on cut transfers
-accounts for the rest: `resume` alone takes it to 43.3%. With all four
-fixes Mycel delivers 66.3%, against 47.4% for the best ONE router.
-- The ONE's routers can't resume, so `resume` is an advantage they don't
-  have. Without it, `own,free,expiry` reaches 49.5%, still above MaxProp.
+The refusal livelock of §6.1 accounts for part of the gap: `free` alone
+takes delivery to 45.2%. Lost progress on cut transfers accounts for the
+rest: `resume` alone takes it to 43.3%. With all four fixes Mycel delivers
+66.3%, against 47.4% for the best ONE router.
+
+The ONE's routers can't resume, so `resume` is an advantage they don't have.
+Without it, `own,free,expiry` reaches 49.5%, still above MaxProp.
 
 ### 6.3 Copies don't spread, and the destination gradient wanders
 
-**Symptom.** On Helsinki, Mycel is slower than Spray-and-Wait. Even with
-all four fixes, 15% of heavy messages arrive within an hour, against
-30.5%. With chat-sized messages the median is 3,116 s, against 2,214 s
-for Spray-and-Wait, at 5× the transmissions (overhead 17.8 vs 3.2).
+On Helsinki, Mycel was slower than Spray-and-Wait. Even with all four fixes,
+15% of heavy messages arrived within an hour, against 30.5%. With chat-sized
+messages the median was 3,116 s, against 2,214 s for Spray-and-Wait, at 5×
+the transmissions (overhead 17.8 vs 3.2).
 
-**Evidence.** On Helsinki chat, Mycel made 68 spray transfers and 22,461
-gradient transfers. The carrier sprays only when its utility for the
-destination is exactly zero (`mine == 0.0`). After a few encounters, the
-transitive PRoPHET update (β = 0.9) gives nearly every device some
-predictability for nearly every destination, so Spray-and-Wait almost
-never runs.
-- The 4 copies go only to "better" neighbours.
-- Single copies move with custody along a gradient that, in random
+On Helsinki chat, Mycel made 68 spray transfers and 22,461 gradient
+transfers. The carrier sprayed only when its utility for the destination was
+exactly zero (`mine == 0.0`). After a few encounters, the transitive PRoPHET
+update (β = 0.9) gives nearly every device some predictability for nearly
+every destination, so Spray-and-Wait almost never ran. As a result:
+
+- The 4 copies went only to "better" neighbours.
+- Single copies moved with custody along a gradient that, in random
   movement, doesn't point anywhere.
-- The `nograd` diagnostic (spray-first, no gradient at all) brings
-  Helsinki chat to 2,272 s at overhead 3.3, the same as Spray-and-Wait.
+- The `nograd` diagnostic (spray-first, no gradient at all) brings Helsinki
+  chat to 2,272 s at overhead 3.3, the same as Spray-and-Wait.
 
-**Fixes.**
-- **`spray`**: while a bundle has more than one copy, hand half of them to
-  the most useful neighbour that lacks it, whether or not it is better
-  than us. The gradient then moves single copies only.
+The fixes:
+
+- `spray`: while a bundle has more than one copy, hand half of them to the
+  most useful neighbour that lacks it, whether or not it is better than us.
+  The gradient then moves single copies only.
 - `fallback`, which sprays only when no neighbour is clearly better, is
   within 2.5 points of `spray` on every trace.
-- **`inet`**: the single-copy gradient follows predictability for the
-  internet only, not for the destination. The internet is the gradient's
-  purpose in ROUTING.md §7.2. Without gateways, `inet` is the same as no
+- `inet`: the single-copy gradient follows predictability for the internet
+  only, not for the destination. The internet is the gradient's purpose in
+  [ROUTING.md](ROUTING.md). Without gateways, `inet` is the same as no
   gradient.
 
-**It depends on movement, and on `evict` (§6.4).**
-- On Infocom 2006 (98 people with social structure), `spray` without
-  `evict` *hurts*: delivery falls from 51.1% to 46.6%, and from 30.3% to
-  26.8% within an hour. Copies sprayed into full stores crowd out the
-  gradient's better choices.
-- With `evict`, the difference disappears: 55.6% for `all,evict`
-  against 54.4% for `all,spray,evict`, both 43% within an hour.
+The effect depends on movement, and on `evict`
+([§6.4](#64-speed-versus-completeness-when-stores-fill)):
+
+- On Infocom 2006 (98 people with social structure), `spray` without `evict`
+  hurts: delivery falls from 51.1% to 46.6%, and from 30.3% to 26.8% within
+  an hour. Copies sprayed into full stores crowd out the gradient's better
+  choices.
+- With `evict`, the difference disappears: 55.6% for `all,evict` against
+  54.4% for `all,spray,evict`, both 43% within an hour.
 - On Helsinki, spray-first plus `inet` is what closes the gap: 73.1%
   delivered and 34.6% within 1 h, against 44.5% and 30.5% for
   Spray-and-Wait.
 
-**The gradient toward the internet, with fast-moving gateways.**
-- On Helsinki-gw, 6 trams with 5 MB stores are the only gateways.
-  Climbing toward them funnels heavy bundles into tiny stores: 39.6%
-  delivered with `inet`, against 63.4% with no gradient.
-- With chat-sized bundles the same gradient helps: 67.1% within 1 h,
-  against 65.5% with no gradient.
-- Real gateways have 64 MiB stores and real uplinks, so this bench is
-  the worst case. The simulator's partition and disaster scenarios, where
-  the gradient is meant to pay off, decided the default (§6.5).
+The gradient toward the internet does badly with fast-moving gateways:
 
-**Chat needs more copies.** On Helsinki chat, MaxProp delivers 98% within
-an hour by copying everywhere, at overhead 90. Four copies cap Mycel at
-61%. Small bundles are cheap to copy, so the copy budget should depend on
-size. `all,spray,evict,inet` with `--copies`:
+- On Helsinki-gw, 6 trams with 5 MB stores are the only gateways. Climbing
+  toward them funnels heavy bundles into tiny stores: 39.6% delivered with
+  `inet`, against 63.4% with no gradient.
+- With chat-sized bundles the same gradient helps: 67.1% within 1 h, against
+  65.5% with no gradient.
+- Real gateways have 64 MiB stores and real uplinks, so this bench is the
+  worst case. The simulator's partition and disaster scenarios, where the
+  gradient is meant to pay off, decided the default (§6.5).
+
+Chat needs more copies. On Helsinki chat, MaxProp delivers 98% within an
+hour by copying everywhere, at overhead 90. Four copies cap Mycel at 61%.
+Small bundles are cheap to copy, so the copy budget should depend on size.
+`all,spray,evict,inet` with `--copies`:
 
 | Helsinki chat | Delivered | ≤ 10 min | ≤ 1 h | Overhead |
 |---|---:|---:|---:|---:|
@@ -538,40 +623,39 @@ size. `all,spray,evict,inet` with `--copies`:
 | MaxProp | 98.1 % | 28.0 % | 98.0 % | 90.4 |
 | Epidemic | 87.8 % | 15.8 % | 79.6 % | 182.8 |
 
-On the conference traces more copies don't help. Infocom 2005 gains 1
-point at 32 copies. Cambridge, whose 12 devices share small stores, loses
-3 points.
-A budget such as 32 copies for bundles of 16 KiB or less, falling to 4 at
-256 KiB, gives chat MaxProp-like speed at a third of its overhead.
+On the conference traces more copies don't help. Infocom 2005 gains 1 point
+at 32 copies. Cambridge, whose 12 devices share small stores, loses 3
+points. A budget such as 32 copies for bundles of 16 KiB or less, falling to
+4 at 256 KiB, gives chat MaxProp-like speed at a third of its overhead.
 
-These rows come from the retired experimental copy (`bench/results/ablation/`).
-On the real carrier the same choice is the `copies_small` knob, measured in §6.5.
+These rows come from the retired experimental copy
+(`bench/results/ablation/`). On the real carrier the same choice is the
+`copies_small` knob, measured in §6.5.
 
 ### 6.4 Speed versus completeness when stores fill
 
-**Symptom.** With the fixes above, Mycel delivers far more in total, but
-fresh messages still arrive later than with the best ONE router. On
-Infocom 2005 heavy with `all`, 15.3% arrive within an hour, against
-16.8% for MaxProp.
+With the fixes above, Mycel delivered far more in total, but fresh messages
+still arrived later than with the best ONE router. On Infocom 2005 heavy
+with `all`, 15.3% arrived within an hour, against 16.8% for MaxProp.
 
-**Cause.** A full Mycel store refuses new bundles and keeps old ones until
-they expire. The ONE's routers drop their oldest message to take a new one,
+The cause: a full Mycel store refused new bundles and kept old ones until
+they expired. The ONE's routers drop their oldest message to take a new one,
 which favours messages young enough to still arrive soon.
 
-**Fix: `evict`.** When the store is full, drop the carried bundles that
+The fix is `evict`. When the store is full, drop the carried bundles that
 expire soonest, never one of the device's own, to make room for one that
 expires later. If its source is over its share, its own older bundles go
-first. *Applied*, including the per-source order; nothing is dropped
+first. It is applied, including the per-source order; nothing is dropped
 unless that makes room.
-- For senders to avoid sending what would be refused, a summary also
-  lists the receiver's soonest-expiring carried bundles (expiry, size; up
-  to 32).
+
+- For senders to avoid sending what would be refused, a summary also lists
+  the receiver's soonest-expiring carried bundles (expiry, size; up to 32).
 - Two earlier versions of this switch brought back tens of thousands of
   refusals (87,000 on Cambridge). One checked the per-source share before
-  evicting; the other advertised all carried bytes as room. `refused_by`
-  in the replay output is how that showed up.
+  evicting; the other advertised all carried bytes as room. `refused_by` in
+  the replay output is how that showed up.
 
-**Effect.** On the conference traces `evict` is the biggest speed gain:
+On the conference traces `evict` is the biggest speed gain:
 
 | Trace | Within 1 h, `all` → `all,evict` | Best ONE router |
 |---|---|---|
@@ -579,79 +663,133 @@ unless that makes room.
 | Infocom 2006 | 30.3% → 43.0% | 30.0% |
 
 It costs total delivery wherever stores overflow:
+
 - Cambridge: 16.4% → 14.5%
 - Infocom 2005: 35.8% → 29.9%
 - Helsinki without spray-first: 66.3% → 49.3%
 
-That trade is a policy choice: fresh-first suits chat, keep-everything
-suits files.
+That trade is a policy choice: fresh-first suits chat, keep-everything suits
+files.
 
 ### 6.5 Results on the real carrier, and the defaults
 
 Every row is the real carrier (`dtn-replay --knobs`), with the mechanics
 above always on. The variants differ in policy only: how copies spread
 (`spray`) and what the single copy's gradient measures (`gradient`).
-`bench/results/knobs/knobs.md` has the full grid, chat and per-variant
-offer and cut counts included.
+`bench/results/knobs/knobs.md` has the full grid, chat and per-variant offer
+and cut counts included.
 
-| Trace | Default: spray-first, internet gradient | Spray-and-Focus, max(P(dst), P(internet)) (the simulator's first choice) | Spray-first, max(P(dst), P(internet)) | Spray-first, no gradient | 4 copies whatever the size | No resume |
+Cells are delivered / delivered within an hour, as shares of all messages
+created. The columns are the variants of `bench/ablation.py`:
+
+- `default`: spray-first, internet gradient;
+- `focus-both`: Spray-and-Focus, max(P(dst), P(internet)), the simulator's
+  first choice;
+- `first-both`: spray-first, max(P(dst), P(internet));
+- `first-off`: spray-first, no gradient;
+- `copies-4`: 4 copies whatever the size;
+- `no-resume`: no resume.
+
+| Trace | `default` | `focus-both` | `first-both` | `first-off` | `copies-4` | `no-resume` |
 |---|---|---|---|---|---|---|
-| cambridge heavy | **14.8 %** / 10.6 % | 14.2 % / 10.7 % | 14.3 % / 10.6 % | 14.8 % / 10.6 % | 14.8 % / 10.6 % | 14.8 % / 10.6 % |
-| infocom2005 heavy | **32.1 %** / 22.1 % | 28.1 % / 21.6 % | 28.3 % / 21.6 % | 32.1 % / 22.1 % | 32.1 % / 22.1 % | 32.1 % / 22.1 % |
-| infocom2006 heavy | **57.0 %** / 43.0 % | 54.5 % / 43.1 % | 55.0 % / 43.4 % | 57.0 % / 43.0 % | 57.0 % / 43.0 % | 57.0 % / 43.0 % |
-| infocom2006-gw heavy | **58.3 %** / 48.2 % | 58.3 % / 48.1 % | 58.4 % / 48.2 % | 58.3 % / 48.1 % | 58.3 % / 48.2 % | 58.4 % / 48.3 % |
-| helsinki heavy | **62.9 %** / 30.5 % | 39.5 % / 16.9 % | 34.6 % / 19.4 % | 62.9 % / 30.5 % | 62.9 % / 30.5 % | 58.1 % / 25.7 % |
-| helsinki-gw heavy | 37.2 % / 24.3 % | 35.3 % / 20.2 % | 35.0 % / 21.4 % | **55.0 %** / 28.9 % | 37.2 % / 24.3 % | 35.9 % / 21.2 % |
-| helsinki chat | **97.2 %** / 94.4 % | 94.5 % / 79.4 % | 96.3 % / 89.2 % | 97.2 % / 94.4 % | 91.3 % / 60.7 % | 97.2 % / 94.4 % |
+| cambridge heavy | 14.8 % / 10.6 % | 14.2 % / 10.7 % | 14.3 % / 10.6 % | 14.8 % / 10.6 % | 14.8 % / 10.6 % | 14.8 % / 10.6 % |
+| infocom2005 heavy | 32.1 % / 22.1 % | 28.1 % / 21.6 % | 28.3 % / 21.6 % | 32.1 % / 22.1 % | 32.1 % / 22.1 % | 32.1 % / 22.1 % |
+| infocom2006 heavy | 57.0 % / 43.0 % | 54.5 % / 43.1 % | 55.0 % / 43.4 % | 57.0 % / 43.0 % | 57.0 % / 43.0 % | 57.0 % / 43.0 % |
+| infocom2006-gw heavy | 58.3 % / 48.2 % | 58.3 % / 48.1 % | 58.4 % / 48.2 % | 58.3 % / 48.1 % | 58.3 % / 48.2 % | 58.4 % / 48.3 % |
+| helsinki heavy | 62.9 % / 30.5 % | 39.5 % / 16.9 % | 34.6 % / 19.4 % | 62.9 % / 30.5 % | 62.9 % / 30.5 % | 58.1 % / 25.7 % |
+| helsinki-gw heavy | 37.2 % / 24.3 % | 35.3 % / 20.2 % | 35.0 % / 21.4 % | 55.0 % / 28.9 % | 37.2 % / 24.3 % | 35.9 % / 21.2 % |
+| helsinki chat | 97.2 % / 94.4 % | 94.5 % / 79.4 % | 96.3 % / 89.2 % | 97.2 % / 94.4 % | 91.3 % / 60.7 % | 97.2 % / 94.4 % |
 | helsinki-gw chat | 96.0 % / 87.7 % | 95.3 % / 83.0 % | 95.0 % / 86.1 % | 95.7 % / 88.6 % | 92.4 % / 68.7 % | 96.0 % / 87.7 % |
 | infocom2006 chat | 83.2 % / 46.9 % | 83.3 % / 46.5 % | 83.3 % / 47.2 % | 83.2 % / 46.9 % | 83.0 % / 45.8 % | 83.2 % / 46.9 % |
 
-Cells are delivered / delivered within an hour, as shares of all messages
-created. Without gateways, "internet gradient" and "no gradient" are the
-same thing (nobody has the internet), and spray-first and fallback (spray
-only when no neighbour is clearly better) coincide.
+Without gateways, "internet gradient" and "no gradient" are the same thing
+(nobody has the internet), and spray-first and fallback (spray only when no
+neighbour is clearly better) coincide.
 
-**The defaults, and why:**
-- **Spray-first** (`Spray::First`): while a bundle has copies to spare,
-  half go to the likeliest neighbour without one, better than us or not.
-  It wins or ties everywhere. Spray-and-Focus, which the simulator had first
-  chosen, only sprays to neighbours no worse than us; on Helsinki, where
-  movement has no social structure, that keeps copies where they are
-  (39.5% against 62.9% heavy, 79% against 94% of chat within an hour).
-- **The single copy follows predictability toward the internet only**
-  (`Gradient::Internet`; for the destination itself once the internet has
-  proved not to reach it). Following predictability for the destination
-  costs 2–4 points of heavy delivery on the conference traces and 28 on
-  Helsinki. Following nothing ties on the conference traces and wins on
-  Helsinki with gateways (55.0% against 37.2%), but loses 13 points in the
-  simulator's disaster zone (77% against 90% within 3 h, mean of 5 seeds,
-  `docs/SIMULATION.md`), and getting a message out of a partition toward
-  the internet is what the gradient is for (`docs/ROUTING.md` §7.2). The
-  trams are the worst case for it: fast-moving gateways with tiny stores.
-- **The gradient weighs room** (`room_aware`, on; `room=on|off`). A
-  neighbour whose summary shows free room for fewer than 4 more bundles of
-  this size counts in proportion: its utility is multiplied by
-  free / (4 × size).
-  - Helsinki with gateways, heavy: 37.2% → 52.7% delivered, 24.3% → 27.7%
-    within an hour, and overhead 19.4 → 9.7.
-  - Infocom 2006 with gateways, heavy: 58.3% → 58.5%.
-  - Every other trace and workload: identical. Without gateways, the
-    internet gradient has nothing to climb.
-  - `disaster-dtn` in the simulator: identical (stores never fill there).
-  - The rows above are with it on. The table's Helsinki-gw default column
-    (37.2%) was before it.
-- **Copies by size** (`copies_small` 32 at 16 KiB or less, `copies` 4 at
-  256 KiB or more, geometric in between): chat within an hour on Helsinki
-  goes from 60.7% to 94.4% (with gateways 68.7% to 87.7%), at 3–8× the
-  transmissions. Heavy bundles keep 4 copies. On the conference traces
-  more copies change little.
-- **Resume** is worth 5 points of heavy delivery on Helsinki (2.4 s median
-  contacts) and nothing where contacts are long.
+The `default` column predates the room-aware gradient (below) for the two
+rows it changes: Helsinki-gw heavy (37.2%) and Infocom 2006-gw heavy
+(58.3%). The tables in §1 and §3 are with it on.
 
-To reproduce one cell:
+Spray-first (`Spray::First`) is the default. While a bundle has copies to
+spare, half go to the likeliest neighbour without one, better than us or
+not. It wins or ties everywhere. Spray-and-Focus, which the simulator had
+first chosen, only sprays to neighbours no worse than us. On Helsinki, where
+movement has no social structure, that keeps copies where they are: 39.5%
+against 62.9% heavy, 79% against 94% of chat within an hour.
+
+The single copy follows predictability toward the internet only
+(`Gradient::Internet`; for the destination itself once the internet has
+proved not to reach it). The alternatives:
+
+- Following predictability for the destination costs 2–4 points of heavy
+  delivery on the conference traces and 28 on Helsinki.
+- Following nothing ties on the conference traces and wins on Helsinki with
+  gateways (55.0% against 37.2%), but loses 13 points in the simulator's
+  disaster zone (77% against 90% within 3 h, mean of 5 seeds;
+  [SIMULATION.md §4](SIMULATION.md#4-findings), fixed 8).
+
+Getting a message out of a partition toward the internet is what the
+gradient is for ([ROUTING.md](ROUTING.md)). The trams are the worst case for
+it: fast-moving gateways with tiny stores.
+
+The gradient weighs room (`room_aware`, on by default; `room=on|off`). A
+neighbour whose summary shows free room for fewer than 4 more bundles of
+this size counts in proportion: its utility is multiplied by free / (4 ×
+size).
+
+- Helsinki with gateways, heavy: 37.2% → 52.7% delivered, 24.3% → 27.7%
+  within an hour, and overhead 19.4 → 9.7.
+- Infocom 2006 with gateways, heavy: 58.3% → 58.5%.
+- Every other trace and workload: identical. Without gateways, the internet
+  gradient has nothing to climb.
+- `disaster-dtn` in the simulator: identical (stores never fill there).
+
+Copies go by size: `copies_small` is 32 at 16 KiB or less, `copies` is 4 at
+256 KiB or more, geometric in between. Chat within an hour on Helsinki goes
+from 60.7% to 94.4% (with gateways 68.7% to 87.7%), at 3–8× the
+transmissions. Heavy bundles keep 4 copies. On the conference traces more
+copies change little.
+
+Resume is worth 5 points of heavy delivery on Helsinki (2.4 s median
+contacts) and nothing where contacts are long.
+
+## 7. Reproducing the results
+
+```sh
+bench/fetch.sh                          # tools + traces (once)
+bench/one/one.sh build                  # compile The ONE (once)
+cargo build --profile replay -p mycel-bench   # speed-optimised (the release profile optimises for size)
+bench/run.py                            # every trace × workload, both sides; skips finished runs
+bench/run.py --routers mycel --force    # Mycel only, all traces: after changing mesh/dtn.rs
+bench/run.py --only helsinki --workloads heavy --routers mycel --force   # one case
+bench/run.py --summary-only             # rebuild bench/results/summary.{md,csv}
+bench/ablation.py                       # the carrier's policy knobs (§6.5), one variant at a time
+```
+
+`run.py` resumes a killed ONE batch: only routers without a finished report
+run again. Every run takes seconds to minutes except Infocom 2006 with
+`chat`, where The ONE takes much longer:
+
+- Epidemic: about 30 min.
+- PRoPHET: about 20 min.
+- MaxProp: 73 min, and more than 2 h 23 min with gateways (not finished).
+
+Mycel's replay of all twelve runs takes under 5 minutes with 4 jobs (the
+slowest, Infocom 2006 with gateways, about 3 minutes).
+
+`bench/ablation.py` needs the inputs that `bench/run.py` makes, so run that
+first. To reproduce one cell of the table in
+[§6.5](#65-results-on-the-real-carrier-and-the-defaults):
 
 ```sh
 ./target/replay/dtn-replay --contacts bench/traces/out/helsinki.csv \
   --messages bench/traces/out/helsinki-chat-msgs.csv --ttl-min 1440 \
   --knobs spray=focus,gradient=both --latencies /tmp/lat.csv
+```
+
+`route-check` takes a contacts file, a start time and a duration, both in
+seconds:
+
+```sh
+./target/replay/route-check bench/traces/out/infocom2006.csv <start> <duration>
 ```

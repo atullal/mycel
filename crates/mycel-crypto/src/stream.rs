@@ -1,5 +1,5 @@
 //! Chunked, streaming XChaCha20-Poly1305 for attachments of any size
-//! (docs/TRUST.md §6, "Attachments").
+//! (docs/TRUST.md §7b).
 //!
 //! This is the STREAM construction (Hoang, Reyhanitabar, Rogaway, Vizár 2015):
 //! the plaintext is cut into fixed-size chunks and chunk `i` is sealed with a

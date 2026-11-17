@@ -1,31 +1,35 @@
 # Security policy
 
-Mycel is end-to-end encrypted, peer-to-peer software. We take reports about
-its security seriously, and we are grateful for them.
+This policy is for anyone who finds a security problem in Mycel. It states
+the project's status, which builds get fixes, how to report a vulnerability
+privately, what happens after you report it, and what is in scope.
 
-## Status: not audited
+## Status: experimental and unaudited
 
-Mycel is pre-release software. **Its cryptography and protocols have not been
-reviewed by an external auditor.** The trust layer, the encrypted envelopes
-and the sync protocol were designed and reviewed only by this project. Don't
-rely on Mycel where a flaw could put someone at risk until an independent
-review has happened.
+Mycel is experimental, pre-release software. **Its cryptography and
+protocols have not been reviewed by an external auditor.** The trust layer,
+the encrypted envelopes and the sync protocol were designed and reviewed
+only by this project. Don't rely on Mycel where a flaw could put someone at
+risk until an independent review has happened.
 
 ## Supported versions
 
-Only the latest commit on `main` and the newest pre-release (`dev-*` tags) get
-security fixes. We don't backport fixes to older builds. Mycel doesn't yet
-promise compatibility between builds, so after a fix, update every device.
+Mycel has one line of development, the `main` branch, and pre-release builds
+(the `dev-*` tags). Only the latest commit on `main` and the newest
+pre-release get security fixes. Fixes are not backported to older builds.
+
+Mycel doesn't yet promise compatibility between builds, so after a fix,
+update every device.
 
 ## Reporting a vulnerability
 
-**Please don't report vulnerabilities in public issues, pull requests or
+**Don't report vulnerabilities in public issues, pull requests or
 discussions.**
 
 Report them privately through GitHub:
 <https://github.com/atullal/mycel/security/advisories/new>
 
-Only the maintainers can see the report. Please include:
+Only the maintainers can see the report. Include:
 
 - what is affected: the component, and the commit or release;
 - what an attacker can do, and what they need first (a contact, a member of a
@@ -66,29 +70,30 @@ upstream as well, coordinating with you and with the upstream maintainers.
 
 ## Scope
 
-In scope: any way to break Mycel's security guarantees through the code in
+In scope is any way to break Mycel's security guarantees through the code in
 this repository. In particular:
 
-- **Trust layer** (`crates/mycel-trust`): membership, roles, invites,
+- The trust layer (`crates/mycel-trust`): membership, roles, invites,
   removal and encryption epochs. For example, gaining or keeping access you
   shouldn't have, or making peers disagree about who is a member.
-- **Cryptography and encrypted envelopes** (`crates/mycel-crypto`,
+- Cryptography and encrypted envelopes (`crates/mycel-crypto`,
   `crates/mycel-sync`): signatures, key agreement, content encryption,
   attachments, and the keys kept on the device.
-- **Sync** (`crates/mycel-sync`, `crates/mycel-net`): forged, replayed,
+- Sync (`crates/mycel-sync`, `crates/mycel-net`): forged, replayed,
   reordered or malformed data accepted from a peer, and peers learning data
   they shouldn't.
-- **Network and mesh** (`crates/mycel-net`, `crates/mycel-link-*`,
+- The network and the mesh (`crates/mycel-net`, `crates/mycel-link-*`,
   `crates/mycel-call`, `crates/mycel-video`): discovery, invites, contact
-  cards, relays and keepers, mesh routing, blobs, calls and video. Includes
-  remote crashes and resource exhaustion that a peer can trigger.
-- **Rules sandbox** (`crates/mycel-rules`): escaping the WebAssembly sandbox,
+  cards, relays and keepers, mesh routing, blobs, calls and video. This
+  includes remote crashes and resource exhaustion that a peer can trigger.
+- The rules sandbox (`crates/mycel-rules`): escaping the WebAssembly sandbox,
   breaking determinism, or getting around fuel and memory limits.
-- **Host and IPC** (`apps/host`, `packages/sdk`, `crates/mycel-cli`): the
-  Tauri commands and capabilities exposed to app code, the web UI, the CLI's
-  local HTTP API, file access, notifications, and data stored on the device.
-- **Vendored crates** (`vendor/`), as Mycel uses them.
-- **Build and release**: the GitHub Actions workflows and the published
+- The runtime, the host and IPC (`crates/mycel-node`, `apps/host`,
+  `packages/sdk`, `crates/mycel-cli`): the Tauri commands and capabilities
+  exposed to app code, the web UI, the CLI's local HTTP API, file access,
+  notifications, and data stored on the device.
+- Vendored crates (`vendor/`), as Mycel uses them.
+- Build and release: the GitHub Actions workflows and the published
   installers.
 
 Out of scope:
@@ -101,10 +106,13 @@ Out of scope:
   the problem also affects the shipped code.
 - Reports from automated scanners with no demonstrated impact.
 
+[TRUST.md](docs/TRUST.md) is the security specification. It states the
+threat model, what Mycel defends against and what it does not.
+
 ## Safe harbour
 
 We consider security research done in good faith and within this policy to
-be authorized. We won't take legal action against you for it, and if someone
+be authorised. We won't take legal action against you for it, and if someone
 else does, we'll make clear that you acted with our permission.
 
 Good faith means that you:

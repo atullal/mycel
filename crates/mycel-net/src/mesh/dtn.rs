@@ -1,6 +1,6 @@
 //! Store-and-forward ("delay-tolerant") carrying, as a pure state machine
 //! like [`super::core`]: no I/O, no clock, no crypto (signatures are checked
-//! through closures). Design record: `docs/ROUTING.md` §7; measurements:
+//! through closures). Design record: `docs/ROUTING.md`, "Store-and-forward"; measurements:
 //! `docs/BENCHMARKS.md` §6 and `docs/SIMULATION.md`.
 //!
 //! A **bundle** is an already-signed, already-encrypted batch of Mycel
