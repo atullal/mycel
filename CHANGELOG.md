@@ -83,6 +83,13 @@ The first public version. It contains:
 
 ### Changed
 
+- The rules ABI is version 2. The rules engine moved from wasmi 2.0.0, which
+  its authors withdrew, to 2.0.1, which fixes a miscompiled `select`, two
+  crashes on malformed modules and a stack overflow, and charges fuel for
+  zero-initialising a function's locals. That changes the fuel cost model,
+  which decides verdicts near the fuel limit, so the version went up and the
+  bundled rule modules were rebuilt. Devices on the two versions do not
+  agree on rules; as before, everyone must run the same build.
 - Records and relaying on the wire: a relay control message between hop
   neighbours, and new items in reachability records (`mycel-relay`; a
   device's own record now carries its relays). A device's record on n0's

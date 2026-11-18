@@ -1083,7 +1083,7 @@ encode. So the app goes through a canvas.
 
 The rules engine gives the same verdicts and uses the same fuel at every
 optimisation level. The `mycel-rules` tests at opt-level 2 report the same
-verdicts and fuel (56,603 for a 16 KiB message) with wasmi's portable
+verdicts and fuel (56,749 for a 16 KiB message) with wasmi's portable
 dispatch. wasmi's tail-call dispatch overflowed a 2 MiB thread stack there.
 
 ### Timing on the macOS CI runner

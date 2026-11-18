@@ -24,7 +24,15 @@ pub use serde_bytes;
 
 /// The ABI version implemented by this crate. A guest's `mycel_abi_version()` export must
 /// return exactly this value.
-pub const ABI_VERSION: i32 = 1;
+///
+/// The version covers everything that decides a verdict: the encodings in this crate, the
+/// exports, and the host engine's fuel cost model, since a verdict near the fuel limit
+/// depends on it.
+///
+/// - 1: the first version (wasmi 2.0.0).
+/// - 2: wasmi 2.0.1, which also charges fuel for zero-initialising a function's locals.
+///   Nothing else changed; modules built for version 1 are refused and must be rebuilt.
+pub const ABI_VERSION: i32 = 2;
 
 /// Export names (the complete guest interface).
 pub mod exports {

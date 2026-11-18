@@ -27,7 +27,7 @@
 //!   [`Limits`] are part of consensus too; a Space should pin `(RulesHash, Limits)` (the
 //!   defaults are [`Limits::V1`]).
 //!
-//! ## Guest ABI, version 1 (exact)
+//! ## Guest ABI, version 2 (exact)
 //!
 //! A rules module is a wasm32 core module (MVP + mutable-globals, sign-extension,
 //! saturating-float-to-int (unusable without floats), multi-value, bulk-memory,
@@ -37,13 +37,13 @@
 //! | export | type | required |
 //! |---|---|---|
 //! | `memory` | memory, 32-bit, initial size ≤ `Limits::max_memory_bytes` | yes |
-//! | `mycel_abi_version` | `() -> i32`, must return `1` | yes |
+//! | `mycel_abi_version` | `() -> i32`, must return `2` | yes |
 //! | `mycel_alloc` | `(len: i32) -> i32` | yes |
 //! | `mycel_validate` | `(ptr: i32, len: i32) -> i64` | yes |
 //! | `mycel_reduce` | `(ptr: i32, len: i32) -> i64` | no |
 //!
 //! Other exports are ignored. At load the host instantiates the module once and checks
-//! `mycel_abi_version() == 1`.
+//! `mycel_abi_version() == 2`.
 //!
 //! **Calling convention** (per call, on a fresh instance with a fresh fuel budget):
 //! 1. The host encodes the input with postcard (`RuleInput` for validate, `ReduceInput` for
@@ -133,7 +133,7 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// The default limits for ABI v1.
+    /// The default limits. They have not changed since ABI version 1, which named them.
     pub const V1: Limits =
         Limits { fuel: 20_000_000, max_memory_bytes: 16 * 1024 * 1024, max_module_bytes: 4 * 1024 * 1024 };
 }
