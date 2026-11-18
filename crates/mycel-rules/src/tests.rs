@@ -44,7 +44,7 @@ fn wat_guest(extra: &str, validate_body: &str) -> Vec<u8> {
         r#"(module
             {extra}
             (memory (export "memory") 1)
-            (func (export "mycel_abi_version") (result i32) i32.const 1)
+            (func (export "mycel_abi_version") (result i32) i32.const 2)
             (func (export "mycel_alloc") (param i32) (result i32) i32.const 1024)
             (func (export "mycel_validate") (param $ptr i32) (param $len i32) (result i64)
                 {validate_body}))"#
@@ -315,7 +315,9 @@ fn determinism_repeated_calls_and_fresh_engines() {
 
 /// The fuel cost model is consensus: if a wasmi upgrade changes it, verdicts near the fuel
 /// limit can change. This pins the exact fuel of a fixed workload so such a change is noticed
-/// (and shipped as a new ABI/limits version rather than silently).
+/// (and shipped as a new ABI version rather than silently: `mycel_rules_abi::ABI_VERSION`
+/// lists what each version changed). 12,004 with wasmi 2.0.0; 12,005 with 2.0.1, which charges
+/// for zero-initialising the one local.
 #[test]
 fn fuel_cost_model_is_pinned() {
     let wasm = wat_guest(
@@ -330,7 +332,7 @@ fn fuel_cost_model_is_pinned() {
     let e = RulesEngine::load(&wasm).unwrap();
     let t = e.validate_traced(&input(ALICE, RoleTag::Writer, &text("x"), &[]));
     assert_eq!(t.result, Verdict::Accept);
-    assert_eq!(t.fuel_used, 12_004, "fuel cost model changed");
+    assert_eq!(t.fuel_used, 12_005, "fuel cost model changed");
 }
 
 #[test]
@@ -463,7 +465,7 @@ fn memory_bomb_is_capped() {
     // A module whose *initial* memory exceeds the cap is refused at load.
     let huge = wat::parse_str(
         r#"(module (memory (export "memory") 1000)
-            (func (export "mycel_abi_version") (result i32) i32.const 1)
+            (func (export "mycel_abi_version") (result i32) i32.const 2)
             (func (export "mycel_alloc") (param i32) (result i32) i32.const 0)
             (func (export "mycel_validate") (param i32 i32) (result i64) i64.const 0))"#,
     )
@@ -512,7 +514,7 @@ fn bad_return_values_are_bad_abi() {
 fn out_of_bounds_alloc_is_bad_abi() {
     let wasm = wat::parse_str(
         r#"(module (memory (export "memory") 1)
-            (func (export "mycel_abi_version") (result i32) i32.const 1)
+            (func (export "mycel_abi_version") (result i32) i32.const 2)
             (func (export "mycel_alloc") (param i32) (result i32) i32.const 65530)
             (func (export "mycel_validate") (param i32 i32) (result i64) i64.const 0))"#,
     )
@@ -528,7 +530,7 @@ fn bad_reduce_output_is_bad_abi() {
     for (ret, what) in [("0x0000fff000000100", "oob"), ("0x0000000000000003", "garbage")] {
         let wasm = wat::parse_str(format!(
             r#"(module (memory (export "memory") 1)
-                (func (export "mycel_abi_version") (result i32) i32.const 1)
+                (func (export "mycel_abi_version") (result i32) i32.const 2)
                 (func (export "mycel_alloc") (param i32) (result i32) i32.const 1024)
                 (func (export "mycel_validate") (param i32 i32) (result i64) i64.const 0)
                 (func (export "mycel_reduce") (param i32 i32) (result i64)
@@ -582,7 +584,7 @@ fn imports_rejected_at_load() {
     }
     let imported_memory = wat::parse_str(
         r#"(module (import "env" "memory" (memory 1)) (export "memory" (memory 0))
-            (func (export "mycel_abi_version") (result i32) i32.const 1)
+            (func (export "mycel_abi_version") (result i32) i32.const 2)
             (func (export "mycel_alloc") (param i32) (result i32) i32.const 0)
             (func (export "mycel_validate") (param i32 i32) (result i64) i64.const 0))"#,
     )
@@ -601,7 +603,7 @@ fn abi_shape_enforced_at_load() {
     assert!(matches!(load_err(b"not wasm"), LoadError::Invalid(_)));
     let no_validate = wat::parse_str(
         r#"(module (memory (export "memory") 1)
-            (func (export "mycel_abi_version") (result i32) i32.const 1)
+            (func (export "mycel_abi_version") (result i32) i32.const 2)
             (func (export "mycel_alloc") (param i32) (result i32) i32.const 0))"#,
     )
     .unwrap();
@@ -609,14 +611,15 @@ fn abi_shape_enforced_at_load() {
     let wrong_sig =
         wat_guest(r#"(func (export "mycel_reduce") (param i32 i32) (result i32) i32.const 0)"#, "(i64.const 0)");
     assert!(matches!(load_err(&wrong_sig), LoadError::BadExportType("mycel_reduce")));
+    // a module built for the previous ABI version
     let wrong_version = wat::parse_str(
         r#"(module (memory (export "memory") 1)
-            (func (export "mycel_abi_version") (result i32) i32.const 2)
+            (func (export "mycel_abi_version") (result i32) i32.const 1)
             (func (export "mycel_alloc") (param i32) (result i32) i32.const 0)
             (func (export "mycel_validate") (param i32 i32) (result i64) i64.const 0))"#,
     )
     .unwrap();
-    assert!(matches!(load_err(&wrong_version), LoadError::AbiVersion { found: 2, expected: 1 }));
+    assert!(matches!(load_err(&wrong_version), LoadError::AbiVersion { found: 1, expected: 2 }));
     let small = Limits { max_module_bytes: 100, ..Limits::V1 };
     assert!(matches!(RulesModule::load_with_limits(CHAT_RULES, small), Err(LoadError::TooLarge { .. })));
 }

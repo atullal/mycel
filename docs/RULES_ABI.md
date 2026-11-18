@@ -1,7 +1,7 @@
 # Mycel rules ABI
 
 This is the specification of the WebAssembly ABI between the Mycel runtime and
-app rules, version 1. It is for people who write a rules bundle or work on the
+app rules, version 2. It is for people who write a rules bundle or work on the
 rules host. [ARCHITECTURE.md](ARCHITECTURE.md) places rules in the layer model
 as L4.
 
@@ -27,7 +27,7 @@ A rules bundle is one WebAssembly module. Its identity is a hash of its bytes:
 RulesHash = BLAKE3::derive_key("mycel/v0/rules-bundle", wasm_bytes)
 ```
 
-`Limits::V1` holds the limits of ABI version 1:
+`Limits::V1` holds the limits, unchanged since ABI version 1:
 
 | Limit | Value |
 |---|---|
@@ -42,9 +42,19 @@ elements.
 The bundle bytes, the `Limits`, the ABI version and the wasmi version are
 consensus parameters. Changing any of them can change verdicts near the
 limits, so every peer must run the same ones. wasmi is pinned to exactly
-2.0.0 and always runs its portable loop dispatch, whatever the optimisation
+2.0.1 and always runs its portable loop dispatch, whatever the optimisation
 level. Its fuel cost model is part of consensus, and the test
 `fuel_cost_model_is_pinned` fails if it changes.
+
+The ABI version changes whenever anything that decides a verdict does:
+
+| Version | What changed |
+|---|---|
+| 1 | The first version, on wasmi 2.0.0. |
+| 2 | wasmi 2.0.1, which also charges fuel for zero-initialising a function's locals (one unit per eight locals). The exports, encodings and limits are the same. |
+
+A host refuses a module built for another version, so bundles are rebuilt
+with `rules/build.sh` when the version changes.
 
 ## Module requirements
 
@@ -70,7 +80,7 @@ call. Load also instantiates the module once and calls `mycel_abi_version()`.
 | Export | Type | Required |
 |---|---|---|
 | `memory` | memory, 32-bit, initial size at most the memory limit | yes |
-| `mycel_abi_version` | `() -> i32`, must return `1` | yes |
+| `mycel_abi_version` | `() -> i32`, must return `2` | yes |
 | `mycel_alloc` | `(len: i32) -> i32` | yes |
 | `mycel_validate` | `(ptr: i32, len: i32) -> i64` | yes |
 | `mycel_reduce` | `(ptr: i32, len: i32) -> i64` | no |
